@@ -1,0 +1,30 @@
+name: Rig regressions
+
+on:
+  push:
+    branches: [fix/pr237-retarget-hands]
+  pull_request:
+    paths:
+      - src/rig/**
+      - src/tools/rig.ts
+      - tests/rig-*.ts
+      - package.json
+      - package-lock.json
+      - .github/workflows/rig-regressions.yml
+
+permissions:
+  contents: read
+
+jobs:
+  rig-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test -- tests/rig-retarget-hands.test.ts tests/rig-retarget.test.ts tests/rig-retarget.integration.test.ts
