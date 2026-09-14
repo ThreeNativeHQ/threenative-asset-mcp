@@ -11,7 +11,7 @@ afterEach(() => vi.restoreAllMocks());
 async function handTriangle(skinned: boolean, clipName?: string): Promise<Uint8Array> {
   const document = new Document();
   const buffer = document.createBuffer();
-  const material = document.createMaterial().setDoubleSided(true).setRoughness(1);
+  const material = document.createMaterial().setDoubleSided(true).setRoughnessFactor(1);
   const primitive = document.createPrimitive().setMaterial(material)
     .setAttribute("POSITION", document.createAccessor().setType("VEC3").setBuffer(buffer)
       .setArray(new Float32Array([-0.5, -0.4, 0, 0.6, -0.4, 0, -0.3, 0.8, 0])))
