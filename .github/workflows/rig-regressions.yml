@@ -33,4 +33,6 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/rig-python"
           "$RUNNER_TEMP/rig-python/bin/python" -m pip install numpy==2.2.6 Pillow==11.3.0
           echo "$RUNNER_TEMP/rig-python/bin" >> "$GITHUB_PATH"
-      - run: npm test
+      # Each integration file can launch Chromium, Python and installed MCP
+      # processes. Bound concurrency instead of weakening existing deadlines.
+      - run: npm test -- --maxWorkers=1
