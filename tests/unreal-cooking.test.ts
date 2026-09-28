@@ -68,6 +68,14 @@ describe("readPackageCooking", () => {
     });
   });
 
+  it("recognizes a UE5.5 editor SkeletalMesh saved with skeletal source models", async () => {
+    // The MetaHuman sample's Ada_FaceMesh (UE 5.5): no SkeletalMeshEditorData, no Default__SkeletalMesh.
+    const head = packageHead(["AssetImportData", "SkeletalMesh", "SkeletalMeshSourceModel", "SkeletalMeshDescriptionBulkData"]);
+    head.writeInt32LE(-8, 4);
+    const file = await write("Ada_FaceMesh.uasset", head);
+    await expect(readPackageCooking(file)).resolves.toMatchObject({ legacyFileVersion: -8, meshKindHint: "skeletal" });
+  });
+
   it("recognizes a cooked modern StaticMesh only with its default class object", async () => {
     const head = packageHead(["StaticMesh", "Default__StaticMesh"]);
     head.writeInt32LE(-8, 4);

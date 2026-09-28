@@ -137,7 +137,9 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
   const hasSkeletalClass = head.includes("SkeletalMesh", 0, "latin1");
   const hasSkeletalEditorData =
     head.includes("SkeletalMeshEditorData", 0, "latin1") ||
-    head.includes("MeshEditorDataObject", 0, "latin1");
+    head.includes("MeshEditorDataObject", 0, "latin1") ||
+    // UE 5.5+ keeps skeletal source geometry in these instead (MetaHuman face meshes).
+    head.includes("SkeletalMeshSourceModel", 0, "latin1");
   const hasStaticClass = head.includes("StaticMesh", 0, "latin1");
   const hasDefaultSkeletalClass = head.includes("Default__SkeletalMesh", 0, "latin1");
   const hasDefaultStaticClass = head.includes("Default__StaticMesh", 0, "latin1");
