@@ -18,6 +18,37 @@ export const CUE4PARSE_PATCH = String.raw`diff --git a/Directory.Packages.props 
      <PackageVersion Include="LZMA-SDK" Version="22.1.1" />
 +    <PackageVersion Include="Microsoft.Bcl.Memory" Version="9.0.14" />
      <PackageVersion Include="Newtonsoft.Json" Version="13.0.4" />
+diff --git a/CUE4Parse-Conversion/ExportSession.cs b/CUE4Parse-Conversion/ExportSession.cs
+index 8cfaa87..c40edb0 100644
+--- a/CUE4Parse-Conversion/ExportSession.cs
++++ b/CUE4Parse-Conversion/ExportSession.cs
+@@ -163,7 +163,9 @@ public sealed class ExportSession(Action<StreamingLevelFilterArgs, CancellationT
+         var fullPath = Path.Combine(BaseDirectory.FullName, savePath) + nameSuffix + '.' + ext.ToLower();
+         var dir = Path.GetDirectoryName(fullPath) ?? throw new InvalidOperationException($"Cannot determine directory for path: {fullPath}");
+         Directory.CreateDirectory(dir);
+-        return fullPath.Replace('/', '\\');
++        // The old unconditional '\\' rewrite joined the whole absolute path into one backslash
++        // separated filename on Linux, so the file landed in the process working directory.
++        return fullPath.Replace('/', Path.DirectorySeparatorChar);
+     }
+ 
+     public event PropertyChangedEventHandler? PropertyChanged;
+diff --git a/CUE4Parse-Conversion/Exporters/DnaExporter.cs b/CUE4Parse-Conversion/Exporters/DnaExporter.cs
+index dc63558..3aa234d 100644
+--- a/CUE4Parse-Conversion/Exporters/DnaExporter.cs
++++ b/CUE4Parse-Conversion/Exporters/DnaExporter.cs
+@@ -15,7 +15,10 @@ public sealed class DnaExporter(UDNAAsset dna) : ExporterBase(dna)
+         string? suffix = null;
+         if (!string.IsNullOrEmpty(dna.DnaFileName))
+         {
+-            suffix = $"/{Path.GetFileNameWithoutExtension(dna.DnaFileName)}";
++            // DnaFileName is the authoring machine's absolute path, so its separators are whatever
++            // that machine used. Normalize before taking the leaf, or the whole path becomes a name.
++            var leaf = dna.DnaFileName.Replace('\\', '/');
++            suffix = $"/{Path.GetFileNameWithoutExtension(leaf)}";
+         }
+ 
+         return [new ExportFile("dna", dna.DNAData?.Value ?? [], suffix)];
 diff --git a/CUE4Parse-Conversion/Dto/MeshLodDto.SkeletalMesh.cs b/CUE4Parse-Conversion/Dto/MeshLodDto.SkeletalMesh.cs
 index 0c3aa7d..3b63cc2 100644
 --- a/CUE4Parse-Conversion/Dto/MeshLodDto.SkeletalMesh.cs
@@ -204,6 +235,17 @@ diff --git a/CUE4Parse-Conversion/Textures/TextureDecoder.cs b/CUE4Parse-Convers
          {
              var slices = texture.PlatformData.GetNumSlices();
              if (texture.Owner?.Provider?.Versions.Game == EGame.GAME_Borderlands4)
++diff --git a/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs b/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
++--- a/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
+++++ b/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
++@@ -68,6 +68,9 @@
++                 var verts = morphBuilder.Vertices.ToArray();
++                 foreach (var delta in morphModel.Vertices)
++                 {
+++                    // A morph LOD model can carry a source index past this LOD's shorter vertex
+++                    // array (Ada_FaceMesh LOD1 has one), which used to fail the whole export.
+++                    if (delta.SourceIdx < 0 || delta.SourceIdx >= lod.Vertices.Length) continue;
++                     var vert = lod.Vertices[delta.SourceIdx];
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
@@ -259,11 +301,22 @@ using CUE4Parse_Conversion.Sounds;
 using Newtonsoft.Json;
 
 if (args.Contains("--version")) { Console.WriteLine("threenative-cue4parse ${CUE4PARSE_SOURCE.version}"); return; }
-if (args.Length < 3 || !args.Contains("--export-dir")) throw new ArgumentException("usage: converter SOURCE --export-dir OUTPUT [--filter NAME]");
+if (args.Length < 3 || !args.Contains("--export-dir")) throw new ArgumentException("usage: converter SOURCE --export-dir OUTPUT [--filter NAME] [--lods 0,1]");
 var root = Path.GetFullPath(args[0]);
 var output = Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
 var filterAt = Array.IndexOf(args, "--filter");
 var filter = filterAt >= 0 ? args[filterAt + 1] : null;
+// Source-model LODs of a skeletal mesh to export, as indices into its source model array.
+var lodsAt = Array.IndexOf(args, "--lods");
+var requestedLods = lodsAt >= 0
+    ? args[lodsAt + 1].Split(',', StringSplitOptions.RemoveEmptyEntries)
+        .Select(part => int.TryParse(part.Trim(), out var lod) ? lod : -1)
+        .Where(lod => lod >= 0)
+        .Distinct()
+        .OrderBy(lod => lod)
+        .ToArray()
+    : new[] { 0 };
+if (requestedLods.Length == 0) throw new ArgumentException("--lods needs at least one LOD index");
 bool MatchesFilter(string key)
 {
     if (filter is null) return true;
@@ -585,17 +638,41 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
     var identity = mesh.GetPathName();
     var target = Path.Combine(output, "Meshes", mesh.Name + ".glb");
     if (!exportedMeshes.Add(identity)) return File.Exists(target);
+    // EMeshQuality.Highest, the export default, keeps only the first source model. Anything but a
+    // lone LOD0 therefore has to decode every LOD before the requested ones can be selected.
+    var quality = requestedLods.Length > 1 ? EMeshQuality.All : EMeshQuality.Highest;
     var session = new ExportSession { MaxDegreeOfParallelism = 1 };
     session.Add(mesh);
-    var results = await session.RunAsync(output, new ExportOptions(meshFormat: EMeshFormat.Gltf2, exportMaterials: false));
-    var emitted = results.SelectMany(result => result.DiskFilePaths ?? [])
-        .FirstOrDefault(path => path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase));
-    if (emitted is null || !File.Exists(emitted))
+    var results = await session.RunAsync(output, new ExportOptions(meshFormat: EMeshFormat.Gltf2, exportMaterials: false, meshQuality: quality));
+    var diskPaths = results.SelectMany(result => result.DiskFilePaths ?? []).ToArray();
+    // The glTF writer names every LOD after its source index: LOD0 plain, the rest _LOD<n>.
+    var wanted = requestedLods.ToHashSet();
+    var glbByLod = new Dictionary<int, string>();
+    foreach (var path in diskPaths.Where(path => path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)))
+    {
+        var stem = Path.GetFileNameWithoutExtension(path);
+        var marker = stem.LastIndexOf("_LOD", StringComparison.Ordinal);
+        var lod = marker < 0 || !int.TryParse(stem[(marker + 4)..], out var parsed) ? 0 : parsed;
+        if (wanted.Contains(lod)) glbByLod[lod] = path;
+    }
+    if (glbByLod.Count == 0)
     {
         exportedMeshes.Remove(identity);
         return false;
     }
-    if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
+    foreach (var (lod, path) in glbByLod)
+    {
+        var lodTarget = Path.Combine(output, "Meshes", lod == 0 ? mesh.Name + ".glb" : mesh.Name + "_LOD" + lod + ".glb");
+        if (!Path.GetFullPath(path).Equals(Path.GetFullPath(lodTarget), StringComparison.OrdinalIgnoreCase)) File.Move(path, lodTarget, true);
+    }
+    // A DNA asset reaches the session as an inner object of the mesh package, so the session wrote it
+    // under the mesh's own package path. Promote it beside the LOD0 GLB.
+    var dna = diskPaths.FirstOrDefault(path => path.EndsWith(".dna", StringComparison.OrdinalIgnoreCase));
+    if (dna is not null)
+    {
+        var dnaTarget = Path.Combine(output, "Meshes", mesh.Name + ".dna");
+        if (!Path.GetFullPath(dna).Equals(Path.GetFullPath(dnaTarget), StringComparison.OrdinalIgnoreCase)) File.Move(dna, dnaTarget, true);
+    }
     foreach (var materialName in mesh.SkeletalMaterials.Select(slot => slot.Material?.Name).Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase))
         await ExportMaterialAsync(materialName!);
     return true;

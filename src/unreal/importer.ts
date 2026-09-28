@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readdir, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, readdir, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createReadStream, readFileSync, statfs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -123,9 +123,13 @@ export interface ImportedModel {
   readonly vertices: number;
   readonly primitives: number;
   readonly skins: number;
+  readonly joints: number;
+  readonly morphTargets: number;
   readonly animations: number;
   readonly boundsMetres: readonly [number, number, number];
   readonly materials: readonly ImportedMaterialSection[];
+  /** The embedded DNA asset promoted beside the GLB, for a MetaHuman skeletal mesh. */
+  readonly dna?: { readonly path: string; readonly bytes: number; readonly sha256: string };
 }
 
 export interface ImportedTexture {
@@ -339,6 +343,8 @@ export interface ImportUnrealRequest {
   readonly maxTextureSize?: number | undefined;
   /** Limits the run to packages whose name is in this set. Used by tests and partial imports. */
   readonly onlyPackages?: readonly string[] | undefined;
+  /** Source-model LODs to export for a skeletal mesh. Defaults to `[0]`; existing GLBs are unchanged. */
+  readonly lods?: readonly number[] | undefined;
   /** Warnings raised before the import started, carried into the report the caller keeps. */
   readonly extraWarnings?: readonly string[] | undefined;
   readonly license?:
@@ -531,6 +537,8 @@ interface ExportedAssets {
   readonly props: Map<string, string>;
   readonly png: Map<string, string>;
   readonly audio: Map<string, string>;
+  /** Embedded MetaHuman DNA blobs, keyed by the mesh whose export promoted them. */
+  readonly dna: Map<string, string>;
 }
 
 async function indexExported(root: string): Promise<ExportedAssets> {
@@ -540,6 +548,7 @@ async function indexExported(root: string): Promise<ExportedAssets> {
   const props = new Map<string, string>();
   const png = new Map<string, string>();
   const audio = new Map<string, string>();
+  const dna = new Map<string, string>();
   for (const file of await listFiles(root).catch(() => [])) {
     const name = basename(file.path);
     if (name.endsWith(".props.txt")) props.set(name.slice(0, -".props.txt".length), file.path);
@@ -547,9 +556,10 @@ async function indexExported(root: string): Promise<ExportedAssets> {
     else if (name.endsWith(".gltf")) gltf.set(name.slice(0, -".gltf".length), file.path);
     else if (name.endsWith(".psa")) psa.set(name.slice(0, -".psa".length), file.path);
     else if (name.endsWith(".png")) png.set(name.slice(0, -".png".length), file.path);
+    else if (name.endsWith(".dna")) dna.set(name.slice(0, -".dna".length), file.path);
     else if (/\.(?:wav|ogg|mp3|flac)$/i.test(name)) audio.set(name.slice(0, name.lastIndexOf(".")), file.path);
   }
-  return { gltf, psa, mat, props, png, audio };
+  return { gltf, psa, mat, props, png, audio, dna };
 }
 
 function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAssets {
@@ -562,6 +572,7 @@ function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAss
     props: merge(left.props, right.props),
     png: merge(left.png, right.png),
     audio: merge(left.audio, right.audio),
+    dna: merge(left.dna, right.dna),
   };
 }
 
@@ -831,6 +842,8 @@ export interface PackagedModel {
   readonly vertices: number;
   readonly primitives: number;
   readonly skins: number;
+  readonly joints: number;
+  readonly morphTargets: number;
   readonly animations: number;
   readonly attachedPsa: readonly string[];
   readonly existingPsa: readonly string[];
@@ -1155,6 +1168,11 @@ export async function packageGlb(options: {
     vertices,
     primitives,
     skins: root.listSkins().length,
+    joints: root.listSkins().reduce((sum, skin) => sum + skin.listJoints().length, 0),
+    morphTargets: root.listMeshes().reduce(
+      (sum, mesh) => sum + mesh.listPrimitives().reduce((count, primitive) => count + primitive.listTargets().length, 0),
+      0,
+    ),
     animations: root.listAnimations().length,
     attachedPsa: psa.attached,
     existingPsa: psa.existing,
@@ -1445,6 +1463,10 @@ export async function importUnrealDirectory(
   if (!isAbsolute(outputDir)) {
     throw new ImportError("UNREAL_OUTPUT_INVALID", "The import output directory must be absolute.");
   }
+  // The converter's own default is LOD0 only; only a non-default request is forwarded to it.
+  const requestedLods = [...new Set(request.lods ?? [0])].filter((lod) => lod >= 0).sort((a, b) => a - b);
+  if (requestedLods.length === 0) requestedLods.push(0);
+  const lodsArg = requestedLods.length === 1 && requestedLods[0] === 0 ? undefined : requestedLods.join(",");
 
   const files = await listFiles(sourceDir);
   const packages = files.filter((file) => [".uasset", ".umap"].includes(extname(file.path).toLowerCase()));
@@ -1475,6 +1497,7 @@ export async function importUnrealDirectory(
         listingId: request.listingId ?? null,
         maxTextureSize: request.maxTextureSize ?? null,
         only: request.onlyPackages ? [...request.onlyPackages].sort() : null,
+        lods: lodsArg ?? null,
         uncookedConverter: request.uncookedConverter?.version ?? null,
         modernConverter: request.modernConverter?.version ?? null,
       }),
@@ -2154,6 +2177,7 @@ export async function importUnrealDirectory(
     if (request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
       args.push("--filter", request.onlyPackages[0]);
     }
+    if (lodsArg) args.push("--lods", lodsArg);
     log(`Decoding ${modernAssetCount} modern UE5 asset package${modernAssetCount === 1 ? "" : "s"}…`);
     const converted = await runModernConverter(modernConverter.path, sourceDir, modernRaw, args, {
       timeoutMs: 1_800_000,
@@ -2569,12 +2593,24 @@ export async function importUnrealDirectory(
       const name = basename(entry.package, extname(entry.package));
       const fromMeshDescription = uncookedNames.has(name);
       const fromModernConverter = modernNames.has(name);
-      const gltfPath = fromMeshDescription
+      const defaultPath = fromMeshDescription
         ? uncookedGlbs.get(name)
         : fromModernConverter
           ? modernGlbs.get(name)
           : assets.gltf.get(name);
-      if (!gltfPath) {
+      // Only the modern converter emits more than LOD0, and only when asked. Every other route
+      // keeps its single existing GLB. Extra LODs come out of the same run under the writer's own
+      // `_LOD<n>` suffix, so the base mesh name plus that suffix finds them.
+      const lodPaths: { lod: number; path: string }[] = [];
+      if (fromModernConverter && lodsArg !== undefined) {
+        for (const lod of requestedLods) {
+          const path = lod === 0 ? defaultPath : modernGlbs.get(`${name}_LOD${lod}`);
+          if (path) lodPaths.push({ lod, path });
+        }
+      } else if (defaultPath) {
+        lodPaths.push({ lod: 0, path: defaultPath });
+      }
+      if (lodPaths.length === 0) {
         failed.push({
           package: entry.package,
           reason: fromMeshDescription
@@ -2585,55 +2621,74 @@ export async function importUnrealDirectory(
         });
         continue;
       }
-      const relativeGlb = fromMeshDescription || fromModernConverter
-        ? `Models/${name}.glb`
-        : `${relative(raw, gltfPath).split(sep).join("/").slice(0, -".gltf".length)}.glb`;
-      const glbPath = assertContained(promotion, relativeGlb);
-      try {
-        const packaged = await packageGlb({
-          gltfPath,
-          glbPath,
-          assets,
-          maxTextureSize: request.maxTextureSize,
-          keepAllUvSets: false,
-          imageCache,
-          copyright,
-          sidecars,
-          geometryScale: fromMeshDescription ? 0.01 : 1,
-          psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
-        });
-        prunedUvSets += packaged.prunedUvSets;
-        droppedTangents += packaged.droppedTangents;
-        for (const name of packaged.attachedPsa) attachedPsa.add(name);
-        for (const name of packaged.existingPsa) existingPsa.add(name);
-        for (const name of packaged.incompatiblePsa) incompatiblePsa.add(name);
-        const validated = await validateGlb(glbPath);
-        for (const section of packaged.sections) {
-          for (const binding of section.bindings) {
-            transforms[binding.transform] = (transforms[binding.transform] ?? 0) + 1;
+      const dnaSource = fromModernConverter ? assets.dna.get(name) : undefined;
+      for (const { lod, path: gltfPath } of lodPaths) {
+        const relativeGlb = fromMeshDescription || fromModernConverter
+          ? lod === 0 ? `Models/${name}.glb` : `Models/${name}_LOD${lod}.glb`
+          : `${relative(raw, gltfPath).split(sep).join("/").slice(0, -".gltf".length)}.glb`;
+        const glbPath = assertContained(promotion, relativeGlb);
+        try {
+          const packaged = await packageGlb({
+            gltfPath,
+            glbPath,
+            assets,
+            maxTextureSize: request.maxTextureSize,
+            keepAllUvSets: false,
+            imageCache,
+            copyright,
+            sidecars,
+            geometryScale: fromMeshDescription ? 0.01 : 1,
+            psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
+          });
+          prunedUvSets += packaged.prunedUvSets;
+          droppedTangents += packaged.droppedTangents;
+          for (const name of packaged.attachedPsa) attachedPsa.add(name);
+          for (const name of packaged.existingPsa) existingPsa.add(name);
+          for (const name of packaged.incompatiblePsa) incompatiblePsa.add(name);
+          const validated = await validateGlb(glbPath);
+          for (const section of packaged.sections) {
+            for (const binding of section.bindings) {
+              transforms[binding.transform] = (transforms[binding.transform] ?? 0) + 1;
+            }
           }
+          const model: ImportedModel = {
+            name: lod === 0 ? name : `${name}_LOD${lod}`,
+            package: entry.package,
+            kind: entry.meshKind ?? "static",
+            glb: relativeGlb,
+            bytes: validated.bytes,
+            sha256: validated.sha256,
+            vertices: packaged.vertices,
+            primitives: packaged.primitives,
+            skins: packaged.skins,
+            joints: packaged.joints,
+            morphTargets: packaged.morphTargets,
+            animations: packaged.animations,
+            boundsMetres: packaged.bounds,
+            materials: packaged.sections,
+          };
+          // The DNA belongs to the mesh, not to one LOD, so it rides with LOD0.
+          let dna: ImportedModel["dna"];
+          if (lod === 0 && dnaSource) {
+            const dnaTarget = assertContained(promotion, `Models/${name}.dna`);
+            await mkdir(dirname(dnaTarget), { recursive: true });
+            await copyFile(dnaSource, dnaTarget);
+            const dnaBytes = await readFile(dnaTarget);
+            dna = {
+              path: `Models/${name}.dna`,
+              bytes: dnaBytes.byteLength,
+              sha256: createHash("sha256").update(dnaBytes).digest("hex"),
+            };
+          }
+          models.push(dna ? { ...model, dna } : model);
+          log(`Packaged ${relativeGlb} (${(validated.bytes / 1024 ** 2).toFixed(1)} MiB).`);
+        } catch (error) {
+          await rm(glbPath, { force: true });
+          failed.push({
+            package: entry.package,
+            reason: error instanceof Error ? error.message : "GLB packaging failed.",
+          });
         }
-        models.push({
-          name,
-          package: entry.package,
-          kind: entry.meshKind ?? "static",
-          glb: relativeGlb,
-          bytes: validated.bytes,
-          sha256: validated.sha256,
-          vertices: packaged.vertices,
-          primitives: packaged.primitives,
-          skins: packaged.skins,
-          animations: packaged.animations,
-          boundsMetres: packaged.bounds,
-          materials: packaged.sections,
-        });
-        log(`Packaged ${relativeGlb} (${(validated.bytes / 1024 ** 2).toFixed(1)} MiB).`);
-      } catch (error) {
-        await rm(glbPath, { force: true });
-        failed.push({
-          package: entry.package,
-          reason: error instanceof Error ? error.message : "GLB packaging failed.",
-        });
       }
     }
 
@@ -2668,6 +2723,8 @@ export async function importUnrealDirectory(
           vertices: packaged.vertices,
           primitives: packaged.primitives,
           skins: packaged.skins,
+          joints: packaged.joints,
+          morphTargets: packaged.morphTargets,
           animations: packaged.animations,
           boundsMetres: packaged.bounds,
           materials: packaged.sections,
@@ -3318,6 +3375,8 @@ export async function importUnrealDirectory(
           vertices: packaged.vertices,
           primitives: 1,
           skins: 0,
+          joints: 0,
+          morphTargets: 0,
           animations: 0,
           boundsMetres: packaged.bounds,
           materials: [],
