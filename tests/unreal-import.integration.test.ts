@@ -1,5 +1,6 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -48,25 +49,38 @@ async function temporaryDirectory(prefix = "asset-mcp-unreal-"): Promise<string>
   return directory;
 }
 
-async function writeSkinnedGlb(path: string, name: string): Promise<void> {
+async function writeSkinnedGlb(
+  path: string,
+  name: string,
+  options: { readonly vertices?: number; readonly joints?: number; readonly morphs?: readonly string[] } = {},
+): Promise<void> {
+  const vertexCount = options.vertices ?? 3;
+  const jointCount = options.joints ?? 1;
   const document = new Document();
   const buffer = document.createBuffer();
+  // The first three vertices stay the original unit triangle, so a shorter LOD is a prefix of it.
+  const triangle: readonly (readonly [number, number, number])[] = [
+    [0, 0, 0],
+    [1, 0, 0],
+    [0, 1, 0],
+  ];
+  const positions = new Float32Array(vertexCount * 3);
+  for (let index = 0; index < vertexCount; index += 1) {
+    const corner = triangle[index] ?? [index * 0.5, 0.5, 0];
+    positions.set(corner, index * 3);
+  }
   const primitive = document
     .createPrimitive()
     .setAttribute(
       "POSITION",
-      document
-        .createAccessor("POSITION")
-        .setType("VEC3")
-        .setArray(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]))
-        .setBuffer(buffer),
+      document.createAccessor("POSITION").setType("VEC3").setArray(positions).setBuffer(buffer),
     )
     .setAttribute(
       "JOINTS_0",
       document
         .createAccessor("JOINTS_0")
         .setType("VEC4")
-        .setArray(new Uint16Array(12))
+        .setArray(new Uint16Array(vertexCount * 4))
         .setBuffer(buffer),
     )
     .setAttribute(
@@ -74,38 +88,96 @@ async function writeSkinnedGlb(path: string, name: string): Promise<void> {
       document
         .createAccessor("WEIGHTS_0")
         .setType("VEC4")
-        .setArray(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]))
+        .setArray(new Float32Array(vertexCount * 4).fill(0.25))
         .setBuffer(buffer),
     );
+  for (const morph of options.morphs ?? []) {
+    primitive.addTarget(
+      document
+        .createPrimitiveTarget(`target_${morph}`)
+        .setAttribute(
+          "POSITION",
+          document
+            .createAccessor(`target_${morph}`)
+            .setType("VEC3")
+            .setArray(new Float32Array(vertexCount * 3).fill(0.5))
+            .setBuffer(buffer),
+        ),
+    );
+  }
+  if (options.morphs) primitive.setExtras({ targetNames: [...options.morphs] });
   primitive.setMaterial(document.createMaterial("M_Rock"));
   const mesh = document.createMesh(name).addPrimitive(primitive);
-  const joint = document.createNode("root");
+  const joints = Array.from({ length: jointCount }, (_, index) =>
+    document.createNode(index === 0 ? "root" : `joint_${index}`),
+  );
   const inverseBindMatrices = document
     .createAccessor("InverseBindMatrices")
     .setType("MAT4")
-    .setArray(new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]))
+    .setArray(new Float32Array(jointCount * 16).fill(0).map((_, index) => (index % 4 === 0 ? 1 : 0)))
     .setBuffer(buffer);
   const skin = document
     .createSkin("Skeleton")
-    .addJoint(joint)
-    .setSkeleton(joint)
+    .setSkeleton(joints[0]!)
     .setInverseBindMatrices(inverseBindMatrices);
+  for (const joint of joints) skin.addJoint(joint);
   document
     .createScene()
-    .addChild(joint)
+    .addChild(joints[0]!)
     .addChild(document.createNode(name).setMesh(mesh).setSkin(skin));
   await new NodeIO().write(path, document);
+}
+
+/** A package header UE Viewer cannot read, so only the modern converter can classify it. */
+async function writeEditorSkeletalMesh(sourceDir: string, name: string): Promise<void> {
+  const header = Buffer.alloc(32);
+  header.writeUInt32LE(0x9e2a83c1, 0);
+  header.writeInt32LE(-8, 4);
+  header.writeInt32LE(864, 8);
+  header.writeInt32LE(522, 12);
+  header.writeInt32LE(1009, 16);
+  await writeFile(
+    join(sourceDir, `${name}.uasset`),
+    Buffer.concat([
+      header,
+      Buffer.from("AssetImportData\0SkeletalMesh\0SkeletalMeshEditorData\0MeshEditorDataObject\0"),
+    ]),
+  );
+}
+
+/** A stand-in for the real converter: the same --export-dir contract, driven by `body`. */
+async function writeModernConverter(
+  sourceDir: string,
+  name: string,
+  body: readonly string[],
+): Promise<string> {
+  const converter = join(sourceDir, "..", name);
+  await writeFile(
+    converter,
+    [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const at = process.argv.indexOf("--export-dir");',
+      "const out = process.argv[at + 1];",
+      'fs.mkdirSync(path.join(out, "Meshes"), { recursive: true });',
+      ...body,
+      "",
+    ].join("\n"),
+  );
+  await chmod(converter, 0o755);
+  return converter;
 }
 
 const ROCK_MAT = `Diffuse=T_Rock_D_R
 Normal=T_Rock_N
 Other[0]=T_Rock_Extra
 `;
-
 const ROCK_PROPS = `TwoSided = false
 BlendMode = BLEND_Opaque (0)
 OpacityMaskClipValue = 0.333
 `;
+
 
 const FOLIAGE_MAT = `Normal=T_Leaf_N
 SpecPower=T_Leaf_S
@@ -810,6 +882,101 @@ fs.copyFileSync(${JSON.stringify(normalFixture)}, path.join(out, "Materials", "T
     expect(importedPrimitive.getAttribute("JOINTS_0")).not.toBeNull();
     expect(importedPrimitive.getAttribute("WEIGHTS_0")).not.toBeNull();
     expect(artifact.getRoot().listMaterials()[0]?.getNormalTexture()?.getImage()?.byteLength).toBeGreaterThan(0);
+  });
+
+  it("promotes a skeletal mesh's embedded DNA beside the GLB and reports its bytes and hash", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    await writeEditorSkeletalMesh(workspace.sourceDir, "SM_Rock");
+    // A MetaHuman DNA asset is a byte blob whose stored file name is the authoring machine's
+    // Windows path. The converter is what has to land it inside the export tree.
+    const dna = Buffer.from("DNA ð Ada", "binary");
+    const dnaFixture = join(workspace.sourceDir, "..", "dna", "DNAAsset_7.dna");
+    await mkdir(join(workspace.sourceDir, "..", "dna"), { recursive: true });
+    await writeFile(dnaFixture, dna);
+    const glbFixture = join(workspace.sourceDir, "..", "skeletal-dna.glb");
+    await writeSkinnedGlb(glbFixture, "SM_Rock");
+    const converter = await writeModernConverter(workspace.sourceDir, "modern-dna-converter", [
+      `fs.copyFileSync(${JSON.stringify(glbFixture)}, path.join(out, "Meshes", "SM_Rock.glb"));`,
+      `fs.copyFileSync(${JSON.stringify(dnaFixture)}, path.join(out, "Meshes", "SM_Rock.dna"));`,
+    ]);
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test modern dna" },
+      onlyPackages: ["SM_Rock"],
+    });
+
+    expect(report.models[0]).toMatchObject({ name: "SM_Rock", kind: "skeletal" });
+    expect(report.models[0]?.dna).toEqual({
+      path: "Models/SM_Rock.dna",
+      bytes: dna.byteLength,
+      sha256: createHash("sha256").update(dna).digest("hex"),
+    });
+    // The promoted file is the DNA asset's own bytes, byte for byte.
+    expect(await readFile(join(workspace.outputDir, "Models", "SM_Rock.dna"))).toEqual(dna);
+  });
+
+  it("keeps a skeletal mesh at LOD0 unless another LOD is requested", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    await writeEditorSkeletalMesh(workspace.sourceDir, "SM_Rock");
+    const fixtures = join(workspace.sourceDir, "..", "lods");
+    await mkdir(fixtures, { recursive: true });
+    await writeSkinnedGlb(join(fixtures, "SM_Rock.glb"), "SM_Rock", {
+      vertices: 3,
+      joints: 2,
+      morphs: ["face_browInnerUp", "face_jawOpen"],
+    });
+    await writeSkinnedGlb(join(fixtures, "SM_Rock_LOD1.glb"), "SM_Rock", {
+      vertices: 2,
+      joints: 2,
+      morphs: ["face_browInnerUp"],
+    });
+    await writeSkinnedGlb(join(fixtures, "SM_Rock_LOD2.glb"), "SM_Rock", { vertices: 1, joints: 2 });
+    const argvLog = join(workspace.sourceDir, "..", "lods-argv.json");
+    const converter = await writeModernConverter(workspace.sourceDir, "modern-lods-converter", [
+      `fs.writeFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)));`,
+      `for (const name of ["SM_Rock", "SM_Rock_LOD1", "SM_Rock_LOD2"])`,
+      `  fs.copyFileSync(path.join(${JSON.stringify(fixtures)}, name + ".glb"), path.join(out, "Meshes", name + ".glb"));`,
+    ]);
+
+    const base = {
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel" as const, path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern" as const, path: converter, version: "Test modern lods" },
+      onlyPackages: ["SM_Rock"],
+    };
+
+    const defaulted = await importUnrealDirectory(base);
+    expect(defaulted.models.map((model) => model.glb)).toEqual(["Models/SM_Rock.glb"]);
+    expect(JSON.parse(await readFile(argvLog, "utf8"))).not.toContain("--lods");
+
+    const requestedDir = join(workspace.outputDir, "lods");
+    const requested = await importUnrealDirectory({ ...base, outputDir: requestedDir, lods: [1, 0] });
+    expect(requested.models.map((model) => model.glb)).toEqual([
+      "Models/SM_Rock.glb",
+      "Models/SM_Rock_LOD1.glb",
+    ]);
+    expect(JSON.parse(await readFile(argvLog, "utf8"))).toContain("--lods");
+    expect(requested.models.map((model) => [model.vertices, model.joints, model.morphTargets])).toEqual([
+      [3, 2, 2],
+      [2, 2, 1],
+    ]);
+    // Every LOD keeps the same skeleton and target naming, so a swap needs no rebinding.
+    for (const model of requested.models) {
+      const lod = await new NodeIO().read(join(requestedDir, model.glb));
+      expect(lod.getRoot().listNodes().map((node) => node.getName())).toEqual(["root", "joint_1", "SM_Rock"]);
+      const targetNames = lod
+        .getRoot()
+        .listMeshes()
+        .flatMap((mesh) => mesh.listPrimitives())
+        .reduce((sum, primitive) => sum + primitive.listTargets().length, 0);
+      expect(targetNames).toBe(model.morphTargets);
+    }
   });
 
   it("routes a cooked UE5 StaticMesh rejected by UE Viewer through the modern converter", async () => {
