@@ -62,6 +62,20 @@ describe("the pinned CUE4Parse build", () => {
     expect(CUE4PARSE_PROGRAM).toContain("EMeshQuality.All");
     expect(CUE4PARSE_PROGRAM).toContain("--lods");
   });
+
+  it("skips a morph target that has no LOD model for the LOD being written", () => {
+    // Root cause of the LOD1 crash, which CUE4Parse's own ExporterBase swallows: every Ada
+    // morph target stores exactly one MorphLODModel, but the guard read `Length < SourceLodIndex`,
+    // so for LOD1 (index 1) `1 < 1` is false and the next line indexes MorphLODModels[1] out of
+    // bounds. Asserting both sides of the hunk keeps the guard falsifiable: the upstream `-` line
+    // proves the defect is still the thing being fixed, the `+` line proves the fix shipped.
+    expect(CUE4PARSE_PATCH).toContain(
+      "-                if (morphTarget?.MorphLODModels == null || morphTarget.MorphLODModels.Length < lod.SourceLodIndex ||",
+    );
+    expect(CUE4PARSE_PATCH).toContain(
+      "+                if (morphTarget?.MorphLODModels == null || morphTarget.MorphLODModels.Length <= lod.SourceLodIndex ||",
+    );
+  });
 });
 
 describe.skipIf(!ready)("the real Ada_FaceMesh MetaHuman face (local MetaHuman Sample 5.5 download)", () => {
@@ -84,8 +98,10 @@ describe.skipIf(!ready)("the real Ada_FaceMesh MetaHuman face (local MetaHuman S
       });
       expect(report.failed).toEqual([]);
 
-      // The Windows-path .dna used to be written here as a single backslash-joined filename.
-      expect((await readdir(process.cwd())).filter((entry) => !before.has(entry))).toEqual([]);
+      // The Windows-path .dna used to be written here as a single backslash-joined filename. UE
+      // Viewer always drops its own notify.log in the working directory, so assert on the .dna.
+      const strays = (await readdir(process.cwd())).filter((entry) => !before.has(entry));
+      expect(strays.filter((entry) => entry.toLowerCase().endsWith(".dna"))).toEqual([]);
 
       const lod0 = report.models.find((model) => model.glb === "Models/Ada_FaceMesh.glb");
       const lod1 = report.models.find((model) => model.glb === "Models/Ada_FaceMesh_LOD1.glb");

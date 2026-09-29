@@ -239,6 +239,15 @@ diff --git a/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs b/CUE4Parse-Conversion/Wr
 index 10bfc73..b1d220e 100644
 --- a/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
 +++ b/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
+@@ -56,7 +56,7 @@ public Gltf(string name, MeshLodDto<SkinnedMeshVertex> lod, bool exportMorphTarg
+             for (var j = 0; j < morphTargets.Length; j++)
+             {
+                 var morphTarget = morphTargets[j].Load<UMorphTarget>();
+-                if (morphTarget?.MorphLODModels == null || morphTarget.MorphLODModels.Length < lod.SourceLodIndex || morphTarget.MorphLODModels[lod.SourceLodIndex].Vertices.Length == 0)
++                if (morphTarget?.MorphLODModels == null || morphTarget.MorphLODModels.Length <= lod.SourceLodIndex || morphTarget.MorphLODModels[lod.SourceLodIndex].Vertices.Length == 0)
+                     continue;
+ 
+                 var morphBuilder = meshBuilder.UseMorphTarget(j);
 @@ -68,6 +68,9 @@ public Gltf(string name, MeshLodDto<SkinnedMeshVertex> lod, bool exportMorphTarg
                  var verts = morphBuilder.Vertices.ToArray();
                  foreach (var delta in morphModel.Vertices)
