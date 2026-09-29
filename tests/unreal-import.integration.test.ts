@@ -113,25 +113,38 @@ async function writeSkinnedGlb(
     );
   for (const morph of options.morphs ?? []) {
     const deltas = new Float32Array(vertexCount * 3);
+    // Unreal's morph delta holds a tangent-Z, which IS the normal, so the converter exports it as a
+    // NORMAL delta. A distinct magnitude from the position delta so a test can tell the two apart.
+    const normalDeltas = new Float32Array(vertexCount * 3);
     if (seam) {
       // Only the twins move: 3 is a same-skin twin of vertex 1 and 5 a different-skin twin of 0.
       deltas.fill(0.5, 3 * 3, 4 * 3);
       deltas.fill(0.5, 5 * 3, 6 * 3);
+      normalDeltas.fill(0.25, 3 * 3, 4 * 3);
+      normalDeltas.fill(0.25, 5 * 3, 6 * 3);
     } else {
       deltas.fill(0.5);
+      normalDeltas.fill(0.25);
     }
-    primitive.addTarget(
-      document
-        .createPrimitiveTarget(`target_${morph}`)
-        .setAttribute(
-          "POSITION",
-          document
-            .createAccessor(`target_${morph}`)
-            .setType("VEC3")
-            .setArray(deltas)
-            .setBuffer(buffer),
-        ),
-    );
+    const target = document
+      .createPrimitiveTarget(`target_${morph}`)
+      .setAttribute(
+        "POSITION",
+        document
+          .createAccessor(`target_${morph}`)
+          .setType("VEC3")
+          .setArray(deltas)
+          .setBuffer(buffer),
+      )
+      .setAttribute(
+        "NORMAL",
+        document
+          .createAccessor(`target_${morph}_normal`)
+          .setType("VEC3")
+          .setArray(normalDeltas)
+          .setBuffer(buffer),
+      );
+    primitive.addTarget(target);
   }
   if (options.morphs) primitive.setExtras({ targetNames: [...options.morphs] });
   primitive.setMaterial(document.createMaterial("M_Rock"));
@@ -947,7 +960,7 @@ fs.copyFileSync(${JSON.stringify(normalFixture)}, path.join(out, "Materials", "T
     expect(await readFile(join(workspace.outputDir, "Models", "SM_Rock.dna"))).toEqual(dna);
   });
 
-  it("gives every co-located copy of a vertex the morph delta its twin carries", async () => {
+  it("gives every co-located copy of a vertex the position and normal morph deltas its twin carries", async () => {
     const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
     await writeEditorSkeletalMesh(workspace.sourceDir, "SM_Rock");
     const fixture = join(workspace.sourceDir, "..", "seam.glb");
@@ -970,26 +983,35 @@ fs.copyFileSync(${JSON.stringify(normalFixture)}, path.join(out, "Materials", "T
     });
 
     const promoted = await new NodeIO().read(join(workspace.outputDir, report.models[0]!.glb));
-    const deltas = promoted
+    const target = promoted
       .getRoot()
       .listMeshes()[0]!
       .listPrimitives()[0]!
-      .listTargets()[0]!
-      .getAttribute("POSITION")!;
-    const at = (index: number): number[] => {
+      .listTargets()[0]!;
+    const deltas = target.getAttribute("POSITION")!;
+    const normalDeltas = target.getAttribute("NORMAL")!;
+    const at = (attribute: typeof deltas, index: number): number[] => {
       const element: number[] = [];
-      deltas.getElement(index, element);
+      attribute.getElement(index, element);
       return element;
     };
     // Vertices 1 and 3 are one source vertex split along a seam: both move, or the skin tears.
-    expect(at(1)).toEqual(at(3));
-    expect(at(1)).toEqual([0.5, 0.5, 0.5]);
+    expect(at(deltas, 1)).toEqual(at(deltas, 3));
+    expect(at(deltas, 1)).toEqual([0.5, 0.5, 0.5]);
     // Vertices 2 and 4 are twins too, but neither carries a delta, so there is nothing to copy.
-    expect(at(2)).toEqual([0, 0, 0]);
-    expect(at(4)).toEqual([0, 0, 0]);
+    expect(at(deltas, 2)).toEqual([0, 0, 0]);
+    expect(at(deltas, 4)).toEqual([0, 0, 0]);
     // Vertices 0 and 5 share a position and nothing else: a different skin must stay untouched.
-    expect(at(0)).toEqual([0, 0, 0]);
-    expect(at(5)).toEqual([0.5, 0.5, 0.5]);
+    expect(at(deltas, 0)).toEqual([0, 0, 0]);
+    expect(at(deltas, 5)).toEqual([0.5, 0.5, 0.5]);
+    // The shading normal has to travel with the position, or a morphing vertex keeps the rest-pose
+    // normal and the mesh creases along the fold. Same repair, same rules, same different-skin veto.
+    expect(at(normalDeltas, 1)).toEqual(at(normalDeltas, 3));
+    expect(at(normalDeltas, 1)).toEqual([0.25, 0.25, 0.25]);
+    expect(at(normalDeltas, 2)).toEqual([0, 0, 0]);
+    expect(at(normalDeltas, 4)).toEqual([0, 0, 0]);
+    expect(at(normalDeltas, 0)).toEqual([0, 0, 0]);
+    expect(at(normalDeltas, 5)).toEqual([0.25, 0.25, 0.25]);
   });
 
   it("keeps a skeletal mesh at LOD0 unless another LOD is requested", async () => {
