@@ -63,6 +63,24 @@ describe("the pinned CUE4Parse build", () => {
     expect(CUE4PARSE_PROGRAM).toContain("--lods");
   });
 
+  it("exports the morph target's tangent-Z delta as its NORMAL delta", () => {
+    // Root cause of the jaw crease: Unreal's FMorphTargetDelta stores a PositionDelta and a
+    // TangentZDelta, and tangent-Z IS the normal. The export put that value in the delta's TANGENT
+    // slot and left NORMAL at Vector3.Zero, so every morph target carried only POSITION and
+    // TANGENT. three.js morphs normals from NORMAL and ignores a TANGENT target delta, so the
+    // vertices moved while the shading normals stayed at rest. The delta also has to keep its
+    // magnitude: `SwapYZAndNormalize` forced every non-zero delta to unit length, which is a
+    // direction, not the difference between two normals. Asserting both sides of the hunk keeps
+    // the guard falsifiable — the upstream `-` line proves the defect is still the thing being
+    // fixed, the `+` line proves the fix shipped.
+    expect(CUE4PARSE_PATCH).toContain(
+      "-                    morphBuilder.SetVertexDelta(morphBuilder.Vertices.ElementAt(index), new VertexGeometryDelta(SwapYZ(delta.PositionDelta * UnitScale), Vector3.Zero, SwapYZAndNormalize(delta.TangentZDelta)));",
+    );
+    expect(CUE4PARSE_PATCH).toContain(
+      "+                    morphBuilder.SetVertexDelta(morphBuilder.Vertices.ElementAt(index), new VertexGeometryDelta(SwapYZ(delta.PositionDelta * UnitScale), SwapYZ(delta.TangentZDelta), Vector3.Zero));",
+    );
+  });
+
   it("skips a morph target that has no LOD model for the LOD being written", () => {
     // Root cause of the LOD1 crash, which CUE4Parse's own ExporterBase swallows: every Ada
     // morph target stores exactly one MorphLODModel, but the guard read `Length < SourceLodIndex`,

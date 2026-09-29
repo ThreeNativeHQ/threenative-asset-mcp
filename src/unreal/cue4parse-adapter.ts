@@ -248,7 +248,7 @@ index 10bfc73..b1d220e 100644
                      continue;
  
                  var morphBuilder = meshBuilder.UseMorphTarget(j);
-@@ -68,6 +68,9 @@ public Gltf(string name, MeshLodDto<SkinnedMeshVertex> lod, bool exportMorphTarg
+@@ -68,12 +68,15 @@ public Gltf(string name, MeshLodDto<SkinnedMeshVertex> lod, bool exportMorphTarg
                  var verts = morphBuilder.Vertices.ToArray();
                  foreach (var delta in morphModel.Vertices)
                  {
@@ -258,6 +258,13 @@ index 10bfc73..b1d220e 100644
                      var vert = lod.Vertices[delta.SourceIdx];
                      var srcVert = new VertexPositionNormalTangent(SwapYZ(vert.Position * UnitScale),SwapYZAndNormalize((FVector)vert.Normal) , SwapYZAndNormalize((Vector4)vert.Tangent));
                      var index = FindVert(srcVert, verts);
+                     if (index == -1)  continue;
+ 
+-                    morphBuilder.SetVertexDelta(morphBuilder.Vertices.ElementAt(index), new VertexGeometryDelta(SwapYZ(delta.PositionDelta * UnitScale), Vector3.Zero, SwapYZAndNormalize(delta.TangentZDelta)));
++                    morphBuilder.SetVertexDelta(morphBuilder.Vertices.ElementAt(index), new VertexGeometryDelta(SwapYZ(delta.PositionDelta * UnitScale), SwapYZ(delta.TangentZDelta), Vector3.Zero));
+                 }
+             }
+ 
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
