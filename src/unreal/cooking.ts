@@ -178,7 +178,10 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
               (legacyFileVersion <= -8 && hasDefaultStaticClass))
           ? "static"
           : undefined,
-    textureHint: hasTextureClass && markers.includes("AssetImportData"),
+    // A generated editor texture (MetaHuman Creator bakes) keeps TextureSource with no import data.
+    textureHint:
+      hasTextureClass &&
+      (markers.includes("AssetImportData") || head.includes("\0TextureSource\0", 0, "latin1")),
     cubemapHint: hasCubemapClass && markers.includes("AssetImportData"),
     soundHint: hasSoundClass && markers.includes("AssetImportData"),
     dataClassHint,

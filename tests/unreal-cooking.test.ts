@@ -98,6 +98,14 @@ describe("readPackageCooking", () => {
     });
   });
 
+  it("recognizes a UE5.5 generated editor Texture2D by its TextureSource", async () => {
+    // MetaHuman Creator bakes textures in-editor: TextureSource, but no AssetImportData.
+    const head = packageHead(["Texture2D", "TextureSource"]);
+    head.writeInt32LE(-8, 4);
+    const file = await write("FaceColor_MAIN.uasset", head);
+    await expect(readPackageCooking(file)).resolves.toMatchObject({ textureHint: true });
+  });
+
   it("does not infer a Texture2D from a modern class-name fragment without editor evidence", async () => {
     const head = packageHead(["Texture2D"]);
     head.writeInt32LE(-8, 4);
