@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { Document, NodeIO, VertexLayout, type Material, type Texture } from "@gltf-transform/core";
+import { Document, NodeIO, VertexLayout, type Material, type Primitive, type Texture } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsUnlit } from "@gltf-transform/extensions";
 import { attachPsaAnimations, parsePsa, type PsaFile } from "./psa.js";
 
@@ -852,6 +852,110 @@ export interface PackagedModel {
   readonly sections: ImportedMaterialSection[];
   readonly prunedUvSets: number;
   readonly droppedTangents: number;
+  /** Seam-duplicated render vertices given the morph delta their twin already carried. */
+  readonly repairedMorphDeltas: number;
+  /** Co-located vertices whose morph deltas disagreed in a way no single value could repair. */
+  readonly conflictingMorphDeltas: number;
+}
+
+/** Two co-located vertices are the same source vertex when their positions agree to this far. */
+const SEAM_POSITION_EPSILON = 1e-6;
+/** A delta at or below this is a value no renderer can see, so it is not a delta. */
+const SEAM_DELTA_EPSILON = 1e-6;
+
+/**
+ * A glTF export splits one render vertex into a copy per UV and normal seam, and Unreal's morph
+ * export writes a source vertex's delta to a single one of those copies. The skin then tears open
+ * along the seam: one copy moves, its identical twin stays put. Every co-located copy that shares a
+ * skin has to carry the same delta, so a group of them is given the value its delta-carrying
+ * member already has. Two members that disagree are left exactly as exported — picking either would
+ * move a vertex the source data put somewhere else — and counted.
+ */
+function repairSeamMorphDeltas(primitive: Primitive): { readonly repaired: number; readonly conflicting: number } {
+  const targets = primitive.listTargets();
+  const position = primitive.getAttribute("POSITION");
+  const joints = primitive.getAttribute("JOINTS_0");
+  const weights = primitive.getAttribute("WEIGHTS_0");
+  if (targets.length === 0 || !position || !joints || !weights) return { repaired: 0, conflicting: 0 };
+
+  const positionArray = position.getArray();
+  const jointArray = joints.getArray();
+  const weightArray = weights.getArray();
+  const positionSize = position.getElementSize();
+  const jointSize = joints.getElementSize();
+  const weightSize = weights.getElementSize();
+  if (!positionArray || !jointArray || !weightArray) return { repaired: 0, conflicting: 0 };
+
+  // The seams belong to the mesh, not to a morph, so the groups are built once and reused for
+  // every target. Two vertices join a group only when they are co-located AND bound to the same
+  // joints with the same weights, because a vertex on a different skin is a different vertex no
+  // matter how close it lies to this one.
+  const groups = new Map<string, number[]>();
+  for (let index = 0; index < position.getCount(); index += 1) {
+    let key = "";
+    for (let axis = 0; axis < positionSize; axis += 1) {
+      key += `${Math.round((positionArray[index * positionSize + axis] ?? 0) / SEAM_POSITION_EPSILON)},`;
+    }
+    for (let slot = 0; slot < jointSize; slot += 1) key += `/${jointArray[index * jointSize + slot]}`;
+    for (let slot = 0; slot < weightSize; slot += 1) key += `/${weightArray[index * weightSize + slot]}`;
+    const group = groups.get(key);
+    if (group) group.push(index);
+    else groups.set(key, [index]);
+  }
+
+  let repaired = 0;
+  let conflicting = 0;
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    for (const target of targets) {
+      for (const delta of target.listAttributes()) {
+        const array = delta.getArray();
+        if (!array) continue;
+        const size = delta.getElementSize();
+        // The first member carrying a delta is the value the rest of the group has to take, unless
+        // a second member carries a different one — then neither is right, and neither is moved.
+        let carrier = -1;
+        let agreed = true;
+        for (const member of group) {
+          let magnitude = 0;
+          for (let axis = 0; axis < size; axis += 1) {
+            magnitude = Math.max(magnitude, Math.abs(array[member * size + axis] ?? 0));
+          }
+          if (magnitude <= SEAM_DELTA_EPSILON) continue;
+          if (carrier === -1) {
+            carrier = member;
+            continue;
+          }
+          for (let axis = 0; axis < size; axis += 1) {
+            if (
+              Math.abs((array[member * size + axis] ?? 0) - (array[carrier * size + axis] ?? 0)) >
+              SEAM_DELTA_EPSILON
+            ) {
+              agreed = false;
+            }
+          }
+          if (!agreed) break;
+        }
+        if (carrier === -1) continue;
+        if (!agreed) {
+          conflicting += 1;
+          continue;
+        }
+        for (const member of group) {
+          if (member === carrier) continue;
+          let written = false;
+          for (let axis = 0; axis < size; axis += 1) {
+            const value = array[carrier * size + axis] ?? 0;
+            if (array[member * size + axis] === value) continue;
+            array[member * size + axis] = value;
+            written = true;
+          }
+          if (written) repaired += 1;
+        }
+      }
+    }
+  }
+  return { repaired, conflicting };
 }
 
 /**
@@ -953,6 +1057,8 @@ export async function packageGlb(options: {
   const cache = new Map<string, Texture>();
   let prunedUvSets = 0;
   let droppedTangents = 0;
+  let repairedMorphDeltas = 0;
+  let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
 
   for (const [index, material] of root.listMaterials().entries()) {
@@ -1147,6 +1253,10 @@ export async function packageGlb(options: {
         }
       }
 
+      const seams = repairSeamMorphDeltas(primitive);
+      repairedMorphDeltas += seams.repaired;
+      conflictingMorphDeltas += seams.conflicting;
+
       if (options.keepAllUvSets) continue;
       // UE Viewer emits every Unreal UV channel, including lightmap sets no runtime material
       // reads. They are pure size in a source asset that a compiler will copy again.
@@ -1185,6 +1295,8 @@ export async function packageGlb(options: {
     sections,
     prunedUvSets,
     droppedTangents,
+    repairedMorphDeltas,
+    conflictingMorphDeltas,
   };
 }
 
@@ -2614,6 +2726,8 @@ export async function importUnrealDirectory(
   const transforms: Record<string, number> = {};
   let prunedUvSets = 0;
   let droppedTangents = 0;
+  let repairedMorphDeltas = 0;
+  let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
   const attachedPsa = new Set<string>();
   const existingPsa = new Set<string>();
@@ -2673,6 +2787,8 @@ export async function importUnrealDirectory(
           });
           prunedUvSets += packaged.prunedUvSets;
           droppedTangents += packaged.droppedTangents;
+          repairedMorphDeltas += packaged.repairedMorphDeltas;
+          conflictingMorphDeltas += packaged.conflictingMorphDeltas;
           for (const name of packaged.attachedPsa) attachedPsa.add(name);
           for (const name of packaged.existingPsa) existingPsa.add(name);
           for (const name of packaged.incompatiblePsa) incompatiblePsa.add(name);
@@ -2743,6 +2859,8 @@ export async function importUnrealDirectory(
         });
         prunedUvSets += packaged.prunedUvSets;
         droppedTangents += packaged.droppedTangents;
+        repairedMorphDeltas += packaged.repairedMorphDeltas;
+        conflictingMorphDeltas += packaged.conflictingMorphDeltas;
         const validated = await validateGlb(glbPath);
         const model: ImportedModel = {
           name: source.name,
@@ -3545,6 +3663,16 @@ export async function importUnrealDirectory(
     if (prunedUvSets > 0) {
       warnings.push(
         `Dropped ${prunedUvSets} extra UV channels (TEXCOORD_1 and above); Unreal lightmap UVs have no runtime consumer here.`,
+      );
+    }
+    if (repairedMorphDeltas > 0) {
+      warnings.push(
+        `Gave ${repairedMorphDeltas} seam-duplicated vertices the morph delta their twin carried; Unreal's export writes a source vertex's delta to one copy per UV or normal seam, which tears the skin open along the seam.`,
+      );
+    }
+    if (conflictingMorphDeltas > 0) {
+      warnings.push(
+        `${conflictingMorphDeltas} seam-duplicated vertex groups carry two different non-zero morph deltas; both were kept, because either value would move a vertex the source placed elsewhere.`,
       );
     }
     if (coverage.unresolved > 0) {

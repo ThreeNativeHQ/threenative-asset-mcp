@@ -52,9 +52,20 @@ async function temporaryDirectory(prefix = "asset-mcp-unreal-"): Promise<string>
 async function writeSkinnedGlb(
   path: string,
   name: string,
-  options: { readonly vertices?: number; readonly joints?: number; readonly morphs?: readonly string[] } = {},
+  options: {
+    readonly vertices?: number;
+    readonly joints?: number;
+    readonly morphs?: readonly string[];
+    /**
+     * Appends the three seam twins CUE4Parse's morph export splits a render vertex into: 3 twins
+     * vertex 1 on the same skin, 4 twins vertex 2 with no delta on either copy, and 5 twins vertex 0
+     * on a different skin. Only the twins carry a delta, which is the defect under test.
+     */
+    readonly seam?: boolean;
+  } = {},
 ): Promise<void> {
-  const vertexCount = options.vertices ?? 3;
+  const seam = options.seam ?? false;
+  const vertexCount = seam ? 6 : (options.vertices ?? 3);
   const jointCount = options.joints ?? 1;
   const document = new Document();
   const buffer = document.createBuffer();
@@ -64,11 +75,20 @@ async function writeSkinnedGlb(
     [1, 0, 0],
     [0, 1, 0],
   ];
+  const twins: readonly (readonly [number, number, number])[] = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 0],
+  ];
   const positions = new Float32Array(vertexCount * 3);
   for (let index = 0; index < vertexCount; index += 1) {
-    const corner = triangle[index] ?? [index * 0.5, 0.5, 0];
+    const corner = triangle[index] ?? twins[index - 3] ?? [index * 0.5, 0.5, 0];
     positions.set(corner, index * 3);
   }
+  const weights = new Float32Array(vertexCount * 4).fill(0.25);
+  // The last twin is co-located with vertex 0 but bound to a different pair of joints, so no
+  // delta may be copied between them.
+  if (seam) weights.set([0.5, 0.5, 0, 0], 5 * 4);
   const primitive = document
     .createPrimitive()
     .setAttribute(
@@ -88,10 +108,18 @@ async function writeSkinnedGlb(
       document
         .createAccessor("WEIGHTS_0")
         .setType("VEC4")
-        .setArray(new Float32Array(vertexCount * 4).fill(0.25))
+        .setArray(weights)
         .setBuffer(buffer),
     );
   for (const morph of options.morphs ?? []) {
+    const deltas = new Float32Array(vertexCount * 3);
+    if (seam) {
+      // Only the twins move: 3 is a same-skin twin of vertex 1 and 5 a different-skin twin of 0.
+      deltas.fill(0.5, 3 * 3, 4 * 3);
+      deltas.fill(0.5, 5 * 3, 6 * 3);
+    } else {
+      deltas.fill(0.5);
+    }
     primitive.addTarget(
       document
         .createPrimitiveTarget(`target_${morph}`)
@@ -100,7 +128,7 @@ async function writeSkinnedGlb(
           document
             .createAccessor(`target_${morph}`)
             .setType("VEC3")
-            .setArray(new Float32Array(vertexCount * 3).fill(0.5))
+            .setArray(deltas)
             .setBuffer(buffer),
         ),
     );
@@ -917,6 +945,51 @@ fs.copyFileSync(${JSON.stringify(normalFixture)}, path.join(out, "Materials", "T
     });
     // The promoted file is the DNA asset's own bytes, byte for byte.
     expect(await readFile(join(workspace.outputDir, "Models", "SM_Rock.dna"))).toEqual(dna);
+  });
+
+  it("gives every co-located copy of a vertex the morph delta its twin carries", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    await writeEditorSkeletalMesh(workspace.sourceDir, "SM_Rock");
+    const fixture = join(workspace.sourceDir, "..", "seam.glb");
+    await writeSkinnedGlb(fixture, "SM_Rock", {
+      joints: 2,
+      morphs: ["face_jawOpen"],
+      seam: true,
+    });
+    const converter = await writeModernConverter(workspace.sourceDir, "modern-seam-converter", [
+      `fs.copyFileSync(${JSON.stringify(fixture)}, path.join(out, "Meshes", "SM_Rock.glb"));`,
+    ]);
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test modern seam" },
+      onlyPackages: ["SM_Rock"],
+    });
+
+    const promoted = await new NodeIO().read(join(workspace.outputDir, report.models[0]!.glb));
+    const deltas = promoted
+      .getRoot()
+      .listMeshes()[0]!
+      .listPrimitives()[0]!
+      .listTargets()[0]!
+      .getAttribute("POSITION")!;
+    const at = (index: number): number[] => {
+      const element: number[] = [];
+      deltas.getElement(index, element);
+      return element;
+    };
+    // Vertices 1 and 3 are one source vertex split along a seam: both move, or the skin tears.
+    expect(at(1)).toEqual(at(3));
+    expect(at(1)).toEqual([0.5, 0.5, 0.5]);
+    // Vertices 2 and 4 are twins too, but neither carries a delta, so there is nothing to copy.
+    expect(at(2)).toEqual([0, 0, 0]);
+    expect(at(4)).toEqual([0, 0, 0]);
+    // Vertices 0 and 5 share a position and nothing else: a different skin must stay untouched.
+    expect(at(0)).toEqual([0, 0, 0]);
+    expect(at(5)).toEqual([0.5, 0.5, 0.5]);
   });
 
   it("keeps a skeletal mesh at LOD0 unless another LOD is requested", async () => {
