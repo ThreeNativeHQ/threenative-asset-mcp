@@ -58,8 +58,17 @@ async function writeSkinnedGlb(
   const jointCount = options.joints ?? 1;
   const document = new Document();
   const buffer = document.createBuffer();
+  // The first three vertices stay the original unit triangle, so a shorter LOD is a prefix of it.
+  const triangle: readonly (readonly [number, number, number])[] = [
+    [0, 0, 0],
+    [1, 0, 0],
+    [0, 1, 0],
+  ];
   const positions = new Float32Array(vertexCount * 3);
-  for (let index = 0; index < vertexCount; index += 1) positions[index * 3] = index;
+  for (let index = 0; index < vertexCount; index += 1) {
+    const corner = triangle[index] ?? [index * 0.5, 0.5, 0];
+    positions.set(corner, index * 3);
+  }
   const primitive = document
     .createPrimitive()
     .setAttribute(
@@ -105,7 +114,7 @@ async function writeSkinnedGlb(
   const inverseBindMatrices = document
     .createAccessor("InverseBindMatrices")
     .setType("MAT4")
-    .setArray(new Float32Array(jointCount * 16).fill(0).map((_, index) => (index % 5 === 0 ? 1 : 0)))
+    .setArray(new Float32Array(jointCount * 16).fill(0).map((_, index) => (index % 4 === 0 ? 1 : 0)))
     .setBuffer(buffer);
   const skin = document
     .createSkin("Skeleton")

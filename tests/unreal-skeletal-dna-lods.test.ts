@@ -35,7 +35,10 @@ function converterReady(): boolean {
   }
 }
 
-const ready = existsSync(ADA) && existsSync(REFERENCE_DNA) && converterReady();
+// A full import of this 4.8 MB DNA asset and 23 MB LOD0 face mesh takes about half an hour, so the
+// real-asset case only runs when METAHUMAN_E2E=1 asks for it. The stub-converter coverage in
+// tests/unreal-import.integration.test.ts is what guards the wiring on an ordinary test run.
+const ready = process.env.METAHUMAN_E2E === "1" && existsSync(ADA) && existsSync(REFERENCE_DNA) && converterReady();
 const outputs: string[] = [];
 afterAll(async () => {
   await Promise.all(outputs.map((directory) => rm(directory, { recursive: true, force: true })));

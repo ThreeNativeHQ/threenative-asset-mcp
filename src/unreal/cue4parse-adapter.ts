@@ -235,17 +235,20 @@ diff --git a/CUE4Parse-Conversion/Textures/TextureDecoder.cs b/CUE4Parse-Convers
          {
              var slices = texture.PlatformData.GetNumSlices();
              if (texture.Owner?.Provider?.Versions.Game == EGame.GAME_Borderlands4)
-+diff --git a/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs b/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
-+--- a/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
-++++ b/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
-+@@ -68,6 +68,9 @@
-+                 var verts = morphBuilder.Vertices.ToArray();
-+                 foreach (var delta in morphModel.Vertices)
-+                 {
-++                    // A morph LOD model can carry a source index past this LOD's shorter vertex
-++                    // array (Ada_FaceMesh LOD1 has one), which used to fail the whole export.
-++                    if (delta.SourceIdx < 0 || delta.SourceIdx >= lod.Vertices.Length) continue;
-+                     var vert = lod.Vertices[delta.SourceIdx];
+diff --git a/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs b/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
+index 10bfc73..b1d220e 100644
+--- a/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
++++ b/CUE4Parse-Conversion/Writers/Gltf/Gltf.cs
+@@ -68,6 +68,9 @@ public Gltf(string name, MeshLodDto<SkinnedMeshVertex> lod, bool exportMorphTarg
+                 var verts = morphBuilder.Vertices.ToArray();
+                 foreach (var delta in morphModel.Vertices)
+                 {
++                    // A morph LOD model can carry a source index past this LOD's shorter vertex
++                    // array (Ada_FaceMesh LOD1 has one), which used to fail the whole export.
++                    if (delta.SourceIdx < 0 || delta.SourceIdx >= lod.Vertices.Length) continue;
+                     var vert = lod.Vertices[delta.SourceIdx];
+                     var srcVert = new VertexPositionNormalTangent(SwapYZ(vert.Position * UnitScale),SwapYZAndNormalize((FVector)vert.Normal) , SwapYZAndNormalize((Vector4)vert.Tangent));
+                     var index = FindVert(srcVert, verts);
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
