@@ -17,6 +17,8 @@ import {
   resolveMaterial,
 } from "./materials.js";
 import { readPackageCooking, readPackageObjectNames } from "./cooking.js";
+import { decodeGroomPayload, groomSidecar, type GroomStrands } from "./grooms.js";
+import { ImportError } from "./errors.js";
 import { extractUnrealFonts } from "./fonts.js";
 import { parseOfflineFontDescriptor, writeOfflineFont } from "./bitmap-fonts.js";
 import {
@@ -45,7 +47,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 47;
+export const IMPORTER_VERSION = 48;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -64,27 +66,7 @@ export function uncookedMeshRoute(
   return fileVersionUE4 !== undefined && fileVersionUE4 <= MESH_DESCRIPTION_LAST_VERSION ? "mesh-description" : undefined;
 }
 
-export type ImportErrorCode =
-  | "UNREAL_SOURCE_NOT_FOUND"
-  | "UNREAL_SOURCE_EMPTY"
-  | "UNREAL_OUTPUT_INVALID"
-  | "UNREAL_OUTPUT_COLLISION"
-  | "UNREAL_DISK_SPACE"
-  | "UNREAL_EXPORT_EMPTY"
-  | "UNREAL_SOURCE_UNCOOKED"
-  | "UNREAL_SOURCE_UNSUPPORTED"
-  | "UNREAL_GLB_INVALID";
-
-export class ImportError extends Error {
-  constructor(
-    readonly code: ImportErrorCode,
-    message: string,
-    readonly retryable = false,
-  ) {
-    super(message);
-    this.name = "ImportError";
-  }
-}
+export { ImportError, type ImportErrorCode } from "./errors.js";
 
 export interface ImportedMaterialSection {
   readonly name: string;
@@ -254,6 +236,22 @@ export interface ImportedFlipbook {
   readonly unresolvedSprites: readonly string[];
 }
 
+/** Renderable hair strands promoted beside the models, in metres and glTF's Y-up frame. */
+export interface ImportedGroom {
+  readonly name: string;
+  readonly package: string;
+  /** Path to the `.strands.bin`, relative to the promoted output directory. */
+  readonly path: string;
+  /** The `.strands.json` sidecar describing the same strands, relative to the output directory. */
+  readonly sidecar: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly strandCount: number;
+  readonly pointCount: number;
+  /** Guide strands the payload carried and this format leaves out. */
+  readonly excludedGuides: number;
+}
+
 export interface ImportReport {
   readonly importer: { readonly name: string; readonly version: number };
   readonly source: {
@@ -298,6 +296,7 @@ export interface ImportReport {
     readonly sprites: number;
     readonly flipbooks: number;
     readonly scenes: number;
+    readonly strands: number;
     readonly skipped: number;
     readonly failed: number;
   };
@@ -313,6 +312,7 @@ export interface ImportReport {
   readonly sprites: readonly ImportedSprite[];
   readonly flipbooks: readonly ImportedFlipbook[];
   readonly scenes: readonly ImportedScene[];
+  readonly strands: readonly ImportedGroom[];
   readonly skipped: readonly { readonly package: string; readonly reason: string }[];
   readonly failed: readonly { readonly package: string; readonly reason: string }[];
   readonly materialCoverage: {
@@ -492,6 +492,7 @@ interface PackageClassification {
   readonly hasFont: boolean;
   readonly hasBlueprintPrefab: boolean;
   readonly paperClass: "PaperSprite" | "PaperFlipbook" | "PaperTileMap" | "PaperTileSet" | undefined;
+  readonly hasGroom: boolean;
   readonly needsModernConverter: boolean;
   readonly error: string | undefined;
 }
@@ -583,6 +584,26 @@ async function indexGlbs(root: string): Promise<Map<string, string>> {
     if (name.toLowerCase().endsWith(".glb")) glbs.set(name.slice(0, -4), file.path);
   }
   return glbs;
+}
+
+/** Raw GroomAsset editor payloads by asset name, largest first: only one of a package's compressed
+ * trailers is the hair description, and the decoder recognises it by consuming all of it. */
+async function indexGroomPayloads(root: string): Promise<Map<string, string[]>> {
+  const payloads = new Map<string, { readonly path: string; readonly size: number }[]>();
+  for (const file of await listFiles(root).catch(() => [])) {
+    const name = basename(file.path);
+    const match = /^(.*)\.payload\d+\.bin$/i.exec(name);
+    if (!match?.[1]) continue;
+    const forName = payloads.get(match[1]) ?? [];
+    forName.push(file);
+    payloads.set(match[1], forName);
+  }
+  return new Map(
+    [...payloads].map(([name, files]) => [
+      name,
+      files.sort((left, right) => right.size - left.size).map((file) => file.path),
+    ]),
+  );
 }
 
 const MODERN_ENGINE_FALLBACKS = ["5.7", "5.6", "5.5", "5.4", "5.3", "5.2", "5.1", "5.0"] as const;
@@ -1714,6 +1735,7 @@ export async function importUnrealDirectory(
         hasFont: false,
         hasBlueprintPrefab: false,
         paperClass: undefined,
+        hasGroom: false,
         needsModernConverter: false,
         error: unsupported,
       };
@@ -1757,12 +1779,15 @@ export async function importUnrealDirectory(
         : classes.includes("PaperTileMap") ? "PaperTileMap"
         : classes.includes("PaperTileSet") ? "PaperTileSet"
         : undefined;
+      // A hair description is editor-only bulk data, so it is decoded by the modern converter
+      // whatever UE Viewer can say about the package.
+      const hasGroom = classes.includes("GroomAsset") || cooking?.groomHint === true;
       const modernHeader = cooking.legacyFileVersion !== undefined && cooking.legacyFileVersion <= -8;
       const hasBlueprintPrefab = classes.includes("BlueprintGeneratedClass") || cooking?.blueprintPrefabHint === true;
       const needsModernConverter = modernHeader && (
         hasMaterial ||
         hasBlueprintPrefab ||
-        (run.code !== 0 && (meshKind !== undefined || hasTexture || hasCubemap || hasSound || dataClass !== undefined || textureStackClass !== undefined))
+        (run.code !== 0 && (meshKind !== undefined || hasTexture || hasCubemap || hasSound || dataClass !== undefined || textureStackClass !== undefined || hasGroom))
       );
       // UE Viewer cannot list UE5 packages at all; when the name table shows an editor-only class
       // with nothing to import, report that class instead of a listing failure.
@@ -1786,6 +1811,7 @@ export async function importUnrealDirectory(
         hasFont,
         hasBlueprintPrefab,
         paperClass,
+        hasGroom,
         needsModernConverter,
         error:
           run.code === 0 || needsModernConverter || nonImportableClass !== undefined || hasFont || paperClass !== undefined || cooking?.levelHint === true
@@ -1809,6 +1835,7 @@ export async function importUnrealDirectory(
         hasFont: false,
         hasBlueprintPrefab: false,
         paperClass: undefined,
+        hasGroom: false,
         needsModernConverter: false,
         error: error instanceof ToolchainError ? error.message : "UE Viewer failed to list the package.",
       };
@@ -1828,6 +1855,7 @@ export async function importUnrealDirectory(
   const fontPackages = classified.filter((entry) => entry.hasFont && !entry.error);
   const offlineFontPackages = fontPackages.filter((entry) => entry.classes.includes("Font") && entry.classes.includes("Texture2D"));
   const paperPackages = classified.filter((entry) => entry.paperClass !== undefined && !entry.error);
+  const groomPackages = classified.filter((entry) => entry.hasGroom && !entry.error);
   const levelCandidates = classified.filter(
     (entry) =>
       entry.file.toLowerCase().endsWith(".umap") &&
@@ -1886,6 +1914,7 @@ export async function importUnrealDirectory(
       (entry.textureStackClass !== undefined && !entry.error) ||
       (entry.hasFont && !entry.error) ||
       (entry.paperClass !== undefined && !entry.error) ||
+      (entry.hasGroom && !entry.error) ||
       prefabFiles.has(entry.file) ||
       mapFiles.has(entry.file)
     ) continue;
@@ -1921,13 +1950,14 @@ export async function importUnrealDirectory(
     textureStackPackages.length === 0
     && fontPackages.length === 0
     && paperPackages.length === 0
+    && groomPackages.length === 0
   ) {
     const animationOnly = animationPackages.length > 0
       ? ` Found ${animationPackages.length} animation package${animationPackages.length === 1 ? "" : "s"}, but no compatible SkeletalMesh to receive those tracks.`
       : "";
     throw new ImportError(
       "UNREAL_EXPORT_EMPTY",
-      `No package under "${sourceDir}" contains a supported StaticMesh, SkeletalMesh, Texture2D, TextureCube, multidimensional texture, Material, SoundWave, Font, PaperSprite, PaperFlipbook, structured data, or Level, so there is nothing to convert.${animationOnly}`,
+      `No package under "${sourceDir}" contains a supported StaticMesh, SkeletalMesh, Texture2D, TextureCube, multidimensional texture, Material, SoundWave, Font, PaperSprite, PaperFlipbook, GroomAsset, structured data, or Level, so there is nothing to convert.${animationOnly}`,
     );
   }
 
@@ -1939,11 +1969,20 @@ export async function importUnrealDirectory(
     package: entry.package,
     ...(await readPackageCooking(entry.file)),
   }));
-  const modernPackages = cooking.filter(
-    ({ entry, state, fileVersionUE4 }) =>
-      entry.needsModernConverter ||
-      (entry.meshKind === "skeletal" && state === "uncooked" && uncookedMeshRoute("skeletal", fileVersionUE4) === "modern"),
-  );
+  const modernPackages = [
+    ...cooking.filter(
+      ({ entry, state, fileVersionUE4 }) =>
+        entry.needsModernConverter ||
+        (entry.meshKind === "skeletal" && state === "uncooked" && uncookedMeshRoute("skeletal", fileVersionUE4) === "modern"),
+    ),
+    // A hair description is editor-only bulk data in the package trailer, so its package goes
+    // through the same converter run as the meshes.
+    ...(await mapWithConcurrency(groomPackages, concurrency, async (entry) => ({
+      entry,
+      package: entry.package,
+      ...(await readPackageCooking(entry.file)),
+    }))),
+  ];
   const modernTexturePackages = texturePackages.filter((entry) => entry.needsModernConverter);
   const modernMaterialPackages = materialPackages.filter((entry) => entry.needsModernConverter);
   const modernSoundPackages = soundPackages.filter((entry) => entry.needsModernConverter);
@@ -2228,6 +2267,7 @@ export async function importUnrealDirectory(
   let uncookedGlbs = new Map<string, string>();
   let modernConverter: ExternalTool | undefined;
   let modernGlbs = new Map<string, string>();
+  let modernGroomPayloads = new Map<string, string[]>();
   /** Meshes UE Viewer exported after the modern converter failed on them. */
   const recoveredByUmodel = new Set<string>();
   const modernSceneModelSources: {
@@ -2324,6 +2364,7 @@ export async function importUnrealDirectory(
       );
     } else {
       modernGlbs = await indexGlbs(modernRaw);
+      modernGroomPayloads = await indexGroomPayloads(modernRaw);
       assets = mergeExported(assets, await indexExported(modernRaw));
       warnings.push(
         `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
@@ -2717,6 +2758,7 @@ export async function importUnrealDirectory(
   const sprites: ImportedSprite[] = [];
   const flipbooks: ImportedFlipbook[] = [];
   const scenes: ImportedScene[] = [];
+  const strands: ImportedGroom[] = [];
   const modernSceneModelsByFile = new Map<string, ImportedModel[]>();
   const modernSceneModelPackages = new Set<string>();
   const imageCache = new TransformedImageCache();
@@ -2836,6 +2878,56 @@ export async function importUnrealDirectory(
             reason: error instanceof Error ? error.message : "GLB packaging failed.",
           });
         }
+      }
+    }
+
+    for (const entry of groomPackages) {
+      const name = basename(entry.package, extname(entry.package));
+      const relativeBinary = `Models/${name}.strands.bin`;
+      const binaryPath = assertContained(promotion, relativeBinary);
+      const candidates = modernGroomPayloads.get(name) ?? [];
+      let decoded: GroomStrands | undefined;
+      let reason = "The modern UE5 asset converter produced no hair description for this package.";
+      for (const candidate of candidates) {
+        try {
+          decoded = decodeGroomPayload(await readFile(candidate));
+          break;
+        } catch (error) {
+          // A package carries more than one compressed trailer and only one of them is the hair
+          // description. A payload that decodes into strands this build refuses is not a different
+          // candidate, so that verdict stands instead of being retried against the next one.
+          reason = error instanceof Error ? error.message : "Groom decoding failed.";
+          if (error instanceof ImportError && error.code === "UNREAL_GROOM_UNSUPPORTED") break;
+        }
+      }
+      if (!decoded) {
+        failed.push({ package: entry.package, reason });
+        continue;
+      }
+      try {
+        const sidecarRelative = `Models/${name}.strands.json`;
+        const sidecarPath = assertContained(promotion, sidecarRelative);
+        await mkdir(dirname(binaryPath), { recursive: true });
+        await writeFile(binaryPath, decoded.binary);
+        await writeFile(sidecarPath, `${JSON.stringify(groomSidecar(decoded, entry.package), null, 2)}\n`);
+        strands.push({
+          name,
+          package: entry.package,
+          path: relativeBinary,
+          sidecar: sidecarRelative,
+          bytes: decoded.binary.byteLength,
+          sha256: createHash("sha256").update(decoded.binary).digest("hex"),
+          strandCount: decoded.strandCount,
+          pointCount: decoded.pointCount,
+          excludedGuides: decoded.excludedGuides,
+        });
+        log(`Wrote ${relativeBinary} (${decoded.strandCount} strands, ${decoded.pointCount} points).`);
+      } catch (error) {
+        await rm(binaryPath, { force: true });
+        failed.push({
+          package: entry.package,
+          reason: `Groom strand packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
       }
     }
 
@@ -3629,13 +3721,14 @@ export async function importUnrealDirectory(
       fonts.length === 0 &&
       bitmapFonts.length === 0 &&
       sprites.length === 0 &&
-      flipbooks.length === 0
+      flipbooks.length === 0 &&
+      strands.length === 0
     ) {
       const reasons = failed.slice(0, 5).map((entry) => `${entry.package}: ${entry.reason}`);
       const more = failed.length > reasons.length ? ` (+${failed.length - reasons.length} more)` : "";
       throw new ImportError(
         "UNREAL_EXPORT_EMPTY",
-        "No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, or scene; nothing was promoted." +
+        "No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene; nothing was promoted." +
           (reasons.length > 0 ? ` Failures — ${reasons.join("; ")}${more}.` : ""),
       );
     }
@@ -3726,6 +3819,7 @@ export async function importUnrealDirectory(
         sprites: sprites.length,
         flipbooks: flipbooks.length,
         scenes: scenes.length,
+        strands: strands.length,
         skipped: skipped.length,
         failed: failed.length,
       },
@@ -3741,6 +3835,7 @@ export async function importUnrealDirectory(
       sprites,
       flipbooks,
       scenes,
+      strands,
       skipped,
       failed,
       materialCoverage: coverage,

@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.49",
+  version: "b4e95441+threenative.50",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -361,6 +361,7 @@ Directory.CreateDirectory(Path.Combine(output, "Fonts"));
 Directory.CreateDirectory(Path.Combine(output, "Scenes"));
 Directory.CreateDirectory(Path.Combine(output, "Sprites"));
 Directory.CreateDirectory(Path.Combine(output, "TileMaps"));
+Directory.CreateDirectory(Path.Combine(output, "Grooms"));
 ObjectTypeRegistry.RegisterClass(typeof(USkeletalMeshEditorData));
 
 var engineAt = Array.IndexOf(args, "--engine");
@@ -717,6 +718,11 @@ foreach (var key in provider.Files.Keys.Where(key =>
     {
         if (await ExportStaticMeshAsync(mesh)) exported++;
     }
+    // A hair description only exists in an editor package, and no export class reads it, so it is
+    // recognised by the class name the package was authored as.
+    foreach (var asset in package.GetExports().Where(asset => asset.ExportType.Equals("GroomAsset", StringComparison.OrdinalIgnoreCase)))
+        if (provider.Files.TryGetValue(key, out var groomFile) && groomFile.Size <= 2_000_000_000L &&
+            ExportGroomPayloads(groomFile.Read(), asset.Name) > 0) exported++;
     foreach (var material in package.GetExports().OfType<UMaterialInterface>())
     {
         await ExportMaterialAsync(material.Name);
@@ -1522,6 +1528,27 @@ static byte[]? ExtractCompressedPayloadPng(byte[] bytes)
 // header's raw size decompresses only what is kept.
 static EditorMesh? ReadLargestMeshDescription(byte[] bytes)
 {
+    foreach (var (at, _) in ScanEditorPayloads(bytes))
+    {
+        try
+        {
+            using var archive = new FByteArchive("editor-payload", bytes);
+            archive.Position = at;
+            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)));
+        }
+        catch
+        {
+            // Not a mesh description; try the next largest payload.
+        }
+    }
+    return null;
+}
+
+// Every plausible FCompressedBuffer in a package, largest raw size first. The 0xb7 0x75 0x63 0x62
+// magic also occurs inside unrelated bulk bytes, so each candidate is header-validated and the
+// reader decides what it is.
+static List<(int At, ulong RawSize)> ScanEditorPayloads(byte[] bytes)
+{
     ReadOnlySpan<byte> magic = [0xb7, 0x75, 0x63, 0x62];
     var candidates = new List<(int At, ulong RawSize)>();
     for (var searchAt = 0; searchAt <= bytes.Length - magic.Length;)
@@ -1543,20 +1570,33 @@ static EditorMesh? ReadLargestMeshDescription(byte[] bytes)
             // The magic may occur inside unrelated compressed bytes.
         }
     }
-    foreach (var (at, _) in candidates.OrderByDescending(candidate => candidate.RawSize))
+    return candidates.OrderByDescending(candidate => candidate.RawSize).ToList();
+}
+
+// A GroomAsset's hair description is editor-only bulk data, so the cooked export path never sees
+// it: it lives in the package's compressed trailer. CUE4Parse has no GroomAsset export to read it
+// from, so every decompressible candidate is written raw and the importer's parser picks the one
+// that decodes as a hair description. Returning the candidate count keeps a groom package that
+// decoded nothing from passing for an export.
+int ExportGroomPayloads(byte[] bytes, string name)
+{
+    var written = 0;
+    foreach (var (at, _) in ScanEditorPayloads(bytes))
     {
         try
         {
-            using var archive = new FByteArchive("editor-payload", bytes);
+            using var archive = new FByteArchive("groom-payload", bytes);
             archive.Position = at;
-            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)));
+            var raw = DecompressEditorPayload(new FCompressedBuffer(archive));
+            File.WriteAllBytes(Path.Combine(output, "Grooms", $"{name}.payload{written}.bin"), raw);
+            written++;
         }
         catch
         {
-            // Not a mesh description; try the next largest payload.
+            // Not a decompressible payload; the next candidate is still worth trying.
         }
     }
-    return null;
+    return written;
 }
 
 // UE5's FMeshDescription serialization, as verified byte-exact on the Common Hazel packs (see

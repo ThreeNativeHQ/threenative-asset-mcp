@@ -57,6 +57,8 @@ export interface PackageCooking {
   readonly materialHint: boolean;
   /** High-confidence Level hint for `.umap` packages UE Viewer cannot list. */
   readonly levelHint: boolean;
+  /** A whole name-table entry naming the GroomAsset class, which only a hair package carries. */
+  readonly groomHint: boolean;
   /** Serialized BlueprintGeneratedClass/SCS prefab hint for newer headers UE Viewer rejects. */
   readonly blueprintPrefabHint: boolean;
   /** An editor-only class with nothing to import, named when UE Viewer cannot list the package. */
@@ -84,6 +86,7 @@ const UNKNOWN: PackageCooking = Object.freeze({
   fontHint: false,
   materialHint: false,
   levelHint: false,
+  groomHint: false,
   blueprintPrefabHint: false,
   nonImportableClassHint: undefined,
 });
@@ -156,6 +159,9 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     (head.includes("MaterialInstanceBasePropertyOverrides", 0, "latin1") && head.includes("MaterialInstanceConstant", 0, "latin1"));
   const levelHint = file.toLowerCase().endsWith(".umap") &&
     head.includes("PersistentLevel", 0, "latin1") && head.includes("WorldSettings", 0, "latin1");
+  // A whole name-table entry, like nonImportableClassHint: the cards mesh a groom renders with is a
+  // StaticMesh package and names no GroomAsset.
+  const groomHint = file.toLowerCase().endsWith(".uasset") && head.includes("\0GroomAsset\0", 0, "latin1");
   // A whole name-table entry: the length prefix's high byte and the NUL terminator bracket it,
   // so "MaterialFunction" does not match inside "MaterialFunctionInstance".
   const nonImportableClassHint = NON_IMPORTABLE_CLASSES.find((className) => head.includes(`\0${className}\0`, 0, "latin1"));
@@ -189,6 +195,7 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     fontHint,
     materialHint,
     levelHint,
+    groomHint,
     blueprintPrefabHint,
     nonImportableClassHint,
   };

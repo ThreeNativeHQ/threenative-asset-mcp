@@ -2479,7 +2479,7 @@ for (const face of Object.keys(faces)) {
         environment: workspace.environment,
         umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
       }),
-    ).rejects.toThrow(/No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, or scene/);
+    ).rejects.toThrow(/No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene/);
     await expect(stat(workspace.outputDir)).rejects.toThrow();
   });
 
@@ -2505,7 +2505,7 @@ for (const face of Object.keys(faces)) {
         environment: workspace.environment,
         umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
       }),
-    ).rejects.toThrow(/contains a supported StaticMesh, SkeletalMesh, Texture2D, TextureCube, multidimensional texture, Material, SoundWave, Font, PaperSprite, PaperFlipbook, structured data, or Level/);
+    ).rejects.toThrow(/contains a supported StaticMesh, SkeletalMesh, Texture2D, TextureCube, multidimensional texture, Material, SoundWave, Font, PaperSprite, PaperFlipbook, GroomAsset, structured data, or Level/);
   });
 
   it("refuses a source directory that is not there", async () => {
