@@ -2107,6 +2107,76 @@ process.exit(1);
     expect(report.skipped.some((entry) => entry.reason.includes("Texture2D"))).toBe(false);
   });
 
+  it("decodes same-named modern Texture2D packages from different folders as separate PNGs", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    header.writeInt32LE(-8, 4);
+    for (const face of ["Ada", "Taro"]) {
+      const directory = join(workspace.sourceDir, "Content", "MetaHumans", face, "Face");
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        join(directory, "FaceColor_MAIN.uasset"),
+        Buffer.concat([header, Buffer.from("AssetImportData\0Texture2D\0")]),
+      );
+    }
+    const faces = join(workspace.sourceDir, "..", "faces");
+    await mkdir(faces, { recursive: true });
+    // Ada's albedo and Taro's differ in size, so a promoted PNG's dimensions say which face it
+    // came from — a promoted pair of identical bytes cannot satisfy both.
+    await writePng(join(faces, "Ada.png"), [113, 68, 55, 255], 4);
+    await writePng(join(faces, "Taro.png"), [96, 74, 60, 255], 8);
+    const converter = join(workspace.sourceDir, "..", "modern-texture-converter");
+    // Mirrors the pinned converter: a bare --filter name matches every package of that name, a
+    // path matches exactly one, and every texture is written to the same Textures/<name>.png.
+    await writeFile(
+      converter,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const argv = process.argv;
+const out = argv[argv.indexOf("--export-dir") + 1];
+const filter = (argv[argv.indexOf("--filter") + 1] || "").toLowerCase();
+const faces = ${JSON.stringify({
+        ada: join(faces, "Ada.png"),
+        taro: join(faces, "Taro.png"),
+      })};
+fs.mkdirSync(path.join(out, "Textures"), { recursive: true });
+for (const face of Object.keys(faces)) {
+  if (filter.includes("/") && !filter.includes("content/metahumans/" + face + "/")) continue;
+  fs.copyFileSync(faces[face], path.join(out, "Textures", "FaceColor_MAIN.png"));
+}
+`,
+    );
+    await chmod(converter, 0o755);
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      maxTextureSize: 64,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test modern same-name" },
+      onlyPackages: ["FaceColor_MAIN"],
+    });
+
+    expect(report.failed).toEqual([]);
+    expect(report.counts).toMatchObject({ textures: 2, failed: 0 });
+    const promoted = new Map(report.textures.map((texture) => [texture.png, texture]));
+    expect([...promoted.keys()].sort()).toEqual([
+      "textures/Content/MetaHumans/Ada/Face/FaceColor_MAIN.png",
+      "textures/Content/MetaHumans/Taro/Face/FaceColor_MAIN.png",
+    ]);
+    expect(promoted.get("textures/Content/MetaHumans/Ada/Face/FaceColor_MAIN.png")).toMatchObject({
+      width: 4,
+      height: 4,
+    });
+    expect(promoted.get("textures/Content/MetaHumans/Taro/Face/FaceColor_MAIN.png")).toMatchObject({
+      width: 8,
+      height: 8,
+    });
+  });
+
   it("promotes duplicate-named SoundWave packages with collision-free paths", async () => {
     const workspace = await unrealWorkspace({
       classes: {

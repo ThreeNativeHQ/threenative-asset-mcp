@@ -2169,7 +2169,7 @@ export async function importUnrealDirectory(
     }
   }
   const uncookedNames = new Set(uncookedMeshDescription.map((entry) => basename(entry.package, extname(entry.package))));
-  const modernAssetCount = modernPackages.length + modernTexturePackages.length;
+  const modernAssetCount = modernPackages.length;
   if (modernAssetCount > 0) {
     modernConverter = request.modernConverter ?? (await ensureModernConverter(environment, log));
     const modernRaw = join(staging, "modern");
@@ -2213,19 +2213,50 @@ export async function importUnrealDirectory(
     } else {
       modernGlbs = await indexGlbs(modernRaw);
       assets = mergeExported(assets, await indexExported(modernRaw));
-      for (const entry of modernTexturePackages) {
-        const name = basename(entry.package, extname(entry.package));
-        const source = assets.png.get(name);
-        if (source) textureSources.set(entry.file, source);
-        else failed.push({
-          package: entry.package,
-          reason: "The modern UE5 texture converter produced no PNG for this package.",
-        });
-      }
       warnings.push(
         `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
       );
     }
+  }
+  if (modernTexturePackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const modernTextureRoot = join(staging, "modern-textures");
+    await mkdir(modernTextureRoot, { recursive: true });
+    log(`Decoding ${modernTexturePackages.length} modern UE5 texture package${modernTexturePackages.length === 1 ? "" : "s"}…`);
+    // The converter writes every texture to Textures/<name>.png, so one run holding two packages
+    // that share a basename leaves both pointing at whichever was exported last. Isolated
+    // directories and a relative-path filter are the only way each entry gets its own pixels.
+    const results = await mapWithConcurrency(modernTexturePackages, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(modernTextureRoot, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) return { entry, reason: `The modern UE5 texture converter exited ${converted.code}.` };
+      const exported = await indexExported(isolated);
+      const source = exported.png.get(name);
+      return source
+        ? { entry, source, exported }
+        : { entry, reason: "The modern UE5 texture converter produced no PNG for this package." };
+    });
+    for (const result of results) {
+      if (result.exported) {
+        // Material texture bindings resolve by name, so the isolated exports still feed the
+        // shared index exactly as the batched run used to.
+        assets = mergeExported(assets, result.exported);
+        textureSources.set(result.entry.file, result.source!);
+      } else {
+        failed.push({ package: result.entry.package, reason: result.reason ?? "Modern texture conversion failed." });
+      }
+    }
+    warnings.push(
+      `Decoded ${modernTexturePackages.length} requested modern UE5 texture package${modernTexturePackages.length === 1 ? "" : "s"} without Unreal Engine.`,
+    );
   }
   if (modernMapPackages.length > 0) {
     modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
