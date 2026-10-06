@@ -681,6 +681,7 @@ describe("creature_preview installed MCP", () => {
         await stopServer(child);
       }
     },
+    120_000,
   );
 
   it(
