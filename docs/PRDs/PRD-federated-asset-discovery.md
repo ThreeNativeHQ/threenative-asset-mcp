@@ -1,11 +1,11 @@
 # PRD — Federated asset discovery and selective 3d-asset-server adoption
 
-**Status:** IN PROGRESS — implementation authorized on 2026-10-06; local acceptance and GitHub CI passed; live Kenney qualification passed; default-setting verification pending.
+**Status:** IN PROGRESS — implementation authorized on 2026-10-06; live Kenney qualification and final local default-setting checks passed; final GitHub CI qualification pending.
 **Priority:** P2 — reduce provider-selection friction and incomplete asset downloads without replacing working asset tools.
 **Date:** 2026-10-05 (America/Vancouver)
 **Implementation owner:** `jonit-dev/threenative-asset-mcp`.
 **Engine consumer:** `ThreeNativeHQ/threenative`; a later, separately verified package-version adoption, not an engine-MCP rewrite.
-**Progress:** 6 of 7 implementation boxes and the controlled-consumer acceptance box are verified. Live Kenney archive qualification passed; default-setting verification remains open. The owner authorized implementation and CI; merge/package release and engine adoption remain outside this run.
+**Progress:** 6 of 7 implementation boxes and the controlled-consumer acceptance box are verified. Live Kenney archive qualification and final local default-setting checks passed; the final supported-Node CI matrix remains open. The owner authorized implementation and CI; merge/package release and engine adoption remain outside this run.
 
 ## Decision
 
@@ -193,7 +193,7 @@ Verification boxes are updated only after the stated checks actually run. The im
 
 ### Phase 3 — Useful new coverage and packaged delivery
 
-- [ ] Add bounded Kenney 3D-pack discovery and guarded archive acquisition. proof: `npm test` with Kenney parser/transport fixtures; an explicitly invoked provider probe qualifies one official pack before enabling the provider by default. Result: parser/transport and packed archive fixtures passed; official listing/detail metadata qualified. Official Mini Dungeon archive acquisition passed through the npm-packed public MCP on 2026-10-06, independently reviewed. Default-setting verification remains pending.
+- [ ] Add bounded Kenney 3D-pack discovery and guarded archive acquisition. proof: `npm test` with Kenney parser/transport fixtures; an explicitly invoked provider probe qualifies one official pack before enabling the provider by default. Result: parser/transport and packed archive fixtures passed; official Mini Dungeon archive acquisition passed through the npm-packed public MCP on 2026-10-06, independently reviewed. Final default/disable/invalid-setting packed consumers and retained acquisition regressions passed (11 tests); final supported-Node CI qualification remains pending.
 - [x] Expose the additive tool contract from the built package without breaking existing MCP registration. proof: `npm run typecheck && npm run build && npm test`, including a new stdio consumer smoke test against the built entry point. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
 
 ## Acceptance criteria
@@ -232,7 +232,7 @@ Optional future authenticated integrations require the user's own credentials. D
 
 2026-10-06 — Kenney is explicitly opt-in (`ASSET_ENABLE_KENNEY=1`). One official listing and Nature Kit detail were inspected anonymously for parser, CC0, explicit free availability and official ZIP-link evidence. No live archive or legal acceptance was performed. Default/live archive qualification remains open.
 
-2026-10-06 — The later authorized Mini Dungeon acquisition and independent inspection passed the one-pack live prerequisite. Kenney registration now defaults to enabled, with `ASSET_ENABLE_KENNEY=0` as its named disable switch and strict `0`/`1` validation. The previous npm-packed binary reproduced the missing default as `ASSET_INVALID_ID` with the setting unset. Final default/disable/invalid-setting packed-consumer checks and compilation remain pending GitHub-hosted CI; no local build graph was run while HLOD owns the CPU slots.
+2026-10-06 — The later authorized Mini Dungeon acquisition and independent inspection passed the one-pack live prerequisite. Kenney registration now defaults to enabled, with `ASSET_ENABLE_KENNEY=0` as its named disable switch and strict `0`/`1` validation. The previous npm-packed binary reproduced the missing default as `ASSET_INVALID_ID` with the setting unset. The owner subsequently granted a bounded local CPU window: typecheck/build and all 11 focused final packed-consumer/acquisition-regression tests passed. The final full supported-Node CI matrix remains pending; no native/GPU or heavy monorepo graph was run.
 
 
 2026-10-05 — User requested evaluation and a PRD in an open PR for later work. This PR is documentation only; no implementation, publication, dependency bump or merge is included.
@@ -254,6 +254,8 @@ Optional future authenticated integrations require the user's own credentials. D
 - Official metadata only: `https://kenney.nl/assets?search=nature` and `https://kenney.nl/assets/nature-kit`, inspected anonymously on 2026-10-06. Saved-body parser qualification passed for listing/category, item CC0, explicit free availability and official ZIP link. Listing SHA-256: `d87b137c303744c9ac036b8d5b73da01d78b689c45c49303dede169a7b11bf2c`; detail SHA-256: `30d56abcd762e4bd65dba9ffb1884a3e9352e0f0102d029c41b62dbda00cab92`.
 
 GitHub Node 20.19.0 and 24 jobs passed for `6e7ad9e70890c6de3a57fe68ffa4bc60adadd425`: [CI run 1](https://github.com/jonit-dev/threenative-asset-mcp/actions/runs/37414016982). No additional explicit EULA, checkout or paid/authenticated workflow was entered. Published-package equivalence, engine adoption, runtime/native compatibility, production latency quantiles and peak metadata memory remain unverified. No verified cross-provider alias corpus exists; current deduplication uses canonical provider/native identity. Mid-hash cancellation was inspected through the standard stream signal mechanism, without a timing-dependent runtime control.
+
+Final default-setting source `7cd0d4f` was compiled and typechecked locally on Node 20.19.6. `vitest run tests/federated-consumer.test.ts tests/federation-review.test.ts --maxWorkers=1` passed all **11 tests** in 9.23 seconds. The four actual npm-packed consumers exercise unset/default acquisition, explicit disable with no Kenney requests, malformed initialization and the acquisition security boundaries; all seven retained independent-review regressions also passed. This focused proof does not replace observing the final full GitHub CI matrix.
 
 The initial 2026-10-05 PR was a documentation-only draft with product gates unrun. The owner subsequently authorized this implementation; that historical limitation is superseded by the executed results above.
 
