@@ -445,6 +445,9 @@ describe("built stdio package", () => {
         (tool) => tool.name,
       ),
     ).toEqual([
+      "asset_search",
+      "asset_get",
+      "asset_download",
       "creature_status",
       "creature_guide",
       "asset_inspect_rig",

@@ -49,6 +49,8 @@
     "start": "node dist/index.js",
     "probe:fab": "tsx scripts/probe-fab.ts",
     "test": "vitest run",
+    "test:ci": "vitest run --maxWorkers=1 --exclude tests/mcp-smoke.test.ts --reporter=default --reporter=junit --outputFile=artifacts/ci/tests.xml",
+    "test:smoke": "vitest run tests/mcp-smoke.test.ts --maxWorkers=1 --reporter=default --reporter=junit --outputFile=artifacts/ci/mcp-smoke.xml",
     "test:live": "tsx scripts/probe-fab.ts",
     "test:providers:live": "npm run build && tsx scripts/probe-providers.ts",
     "typecheck": "tsc --noEmit",

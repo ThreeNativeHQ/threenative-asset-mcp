@@ -1,3 +1,5 @@
+import { MetadataRequests, readMetadata, type MetadataContext } from "../discovery/metadata.js";
+
 const API_BASE = "https://api.sketchfab.com/v3";
 
 export interface SketchfabArchive {
@@ -57,6 +59,7 @@ export class SketchfabClientError extends Error {
       | "SKETCHFAB_UPSTREAM_CHANGED",
     message: string,
     readonly retryable = false,
+    readonly retryAfter?: string,
   ) {
     super(message);
     this.name = "SketchfabClientError";
@@ -72,15 +75,11 @@ function record(value: unknown): Record<string, unknown> | undefined {
 }
 
 function text(value: unknown, max = 12_000): string | undefined {
-  return typeof value === "string" && value.length > 0
-    ? value.slice(0, max)
-    : undefined;
+  return typeof value === "string" && value.length > 0 ? value.slice(0, max) : undefined;
 }
 
 function number(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value
-    : undefined;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function thumbnail(value: unknown): string | undefined {
@@ -109,14 +108,16 @@ function normalizeArchives(value: unknown): SketchfabArchive[] {
     const textureMaxResolution = number(item.textureMaxResolution);
     const faceCount = number(item.faceCount);
     const vertexCount = number(item.vertexCount);
-    return [{
-      format,
-      ...(sizeBytes !== undefined ? { sizeBytes } : {}),
-      ...(textureCount !== undefined ? { textureCount } : {}),
-      ...(textureMaxResolution !== undefined ? { textureMaxResolution } : {}),
-      ...(faceCount !== undefined ? { faceCount } : {}),
-      ...(vertexCount !== undefined ? { vertexCount } : {}),
-    }];
+    return [
+      {
+        format,
+        ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+        ...(textureCount !== undefined ? { textureCount } : {}),
+        ...(textureMaxResolution !== undefined ? { textureMaxResolution } : {}),
+        ...(faceCount !== undefined ? { faceCount } : {}),
+        ...(vertexCount !== undefined ? { vertexCount } : {}),
+      },
+    ];
   });
 }
 
@@ -153,10 +154,7 @@ function normalizeModel(value: unknown): SketchfabModel {
       : [],
     categories: Array.isArray(item?.categories)
       ? item.categories
-          .map((category) =>
-            text(record(category)?.name, 200) ??
-            text(record(category)?.slug, 200),
-          )
+          .map((category) => text(record(category)?.name, 200) ?? text(record(category)?.slug, 200))
           .filter((category): category is string => !!category)
           .slice(0, 50)
       : [],
@@ -190,9 +188,7 @@ function normalizeModel(value: unknown): SketchfabModel {
           },
         }
       : {}),
-    ...(typeof item?.isAgeRestricted === "boolean"
-      ? { ageRestricted: item.isAgeRestricted }
-      : {}),
+    ...(typeof item?.isAgeRestricted === "boolean" ? { ageRestricted: item.isAgeRestricted } : {}),
     ...(number(item?.faceCount) !== undefined
       ? { faceCount: number(item?.faceCount) as number }
       : {}),
@@ -211,100 +207,111 @@ function normalizeModel(value: unknown): SketchfabModel {
     ...(text(item?.publishedAt, 100)
       ? { publishedAt: text(item?.publishedAt, 100) as string }
       : {}),
-    ...(text(item?.updatedAt, 100)
-      ? { updatedAt: text(item?.updatedAt, 100) as string }
-      : {}),
+    ...(text(item?.updatedAt, 100) ? { updatedAt: text(item?.updatedAt, 100) as string } : {}),
   };
 }
 
 export class SketchfabClient {
+  private readonly requests = new MetadataRequests();
   private readonly token?: string;
 
   constructor(
     private readonly fetchImpl: FetchLike = fetch,
     options: { token?: string | null } = {},
   ) {
-    const token =
-      options.token === undefined
-        ? process.env.SKETCHFAB_API_TOKEN
-        : options.token;
+    const token = options.token === undefined ? process.env.SKETCHFAB_API_TOKEN : options.token;
     if (token?.trim()) this.token = token.trim();
   }
 
-  private async request(path: string, authenticated = false): Promise<unknown> {
+  private async request(
+    path: string,
+    authenticated = false,
+    context: MetadataContext = {},
+  ): Promise<unknown> {
     if (authenticated && !this.token) {
       throw new SketchfabClientError(
         "SKETCHFAB_AUTH_REQUIRED",
         "Set SKETCHFAB_API_TOKEN to retrieve Sketchfab download URLs.",
       );
     }
-    let response: Response;
-    try {
-      response = await this.fetchImpl(`${API_BASE}${path}`, {
-        headers: {
-          accept: "application/json",
-          "user-agent": "threenative-asset-mcp/0.4.0",
-          ...(this.token ? { authorization: `Token ${this.token}` } : {}),
-        },
-        signal: AbortSignal.timeout(20_000),
-      });
-    } catch {
-      throw new SketchfabClientError(
-        "SKETCHFAB_UPSTREAM_UNAVAILABLE",
-        "Sketchfab could not be reached.",
-        true,
-      );
-    }
-    if (response.status === 401) {
-      throw new SketchfabClientError(
-        "SKETCHFAB_AUTH_REQUIRED",
-        "Sketchfab authentication is required or the configured token is invalid.",
-      );
-    }
-    if (response.status === 403) {
-      throw new SketchfabClientError(
-        "SKETCHFAB_ACCESS_DENIED",
-        "Sketchfab denied access to this model.",
-      );
-    }
-    if (response.status === 404) {
-      throw new SketchfabClientError(
-        "SKETCHFAB_NOT_FOUND",
-        "The Sketchfab model was not found.",
-      );
-    }
-    if (response.status === 429) {
-      throw new SketchfabClientError(
-        "SKETCHFAB_RATE_LIMITED",
-        "Sketchfab rate-limited the request.",
-        true,
-      );
-    }
-    if (!response.ok) {
-      throw new SketchfabClientError(
-        "SKETCHFAB_UPSTREAM_UNAVAILABLE",
-        `Sketchfab returned HTTP ${response.status}.`,
-        response.status >= 500,
-      );
-    }
-    try {
-      return (await response.json()) as unknown;
-    } catch {
-      throw new SketchfabClientError(
-        "SKETCHFAB_UPSTREAM_CHANGED",
-        "Sketchfab returned invalid JSON.",
-      );
-    }
+    return this.requests.run(path, context.signal, async (callerSignal) => {
+      const signal = AbortSignal.any([callerSignal, AbortSignal.timeout(20_000)]);
+      let response: Response;
+      try {
+        response = await this.fetchImpl(`${API_BASE}${path}`, {
+          headers: {
+            accept: "application/json",
+            "user-agent": "threenative-asset-mcp/0.4.0",
+            ...(this.token ? { authorization: `Token ${this.token}` } : {}),
+          },
+          signal,
+          redirect: "error",
+        });
+      } catch {
+        throw new SketchfabClientError(
+          "SKETCHFAB_UPSTREAM_UNAVAILABLE",
+          "Sketchfab could not be reached.",
+          true,
+        );
+      }
+      if (!response.ok) await response.body?.cancel();
+      if (response.status === 401) {
+        throw new SketchfabClientError(
+          "SKETCHFAB_AUTH_REQUIRED",
+          "Sketchfab authentication is required or the configured token is invalid.",
+        );
+      }
+      if (response.status === 403) {
+        throw new SketchfabClientError(
+          "SKETCHFAB_ACCESS_DENIED",
+          "Sketchfab denied access to this model.",
+        );
+      }
+      if (response.status === 404) {
+        throw new SketchfabClientError("SKETCHFAB_NOT_FOUND", "The Sketchfab model was not found.");
+      }
+      if (response.status === 429) {
+        throw new SketchfabClientError(
+          "SKETCHFAB_RATE_LIMITED",
+          "Sketchfab rate-limited the request.",
+          true,
+          response.headers.get("retry-after")?.slice(0, 100),
+        );
+      }
+      if (!response.ok) {
+        throw new SketchfabClientError(
+          "SKETCHFAB_UPSTREAM_UNAVAILABLE",
+          `Sketchfab returned HTTP ${response.status}.`,
+          response.status >= 500,
+        );
+      }
+      try {
+        return JSON.parse(await readMetadata(response, 16 * 1024 * 1024, signal)) as unknown;
+      } catch {
+        throw new SketchfabClientError(
+          "SKETCHFAB_UPSTREAM_CHANGED",
+          "Sketchfab returned invalid JSON.",
+        );
+      }
+    });
   }
 
-  async search(params: URLSearchParams): Promise<SketchfabSearchResult> {
-    const payload = record(await this.request(`/search?${params}`));
+  async search(
+    params: URLSearchParams,
+    context: MetadataContext = {},
+  ): Promise<SketchfabSearchResult> {
+    const payload = record(await this.request(`/search?${params}`, false, context));
     if (!Array.isArray(payload?.results)) {
       throw new SketchfabClientError(
         "SKETCHFAB_UPSTREAM_CHANGED",
         "Sketchfab returned an invalid search response.",
       );
     }
+    if (payload.results.length > 1000)
+      throw new SketchfabClientError(
+        "SKETCHFAB_UPSTREAM_CHANGED",
+        "Sketchfab search exceeds its entry limit.",
+      );
     const cursors = record(payload.cursors);
     const nextCursor = text(cursors?.next, 500);
     return {
@@ -313,18 +320,13 @@ export class SketchfabClient {
     };
   }
 
-  async getModel(id: string): Promise<SketchfabModel> {
-    return normalizeModel(
-      await this.request(`/models/${encodeURIComponent(id)}`),
-    );
+  async getModel(id: string, context: MetadataContext = {}): Promise<SketchfabModel> {
+    return normalizeModel(await this.request(`/models/${encodeURIComponent(id)}`, false, context));
   }
 
-  async getDownloads(id: string): Promise<SketchfabArchive[]> {
+  async getDownloads(id: string, context: MetadataContext = {}): Promise<SketchfabArchive[]> {
     const payload = record(
-      await this.request(
-        `/models/${encodeURIComponent(id)}/download`,
-        true,
-      ),
+      await this.request(`/models/${encodeURIComponent(id)}/download`, true, context),
     );
     if (!payload) {
       throw new SketchfabClientError(
@@ -338,17 +340,21 @@ export class SketchfabClient {
       if (!url) return [];
       const expiresInSeconds = number(item?.expires);
       const sizeBytes = number(item?.size);
-      return [{
-        format,
-        url,
-        ...(expiresInSeconds !== undefined ? { expiresInSeconds } : {}),
-        ...(sizeBytes !== undefined ? { sizeBytes } : {}),
-      }];
+      return [
+        {
+          format,
+          url,
+          ...(expiresInSeconds !== undefined ? { expiresInSeconds } : {}),
+          ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+        },
+      ];
     });
   }
 
-  async listCategories(): Promise<Array<{ name: string; slug: string }>> {
-    const payload = record(await this.request("/categories"));
+  async listCategories(
+    context: MetadataContext = {},
+  ): Promise<Array<{ name: string; slug: string }>> {
+    const payload = record(await this.request("/categories", false, context));
     if (!Array.isArray(payload?.results)) {
       throw new SketchfabClientError(
         "SKETCHFAB_UPSTREAM_CHANGED",

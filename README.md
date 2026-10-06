@@ -316,6 +316,36 @@ Unified source and download routing:
   revalidated, existing files are never overwritten, and the result includes
   SHA-256.
 
+The additive `asset_search` tool searches individual `3d-model`, `texture`,
+`hdri` and `animation` candidates across supported clients. It reports each
+provider, bounded results and local continuation actions. Unknown prices fail
+`freeOnly`; unknown rights fail explicit commercial-use/attribution filters.
+Fab remains a specialized action and generic Sketchfab uses anonymous metadata,
+without authenticated acquisition. Existing tools retain their public names.
+
+Use `asset_get` with the returned stable `assetId` to inspect current terms and
+available variants. It prefers GLB, then glTF with its supplied dependencies;
+explicit unavailable formats return alternatives. The read-only call returns an
+expiring `planToken`, required relative files and acknowledgement information.
+A plan is not consent. Call `asset_download` with that token and explicit
+`acceptLicense: true` only after reviewing the terms. Optional `maxBytes` can
+only tighten the configured cap. Changed terms/files invalidate the plan.
+
+Acquisition stages originals under `ASSET_DOWNLOAD_DIR/acquisitions`, verifies
+checksums and all glTF buffer/texture references, then atomically publishes a
+complete directory with `asset.acquisition.json`. Replays verify cached bytes
+and provenance; a corrupt cache fails rather than being silently accepted.
+Receipts preserve asset attribution separately from Poly Haven API credit.
+No transfer/signed URLs or credentials enter the new public plan or receipt.
+Archives stay archives with `requiresExtraction: true`; runtime readiness is
+`unverified`. Acquiring originals does not change or adopt assets into a project.
+
+Kenney 3D packs are available with explicit `ASSET_ENABLE_KENNEY=1`. This uses
+one official listing page and at most three item detail checks per query,
+paces requests, verifies item CC0/free/official-ZIP evidence and never crawls
+or extracts archives. Broader catalog coverage and live archive acquisition
+remain unqualified; ordinary tests use hand-authored local fixtures.
+
 Recommended agent flow:
 
 1. Call `asset_search_sources` with the requested category/query. Its default
@@ -491,8 +521,13 @@ glTF's standard punctual-light extension has no area-light type.
 | `AUDIO_CLAP_CHECKPOINT`         | unset                                              | Path to the `630k-audioset-best.pt` checkpoint.          |
 | `AUDIO_CLAP_CHECKPOINT_SHA256`  | unset                                              | Optional pin; a mismatched checkpoint is refused.        |
 | `ASSET_DOWNLOAD_DIR`            | `~/Downloads/threenative-asset-mcp/assets`         | Dedicated directory for direct provider downloads.       |
-| `ASSET_MAX_DOWNLOAD_BYTES`      | `10737418240`                                      | Maximum accepted bytes per provider file (10 GiB).       |
+| `ASSET_MAX_DOWNLOAD_BYTES`      | `10737418240`                                      | Maximum bytes per direct file or complete generic acquisition (10 GiB).       |
 | `ASSET_DOWNLOAD_TIMEOUT_MS`     | `1800000`                                          | Total timeout for one provider download (30 minutes).    |
+| `ASSET_ENABLE_KENNEY`           | unset                                              | Set `1` to opt into bounded official Kenney 3D-pack metadata. |
+| `ASSET_SEARCH_CONCURRENCY`      | `4`                                                | Concurrent provider operations per search; range 1–4. |
+| `ASSET_PROVIDER_TIMEOUT_MS`     | `8000`                                             | Provider deadline; range 1–30000 milliseconds. |
+| `ASSET_SEARCH_TIMEOUT_MS`       | `10000`                                            | Aggregate search/metadata deadline including queue time; range 1–60000. |
+| `ASSET_PLAN_TTL_MS`             | `300000`                                           | Acquisition-plan TTL; range 1–900000; at most 100 bounded plans. |
 | `THREENATIVE_TOOLCHAIN_AUTOINSTALL` | `1`                                            | Set to `0` to disable first-use external-tool installs.  |
 | `THREENATIVE_TOOLCHAIN_DIR`     | OS cache under `threenative-asset-mcp/toolchain`   | UE Viewer, FabCLI, and uncooked-converter cache.          |
 | `THREENATIVE_UMODEL_PATH`       | auto-detected/provisioned                           | Absolute path to a UE Viewer executable override.        |
@@ -638,6 +673,26 @@ The MCP host shows no tools
 `npm run inspect`. Logs belong on stderr; any non-JSON stdout is a bug.
 
 ## Verification
+
+GitHub-hosted CI checks pull requests, pushes to main and manual runs on the
+minimum supported Node 20.19 and Node 24. It installs the committed npm lockfile,
+runs typecheck/build, deterministic fixtures and actual built/npm-packed stdio
+consumers. Reports distinguish intentionally conditional proprietary Unreal
+fixtures. No provider live probes, credentials, package publishing or account
+changes run in that workflow. Local CI-equivalent commands are:
+
+```bash
+npm ci
+npm run build
+npm run typecheck
+npm run test:ci
+npm run test:smoke
+```
+
+The suite needs Chromium (`npx playwright install --with-deps chromium`),
+ffmpeg and Python with NumPy/Pillow for local render/audio fixtures. Live probes
+remain separate from deterministic acceptance tests.
+
 
 ```bash
 npm ci

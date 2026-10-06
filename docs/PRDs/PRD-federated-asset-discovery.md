@@ -1,11 +1,11 @@
 # PRD — Federated asset discovery and selective 3d-asset-server adoption
 
-**Status:** NOT STARTED — proposed design; documentation-only draft for later review.
+**Status:** IN PROGRESS — implementation authorized on 2026-10-06; local acceptance passed; GitHub CI qualification pending.
 **Priority:** P2 — reduce provider-selection friction and incomplete asset downloads without replacing working asset tools.
 **Date:** 2026-10-05 (America/Vancouver)
 **Implementation owner:** `jonit-dev/threenative-asset-mcp`.
 **Engine consumer:** `ThreeNativeHQ/threenative`; a later, separately verified package-version adoption, not an engine-MCP rewrite.
-**Progress:** 0/7 implementation boxes; 0/1 acceptance box. No implementation or release is authorized by this document alone.
+**Progress:** 6 of 7 implementation boxes and the controlled-consumer acceptance box are verified. Kenney live archive/default-enable qualification remains open. The owner authorized implementation and CI; merge/package release and engine adoption remain outside this run.
 
 ## Decision
 
@@ -178,27 +178,27 @@ Prefer our existing orchestration, schemas and SDK. Port the small provider pars
 
 ## Implementation order
 
-All boxes are unimplemented. Test names below describe planned suites; the commands are existing package commands, not claims that those suites already exist.
+Verification boxes are updated only after the stated checks actually run. The implementation adds CI with lockfile install, Node 20.19/24, typecheck/build, deterministic tests and built/packed stdio consumers. CI never probes provider credentials, publishes packages or changes account permissions.
 
 ### Phase 1 — Federated discovery without breaking existing tools
 
-- [ ] Expose item-level federation through adapters over the existing provider registry and clients. proof: `npm test` with new adapter and legacy-tool contract fixtures.
-- [ ] Bound federated search and report partial failures without losing successful provider results. proof: `npm test` with deterministic ranking, duplicate, timeout, cancellation and rate-limit fixtures.
-- [ ] Return truthful per-item capabilities and dependency-aware plans from `asset_get`. proof: `npm test` with unknown-license, free-tier, authentication, format and companion-file fixtures.
+- [x] Expose item-level federation through adapters over the existing provider registry and clients. proof: `npm test` with new adapter and legacy-tool contract fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
+- [x] Bound federated search and report partial failures without losing successful provider results. proof: `npm test` with deterministic ranking, duplicate, timeout, cancellation and rate-limit fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
+- [x] Return truthful per-item capabilities and dependency-aware plans from `asset_get`. proof: `npm test` with unknown-license, free-tier, authentication, format and companion-file fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
 
 ### Phase 2 — Complete guarded acquisition
 
-- [ ] Publish dependency-complete acquisitions atomically through the existing guarded download paths. proof: `npm test` with multi-file success, interruption, redirect, path, byte-budget and cache-integrity fixtures.
-- [ ] Emit a non-secret acquisition receipt that preserves the selected asset's provenance. proof: `npm test` with receipt-schema, attribution, changed-terms and redaction fixtures.
+- [x] Publish dependency-complete acquisitions atomically through the existing guarded download paths. proof: `npm test` with multi-file success, interruption, redirect, path, byte-budget and cache-integrity fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
+- [x] Emit a non-secret acquisition receipt that preserves the selected asset's provenance. proof: `npm test` with receipt-schema, attribution, changed-terms and redaction fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
 
 ### Phase 3 — Useful new coverage and packaged delivery
 
-- [ ] Add bounded Kenney 3D-pack discovery and guarded archive acquisition. proof: `npm test` with Kenney parser/transport fixtures; an explicitly invoked provider probe qualifies one official pack before enabling the provider by default.
-- [ ] Expose the additive tool contract from the built package without breaking existing MCP registration. proof: `npm run typecheck && npm run build && npm test`, including a new stdio consumer smoke test against the built entry point.
+- [ ] Add bounded Kenney 3D-pack discovery and guarded archive acquisition. proof: `npm test` with Kenney parser/transport fixtures; an explicitly invoked provider probe qualifies one official pack before enabling the provider by default. Result: parser/transport and packed archive fixtures passed; official listing/detail metadata qualified. Live archive acquisition/default enablement remain unverified; provider stays opt-in.
+- [x] Expose the additive tool contract from the built package without breaking existing MCP registration. proof: `npm run typecheck && npm run build && npm test`, including a new stdio consumer smoke test against the built entry point. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
 
 ## Acceptance criteria
 
-- [ ] A credential-free consumer completes the two acquisition scenarios below through public MCP tools. proof: `npm test` with a new end-to-end acquisition fixture using a local controlled HTTP transport and the built MCP entry point.
+- [x] A credential-free consumer completes the two acquisition scenarios below through public MCP tools. proof: `npm test` with a new end-to-end acquisition fixture using a local controlled HTTP transport and the built MCP entry point. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
 
 Scenario A: search for a model, select a glTF variant with external buffer and texture dependencies, acquire the complete set, and load it from disk with the existing glTF tooling while external network access is disabled. The receipt identifies every delivered file; a missing companion fails by name.
 
@@ -226,15 +226,34 @@ Optional future authenticated integrations require the user's own credentials. D
 
 ## Decisions
 
+2026-10-06 — Owner requested implementation of PR 22, explicit subagent work, self-verification and useful CI. Preserve the single draft PR and all specialized tools; no merge or package release without coordination.
+
+2026-10-06 — CI uses standard GitHub-hosted Ubuntu runners, read-only repository permissions, a minimal supported Node matrix, deterministic provider transports and explicit packed stdio checks. No upstream code was copied; clients and the existing guarded downloader are reused.
+
+2026-10-06 — Kenney is explicitly opt-in (`ASSET_ENABLE_KENNEY=1`). One official listing and Nature Kit detail were inspected anonymously for parser, CC0, explicit free availability and official ZIP-link evidence. No live archive or legal acceptance was performed. Default/live archive qualification remains open.
+
+
 2026-10-05 — User requested evaluation and a PRD in an open PR for later work. This PR is documentation only; no implementation, publication, dependency bump or merge is included.
 
 2026-10-05 — Proposed engineering recommendation: keep the existing asset MCP and selectively absorb discovery/file-planning/provider ideas. The owner has not yet approved the design or implementation schedule.
 
 2026-10-05 — Scope choice: existing providers plus Kenney 3D packs first; leave additional catalogs, generic archive extraction and a hosted service outside this PRD. Keep engine capability lookup and asset cooking separate.
 
-## Verification of this draft
+## Verification of the implementation
 
-Repository source and package metadata were inspected through GitHub. No provider integration was executed, no benchmark was run, no downloaded asset was validated and no product tests passed as part of this drafting task. Local checkout acquisition failed because the execution environment could not resolve GitHub; full repository gates are therefore unrun. Document-structure and read-back verification results belong in the PR body, separate from the unchecked implementation work above.
+2026-10-06, Node 20.19.6, CPU10/maxWorkers1:
+
+- Original `main@80a7ddb`: typecheck/build passed; full baseline passed 430 tests, with 2 conditional Unreal fixture skips.
+- Final `npm run typecheck` and `npm run build`: passed.
+- Final `npm run test:ci`: 452 passed, 2 conditional Unreal fixture skips, 155.50 seconds.
+- Final `npm run test:smoke`: all 15 built/installed stdio checks passed, 20.37 seconds. The exact tool list retains all 43 previous tools and adds only the three new names.
+- The packed federated consumer discovers two providers, loads the complete glTF with networking disabled, preserves the exact Kenney archive, validates receipts, and rejects consent/URL/path/redirect/checksum/dependency/budget/change/cache failures.
+- Fresh independent review reproduced plan expiry during metadata refresh, missing GLB BIN resources, incorrect 6k/16k matching and version-upgrade cache rejection. Repairs passed their retained regression tests; an independent built-output control script passed all 7 controls after the first three repairs.
+- Official metadata only: `https://kenney.nl/assets?search=nature` and `https://kenney.nl/assets/nature-kit`, inspected anonymously on 2026-10-06. Saved-body parser qualification passed for listing/category, item CC0, explicit free availability and official ZIP link. Listing SHA-256: `d87b137c303744c9ac036b8d5b73da01d78b689c45c49303dede169a7b11bf2c`; detail SHA-256: `30d56abcd762e4bd65dba9ffb1884a3e9352e0f0102d029c41b62dbda00cab92`.
+
+GitHub's minimum Node 20.19.0 and current LTS Node 24 jobs still require observation after pushing. No live archive was downloaded or legally binding provider acceptance performed. Published-package equivalence, engine adoption, runtime/native compatibility, production latency quantiles and peak metadata memory remain unverified. No verified cross-provider alias corpus exists; current deduplication uses canonical provider/native identity. Mid-hash cancellation was inspected through the standard stream signal mechanism, without a timing-dependent runtime control.
+
+The initial 2026-10-05 PR was a documentation-only draft with product gates unrun. The owner subsequently authorized this implementation; that historical limitation is superseded by the executed results above.
 
 ## Source references
 
