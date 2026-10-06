@@ -1,11 +1,11 @@
 # PRD — Federated asset discovery and selective 3d-asset-server adoption
 
-**Status:** IN PROGRESS — implementation authorized on 2026-10-06; live Kenney qualification and final local default-setting checks passed; final GitHub CI qualification pending.
+**Status:** DONE — implementation and acceptance qualified on 2026-10-06; the pull request remains draft and unmerged, with no package release or engine adoption.
 **Priority:** P2 — reduce provider-selection friction and incomplete asset downloads without replacing working asset tools.
 **Date:** 2026-10-05 (America/Vancouver)
 **Implementation owner:** `jonit-dev/threenative-asset-mcp`.
 **Engine consumer:** `ThreeNativeHQ/threenative`; a later, separately verified package-version adoption, not an engine-MCP rewrite.
-**Progress:** 6 of 7 implementation boxes and the controlled-consumer acceptance box are verified. Live Kenney archive qualification and final local default-setting checks passed; the final supported-Node CI matrix remains open. The owner authorized implementation and CI; merge/package release and engine adoption remain outside this run.
+**Progress:** All 7 implementation boxes and the controlled-consumer acceptance box are verified. Live Kenney archive qualification, default/disable/invalid-setting packed consumers, independent review and final full Node 20.19.0/24 CI passed. Merge/package release and engine adoption remain outside this run.
 
 ## Decision
 
@@ -182,23 +182,23 @@ Verification boxes are updated only after the stated checks actually run. The im
 
 ### Phase 1 — Federated discovery without breaking existing tools
 
-- [x] Expose item-level federation through adapters over the existing provider registry and clients. proof: `npm test` with new adapter and legacy-tool contract fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
-- [x] Bound federated search and report partial failures without losing successful provider results. proof: `npm test` with deterministic ranking, duplicate, timeout, cancellation and rate-limit fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
-- [x] Return truthful per-item capabilities and dependency-aware plans from `asset_get`. proof: `npm test` with unknown-license, free-tier, authentication, format and companion-file fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
+- [x] Expose item-level federation through adapters over the existing provider registry and clients. proof: `npm test` with new adapter and legacy-tool contract fixtures. Result: passed on 2026-10-06; final supported-Node CI passed typecheck/build and 469 tests per Node version (2 conditional Unreal skips), including all four npm-packed stdio consumers and acquisition negative controls.
+- [x] Bound federated search and report partial failures without losing successful provider results. proof: `npm test` with deterministic ranking, duplicate, timeout, cancellation and rate-limit fixtures. Result: passed on 2026-10-06; final supported-Node CI passed typecheck/build and 469 tests per Node version (2 conditional Unreal skips), including all four npm-packed stdio consumers and acquisition negative controls.
+- [x] Return truthful per-item capabilities and dependency-aware plans from `asset_get`. proof: `npm test` with unknown-license, free-tier, authentication, format and companion-file fixtures. Result: passed on 2026-10-06; final supported-Node CI passed typecheck/build and 469 tests per Node version (2 conditional Unreal skips), including all four npm-packed stdio consumers and acquisition negative controls.
 
 ### Phase 2 — Complete guarded acquisition
 
-- [x] Publish dependency-complete acquisitions atomically through the existing guarded download paths. proof: `npm test` with multi-file success, interruption, redirect, path, byte-budget and cache-integrity fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
-- [x] Emit a non-secret acquisition receipt that preserves the selected asset's provenance. proof: `npm test` with receipt-schema, attribution, changed-terms and redaction fixtures. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
+- [x] Publish dependency-complete acquisitions atomically through the existing guarded download paths. proof: `npm test` with multi-file success, interruption, redirect, path, byte-budget and cache-integrity fixtures. Result: passed on 2026-10-06; final supported-Node CI passed typecheck/build and 469 tests per Node version (2 conditional Unreal skips), including all four npm-packed stdio consumers and acquisition negative controls.
+- [x] Emit a non-secret acquisition receipt that preserves the selected asset's provenance. proof: `npm test` with receipt-schema, attribution, changed-terms and redaction fixtures. Result: passed on 2026-10-06; final supported-Node CI passed typecheck/build and 469 tests per Node version (2 conditional Unreal skips), including all four npm-packed stdio consumers and acquisition negative controls.
 
 ### Phase 3 — Useful new coverage and packaged delivery
 
-- [ ] Add bounded Kenney 3D-pack discovery and guarded archive acquisition. proof: `npm test` with Kenney parser/transport fixtures; an explicitly invoked provider probe qualifies one official pack before enabling the provider by default. Result: parser/transport and packed archive fixtures passed; official Mini Dungeon archive acquisition passed through the npm-packed public MCP on 2026-10-06, independently reviewed. Final default/disable/invalid-setting packed consumers and retained acquisition regressions passed (11 tests); final supported-Node CI qualification remains pending.
-- [x] Expose the additive tool contract from the built package without breaking existing MCP registration. proof: `npm run typecheck && npm run build && npm test`, including a new stdio consumer smoke test against the built entry point. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
+- [x] Add bounded Kenney 3D-pack discovery and guarded archive acquisition. proof: `npm test` with Kenney parser/transport fixtures; an explicitly invoked provider probe qualifies one official pack before enabling the provider by default. Result: parser/transport and packed archive fixtures passed; official Mini Dungeon archive acquisition passed through the npm-packed public MCP on 2026-10-06, independently reviewed. Final default/disable/invalid-setting packed consumers and retained acquisition regressions passed locally (11 tests); fresh independent verification passed 7 built-output controls and all 4 packed consumers. Final Node 20.19.0/24 full CI passed 469 tests per version, with 2 conditional Unreal skips: [run 3](https://github.com/jonit-dev/threenative-asset-mcp/actions/runs/37416880135).
+- [x] Expose the additive tool contract from the built package without breaking existing MCP registration. proof: `npm run typecheck && npm run build && npm test`, including a new stdio consumer smoke test against the built entry point. Result: passed on 2026-10-06; final supported-Node CI passed typecheck/build and 469 tests per Node version (2 conditional Unreal skips), including all four npm-packed stdio consumers and acquisition negative controls.
 
 ## Acceptance criteria
 
-- [x] A credential-free consumer completes the two acquisition scenarios below through public MCP tools. proof: `npm test` with a new end-to-end acquisition fixture using a local controlled HTTP transport and the built MCP entry point. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
+- [x] A credential-free consumer completes the two acquisition scenarios below through public MCP tools. proof: `npm test` with a new end-to-end acquisition fixture using a local controlled HTTP transport and the built MCP entry point. Result: passed on 2026-10-06; final supported-Node CI passed typecheck/build and 469 tests per Node version (2 conditional Unreal skips), including all four npm-packed stdio consumers and acquisition negative controls.
 
 Scenario A: search for a model, select a glTF variant with external buffer and texture dependencies, acquire the complete set, and load it from disk with the existing glTF tooling while external network access is disabled. The receipt identifies every delivered file; a missing companion fails by name.
 
@@ -216,7 +216,7 @@ ThreeNative adoption happens after a real package release: inspect the published
 
 Rollback disables the new federation/Kenney registrations or restores the previous package pin without removing acquired originals or changing existing provider tools. No persistent server infrastructure or data migration is required.
 
-## Blocked on
+## Release and provider access conditions
 
 Publishing and engine adoption require the maintainer's release authorization and registry credentials; neither is requested or used by this draft. They do not block implementing deterministic tests locally.
 
@@ -230,12 +230,12 @@ Optional future authenticated integrations require the user's own credentials. D
 
 2026-10-06 — CI uses standard GitHub-hosted Ubuntu runners, read-only repository permissions, a minimal supported Node matrix, deterministic provider transports and explicit packed stdio checks. No upstream code was copied; clients and the existing guarded downloader are reused.
 
-2026-10-06 — Kenney is explicitly opt-in (`ASSET_ENABLE_KENNEY=1`). One official listing and Nature Kit detail were inspected anonymously for parser, CC0, explicit free availability and official ZIP-link evidence. No live archive or legal acceptance was performed. Default/live archive qualification remains open.
+2026-10-06 — Initially, Kenney stayed opt-in (`ASSET_ENABLE_KENNEY=1`). One official listing and Nature Kit detail were inspected anonymously for parser, CC0, explicit free availability and official ZIP-link evidence. At that stage no live archive or legal acceptance was performed; the later qualification below supersedes the initial open default/live prerequisite.
 
-2026-10-06 — The later authorized Mini Dungeon acquisition and independent inspection passed the one-pack live prerequisite. Kenney registration now defaults to enabled, with `ASSET_ENABLE_KENNEY=0` as its named disable switch and strict `0`/`1` validation. The previous npm-packed binary reproduced the missing default as `ASSET_INVALID_ID` with the setting unset. The owner subsequently granted a bounded local CPU window: typecheck/build and all 11 focused final packed-consumer/acquisition-regression tests passed. The final full supported-Node CI matrix remains pending; no native/GPU or heavy monorepo graph was run.
+2026-10-06 — The later authorized Mini Dungeon acquisition and independent inspection passed the one-pack live prerequisite. Kenney registration now defaults to enabled, with `ASSET_ENABLE_KENNEY=0` as its named disable switch and strict `0`/`1` validation. The previous npm-packed binary reproduced the missing default as `ASSET_INVALID_ID` with the setting unset. The owner subsequently granted a bounded local CPU window: typecheck/build and all 11 focused final packed-consumer/acquisition-regression tests passed. The final full supported-Node CI matrix subsequently passed; no native/GPU or heavy monorepo graph was run.
 
 
-2026-10-05 — User requested evaluation and a PRD in an open PR for later work. This PR is documentation only; no implementation, publication, dependency bump or merge is included.
+2026-10-05 — The original request covered evaluation and a documentation-only draft PRD for later work, with no implementation, publication, dependency bump or merge. The later authorized implementation supersedes that original scope.
 
 2026-10-05 — Proposed engineering recommendation: keep the existing asset MCP and selectively absorb discovery/file-planning/provider ideas. The owner has not yet approved the design or implementation schedule.
 
@@ -255,11 +255,17 @@ Optional future authenticated integrations require the user's own credentials. D
 
 GitHub Node 20.19.0 and 24 jobs passed for `6e7ad9e70890c6de3a57fe68ffa4bc60adadd425`: [CI run 1](https://github.com/jonit-dev/threenative-asset-mcp/actions/runs/37414016982). No additional explicit EULA, checkout or paid/authenticated workflow was entered. Published-package equivalence, engine adoption, runtime/native compatibility, production latency quantiles and peak metadata memory remain unverified. No verified cross-provider alias corpus exists; current deduplication uses canonical provider/native identity. Mid-hash cancellation was inspected through the standard stream signal mechanism, without a timing-dependent runtime control.
 
-Final default-setting source `7cd0d4f` was compiled and typechecked locally on Node 20.19.6. `vitest run tests/federated-consumer.test.ts tests/federation-review.test.ts --maxWorkers=1` passed all **11 tests** in 9.23 seconds. The four actual npm-packed consumers exercise unset/default acquisition, explicit disable with no Kenney requests, malformed initialization and the acquisition security boundaries; all seven retained independent-review regressions also passed. This focused proof does not replace observing the final full GitHub CI matrix.
+Final default-setting source `7cd0d4f` was compiled and typechecked locally on Node 20.19.6. `vitest run tests/federated-consumer.test.ts tests/federation-review.test.ts --maxWorkers=1` passed all **11 tests** in 9.23 seconds. The four actual npm-packed consumers exercise unset/default acquisition, explicit disable with no Kenney requests, malformed initialization and the acquisition security boundaries; all seven retained independent-review regressions also passed. The final full GitHub CI result below completes the supported-Node qualification.
 
-[CI run 2](https://github.com/jonit-dev/threenative-asset-mcp/actions/runs/37416313483) at `9d68bc9`: Node 24 passed typecheck/build, **454 deterministic tests plus 15 smoke tests**, with 2 conditional Unreal skips. Node 20.19.0 passed installation/typecheck/build/new acquisition tests and all 15 smoke tests, but the existing installed creature-preview backend comparison timed out at its omitted 5-second default test deadline. Its neighboring compile/render cases already use 120 seconds; sibling runs took 5–6.7 seconds. The narrow repair adds only that case's 120-second deadline, preserving its `PREVIEW_COMPARISON` assertion and 90-second MCP-response bound. The focused local installed-MCP case passed in **5.317 seconds** (1 selected test, 9 unselected; 11.51 seconds total), independently reviewed without skips, retries, global timeout changes or product changes. The next full supported-Node matrix remains pending.
+[CI run 2](https://github.com/jonit-dev/threenative-asset-mcp/actions/runs/37416313483) at `9d68bc9`: Node 24 passed typecheck/build, **454 deterministic tests plus 15 smoke tests**, with 2 conditional Unreal skips. Node 20.19.0 passed installation/typecheck/build/new acquisition tests and all 15 smoke tests, but the existing installed creature-preview backend comparison timed out at its omitted 5-second default test deadline. Its neighboring compile/render cases already use 120 seconds; sibling runs took 5–6.7 seconds. The narrow repair adds only that case's 120-second deadline, preserving its `PREVIEW_COMPARISON` assertion and 90-second MCP-response bound. The focused local installed-MCP case passed in **5.317 seconds** (1 selected test, 9 unselected; 11.51 seconds total), independently reviewed without skips, retries, global timeout changes or product changes. The subsequent full supported-Node matrix passed, as recorded below.
 
 The initial 2026-10-05 PR was a documentation-only draft with product gates unrun. The owner subsequently authorized this implementation; that historical limitation is superseded by the executed results above.
+
+### Final supported-Node qualification — 2026-10-06
+
+[CI run 3](https://github.com/jonit-dev/threenative-asset-mcp/actions/runs/37416880135) completed **successfully** for exact candidate `342a4ab60b24758a20b3509e67963726df843182`. Both Node **20.19.0** and **24.x** passed frozen lockfile/prerequisite installation, typecheck, distributable build, **454 deterministic tests** and **15 built/installed stdio smoke tests**, with **2 conditional Unreal fixture skips** per version. All four npm-packed federated consumers and seven retained review regressions passed in both jobs. The repaired installed-preview comparison passed in 5.031 seconds on Node 20 and 5.094 seconds on Node 24, both above its former 5-second test deadline.
+
+A fresh independent final-source review also passed **7 built-output negative controls** and **4 actual npm-packed consumers**; no actionable blocker remained. Product source is `7cd0d4f`; the later changes are recorded verification and the one-line legacy test deadline. This completes the bounded implementation and acquisition acceptance scope. Registry publication, merge, engine pin adoption, broader catalog qualification and runtime/native compatibility remain outside this verified result.
 
 ### Live Kenney qualification — 2026-10-06
 
