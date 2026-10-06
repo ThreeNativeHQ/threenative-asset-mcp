@@ -4,6 +4,7 @@ node_modules/
 # Build and test output
 dist/
 coverage/
+artifacts/ci/
 *.tsbuildinfo
 outputs/*.tgz
 

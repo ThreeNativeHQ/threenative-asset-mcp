@@ -62,37 +62,34 @@ export interface DirectAssetDownloaderOptions {
 
 const PROVIDER_HOSTS: Record<DirectAssetProvider, ReadonlySet<string>> = {
   polyhaven: new Set(["dl.polyhaven.org"]),
-  ambientcg: new Set([
-    "ambientcg.com",
-    "acg-download.struffelproductions.com",
-  ]),
+  ambientcg: new Set(["ambientcg.com", "acg-download.struffelproductions.com"]),
   smithsonian: new Set(["3d-api.si.edu"]),
   "game-icons": new Set(["game-icons.net"]),
   kenney: new Set(["kenney.nl"]),
   itch: new Set(),
 };
 
-function isAllowedProviderHost(
-  provider: DirectAssetProvider,
-  hostname: string,
-): boolean {
+function isAllowedProviderHost(provider: DirectAssetProvider, hostname: string): boolean {
   if (provider === "itch") {
-    return /^itchio-mirror\.[0-9a-f]+\.r2\.cloudflarestorage\.com$/i.test(
-      hostname,
-    );
+    return /^itchio-mirror\.[0-9a-f]+\.r2\.cloudflarestorage\.com$/i.test(hostname);
   }
   return PROVIDER_HOSTS[provider].has(hostname);
 }
 
 function validateInitialUrl(provider: DirectAssetProvider, url: URL): boolean {
+  if (url.username || url.password || url.port || url.hash) return false;
   if (url.protocol !== "https:" || !isAllowedProviderHost(provider, url.hostname)) {
     return false;
   }
   if (provider === "ambientcg") {
-    return url.hostname === "ambientcg.com" && url.pathname === "/get" && url.searchParams.has("file");
+    return (
+      url.hostname === "ambientcg.com" && url.pathname === "/get" && url.searchParams.has("file")
+    );
   }
   if (provider === "smithsonian") {
-    return url.hostname === "3d-api.si.edu" && url.pathname.startsWith("/content/document/3d_package:");
+    return (
+      url.hostname === "3d-api.si.edu" && url.pathname.startsWith("/content/document/3d_package:")
+    );
   }
   if (provider === "game-icons") {
     return (
@@ -109,8 +106,7 @@ function validateInitialUrl(provider: DirectAssetProvider, url: URL): boolean {
   }
   if (provider === "itch") {
     return (
-      /^\/upload2\/game\/\d+\/\d+$/.test(url.pathname) &&
-      url.searchParams.has("X-Amz-Signature")
+      /^\/upload2\/game\/\d+\/\d+$/.test(url.pathname) && url.searchParams.has("X-Amz-Signature")
     );
   }
   return url.hostname === "dl.polyhaven.org";
@@ -133,10 +129,10 @@ function isInside(path: string, parent: string): boolean {
   return child === "" || (!child.startsWith("..") && !isAbsolute(child));
 }
 
-async function sha256File(path: string): Promise<string> {
-  const hash = createHash("sha256");
+async function hashFile(path: string, algorithm: string, signal: AbortSignal): Promise<string> {
+  const hash = createHash(algorithm);
   await new Promise<void>((resolveHash, reject) => {
-    const stream = createReadStream(path);
+    const stream = createReadStream(path, { signal });
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("error", reject);
     stream.on("end", resolveHash);
@@ -147,12 +143,7 @@ async function sha256File(path: string): Promise<string> {
 async function writeAll(file: FileHandle, value: Uint8Array): Promise<void> {
   let offset = 0;
   while (offset < value.byteLength) {
-    const { bytesWritten } = await file.write(
-      value,
-      offset,
-      value.byteLength - offset,
-      null,
-    );
+    const { bytesWritten } = await file.write(value, offset, value.byteLength - offset, null);
     if (bytesWritten <= 0) throw new Error("Asset file write made no progress.");
     offset += bytesWritten;
   }
@@ -165,9 +156,7 @@ function positiveIntegerEnvironment(
 ): number {
   if (!value) return fallback;
   const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= maximum
-    ? parsed
-    : fallback;
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= maximum ? parsed : fallback;
 }
 
 export class DirectAssetDownloader {
@@ -192,11 +181,24 @@ export class DirectAssetDownloader {
       );
     this.downloadTimeoutMs =
       options.downloadTimeoutMs ??
-      positiveIntegerEnvironment(
-        process.env.ASSET_DOWNLOAD_TIMEOUT_MS,
-        1_800_000,
-        7_200_000,
-      );
+      positiveIntegerEnvironment(process.env.ASSET_DOWNLOAD_TIMEOUT_MS, 1_800_000, 7_200_000);
+  }
+
+  /** Keep transfers on the same guarded transport while staging a whole asset. */
+  forDirectory(downloadDir: string): DirectAssetDownloader {
+    return new DirectAssetDownloader({
+      fetch: this.fetch,
+      downloadDir,
+      maxDownloadBytes: this.maxDownloadBytes,
+      downloadTimeoutMs: this.downloadTimeoutMs,
+    });
+  }
+
+  get storageDirectory(): string {
+    return this.downloadDir;
+  }
+  get byteLimit(): number {
+    return this.maxDownloadBytes;
   }
 
   async download(input: {
@@ -205,7 +207,47 @@ export class DirectAssetDownloader {
     fileName: string;
     identity?: string;
     reportedSourceUrl?: string;
+    signal?: AbortSignal;
+    maxBytes?: number;
+    expectedSize?: number;
+    expectedMd5?: string;
   }): Promise<DirectAssetDownloadResult> {
+    const maxBytes = input.maxBytes ?? this.maxDownloadBytes;
+    if (
+      !Number.isSafeInteger(maxBytes) ||
+      maxBytes < 1 ||
+      maxBytes > this.maxDownloadBytes ||
+      (input.expectedSize !== undefined &&
+        (!Number.isSafeInteger(input.expectedSize) || input.expectedSize < 0)) ||
+      (input.expectedMd5 !== undefined && !/^[0-9a-f]{32}$/i.test(input.expectedMd5))
+    ) {
+      throw new DirectAssetDownloadError(
+        "ASSET_DOWNLOAD_FAILED",
+        "Invalid download budget or integrity metadata.",
+      );
+    }
+    const signal = AbortSignal.any([
+      AbortSignal.timeout(this.downloadTimeoutMs),
+      ...(input.signal ? [input.signal] : []),
+    ]);
+    signal.throwIfAborted();
+    const verify = async (path: string, size: number, md5?: string) => {
+      if (size > maxBytes)
+        throw new DirectAssetDownloadError(
+          "ASSET_DOWNLOAD_TOO_LARGE",
+          "The asset exceeds the selected byte budget.",
+        );
+      if (
+        (input.expectedSize !== undefined && input.expectedSize !== size) ||
+        (input.expectedMd5 &&
+          input.expectedMd5.toLowerCase() !== (md5 ?? (await hashFile(path, "md5", signal))))
+      ) {
+        throw new DirectAssetDownloadError(
+          "ASSET_DOWNLOAD_FAILED",
+          "The selected file failed integrity verification.",
+        );
+      }
+    };
     let initial: URL;
     try {
       initial = new URL(input.url);
@@ -227,9 +269,7 @@ export class DirectAssetDownloader {
     const sourceKey = createHash("sha256")
       .update(input.identity ?? initial.toString())
       .digest("hex");
-    const directory = await this.ensureDirectory(
-      join(root, input.provider, sourceKey),
-    );
+    const directory = await this.ensureDirectory(join(root, input.provider, sourceKey));
     if (!isInside(directory, root)) {
       throw new DirectAssetDownloadError(
         "ASSET_DOWNLOAD_FAILED",
@@ -246,22 +286,25 @@ export class DirectAssetDownloader {
         );
       }
       const metadata = await stat(outputPath);
+      await verify(outputPath, metadata.size);
+      signal.throwIfAborted();
       return this.result(
         input.provider,
         input.reportedSourceUrl ?? initial.toString(),
         fileName,
         outputPath,
         metadata.size,
-        await sha256File(outputPath),
+        await hashFile(outputPath, "sha256", signal),
         true,
       );
     }
 
     const temporaryPath = join(directory, `.${fileName}.${randomUUID()}.part`);
     try {
-      const response = await this.fetchDownload(input.provider, initial);
+      const response = await this.fetchDownload(input.provider, initial, signal);
       const declaredLength = Number(response.headers.get("content-length"));
-      if (Number.isFinite(declaredLength) && declaredLength > this.maxDownloadBytes) {
+      if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        await response.body?.cancel();
         throw new DirectAssetDownloadError(
           "ASSET_DOWNLOAD_TOO_LARGE",
           "The asset exceeds ASSET_MAX_DOWNLOAD_BYTES.",
@@ -277,27 +320,43 @@ export class DirectAssetDownloader {
 
       const file = await open(temporaryPath, "wx", 0o600);
       const hash = createHash("sha256");
+      const md5 = createHash("md5");
       let sizeBytes = 0;
       try {
         const reader = response.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          sizeBytes += value.byteLength;
-          if (sizeBytes > this.maxDownloadBytes) {
-            await reader.cancel();
-            throw new DirectAssetDownloadError(
-              "ASSET_DOWNLOAD_TOO_LARGE",
-              "The asset exceeds ASSET_MAX_DOWNLOAD_BYTES.",
-            );
+        const cancel = () => {
+          void reader.cancel().catch(() => undefined);
+        };
+        signal.addEventListener("abort", cancel, { once: true });
+        try {
+          while (true) {
+            signal.throwIfAborted();
+            const { done, value } = await reader.read();
+            signal.throwIfAborted();
+            if (done) break;
+            sizeBytes += value.byteLength;
+            if (sizeBytes > maxBytes) {
+              await reader.cancel();
+              throw new DirectAssetDownloadError(
+                "ASSET_DOWNLOAD_TOO_LARGE",
+                "The asset exceeds ASSET_MAX_DOWNLOAD_BYTES.",
+              );
+            }
+            hash.update(value);
+            md5.update(value);
+            await writeAll(file, value);
           }
-          hash.update(value);
-          await writeAll(file, value);
+        } finally {
+          signal.removeEventListener("abort", cancel);
+          await reader.cancel().catch(() => undefined);
+          reader.releaseLock();
         }
+        await verify(temporaryPath, sizeBytes, md5.digest("hex"));
         await file.sync();
       } finally {
         await file.close();
       }
+      signal.throwIfAborted();
       await link(temporaryPath, outputPath);
       return this.result(
         input.provider,
@@ -328,10 +387,15 @@ export class DirectAssetDownloader {
   private async fetchDownload(
     provider: DirectAssetProvider,
     initial: URL,
+    signal: AbortSignal,
   ): Promise<Response> {
     let current = initial;
     for (let redirects = 0; redirects <= 5; redirects += 1) {
       if (
+        current.username ||
+        current.password ||
+        current.port ||
+        current.hash ||
         current.protocol !== "https:" ||
         !isAllowedProviderHost(provider, current.hostname)
       ) {
@@ -340,18 +404,21 @@ export class DirectAssetDownloader {
           "The provider redirected outside its official download-host allowlist.",
         );
       }
+      signal.throwIfAborted();
       const response = await this.fetch(current, {
         redirect: "manual",
-        signal: AbortSignal.timeout(this.downloadTimeoutMs),
+        signal,
         headers: { "user-agent": "threenative-asset-mcp/0.4.0" },
       });
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = response.headers.get("location");
         if (!location) break;
+        await response.body?.cancel();
         current = new URL(location, current);
         continue;
       }
       if (!response.ok) {
+        await response.body?.cancel();
         throw new DirectAssetDownloadError(
           "ASSET_DOWNLOAD_UPSTREAM_DENIED",
           `The provider refused the download with HTTP ${response.status}.`,
@@ -360,6 +427,7 @@ export class DirectAssetDownloader {
       }
       const contentType = response.headers.get("content-type")?.toLocaleLowerCase();
       if (contentType?.includes("text/html")) {
+        await response.body?.cancel();
         throw new DirectAssetDownloadError(
           "ASSET_DOWNLOAD_UPSTREAM_DENIED",
           "The provider returned HTML instead of an asset file.",

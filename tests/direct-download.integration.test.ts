@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,13 +24,78 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 describe("direct provider file downloads", () => {
+  it("rejects credentials and nonstandard ports even on allowed provider hosts", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch,
+    });
+    for (const url of [
+      "https://user:secret@dl.polyhaven.org/file.glb",
+      "https://dl.polyhaven.org:8443/file.glb",
+    ]) {
+      await expect(
+        downloader.download({ provider: "polyhaven", url, fileName: "file.glb" }),
+      ).rejects.toThrow(/official download contract/);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("verifies selected size/checksum on transfer and on cached files", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("abc"));
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch,
+    });
+    const input = {
+      provider: "polyhaven" as const,
+      url: "https://dl.polyhaven.org/file.bin",
+      fileName: "file.bin",
+      expectedSize: 3,
+      expectedMd5: "900150983cd24fb0d6963f7d28e17f72",
+    };
+    const first = await downloader.download(input);
+    await writeFile(first.path, "bad");
+    await expect(downloader.download(input)).rejects.toThrow(/integrity/i);
+    await expect(
+      downloader.download({ ...input, identity: "wrong-size", expectedSize: 4 }),
+    ).rejects.toThrow(/integrity/i);
+  });
+
+  it("propagates cancellation and a tightened transfer budget", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("abc"));
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch,
+    });
+    await expect(
+      downloader.download({
+        provider: "polyhaven",
+        url: "https://dl.polyhaven.org/file.bin",
+        fileName: "file.bin",
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+    await expect(
+      downloader.download({
+        provider: "polyhaven",
+        url: "https://dl.polyhaven.org/file.bin",
+        fileName: "file.bin",
+        maxBytes: 2,
+      }),
+    ).rejects.toThrow(/exceeds/);
+  });
   it("streams a Poly Haven file returned by the MCP into guarded local storage", async () => {
     const downloadDir = await temporaryDirectory();
-    const fetch = vi.fn<typeof globalThis.fetch>(async () =>
-      new Response(new Uint8Array([1, 2, 3, 4]), {
-        status: 200,
-        headers: { "content-length": "4", "content-type": "application/zip" },
-      }),
+    const fetch = vi.fn<typeof globalThis.fetch>(
+      async () =>
+        new Response(new Uint8Array([1, 2, 3, 4]), {
+          status: 200,
+          headers: { "content-length": "4", "content-type": "application/zip" },
+        }),
     );
     const handler = createDirectAssetDownloadHandler(
       new DirectAssetDownloader({ fetch, downloadDir, maxDownloadBytes: 100 }),
