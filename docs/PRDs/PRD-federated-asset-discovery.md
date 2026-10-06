@@ -1,11 +1,11 @@
 # PRD — Federated asset discovery and selective 3d-asset-server adoption
 
-**Status:** IN PROGRESS — implementation authorized on 2026-10-06; local acceptance passed; GitHub CI qualification pending.
+**Status:** IN PROGRESS — implementation authorized on 2026-10-06; local acceptance and GitHub CI passed; live Kenney qualification passed; default-setting verification pending.
 **Priority:** P2 — reduce provider-selection friction and incomplete asset downloads without replacing working asset tools.
 **Date:** 2026-10-05 (America/Vancouver)
 **Implementation owner:** `jonit-dev/threenative-asset-mcp`.
 **Engine consumer:** `ThreeNativeHQ/threenative`; a later, separately verified package-version adoption, not an engine-MCP rewrite.
-**Progress:** 6 of 7 implementation boxes and the controlled-consumer acceptance box are verified. Kenney live archive/default-enable qualification remains open. The owner authorized implementation and CI; merge/package release and engine adoption remain outside this run.
+**Progress:** 6 of 7 implementation boxes and the controlled-consumer acceptance box are verified. Live Kenney archive qualification passed; default-setting verification remains open. The owner authorized implementation and CI; merge/package release and engine adoption remain outside this run.
 
 ## Decision
 
@@ -193,7 +193,7 @@ Verification boxes are updated only after the stated checks actually run. The im
 
 ### Phase 3 — Useful new coverage and packaged delivery
 
-- [ ] Add bounded Kenney 3D-pack discovery and guarded archive acquisition. proof: `npm test` with Kenney parser/transport fixtures; an explicitly invoked provider probe qualifies one official pack before enabling the provider by default. Result: parser/transport and packed archive fixtures passed; official listing/detail metadata qualified. Live archive acquisition/default enablement remain unverified; provider stays opt-in.
+- [ ] Add bounded Kenney 3D-pack discovery and guarded archive acquisition. proof: `npm test` with Kenney parser/transport fixtures; an explicitly invoked provider probe qualifies one official pack before enabling the provider by default. Result: parser/transport and packed archive fixtures passed; official listing/detail metadata qualified. Official Mini Dungeon archive acquisition passed through the npm-packed public MCP on 2026-10-06, independently reviewed. Default-setting verification remains pending.
 - [x] Expose the additive tool contract from the built package without breaking existing MCP registration. proof: `npm run typecheck && npm run build && npm test`, including a new stdio consumer smoke test against the built entry point. Result: passed on 2026-10-06; final typecheck/build and 467 tests passed (2 conditional Unreal skips), including the npm-packed stdio acquisitions and negative controls.
 
 ## Acceptance criteria
@@ -232,6 +232,8 @@ Optional future authenticated integrations require the user's own credentials. D
 
 2026-10-06 — Kenney is explicitly opt-in (`ASSET_ENABLE_KENNEY=1`). One official listing and Nature Kit detail were inspected anonymously for parser, CC0, explicit free availability and official ZIP-link evidence. No live archive or legal acceptance was performed. Default/live archive qualification remains open.
 
+2026-10-06 — The later authorized Mini Dungeon acquisition and independent inspection passed the one-pack live prerequisite. Kenney registration now defaults to enabled, with `ASSET_ENABLE_KENNEY=0` as its named disable switch and strict `0`/`1` validation. The previous npm-packed binary reproduced the missing default as `ASSET_INVALID_ID` with the setting unset. Final default/disable/invalid-setting packed-consumer checks and compilation remain pending GitHub-hosted CI; no local build graph was run while HLOD owns the CPU slots.
+
 
 2026-10-05 — User requested evaluation and a PRD in an open PR for later work. This PR is documentation only; no implementation, publication, dependency bump or merge is included.
 
@@ -251,9 +253,23 @@ Optional future authenticated integrations require the user's own credentials. D
 - Fresh independent review reproduced plan expiry during metadata refresh, missing GLB BIN resources, incorrect 6k/16k matching and version-upgrade cache rejection. Repairs passed their retained regression tests; an independent built-output control script passed all 7 controls after the first three repairs.
 - Official metadata only: `https://kenney.nl/assets?search=nature` and `https://kenney.nl/assets/nature-kit`, inspected anonymously on 2026-10-06. Saved-body parser qualification passed for listing/category, item CC0, explicit free availability and official ZIP link. Listing SHA-256: `d87b137c303744c9ac036b8d5b73da01d78b689c45c49303dede169a7b11bf2c`; detail SHA-256: `30d56abcd762e4bd65dba9ffb1884a3e9352e0f0102d029c41b62dbda00cab92`.
 
-GitHub's minimum Node 20.19.0 and current LTS Node 24 jobs still require observation after pushing. No live archive was downloaded or legally binding provider acceptance performed. Published-package equivalence, engine adoption, runtime/native compatibility, production latency quantiles and peak metadata memory remain unverified. No verified cross-provider alias corpus exists; current deduplication uses canonical provider/native identity. Mid-hash cancellation was inspected through the standard stream signal mechanism, without a timing-dependent runtime control.
+GitHub Node 20.19.0 and 24 jobs passed for `6e7ad9e70890c6de3a57fe68ffa4bc60adadd425`: [CI run 1](https://github.com/jonit-dev/threenative-asset-mcp/actions/runs/37414016982). No additional explicit EULA, checkout or paid/authenticated workflow was entered. Published-package equivalence, engine adoption, runtime/native compatibility, production latency quantiles and peak metadata memory remain unverified. No verified cross-provider alias corpus exists; current deduplication uses canonical provider/native identity. Mid-hash cancellation was inspected through the standard stream signal mechanism, without a timing-dependent runtime control.
 
 The initial 2026-10-05 PR was a documentation-only draft with product gates unrun. The owner subsequently authorized this implementation; that historical limitation is superseded by the executed results above.
+
+### Live Kenney qualification — 2026-10-06
+
+The owner authorized one bounded credential-free public-pack probe after the initial CI pass. Official [Mini Dungeon](https://kenney.nl/assets/mini-dungeon) metadata identifies category 3D, explicit free availability and [CC0](https://creativecommons.org/publicdomain/zero/1.0/); [Kenney support](https://kenney.nl/support) corroborates its public-domain asset policy. The [website terms](https://kenney.nl/terms-of-service) were read; no additional acceptance UI or EULA appeared. The MCP flag acknowledged the evidenced CC0 dedication, with no purchase, login or new explicit legal-assent step.
+
+The actual npm-packed `0.9.5` stdio server at source `6e7ad9e` executed `asset_search`, `asset_get`, and guarded `asset_download` against the official provider, without a fixture/preload or transport override. The probe used a 4 MiB cap and 30-second transfer timeout. Exact result:
+
+- Official ZIP: `https://kenney.nl/media/pages/assets/mini-dungeon/6cd72dc849-1785314274/kenney_mini-dungeon.zip`.
+- Acquired bytes: **1,796,820**; SHA-256 `19c4648680cb1d2e8836cade96cbf9781c0c1f45fbc6d2ce41cee8239a3ec4d8`.
+- Saved official detail-page SHA-256: `676957757bbb43687039e3ee9109f339e8e560412b306f1d5982411e91c58627`.
+- Receipt records Kenney/Mini Dungeon identity, canonical source, CC0 evidence, author, tool version, terms digest and exact archive hash. `requiresExtraction: true`, `runtimeReadiness: unverified`, no dependencies fabricated.
+- Bounded ZIP-directory inspection: 171 entries, 90 model-format entries; only the 701-byte `License.txt` was read, with CRC verification and a 64 KiB bound. License SHA-256 `f8b470068a1c043854101c9ff7161d376ba02c36239da3c1dbdfa928b08444b6`, confirming CC0/Kenney. No archive extraction or runtime import was performed.
+- Cached replay preserved the receipt. A real archive byte alteration failed; restoring the exact bytes restored verified replay.
+- Independent reviewer checked the actual package/archive/license hashes, official saved-page parsing, receipt provenance and probe source, finding no remaining policy/source blocker. The one-official-pack prerequisite for default enablement passed; broader catalog and runtime compatibility remain unverified.
 
 ## Source references
 

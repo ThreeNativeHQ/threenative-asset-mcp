@@ -211,7 +211,7 @@ export const ASSET_SOURCES: readonly AssetSource[] = [
     downloadSupport: "mcp-managed",
     searchTool: "audio_search_assets",
     downloadTool: "audio_download_asset",
-    caution: "The MCP-managed catalog covers selected audio packs; the Particle Pack has its own entry. Set ASSET_ENABLE_KENNEY=1 to use asset_search, asset_get and asset_download for bounded official 3D-pack metadata and acknowledged original archives. Other categories remain provider-page workflows.",
+    caution: "The MCP-managed catalog covers selected audio packs; the Particle Pack has its own entry. Generic asset_search, asset_get and asset_download include bounded official 3D-pack metadata and acknowledged original archives by default; ASSET_ENABLE_KENNEY=0 disables that adapter. Other categories remain provider-page workflows.",
   }),
   source({
     id: "kenney-particle-pack",

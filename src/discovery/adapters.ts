@@ -384,7 +384,7 @@ export interface AssetAdapterClients {
   ambientcg?: AmbientCgClient;
   smithsonian?: SmithsonianClient;
   sketchfab?: SketchfabClient;
-  /** Explicit opt-in: live Kenney catalog queries never run by default. */
+  /** Optional injection; the server includes the qualified adapter unless explicitly disabled. */
   kenney?: KenneyClient;
 }
 

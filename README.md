@@ -340,11 +340,13 @@ No transfer/signed URLs or credentials enter the new public plan or receipt.
 Archives stay archives with `requiresExtraction: true`; runtime readiness is
 `unverified`. Acquiring originals does not change or adopt assets into a project.
 
-Kenney 3D packs are available with explicit `ASSET_ENABLE_KENNEY=1`. This uses
-one official listing page and at most three item detail checks per query,
+Kenney 3D packs are enabled by default; `ASSET_ENABLE_KENNEY=0` disables the
+generic adapter. Each query uses one official listing page and at most three
+item detail checks,
 paces requests, verifies item CC0/free/official-ZIP evidence and never crawls
-or extracts archives. Broader catalog coverage and live archive acquisition
-remain unqualified; ordinary tests use hand-authored local fixtures.
+or extracts archives. One official Mini Dungeon archive was qualified through
+the packed public MCP on 2026-10-06. Broader catalog coverage and runtime import
+remain unverified; ordinary tests use hand-authored local fixtures.
 
 Recommended agent flow:
 
@@ -523,7 +525,7 @@ glTF's standard punctual-light extension has no area-light type.
 | `ASSET_DOWNLOAD_DIR`            | `~/Downloads/threenative-asset-mcp/assets`         | Dedicated directory for direct provider downloads.       |
 | `ASSET_MAX_DOWNLOAD_BYTES`      | `10737418240`                                      | Maximum bytes per direct file or complete generic acquisition (10 GiB).       |
 | `ASSET_DOWNLOAD_TIMEOUT_MS`     | `1800000`                                          | Total timeout for one provider download (30 minutes).    |
-| `ASSET_ENABLE_KENNEY`           | unset                                              | Set `1` to opt into bounded official Kenney 3D-pack metadata. |
+| `ASSET_ENABLE_KENNEY`           | `1`                                                | Bounded official Kenney 3D-pack discovery; `0` disables it. Other values fail initialization. |
 | `ASSET_SEARCH_CONCURRENCY`      | `4`                                                | Concurrent provider operations per search; range 1–4. |
 | `ASSET_PROVIDER_TIMEOUT_MS`     | `8000`                                             | Provider deadline; range 1–30000 milliseconds. |
 | `ASSET_SEARCH_TIMEOUT_MS`       | `10000`                                            | Aggregate search/metadata deadline including queue time; range 1–60000. |

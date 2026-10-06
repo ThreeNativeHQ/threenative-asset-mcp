@@ -229,6 +229,10 @@ export function createAssetServer(
     bundle: new BundleAssetClient({ itch: new ItchAssetClient() }),
   },
 ): McpServer {
+  const kenneySetting = process.env.ASSET_ENABLE_KENNEY ?? "1";
+  if (kenneySetting !== "0" && kenneySetting !== "1") {
+    throw new Error("ASSET_ENABLE_KENNEY must be 0 or 1.");
+  }
   const {
     fab,
     polyhaven,
@@ -256,11 +260,7 @@ export function createAssetServer(
         polyhaven,
         ambientcg,
         smithsonian,
-        ...(clients.kenney
-          ? { kenney: clients.kenney }
-          : process.env.ASSET_ENABLE_KENNEY === "1"
-            ? { kenney: new KenneyClient() }
-            : {}),
+        ...(kenneySetting === "1" ? { kenney: clients.kenney ?? new KenneyClient() } : {}),
       }),
       directDownloader,
       { toolVersion: packageVersion() },

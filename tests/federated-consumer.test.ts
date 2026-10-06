@@ -221,7 +221,7 @@ async function providerFixtures(): Promise<{
   return { routes, resources, archive };
 }
 
-async function startConsumer(routes: Routes) {
+async function startConsumer(routes: Routes, kenneySetting?: string) {
   const root = await temporaryDirectory("asset-federated-consumer-");
   const fixturePath = join(root, "routes.json");
   const auditPath = join(root, "requests.jsonl");
@@ -255,7 +255,7 @@ globalThis.fetch = async (input, init) => {
       FAB_BROWSER_HEADLESS: "true",
       ASSET_DOWNLOAD_DIR: storage,
       ASSET_MAX_DOWNLOAD_BYTES: "1048576",
-      ASSET_ENABLE_KENNEY: "1",
+      ...(kenneySetting !== undefined ? { ASSET_ENABLE_KENNEY: kenneySetting } : {}),
       FIXTURE_ROUTES: fixturePath,
       FIXTURE_AUDIT: auditPath,
     },
@@ -311,13 +311,15 @@ globalThis.fetch = async (input, init) => {
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
   };
-  expect(
-    await request("initialize", {
-      protocolVersion: LATEST_PROTOCOL_VERSION,
-      capabilities: {},
-      clientInfo: { name: "packed-federation-consumer", version: "1.0.0" },
-    }),
-  ).toMatchObject({
+  const initialized = await request("initialize", {
+    protocolVersion: LATEST_PROTOCOL_VERSION,
+    capabilities: {},
+    clientInfo: { name: "packed-federation-consumer", version: "1.0.0" },
+  });
+  if (initialized.error) {
+    throw new Error(`MCP initialization rejected: ${JSON.stringify(initialized.error)}`);
+  }
+  expect(initialized).toMatchObject({
     result: { serverInfo: { name: "threenative-asset-mcp", version: packageVersion } },
   });
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
@@ -359,6 +361,28 @@ globalThis.fetch = async (input, init) => {
 }
 
 describe("packed federated stdio consumer", () => {
+  it("disables generic Kenney explicitly without making provider requests", async () => {
+    const fixtures = await providerFixtures();
+    const consumer = await startConsumer(fixtures.routes, "0");
+    const found = await consumer.success<{ results: Json[]; providers: Json[] }>("asset_search", {
+      query: "chair",
+      providers: ["polyhaven", "kenney"],
+      types: ["3d-model"],
+    });
+    expect(found.results.map((item) => item.provider)).toEqual(["polyhaven"]);
+    expect(found.providers).toContainEqual(
+      expect.objectContaining({ provider: "kenney", status: "manual" }),
+    );
+    await consumer.failure("asset_get", { assetId: "kenney:chair-kit" });
+    expect(
+      (await consumer.requests()).every((request) => !request.url.startsWith("https://kenney.nl/")),
+    ).toBe(true);
+    await consumer.close();
+  });
+
+  it("rejects malformed Kenney settings during startup", async () => {
+    await expect(startConsumer({}, "sometimes")).rejects.toThrow(/MCP initialization rejected/u);
+  });
   it("discovers two providers and acquires dependency-complete glTF and an original Kenney archive", async () => {
     const fixtures = await providerFixtures();
     const consumer = await startConsumer(fixtures.routes);
