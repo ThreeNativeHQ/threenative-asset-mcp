@@ -843,6 +843,51 @@ CollectedVectorParameters[0] = { Value={ R=1,G=0,B=0,A=1 }, Name=BaseColor }
 });
 
 describe("named channel transforms", () => {
+  it("compresses composed opacity textures without changing RGBA or PNG metadata", async () => {
+    const { default: sharp } = await import("sharp");
+    const width = 256;
+    const height = 256;
+    const colourPixels = Buffer.alloc(width * height * 4);
+    const opacityPixels = Buffer.alloc(colourPixels.length);
+    const expected = Buffer.alloc(colourPixels.length);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const offset = (y * width + x) * 4;
+        colourPixels.set([x, y, (x + y) & 255, 255], offset);
+        opacityPixels.set([(3 * x + y) & 255, 0, 0, 255], offset);
+        expected.set([x, y, (x + y) & 255, (3 * x + y) & 255], offset);
+      }
+    }
+    const raw = { width, height, channels: 4 as const };
+    const colour = await sharp(colourPixels, { raw }).png().toBuffer();
+    const opacity = await sharp(opacityPixels, { raw }).png().toBuffer();
+    const previousEncoding = await sharp(expected, { raw }).png({ compressionLevel: 6 }).toBuffer();
+    const result = await applyTextureTransform(colour, "redToBaseColorAlpha", undefined, opacity);
+    expect(await sharp(result.data).ensureAlpha().raw().toBuffer()).toEqual(expected);
+    const nonImageChunks = (png: Buffer): Buffer[] => {
+      const chunks: Buffer[] = [];
+      for (let offset = 8; offset < png.length;) {
+        const end = offset + png.readUInt32BE(offset) + 12;
+        expect(end).toBeLessThanOrEqual(png.length);
+        if (png.toString("ascii", offset + 4, offset + 8) !== "IDAT") chunks.push(png.subarray(offset, end));
+        offset = end;
+      }
+      return chunks;
+    };
+    expect(nonImageChunks(result.data)).toEqual(nonImageChunks(previousEncoding));
+    expect(result.data.length).toBeLessThan(previousEncoding.length * 0.75);
+  });
+
+  it("keeps untouched colour-profile and XMP PNGs byte-for-byte", async () => {
+    const { default: sharp } = await import("sharp");
+    const bytes = await sharp(Buffer.from([1, 2, 3, 4, 5, 6]), { raw: { width: 2, height: 1, channels: 3 } })
+      .withIccProfile("p3")
+      .withXmp('<x:xmpmeta xmlns:x="adobe:ns:meta/"><test>retained</test></x:xmpmeta>')
+      .png().toBuffer();
+    expect((await sharp(bytes).metadata()).icc).toBeDefined();
+    expect((await applyTextureTransform(bytes, "none", undefined)).data).toEqual(bytes);
+  });
+
   it("reads grayscale opacity without mistaking interleaved alpha for a red-channel sample", async () => {
     const { default: sharp } = await import("sharp");
     const colour = await sharp(Buffer.from([90, 110, 40, 75, 80, 50, 90, 110, 40, 75, 80, 50]), { raw: { width: 2, height: 2, channels: 3 } }).png().toBuffer();

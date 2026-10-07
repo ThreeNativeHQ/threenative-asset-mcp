@@ -415,6 +415,11 @@ altering RGB; different source dimensions are currently unsupported. Existing
 cached conversions are invalidated. A textured result does not certify the
 appearance of the original Unreal shader.
 
+Importer version 51 uses adaptive PNG row filtering for composed opacity maps,
+preserving the previous encoder's decoded RGBA and PNG metadata. Untouched textures
+retain their original bytes; their profiles, bit depth, and metadata are not
+re-encoded for storage savings.
+
 Legacy instance sidecars without override flags retain inherited settings for
 ambiguous opaque, false, and zero defaults. Their non-default values retain the
 previous behavior; missing flags are reported as a material limitation.
