@@ -49,7 +49,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 50;
+export const IMPORTER_VERSION = 51;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -707,7 +707,7 @@ export async function applyTextureTransform(
       .ensureAlpha().raw().toBuffer();
     for (let index = 0; index < pixels; index += 1) data[index * 4 + 3] = mask[index * 4] ?? 0;
     return {
-      data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6 }).toBuffer(),
+      data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer(),
       mimeType: "image/png",
     };
   }
