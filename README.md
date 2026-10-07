@@ -443,6 +443,40 @@ Legacy instance sidecars without override flags retain inherited settings for
 ambiguous opaque, false, and zero defaults. Their non-default values retain the
 previous behavior; missing flags are reported as a material limitation.
 
+Importer version 50 reads a bounded authored-material subset from tagged UE4
+object-version 516 packages (legacy -7, UE3 864, licensee 0). Exact source paths
+and closest flagged static overrides select the active branches before reduction.
+Mesh-only package selection still loads needed material parents from the source
+file inventory without exporting unrelated packages; lookups stay within the same
+Content namespace. Mesh import-table material references resolve duplicate source
+basenames by exact object path. Multiple matching references refuse source routing;
+a unique basename fallback reports its unresolved mesh routing.
+Reroutes, scalar constants/parameters and representable multiplication recover
+scalar roughness; glTF normalization retains the raw authored value in the report.
+An authored scalar replaces any earlier roughness texture contribution while
+retaining its packed metallic channel. Source functions, Specular conversion,
+foliage shading and unsupported sampling remain explicit limitations.
+
+AO.R is attached only with explicit `Texture2D.SRGB=false`, a serialized linear
+sampler mode (`LinearColor`, `LinearGrayscale` or `Masks`), and source coordinates
+matching the sampler of the currently bound albedo. Its existing glTF coordinate
+mapping is reused only after the selected albedo attaches; an incoming unrelated
+base texture cannot establish that reference. Omitted Unreal defaults remain
+unresolved. Unknown color
+interpretation, ambiguous source paths or exported PNG basenames, nonidentity AO
+multipliers and unproved UV transforms withhold AO, including earlier filename
+guesses. Texture metadata is
+read lazily for the selected AO candidate; unrelated large images are untouched
+by the material reader. Other package profiles keep prior reconstruction with a
+named source-reader limitation. Cached conversions are invalidated.
+
+The Buffer reader is independently implemented from the tagged package, property
+and native-input schemas at [CUE4Parse commit b4e9544](https://github.com/FabianFG/CUE4Parse/tree/b4e95441bcf0c975eb3adb68c0fb44c740c2cf62/CUE4Parse/UE4).
+Native expression inputs require verified Core=2 and Framework=33 custom versions;
+tagged instances without native inputs do not require these versions. Native
+trailers and omitted class defaults are outside its scope. This subset does not
+certify original Unreal appearance.
+
 Automatic uncooked conversion needs Python 3 with `venv` and `pip`. A Linux
 source build fallback for UE Viewer additionally needs `git`, `g++`, `perl`,
 zlib, and SDL2 development headers. Unreal import currently runs on Linux and
