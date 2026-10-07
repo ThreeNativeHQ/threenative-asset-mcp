@@ -2,8 +2,10 @@
  * Reconstructs a standard glTF PBR material from what UE Viewer can recover of an Unreal material.
  *
  * Three sources, ranked. The `.mat` file is the authority: umodel resolved the material graph far
- * enough to name a Diffuse/Normal/Specular/SpecPower/Opacity/Emissive/Cube/Mask texture, and a slot
- * it names is exact. `.props.txt` carries `CollectedTextureParameters`, the material's own
+ * enough to name a Diffuse/Normal/Specular/SpecPower/Opacity/Emissive/Cube/Mask texture. A named
+ * slot normally has exact binding confidence, except contradictory samples duplicated across
+ * distinct section families in one export namespace. Shader fidelity is reported separately.
+ * `.props.txt` carries `CollectedTextureParameters`, the material's own
  * parameter names, which recover slots the `.mat` left in `Other[n]` — the Kite Demo foliage is the
  * case that matters: its diffuse atlas is `Other[0]` in the `.mat` and `Diffuse` in the props. That
  * is the material's naming rather than umodel's resolution, so it is heuristic. Texture filename
@@ -33,7 +35,9 @@ export type TextureTransform =
   /** A roughness map already in red: moved to glTF's green channel. */
   | "redToRoughness"
   /** Separate red-channel roughness and metalness maps packed into glTF G and B. */
-  | "redRoughnessRedMetalness";
+  | "redRoughnessRedMetalness"
+  /** Preserve diffuse RGB, with a separate opacity map's red channel as alpha. */
+  | "redToBaseColorAlpha";
 
 export type BindingSource = "mat" | "props" | "filename" | "texture-set";
 export type BindingConfidence = "exact" | "heuristic";
@@ -66,6 +70,7 @@ export interface ResolvedMaterial {
   readonly roughnessFactor: number | undefined;
   /** Parent materials followed, nearest first. Empty for a plain Material. */
   readonly parents: readonly string[];
+  readonly limitations: readonly string[];
 }
 
 export interface MatFile {
@@ -89,7 +94,7 @@ export interface VectorParameter {
 }
 
 export interface PropsFile {
-  readonly twoSided: boolean;
+  readonly twoSided: boolean | undefined;
   readonly blendMode: string | undefined;
   readonly opacityMaskClipValue: number | undefined;
   /** `CollectedTextureParameters`, present from UE 4.19 on. */
@@ -102,6 +107,8 @@ export interface PropsFile {
   readonly vectors: readonly VectorParameter[];
   readonly vectorOverrides: readonly VectorParameter[];
   readonly parent: string | undefined;
+  /** Instance-local streaming references identify a surface family, never its UV transform. */
+  readonly streamingTextures: readonly string[];
 }
 
 const MAT_SLOTS = new Set([
@@ -152,7 +159,7 @@ function objectName(reference: string): string | undefined {
  */
 export function parsePropsFile(text: string): PropsFile {
   const lines = text.split(/\r?\n/);
-  let twoSided = false;
+  let twoSided: boolean | undefined;
   let blendMode: string | undefined;
   let opacityMaskClipValue: number | undefined;
   let parent: string | undefined;
@@ -165,17 +172,17 @@ export function parsePropsFile(text: string): PropsFile {
   const vectorOverrides: VectorParameter[] = [];
   let inCollected = false;
   let collectedDepth = 0;
-  let inOverrides = false;
-  let overridesDepth = 0;
   let depth = 0;
   let pendingTexture: string | undefined;
   let pendingName: string | undefined;
-  let overrideTexture: string | undefined;
-  let overrideName: string | undefined;
 
   const number = "[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[Ee][-+]?\\d+)?";
-  const readName = (line: string): string | undefined =>
-    /(?:ParameterName|Name)\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
+  const readName = (line: string): string | undefined => {
+    const legacy = /ParameterName\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
+    const modern = /ParameterInfo\s*=\s*\{\s*Name\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
+    const collected = /\bName\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
+    return [legacy, modern, collected].find((name) => name && name !== "None");
+  };
   const readScalar = (line: string): number | undefined => {
     const value = new RegExp(`(?:ParameterValue|Value)\\s*=\\s*(${number})`).exec(line)?.[1];
     return value === undefined ? undefined : Number(value);
@@ -228,10 +235,20 @@ export function parsePropsFile(text: string): PropsFile {
   collectScalars("ScalarParameterValues", scalarOverrides);
   collectVectors("CollectedVectorParameters", vectors);
   collectVectors("VectorParameterValues", vectorOverrides);
+  for (const block of indexedBlocks("TextureParameterValues")) {
+    if (/TextureParameterValues\[\d+\]/.test(block)) continue;
+    const name = readName(block);
+    const texture = objectName(/ParameterValue\s*=\s*([^\r\n}]+)/.exec(block)?.[1] ?? "");
+    if (name && texture) overrides.push({ name, texture });
+  }
+  const streamingTextures = indexedBlocks("TextureStreamingData")
+    .filter((block) => !/TextureStreamingData\[\d+\]/.test(block))
+    .flatMap((block) => /TextureName\s*=\s*([^\s,}]+)/.exec(block)?.[1] ?? []);
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    if (/^TwoSided\s*=\s*true$/.test(line)) twoSided = true;
+    const sided = /^TwoSided\s*=\s*(true|false)$/.exec(line);
+    if (sided) twoSided = sided[1] === "true";
     if (blendMode === undefined) {
       const blend = /^BlendMode\s*=\s*(BLEND_[A-Za-z]+)/.exec(line);
       if (blend?.[1]) blendMode = blend[1];
@@ -260,38 +277,19 @@ export function parsePropsFile(text: string): PropsFile {
         pendingName = undefined;
       }
     }
-    if (!inOverrides && /^TextureParameterValues\[\d+\]/.test(line)) {
-      inOverrides = true;
-      overridesDepth = depth;
-      overrideTexture = undefined;
-      overrideName = undefined;
-    }
-    if (inOverrides) {
-      const value = /^ParameterValue\s*=\s*(.+)$/.exec(line);
-      if (value?.[1]) overrideTexture = objectName(value[1]);
-      const parameterName = /^ParameterName\s*=\s*(.+)$/.exec(line);
-      if (parameterName?.[1]) overrideName = parameterName[1].trim();
-      if (overrideTexture && overrideName) {
-        overrides.push({ name: overrideName, texture: overrideTexture });
-        overrideTexture = undefined;
-        overrideName = undefined;
-      }
-    }
-
     for (const character of line) {
       if (character === "{") depth += 1;
       else if (character === "}") {
         depth -= 1;
         if (inCollected && depth <= collectedDepth) inCollected = false;
-        if (inOverrides && depth <= overridesDepth) inOverrides = false;
       }
     }
   }
 
   return {
-    twoSided,
-    blendMode,
-    opacityMaskClipValue,
+    twoSided: /^\s*bOverride_TwoSided\s*=\s*false\s*$/m.test(text) ? undefined : twoSided,
+    blendMode: /^\s*bOverride_BlendMode\s*=\s*false\s*$/m.test(text) ? undefined : blendMode,
+    opacityMaskClipValue: /^\s*bOverride_OpacityMaskClipValue\s*=\s*false\s*$/m.test(text) ? undefined : opacityMaskClipValue,
     collected,
     overrides,
     scalars,
@@ -299,6 +297,7 @@ export function parsePropsFile(text: string): PropsFile {
     vectors,
     vectorOverrides,
     parent,
+    streamingTextures,
   };
 }
 
@@ -406,6 +405,8 @@ export interface ResolveMaterialRequest {
   readonly readProps: (materialName: string) => string | undefined;
   /** Names of the textures actually written next to the material. */
   readonly availableTextures: ReadonlySet<string>;
+  /** Distinct sections whose exported .mat metadata is byte-identical in this model. */
+  readonly sharedGraphMaterialNames?: ReadonlySet<string>;
 }
 
 const MAX_PARENT_DEPTH = 8;
@@ -425,7 +426,8 @@ function referencedTextures(
     }
     const propsText = request.readProps(material);
     if (propsText) {
-      for (const parameter of parsePropsFile(propsText).overrides) referenced.add(parameter.texture);
+      const props = parsePropsFile(propsText);
+      for (const parameter of [...props.collected, ...props.overrides]) referenced.add(parameter.texture);
     }
   }
   return referenced;
@@ -440,10 +442,13 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   const claimed = new Set<string>();
   const seenMaterials = new Set<string>();
   const parents: string[] = [];
+  const limitations = new Set<string>();
 
   let alphaMode: ResolvedMaterial["alphaMode"] = "OPAQUE";
   let alphaCutoff: number | undefined;
   let doubleSided = false;
+  let inheritedSidedness: boolean | undefined;
+  let inheritedBlend: string | undefined;
   let sawAlphaSource = false;
   let baseColorFactorValue: [number, number, number, number] | undefined;
   let emissive: [number, number, number] | undefined;
@@ -479,6 +484,9 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     const propsText = request.readProps(current);
     const mat = matText ? parseMatFile(matText) : undefined;
     const props = propsText ? parsePropsFile(propsText) : undefined;
+    if (propsText && /^\s*Expressions\[[1-9]\d*\]/m.test(propsText)) {
+      limitations.add("Unreal shader expression connections are unavailable: layer blending, graph UV transforms, subsurface lighting, normal strength and vertex deformation are not reconstructed by standard glTF PBR.");
+    }
 
     if (mat) {
       for (const [key, texture] of mat.slots) {
@@ -497,13 +505,9 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     }
 
     if (props) {
-      doubleSided = doubleSided || props.twoSided;
-      if (alphaMode === "OPAQUE" && props.blendMode === "BLEND_Masked") {
-        alphaMode = "MASK";
-        alphaCutoff = props.opacityMaskClipValue ?? 0.333;
-      } else if (alphaMode === "OPAQUE" && props.blendMode === "BLEND_Translucent") {
-        alphaMode = "BLEND";
-      }
+      inheritedSidedness ??= props.twoSided;
+      inheritedBlend ??= props.blendMode;
+      alphaCutoff ??= props.opacityMaskClipValue;
       for (const parameter of props.collected) {
         const plan = planForParameterName(parameter.name);
         if (plan) bind(plan, parameter.texture, "props", "heuristic");
@@ -548,6 +552,11 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
 
     current = props?.parent;
   }
+
+  doubleSided = inheritedSidedness ?? false;
+  alphaMode = inheritedBlend === "BLEND_Masked" ? "MASK"
+    : inheritedBlend === "BLEND_Translucent" ? "BLEND" : "OPAQUE";
+  alphaCutoff = alphaMode === "MASK" ? alphaCutoff ?? 0.333 : undefined;
 
   // Last resort: complete a texture set by its own naming.
   //
@@ -600,6 +609,51 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   // glTF has one combined metallic-roughness texture while Unreal commonly references two
   // grayscale images. Preserve both by packing roughness.red -> G and metalness.red -> B.
   const referenced = referencedTextures(request, seenMaterials);
+
+  // A shared graph can emit unrelated first samples as Diffuse and Normal. Correct only that
+  // contradiction, using one coherent referenced family. A name or streaming record is a
+  // heuristic; neither recovers shader links, layered masks, normal strength or subsurface light.
+  const colourStem = (texture: string): string | undefined =>
+    /^(.*)_(?:a|d|albedo|diffuse|basecolou?r)(?:_\d+)?_?$/i.exec(texture)?.[1]?.toLowerCase();
+  const normalStem = (texture: string): string | undefined =>
+    /^(.*)_(?:n|normal)(?:_tex)?$/i.exec(texture)?.[1]?.toLowerCase();
+  const diffuse = bindings.get("baseColor");
+  const normal = bindings.get("normal");
+  const families = [...new Set([...referenced].flatMap((texture) => colourStem(texture) ?? []))]
+    .flatMap((stem) => {
+      const colours = [...referenced].filter((texture) => colourStem(texture) === stem && request.availableTextures.has(texture));
+      const normals = [...referenced].filter((texture) => normalStem(texture) === stem && request.availableTextures.has(texture));
+      return colours.length === 1 && normals.length === 1 ? [{ stem, colour: colours[0]!, normal: normals[0]! }] : [];
+    });
+  const candidatesFor = (section: string) => {
+    const text = request.readProps(section);
+    const streamed = text ? parsePropsFile(text).streamingTextures : [];
+    return streamed.length > 0
+      ? families.filter(({ stem }) => streamed.some((texture) => colourStem(texture) === stem || normalStem(texture) === stem || texture.toLowerCase().startsWith(`${stem}_`)))
+      : families.filter(({ stem }) => stem.replace(/^(?:t|tex)_/, "").split("_").every((token) => section.toLowerCase().split("_").includes(token)));
+  };
+  const sectionFamilies = new Set([...(request.sharedGraphMaterialNames ?? [])].flatMap((section) => {
+    const candidates = candidatesFor(section);
+    return candidates.length === 1 ? candidates[0]!.stem : [];
+  }));
+  if (sectionFamilies.size > 1 && diffuse?.source === "mat" && normal?.source === "mat"
+    && colourStem(diffuse.texture) && normalStem(normal.texture)
+    && colourStem(diffuse.texture) !== normalStem(normal.texture) && families.length > 1) {
+    limitations.add("Duplicated shared-graph samples conflict with distinct section families; texture-family selection is heuristic, not recovered Unreal shader routing.");
+    const candidates = candidatesFor(request.name);
+    if (candidates.length === 1) {
+      const family = candidates[0]!;
+      const opacityCandidates = [...referenced].filter((texture) => request.availableTextures.has(texture) && /_(?:o|opacity)$/i.test(texture) && texture.replace(/_(?:o|opacity)$/i, "").toLowerCase() === family.stem);
+      const mask = alphaMode === "MASK" && opacityCandidates.length === 1 ? opacityCandidates[0] : undefined;
+      if (mask) limitations.add("Separate opacity.red is inferred from the selected texture family; equal source dimensions and shared TEXCOORD_0 are assumed. The original colour RGB is preserved.");
+      bindings.set("baseColor", { slot: "baseColor", texture: family.colour, ...(mask ? { secondaryTexture: mask } : {}), source: "texture-set", confidence: "heuristic", transform: mask ? "redToBaseColorAlpha" : "none" });
+      bindings.set("normal", { slot: "normal", texture: family.normal, source: "texture-set", confidence: "heuristic", transform: "none" });
+    } else {
+      // Conflicting graph samples are not exact merely because no safe replacement was found.
+      bindings.set("baseColor", { ...diffuse, confidence: "heuristic" });
+      bindings.set("normal", { ...normal, confidence: "heuristic" });
+    }
+  }
 
   // UE Viewer labels the first texture of a diffuse chain `Diffuse` when it cannot reduce the
   // graph, and in older packs that is often a data map: a rock's height/AO/curvature mask, a
@@ -654,7 +708,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   }
 
   // Masked foliage takes its cutout from the base colour's own alpha channel.
-  if (alphaMode === "OPAQUE" && sawAlphaSource && baseColor) {
+  if (inheritedBlend === undefined && alphaMode === "OPAQUE" && sawAlphaSource && baseColor) {
     alphaMode = "MASK";
     alphaCutoff = 0.333;
   }
@@ -691,5 +745,6 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     metallicFactor: metallic,
     roughnessFactor: roughness,
     parents,
+    limitations: [...limitations],
   };
 }

@@ -47,7 +47,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 48;
+export const IMPORTER_VERSION = 49;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -82,6 +82,8 @@ export interface ImportedMaterialSection {
   }[];
   readonly unsupported: readonly { readonly texture: string; readonly reason: string }[];
   readonly alphaMode: string;
+  readonly alphaCutoff?: number;
+  readonly limitations: readonly string[];
   readonly doubleSided: boolean;
   readonly factors: {
     readonly baseColor: readonly [number, number, number, number];
@@ -681,6 +683,22 @@ export async function applyTextureTransform(
     .raw()
     .toBuffer({ resolveWithObject: true });
   const pixels = info.width * info.height;
+  if (transform === "redToBaseColorAlpha") {
+    if (!secondaryInput) throw new Error("Opacity source is missing for base-colour alpha composition.");
+    const colourMetadata = await sharp(input).metadata();
+    const opacityMetadata = await sharp(secondaryInput).metadata();
+    if (colourMetadata.width !== opacityMetadata.width || colourMetadata.height !== opacityMetadata.height) {
+      throw new Error("Opacity and base-colour source dimensions do not match.");
+    }
+    const mask = await sharp(secondaryInput, { limitInputPixels: 268_435_456, unlimited: true })
+      .resize(info.width, info.height, { fit: "fill" })
+      .ensureAlpha().raw().toBuffer();
+    for (let index = 0; index < pixels; index += 1) data[index * 4 + 3] = mask[index * 4] ?? 0;
+    return {
+      data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6 }).toBuffer(),
+      mimeType: "image/png",
+    };
+  }
   const output = Buffer.alloc(pixels * 3);
   let secondary: Buffer | undefined;
   if (transform === "redRoughnessRedMetalness") {
@@ -1081,12 +1099,30 @@ export async function packageGlb(options: {
   let repairedMorphDeltas = 0;
   let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
+  const sharedGraphs = new Map<ExportedAssets, Map<string, Set<string>>>();
+  for (const material of root.listMaterials()) {
+    const name = material.getName();
+    const lookup = options.materialLookupNames?.get(name) ?? name;
+    const assets = options.materialAssets?.get(name) ?? options.assets;
+    const path = assets.mat.get(lookup);
+    if (!path) continue;
+    const text = readMaterialSidecar(path);
+    if (!text) continue;
+    const graphs = sharedGraphs.get(assets) ?? new Map<string, Set<string>>();
+    const names = graphs.get(text) ?? new Set<string>();
+    names.add(lookup);
+    graphs.set(text, names);
+    sharedGraphs.set(assets, graphs);
+  }
 
   for (const [index, material] of root.listMaterials().entries()) {
     const name = material.getName();
     const lookupName = options.materialLookupNames?.get(name) ?? name;
     const materialAssets = options.materialAssets?.get(name) ?? options.assets;
     const availableTextures = new Set(materialAssets.png.keys());
+    const graphPath = materialAssets.mat.get(lookupName);
+    const graphText = graphPath ? readMaterialSidecar(graphPath) : undefined;
+    const graphNames = graphText ? sharedGraphs.get(materialAssets)?.get(graphText) : undefined;
     // UE Viewer names a section it could not resolve `dummy_material_<n>` and paints it a debug
     // colour. Shipping that name would put a placeholder into a game asset and let a reader
     // mistake it for a real material, so it is renamed to something that says what it is.
@@ -1105,6 +1141,7 @@ export async function packageGlb(options: {
         return path === undefined ? undefined : readMaterialSidecar(path);
       },
       availableTextures,
+      ...(graphNames ? { sharedGraphMaterialNames: graphNames } : {}),
     });
 
     // UE Viewer's exporter writes a per-section debug colour. Whether or not a texture replaces
@@ -1151,7 +1188,7 @@ export async function packageGlb(options: {
       let texture = cache.get(key);
       if (!texture) {
         const image = options.imageCache
-          ? await options.imageCache.get(`${source}|${binding.transform}`, async () =>
+          ? await options.imageCache.get(key, async () =>
               applyTextureTransform(
                 await readFile(source),
                 binding.transform,
@@ -1219,6 +1256,8 @@ export async function packageGlb(options: {
       })),
       unsupported: [...resolved.unsupported.map((entry) => ({ ...entry })), ...rejectedMasks.splice(0)],
       alphaMode: material.getAlphaMode(),
+      ...(material.getAlphaMode() === "MASK" ? { alphaCutoff: material.getAlphaCutoff() } : {}),
+      limitations: resolved.limitations,
       doubleSided: material.getDoubleSided(),
       factors: {
         baseColor: material.getBaseColorFactor(),
@@ -3778,6 +3817,8 @@ export async function importUnrealDirectory(
         `${coverage.sections - coverage.textured} material sections have no base colour texture and use an explicit named PBR fallback.`,
       );
     }
+    const materialLimitations = [...new Set(sections.flatMap((section) => section.limitations))];
+    for (const limitation of materialLimitations) warnings.push(`Material reconstruction: ${limitation}`);
 
     const report: ImportReport = {
       importer: { name: "threenative-asset-mcp", version: IMPORTER_VERSION },
@@ -3804,7 +3845,7 @@ export async function importUnrealDirectory(
       },
       cacheKey,
       reused: false,
-      materials: coverage.textured === coverage.sections ? "complete" : "degraded",
+      materials: coverage.textured === coverage.sections && materialLimitations.length === 0 ? "complete" : "degraded",
       counts: {
         packages: candidates.length,
         exported: models.length,

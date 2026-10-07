@@ -21,6 +21,7 @@ import {
   hashSourceTree,
   ImportError,
   importUnrealDirectory,
+  packageGlb,
   interleavedBufferViews,
   inspectWebAudio,
   parseUmodelList,
@@ -400,6 +401,115 @@ VectorParameterValues[0] =
 });
 
 describe("material reconstruction", () => {
+  it("uses inherited settings when an instance explicitly disables its base-property overrides", () => {
+    const resolved = resolveMaterial({
+      name: "MI_Leaf",
+      readMat: () => undefined,
+      readProps: (name) => name === "MI_Leaf"
+        ? `Parent = Material'M_Master.M_Master'
+BasePropertyOverrides = {
+ bOverride_BlendMode = false
+ BlendMode = BLEND_Masked (1)
+ bOverride_TwoSided = false
+ TwoSided = false
+ bOverride_OpacityMaskClipValue = false
+ OpacityMaskClipValue = 0.91
+}`
+        : "BlendMode = BLEND_Masked (1)\nTwoSided = true\nOpacityMaskClipValue = 0.333\n",
+      availableTextures: new Set(),
+    });
+    expect(resolved.alphaCutoff).toBe(0.333);
+    expect(resolved.doubleSided).toBe(true);
+  });
+
+  it("lets explicit opaque and single-sided instance overrides clear inherited settings", () => {
+    const resolved = resolveMaterial({
+      name: "MI_Solid",
+      readMat: () => undefined,
+      readProps: (name) => name === "MI_Solid"
+        ? `Parent = Material'M_Master.M_Master'
+bOverride_BlendMode = true
+BlendMode = BLEND_Opaque (0)
+bOverride_TwoSided = true
+TwoSided = false
+`
+        : "BlendMode = BLEND_Masked (1)\nTwoSided = true\nOpacityMaskClipValue = 0.4\n",
+      availableTextures: new Set(),
+    });
+    expect(resolved.alphaMode).toBe("OPAQUE");
+    expect(resolved.doubleSided).toBe(false);
+  });
+
+  it("reads modern ParameterInfo names instead of the legacy None placeholder", () => {
+    const parsed = parsePropsFile(`TextureParameterValues[0] = {
+ ParameterInfo = { Name=Normal }
+ ParameterValue = Texture2D'T_New_N.T_New_N'
+ ParameterName = None
+}`);
+    expect(parsed.overrides).toEqual([{ name: "Normal", texture: "T_New_N" }]);
+  });
+
+  const sharedGraph = `Diffuse=Moss_A\nNormal=Bark_N\nOther[0]=Moss_N\nOther[1]=Bark_A_\nOther[2]=Branch_A\nOther[3]=Branch_N\nOther[4]=Leaf_A_02\nOther[5]=Leaf_N\nOther[6]=Leaf_O\n`;
+  const sharedTextures = new Set(["Moss_A", "Moss_N", "Bark_A_", "Bark_N", "Branch_A", "Branch_N", "Leaf_A_02", "Leaf_N", "Leaf_O"]);
+  const sharedGraphMaterialNames = new Set(["MI_Plant_leaf", "MI_Plant_branch", "MI_Plant_trunk"]);
+
+  it("preserves a deliberately shared detail normal on a material with several texture sets", () => {
+    const resolved = resolveMaterial({ name: "MI_Wood", readMat: () => "Diffuse=Wood_A\nNormal=Detail_N\nOther[0]=Wood_N\nOther[1]=Detail_A\n", readProps: () => "TextureStreamingData[0] = { TextureName = Wood_A }", availableTextures: new Set(["Wood_A", "Wood_N", "Detail_A", "Detail_N"]) });
+    expect(resolved.bindings.find(({ slot }) => slot === "normal")).toMatchObject({ texture: "Detail_N", confidence: "exact" });
+  });
+
+  it("keeps an explicit opaque override when the parent exports an opacity sample", () => {
+    const resolved = resolveMaterial({ name: "MI_Solid", readMat: () => "Diffuse=Wood_A\nOpacity=Wood_O\n", readProps: (name) => name === "MI_Solid" ? "Parent = Material'M_Master.M_Master'\nBlendMode = BLEND_Opaque (0)\n" : "BlendMode = BLEND_Masked (1)\n", availableTextures: new Set(["Wood_A", "Wood_O"]) });
+    expect(resolved.alphaMode).toBe("OPAQUE");
+  });
+
+  it("repairs a contradictory shared graph using a unique referenced section family", () => {
+    const resolved = resolveMaterial({
+      name: "MI_Plant_leaf",
+      readMat: () => sharedGraph,
+      readProps: () => "BlendMode = BLEND_Masked (1)\nOpacityMaskClipValue = 0.333\n",
+      availableTextures: sharedTextures,
+      sharedGraphMaterialNames,
+    });
+    expect(resolved.bindings).toContainEqual({ slot: "baseColor", texture: "Leaf_A_02", secondaryTexture: "Leaf_O", source: "texture-set", confidence: "heuristic", transform: "redToBaseColorAlpha" });
+    expect(resolved.bindings).toContainEqual({ slot: "normal", texture: "Leaf_N", source: "texture-set", confidence: "heuristic", transform: "none" });
+    expect(resolved.unsupported.some(({ texture }) => texture === "Moss_A")).toBe(true);
+  });
+
+  it("anchors a conflicting graph to instance streaming references without a trunk-to-bark alias", () => {
+    const resolved = resolveMaterial({
+      name: "MI_Plant_trunk",
+      readMat: () => sharedGraph,
+      readProps: (name) => name === "MI_Plant_trunk" ? `TextureStreamingData[0] = { TextureName = Bark_A_ }` : undefined,
+      availableTextures: sharedTextures,
+      sharedGraphMaterialNames,
+    });
+    expect(resolved.bindings.find(({ slot }) => slot === "baseColor")?.texture).toBe("Bark_A_");
+    expect(resolved.bindings.find(({ slot }) => slot === "normal")?.texture).toBe("Bark_N");
+  });
+
+  it("leaves coherent .mat bindings intact even if another family matches the section name", () => {
+    const resolved = resolveMaterial({
+      name: "MI_Plant_leaf",
+      readMat: () => sharedGraph.replace("Normal=Bark_N", "Normal=Moss_N"),
+      readProps: () => undefined,
+      availableTextures: sharedTextures,
+      sharedGraphMaterialNames,
+    });
+    expect(resolved.bindings.find(({ slot }) => slot === "baseColor")).toMatchObject({ texture: "Moss_A", confidence: "exact", transform: "none" });
+  });
+
+  it("does not choose an unreferenced, missing, or ambiguously streamed family", () => {
+    for (const [mat, available, props] of [
+      ["Diffuse=Moss_A\nNormal=Bark_N\nOther[0]=Moss_N\nOther[1]=Bark_A_", sharedTextures, ""],
+      [sharedGraph, new Set([...sharedTextures].filter((name) => name !== "Leaf_N")), ""],
+      [sharedGraph, sharedTextures, "TextureStreamingData[0] = { TextureName = Moss_N }\nTextureStreamingData[1] = { TextureName = Leaf_N }"],
+    ] as const) {
+      const resolved = resolveMaterial({ name: "MI_Plant_leaf", readMat: () => mat, readProps: (name) => name === "MI_Plant_leaf" ? props : name.endsWith("trunk") ? "TextureStreamingData[0] = { TextureName = Bark_A_ }" : undefined, availableTextures: available, sharedGraphMaterialNames });
+      expect(resolved.bindings.find(({ slot }) => slot === "baseColor")?.texture).toBe("Moss_A");
+    }
+  });
+
   const textures = new Set([
     "T_Rock_D_R",
     "T_Rock_N",
@@ -660,6 +770,31 @@ CollectedVectorParameters[0] = { Value={ R=1,G=0,B=0,A=1 }, Name=BaseColor }
 });
 
 describe("named channel transforms", () => {
+  it("reads grayscale opacity without mistaking interleaved alpha for a red-channel sample", async () => {
+    const { default: sharp } = await import("sharp");
+    const colour = await sharp(Buffer.from([90, 110, 40, 75, 80, 50, 90, 110, 40, 75, 80, 50]), { raw: { width: 2, height: 2, channels: 3 } }).png().toBuffer();
+    const opacity = await sharp(Buffer.from([0, 64, 128, 255]), { raw: { width: 2, height: 2, channels: 1 } }).toColourspace("b-w").png().toBuffer();
+    const result = await applyTextureTransform(colour, "redToBaseColorAlpha", undefined, opacity);
+    const { data } = await sharp(result.data).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect([data[3], data[7], data[11], data[15]]).toEqual([0, 64, 128, 255]);
+  });
+
+  it("preserves colour RGB while composing a separate opacity map's red channel into alpha", async () => {
+    const { default: sharp } = await import("sharp");
+    const colour = await sharp(Buffer.from([90, 110, 40, 99, 75, 80, 50, 155]), { raw: { width: 2, height: 1, channels: 4 } }).png().toBuffer();
+    const opacity = await sharp(Buffer.from([0, 200, 255, 255, 128, 50, 250, 255]), { raw: { width: 2, height: 1, channels: 4 } }).png().toBuffer();
+    const result = await applyTextureTransform(colour, "redToBaseColorAlpha", undefined, opacity);
+    expect([...await sharp(result.data).ensureAlpha().raw().toBuffer()]).toEqual([90, 110, 40, 0, 75, 80, 50, 128]);
+  });
+
+  it("rejects missing or misaligned opacity data rather than producing opaque cutouts", async () => {
+    const { default: sharp } = await import("sharp");
+    const colour = await sharp({ create: { width: 2, height: 1, channels: 3, background: { r: 20, g: 40, b: 10 } } }).png().toBuffer();
+    const opacity = await sharp({ create: { width: 1, height: 1, channels: 3, background: { r: 100, g: 0, b: 255 } } }).png().toBuffer();
+    await expect(applyTextureTransform(colour, "redToBaseColorAlpha", undefined)).rejects.toThrow(/opacity/i);
+    await expect(applyTextureTransform(colour, "redToBaseColorAlpha", undefined, opacity)).rejects.toThrow(/dimensions/i);
+  });
+
   async function readPixel(data: Buffer): Promise<number[]> {
     const { default: sharp } = await import("sharp");
     const raw = await sharp(data).raw().toBuffer({ resolveWithObject: true });
@@ -868,6 +1003,74 @@ describe("web audio validation", () => {
 });
 
 describe("importing a local Unreal directory", () => {
+  it("keeps identical material graphs in isolated package namespaces from influencing each other", async () => {
+    const workspace = await unrealWorkspace();
+    const exported = join(dirname(workspace.sourceDir), "exported");
+    const io = new NodeIO();
+    const gltfPath = join(exported, "SM_Rock.gltf");
+    const document = await io.read(gltfPath);
+    const mesh = document.getRoot().listMeshes()[0]!;
+    const first = mesh.listPrimitives()[0]!;
+    first.getMaterial()!.setName("PackageA_MI_Wood");
+    mesh.addPrimitive(first.clone().setMaterial(document.createMaterial("PackageB_MI_Detail")));
+    await io.write(gltfPath, document);
+    const emptyAssets = () => ({ gltf: new Map<string, string>(), psa: new Map<string, string>(), mat: new Map<string, string>(), props: new Map<string, string>(), png: new Map<string, string>(), audio: new Map<string, string>(), dna: new Map<string, string>() });
+    const materialAssets = new Map<string, ReturnType<typeof emptyAssets>>();
+    for (const [library, material, family] of [["PackageA_MI_Wood", "MI_Wood", "Wood"], ["PackageB_MI_Detail", "MI_Detail", "Detail"]] as const) {
+      const assets = emptyAssets();
+      const directory = join(exported, library);
+      await mkdir(directory);
+      const mat = join(directory, `${material}.mat`);
+      const props = join(directory, `${material}.props.txt`);
+      await writeFile(mat, "Diffuse=Wood_A\nNormal=Detail_N\nOther[0]=Wood_N\nOther[1]=Detail_A\n");
+      await writeFile(props, `TextureStreamingData[0] = { TextureName = ${family}_A }`);
+      assets.mat.set(material, mat);
+      assets.props.set(material, props);
+      for (const texture of ["Wood_A", "Wood_N", "Detail_A", "Detail_N"]) {
+        const path = join(directory, `${texture}.png`);
+        await writePng(path, [140, 150, 130, 255]);
+        assets.png.set(texture, path);
+      }
+      materialAssets.set(library, assets);
+    }
+    const result = await packageGlb({ gltfPath, glbPath: join(exported, "namespaced.glb"), assets: emptyAssets(), maxTextureSize: undefined, keepAllUvSets: false, materialLookupNames: new Map([["PackageA_MI_Wood", "MI_Wood"], ["PackageB_MI_Detail", "MI_Detail"]]), materialAssets });
+    expect(result.sections[0]!.bindings.find(({ slot }) => slot === "normal")).toMatchObject({ texture: "Detail_N", confidence: "exact" });
+  });
+
+  it("reconstructs distinct shared-master sections and reports source-appearance limitations", async () => {
+    const graph = "Diffuse=Moss_A\nNormal=Bark_N\nOther[0]=Moss_N\nOther[1]=Bark_A_\nOther[2]=Leaf_A_02\nOther[3]=Leaf_N\nOther[4]=Leaf_O\n";
+    const workspace = await unrealWorkspace({ mat: graph, textures: ["Moss_A", "Moss_N", "Bark_A_", "Bark_N", "Leaf_A_02", "Leaf_N", "Leaf_O"] });
+    const exported = join(dirname(workspace.sourceDir), "exported");
+    const io = new NodeIO();
+    const document = await io.read(join(exported, "SM_Rock.gltf"));
+    const mesh = document.getRoot().listMeshes()[0]!;
+    const first = mesh.listPrimitives()[0]!;
+    first.getMaterial()!.setName("MI_Leaf");
+    mesh.addPrimitive(first.clone().setMaterial(document.createMaterial("MI_Bark")));
+    await io.write(join(exported, "SM_Rock.gltf"), document);
+    for (const name of ["MI_Leaf", "MI_Bark"]) {
+      await writeFile(join(exported, `${name}.mat`), graph);
+      await writeFile(join(exported, `${name}.props.txt`), "BlendMode = BLEND_Masked (1)\nTwoSided = true\nOpacityMaskClipValue = 0.333\n");
+    }
+    const { default: sharp } = await import("sharp");
+    await writeFile(join(exported, "Leaf_A_02.png"), await sharp(Buffer.from([150, 170, 90, 150, 170, 90, 150, 170, 90, 150, 170, 90]), { raw: { width: 2, height: 2, channels: 3 } }).png().toBuffer());
+    await writeFile(join(exported, "Leaf_O.png"), await sharp(Buffer.from([0, 20, 255, 255, 20, 255, 0, 20, 255, 255, 20, 255]), { raw: { width: 2, height: 2, channels: 3 } }).png().toBuffer());
+    const report = await importUnrealDirectory({ sourceDir: workspace.sourceDir, outputDir: workspace.outputDir, environment: workspace.environment });
+    const result = await io.read(join(workspace.outputDir, report.models[0]!.glb));
+    const leaf = result.getRoot().listMaterials().find((material) => material.getName() === "MI_Leaf")!;
+    const bark = result.getRoot().listMaterials().find((material) => material.getName() === "MI_Bark")!;
+    expect(leaf.getBaseColorTexture()?.getName()).toBe("Leaf_A_02_redToBaseColorAlpha");
+    expect(leaf.getNormalTexture()?.getName()).toBe("Leaf_N");
+    expect(bark.getBaseColorTexture()?.getName()).toBe("Bark_A_");
+    expect(bark.getNormalTexture()?.getName()).toBe("Bark_N");
+    expect(leaf.getAlphaCutoff()).toBe(0.333);
+    const pixels = await sharp(leaf.getBaseColorTexture()!.getImage()!).ensureAlpha().raw().toBuffer();
+    expect([...pixels]).toEqual([150, 170, 90, 0, 150, 170, 90, 255, 150, 170, 90, 0, 150, 170, 90, 255]);
+    expect(report.materials).toBe("degraded");
+    expect(report.warnings.join(" ")).toMatch(/heuristic|shader/i);
+    expect(report.models[0]!.materials.find(({ name }) => name === "MI_Leaf")?.alphaCutoff).toBe(0.333);
+  });
+
   it("routes a UE5 editor SkeletalMesh past UE Viewer and preserves skinning", async () => {
     const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
     const sourceMesh = join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset");

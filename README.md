@@ -403,8 +403,17 @@ require manually installed tools instead.
 | UE4 ISM/HISM and painted static-mesh foliage placement | Bulk-serialized instance matrices become `EXT_mesh_gpu_instancing`, which Three.js `GLTFLoader` loads as GPU-instanced meshes |
 | UE4 editor `LandscapeComponent` heightfields | Package-relative compressed BGRA8 heightmaps become indexed terrain meshes with decoded normals, component transforms, and original material names |
 | ActorX per-frame bone scale, dynamic Blueprint bytecode/construction scripts, Paper Terrain/spline deformation, and Nanite-only data without a fallback mesh | Detected or reported honestly; scene-level omissions are listed in `scenes[].omittedActors`, and Blueprint bytecode is never executed by the importer |
-| Arbitrary Unreal shader graphs | Common PBR inputs become standard glTF materials; graph inputs with no glTF counterpart remain named in the report instead of being silently discarded |
+| Arbitrary Unreal shader graphs | Recoverable PBR inputs become standard glTF materials. Reports mark materials as degraded when shader connections are unavailable, even if every section has a texture; section `limitations` explain omitted layering, graph UV transforms, subsurface lighting, normal strength, and deformation |
 | Encrypted Pak/IoStore | Unsupported without user-supplied keys and archive extraction; never reported as a complete conversion |
+
+Importer version 49 also respects material-instance override flags and modern
+parameter names. Contradictory texture samples duplicated across distinct mesh
+section families are repaired only when referenced texture families are
+unambiguous in the same export namespace. These bindings remain heuristic.
+Separate same-resolution opacity maps can supply base-colour alpha without
+altering RGB; different source dimensions are currently unsupported. Existing
+cached conversions are invalidated. A textured result does not certify the
+appearance of the original Unreal shader.
 
 Automatic uncooked conversion needs Python 3 with `venv` and `pip`. A Linux
 source build fallback for UE Viewer additionally needs `git`, `g++`, `perl`,
