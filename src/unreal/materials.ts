@@ -36,10 +36,12 @@ export type TextureTransform =
   | "redToRoughness"
   /** Separate red-channel roughness and metalness maps packed into glTF G and B. */
   | "redRoughnessRedMetalness"
+  /** Already packed glTF image: force G to one so an authored scalar supplies all roughness. */
+  | "roughnessToOne"
   /** Preserve diffuse RGB, with a separate opacity map's red channel as alpha. */
   | "redToBaseColorAlpha";
 
-export type BindingSource = "mat" | "props" | "filename" | "texture-set";
+export type BindingSource = "mat" | "props" | "filename" | "texture-set" | "authored-source";
 export type BindingConfidence = "exact" | "heuristic";
 
 export interface MaterialTextureBinding {
