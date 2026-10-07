@@ -439,6 +439,10 @@ altering RGB; different source dimensions are currently unsupported. Existing
 cached conversions are invalidated. A textured result does not certify the
 appearance of the original Unreal shader.
 
+Legacy instance sidecars without override flags retain inherited settings for
+ambiguous opaque, false, and zero defaults. Their non-default values retain the
+previous behavior; missing flags are reported as a material limitation.
+
 Automatic uncooked conversion needs Python 3 with `venv` and `pip`. A Linux
 source build fallback for UE Viewer additionally needs `git`, `g++`, `perl`,
 zlib, and SDL2 development headers. Unreal import currently runs on Linux and

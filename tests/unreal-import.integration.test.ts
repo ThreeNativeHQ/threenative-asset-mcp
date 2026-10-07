@@ -401,6 +401,79 @@ VectorParameterValues[0] =
 });
 
 describe("material reconstruction", () => {
+  it("preserves inherited settings for ambiguous legacy instance defaults without override flags", () => {
+    const resolved = resolveMaterial({
+      name: "MI_Legacy",
+      readMat: () => undefined,
+      readProps: (name) => name === "MI_Legacy"
+        ? "Parent = Material'M_Master.M_Master'\nBlendMode = BLEND_Opaque (0)\nTwoSided = false\nOpacityMaskClipValue = 0\n"
+        : "BlendMode = BLEND_Masked (1)\nTwoSided = true\nOpacityMaskClipValue = 0.42\n",
+      availableTextures: new Set(),
+    });
+    expect(resolved.alphaMode).toBe("MASK");
+    expect(resolved.alphaCutoff).toBe(0.42);
+    expect(resolved.doubleSided).toBe(true);
+    expect(resolved.limitations.join(" ")).toMatch(/override flags.*unavailable/i);
+  });
+
+  it("preserves non-default legacy instance settings without claiming their override flags", () => {
+    const resolved = resolveMaterial({
+      name: "MI_Legacy",
+      readMat: () => undefined,
+      readProps: (name) => name === "MI_Legacy"
+        ? "Parent = Material'M_Master.M_Master'\nBlendMode = BLEND_Masked (1)\nTwoSided = true\nOpacityMaskClipValue = 0.61\n"
+        : "BlendMode = BLEND_Opaque (0)\nTwoSided = false\nOpacityMaskClipValue = 0.42\n",
+      availableTextures: new Set(),
+    });
+    expect(resolved.alphaMode).toBe("MASK");
+    expect(resolved.alphaCutoff).toBe(0.61);
+    expect(resolved.doubleSided).toBe(true);
+    expect(resolved.limitations.join(" ")).toMatch(/override flags.*unavailable/i);
+  });
+
+  it("keeps explicit zero cutoffs and root material defaults", () => {
+    const parsed = parsePropsFile("BlendMode = BLEND_Opaque (0)\nTwoSided = false\nOpacityMaskClipValue = 0\n");
+    expect(parsed.blendMode).toBe("BLEND_Opaque");
+    expect(parsed.twoSided).toBe(false);
+    expect(parsed.opacityMaskClipValue).toBe(0);
+    const resolved = resolveMaterial({
+      name: "MI_Zero",
+      readMat: () => undefined,
+      readProps: (name) => name === "MI_Zero"
+        ? "Parent = Material'M_Master.M_Master'\nbOverride_OpacityMaskClipValue = true\nOpacityMaskClipValue = 0\n"
+        : "BlendMode = BLEND_Masked (1)\nOpacityMaskClipValue = 0.42\n",
+      availableTextures: new Set(),
+    });
+    expect(resolved.alphaCutoff).toBe(0);
+    expect(resolved.limitations).toEqual([]);
+  });
+
+  it("handles partial override flags independently and inherits through two instance levels", () => {
+    const props = new Map([
+      ["MI_Child", "Parent = Material'MI_Parent.MI_Parent'\nbOverride_BlendMode = true\nBlendMode = BLEND_Opaque (0)\nTwoSided = false\nOpacityMaskClipValue = 0\n"],
+      ["MI_Parent", "Parent = Material'M_Master.M_Master'\nTwoSided = true\nOpacityMaskClipValue = 0.61\n"],
+      ["M_Master", "BlendMode = BLEND_Masked (1)\nTwoSided = false\nOpacityMaskClipValue = 0.42\n"],
+    ]);
+    const resolved = resolveMaterial({name: "MI_Child", readMat: () => undefined, readProps: (name) => props.get(name), availableTextures: new Set()});
+    expect(resolved.alphaMode).toBe("OPAQUE");
+    expect(resolved.doubleSided).toBe(true);
+    expect(resolved.alphaCutoff).toBeUndefined();
+    const parent = resolveMaterial({name: "MI_Parent", readMat: () => undefined, readProps: (name) => props.get(name), availableTextures: new Set()});
+    expect(parent.alphaCutoff).toBe(0.61);
+    expect(parent.limitations.join(" ")).toMatch(/override flags.*unavailable/i);
+  });
+
+  it("reports missing legacy flags when parent metadata cannot supply an effective setting", () => {
+    const resolved = resolveMaterial({
+      name: "MI_MissingParent", readMat: () => undefined,
+      readProps: (name) => name === "MI_MissingParent" ? "Parent = Material'M_Missing.M_Missing'\nBlendMode = BLEND_Opaque (0)\nTwoSided = false\nOpacityMaskClipValue = 0\n" : undefined,
+      availableTextures: new Set(),
+    });
+    expect(resolved.alphaMode).toBe("OPAQUE");
+    expect(resolved.doubleSided).toBe(false);
+    expect(resolved.limitations.join(" ")).toMatch(/override flags.*unavailable/i);
+  });
+
   it("uses inherited settings when an instance explicitly disables its base-property overrides", () => {
     const resolved = resolveMaterial({
       name: "MI_Leaf",
@@ -459,7 +532,7 @@ TwoSided = false
   });
 
   it("keeps an explicit opaque override when the parent exports an opacity sample", () => {
-    const resolved = resolveMaterial({ name: "MI_Solid", readMat: () => "Diffuse=Wood_A\nOpacity=Wood_O\n", readProps: (name) => name === "MI_Solid" ? "Parent = Material'M_Master.M_Master'\nBlendMode = BLEND_Opaque (0)\n" : "BlendMode = BLEND_Masked (1)\n", availableTextures: new Set(["Wood_A", "Wood_O"]) });
+    const resolved = resolveMaterial({ name: "MI_Solid", readMat: () => "Diffuse=Wood_A\nOpacity=Wood_O\n", readProps: (name) => name === "MI_Solid" ? "Parent = Material'M_Master.M_Master'\nbOverride_BlendMode = true\nBlendMode = BLEND_Opaque (0)\n" : "BlendMode = BLEND_Masked (1)\n", availableTextures: new Set(["Wood_A", "Wood_O"]) });
     expect(resolved.alphaMode).toBe("OPAQUE");
   });
 

@@ -109,6 +109,8 @@ export interface PropsFile {
   readonly parent: string | undefined;
   /** Instance-local streaming references identify a surface family, never its UV transform. */
   readonly streamingTextures: readonly string[];
+  /** Legacy decoder sidecars can omit the flags that distinguish instance defaults from overrides. */
+  readonly overrideFlagsMissing: boolean;
 }
 
 const MAT_SLOTS = new Set([
@@ -286,10 +288,18 @@ export function parsePropsFile(text: string): PropsFile {
     }
   }
 
+  const overrideFlag = (name: string): boolean | undefined => {
+    const value = new RegExp(`^\\s*bOverride_${name}\\s*=\\s*(true|false)\\s*$`, "m").exec(text)?.[1];
+    return value === undefined ? undefined : value === "true";
+  };
+  const effective = <T>(name: string, value: T | undefined, placeholder: T): T | undefined => {
+    const flag = overrideFlag(name);
+    return flag === false || (parent !== undefined && flag === undefined && value === placeholder) ? undefined : value;
+  };
   return {
-    twoSided: /^\s*bOverride_TwoSided\s*=\s*false\s*$/m.test(text) ? undefined : twoSided,
-    blendMode: /^\s*bOverride_BlendMode\s*=\s*false\s*$/m.test(text) ? undefined : blendMode,
-    opacityMaskClipValue: /^\s*bOverride_OpacityMaskClipValue\s*=\s*false\s*$/m.test(text) ? undefined : opacityMaskClipValue,
+    twoSided: effective("TwoSided", twoSided, false),
+    blendMode: effective("BlendMode", blendMode, "BLEND_Opaque"),
+    opacityMaskClipValue: effective("OpacityMaskClipValue", opacityMaskClipValue, 0),
     collected,
     overrides,
     scalars,
@@ -298,6 +308,9 @@ export function parsePropsFile(text: string): PropsFile {
     vectorOverrides,
     parent,
     streamingTextures,
+    overrideFlagsMissing: parent !== undefined && [
+      ["TwoSided", twoSided], ["BlendMode", blendMode], ["OpacityMaskClipValue", opacityMaskClipValue],
+    ].some(([name, value]) => value !== undefined && overrideFlag(String(name)) === undefined),
   };
 }
 
@@ -505,6 +518,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     }
 
     if (props) {
+      if (props.overrideFlagsMissing) limitations.add("Material-instance override flags are unavailable: ambiguous opaque, false and zero defaults inherit parent settings; non-default values retain legacy behavior without certifying the effective Unreal settings.");
       inheritedSidedness ??= props.twoSided;
       inheritedBlend ??= props.blendMode;
       alphaCutoff ??= props.opacityMaskClipValue;
