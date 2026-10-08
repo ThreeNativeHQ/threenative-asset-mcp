@@ -1,11 +1,21 @@
 import { open, readdir, stat } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
+import sharp from "sharp";
 
 /**
  * The content-browser thumbnail an Unreal editor embeds in an uncooked `.uasset` (an
  * `FObjectThumbnail`: int32 width, int32 height, int32 compressedSize, then the PNG or JPEG bytes).
  * It is the editor's own render of that one asset, so it is a per-piece "original" to set beside our
  * import of the same piece.
+ *
+ * Channel order. The stored image has red and blue exchanged (consistent with the editor writing its BGRA `FColor`
+ * buffer as if it were RGBA; the engine reads it back the same way, so it never shows; the mechanism is inferred,
+ * the swap is measured). Measured on the Soul Cave pack (UE 4.18, package legacy version -7): for each of the 37 texture
+ * packages checked, the thumbnail is closer to UE Viewer's export of the same texture with red and blue swapped
+ * than as stored (34 of them by a factor of 1.5 or more, the other 3 near-neutral or not matching either way), and
+ * a rock texture that exports brown has a blue-grey stored thumbnail. Packages whose summary says UE4 are
+ * therefore returned with red and blue swapped back. UE5 packages (legacy version -8 and below) and packages
+ * without a readable summary are returned as stored: the order there is unverified.
  *
  * A PNG or JPEG found in a package is accepted only when the 12 bytes in front of it parse as that
  * record and agree with the image: little-endian width and height equal the image header's, and
@@ -25,6 +35,28 @@ export interface PackageThumbnail {
   readonly width: number;
   readonly height: number;
   readonly bytes: Buffer;
+  /** True when `bytes` had red and blue exchanged back (see the channel-order note above); it is then a PNG. */
+  readonly channelsSwapped?: boolean;
+}
+
+const PACKAGE_TAG = 0x9e2a83c1;
+
+/** True when the package summary at the start of `head` is a UE4 one (legacy file version -7 .. -1). */
+export function packageStoresSwappedThumbnail(head: Buffer): boolean {
+  if (head.length < 8 || head.readUInt32LE(0) !== PACKAGE_TAG) return false;
+  const legacy = head.readInt32LE(4);
+  return legacy <= -1 && legacy >= -7;
+}
+
+/** The same image with its red and blue channels exchanged, as a PNG (alpha kept). */
+export async function swapRedBlue(image: Buffer): Promise<Buffer> {
+  const { data, info } = await sharp(image).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  for (let at = 0; at + 3 < data.length; at += 4) {
+    const red = data[at]!;
+    data[at] = data[at + 2]!;
+    data[at + 2] = red;
+  }
+  return sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
 }
 
 /** Length of the PNG that starts at `start`, ending exactly after IEND; undefined when truncated. */
@@ -117,7 +149,7 @@ export function findThumbnailInPackage(buffer: Buffer, fileSize = buffer.length)
 }
 
 /**
- * The editor thumbnail of an uncooked `.uasset` as PNG/JPEG bytes, or `undefined` when the package
+ * The editor thumbnail of an uncooked `.uasset` as PNG/JPEG bytes, in true colour order (see above), or `undefined` when the package
  * has none, is not a `.uasset`, or cannot be read. UE5 packages are accepted when the same record
  * validates; there is no version-specific path.
  */
@@ -133,7 +165,9 @@ export async function readPackageThumbnail(uassetPath: string): Promise<PackageT
     handle = await open(uassetPath, "r");
     const head = Buffer.alloc(Math.min(size, SCAN_BYTES));
     const { bytesRead } = await handle.read(head, 0, head.length, 0);
-    return findThumbnailInPackage(head.subarray(0, bytesRead), size);
+    const found = findThumbnailInPackage(head.subarray(0, bytesRead), size);
+    if (found === undefined || !packageStoresSwappedThumbnail(head.subarray(0, bytesRead))) return found;
+    return { format: "png", width: found.width, height: found.height, bytes: await swapRedBlue(found.bytes), channelsSwapped: true };
   } catch {
     return undefined;
   } finally {
