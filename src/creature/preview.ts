@@ -437,15 +437,20 @@ async function createBrowserHarness(payloadRoot: string): Promise<{ readonly roo
   const harness = join(temporary, "harness");
   const assets = join(harness, "assets");
   const tmp = join(temporary, "tmp");
-  await mkdir(assets, { recursive: true, mode: 0o700 });
-  await mkdir(tmp, { recursive: true, mode: 0o700 });
-  for (const name of ["pwlaunch.mjs", "pwprobe.mjs", "silmetrics.mjs", "hero.mjs"]) {
-    await copyFile(join(payloadRoot, "harness", name), join(harness, name));
+  try {
+    await mkdir(assets, { recursive: true, mode: 0o700 });
+    await mkdir(tmp, { recursive: true, mode: 0o700 });
+    for (const name of ["pwlaunch.mjs", "pwprobe.mjs", "silmetrics.mjs", "hero.mjs"]) {
+      await copyFile(join(payloadRoot, "harness", name), join(harness, name));
+    }
+    await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(assets, "three-bundle.js"));
+    const playwrightRoot = await packageDirectory();
+    await mkdir(join(temporary, "node_modules"), { recursive: true, mode: 0o700 });
+    await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
+  } catch (error) {
+    await rm(temporary, { recursive: true, force: true });
+    throw error;
   }
-  await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(assets, "three-bundle.js"));
-  const playwrightRoot = await packageDirectory();
-  await mkdir(join(temporary, "node_modules"), { recursive: true, mode: 0o700 });
-  await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
   return {
     root: temporary,
     scriptRoot: harness,

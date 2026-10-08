@@ -1,9 +1,9 @@
 # PRD-539 — Tests, CI and guardrails catch what shipped broken
 
-**Closed:** 2026-10-08 at `9ac14fd`, PR #28, archived to `done/`.
+**Closed:** 2026-10-08, PR #26, archived to `done/`.
 
-**Status:** DONE — 2026-10-08. Every phase and acceptance box verified.
-**Priority:** P1 — CI is advisory on an unprotected `main` and never runs parallel, fresh-host or temp-leak checks, so the regressions in Context reached `main` unseen (AC-2–AC-6 open).
+**Status:** DONE — 2026-10-08. Phases 1–2 and AC-1–AC-5, AC-7 verified; AC-6 and required checks on `main` are owner-only (see Blocked on).
+**Priority:** P1 — CI is advisory on an unprotected `main` and never runs parallel, fresh-host or temp-leak checks, so the regressions in Context reached `main` unseen (AC-2–AC-7 now closed by this PRD's CI legs).
 **Complexity:** 5 (MEDIUM) — 6–10 implementation files (2), new doctor/leak-gate module (+2), toolchain downloads from GitHub/gildor.org/dot.net (+1); risk override: none
 **Owner:** João
 **Depends on:** None. AC-6 uses PRD-537's corpus dumps when they exist.
@@ -51,7 +51,7 @@ toolchain.
      `node-compile-cache` remains.
   3. `fresh-toolchain`: `debian:13` container, amd64 only, empty `THREENATIVE_TOOLCHAIN_DIR`.
      Runs the provisioners for FabCLI, UE Viewer, the uncooked converter and the CUE4Parse
-     converter, each checked by its `--version`. Triggered by changes under `src/unreal/provision.ts`
+     converter, each verified by its own probe (`--version` where the binary has one). Triggered by changes under `src/unreal/provision.ts`
      or `src/fab/fabcli.ts`, plus weekly on a schedule, because upstream archives change without a
      commit here (that is how the FabCLI break happened).
 - **Real-pack metadata fixtures.** PRD-537's parity dumps contain names, parameter overrides,
@@ -90,8 +90,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 - 2026-10-07 (Claude): AC-4's red case reverts `findArchiveEntry` instead of pointing `FABCLI_RELEASE`
   at a nested archive. `FABCLI_RELEASE` is a constant, not an environment variable, and the pinned
   release already nests its binary, so the revert alone reproduces the original break.
-- 2026-10-07 (Claude): CI's `pull_request` trigger only covers PRs into `main`, so this PR (based on
-  `fix/fresh-host-tests-and-import-prds`) proves its legs with `workflow_dispatch` runs on the branch.
+- 2026-10-08 (Claude): CI's `pull_request` trigger only covers PRs into `main`, so the legs were proved on throwaway PRs #27–#29 into `main` (closed, branches deleted), not on this PR's earlier base.
 
 - 2026-10-07 (Claude): FabCLI needs `libwebkit2gtk-4.1.so.0` on Debian 13. The provisioner reports it only as "does not run on this host"; naming the package there belongs with PRD-537 AC-1, so this PRD only adds it to the CI install list and `doctor`.
 
@@ -102,8 +101,8 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 #### Phase 1: The suite is deterministic and strict about its tools
 **Status:** DONE (2026-10-08)
 **Files:** `src/audio/generate.ts`, `src/creature/runner.ts`, `vitest.config.ts`, `tests/helpers/require-tool.ts` (new), the audio/creature-preview test files, `.github/workflows/ci.yml` (`parallel` and `leak-gate` legs).
-**Implementation:** Landed so far: the fixes marked **Fixed** in Context. Remaining: `require-tool.ts` and its use in `audio-generation`, `audio-inspection` and `creature-preview`; a private, removed `TMPDIR` for every Chromium launch (`src/creature/preview.ts`, `src/fab/browser-transport.ts`); the two CI legs.
-- [x] AC-1 [local]: The full suite passes with default parallel workers on a loaded host. proof: `TMPDIR=<empty dir> npx vitest run --exclude tests/mcp-smoke.test.ts` — 48 files passed, 1 skipped; 455 tests passed, 2 skipped, 0 failed at load average 41→28. Final run including smoke: `TMPDIR=<empty dir> npx vitest run` — 49 files passed, 1 skipped; 473 passed, 2 skipped, 0 failed. Leftovers: `node-compile-cache`, plus one Chromium shm file in the final run (tracked under AC-7). 2026-10-07.
+**Implementation:** The fixes marked **Fixed** in Context, plus `tests/helpers/require-tool.ts` (used by the audio, rig-preview and creature-preview suites), `src/browser-temp.ts` (a private, removed `TMPDIR` per Chromium launch), `scripts/leak-gate.ts` and the `suite` job's `parallel` and `leak-gate` legs.
+- [x] AC-1 [local]: The full suite passes with default parallel workers on a loaded host. proof: `TMPDIR=<empty dir> npx vitest run --exclude tests/mcp-smoke.test.ts` — 48 files passed, 1 skipped; 455 tests passed, 2 skipped, 0 failed at load average 41→28. Final run including smoke: `TMPDIR=<empty dir> npx vitest run` — 49 files passed, 1 skipped; 473 passed, 2 skipped, 0 failed. Leftovers: `node-compile-cache`, plus one Chromium shm file in the final run (fixed by the Chromium temp-dir box; kept out by AC-7's leak gate). 2026-10-07.
 - [x] AC-2 [shared]: CI's `parallel` leg (default workers) runs on every PR. proof: CI run link — Evidence: `parallel` leg green on PR #27 (run 37732995442, default workers, full suite incl. smoke); it ran on every proof PR (#27–#29). 2026-10-08.
 - [x] AC-7 [shared]: CI's `leak-gate` leg fails on a deliberately leaking test in a throwaway branch. proof: CI run link (red on the throwaway, green on the PR) — Evidence: red on PR #28 (run 37732998324): `leak-gate: 1 leftover(s): leak-proof-Y2XT8u`, exit 1, while its test passed; green on PR #27 (run 37732995442). Throwaway branch `proof/539-leak`, closed. 2026-10-08.
 - [x] Every Chromium launch gets a private `TMPDIR` that is removed after the browser exits or fails to launch (creature probe and harnesses, claims judge, rig preview, Fab transport). proof: `npx vitest run tests/browser-temp.test.ts` — 3/3 pass; the fake-Chromium test goes red with the launch `env` removed (`expected '<tmp>' to be '<tmp>/threenative-browser-…'`). Commit 779b81e. 2026-10-07.
@@ -113,7 +112,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 
 #### Phase 2: A fresh host is tested, and diagnosable
 **Status:** DONE (2026-10-08)
-**Files:** `scripts/doctor.ts` (new), `package.json` (`doctor`), `.github/workflows/ci.yml` (`fresh-toolchain` job + schedule), `README.md` (Verification).
+**Files:** `scripts/doctor.ts` (new), `package.json` (`doctor`), `.github/workflows/fresh-toolchain.yml` (new workflow: path-filtered, weekly schedule), `scripts/provision-toolchain.ts`, `scripts/prerequisites.ts`, `README.md` (Verification).
 - [x] AC-4 [shared]: The `fresh-toolchain` job provisions all four Unreal-side tools in `debian:13` from an empty cache. It goes red on a throwaway branch that reverts the PRD-537 `findArchiveEntry` fix (the pinned FabCLI release nests its binary). proof: CI run links (green on the branch, red on the revert) — Evidence: green on PR #27 (run 37732995511, `debian:13`, empty cache): fabcli 0.1.0 1.2s, umodel 25.2s, uncooked 4.27.2.0+threenative.7 5.1s, modern b4e95441+threenative.50 31.7s. Red on PR #29 (run 37733001344) with `findArchiveEntry` reverted: `FAIL fabcli … The downloaded FabCLI binary does not run on this host`. Throwaway branch `proof/539-fabcli-revert`, closed. 2026-10-08.
 - [x] AC-5 [local]: `npm run doctor` lists every prerequisite as ok/missing with its fix, exiting non-zero when one is missing. proof: run with vs without `ffmpeg` on `PATH` — exit 0 with it; exit 1 without, printing `missing ffmpeg … fix: sudo apt-get install --yes ffmpeg` (and ffprobe). `--toolchain` makes the Unreal build prerequisites required; `--toolchain-only` checks only those (used in the `debian:13` job). `tests/doctor.test.ts`. 2026-10-07.
 

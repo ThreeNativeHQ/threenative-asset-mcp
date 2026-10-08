@@ -506,19 +506,24 @@ async function createJudgeHarness(payloadRoot: string): Promise<{
   const tmp = join(temporary, "tmp");
   const threeBuild = join(temporary, "node_modules", "three", "build");
   const threeLoaders = join(temporary, "node_modules", "three", "examples", "jsm", "loaders");
-  await mkdir(scriptRoot, { recursive: true, mode: 0o700 });
-  await mkdir(tmp, { recursive: true, mode: 0o700 });
-  await mkdir(threeBuild, { recursive: true, mode: 0o700 });
-  await mkdir(threeLoaders, { recursive: true, mode: 0o700 });
-  await copyFile(join(payloadRoot, "harness", "judge.mjs"), join(scriptRoot, "judge.mjs"));
-  await copyFile(join(payloadRoot, "harness", "pwlaunch.mjs"), join(scriptRoot, "pwlaunch.mjs"));
-  await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(scriptRoot, "assets-three-bundle.js"));
-  await mkdir(join(scriptRoot, "assets"), { recursive: true, mode: 0o700 });
-  await rename(join(scriptRoot, "assets-three-bundle.js"), join(scriptRoot, "assets", "three-bundle.js"));
-  await writeFile(join(threeBuild, "three.module.js"), `${THREE_BROWSER_MODULE}\n`, { mode: 0o600 });
-  await writeFile(join(threeLoaders, "GLTFLoader.js"), `${GLTF_LOADER_BROWSER_MODULE}\n`, { mode: 0o600 });
-  const playwrightRoot = await installedPackageRoot("playwright");
-  await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
+  try {
+    await mkdir(scriptRoot, { recursive: true, mode: 0o700 });
+    await mkdir(tmp, { recursive: true, mode: 0o700 });
+    await mkdir(threeBuild, { recursive: true, mode: 0o700 });
+    await mkdir(threeLoaders, { recursive: true, mode: 0o700 });
+    await copyFile(join(payloadRoot, "harness", "judge.mjs"), join(scriptRoot, "judge.mjs"));
+    await copyFile(join(payloadRoot, "harness", "pwlaunch.mjs"), join(scriptRoot, "pwlaunch.mjs"));
+    await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(scriptRoot, "assets-three-bundle.js"));
+    await mkdir(join(scriptRoot, "assets"), { recursive: true, mode: 0o700 });
+    await rename(join(scriptRoot, "assets-three-bundle.js"), join(scriptRoot, "assets", "three-bundle.js"));
+    await writeFile(join(threeBuild, "three.module.js"), `${THREE_BROWSER_MODULE}\n`, { mode: 0o600 });
+    await writeFile(join(threeLoaders, "GLTFLoader.js"), `${GLTF_LOADER_BROWSER_MODULE}\n`, { mode: 0o600 });
+    const playwrightRoot = await installedPackageRoot("playwright");
+    await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
+  } catch (error) {
+    await rm(temporary, { recursive: true, force: true });
+    throw error;
+  }
   return {
     root: temporary,
     scriptRoot,

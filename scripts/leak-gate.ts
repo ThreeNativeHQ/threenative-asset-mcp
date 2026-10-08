@@ -50,7 +50,8 @@ function runCommand(command: readonly string[], dir: string): Promise<number> {
 
 async function leftovers(dir: string): Promise<string[]> {
   const entries = await readdir(dir, { recursive: true });
-  return entries.filter((entry) => entry.split(sep)[0] !== SHARED_CACHE);
+  // The cache is allowed, but a Chromium shared-memory file inside it is the leak this gate exists for.
+  return entries.filter((entry) => entry.split(sep)[0] !== SHARED_CACHE || /(^|[\\/])\.org\.chromium\./u.test(entry));
 }
 
 async function main(): Promise<number> {
