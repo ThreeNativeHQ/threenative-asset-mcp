@@ -42,6 +42,72 @@ const resolve = (files: Record<string, { mat?: string; props?: string }>, name: 
     availableTextures: new Set(textures),
   });
 
+// Old West - VOL 5 - Town Props: MM_MasterMaterial_01a declares an `Emissive` texture parameter whose
+// default is the neutral TX_Fill_01_ALB, but its UE Viewer `.mat` — the resolved graph — names no
+// Emissive output. Binding that default painted every instance with a flat grey emissive that washed
+// the dark albedo out to near-white.
+describe("a resolved .mat forbids parameter defaults from inventing slots", () => {
+  const west = {
+    MI_Chair: {
+      mat: "Diffuse=TX_Chair_ALB\nNormal=TX_Chair_NRM\nOther[0]=TX_Chair_RMA\nOther[1]=TX_Fill_ALB\nOther[2]=TX_Fill_NRM\nOther[3]=TX_Fill_RMA\n",
+      props: instanceProps("MM_Master", [["Albedo", "TX_Chair_ALB"], ["Normal", "TX_Chair_NRM"], ["RMA", "TX_Chair_RMA"]]),
+    },
+    MM_Master: {
+      mat: "Diffuse=TX_Fill_ALB\nNormal=TX_Fill_NRM\nOther[0]=TX_Fill_RMA\n",
+      props: masterProps([["Albedo", "TX_Fill_ALB"], ["Emissive", "TX_Fill_ALB"], ["Normal", "TX_Fill_NRM"], ["RMA", "TX_Fill_RMA"]]),
+    },
+  };
+  const available = ["TX_Chair_ALB", "TX_Chair_NRM", "TX_Chair_RMA", "TX_Fill_ALB", "TX_Fill_NRM", "TX_Fill_RMA"];
+
+  it("does not bind a master's Emissive default when the resolved graph names no Emissive slot", () => {
+    const resolved = resolve(west, "MI_Chair", available);
+    expect(resolved.bindings.find((b) => b.slot === "emissive")).toBeUndefined();
+    const bound = resolved.bindings.flatMap((b) => [b.texture, b.secondaryTexture ?? []].flat());
+    expect(bound).not.toContain("TX_Fill_ALB");
+  });
+
+  it("still binds the Emissive the resolved graph actually names", () => {
+    const resolved = resolve(
+      {
+        MI_Lamp: { mat: "Diffuse=TX_Lamp_D\nEmissive=TX_Lamp_E\n", props: masterProps([["Diffuse", "TX_Lamp_D"], ["Emissive", "TX_Lamp_E"]]) },
+      },
+      "MI_Lamp",
+      ["TX_Lamp_D", "TX_Lamp_E"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "emissive")).toMatchObject({ texture: "TX_Lamp_E", source: "mat" });
+  });
+
+  it("keeps binding a modern-converter material whose .mat names no slot", () => {
+    // The UE5 converter writes `Other[n]` references only; props collected is then the sole slot source.
+    const resolved = resolve(
+      {
+        M_UE5: {
+          mat: "Other[0]=T_UE5_D\nOther[1]=T_UE5_N\n",
+          props: masterProps([["BaseColor", "T_UE5_D"], ["Normal", "T_UE5_N"]]),
+        },
+      },
+      "M_UE5",
+      ["T_UE5_D", "T_UE5_N"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "baseColor")).toMatchObject({ texture: "T_UE5_D", source: "props" });
+    expect(resolved.bindings.find((b) => b.slot === "normal")).toMatchObject({ texture: "T_UE5_N", source: "props" });
+  });
+
+  it("still recovers a diffuse the .mat left in Other beside a named slot", () => {
+    const resolved = resolve(
+      {
+        M_Leaf: {
+          mat: "Normal=T_Leaf_N\nSpecPower=T_Leaf_S\nOther[0]=T_Leaf_Atlas\n",
+          props: masterProps([["Diffuse", "T_Leaf_Atlas"], ["Normal", "T_Leaf_N"]]),
+        },
+      },
+      "M_Leaf",
+      ["T_Leaf_Atlas", "T_Leaf_N", "T_Leaf_S"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "baseColor")).toMatchObject({ texture: "T_Leaf_Atlas", source: "props" });
+  });
+});
+
 describe("material instance overrides beat parent defaults", () => {
   // Shaped like Soul Cave's MI_Cave_Rock_Pillar: UE Viewer wrote the instance's .mat from the
   // parent's defaults, while the instance's TextureParameterValues name the real textures.
