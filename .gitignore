@@ -30,3 +30,6 @@ work/
 # Agent worktrees
 .worktrees/
 __pycache__/
+
+# AFK run logs
+.afk/
