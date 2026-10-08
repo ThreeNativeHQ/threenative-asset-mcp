@@ -83,6 +83,7 @@ const SUPPORTED_NODE_CLASSES = [
   "Constant3Vector",
   "Constant4Vector",
   "Multiply",
+  "Divide",
   "Add",
   "Subtract",
   "LinearInterpolate",
@@ -486,6 +487,9 @@ class Compiler {
       // Class defaults below are Unreal's; the dumper omits a constant that equals its default.
       case "Multiply":
         return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => x * y);
+      case "Divide":
+        // A divisor within 1e-6 of zero is pushed out to 1e-6, keeping its sign, so a black texel yields a large finite value.
+        return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => x / (Math.abs(y) < 1e-6 ? (y < 0 ? -1e-6 : 1e-6) : y));
       case "Add":
         return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => x + y);
       case "Subtract":

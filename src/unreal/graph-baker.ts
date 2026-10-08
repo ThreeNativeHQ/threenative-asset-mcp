@@ -59,6 +59,11 @@ export interface GraphBakerOptions {
   readonly modernConverter?: ExternalTool | undefined;
   /** The importer's longest embedded edge; the bake never exceeds 1024 either way. */
   readonly maxTextureSize?: number | undefined;
+  /**
+   * Exports one texture package that the mesh export did not carry (colour textures that only a material
+   * function references) and returns the PNG path, or undefined. Tried after `assets.png`.
+   */
+  readonly exportTexture?: ((name: string) => Promise<string | undefined>) | undefined;
   /** Test seam; production runs the converter's `--dump-graphs` mode. */
   readonly dumpGraphs?: typeof dumpMaterialGraphs;
 }
@@ -246,7 +251,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         allowUvSetFallback: true,
         loadTexture: async (reference) => {
           const name = textureBasename(reference);
-          const path = request.assets.png.get(name);
+          const path = request.assets.png.get(name) ?? (await options.exportTexture?.(name));
           if (!path) return undefined;
           if (request.assets.ambiguousPng?.has(name) && !loaded.has(name)) ambiguous.push(name);
           loaded.add(name);

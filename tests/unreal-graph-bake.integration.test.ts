@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,14 +24,14 @@ type Raw = Record<string, unknown>;
 const pin = (node: string, mask: number[] | null = null) => ({ node, output: 0, mask });
 const node = (id: string, cls: string, extra: Raw = {}): Raw => ({ id, class: cls, inputs: {}, constants: {}, ...extra });
 
-function masterGraph(kind: "mask-tint" | "vertex-color" = "mask-tint"): MaterialGraph {
+function masterGraph(kind: "mask-tint" | "vertex-color" = "mask-tint", defaultTexture = "T_MasterMask"): MaterialGraph {
   const nodes: Raw[] =
     kind === "mask-tint"
       ? [
           node("mask", "TextureSampleParameter2D", {
             parameter: { name: "Mask", group: "" },
             default: null,
-            texture: "/Game/Test/T_MasterMask.T_MasterMask",
+            texture: `/Game/Test/${defaultTexture}.${defaultTexture}`,
             samplerType: "Masks",
           }),
           node("tint", "Constant3Vector", { constants: { Constant: [0.5, 0.25, 1, 1] } }),
@@ -226,7 +226,33 @@ process.exit(0);
   await chmod(path, 0o755);
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean }) {
+/** A umodel that exports `hiddenFrom` for the one texture package `T_Hidden` and defers everything else to `base`. */
+async function writeDispatchingUmodel(path: string, base: string, hiddenFrom: string, log: string): Promise<void> {
+  await writeFile(
+    path,
+    `#!/usr/bin/env node
+"use strict";
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const { basename, join } = require("node:path");
+const argv = process.argv.slice(2);
+const selector = argv.filter((entry) => !entry.startsWith("-")).pop() || "";
+if (argv.includes("-export") && basename(selector) === "T_Hidden") {
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(argv) + "\\n");
+  const out = argv.find((entry) => entry.indexOf("-out=") === 0).slice("-out=".length);
+  fs.mkdirSync(join(out, "Group"), { recursive: true });
+  fs.cpSync(${JSON.stringify(hiddenFrom)}, join(out, "Group"), { recursive: true });
+  process.exit(0);
+}
+const run = spawnSync(${JSON.stringify(base)}, argv, { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
+process.stdout.write(run.stdout || ""); process.stderr.write(run.stderr || "");
+process.exit(run.status === null ? 1 : run.status);
+`,
+  );
+  await chmod(path, 0o755);
+}
+
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -241,13 +267,24 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     name: "Mesh",
     materialName: "MI_Rock",
     mat: "",
-    props: instanceProps("M_Master", [["Mask", "T_InstanceMask"]]),
+    props: instanceProps("M_Master", options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]]),
     textures: [],
   });
   await writePng(join(exported, "T_InstanceMask.png"), [200, 100, 50, 255], 4);
   await writePng(join(exported, "T_MasterMask.png"), [10, 10, 10, 255], 4);
   const umodel = join(root, "umodel");
-  await writeFakeUmodel(umodel, { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
+  const textureLog = join(root, "texture-exports.log");
+  const cacheDir = join(root, "cache");
+  if (options.hiddenTexture) {
+    // T_Hidden is referenced only by the graph: the mesh export does not carry it, only its own package export does.
+    await writeFile(join(content, "T_Hidden.uasset"), Buffer.alloc(16));
+    await mkdir(join(root, "hidden"), { recursive: true });
+    await writePng(join(root, "hidden", "T_Hidden.png"), [80, 160, 240, 255], 4);
+    await writeFakeUmodel(join(root, "umodel-base"), { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
+    await writeDispatchingUmodel(umodel, join(root, "umodel-base"), join(root, "hidden"), textureLog);
+  } else {
+    await writeFakeUmodel(umodel, { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
+  }
   const converter = join(root, "converter");
   const converterLog = join(root, "converter.log");
   await writeFakeConverter(converter, options.graph, converterLog);
@@ -257,6 +294,7 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     onlyPackages: ["Mesh"],
     concurrency: 1,
     freeSpaceBytes: 30_000_000_000,
+    environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: cacheDir },
     umodel: { name: "umodel", path: umodel, version: "fixture" },
     modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
     ...(options.graphBake === undefined ? {} : { graphBake: options.graphBake }),
@@ -264,7 +302,9 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   const glb = await new NodeIO().read(join(outputDir, report.models[0]!.glb));
   const onDisk = JSON.parse(await readFile(join(outputDir, "import-report.json"), "utf8")) as ImportReport;
   const dumped = await readFile(converterLog, "utf8").catch(() => "");
-  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, dumped };
+  const leftovers = await readdir(cacheDir, { recursive: true }).catch(() => [] as string[]);
+  const textureExports = (await readFile(textureLog, "utf8").catch(() => "")).split("\n").filter(Boolean);
+  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, dumped, leftovers, textureExports };
 }
 
 describe("importUnrealDirectory graph bake", () => {
@@ -309,5 +349,47 @@ describe("importUnrealDirectory graph bake", () => {
     expect(section.graph?.unsupportedNodes).toContain("VertexColor");
     expect(section.bindings.some((binding) => binding.source === "graph")).toBe(false);
     expect(report.materialCoverage.graphBaked).toBe(0);
+  });
+});
+
+describe("graph textures that only a material function references", () => {
+  it("unit: falls back to exportTexture after assets.png and stays unavailable, named, when both fail", async () => {
+    const root = await scratch("graph-bake-export-");
+    const content = join(root, "source", "Content", "Test");
+    await mkdir(content, { recursive: true });
+    await writeFile(join(content, "M_Master.uasset"), Buffer.alloc(16));
+    await writePng(join(root, "T_Late.png"), [200, 100, 50, 255], 4);
+    const requested: string[] = [];
+    const make = (exportTexture: (name: string) => Promise<string | undefined>) =>
+      createGraphBaker({ sourceDir: join(root, "source"), maxTextureSize: 4, exportTexture, dumpGraphs: async () => new Map([["M_Master", masterGraph("mask-tint", "T_Late")]]) })!;
+    const request = { materialName: "M_Master", lookupName: "M_Master", assets: { png: new Map<string, string>() }, readProps: () => undefined };
+    const baked = await make(async (name) => {
+      requested.push(name);
+      return join(root, "T_Late.png");
+    })(request);
+    expect(baked.status).toBe("baked");
+    expect(requested).toEqual(["T_Late"]);
+    const failed = await make(async () => undefined)(request);
+    expect(failed).toMatchObject({ status: "unavailable" });
+    expect(failed.status === "unavailable" && failed.reason).toContain("T_Late");
+    // assets.png wins when the mesh export did carry the texture.
+    const asked: string[] = [];
+    const present = await make(async (name) => {
+      asked.push(name);
+      return undefined;
+    })({ ...request, assets: { png: new Map([["T_Late", join(root, "T_Late.png")]]) } });
+    expect(present.status).toBe("baked");
+    expect(asked).toEqual([]);
+  });
+
+  it("importer: exports the one package on demand, bakes it, and leaves nothing behind", async () => {
+    const { report, material, textureExports, leftovers } = await importWithGraph({ graph: masterGraph("mask-tint", "T_Hidden"), hiddenTexture: true });
+    expect(material.getBaseColorTexture()).not.toBeNull();
+    expect(await firstPixel(material.getBaseColorTexture()!.getImage()!)).toEqual([encode((80 / 255) * 0.5), encode((160 / 255) * 0.25), encode(240 / 255)]);
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked" });
+    expect(textureExports).toHaveLength(1);
+    expect(textureExports[0]).toContain("-png");
+    expect(textureExports[0]).toContain("Content/Test/T_Hidden");
+    expect(leftovers.filter((entry) => entry.includes("graph-textures"))).toEqual([]);
   });
 });

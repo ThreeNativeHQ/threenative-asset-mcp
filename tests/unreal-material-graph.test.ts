@@ -436,6 +436,29 @@ describe("bakeGraph", () => {
     expect((await pixelsOf(unflagged))(0, 0)).toEqual([188, 188, 188]);
   });
 
+  it("evaluates Divide per channel, with ConstB as the unwired divisor and a guarded zero", async () => {
+    const texture = { png: await flat([100, 0, 255])(), srgb: false };
+    const divideBy = (constants: Raw): MaterialGraph =>
+      makeGraph([node("d", "Divide", { inputs: { A: pin("t", 0, RGB_MASK) }, constants }), textureSample("t", "T_Div", "LinearColor")], pin("d"));
+    // LinearColor is read as stored: 100/255 / 0.5 = 0.7843 -> encode 232; 0 stays 0; 1 / 0.5 clamps to 255.
+    const half = await bakeGraph({ graph: divideBy({ ConstB: 0.5 }), output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({ T_Div: texture }).loadTexture, size: 2 });
+    expect((await pixelsOf(half))(0, 0)).toEqual([encode(100 / 255 / 0.5), 0, 255]);
+    // A zero divisor becomes 1e-6: positive numerators saturate, zero stays zero, and nothing is NaN.
+    const zero = await bakeGraph({ graph: divideBy({ ConstB: 0 }), output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({ T_Div: texture }).loadTexture, size: 2 });
+    expect((await pixelsOf(zero))(0, 0)).toEqual([255, 0, 255]);
+    // Wired divisors work too: A / B with B a Constant3Vector.
+    const wired = makeGraph(
+      [
+        node("d", "Divide", { inputs: { A: pin("t", 0, RGB_MASK), B: pin("c") } }),
+        textureSample("t", "T_Div", "LinearColor"),
+        constant3("c", [2, 1, 4]),
+      ],
+      pin("d"),
+    );
+    const result = await bakeGraph({ graph: wired, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({ T_Div: texture }).loadTexture, size: 2 });
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(100 / 255 / 2), 0, encode(255 / 255 / 4)]);
+  });
+
   it("keeps the texture's row order: v = 0 is the first PNG row", async () => {
     // Every texel is distinct and non-symmetric: (x, y) = (40x + 10, 60y + 5, 77).
     const texel = (x: number, y: number): Rgb => [40 * x + 10, 60 * y + 5, 77];

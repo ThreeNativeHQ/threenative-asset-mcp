@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
-import { copyFile, readdir, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { copyFile, readdir, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createReadStream, readFileSync, statfs } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -2130,8 +2130,69 @@ export async function importUnrealDirectory(
     const material = await sourceForFile(matches[0]!.file);
     return material ? { ...material, limitations: [...material.limitations, `Authored source material ${lookup}: unique source basename fallback used because an exact mesh material import was not recovered${mesh.status === "unsupported" ? ` (${mesh.reason})` : ""}; canonical mesh routing remains unresolved.`] } : undefined;
   };
+  // PRD-538: colour textures that only a material function references were never exported with the mesh.
+  // Export exactly one such package on demand, serially, into the import's own staging directory.
+  let textureIndex: Map<string, string[]> | undefined;
+  let textureExports: Promise<unknown> = Promise.resolve();
+  let textureExportCount = 0;
+  const exportedTextures = new Map<string, Promise<string | undefined>>();
+  const exportTexture = (name: string): Promise<string | undefined> => {
+    const known = exportedTextures.get(name);
+    if (known) return known;
+    const run = textureExports.then(async (): Promise<string | undefined> => {
+      if (!textureIndex) {
+        textureIndex = new Map();
+        for (const file of packages) {
+          if (extname(file.path).toLowerCase() !== ".uasset") continue;
+          const stem = basename(file.path, extname(file.path));
+          textureIndex.set(stem, [...(textureIndex.get(stem) ?? []), file.path]);
+        }
+      }
+      const matches = textureIndex.get(name) ?? [];
+      // Two packages of one name cannot say which pixels the material meant.
+      if (matches.length !== 1) {
+        log(`Graph texture ${name}: ${matches.length === 0 ? "no source package" : "ambiguous source packages"}; not exported.`);
+        return undefined;
+      }
+      const selector = relative(sourceDir, matches[0]!).split(sep).join("/").slice(0, -extname(matches[0]!).length);
+      const isolated = join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
+      // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the
+      // package's own folders are appended to it. A deep staging path is reached through a short
+      // symlink (removed below); the files still land inside the staging directory.
+      let link: string | undefined;
+      try {
+        await mkdir(isolated, { recursive: true });
+        let out = isolated;
+        if (isolated.length > 120) {
+          link = join(tmpdir(), `tn-gt-${randomBytes(6).toString("hex")}`);
+          await symlink(isolated, link);
+          out = link;
+        }
+        const exportRun = await runBounded(umodel.path, [`-path=${sourceDir}`, "-export", "-png", `-out=${out}`, selector], {
+          timeoutMs: 300_000,
+          maxOutputBytes: 32 * 1024 * 1024,
+        });
+        if (exportRun.code !== 0) {
+          log(`Graph texture ${name}: UE Viewer exited ${exportRun.code}.`);
+          return undefined;
+        }
+        const png = (await indexExported(isolated)).png.get(name);
+        if (!png) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
+        return png;
+      } catch (error) {
+        log(`Graph texture ${name}: export failed (${error instanceof Error ? error.message : String(error)}).`);
+        return undefined;
+      } finally {
+        if (link) await rm(link, { force: true });
+      }
+    });
+    textureExports = run;
+    exportedTextures.set(name, run);
+    return run;
+  };
   // PRD-538: lazy, so a run that never meets a colourless section never provisions or spawns the converter.
   const graphBaker = request.graphBake === false ? undefined : createGraphBaker({
+    exportTexture,
     sourceDir,
     engine: request.engine,
     environment,
