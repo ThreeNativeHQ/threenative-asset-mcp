@@ -103,3 +103,63 @@ jobs:
             printf 'Provider HTTP boundaries use fixtures. No live provider probes, credentials, or publishing run in CI.\n\n'
             printf 'Local proprietary Unreal asset regressions remain conditional on their fixtures; inspect the JUnit reports for skipped tests.\n'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # parallel: races and load timeouts only show under default workers. leak-gate: temp dirs a run leaves behind.
+  suite:
+    name: ${{ matrix.leg }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [parallel, leak-gate]
+    env:
+      CI: "true"
+      FAB_BROWSER_HEADLESS: "true"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Python for local creature fixtures
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install deterministic test prerequisites
+        run: |
+          npm ci --no-audit --no-fund
+          python -m pip install --disable-pip-version-check --only-binary=:all: numpy==2.3.5 pillow==12.0.0
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+          npx --no-install playwright install --with-deps chromium
+
+      - name: Build the distributable
+        run: npm run build
+
+      - name: Run every suite with default workers
+        if: matrix.leg == 'parallel'
+        run: npx vitest run --reporter=default --reporter=junit --outputFile=artifacts/ci/parallel.xml
+
+      - name: Run every suite under the temp-leak gate
+        if: matrix.leg == 'leak-gate'
+        run: npx tsx scripts/leak-gate.ts --dir "$RUNNER_TEMP/suite-tmp" -- vitest run
+
+      - name: Keep test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-reports-${{ matrix.leg }}
+          path: artifacts/ci/*.xml
+          if-no-files-found: ignore
+          retention-days: 7
