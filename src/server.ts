@@ -519,7 +519,7 @@ export function createAssetServer(
     {
       title: "List the Fab assets this account owns",
       description:
-        "List every listing already in the signed-in Fab library, optionally filtered to the ones that publish an Unreal artifact fab_import_asset can convert. Search free assets first with fab_search_assets; reach for this when you want something already paid for. Read-only — it never claims or purchases.",
+        "List every listing already in the signed-in Fab library, optionally filtered to the ones that publish an Unreal artifact fab_import_asset can convert. Each listing's `artifacts` array lists every Unreal artifact separately with its artifactId, oldest engine (its source format) and decoder route (umodel, mesh-description or cue4parse). Search free assets first with fab_search_assets; reach for this when you want something already paid for. Read-only — it never claims or purchases.",
       inputSchema: FabListOwnedInputSchema,
       outputSchema: FabListOwnedOutputSchema,
       annotations: {

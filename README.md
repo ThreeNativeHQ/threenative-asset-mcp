@@ -402,6 +402,13 @@ JSON the page shows, and paste it into the prompt within a few minutes. It needs
 interactive terminal. In Claude Code, run it with a `!` prefix. Never paste the code into an
 untrusted service: it grants full access to the Epic account.
 
+`fab_list_owned` lists each listing's Unreal artifacts separately (`artifacts[]`: `artifactId`,
+`engineVersions`, `oldestEngine`, decoder `route`, `targetPlatforms`). An artifact's format is its
+oldest listed engine, and that picks the decoder. When a listing has several artifacts and
+`fab_import_asset` gets neither `engine` nor `artifactId`, it takes the best route (CUE4Parse, then
+the MeshDescription converter, then UE Viewer; the newest source format breaks a tie) and says so
+in the report `warnings`. Pass `artifactId` or `engine` to override.
+
 | Input | Current result |
 | --- | --- |
 | Cooked loose UE4 static meshes and textures | GLB geometry, LOD sections, embedded textures, and common PBR reconstruction |
@@ -427,8 +434,60 @@ untrusted service: it grants full access to the Epic account.
 | UE4 ISM/HISM and painted static-mesh foliage placement | Bulk-serialized instance matrices become `EXT_mesh_gpu_instancing`, which Three.js `GLTFLoader` loads as GPU-instanced meshes |
 | UE4 editor `LandscapeComponent` heightfields | Package-relative compressed BGRA8 heightmaps become indexed terrain meshes with decoded normals, component transforms, and original material names |
 | ActorX per-frame bone scale, dynamic Blueprint bytecode/construction scripts, Paper Terrain/spline deformation, and Nanite-only data without a fallback mesh | Detected or reported honestly; scene-level omissions are listed in `scenes[].omittedActors`, and Blueprint bytecode is never executed by the importer |
-| Arbitrary Unreal shader graphs | Common PBR inputs become standard glTF materials; graph inputs with no glTF counterpart remain named in the report instead of being silently discarded |
+| Arbitrary Unreal shader graphs | Recoverable PBR inputs become standard glTF materials. Reports mark materials as degraded when shader connections are unavailable, even if every section has a texture; section `limitations` explain omitted layering, graph UV transforms, subsurface lighting, normal strength, and deformation |
 | Encrypted Pak/IoStore | Unsupported without user-supplied keys and archive extraction; never reported as a complete conversion |
+
+Importer version 49 also respects material-instance override flags and modern
+parameter names. Contradictory texture samples duplicated across distinct mesh
+section families are repaired only when referenced texture families are
+unambiguous in the same export namespace. These bindings remain heuristic.
+Separate same-resolution opacity maps can supply base-colour alpha without
+altering RGB; different source dimensions are currently unsupported. Existing
+cached conversions are invalidated. A textured result does not certify the
+appearance of the original Unreal shader.
+
+Importer version 51 uses adaptive PNG row filtering for composed opacity maps,
+preserving the previous encoder's decoded RGBA and PNG metadata. Untouched textures
+retain their original bytes; their profiles, bit depth, and metadata are not
+re-encoded for storage savings.
+
+Legacy instance sidecars without override flags retain inherited settings for
+ambiguous opaque, false, and zero defaults. Their non-default values retain the
+previous behavior; missing flags are reported as a material limitation.
+
+Importer version 50 reads a bounded authored-material subset from tagged UE4
+object-version 516 packages (legacy -7, UE3 864, licensee 0). Exact source paths
+and closest flagged static overrides select the active branches before reduction.
+Mesh-only package selection still loads needed material parents from the source
+file inventory without exporting unrelated packages; lookups stay within the same
+Content namespace. Mesh import-table material references resolve duplicate source
+basenames by exact object path. Multiple matching references refuse source routing;
+a unique basename fallback reports its unresolved mesh routing.
+Reroutes, scalar constants/parameters and representable multiplication recover
+scalar roughness; glTF normalization retains the raw authored value in the report.
+An authored scalar replaces any earlier roughness texture contribution while
+retaining its packed metallic channel. Source functions, Specular conversion,
+foliage shading and unsupported sampling remain explicit limitations.
+
+AO.R is attached only with explicit `Texture2D.SRGB=false`, a serialized linear
+sampler mode (`LinearColor`, `LinearGrayscale` or `Masks`), and source coordinates
+matching the sampler of the currently bound albedo. Its existing glTF coordinate
+mapping is reused only after the selected albedo attaches; an incoming unrelated
+base texture cannot establish that reference. Omitted Unreal defaults remain
+unresolved. Unknown color
+interpretation, ambiguous source paths or exported PNG basenames, nonidentity AO
+multipliers and unproved UV transforms withhold AO, including earlier filename
+guesses. Texture metadata is
+read lazily for the selected AO candidate; unrelated large images are untouched
+by the material reader. Other package profiles keep prior reconstruction with a
+named source-reader limitation. Cached conversions are invalidated.
+
+The Buffer reader is independently implemented from the tagged package, property
+and native-input schemas at [CUE4Parse commit b4e9544](https://github.com/FabianFG/CUE4Parse/tree/b4e95441bcf0c975eb3adb68c0fb44c740c2cf62/CUE4Parse/UE4).
+Native expression inputs require verified Core=2 and Framework=33 custom versions;
+tagged instances without native inputs do not require these versions. Native
+trailers and omitted class defaults are outside its scope. This subset does not
+certify original Unreal appearance.
 
 Automatic uncooked conversion needs Python 3 with `venv` and `pip`. A Linux
 source build fallback for UE Viewer additionally needs `git`, `g++`, `perl`,

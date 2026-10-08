@@ -5,6 +5,7 @@ node_modules/
 dist/
 coverage/
 artifacts/ci/
+artifacts/parity/
 *.tsbuildinfo
 outputs/*.tgz
 
@@ -29,3 +30,6 @@ work/
 # Agent worktrees
 .worktrees/
 __pycache__/
+
+# AFK run logs
+.afk/

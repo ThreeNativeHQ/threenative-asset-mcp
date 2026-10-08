@@ -6,6 +6,7 @@ import { z } from "zod";
 
 import { FabClient } from "../fab/client.js";
 import { FabCli, FabCliError, preferredPlatform } from "../fab/fabcli.js";
+import { decoderRoute, oldestEngine } from "../fab/routes.js";
 import { classifyLicenses, type LicenseDecision } from "../fab/license.js";
 import { normalizeListing } from "../fab/normalize.js";
 import { ImportError, type ImportReport, importUnrealDirectory } from "../unreal/importer.js";
@@ -255,7 +256,15 @@ export const FabImportAssetInputSchema = z.object({
     .trim()
     .regex(/^UE_\d+\.\d+$/)
     .optional()
-    .describe("Unreal engine selector, for example UE_4.21. Required when the listing publishes several artifacts."),
+    .describe("Unreal engine selector, for example UE_4.21. When the listing publishes several artifacts and neither engine nor artifactId is given, the artifact with the best decoder route is chosen and the choice is reported in warnings."),
+  artifactId: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9._-]{1,128}$/)
+    .optional()
+    .describe(
+      "Exact Unreal artifact to import, as listed by the library. Wins over engine when both are given, and is the only way to pick between artifacts whose engine lists overlap.",
+    ),
   maxTextureSize: MaxTextureSizeSchema,
   platform: z
     .string()
@@ -507,6 +516,37 @@ export function createAssetImportUnrealHandler(dependencies: ImportUnrealDepende
   };
 }
 
+interface ExactArtifact {
+  readonly artifactId?: string;
+  readonly assetId?: string;
+  readonly assetNamespace?: string;
+}
+
+/**
+ * The catalog ids that let `fabcli download` name one artifact exactly. Empty when the library
+ * does not report them for this listing (older payloads) or cannot be read: the caller then keeps
+ * the engine filter, which is what it did before the ids were known.
+ */
+async function resolveCatalogIds(
+  fabCli: FabCli,
+  listingId: string,
+  artifactId: string,
+  log: (message: string) => void,
+): Promise<ExactArtifact> {
+  try {
+    const entry = (await fabCli.ownedListings()).find(
+      (owned) => owned.listingId?.toLowerCase() === listingId.toLowerCase(),
+    );
+    if (entry?.assetId === undefined || entry.assetNamespace === undefined) return {};
+    return { artifactId, assetId: entry.assetId, assetNamespace: entry.assetNamespace };
+  } catch (error) {
+    log(
+      `Could not read catalog ids from the Fab library (${error instanceof Error ? error.message : "lookup failed"}); using the engine filter.`,
+    );
+    return {};
+  }
+}
+
 export function fabDownloadRoot(environment: NodeJS.ProcessEnv = process.env): string {
   return (
     environment.THREENATIVE_FAB_DOWNLOAD_DIR?.trim() ||
@@ -546,21 +586,50 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
       await fabCli.requireAuthenticatedSession();
 
       const versions = await fabCli.unrealVersions(listingId);
-      const selected = FabCli.selectVersion(versions, input.engine);
+      const { version: selected, reason: choiceReason } = FabCli.selectVersion(
+        versions,
+        input.engine,
+        input.artifactId,
+      );
+      const extraWarnings: string[] = choiceReason === undefined ? [] : [choiceReason];
+      // FabCLI filters by engine, not by artifact, so an explicit artifact is fetched through its
+      // oldest engine, the one that names its package format.
+      let engine = input.engine;
+      if (input.artifactId || choiceReason !== undefined) {
+        engine = oldestEngine(selected.engineVersions);
+        if (input.engine && !selected.engineVersions.includes(input.engine)) {
+          extraWarnings.push(
+            `engine ${input.engine} is not published by artifact ${selected.artifactId} (${selected.engineVersions.join(", ")}); artifactId wins.`,
+          );
+        }
+      }
       const stagingDir = join(fabDownloadRoot(environment), listingId, selected.artifactId);
       await mkdir(stagingDir, { recursive: true });
 
       const marker = join(stagingDir, ".fabcli-asset.json");
       const cached = await readFile(marker, "utf8").catch(() => undefined);
-      const extraWarnings: string[] = [];
       if (cached === undefined || (await readdir(stagingDir)).length <= 1) {
         log(`Downloading ${selected.artifactId} from the Fab library…`);
+        // FabCLI's engine filter cannot tell apart artifacts whose engine lists overlap, so once
+        // an artifact has been chosen among several it is named exactly, by the catalog ids the
+        // library reports. With one artifact, or ids the library did not report, the engine
+        // filter is unambiguous or the only handle there is.
+        const exact: ExactArtifact =
+          versions.length > 1 || input.artifactId !== undefined || choiceReason !== undefined
+            ? await resolveCatalogIds(fabCli, listingId, selected.artifactId, log)
+            : {};
+        if (versions.length > 1 && exact.assetId === undefined) {
+          extraWarnings.push(
+            `Could not read the catalog ids of artifact ${selected.artifactId} from the Fab library, so it was downloaded through the engine filter; FabCLI may have fetched another artifact whose engines overlap.`,
+          );
+        }
         try {
           await fabCli.download({
             listingId,
             outputDir: stagingDir,
-            engine: input.engine,
+            engine,
             platform: input.platform,
+            ...exact,
           });
         } catch (error) {
           // A multi-platform artifact needs a platform picked. The source .uasset files are the
@@ -579,8 +648,9 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
           await fabCli.download({
             listingId,
             outputDir: stagingDir,
-            engine: input.engine,
+            engine,
             platform,
+            ...exact,
           });
         }
       } else {
@@ -592,7 +662,7 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
         sourceDir: stagingDir,
         outputDir,
         listingId,
-        engine: input.engine,
+        engine,
         sourceKind: "fab-listing",
         onlyPackages: input.packages,
         authenticatedDownload: true,
@@ -623,6 +693,20 @@ const OwnedListingSchema = z.object({
   distributionMethod: z.string().max(60),
   hasUnrealArtifact: z.boolean(),
   engineVersions: z.array(z.string().max(20)).max(60),
+  artifacts: z
+    .array(
+      z.object({
+        artifactId: z.string().max(200),
+        engineVersions: z.array(z.string().max(20)).max(60),
+        oldestEngine: z.string().max(20).optional(),
+        route: z.enum(["umodel", "mesh-description", "cue4parse"]).optional(),
+        targetPlatforms: z.array(z.string().max(60)).max(40),
+      }),
+    )
+    .max(60)
+    .describe(
+      "Each Unreal artifact separately. An artifact's format is its oldest listed engine, which picks the decoder route.",
+    ),
 });
 
 export const FabListOwnedInputSchema = z.object({
@@ -689,6 +773,15 @@ export function createFabListOwnedHandler(dependencies: ImportUnrealDependencies
           engineVersions: [
             ...new Set(entry.unrealArtifacts.flatMap((artifact) => artifact.engineVersions)),
           ],
+          artifacts: entry.unrealArtifacts.map((artifact) => {
+            const oldest = oldestEngine(artifact.engineVersions);
+            return {
+              artifactId: artifact.artifactId,
+              engineVersions: artifact.engineVersions,
+              ...(oldest === undefined ? {} : { oldestEngine: oldest, route: decoderRoute(oldest) }),
+              targetPlatforms: artifact.targetPlatforms,
+            };
+          }),
         }));
       const output = FabListOwnedOutputSchema.parse({
         listings: matched.slice(0, 500),

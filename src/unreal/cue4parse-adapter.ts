@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.50",
+  version: "b4e95441+threenative.51",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -320,9 +320,10 @@ using CUE4Parse_Conversion.Sounds;
 using Newtonsoft.Json;
 
 if (args.Contains("--version")) { Console.WriteLine("threenative-cue4parse ${CUE4PARSE_SOURCE.version}"); return; }
-if (args.Length < 3 || !args.Contains("--export-dir")) throw new ArgumentException("usage: converter SOURCE --export-dir OUTPUT [--filter NAME] [--lods 0,1]");
+var dumpAt = Array.IndexOf(args, "--dump-properties");
+if (args.Length < 3 || (dumpAt < 0 && !args.Contains("--export-dir"))) throw new ArgumentException("usage: converter SOURCE --export-dir OUTPUT [--filter NAME] [--lods 0,1] | converter SOURCE --dump-properties OUT.json [--engine X] [--filter NAME]");
 var root = Path.GetFullPath(args[0]);
-var output = Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
+var output = dumpAt >= 0 ? Path.GetFullPath(".") : Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
 var filterAt = Array.IndexOf(args, "--filter");
 var filter = filterAt >= 0 ? args[filterAt + 1] : null;
 // Source-model LODs of a skeletal mesh to export, as indices into its source model array.
@@ -351,17 +352,20 @@ bool MatchesFilter(string key)
     return Path.GetFileName(normalizedKey).Equals(Path.GetFileName(normalizedFilter), StringComparison.OrdinalIgnoreCase) &&
         (normalizedFilter.IndexOf('/') < 0 || normalizedKey.EndsWith(normalizedFilter, StringComparison.OrdinalIgnoreCase));
 }
-Directory.CreateDirectory(Path.Combine(output, "Meshes"));
-Directory.CreateDirectory(Path.Combine(output, "Textures"));
-Directory.CreateDirectory(Path.Combine(output, "Cubemaps"));
-Directory.CreateDirectory(Path.Combine(output, "Audio"));
-Directory.CreateDirectory(Path.Combine(output, "Data"));
-Directory.CreateDirectory(Path.Combine(output, "Multidimensional"));
-Directory.CreateDirectory(Path.Combine(output, "Fonts"));
-Directory.CreateDirectory(Path.Combine(output, "Scenes"));
-Directory.CreateDirectory(Path.Combine(output, "Sprites"));
-Directory.CreateDirectory(Path.Combine(output, "TileMaps"));
-Directory.CreateDirectory(Path.Combine(output, "Grooms"));
+if (dumpAt < 0)
+{
+    Directory.CreateDirectory(Path.Combine(output, "Meshes"));
+    Directory.CreateDirectory(Path.Combine(output, "Textures"));
+    Directory.CreateDirectory(Path.Combine(output, "Cubemaps"));
+    Directory.CreateDirectory(Path.Combine(output, "Audio"));
+    Directory.CreateDirectory(Path.Combine(output, "Data"));
+    Directory.CreateDirectory(Path.Combine(output, "Multidimensional"));
+    Directory.CreateDirectory(Path.Combine(output, "Fonts"));
+    Directory.CreateDirectory(Path.Combine(output, "Scenes"));
+    Directory.CreateDirectory(Path.Combine(output, "Sprites"));
+    Directory.CreateDirectory(Path.Combine(output, "TileMaps"));
+    Directory.CreateDirectory(Path.Combine(output, "Grooms"));
+}
 ObjectTypeRegistry.RegisterClass(typeof(USkeletalMeshEditorData));
 
 var engineAt = Array.IndexOf(args, "--engine");
@@ -372,6 +376,217 @@ if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
+if (dumpAt >= 0)
+{
+    var dumpPath = Path.GetFullPath(args[dumpAt + 1]);
+    Directory.CreateDirectory(Path.GetDirectoryName(dumpPath)!);
+    var dumpedPackages = new List<Dictionary<string, object?>>();
+    foreach (var key in provider.Files.Keys
+        .Where(key => key.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) && MatchesFilter(key))
+        .OrderBy(key => key, StringComparer.OrdinalIgnoreCase))
+        dumpedPackages.Add(DumpPackage(key));
+    var dumpDocument = new Dictionary<string, object?> { ["format"] = 1, ["game"] = game.ToString(), ["packages"] = dumpedPackages };
+    File.WriteAllText(dumpPath, JsonConvert.SerializeObject(dumpDocument, Formatting.Indented), new UTF8Encoding(false));
+    Console.WriteLine($"dumped {dumpedPackages.Count} packages to {dumpPath}");
+    return;
+}
+
+static double DumpNum(float value) => float.IsFinite(value) ? value : 0d;
+static double[] DumpVec(FVector value) => new[] { DumpNum(value.X), DumpNum(value.Y), DumpNum(value.Z) };
+// A loose directory mounts as "<dir>/Content/<path>"; Unreal names that package "/Game/<path>".
+static string DumpGamePath(string path)
+{
+    var normalized = path.Replace('\\', '/');
+    var contentAt = normalized.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+    return contentAt >= 0 ? "/Game/" + normalized[(contentAt + 9)..] : normalized;
+}
+static string? DumpPath(IPackage package, FPackageIndex? index)
+{
+    if (index is null || index.IsNull) return null;
+    try { var resolved = package.ResolvePackageIndex(index)?.GetPathName(); return resolved is null ? null : DumpGamePath(resolved); }
+    catch { return null; }
+}
+static string DumpExportClass(IPackage package, int index)
+{
+    if (package is Package legacy)
+    {
+        var export = legacy.ExportMap[index];
+        if (!string.IsNullOrEmpty(export.ClassName)) return export.ClassName;
+        return legacy.ResolvePackageIndex(export.ClassIndex)?.Name.Text ?? "";
+    }
+    return package.ExportsLazy[index].Value.ExportType;
+}
+static string DumpExportName(IPackage package, int index) =>
+    package is Package legacy ? legacy.ExportMap[index].ObjectName.Text : package.ExportsLazy[index].Value.Name;
+static Dictionary<string, object?> DumpSlot(string? name, string? material) =>
+    new() { ["name"] = name ?? "", ["material"] = material };
+static Dictionary<string, object?>? DumpBounds(UObject mesh, string property)
+{
+    var bounds = mesh.GetOrDefault<FStructFallback>(property);
+    if (bounds is null) return null;
+    return new Dictionary<string, object?>
+    {
+        ["origin"] = DumpVec(bounds.GetOrDefault<FVector>("Origin")),
+        ["boxExtent"] = DumpVec(bounds.GetOrDefault<FVector>("BoxExtent")),
+        ["sphereRadius"] = DumpNum(bounds.GetOrDefault<float>("SphereRadius")),
+        ["property"] = property,
+    };
+}
+static List<Dictionary<string, object?>> DumpSlots(UObject mesh, IPackage package)
+{
+    var slots = new List<Dictionary<string, object?>>();
+    if (mesh is UStaticMesh staticMesh)
+        foreach (var slot in staticMesh.StaticMaterials ?? Array.Empty<FStaticMaterial>())
+            slots.Add(DumpSlot(slot.MaterialSlotName.Text, DumpPath(package, slot.MaterialInterface)));
+    else if (mesh is USkeletalMesh skeletalMesh)
+        foreach (var slot in skeletalMesh.SkeletalMaterials ?? Array.Empty<FSkeletalMaterial>())
+            slots.Add(DumpSlot(slot.MaterialSlotName.Text, DumpPath(package, slot.Material)));
+    if (slots.Count == 0)
+    {
+        foreach (var property in new[] { "StaticMaterials", "SkeletalMaterials" })
+            foreach (var slot in mesh.GetOrDefault<FStructFallback[]>(property) ?? Array.Empty<FStructFallback>())
+                slots.Add(DumpSlot(slot.GetOrDefault<FName>("MaterialSlotName").Text,
+                    DumpPath(package, slot.GetOrDefault<FPackageIndex>("MaterialInterface") ?? slot.GetOrDefault<FPackageIndex>("Material"))));
+    }
+    if (slots.Count == 0)
+        foreach (var material in mesh.GetOrDefault<FPackageIndex[]>("Materials") ?? Array.Empty<FPackageIndex>())
+            slots.Add(DumpSlot("", DumpPath(package, material)));
+    return slots;
+}
+static List<Dictionary<string, object?>> DumpTextureParameters(UObject instance, IPackage package)
+{
+    var parameters = new List<Dictionary<string, object?>>();
+    foreach (var parameter in instance.GetOrDefault<FStructFallback[]>("TextureParameterValues") ?? Array.Empty<FStructFallback>())
+    {
+        var info = parameter.GetOrDefault<FStructFallback>("ParameterInfo");
+        var name = info is not null ? info.GetOrDefault<FName>("Name").Text : parameter.GetOrDefault<FName>("ParameterName").Text;
+        parameters.Add(new Dictionary<string, object?> { ["name"] = name ?? "", ["texture"] = DumpPath(package, parameter.GetOrDefault<FPackageIndex>("ParameterValue")) });
+    }
+    return parameters;
+}
+static List<Dictionary<string, object?>> DumpVectorParameters(UObject instance)
+{
+    var parameters = new List<Dictionary<string, object?>>();
+    foreach (var parameter in instance.GetOrDefault<FStructFallback[]>("VectorParameterValues") ?? Array.Empty<FStructFallback>())
+    {
+        var info = parameter.GetOrDefault<FStructFallback>("ParameterInfo");
+        var name = info is not null ? info.GetOrDefault<FName>("Name").Text : parameter.GetOrDefault<FName>("ParameterName").Text;
+        var value = parameter.GetOrDefault<FLinearColor>("ParameterValue");
+        parameters.Add(new Dictionary<string, object?> { ["name"] = name ?? "", ["value"] = new[] { DumpNum(value.R), DumpNum(value.G), DumpNum(value.B), DumpNum(value.A) } });
+    }
+    return parameters;
+}
+static List<Dictionary<string, object?>> DumpScalarParameters(UObject instance)
+{
+    var parameters = new List<Dictionary<string, object?>>();
+    foreach (var parameter in instance.GetOrDefault<FStructFallback[]>("ScalarParameterValues") ?? Array.Empty<FStructFallback>())
+    {
+        var info = parameter.GetOrDefault<FStructFallback>("ParameterInfo");
+        var name = info is not null ? info.GetOrDefault<FName>("Name").Text : parameter.GetOrDefault<FName>("ParameterName").Text;
+        parameters.Add(new Dictionary<string, object?> { ["name"] = name ?? "", ["value"] = DumpNum(parameter.GetOrDefault<float>("ParameterValue")) });
+    }
+    return parameters;
+}
+
+Dictionary<string, object?> DumpPackage(string key)
+{
+    var entry = new Dictionary<string, object?> { ["path"] = key };
+    IPackage package;
+    try { package = provider.LoadPackage(key); }
+    catch (Exception error) { entry["error"] = error.Message; return entry; }
+    entry["path"] = DumpGamePath(package.Name);
+    var importedTextures = new List<string>();
+    if (package is Package legacyPackage)
+    {
+        for (var index = 0; index < legacyPackage.ImportMap.Length; index++)
+        {
+            var className = legacyPackage.ImportMap[index].ClassName.Text;
+            if (!className.StartsWith("Texture", StringComparison.OrdinalIgnoreCase)) continue;
+            var path = DumpPath(package, new FPackageIndex(package, -(index + 1)));
+            if (path is not null && !importedTextures.Contains(path, StringComparer.OrdinalIgnoreCase)) importedTextures.Add(path);
+        }
+    }
+    entry["importedTextures"] = importedTextures;
+    var exportsJson = new List<Dictionary<string, object?>>();
+    entry["exports"] = exportsJson;
+    // Material graph facts come from the expression exports and are attached to the owning Material below.
+    var graphTextureParameters = new List<Dictionary<string, object?>>();
+    var graphTextures = new List<string>();
+    var graphVectorParameters = new List<Dictionary<string, object?>>();
+    var graphConstants = 0;
+    var graphOwners = new List<Dictionary<string, object?>>();
+    for (var index = 0; index < package.ExportsLazy.Length; index++)
+    {
+        string className, exportName;
+        try { className = DumpExportClass(package, index); exportName = DumpExportName(package, index); }
+        catch (Exception error) { exportsJson.Add(new Dictionary<string, object?> { ["name"] = $"#{index}", ["class"] = "", ["error"] = error.Message }); continue; }
+        var isMesh = className is "StaticMesh" or "SkeletalMesh";
+        var isMaterialExpression = className.StartsWith("MaterialExpression", StringComparison.Ordinal);
+        var isMaterial = className.StartsWith("Material", StringComparison.Ordinal) && !isMaterialExpression;
+        if (!isMesh && !isMaterialExpression && !isMaterial) continue;
+        var item = new Dictionary<string, object?> { ["name"] = exportName, ["class"] = className };
+        try
+        {
+            var export = package.ExportsLazy[index].Value;
+            if (isMesh)
+            {
+                var slots = DumpSlots(export, package);
+                item["slots"] = slots;
+                var bounds = DumpBounds(export, "ExtendedBounds") ?? DumpBounds(export, "ImportedBounds");
+                if (bounds is null && export is UStaticMesh renderMesh && renderMesh.RenderData?.Bounds is { } renderBounds)
+                    bounds = new Dictionary<string, object?>
+                    {
+                        ["origin"] = DumpVec(renderBounds.Origin), ["boxExtent"] = DumpVec(renderBounds.BoxExtent),
+                        ["sphereRadius"] = DumpNum(renderBounds.SphereRadius), ["property"] = "RenderData.Bounds",
+                    };
+                item["bounds"] = bounds;
+                if (slots.Count == 0) item["error"] = "no material slots could be read (typed mesh load may have failed)";
+            }
+            else if (isMaterialExpression)
+            {
+                if (className.Contains("TextureSample", StringComparison.Ordinal) || className.Contains("TextureObject", StringComparison.Ordinal))
+                {
+                    var texture = DumpPath(package, export.GetOrDefault<FPackageIndex>("Texture"));
+                    if (texture is not null)
+                    {
+                        if (!graphTextures.Contains(texture, StringComparer.OrdinalIgnoreCase)) graphTextures.Add(texture);
+                        if (className.Contains("Parameter", StringComparison.Ordinal))
+                            graphTextureParameters.Add(new Dictionary<string, object?> { ["name"] = export.GetOrDefault<FName>("ParameterName").Text ?? "", ["texture"] = texture });
+                    }
+                }
+                else if (className == "MaterialExpressionVectorParameter")
+                {
+                    var value = export.GetOrDefault<FLinearColor>("DefaultValue");
+                    graphVectorParameters.Add(new Dictionary<string, object?> { ["name"] = export.GetOrDefault<FName>("ParameterName").Text ?? "", ["value"] = new[] { DumpNum(value.R), DumpNum(value.G), DumpNum(value.B), DumpNum(value.A) } });
+                }
+                else if (className is "MaterialExpressionConstant3Vector" or "MaterialExpressionConstant4Vector") graphConstants++;
+                continue;
+            }
+            else
+            {
+                if (className == "Material" || className.StartsWith("MaterialFunction", StringComparison.Ordinal))
+                {
+                    item["textureParameters"] = graphTextureParameters;
+                    item["textures"] = graphTextures;
+                    item["vectorParameters"] = graphVectorParameters;
+                    item["constantColors"] = 0;
+                    graphOwners.Add(item);
+                }
+                else
+                {
+                    item["parent"] = DumpPath(package, export.GetOrDefault<FPackageIndex>("Parent"));
+                    item["textureParameters"] = DumpTextureParameters(export, package);
+                    item["vectorParameters"] = DumpVectorParameters(export);
+                    item["scalarParameters"] = DumpScalarParameters(export);
+                }
+            }
+        }
+        catch (Exception error) { item["error"] = error.Message; }
+        exportsJson.Add(item);
+    }
+    foreach (var owner in graphOwners) owner["constantColors"] = graphConstants;
+    return entry;
+}
 var exported = 0;
 var mappingRequired = false;
 Exception? lastLoadError = null;
@@ -1935,6 +2150,32 @@ static EGame ParseGame(string version) => version switch
     "5.0" => EGame.GAME_UE5_0,
     "4.27" => EGame.GAME_UE4_27,
     "4.26" => EGame.GAME_UE4_26,
+    "4.25" => EGame.GAME_UE4_25,
+    "4.24" => EGame.GAME_UE4_24,
+    "4.23" => EGame.GAME_UE4_23,
+    "4.22" => EGame.GAME_UE4_22,
+    "4.21" => EGame.GAME_UE4_21,
+    "4.20" => EGame.GAME_UE4_20,
+    "4.19" => EGame.GAME_UE4_19,
+    "4.18" => EGame.GAME_UE4_18,
+    "4.17" => EGame.GAME_UE4_17,
+    "4.16" => EGame.GAME_UE4_16,
+    "4.15" => EGame.GAME_UE4_15,
+    "4.14" => EGame.GAME_UE4_14,
+    "4.13" => EGame.GAME_UE4_13,
+    "4.12" => EGame.GAME_UE4_12,
+    "4.11" => EGame.GAME_UE4_11,
+    "4.10" => EGame.GAME_UE4_10,
+    "4.9" => EGame.GAME_UE4_9,
+    "4.8" => EGame.GAME_UE4_8,
+    "4.7" => EGame.GAME_UE4_7,
+    "4.6" => EGame.GAME_UE4_6,
+    "4.5" => EGame.GAME_UE4_5,
+    "4.4" => EGame.GAME_UE4_4,
+    "4.3" => EGame.GAME_UE4_3,
+    "4.2" => EGame.GAME_UE4_2,
+    "4.1" => EGame.GAME_UE4_1,
+    "4.0" => EGame.GAME_UE4_0,
     _ => throw new ArgumentException($"unsupported --engine version {version}")
 };
 
