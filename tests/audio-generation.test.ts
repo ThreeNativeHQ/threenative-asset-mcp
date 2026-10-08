@@ -35,17 +35,21 @@ async function temporaryDirectory(): Promise<string> {
 beforeAll(async () => {
   // A real MP3, so the conversion and the inspection downstream are real work.
   const staging = await mkdtemp(join(tmpdir(), "asset-mcp-mp3-"));
-  const path = join(staging, "sound.mp3");
-  execFileSync("ffmpeg", [
-    "-v", "error", "-y",
-    "-f", "lavfi",
-    "-i", "sine=frequency=441:duration=2:sample_rate=44100",
-    "-af", "volume=5.0",
-    "-b:a", "128k",
-    path,
-  ]);
-  mp3Bytes = new Uint8Array(await readFile(path));
-  await rm(staging, { recursive: true, force: true });
+  try {
+    const path = join(staging, "sound.mp3");
+    execFileSync("ffmpeg", [
+      "-v", "error", "-y",
+      "-f", "lavfi",
+      "-i", "sine=frequency=441:duration=2:sample_rate=44100",
+      "-af", "volume=5.0",
+      "-b:a", "128k",
+      path,
+    ]);
+    mp3Bytes = new Uint8Array(await readFile(path));
+  } finally {
+    // Without ffmpeg the call above throws; the staging dir must not outlive the failure.
+    await rm(staging, { recursive: true, force: true });
+  }
 });
 
 interface Recorded {
