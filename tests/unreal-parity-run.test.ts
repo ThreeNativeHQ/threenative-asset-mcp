@@ -22,6 +22,8 @@ import {
   summaryOf,
   parityLine,
   parseParityArgs,
+  licencesReader,
+  parseLicencesFile,
   readPreviousEntries,
   selectResume,
   SweepLockHeldError,
@@ -379,5 +381,52 @@ describe("S4 baseline delta (PRD-538 AC-4)", () => {
     expect(parseParityArgs(["--baseline", "/x/scorecard.json"]).baseline).toBe("/x/scorecard.json");
     expect(parseParityArgs([]).baseline).toBeUndefined();
     expect(() => parseParityArgs(["--baseline"])).toThrow(/needs a value/);
+  });
+});
+
+describe("--licences-file and --no-graph-bake", () => {
+  it("parses the options", () => {
+    const args = parseParityArgs(["--licences-file", "l.json", "--no-graph-bake"]);
+    expect(args.licencesFile).toMatch(/l\.json$/);
+    expect(args.graphBake).toBe(false);
+    const defaults = parseParityArgs([]);
+    expect(defaults.licencesFile).toBeUndefined();
+    expect(defaults.graphBake).toBe(true);
+    expect(() => parseParityArgs(["--licences-file"])).toThrow(/needs a value/);
+  });
+
+  it("reads slugs per listing and ignores _ keys", async () => {
+    const path = join(await scratch(), "l.json");
+    await writeFile(path, JSON.stringify({ _source: "fab.com", "L1": ["personal", "professional"], "L2": ["cc-by"] }));
+    const map = parseLicencesFile(path);
+    expect(map).toEqual({ L1: ["personal", "professional"], L2: ["cc-by"] });
+    const read = licencesReader(map);
+    await expect(read("L1")).resolves.toEqual(["personal", "professional"]);
+    await expect(read("l2")).resolves.toEqual(["cc-by"]);
+    await expect(read("L3")).rejects.toThrow(/not in the licences file/);
+  });
+
+  it("rejects an unreadable or malformed file", async () => {
+    const directory = await scratch();
+    const write = async (name: string, content: string): Promise<string> => {
+      const path = join(directory, name);
+      await writeFile(path, content);
+      return path;
+    };
+    expect(() => parseLicencesFile(join(directory, "missing.json"))).toThrow(/Cannot read/);
+    await write("a.json", "not json");
+    expect(() => parseLicencesFile(join(directory, "a.json"))).toThrow(/not valid JSON/);
+    await write("c.json", JSON.stringify({ L1: [] }));
+    expect(() => parseLicencesFile(join(directory, "c.json"))).toThrow(/L1/);
+    await write("d.json", JSON.stringify({ L1: "personal" }));
+    expect(() => parseLicencesFile(join(directory, "d.json"))).toThrow(/L1/);
+    await write("e.json", JSON.stringify([["personal"]]));
+    expect(() => parseLicencesFile(join(directory, "e.json"))).toThrow();
+  });
+
+  it("does not treat a licence error as fatal to the sweep", () => {
+    expect(isFatalHandlerError({ code: "FABCLI_LICENSE_UNVERIFIED", message: "x", retryable: true })).toBe(false);
+    expect(isFatalHandlerError({ code: "FABCLI_LICENSE_UNVERIFIED", message: "no network", retryable: false })).toBe(false);
+    expect(isFatalHandlerError({ code: "FABCLI_LICENSE_NOT_PERMITTED", message: "download auth", retryable: false })).toBe(false);
   });
 });

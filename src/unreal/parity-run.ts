@@ -15,6 +15,8 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
+import { z } from "zod";
+
 import type { FabOwnedListing } from "../fab/fabcli.js";
 import { decoderRoute, oldestEngine } from "../fab/routes.js";
 import type { MissAttribution, PackScore } from "./parity.js";
@@ -121,6 +123,8 @@ export interface Scorecard {
   readonly generatedAt: string;
   readonly host: { readonly load1: number; readonly platform: string };
   readonly toolchain: { readonly importerVersion: number | null; readonly cue4parse: string | null };
+  /** False for a `--no-graph-bake` baseline sweep (PRD-537's state). */
+  readonly graphBake: boolean;
   readonly entries: readonly ScorecardEntry[];
   readonly skipped: readonly SkippedEntry[];
   readonly summary: ScorecardSummary;
@@ -202,12 +206,60 @@ export interface HandlerError {
  * network down), as opposed to one pack that simply could not be converted.
  */
 export function isFatalHandlerError(error: HandlerError): boolean {
+  // A licence refusal or lookup failure is about one listing; its text mentions "download".
+  if (error.code.startsWith("FABCLI_LICENSE_")) return false;
   if (/^FABCLI_(AUTH|UNAUTH|SESSION|KEYSTORE|DOWNLOAD)/.test(error.code)) return true;
   return (
     error.code.startsWith("FABCLI_") &&
     error.retryable === false &&
     /auth|download|network/i.test(error.message)
   );
+}
+
+// --- licences file ------------------------------------------------------------------------------
+
+const LicencesFileSchema = z.record(z.string(), z.array(z.string().min(1)).min(1));
+
+/**
+ * `{ "<listingId>": ["personal", "professional"], "_source": "..." }`: licence slugs the owner read
+ * from fab.com. Keys starting with `_` are notes. Throws a readable error on a bad file.
+ */
+export function parseLicencesFile(path: string): Record<string, string[]> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new Error(
+      error instanceof SyntaxError
+        ? `Licences file ${path} is not valid JSON.`
+        : `Cannot read licences file ${path}.`,
+    );
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`Licences file ${path} must be a JSON object of listing id to licence slugs.`);
+  }
+  const entries = Object.entries(raw).filter(([key]) => !key.startsWith("_"));
+  const parsed = LicencesFileSchema.safeParse(Object.fromEntries(entries));
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const where = issue?.path[0] === undefined ? "" : ` for listing "${String(issue.path[0])}"`;
+    throw new Error(
+      `Licences file ${path} is invalid${where}: each listing needs a non-empty array of slug strings.`,
+    );
+  }
+  return parsed.data;
+}
+
+/** A `readLicenses` for the import handler: the file's slugs, or a throw the gate reports as UNVERIFIED. */
+export function licencesReader(
+  licences: Readonly<Record<string, readonly string[]>>,
+): (listingId: string) => Promise<readonly string[]> {
+  const byId = new Map(Object.entries(licences).map(([id, slugs]) => [id.toLowerCase(), slugs]));
+  return async (listingId) => {
+    const slugs = byId.get(listingId.toLowerCase());
+    if (slugs === undefined) throw new Error(`Listing ${listingId} is not in the licences file.`);
+    return slugs;
+  };
 }
 
 // --- scoring -> entry ---------------------------------------------------------------------------
@@ -629,6 +681,10 @@ export interface ParityArgs {
   readonly excludeSize: boolean;
   /** A scorecard.json to compare this sweep's S4 miss count against. */
   readonly baseline: string | undefined;
+  /** A JSON map of listing id to licence slugs read from fab.com; replaces the anonymous lookup. */
+  readonly licencesFile: string | undefined;
+  /** False for `--no-graph-bake`: the importer skips graph baking (PRD-537 baseline). */
+  readonly graphBake: boolean;
 }
 
 export const PARITY_USAGE = `Usage: npm run parity:fab -- [options]
@@ -649,6 +705,12 @@ Options:
   --no-exclude-size      Include them
   --baseline <file>      Compare this sweep's S4 miss count with that scorecard.json and print
                          "S4 misses: <baseline> → <now> (<pct>% change)" (PRD-538 AC-4)
+  --licences-file <json> Licence slugs per listing, {"<listingId>": ["personal"], "_source": "..."},
+                         read from fab.com by the owner. Used instead of the anonymous lookup; a
+                         listing absent from it, or with non-permitted slugs, is recorded as an
+                         error and the sweep continues. A bad file exits 2 before any download.
+  --no-graph-bake        Import with graph baking off (THREENATIVE_GRAPH_BAKE=0): the PRD-537
+                         baseline for comparing S4 misses
   -h, --help             Print this help
 
 Exit codes: 0 done, 1 error, 2 Fab session/download failure (partial scorecard written), 130 interrupted.`;
@@ -664,6 +726,8 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let excludeSize = true;
   let help = false;
   let baseline: string | undefined;
+  let licencesFile: string | undefined;
+  let graphBake = true;
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(`${flag} needs a value.`);
@@ -712,6 +776,12 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
       case "--baseline":
         baseline = resolve(value(i++, arg));
         break;
+      case "--licences-file":
+        licencesFile = resolve(value(i++, arg));
+        break;
+      case "--no-graph-bake":
+        graphBake = false;
+        break;
       default:
         throw new Error(`Unknown option "${arg}". Use --help.`);
     }
@@ -727,5 +797,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
     out: resolve(out),
     excludeSize,
     baseline,
+    licencesFile,
+    graphBake,
   };
 }

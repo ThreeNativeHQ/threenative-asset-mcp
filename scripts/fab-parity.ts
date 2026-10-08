@@ -24,8 +24,10 @@ import {
   buildCorpus,
   failureClasses,
   isFatalHandlerError,
+  licencesReader,
   mergeScorecardEntries,
   PARITY_USAGE,
+  parseLicencesFile,
   parityLine,
   parseParityArgs,
   readBaselineS4Misses,
@@ -127,6 +129,17 @@ async function main(): Promise<number> {
     return 0;
   }
 
+  // Validate before anything is created or downloaded: a bad file exits 2.
+  let licences: Record<string, string[]> | undefined;
+  if (args.licencesFile !== undefined) {
+    try {
+      licences = parseLicencesFile(args.licencesFile);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      return 2;
+    }
+  }
+
   const load1 = loadavg()[0] ?? 0;
   if (load1 > HIGH_LOAD) {
     console.warn(`WARNING: load average ${load1.toFixed(1)} is above ${HIGH_LOAD}; expect slow, timing-sensitive packs.`);
@@ -159,6 +172,7 @@ async function main(): Promise<number> {
     THREENATIVE_FAB_DOWNLOAD_DIR: runRoot,
     THREENATIVE_UNREAL_CACHE_DIR: unrealCache,
     TMPDIR: runTmp,
+    ...(args.graphBake ? {} : { THREENATIVE_GRAPH_BAKE: "0" }),
   };
   const scorecardPath = join(args.out, "scorecard.json");
   // Read before the sweep: --baseline may name the scorecard this run is about to rewrite.
@@ -189,6 +203,7 @@ async function main(): Promise<number> {
       generatedAt: new Date().toISOString(),
       host: { load1: loadavg()[0] ?? 0, platform: platform() },
       toolchain: { importerVersion, cue4parse },
+      graphBake: args.graphBake,
       entries: all,
       skipped,
       summary:
@@ -287,7 +302,10 @@ async function main(): Promise<number> {
     say(`Sweeping ${todo.length} artifact(s) from ${new Set(todo.map((e) => e.listingId)).size} listing(s); skipped ${skipped.length}. Run ${runId}.`);
     writeScorecard();
 
-  const handler = createFabImportAssetHandler({ environment });
+    const handler = createFabImportAssetHandler({
+      environment,
+      ...(licences === undefined ? {} : { readLicenses: licencesReader(licences) }),
+    });
     let fatal: HandlerError | undefined;
 
     for (const [index, item] of todo.entries()) {

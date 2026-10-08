@@ -673,6 +673,8 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
         extraWarnings,
         environment,
         log,
+        // The parity sweep's baseline switch (README, "Graph-only colour").
+        ...(environment.THREENATIVE_GRAPH_BAKE === "0" ? { graphBake: false } : {}),
       });
       const output = summarize(report, outputDir);
       return {

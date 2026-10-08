@@ -420,6 +420,8 @@ colours standing in white, and a UV set the importer drops make it `heuristic`, 
 `MatLayerBlend_Tint`) leave the neutral fallback and are listed under `graph.unsupportedNodes`.
 The first bake installs the CUE4Parse converter and its private .NET SDK (hundreds of MB, once);
 pass `graphBake: false` to the importer, or set `THREENATIVE_TOOLCHAIN_AUTOINSTALL=0`, to skip it.
+`fab_import_asset` also skips it when its environment has `THREENATIVE_GRAPH_BAKE=0` (the parity
+sweep's `--no-graph-bake` uses this to produce a baseline).
 
 | Input | Current result |
 | --- | --- |
