@@ -128,7 +128,7 @@ describe("--dump-graphs converter mode", () => {
   it("is wired into the embedded program and the converter version is bumped", () => {
     expect(CUE4PARSE_PROGRAM).toContain("--dump-graphs");
     expect(CUE4PARSE_PROGRAM).toContain(".graph.json");
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.52");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.54");
     // The embedded program prints the same string `canRun` waits for, so a stale binary is rebuilt.
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
   });
@@ -147,6 +147,33 @@ describe("--dump-graphs converter mode", () => {
     expect(parameters).toEqual(expect.arrayContaining(["Mask", "Tint", "Tint1", "RockTint", "DetailRockTint"]));
     expect(byId.get("n1")?.channelMask).toEqual([1, 0, 0, 0]);
     expect(graph.outputConstants).toEqual({});
+  });
+
+  it("accepts a named reroute pair and keeps the declaration reachable through the usage", () => {
+    const graph = materialGraphSchema.parse({
+      format: 1,
+      material: "M_Reroute",
+      package: "/Game/Test/M_Reroute",
+      truncated: false,
+      nodeCount: 3,
+      outputs: { ...NO_OUTPUTS, baseColor: pin("n0") },
+      nodes: [
+        { id: "n0", class: "NamedRerouteUsage", inputs: { Input: pin("n1") }, constants: { DeclarationGuid: "0b0a0e0f-0000-0000-0000-000000000001" } },
+        { id: "n1", class: "NamedRerouteDeclaration", inputs: { Input: pin("n2") }, constants: { Name: "Albedo" } },
+        { id: "n2", class: "Constant3Vector", inputs: {}, constants: { Constant: [1, 0, 0, 1] } },
+        { id: "n3", class: "NamedRerouteUsage", inputs: {}, constants: {}, error: "named reroute declaration could not be found" },
+      ],
+    });
+    expect(graph.nodes[0]?.inputs.Input).toEqual({ node: "n1", output: 0, mask: null });
+    expect(graph.nodes[3]?.error).toMatch(/declaration/);
+  });
+
+  it("pins the C# named reroute handling in the embedded program", () => {
+    expect(CUE4PARSE_PROGRAM).toContain('"NamedRerouteUsage"');
+    expect(CUE4PARSE_PROGRAM).toContain('"NamedRerouteDeclaration"');
+    expect(CUE4PARSE_PROGRAM).toContain('"Declaration"');
+    expect(CUE4PARSE_PROGRAM).toContain('"DeclarationGuid"');
+    expect(CUE4PARSE_PROGRAM).toContain("named reroute declaration could not be found");
   });
 
   it("accepts function calls with inlined nodes and legacy defaults", () => {

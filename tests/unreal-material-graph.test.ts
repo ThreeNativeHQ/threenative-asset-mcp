@@ -932,3 +932,68 @@ describe("graphPathClasses and supportedNodeClasses", () => {
     for (const name of ["VertexColor", "Panner", "Time", "WorldPosition", "Fresnel"]) expect(supported).not.toContain(name);
   });
 });
+
+describe("named reroutes", () => {
+  const SOURCE: Rgb = [200, 100, 50];
+  const bake = async (graph: MaterialGraph) =>
+    bakeGraph({
+      graph,
+      output: "baseColor",
+      parameters: NO_PARAMETERS,
+      loadTexture: makeLoader({ T_Source: { png: await flat(SOURCE)(), srgb: true } }).loadTexture,
+      size: 2,
+    });
+
+  it("bakes BaseColor = Multiply(Usage -> Declaration -> TextureSample, Constant3) exactly", async () => {
+    const graph = makeGraph(
+      [
+        multiply("out", pin("use", 0, RGB_MASK), pin("tint", 0, RGB_MASK)),
+        node("use", "NamedRerouteUsage", { inputs: { Input: pin("decl") }, constants: { DeclarationGuid: "00000000-0000-0000-0000-000000000001" } }),
+        node("decl", "NamedRerouteDeclaration", { inputs: { Input: pin("tex") }, constants: { Name: "Albedo" } }),
+        textureSample("tex", "T_Source"),
+        constant3("tint", [0.5, 0.25, 1]),
+      ],
+      pin("out"),
+    );
+    const result = await bake(graph);
+    const expected = [0.5, 0.25, 1].map((tint, index) => encode(decode(SOURCE[index]!) * tint));
+    expect((await pixelsOf(result))(1, 1)).toEqual(expected);
+    if (result.status === "baked") expect(result.confidence).toBe("exact");
+    expect(graphPathClasses(graph, "baseColor")).toEqual(expect.arrayContaining(["NamedRerouteUsage", "NamedRerouteDeclaration", "TextureSample"]));
+    expect(supportedNodeClasses()).toEqual(expect.arrayContaining(["NamedRerouteUsage", "NamedRerouteDeclaration"]));
+  });
+
+  it("honours the pin mask on the way through a reroute", async () => {
+    const graph = makeGraph(
+      [
+        node("use", "NamedRerouteUsage", { inputs: { Input: pin("decl") } }),
+        node("decl", "NamedRerouteDeclaration", { inputs: { Input: pin("tint") } }),
+        constant3("tint", [0.5, 0.25, 1]),
+      ],
+      pin("use", 0, [0, 0, 1, 0]),
+    );
+    const pixel = await pixelsOf(await bake(graph));
+    expect(pixel(0, 0)).toEqual([encode(1), encode(1), encode(1)]);
+  });
+
+  it("reports a usage with no declaration link (an old dump) as unsupported, naming NamedRerouteUsage", async () => {
+    const graph = makeGraph(
+      [multiply("out", pin("use", 0, RGB_MASK), pin("tint", 0, RGB_MASK)), node("use", "NamedRerouteUsage"), constant3("tint", [0.5, 0.25, 1])],
+      pin("out"),
+    );
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["NamedRerouteUsage"] });
+  });
+
+  it("does not bake a usage whose declaration the dumper could not find", async () => {
+    const graph = makeGraph(
+      [
+        multiply("out", pin("use", 0, RGB_MASK), pin("tint", 0, RGB_MASK)),
+        node("use", "NamedRerouteUsage", { error: "named reroute declaration could not be found" }),
+        constant3("tint", [0.5, 0.25, 1]),
+      ],
+      pin("out"),
+    );
+    const result = await bake(graph);
+    expect(result.status).not.toBe("baked");
+  });
+});

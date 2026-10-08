@@ -14,6 +14,9 @@ const boundsSchema = z.object({
   boxExtent: vec3,
   sphereRadius: z.number(),
   property: z.string(),
+  /** Authored `PositiveBoundsExtension` / `NegativeBoundsExtension` (cm, UE axes); `ExtendedBounds` = geometry + these. */
+  positiveExtension: vec3.optional(),
+  negativeExtension: vec3.optional(),
 });
 const textureParameterSchema = z.object({ name: z.string(), texture: z.string().nullable().optional() });
 const vectorParameterSchema = z.object({ name: z.string(), value: vec4 });
@@ -30,6 +33,8 @@ export const dumpExportSchema = z.object({
   vectorParameters: z.array(vectorParameterSchema).optional(),
   scalarParameters: z.array(scalarParameterSchema).optional(),
   textures: z.array(z.string()).optional(),
+  /** MaterialFunctions this Material or MaterialFunction calls (`/Game/...` object paths). */
+  functions: z.array(z.string()).optional(),
   constantColors: z.number().optional(),
 });
 

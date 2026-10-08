@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.52",
+  version: "b4e95441+threenative.54",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -746,6 +746,37 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                 else if (!inputs.ContainsKey("Input")) inputs["Input"] = null;
                 constants["InputName"] = GraphText(GraphProperty(expr, "InputName")?.Tag?.GenericValue);
             }
+            if (className == "NamedRerouteUsage")
+            {
+                // A usage has no input of its own: link it to its declaration so the declaration's Input is followed.
+                var declarationGuid = GraphGuid(GraphProperty(expr, "DeclarationGuid"));
+                if (declarationGuid is not null) constants["DeclarationGuid"] = declarationGuid;
+                UObject? declaration = null;
+                if (GraphProperty(expr, "Declaration")?.Tag?.GenericValue is FPackageIndex declarationIndex && !declarationIndex.IsNull)
+                {
+                    try { declaration = declarationIndex.Load<UObject>(); } catch { }
+                }
+                if (declaration is null && declarationGuid is not null && owner is not null)
+                {
+                    for (var exportIndex = 0; exportIndex < owner.ExportsLazy.Length && declaration is null; exportIndex++)
+                    {
+                        try
+                        {
+                            if (!DumpExportClass(owner, exportIndex).EndsWith("NamedRerouteDeclaration", StringComparison.Ordinal)) continue;
+                            var candidate = owner.ExportsLazy[exportIndex].Value;
+                            if (GraphGuid(GraphProperty(candidate, "VariableGuid")) == declarationGuid) declaration = candidate;
+                        }
+                        catch { }
+                    }
+                }
+                if (declaration is null) node["error"] = "named reroute declaration could not be found";
+                else
+                {
+                    var declarationId = EmitNode(declaration, prefix, callInputs, depth);
+                    if (declarationId is null) node["error"] = "named reroute declaration could not be emitted (graph node limit)";
+                    else inputs["Input"] = new Dictionary<string, object?> { ["node"] = declarationId, ["output"] = 0, ["mask"] = null };
+                }
+            }
             if (isFunctionCall) InlineFunctionCall(expr, id, node, prefix, callInputs, depth);
         }
         catch (Exception error) { node["error"] = error.Message; }
@@ -893,6 +924,8 @@ static Dictionary<string, object?>? DumpBounds(UObject mesh, string property)
         ["boxExtent"] = DumpVec(bounds.GetOrDefault<FVector>("BoxExtent")),
         ["sphereRadius"] = DumpNum(bounds.GetOrDefault<float>("SphereRadius")),
         ["property"] = property,
+        ["positiveExtension"] = DumpVec(mesh.GetOrDefault<FVector>("PositiveBoundsExtension")),
+        ["negativeExtension"] = DumpVec(mesh.GetOrDefault<FVector>("NegativeBoundsExtension")),
     };
 }
 static List<Dictionary<string, object?>> DumpSlots(UObject mesh, IPackage package)
@@ -976,6 +1009,7 @@ Dictionary<string, object?> DumpPackage(string key)
     var graphTextureParameters = new List<Dictionary<string, object?>>();
     var graphTextures = new List<string>();
     var graphVectorParameters = new List<Dictionary<string, object?>>();
+    var graphFunctions = new List<string>();
     var graphConstants = 0;
     var graphOwners = new List<Dictionary<string, object?>>();
     for (var index = 0; index < package.ExportsLazy.Length; index++)
@@ -1001,6 +1035,8 @@ Dictionary<string, object?> DumpPackage(string key)
                     {
                         ["origin"] = DumpVec(renderBounds.Origin), ["boxExtent"] = DumpVec(renderBounds.BoxExtent),
                         ["sphereRadius"] = DumpNum(renderBounds.SphereRadius), ["property"] = "RenderData.Bounds",
+                        ["positiveExtension"] = DumpVec(export.GetOrDefault<FVector>("PositiveBoundsExtension")),
+                        ["negativeExtension"] = DumpVec(export.GetOrDefault<FVector>("NegativeBoundsExtension")),
                     };
                 item["bounds"] = bounds;
                 if (slots.Count == 0) item["error"] = "no material slots could be read (typed mesh load may have failed)";
@@ -1022,6 +1058,11 @@ Dictionary<string, object?> DumpPackage(string key)
                     var value = export.GetOrDefault<FLinearColor>("DefaultValue");
                     graphVectorParameters.Add(new Dictionary<string, object?> { ["name"] = export.GetOrDefault<FName>("ParameterName").Text ?? "", ["value"] = new[] { DumpNum(value.R), DumpNum(value.G), DumpNum(value.B), DumpNum(value.A) } });
                 }
+                else if (className == "MaterialExpressionMaterialFunctionCall")
+                {
+                    var function = DumpPath(package, export.GetOrDefault<FPackageIndex>("MaterialFunction"));
+                    if (function is not null && !graphFunctions.Contains(function, StringComparer.OrdinalIgnoreCase)) graphFunctions.Add(function);
+                }
                 else if (className is "MaterialExpressionConstant3Vector" or "MaterialExpressionConstant4Vector") graphConstants++;
                 continue;
             }
@@ -1031,6 +1072,7 @@ Dictionary<string, object?> DumpPackage(string key)
                 {
                     item["textureParameters"] = graphTextureParameters;
                     item["textures"] = graphTextures;
+                    item["functions"] = graphFunctions;
                     item["vectorParameters"] = graphVectorParameters;
                     item["constantColors"] = 0;
                     graphOwners.Add(item);

@@ -233,6 +233,28 @@ function resolve(index: Map<string, Located[]>, path: string): Located | undefin
   return candidates.length === 1 && key === undefined ? candidates[0] : undefined;
 }
 
+const MAX_FUNCTION_DEPTH = 16;
+
+/** Textures reachable from `roots` through MaterialFunction calls (cycle-safe, depth-limited). */
+function functionTextures(index: Map<string, Located[]>, roots: readonly string[]): Set<string> {
+  const found = new Set<string>();
+  const seen = new Set<DumpExport>();
+  let frontier = roots;
+  for (let depth = 0; depth < MAX_FUNCTION_DEPTH && frontier.length > 0; depth++) {
+    const next: string[] = [];
+    for (const path of frontier) {
+      const located = resolve(index, path);
+      if (!located || !located.exp.class.startsWith("MaterialFunction") || seen.has(located.exp)) continue;
+      seen.add(located.exp);
+      for (const t of located.exp.textures ?? []) found.add(objectName(t));
+      for (const p of located.exp.textureParameters ?? []) if (p.texture) found.add(objectName(p.texture));
+      next.push(...(located.exp.functions ?? []));
+    }
+    frontier = next;
+  }
+  return found;
+}
+
 /** The effective texture/colour set for a material, or undefined when the chain leaves the dump. */
 function effectiveSet(index: Map<string, Located[]>, start: Located): Effective | undefined {
   const chain: Located[] = [start];
@@ -273,6 +295,9 @@ function effectiveSet(index: Map<string, Located[]>, start: Located): Effective 
     const name = objectName(t);
     if (!rootDefaults.has(name)) textures.add(name);
   }
+  // Textures a MaterialFunction samples are bound through the calling Material's graph, but the dump lists
+  // them on the function's own export. Functions missing from the dump are unverified, never a violation.
+  for (const name of functionTextures(index, root.functions ?? [])) if (!rootDefaults.has(name)) textures.add(name);
   for (const name of textures) replaced.delete(name);
   const normalTextures = new Set<string>();
   for (const name of textures) if (isNormalName(name)) normalTextures.add(name);
@@ -384,7 +409,12 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       const extent = mesh.bounds?.boxExtent;
       if (!extent) boundsUnverified++;
       else {
-        const size = extent.map((e) => (e * 2) / 100);
+        // `ExtendedBounds` is the geometry grown by the mesh's authored Positive/NegativeBoundsExtension
+        // (culling padding, large on foliage), so judge the geometry against the box minus that padding.
+        const padded = mesh.bounds?.property === "ExtendedBounds";
+        const positive = padded ? mesh.bounds?.positiveExtension : undefined;
+        const negative = padded ? mesh.bounds?.negativeExtension : undefined;
+        const size = extent.map((e, i) => Math.max(e * 2 - (positive?.[i] ?? 0) - (negative?.[i] ?? 0), 0) / 100);
         // Two glTF axis conventions are valid and both keep UE's up axis (Z) on glTF Y: UE Viewer writes
         // (X, Z, Y); the CUE4Parse and MeshDescription converters write (Y, Z, X) (UE right -> glTF x,
         // UE forward -> glTF z). A mesh is axis-correct when it matches either order.
