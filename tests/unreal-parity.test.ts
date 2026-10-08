@@ -181,6 +181,18 @@ describe("scorePack", () => {
     expect(unit.shape.violations[0]?.kind).toBe("bounds-size");
   });
 
+  it("accepts both valid glTF axis conventions but still flags a swapped up axis", () => {
+    // extent [100,200,50] cm -> UE size (2,4,1) m. UE Viewer: (x,z,y) = (2,1,4); converters: (y,z,x) = (4,1,2).
+    const secs = [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])];
+    const viewer = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4])]));
+    const converter = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [4, 1, 2])]));
+    expect(viewer.shape.violations).toEqual([]);
+    expect(converter.shape.violations).toEqual([]);
+    // UE Z on glTF Z instead of Y (a Z-up export) is a real error under both conventions
+    const zUp = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 4, 1])]));
+    expect(zUp.shape.violations[0]?.kind).toBe("bounds-axis");
+  });
+
   it("flags more sections than slots and tolerates unverified bounds", () => {
     const d = dumpOf(
       pkg("/Game/C/SM_Pillar", mesh("SM_Pillar", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar", null)),

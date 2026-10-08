@@ -377,18 +377,25 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       if (!extent) boundsUnverified++;
       else {
         const size = extent.map((e) => (e * 2) / 100);
-        const expected = [size[0]!, size[2]!, size[1]!];
+        // Two glTF axis conventions are valid and both keep UE's up axis (Z) on glTF Y: UE Viewer writes
+        // (X, Z, Y); the CUE4Parse and MeshDescription converters write (Y, Z, X) (UE right -> glTF x,
+        // UE forward -> glTF z). A mesh is axis-correct when it matches either order.
+        const viewerOrder = [size[0]!, size[2]!, size[1]!];
+        const converterOrder = [size[1]!, size[2]!, size[0]!];
         const actual = model.boundsMetres;
         // `ExtendedBounds` is an authored, cached value and can lag the geometry (Soul Cave: 4 of 173
-        // meshes sit 2-8 % off). Scale, unit and axis errors are factors, so 10 % still catches them;
-        // the 1-10 % band is counted as drift, not failed.
-        const tolerance = Math.max(BOUNDS_TOLERANCE * Math.max(...expected), 0.001);
-        if (triplesMatch(expected, actual, tolerance) && !triplesMatch(expected, actual, Math.max(0.01 * Math.max(...expected), 0.001))) boundsDrift++;
-        if (!triplesMatch(expected, actual, tolerance)) {
+        // meshes sit 2-8 % off). Scale, unit and up-axis errors are factors, so 10 % still catches
+        // them; the 1-10 % band is counted as drift, not failed.
+        const tolFor = (e: readonly number[], fraction: number): number => Math.max(fraction * Math.max(...e), 0.001);
+        const matched = [viewerOrder, converterOrder].find((order) => triplesMatch(order, actual, tolFor(order, BOUNDS_TOLERANCE)));
+        if (matched) {
+          if (!triplesMatch(matched, actual, tolFor(matched, 0.01))) boundsDrift++;
+        } else {
+          const expected = viewerOrder;
           const sortedE = [...expected].sort((a, b) => a - b);
           const sortedA = [...actual].sort((a, b) => a - b);
           shape.push({
-            kind: triplesMatch(sortedE, sortedA, tolerance) ? "bounds-axis" : "bounds-size",
+            kind: triplesMatch(sortedE, sortedA, tolFor(expected, BOUNDS_TOLERANCE)) ? "bounds-axis" : "bounds-size",
             model: model.name,
             expected,
             actual,
