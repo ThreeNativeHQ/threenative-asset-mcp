@@ -620,9 +620,19 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
       inheritedSidedness ??= props.twoSided;
       inheritedBlend ??= props.blendMode;
       alphaCutoff ??= props.opacityMaskClipValue;
+      // `props.collected` are the material's declared texture-parameter defaults. A parameter can exist
+      // without being wired to any output (or wired only behind a static switch that evaluates off), so its
+      // default texture is not evidence of a live slot. When UE Viewer resolved the graph and named slots in
+      // the `.mat`, a default whose texture is already one of those named outputs is a shared placeholder, not
+      // a second live slot: bind only defaults whose texture the `.mat` left unattributed (in `Other[]`), which
+      // is exactly how a parameter name recovers a diffuse umodel could not place. `props.overrides` still fills
+      // slots below, and `supersededDefaults` applies those over any default bound here.
+      const matNamedTextures = mat ? new Set(mat.slots.values()) : undefined;
       for (const parameter of props.collected) {
         const plan = planForParameterName(parameter.name);
-        if (plan) bind(plan, parameter.texture, "props", "heuristic");
+        if (!plan) continue;
+        if (matNamedTextures?.has(parameter.texture)) continue;
+        bind(plan, parameter.texture, "props", "heuristic");
       }
       // An instance's own overrides fill slots umodel did not resolve. They never displace a
       // `.mat` slot: umodel walked the real graph to produce that one, and a parameter name is

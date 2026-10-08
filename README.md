@@ -473,6 +473,17 @@ heuristically, and composes an opacity map of another resolution when the aspect
 ratio matches. A sweep sheet tile that renders nothing although Unreal has a
 thumbnail for it is recorded under the entry's `sheet.warnings`.
 
+Importer version 58 stops a texture-parameter default from inventing a glTF slot from a
+texture UE Viewer already named as another output. A parameter can exist without being
+wired to its own output, so when its default texture is already the resolved `.mat`'s
+Diffuse (or Normal, and so on) it is a shared placeholder, not a second live slot (Old
+West - VOL 5 Town Props declared an unused `Emissive` default equal to the Fill albedo,
+which painted every dark-wood model with a flat grey emissive wash). Real parameter
+overrides and `.mat`-named Emissive slots still bind, a default whose texture the `.mat`
+left in `Other[]` still recovers its slot by parameter name, and a `.mat` that names no
+slot (the modern converter's `Other[n]` references only) still falls back to the
+collected defaults.
+
 Importer version 57 gives a mesh the `.mat` / `.props.txt` that sit beside it when two
 packages share an object name (a pack with `MI_Rock_Inst` in two folders bound one
 folder's normal map to the other's meshes); with none beside the mesh the pick is named
