@@ -662,7 +662,8 @@ describe("creature_preview installed MCP", () => {
         const receiptPath = join(root, firstOutput.receiptPath as string);
         const receipt = JSON.parse(await readFile(receiptPath, "utf8")) as Record<string, unknown>;
         const backend = receipt.backend as Record<string, unknown>;
-        backend.id = "browser-silmetrics";
+        // Switch to whichever silhouette backend this host did not use, so the change is real.
+        backend.id = backend.id === "browser-silmetrics" ? "python-outline" : "browser-silmetrics";
         await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
 
         const second = await callTool(child, 4, "creature_preview", {

@@ -34,7 +34,12 @@ dependency relationships with pagination and resolution/format filters.
 - Node.js 20.19 or newer
 - A local environment capable of running Playwright Chromium when Fab requests
   browser verification
-- No Epic or Fab login is required or automated
+- No Epic or Fab login is required or automated for search and free downloads.
+  `fab_import_asset` and `fab_list_owned` use your own FabCLI session; see
+  [Fab login for owned packs](#fab-login-for-owned-packs)
+- **On Linux, `g++`, `perl`, `zlib1g-dev`, `libpng-dev` and `libsdl2-dev`** for Unreal imports
+  of UE4.0–4.20 packs. UE Viewer's Linux prebuilt is a 32-bit binary that 64-bit-only
+  hosts cannot run, so the importer builds it from source once
 - **FFmpeg and FFprobe on `PATH`** for `audio_inspect_asset` and
   `audio_generate_sound`. Without them nothing is decoded, and the tools report
   that they could not check rather than reporting a pass.
@@ -377,6 +382,25 @@ data. For uncooked UE4 editor meshes it also provisions the separate GPL-3.0+
 it out of process. Modern UE5 packages rejected by UE Viewer use a pinned,
 out-of-process CUE4Parse adapter. Set `THREENATIVE_TOOLCHAIN_AUTOINSTALL=0` to
 require manually installed tools instead.
+
+### Fab login for owned packs
+
+`fab_import_asset` and `fab_list_owned` read your Fab library through
+[FabCLI](https://github.com/zirklerite/FabCLI), which the importer installs on first
+use. The MCP never signs in for you. Log in once; the session is kept in the OS
+keyring (Secret Service on Linux) and lasts about 90 days:
+
+```bash
+~/.cache/threenative-asset-mcp/toolchain/fabcli/fabcli auth login           # opens a login window
+~/.cache/threenative-asset-mcp/toolchain/fabcli/fabcli auth login --manual  # no window: paste a code
+~/.cache/threenative-asset-mcp/toolchain/fabcli/fabcli auth status
+```
+
+`--manual` reuses the browser where you are already signed in to Epic. FabCLI prints a
+`epicgames.com/id/login?redirectUrl=…` link; open it there, copy `authorizationCode` from the
+JSON the page shows, and paste it into the prompt within a few minutes. It needs an
+interactive terminal. In Claude Code, run it with a `!` prefix. Never paste the code into an
+untrusted service: it grants full access to the Epic account.
 
 | Input | Current result |
 | --- | --- |

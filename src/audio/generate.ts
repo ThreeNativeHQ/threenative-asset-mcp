@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -138,6 +139,8 @@ export class AudioGenerator {
   private readonly apiKeyOverride: string | undefined;
   private readonly ffmpegPath: string;
   private readonly inspector: AudioInspector;
+  /** Request directories this generator is working on right now. */
+  private readonly inFlight = new Set<string>();
 
   constructor(options: AudioGeneratorOptions = {}) {
     this.fetch = options.fetch ?? globalThis.fetch;
@@ -173,6 +176,28 @@ export class AudioGenerator {
     const normalized = normalize(request);
     const normalizedHash = sha256Json(normalized);
     const dir = join(this.audioDir, "generated", request.requestId);
+    // A duplicate that arrives while the first call is still converting would otherwise read its
+    // half-finished receipt and race it through the same local files.
+    if (this.inFlight.has(dir)) {
+      throw new AudioGenerateError(
+        "AUDIO_GENERATE_REQUEST_CONFLICT",
+        "That requestId is already in flight. Wait for it, or use a new requestId.",
+      );
+    }
+    this.inFlight.add(dir);
+    try {
+      return await this.generateOnce(request, normalized, normalizedHash, dir);
+    } finally {
+      this.inFlight.delete(dir);
+    }
+  }
+
+  private async generateOnce(
+    request: AudioGenerateRequest,
+    normalized: NormalizedRequest,
+    normalizedHash: string,
+    dir: string,
+  ): Promise<AudioGenerateResult> {
     const receiptPath = join(dir, "receipt.json");
 
     // Preflight: everything that could fail locally fails before a paid request is made.
@@ -453,7 +478,8 @@ export class AudioGenerator {
    * "cleaning up" here would hide the defect the inspection exists to find.
    */
   private async toWav(sourcePath: string, wavPath: string): Promise<void> {
-    const temporary = `${wavPath}.partial`;
+    // Unique per call, so two processes finishing the same request never rename each other's file.
+    const temporary = `${wavPath}.${randomUUID()}.partial`;
     await new Promise<void>((done, fail) => {
       execFile(
         this.ffmpegPath,
@@ -605,7 +631,7 @@ async function readReceipt(path: string): Promise<Receipt | undefined> {
 }
 
 async function writeReceipt(path: string, receipt: Receipt): Promise<void> {
-  const temporary = `${path}.partial`;
+  const temporary = `${path}.${randomUUID()}.partial`;
   await writeFile(temporary, JSON.stringify(receipt, null, 2), { mode: 0o600 });
   await rename(temporary, path);
 }

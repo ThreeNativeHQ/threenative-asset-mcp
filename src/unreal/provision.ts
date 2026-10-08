@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -159,33 +159,41 @@ export async function provisionUmodel(
 
   const staging = await mkdtemp(join(tmpdir(), "tn-umodel-"));
   try {
-    log("Downloading UE Viewer prebuilt binary…");
     const isWindows = process.platform === "win32";
     const archive = join(staging, isWindows ? "umodel.zip" : "umodel.tar.gz");
-    try {
-      await fetchToFile(
-        isWindows ? UEVIEWER_SOURCE.prebuiltWindows : UEVIEWER_SOURCE.prebuiltLinux,
-        archive,
-        { referer: UEVIEWER_SOURCE.referer },
-      );
-      const unpacked = join(staging, "prebuilt");
-      if (isWindows) await extractZip(archive, unpacked);
-      else await extractTarGz(archive, unpacked);
-      const candidate = join(unpacked, isWindows ? "umodel.exe" : "umodel");
-      await chmod(candidate, 0o755).catch(() => {});
-      if (await canRun(candidate, ["-version"], /UE Viewer/i)) {
-        await rename(candidate, installed).catch(async () => {
-          await writeFile(installed, await readFile(candidate));
-          await chmod(installed, 0o755);
-        });
-        log(`Installed prebuilt UE Viewer at ${installed}`);
-        return installed;
+    // The Linux prebuilt is a 32-bit i386 ELF. Without the i386 loader it cannot even start, so a
+    // 64-bit-only host goes straight to the source build instead of downloading it to find out.
+    const prebuiltRunnable =
+      isWindows || (await access("/lib/ld-linux.so.2").then(() => true, () => false));
+    if (!prebuiltRunnable) {
+      log("UE Viewer's Linux prebuilt is 32-bit and this host has no i386 loader; building from source.");
+    } else {
+      log("Downloading UE Viewer prebuilt binary…");
+      try {
+        await fetchToFile(
+          isWindows ? UEVIEWER_SOURCE.prebuiltWindows : UEVIEWER_SOURCE.prebuiltLinux,
+          archive,
+          { referer: UEVIEWER_SOURCE.referer },
+        );
+        const unpacked = join(staging, "prebuilt");
+        if (isWindows) await extractZip(archive, unpacked);
+        else await extractTarGz(archive, unpacked);
+        const candidate = join(unpacked, isWindows ? "umodel.exe" : "umodel");
+        await chmod(candidate, 0o755).catch(() => {});
+        if (await canRun(candidate, ["-version"], /UE Viewer/i)) {
+          await rename(candidate, installed).catch(async () => {
+            await writeFile(installed, await readFile(candidate));
+            await chmod(installed, 0o755);
+          });
+          log(`Installed prebuilt UE Viewer at ${installed}`);
+          return installed;
+        }
+        log("Prebuilt UE Viewer cannot run on this host; building from source.");
+      } catch (error) {
+        log(
+          `Prebuilt UE Viewer unavailable (${error instanceof Error ? error.name : "error"}); building from source.`,
+        );
       }
-      log("Prebuilt UE Viewer cannot run on this host; building from source.");
-    } catch (error) {
-      log(
-        `Prebuilt UE Viewer unavailable (${error instanceof Error ? error.name : "error"}); building from source.`,
-      );
     }
 
     if (process.platform !== "linux") {
@@ -233,10 +241,7 @@ export async function provisionUmodel(
     });
     const built = join(source, "umodel");
     if (build.code !== 0 || !(await canRun(built, ["-version"], /UE Viewer/i))) {
-      throw new ToolchainError(
-        "UNREAL_TOOL_UNUSABLE",
-        "UE Viewer could not be built here. It needs g++, perl, zlib and SDL2 development headers. Install umodel yourself and set THREENATIVE_UMODEL_PATH.",
-      );
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", umodelBuildFailure(`${build.stdout}\n${build.stderr}`));
     }
     await writeFile(installed, await readFile(built));
     await chmod(installed, 0o755);
@@ -245,6 +250,44 @@ export async function provisionUmodel(
   } finally {
     await rm(staging, { recursive: true, force: true });
   }
+}
+
+/** Debian/Ubuntu packages for the headers and tools UE Viewer's build.sh needs. */
+const UMODEL_BUILD_PACKAGES: Readonly<Record<string, string>> = {
+  "png.h": "libpng-dev",
+  "SDL.h": "libsdl2-dev",
+  "zlib.h": "zlib1g-dev",
+  "g++": "g++",
+  "c++": "g++",
+  perl: "perl",
+};
+
+/**
+ * Names what a failed UE Viewer source build was missing, from the build's own output. On a fresh
+ * Debian 13 host the fixed list of prerequisites sent people after SDL2 while the compiler was
+ * asking for png.h.
+ */
+export function umodelBuildFailure(output: string): string {
+  const fallback = "Install umodel yourself and set THREENATIVE_UMODEL_PATH.";
+  const header = /fatal error: (?:[\w./]+\/)?([\w.+-]+\.h): No such file/.exec(output)?.[1];
+  const tool = /(?:^|\s)(g\+\+|c\+\+|perl)(?::| -)[^\n]*(?:not found|No such file)/m.exec(output)?.[1];
+  const missing = header ?? tool;
+  if (missing) {
+    const pkg = UMODEL_BUILD_PACKAGES[missing];
+    return pkg
+      ? `UE Viewer could not be built here: ${missing} is missing. On Debian/Ubuntu install it with \`sudo apt install ${pkg}\` and retry, or ${fallback.charAt(0).toLowerCase()}${fallback.slice(1)}`
+      : `UE Viewer could not be built here: ${missing} is missing; install the development package that provides it and retry, or ${fallback.charAt(0).toLowerCase()}${fallback.slice(1)}`;
+  }
+  return `UE Viewer could not be built here. It needs g++, perl, and the zlib, libpng and SDL2 development headers. ${fallback}`;
+}
+
+/** The shallowest file named `name` inside an unpacked archive, or undefined. */
+async function findArchiveEntry(root: string, name: string): Promise<string | undefined> {
+  const entries = await readdir(root, { recursive: true, withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && entry.name === name)
+    .map((entry) => join(entry.parentPath, entry.name))
+    .sort((left, right) => left.split(/[\\/]/).length - right.split(/[\\/]/).length)[0];
 }
 
 /** Installs FabCLI from its public GitHub release, checked against the release SHA256SUMS file. */
@@ -281,9 +324,10 @@ export async function provisionFabcli(
     const unpacked = join(staging, "unpacked");
     if (isWindows) await extractZip(archive, unpacked);
     else await extractTarGz(archive, unpacked);
-    const candidate = join(unpacked, isWindows ? "fabcli.exe" : "fabcli");
-    await chmod(candidate, 0o755).catch(() => {});
-    if (!(await canRun(candidate, ["--version"], /fabcli/i))) {
+    // Release archives wrap the binary in a `fabcli-<tag>-<platform>/` folder; older ones did not.
+    const candidate = await findArchiveEntry(unpacked, isWindows ? "fabcli.exe" : "fabcli");
+    if (candidate) await chmod(candidate, 0o755).catch(() => {});
+    if (!candidate || !(await canRun(candidate, ["--version"], /fabcli/i))) {
       throw new ToolchainError(
         "UNREAL_TOOL_UNUSABLE",
         "The downloaded FabCLI binary does not run on this host. Install it yourself and set THREENATIVE_FABCLI_PATH.",

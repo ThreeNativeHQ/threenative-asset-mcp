@@ -998,6 +998,17 @@ async function hashExistingFile(path: string, maxBytes: number): Promise<string 
   }
 }
 
+/**
+ * Test-only fault injection at the two points where another writer can interleave with
+ * publication. Production callers never pass these; tests use them instead of racing `fs.watch`.
+ */
+export interface CreaturePublicationHooks {
+  /** After the new GLB is renamed into place, before its receipt is finalized. */
+  readonly afterPublication?: () => void | Promise<void>;
+  /** During rollback, right after the published GLB is moved aside to its `.rollback-published` capture. */
+  readonly afterRollbackCapture?: () => void | Promise<void>;
+}
+
 export class CreatureRunner {
   readonly limits: CreatureLimits;
   readonly payload: CreaturePayloadDescriptor;
@@ -1007,11 +1018,19 @@ export class CreatureRunner {
   private closing = false;
   private readonly destinationLocks = new Set<string>();
 
-  constructor(config: CreatureConfig, launchRoot: string, payload: CreaturePayloadDescriptor) {
+  private readonly hooks: CreaturePublicationHooks;
+
+  constructor(
+    config: CreatureConfig,
+    launchRoot: string,
+    payload: CreaturePayloadDescriptor,
+    hooks: CreaturePublicationHooks = {},
+  ) {
     this.limits = config.limits;
     this.cacheDir = config.cacheDir;
     this.launchRoot = resolve(launchRoot);
     this.payload = payload;
+    this.hooks = hooks;
   }
 
   async close(): Promise<void> {
@@ -1535,6 +1554,7 @@ export class CreatureRunner {
         await rename(publicationTemporary, outputAbsolute);
         publicationTemporary = undefined;
         publicationCommitted = true;
+        await this.hooks.afterPublication?.();
       }
 
       try {
@@ -1592,6 +1612,7 @@ export class CreatureRunner {
             );
           }
 
+          await this.hooks.afterRollbackCapture?.();
           const capturedOutputSha256 = await hashExistingFile(rollbackCaptureAbsolute, this.limits.glbBytes).catch(() => undefined);
           if (capturedOutputSha256 !== outputSha256) {
             try {

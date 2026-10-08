@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,17 +35,21 @@ async function temporaryDirectory(): Promise<string> {
 beforeAll(async () => {
   // A real MP3, so the conversion and the inspection downstream are real work.
   const staging = await mkdtemp(join(tmpdir(), "asset-mcp-mp3-"));
-  const path = join(staging, "sound.mp3");
-  execFileSync("ffmpeg", [
-    "-v", "error", "-y",
-    "-f", "lavfi",
-    "-i", "sine=frequency=441:duration=2:sample_rate=44100",
-    "-af", "volume=5.0",
-    "-b:a", "128k",
-    path,
-  ]);
-  mp3Bytes = new Uint8Array(await readFile(path));
-  await rm(staging, { recursive: true, force: true });
+  try {
+    const path = join(staging, "sound.mp3");
+    execFileSync("ffmpeg", [
+      "-v", "error", "-y",
+      "-f", "lavfi",
+      "-i", "sine=frequency=441:duration=2:sample_rate=44100",
+      "-af", "volume=5.0",
+      "-b:a", "128k",
+      path,
+    ]);
+    mp3Bytes = new Uint8Array(await readFile(path));
+  } finally {
+    // Without ffmpeg the call above throws; the staging dir must not outlive the failure.
+    await rm(staging, { recursive: true, force: true });
+  }
 });
 
 interface Recorded {
@@ -202,6 +206,34 @@ describe("one invocation is at most one charge", () => {
     expect((rejected as PromiseRejectedResult).reason).toBeInstanceOf(AudioGenerateError);
     expect((rejected as PromiseRejectedResult).reason.code).toBe("AUDIO_GENERATE_REQUEST_CONFLICT");
   });
+
+  it("refuses a duplicate that arrives while the first call is still converting", async () => {
+    const audioDir = await temporaryDirectory();
+    // Hold the first call inside its WAV conversion: the window where a duplicate used to read the
+    // half-finished receipt, run its own conversion, and lose the rename race with ENOENT.
+    const slowFfmpeg = join(await temporaryDirectory(), "slow-ffmpeg");
+    await writeFile(slowFfmpeg, "#!/bin/sh\nsleep 1\nexec ffmpeg \"$@\"\n");
+    await chmod(slowFfmpeg, 0o755);
+    const recorded = recordingFetch(() => audioResponse(mp3Bytes));
+    const generator = new AudioGenerator({
+      audioDir,
+      inspectRoots: [audioDir],
+      fetch: recorded.fetch,
+      apiKey: "test-key-not-a-real-one",
+      ffmpegPath: slowFfmpeg,
+    });
+
+    const first = generator.generate({ requestId: ID_A, prompt: PROMPT, durationSeconds: 2 });
+    const source = join(audioDir, "generated", ID_A, "source.mp3");
+    while (!(await stat(source).then(() => true, () => false))) {
+      await new Promise((done) => setTimeout(done, 10));
+    }
+    const second = generator.generate({ requestId: ID_A, prompt: PROMPT, durationSeconds: 2 });
+
+    await expect(second).rejects.toMatchObject({ code: "AUDIO_GENERATE_REQUEST_CONFLICT" });
+    await expect(first).resolves.toMatchObject({ requestId: ID_A });
+    expect(recorded.calls).toHaveLength(1);
+  }, 20_000);
 
   it("refuses the same id with different options instead of charging for a different sound", async () => {
     const audioDir = await temporaryDirectory();

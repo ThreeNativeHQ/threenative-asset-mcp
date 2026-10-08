@@ -10,7 +10,6 @@ import {
   existsSync,
   readdirSync,
   unlinkSync,
-  watch,
   writeFileSync,
 } from "node:fs";
 import {
@@ -26,13 +25,13 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import type { CreatureRunner } from "../src/creature/runner.js";
+import type { CreaturePublicationHooks, CreatureRunner } from "../src/creature/runner.js";
 
 const WYVERN_SPEC = {
   name: "ember_crown_wyvern",
@@ -383,7 +382,11 @@ async function createScaffold(): Promise<string> {
   return root;
 }
 
-async function createFixtureRunner(root: string, fixtureCli: string): Promise<CreatureRunner> {
+async function createFixtureRunner(
+  root: string,
+  fixtureCli: string,
+  hooks: CreaturePublicationHooks = {},
+): Promise<CreatureRunner> {
   const archiveWriter = new ZipWriter(new Uint8ArrayWriter());
   await archiveWriter.add("fixture/engine/cli.js", new TextReader(fixtureCli));
   const archive = Buffer.from(await archiveWriter.close());
@@ -409,6 +412,7 @@ async function createFixtureRunner(root: string, fixtureCli: string): Promise<Cr
       root: "fixture/",
       files: ["engine/cli.js"],
     },
+    hooks,
   );
 }
 
@@ -476,7 +480,11 @@ function validFixtureGlb(extraBytes: number, marker: number): Buffer {
   }, binary);
 }
 
-async function createSeedCopyRunner(root: string, seedPath: string): Promise<CreatureRunner> {
+async function createSeedCopyRunner(
+  root: string,
+  seedPath: string,
+  hooks: CreaturePublicationHooks = {},
+): Promise<CreatureRunner> {
   return createFixtureRunner(root, String.raw`
     const fs = require("fs");
     const path = require("path");
@@ -497,46 +505,28 @@ async function createSeedCopyRunner(root: string, seedPath: string): Promise<Cre
       verts: 3, faces: 1, joints: 1, anims: ["idle"],
       checks: "all green", contract: "ok"
     }));
-  `);
+  `, hooks);
 }
 
-function sabotageReceiptAfterPublication(
-  stateRoot: string,
-  outputPath: string,
-  sabotage: () => void,
-  timing: "after-publication" | "during-rollback" = "after-publication",
-): Promise<void> {
-  return new Promise((resolveSabotage, reject) => {
-    let receiptSabotaged = false;
-    let sabotageComplete = false;
-    const timer = setTimeout(() => {
-      watcher.close();
-      reject(new Error("Timed out waiting for creature publication rename"));
-    }, 30_000);
-    const watcher = watch(dirname(outputPath), (event, filename) => {
-      if (sabotageComplete) return;
-      if (event !== "rename" || filename !== basename(outputPath)) return;
-      try {
-        if (!receiptSabotaged) {
-          const receiptTemporary = readdirSync(join(stateRoot, "receipts"))
-            .find((name) => name.endsWith(".tmp"));
-          if (!receiptTemporary) return;
-          unlinkSync(join(stateRoot, "receipts", receiptTemporary));
-          receiptSabotaged = true;
-          if (timing === "during-rollback") return;
-        }
-        sabotageComplete = true;
-        sabotage();
-        clearTimeout(timer);
-        watcher.close();
-        resolveSabotage();
-      } catch (error) {
-        clearTimeout(timer);
-        watcher.close();
-        reject(error);
-      }
-    });
-  });
+/**
+ * Makes receipt finalization fail right after publication, then runs `sabotage` at the moment
+ * rollback has moved the published GLB aside — the window a concurrent external writer hits.
+ * Driven by the runner's publication hooks, so it is deterministic under any machine load.
+ */
+function receiptFailureDuringRollback(stateRoot: string, sabotage: () => void) {
+  let ran = false;
+  const hooks: CreaturePublicationHooks = {
+    afterPublication: () => {
+      const receiptTemporary = readdirSync(join(stateRoot, "receipts")).find((name) => name.endsWith(".tmp"));
+      if (!receiptTemporary) throw new Error("No receipt was pending finalization after publication");
+      unlinkSync(join(stateRoot, "receipts", receiptTemporary));
+    },
+    afterRollbackCapture: () => {
+      sabotage();
+      ran = true;
+    },
+  };
+  return { hooks, ran: () => ran };
 }
 
 describe("creature_compile installed MCP", () => {
@@ -978,17 +968,17 @@ describe("creature_compile installed MCP", () => {
     await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
     await writeFile(outputPath, previous);
     await writeFile(seedPath, replacement);
-    const runner = await createSeedCopyRunner(root, seedPath);
-    const sabotaged = sabotageReceiptAfterPublication(stateRoot, outputPath, () => {
+    const sabotage = receiptFailureDuringRollback(stateRoot, () => {
       writeFileSync(outputPath, external);
-    }, "during-rollback");
+    });
+    const runner = await createSeedCopyRunner(root, seedPath, sabotage.hooks);
     try {
       const failure = await runner.compile({
         specPath: ".threenative/creatures/wyvern.json",
         outputPath: "assets/creatures/external-race.glb",
         expectedOutputSha256: hash(previous),
       }).catch((error: unknown) => error) as { code?: string; detail?: Record<string, unknown> };
-      await sabotaged;
+      expect(sabotage.ran()).toBe(true);
       expect(failure).toMatchObject({
         code: "OUTPUT_CONFLICT",
         detail: {
@@ -1021,20 +1011,20 @@ describe("creature_compile installed MCP", () => {
     await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
     await writeFile(outputPath, previous);
     await writeFile(seedPath, replacement);
-    const runner = await createSeedCopyRunner(root, seedPath);
-    const sabotaged = sabotageReceiptAfterPublication(stateRoot, outputPath, () => {
+    const sabotage = receiptFailureDuringRollback(stateRoot, () => {
       const rollbackCapture = readdirSync(outputDirectory)
         .find((name) => name.endsWith(".rollback-published"));
       if (!rollbackCapture) throw new Error("Rollback capture was not published");
       writeFileSync(join(outputDirectory, rollbackCapture), capturedExternal);
-    }, "during-rollback");
+    });
+    const runner = await createSeedCopyRunner(root, seedPath, sabotage.hooks);
     try {
       const failure = await runner.compile({
         specPath: ".threenative/creatures/wyvern.json",
         outputPath: "assets/creatures/in-place-race.glb",
         expectedOutputSha256: hash(previous),
       }).catch((error: unknown) => error) as { code?: string; detail?: Record<string, unknown> };
-      await sabotaged;
+      expect(sabotage.ran()).toBe(true);
       expect(failure).toMatchObject({
         code: "OUTPUT_CONFLICT",
         detail: {
@@ -1068,17 +1058,17 @@ describe("creature_compile installed MCP", () => {
     await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
     await writeFile(outputPath, previous);
     await writeFile(seedPath, replacement);
-    const runner = await createSeedCopyRunner(root, seedPath);
-    const sabotaged = sabotageReceiptAfterPublication(stateRoot, outputPath, () => {
+    const sabotage = receiptFailureDuringRollback(stateRoot, () => {
       chmodSync(outputDirectory, 0o500);
-    }, "during-rollback");
+    });
+    const runner = await createSeedCopyRunner(root, seedPath, sabotage.hooks);
     try {
       const failure = await runner.compile({
         specPath: ".threenative/creatures/wyvern.json",
         outputPath: "assets/creatures/restore-failure.glb",
         expectedOutputSha256: hash(previous),
       }).catch((error: unknown) => error) as { code?: string; detail?: Record<string, unknown> };
-      await sabotaged;
+      expect(sabotage.ran()).toBe(true);
       await chmod(outputDirectory, 0o700);
       expect(failure).toMatchObject({
         code: "OUTPUT_CONFLICT",
