@@ -2713,41 +2713,53 @@ export async function importUnrealDirectory(
   if (uncookedMeshDescription.length > 0 || mapPackages.length > 0) {
     uncookedConverter = request.uncookedConverter ?? (await ensureUncookedConverter(environment, log));
     const uncookedRaw = join(staging, "uncooked");
-    const args =
-      uncookedMeshDescription.length > 0
-        ? [sourceDir, "--export-dir", uncookedRaw, "--skip-textures"]
-        : [sourceDir, "--export-dir", uncookedRaw, "--skip-export"];
-    if (uncookedMeshDescription.length > 0 && request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
-      args.push("--filter", request.onlyPackages[0]);
-    }
-    if (mapPackages.length > 0) args.push("--scene-json-dir", sceneSources);
-    const actions = [
-      ...(uncookedMeshDescription.length > 0
-        ? [`${uncookedMeshDescription.length} uncooked MeshDescription package${uncookedMeshDescription.length === 1 ? "" : "s"}`]
-        : []),
-      ...(mapPackages.length > 0
-        ? [`${mapPackages.length} Unreal level${mapPackages.length === 1 ? "" : "s"}`]
-        : []),
-    ];
-    log(`Decoding ${actions.join(" and ")}…`);
-    const converted = await runBounded(uncookedConverter.path, args, {
-      timeoutMs: 1_800_000,
-      maxOutputBytes: 64 * 1024 * 1024,
-    });
-    if (converted.code !== 0) {
-      throw new ToolchainError(
-        "UNREAL_TOOL_FAILED",
-        `The uncooked MeshDescription converter exited ${converted.code}; no partial output was promoted.`,
-      );
-    }
+    // Meshes and levels run as separate invocations. The Python tool parses every .umap under the
+    // source tree while exporting scenes, so one level it cannot read (a UE5 package the header
+    // check did not catch) must not take the meshes down with it.
     if (uncookedMeshDescription.length > 0) {
+      const args = [sourceDir, "--export-dir", uncookedRaw, "--skip-textures"];
+      if (request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
+        args.push("--filter", request.onlyPackages[0]);
+      }
+      log(`Decoding ${uncookedMeshDescription.length} uncooked MeshDescription package${uncookedMeshDescription.length === 1 ? "" : "s"}…`);
+      const converted = await runBounded(uncookedConverter.path, args, {
+        timeoutMs: 1_800_000,
+        maxOutputBytes: 64 * 1024 * 1024,
+      });
+      if (converted.code !== 0) {
+        throw new ToolchainError(
+          "UNREAL_TOOL_FAILED",
+          `The uncooked MeshDescription converter exited ${converted.code}; no partial output was promoted.`,
+        );
+      }
       uncookedGlbs = await indexGlbs(uncookedRaw);
       warnings.push(
         `Decoded ${uncookedMeshDescription.length} requested uncooked UE4 MeshDescription GLB${uncookedMeshDescription.length === 1 ? "" : "s"} without Unreal Engine; UE Viewer supplied their source textures and material metadata.`,
       );
     }
-    for (const entry of mapPackages) {
-      sceneSourcePaths.set(entry.file, join(sceneSources, `${basename(entry.package, extname(entry.package))}.scene-source.json`));
+    if (mapPackages.length > 0) {
+      const args = [sourceDir, "--export-dir", uncookedRaw, "--skip-export", "--scene-json-dir", sceneSources];
+      log(`Decoding ${mapPackages.length} Unreal level${mapPackages.length === 1 ? "" : "s"}…`);
+      const converted = await runBounded(uncookedConverter.path, args, {
+        timeoutMs: 1_800_000,
+        maxOutputBytes: 64 * 1024 * 1024,
+      });
+      if (converted.code === 0) {
+        for (const entry of mapPackages) {
+          sceneSourcePaths.set(entry.file, join(sceneSources, `${basename(entry.package, extname(entry.package))}.scene-source.json`));
+        }
+      } else {
+        const detail = `${converted.stderr}\n${converted.stdout}`
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .pop();
+        const reason = `The uncooked scene converter exited ${converted.code}${detail ? `: ${detail.slice(0, 160)}` : ""}`;
+        warnings.push(
+          `Scene reconstruction failed (${reason}); ${mapPackages.length} level${mapPackages.length === 1 ? "" : "s"} skipped.`,
+        );
+        for (const entry of mapPackages) failed.push({ package: entry.package, reason: `Scene reconstruction failed: ${reason}` });
+      }
     }
   }
   const uncookedNames = new Set(uncookedMeshDescription.map((entry) => basename(entry.package, extname(entry.package))));
@@ -4071,7 +4083,7 @@ export async function importUnrealDirectory(
     // A modern level or prefab whose conversion did not produce a scene source was already reported
     // above; reconstructing it again would only add a second, misleading ENOENT failure.
     const sceneEntries = [
-      ...mapPackages,
+      ...mapPackages.filter((entry) => sceneSourcePaths.has(entry.file)),
       ...[...modernMapPackages, ...modernPrefabPackages].filter((entry) => sceneSourcePaths.has(entry.file)),
     ];
     const sceneBasenameCounts = new Map<string, number>();
