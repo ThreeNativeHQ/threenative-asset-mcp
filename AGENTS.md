@@ -82,8 +82,13 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   instance's parameter names are not ones it recognises. The instance's real textures are in
   `TextureParameterValues` in `.props.txt`. Check the package name table (`strings -n 4 X.uasset`)
   before trusting either. PRD-537 tracks the resolver fix.
-- **Some colour exists only in the material graph** (mask channels × tint vectors, no colour
-  texture). No texture binding can reproduce it; see PRD-538.
+- **Some colour exists only in the material graph** (layered masters: colour textures blended by
+  mask channels and tinted, sampled inside material functions). `.mat`/props texture binding cannot
+  reproduce it, so a section with no base colour asks the graph baker (`src/unreal/graph-baker.ts`,
+  PRD-538): CUE4Parse dumps the graph, `material-graph.ts` evaluates a closed node set and bakes a
+  base-colour PNG (`source: "graph"`). Anything it cannot evaluate (e.g. `DepthFade`,
+  `MatLayerBlend_Tint`) stays on the neutral fallback and is named under the section's `graph`.
+  Engine content functions are not in the pack, so a bake that relies on them is `heuristic`.
 - Fab downloads land in `~/.cache/threenative-asset-mcp/fab-downloads/<listing>/<artifact>`. They
   are licensed, not redistributable: never commit pack contents. Delete what you downloaded when
   you are done; FabCLI fetched Soul Cave (1.2 GB) in 17 s, so re-downloading is cheap.

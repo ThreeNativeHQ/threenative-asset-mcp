@@ -409,6 +409,18 @@ oldest listed engine, and that picks the decoder. When a listing has several art
 the MeshDescription converter, then UE Viewer; the newest source format breaks a tie) and says so
 in the report `warnings`. Pass `artifactId` or `engine` to override.
 
+**Graph-only colour.** Some Unreal materials compute BaseColor in the material graph (layered
+masters that blend colour textures by mask channels and tint them), so no texture binding can
+reproduce them. A section left without a base colour is baked from its graph: the pack's editor
+package is read with CUE4Parse, a closed node set is evaluated per texel, and the result is a
+base-colour PNG with `source: "graph"` in the section's bindings. The bake is `exact` only when
+every node is understood; engine layer functions that are not in the pack, a mesh without vertex
+colours standing in white, and a UV set the importer drops make it `heuristic`, and the section's
+`graph` field names each approximation. Nodes it cannot evaluate (for example `DepthFade`,
+`MatLayerBlend_Tint`) leave the neutral fallback and are listed under `graph.unsupportedNodes`.
+The first bake installs the CUE4Parse converter and its private .NET SDK (hundreds of MB, once);
+pass `graphBake: false` to the importer, or set `THREENATIVE_TOOLCHAIN_AUTOINSTALL=0`, to skip it.
+
 | Input | Current result |
 | --- | --- |
 | Cooked loose UE4 static meshes and textures | GLB geometry, LOD sections, embedded textures, and common PBR reconstruction |

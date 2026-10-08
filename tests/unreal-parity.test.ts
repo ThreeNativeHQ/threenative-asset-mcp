@@ -135,6 +135,20 @@ describe("scorePack", () => {
     expect(score.identity.violations[0]?.kind).toBe("foreign");
   });
 
+  it("does not call a baked graph texture foreign (it is derived, not one of the pack's textures)", () => {
+    const fromGraph = (s: ImportedMaterialSection): ImportedMaterialSection => ({
+      ...s,
+      bindings: s.bindings.map((b, i) => (i === 0 ? { ...b, source: "graph" } : b)),
+    });
+    const baked = fromGraph(section("MI_Cave_Rock_Pillar", ["MI_Cave_Rock_Pillar_graph_baseColor", "T_Cave_Rock_Pillar_N"]));
+    const ok = scorePack(caveDump(), reportOf([model(MESH_PKG, [baked])]));
+    expect(ok.identity.violationsTotal).toBe(0);
+    // A pack texture that really is foreign is still caught next to a graph binding.
+    const mixed = fromGraph(section("MI_Cave_Rock_Pillar", ["MI_Cave_Rock_Pillar_graph_baseColor", "T_Other_D"]));
+    const bad = scorePack(caveDump(), reportOf([model(MESH_PKG, [mixed])]));
+    expect(bad.identity.violations.map((v) => v.texture)).toEqual(["t_other_d"]);
+  });
+
   it("fails coverage with the report's reason when a mesh is missing", () => {
     const score = scorePack(
       caveDump(),
@@ -179,6 +193,85 @@ describe("scorePack", () => {
     expect(score.colour.coloured).toBe(0);
     expect(score.colour.misses).toHaveLength(1);
     expect(score.status).toBe("fail");
+  });
+
+  describe("graph outcomes (PRD-538)", () => {
+    const grey = (name: string, graph?: ImportedMaterialSection["graph"]): ImportedMaterialSection =>
+      section(name, ["T_Cave_Rock_Pillar_N"], {
+        textured: false,
+        factors: { baseColor: [0.8, 0.8, 0.8, 1], emissive: [0, 0, 0], metallic: 0, roughness: 1 },
+        ...(graph ? { graph } : {}),
+      });
+    const unsupported = (...nodes: string[]): ImportedMaterialSection["graph"] => ({
+      status: "unsupported",
+      unsupportedNodes: nodes,
+      approximations: [],
+    });
+
+    it("counts sections naming each node class, not occurrences", () => {
+      // One section names Divide twice and Power once; another names Divide; a third is baked.
+      const sections = [
+        grey("MI_Cave_Rock_Pillar", unsupported("Divide", "Divide", "Power")),
+        grey("MI_Cave_Rock_Pillar", unsupported("Divide")),
+        grey("MI_Cave_Rock_Pillar", { status: "baked", confidence: "exact", unsupportedNodes: [], approximations: [] }),
+      ];
+      const score = scorePack(caveDump(), reportOf([model(MESH_PKG, sections)]));
+      expect(score.colour.unsupportedNodes).toEqual({ Divide: 2, Power: 1 });
+      expect(score.colour.graphBaked).toBe(1);
+      expect(score.colour.graphUnsupported).toBe(2);
+      expect(score.colour.graphUnavailable).toBe(0);
+    });
+
+    it("normalises unavailable reasons so names do not split the count", () => {
+      const sections = [
+        grey("MI_Cave_Rock_Pillar", { status: "unavailable", unsupportedNodes: [], approximations: [], reason: "texture T_Rock_M could not be loaded" }),
+        grey("MI_Cave_Rock_Pillar", { status: "unavailable", unsupportedNodes: [], approximations: [], reason: "texture T_Other_M could not be loaded" }),
+        grey("MI_Cave_Rock_Pillar", { status: "unavailable", unsupportedNodes: [], approximations: [], reason: "no dumped graph for MI_X or its parents" }),
+        grey("MI_Cave_Rock_Pillar", { status: "unavailable", unsupportedNodes: [], approximations: [], reason: "no dumped graph for MI_Y or its parents" }),
+        grey("MI_Cave_Rock_Pillar", { status: "unavailable", unsupportedNodes: [], approximations: [] }),
+      ];
+      const score = scorePack(caveDump(), reportOf([model(MESH_PKG, sections)]));
+      expect(score.colour.unavailableReasons).toEqual({
+        "texture could not be loaded": 2,
+        "no dumped graph": 2,
+        "no reason given": 1,
+      });
+      expect(score.colour.graphUnavailable).toBe(5);
+    });
+
+    it("attributes each S4 miss to its graph outcome", () => {
+      const sections = [
+        grey("MI_Cave_Rock_Pillar", unsupported("Divide")),
+        grey("MI_Cave_Rock_Pillar", { status: "unavailable", unsupportedNodes: [], approximations: [], reason: "no dumped graph for X or its parents" }),
+        grey("MI_Cave_Rock_Pillar"),
+        grey("MI_Cave_Rock_Pillar", { status: "baked", unsupportedNodes: [], approximations: [] }), // baked, still grey
+        section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_N"], {
+          factors: { baseColor: [0.2, 0.4, 0.1, 1], emissive: [0, 0, 0], metallic: 0, roughness: 1 },
+          textured: false,
+          graph: { status: "baked", confidence: "exact", unsupportedNodes: [], approximations: [] },
+        }),
+      ];
+      const score = scorePack(caveDump(), reportOf([model(MESH_PKG, sections)]));
+      expect(score.colour.misses.map((m) => m.graphStatus)).toEqual(["unsupported", "unavailable", "none", "baked"]);
+      expect(score.colour.misses[0]).toMatchObject({ unsupportedNodes: ["Divide"] });
+      expect(score.colour.missAttribution).toEqual({
+        bakedAway: 1,
+        bakedStillGrey: 1,
+        unsupportedNode: 1,
+        unavailable: 1,
+        noGraph: 1,
+      });
+      expect(score.colour.missesTotal).toBe(4);
+    });
+
+    it("scores an older report with no graph field without crashing", () => {
+      const score = scorePack(caveDump(), reportOf([model(MESH_PKG, [grey("MI_Cave_Rock_Pillar")])]));
+      expect(score.colour.graphBaked).toBe(0);
+      expect(score.colour.unsupportedNodes).toEqual({});
+      expect(score.colour.unavailableReasons).toEqual({});
+      expect(score.colour.misses[0]?.graphStatus).toBe("none");
+      expect(score.colour.missAttribution.noGraph).toBe(1);
+    });
   });
 
   it("does not expect colour from a normal-only material", () => {

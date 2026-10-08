@@ -28,11 +28,16 @@ import {
   PARITY_USAGE,
   parityLine,
   parseParityArgs,
+  readBaselineS4Misses,
   readPreviousEntries,
+  s4Delta,
+  s4DeltaLine,
+  s4MissCount,
   selectResume,
   SweepLockHeldError,
   summarizeEntries,
   summaryOf,
+  unsupportedNodeLines,
   upsertEntry,
   writeJsonAtomic,
   type CorpusEntry,
@@ -156,6 +161,11 @@ async function main(): Promise<number> {
     TMPDIR: runTmp,
   };
   const scorecardPath = join(args.out, "scorecard.json");
+  // Read before the sweep: --baseline may name the scorecard this run is about to rewrite.
+  const baselineMisses = args.baseline === undefined ? null : readBaselineS4Misses(args.baseline);
+  if (args.baseline !== undefined && baselineMisses === null) {
+    console.warn(`WARNING: no S4 miss count could be read from ${args.baseline}; no baseline delta will be printed.`);
+  }
 
   let entries: ScorecardEntry[] = [];
   /** Entries already on disk when a --resume run started; merged under this run's entries. */
@@ -173,13 +183,18 @@ async function main(): Promise<number> {
   const writeScorecard = (): Scorecard | undefined => {
     if (!writable) return undefined;
     const all = args.resume ? mergeScorecardEntries(previousEntries, entries) : entries;
+    const summary = summarizeEntries(all);
+    const now = s4MissCount(summary);
     const scorecard: Scorecard = {
       generatedAt: new Date().toISOString(),
       host: { load1: loadavg()[0] ?? 0, platform: platform() },
       toolchain: { importerVersion, cue4parse },
       entries: all,
       skipped,
-      summary: summarizeEntries(all),
+      summary:
+        baselineMisses !== null && now !== null
+          ? { ...summary, s4VsBaseline: s4Delta(baselineMisses, now) }
+          : summary,
     };
     writeJsonAtomic(scorecardPath, scorecard);
     return scorecard;
@@ -212,7 +227,12 @@ async function main(): Promise<number> {
       say(
         `LEFTOVER downloads=${left.downloads} unreal-cache=${left.cache} tmp=${left.tmp} fab-downloads/parity-*=${left.parityDirs}${args.keep ? " (--keep)" : ""}`,
       );
-      if (scorecard) say(parityLine(scorecard.summary));
+      if (scorecard) {
+        say(parityLine(scorecard.summary));
+        if (scorecard.summary.s4VsBaseline) say(s4DeltaLine(scorecard.summary.s4VsBaseline));
+        const top = unsupportedNodeLines(scorecard.summary);
+        if (top.length > 0) say(["Top unsupported material-graph node classes:", ...top].join("\n"));
+      }
       return code;
     })();
     return finishPromise;

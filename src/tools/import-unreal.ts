@@ -48,6 +48,7 @@ const SummarySchema = z.object({
     heuristic: z.number().int().nonnegative(),
     unsupported: z.number().int().nonnegative(),
     unresolved: z.number().int().nonnegative(),
+    graphBaked: z.number().int().nonnegative().optional(),
   }),
   license: z
     .object({

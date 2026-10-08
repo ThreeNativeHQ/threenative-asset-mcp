@@ -28,9 +28,26 @@ export interface IdentityViolation {
   readonly texture: string;
   readonly kind: "overridden-parent-default" | "foreign";
 }
+/** What the PRD-538 graph bake did for a section: `none` when no bake was attempted. */
+export type GraphOutcome = "baked" | "unsupported" | "unavailable" | "none";
 export interface ColourMiss {
   readonly model: string;
   readonly section: string;
+  readonly graphStatus: GraphOutcome;
+  /** The node classes that stopped the bake, when `graphStatus` is `unsupported`. */
+  readonly unsupportedNodes?: readonly string[];
+}
+/**
+ * Where the sections that expect colour ended up. `bakedAway` sections are coloured because the
+ * graph bake produced a colour (they would be misses without it); every other key counts misses.
+ */
+export interface MissAttribution {
+  readonly bakedAway: number;
+  /** A bake succeeded but the colour it produced is still neutral. */
+  readonly bakedStillGrey: number;
+  readonly unsupportedNode: number;
+  readonly unavailable: number;
+  readonly noGraph: number;
 }
 export interface PackScore {
   readonly status: "pass" | "fail" | "unverified";
@@ -75,6 +92,16 @@ export interface PackScore {
     readonly share: number;
     readonly misses: readonly ColourMiss[];
     readonly missesTotal: number;
+    /** Sections (all models) by graph outcome; sections with no `graph` count in none of these. */
+    readonly graphBaked: number;
+    readonly graphUnsupported: number;
+    readonly graphUnavailable: number;
+    /** Sections naming each unsupported node class (a class repeated in one section counts once). */
+    readonly unsupportedNodes: Readonly<Record<string, number>>;
+    /** Unavailable sections per normalised reason; capped at the top PARITY_LIST_CAP reasons. */
+    readonly unavailableReasons: Readonly<Record<string, number>>;
+    /** Uncapped, unlike `misses`. */
+    readonly missAttribution: MissAttribution;
   };
 }
 
@@ -108,6 +135,40 @@ function objectPackageKey(path: string): string {
 
 function capped<T>(list: readonly T[]): readonly T[] {
   return list.slice(0, PARITY_LIST_CAP);
+}
+
+/**
+ * Strips the names out of a bake's `unavailable` reason so equal causes share a count:
+ * `texture T_Rock_M could not be loaded` and `no dumped graph for MI_X or its parents` become
+ * `texture could not be loaded` and `no dumped graph`.
+ */
+export function normaliseGraphReason(reason: string | undefined): string {
+  const text = (reason ?? "").trim();
+  if (text === "") return "no reason given";
+  const texture = /^(texture)\s+\S+\s+(.+)$/i.exec(text);
+  if (texture) return `${texture[1]!.toLowerCase()} ${texture[2]!}`.slice(0, 80);
+  const noGraph = /^(no dumped graph)\b/i.exec(text);
+  if (noGraph) return noGraph[1]!.toLowerCase();
+  return text
+    .replace(/(["'`])[^"'`]*\1/g, "")
+    .split(/\s+/)
+    .filter((word) => !/[/\\_.]/.test(word) && !/\d/.test(word))
+    .join(" ")
+    .trim()
+    .slice(0, 80) || "other";
+}
+
+function bump(record: Record<string, number>, key: string): void {
+  record[key] = (record[key] ?? 0) + 1;
+}
+
+/** The PARITY_LIST_CAP largest entries, ties by name. */
+function cappedRecord(record: Readonly<Record<string, number>>): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(record)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, PARITY_LIST_CAP),
+  );
 }
 
 const isMeshClass = (c: string): boolean => c === "StaticMesh" || c === "SkeletalMesh";
@@ -274,8 +335,27 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   let expectsColour = 0;
   let coloured = 0;
   const misses: ColourMiss[] = [];
+  let graphBaked = 0;
+  let graphUnsupported = 0;
+  let graphUnavailable = 0;
+  const unsupportedNodes: Record<string, number> = {};
+  const unavailableReasons: Record<string, number> = {};
+  const missAttribution = { bakedAway: 0, bakedStillGrey: 0, unsupportedNode: 0, unavailable: 0, noGraph: 0 };
 
   for (const [key, model] of models) {
+    // Graph outcomes are tallied for every section, readable mesh or not.
+    for (const section of model.materials) {
+      const graph = section.graph;
+      if (!graph) continue;
+      if (graph.status === "baked") graphBaked++;
+      else if (graph.status === "unsupported") {
+        graphUnsupported++;
+        for (const node of new Set(graph.unsupportedNodes ?? [])) bump(unsupportedNodes, node);
+      } else if (graph.status === "unavailable") {
+        graphUnavailable++;
+        bump(unavailableReasons, normaliseGraphReason(graph.reason));
+      }
+    }
     const source = meshes.get(key);
     // A package that failed to load has no mesh export, yet the importer may still list a model.
     const unreadable = source ? source.unreadable : failedPackages.has(key);
@@ -329,8 +409,23 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       if (hasColourTexture || effective.hasVectors || effective.constantColors) {
         expectsColour++;
         const isColoured = section.textured === true || (section.factors?.baseColor !== undefined && !isNeutral(section.factors.baseColor));
-        if (isColoured) coloured++;
-        else misses.push({ model: model.name, section: section.name });
+        const graphStatus: GraphOutcome = section.graph?.status ?? "none";
+        if (isColoured) {
+          coloured++;
+          if (graphStatus === "baked") missAttribution.bakedAway++;
+        } else {
+          if (graphStatus === "baked") missAttribution.bakedStillGrey++;
+          else if (graphStatus === "unsupported") missAttribution.unsupportedNode++;
+          else if (graphStatus === "unavailable") missAttribution.unavailable++;
+          else missAttribution.noGraph++;
+          const nodes = graphStatus === "unsupported" ? [...new Set(section.graph?.unsupportedNodes ?? [])] : [];
+          misses.push({
+            model: model.name,
+            section: section.name,
+            graphStatus,
+            ...(nodes.length > 0 ? { unsupportedNodes: nodes } : {}),
+          });
+        }
       }
     }
   }
@@ -399,6 +494,12 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       share,
       misses: capped(misses),
       missesTotal: misses.length,
+      graphBaked,
+      graphUnsupported,
+      graphUnavailable,
+      unsupportedNodes: cappedRecord(unsupportedNodes),
+      unavailableReasons: cappedRecord(unavailableReasons),
+      missAttribution,
     },
   };
 }
@@ -427,6 +528,8 @@ function scoreIdentity(
 ): void {
   const actual = new Set<string>();
   for (const b of section.bindings) {
+    // A baked graph texture is derived from several pack textures, so it is not itself one of them.
+    if (b.source === "graph") continue;
     actual.add(objectName(b.texture));
     if (b.secondaryTexture) actual.add(objectName(b.secondaryTexture));
   }
