@@ -105,6 +105,22 @@ describe("createGraphBaker", () => {
     return { root, sourceDir: join(root, "source"), assets, readProps };
   }
 
+  it("hands the converter an engine it accepts (the importer carries UE_4.18)", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const engines: Array<string | undefined> = [];
+    const baker = createGraphBaker({
+      sourceDir,
+      engine: "UE_4.18",
+      maxTextureSize: 8,
+      dumpGraphs: async (_dir, options) => {
+        engines.push(options?.engine);
+        return new Map([["M_Master", masterGraph()]]);
+      },
+    })!;
+    await baker({ materialName: "MI_Rock_section", lookupName: "MI_Rock", assets, readProps });
+    expect(engines).toEqual(["4.18"]);
+  });
+
   it("bakes the instance's override, not the master default, and dumps once", async () => {
     const { sourceDir, assets, readProps } = await fixture();
     let dumps = 0;

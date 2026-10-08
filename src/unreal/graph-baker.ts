@@ -1,6 +1,7 @@
 import { readdir } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import sharp from "sharp";
+import { dumpEngineArg } from "../fab/routes.js";
 import { dumpMaterialGraphs } from "./graph-dump.js";
 import type { MaterialGraph } from "./graph-dump.js";
 import {
@@ -149,7 +150,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       try {
         return {
           graphs: await dump(options.sourceDir, {
-            ...(options.engine ? { engine: options.engine } : {}),
+            // The importer carries `UE_4.18`; the converter wants `4.18` and refuses anything else.
+            ...(options.engine && dumpEngineArg(options.engine) ? { engine: dumpEngineArg(options.engine)! } : {}),
             environment,
             ...(options.log ? { log: options.log } : {}),
             ...(options.modernConverter ? { converterPath: options.modernConverter.path } : {}),
