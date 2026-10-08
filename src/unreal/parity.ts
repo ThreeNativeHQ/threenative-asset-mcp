@@ -85,6 +85,8 @@ export interface PackScore {
     readonly sections: number;
     readonly verified: number;
     readonly unverified: number;
+    /** Bindings accepted because the source's own Winter/Autumn texture, not the bound Summer sibling, is in the effective set. */
+    readonly substituted: number;
     readonly violations: readonly IdentityViolation[];
     readonly violationsTotal: number;
     /** Uncapped violation count per kind; `violations` is capped, this is not. */
@@ -366,6 +368,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   const identity: IdentityViolation[] = [];
   let sections = 0;
   let unverified = 0;
+  let substituted = 0;
   // Sections of readable meshes only: the "material data outside the dump" rule must not count
   // sections that are unverified because their mesh was unreadable.
   let readableSections = 0;
@@ -458,7 +461,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
         outsideDump++;
         continue;
       }
-      scoreIdentity(model.name, section, effective, identity);
+      substituted += scoreIdentity(model.name, section, effective, identity);
       const hasColourTexture = [...effective.textures].some((t) => !effective.normalTextures.has(t));
       if (hasColourTexture || effective.hasVectors || effective.constantColors) {
         expectsColour++;
@@ -539,6 +542,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       sections,
       verified: sections - unverified,
       unverified,
+      substituted,
       violations: capped(identity),
       violationsTotal: identity.length,
       byKind: countByKind(identity),
@@ -581,11 +585,19 @@ function scoreIdentity(
   section: ImportedMaterialSection,
   effective: Effective,
   out: IdentityViolation[],
-): void {
+): number {
   const actual = new Set<string>();
+  let substituted = 0;
   for (const b of section.bindings) {
     // A baked graph texture is derived from several pack textures, so it is not itself one of them.
     if (b.source === "graph") continue;
+    // A Summer sibling bound in place of the source's own Winter/Autumn texture is the importer's
+    // declared choice: honest when the texture the source named is one of the section's own.
+    if (b.substitutedFrom && effective.textures.has(objectName(b.substitutedFrom))) {
+      substituted++;
+      if (b.secondaryTexture) actual.add(objectName(b.secondaryTexture));
+      continue;
+    }
     actual.add(objectName(b.texture));
     if (b.secondaryTexture) actual.add(objectName(b.secondaryTexture));
   }
@@ -598,4 +610,5 @@ function scoreIdentity(
       kind: effective.replaced.has(texture) ? "overridden-parent-default" : "foreign",
     });
   }
+  return substituted;
 }

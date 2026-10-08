@@ -522,3 +522,32 @@ describe("unreadable meshes", () => {
     expect(failureClasses(score)).toEqual(["unverified:unreadable-mesh"]);
   });
 });
+
+describe("S3 Summer-sibling substitution", () => {
+  const withSubstitution = (texture: string, substitutedFrom: string): ImportedMaterialSection => {
+    const s = section("MI_Cave_Rock_Pillar", [texture, "T_Cave_Rock_Pillar_N"]);
+    return { ...s, bindings: s.bindings.map((b, i) => (i === 0 ? { ...b, substitutedFrom } : b)) };
+  };
+  const score = (s: ImportedMaterialSection) => scorePack(caveDump(), reportOf([model(MESH_PKG, [s])])).identity;
+
+  it("accepts a swapped binding whose original texture is in the effective set, and counts it", () => {
+    const identity = score(withSubstitution("moss_a", "T_Cave_Rock_Pillar_M"));
+    expect(identity.violationsTotal).toBe(0);
+    expect(identity.substituted).toBe(1);
+  });
+
+  it("still flags a swap whose original is not the section's own texture", () => {
+    const identity = score(withSubstitution("moss_a", "T_Other_D"));
+    expect(identity.violations.map((v) => [v.texture, v.kind])).toEqual([["moss_a", "foreign"]]);
+    expect(identity.substituted).toBe(0);
+  });
+
+  it("still flags a plain foreign texture and other bindings next to a substituted one", () => {
+    const s = withSubstitution("moss_a", "T_Cave_Rock_Pillar_M");
+    const mixed = { ...s, bindings: [...s.bindings, { ...s.bindings[1]!, slot: "occlusion", texture: "T_Other_D" }] };
+    const identity = score(mixed);
+    expect(identity.violations.map((v) => v.texture)).toEqual(["t_other_d"]);
+    expect(identity.substituted).toBe(1);
+    expect(score(section("MI_Cave_Rock_Pillar", ["moss_a"])).substituted).toBe(0);
+  });
+});

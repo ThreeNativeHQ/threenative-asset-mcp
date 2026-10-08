@@ -82,6 +82,8 @@ export interface ImportedMaterialSection {
     readonly source: string;
     readonly confidence: string;
     readonly transform: TextureTransform;
+    /** The texture the source named when this binding is its Summer sibling instead. */
+    readonly substitutedFrom?: string;
   }[];
   readonly unsupported: readonly { readonly texture: string; readonly reason: string }[];
   readonly alphaMode: string;
@@ -1424,6 +1426,7 @@ export async function packageGlb(options: {
         source: binding.source,
         confidence: binding.confidence,
         transform: binding.transform,
+        ...(binding.substitutedFrom ? { substitutedFrom: binding.substitutedFrom } : {}),
       })),
       unsupported: [...resolved.unsupported.map((entry) => ({ ...entry })), ...rejectedMasks.splice(0)],
       alphaMode: material.getAlphaMode(),

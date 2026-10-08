@@ -52,6 +52,8 @@ export interface MaterialTextureBinding {
   readonly source: BindingSource;
   readonly confidence: BindingConfidence;
   readonly transform: TextureTransform;
+  /** The texture the source actually named, when a Winter/Autumn texture yielded to its Summer sibling. */
+  readonly substitutedFrom?: string;
 }
 
 export interface UnsupportedTexture {
@@ -775,7 +777,9 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     const sibling = [...referenced].find(
       (texture) => texture.toLowerCase() === summer && request.availableTextures.has(texture),
     );
-    if (sibling) bindings.set(slot, { ...binding, texture: sibling, confidence: "heuristic" });
+    if (!sibling) continue;
+    bindings.set(slot, { ...binding, texture: sibling, confidence: "heuristic", substitutedFrom: binding.texture });
+    limitations.add(`Winter/Autumn texture ${binding.texture} replaced by its Summer sibling ${sibling} (heuristic default look)`);
   }
 
   const metallicRoughness = bindings.get("metallicRoughness");

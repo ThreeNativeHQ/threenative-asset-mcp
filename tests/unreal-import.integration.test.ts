@@ -3061,3 +3061,30 @@ describe("uncookedMeshRoute", () => {
     expect(uncookedMeshRoute("skeletal", undefined)).toBe("modern");
   });
 });
+
+describe("Winter/Autumn texture yields to its Summer sibling", () => {
+  const resolve = (mat: string, textures: string[]) =>
+    resolveMaterial({
+      name: "MI_Winter",
+      readMat: () => mat,
+      readProps: () => undefined,
+      availableTextures: new Set(textures),
+    });
+
+  it("records the texture the source named and why the binding changed", () => {
+    const resolved = resolve("Diffuse=leaf_winter_d\nOther[0]=leaf_summer_d\n", ["leaf_winter_d", "leaf_summer_d"]);
+    const base = resolved.bindings.find((binding) => binding.slot === "baseColor");
+    expect(base?.texture).toBe("leaf_summer_d");
+    expect(base?.confidence).toBe("heuristic");
+    expect(base?.substitutedFrom).toBe("leaf_winter_d");
+    expect(resolved.limitations).toContain(
+      "Winter/Autumn texture leaf_winter_d replaced by its Summer sibling leaf_summer_d (heuristic default look)",
+    );
+  });
+
+  it("leaves every other binding unmarked", () => {
+    const resolved = resolve("Diffuse=leaf_summer_d\n", ["leaf_summer_d"]);
+    expect(resolved.bindings.every((binding) => binding.substitutedFrom === undefined)).toBe(true);
+    expect(resolved.limitations.filter((entry) => /Summer sibling/.test(entry))).toEqual([]);
+  });
+});
