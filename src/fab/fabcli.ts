@@ -64,6 +64,10 @@ const VersionSchema = z.object({
 });
 
 const LibraryEntrySchema = z.object({
+  // Epic catalog coordinates. Older payloads may omit them, and `download` then falls back to the
+  // engine filter.
+  assetId: z.string().optional(),
+  assetNamespace: z.string().optional(),
   title: z.string().default(""),
   description: z.string().default(""),
   url: z.string().default(""),
@@ -99,6 +103,9 @@ export interface FabAuthStatus {
 
 export interface FabOwnedListing {
   readonly listingId: string | undefined;
+  /** Epic catalog asset id; with `assetNamespace` and an artifact id it names one artifact exactly. */
+  readonly assetId?: string | undefined;
+  readonly assetNamespace?: string | undefined;
   readonly title: string;
   readonly url: string;
   readonly categories: readonly string[];
@@ -118,12 +125,29 @@ export interface FabDownloadRequest {
   readonly engine: string | undefined;
   readonly platform?: string | undefined;
   readonly timeoutMs?: number;
+  /**
+   * When all three are present the download names one artifact exactly (`--artifact-id
+   * --namespace --asset-id`) and `engine` is not sent: FabCLI's engine filter cannot tell apart
+   * artifacts whose engine lists overlap.
+   */
+  readonly artifactId?: string | undefined;
+  readonly assetId?: string | undefined;
+  readonly assetNamespace?: string | undefined;
 }
 
 /** Listing UIDs are the only free-form value that ever reaches an argv slot. */
 const LISTING_UID = /^[0-9a-fA-F-]{8,64}$/;
 const ENGINE_VERSION = /^UE_\d+\.\d+$/;
 const PLATFORM_NAME = /^[A-Za-z0-9_]{1,32}$/;
+/** Epic catalog ids (artifact, namespace, asset) are short opaque tokens. */
+const CATALOG_ID = /^[A-Za-z0-9_.-]{1,128}$/;
+
+export function assertCatalogId(value: string, label: string): string {
+  if (!CATALOG_ID.test(value)) {
+    throw new FabCliError("FABCLI_DOWNLOAD_FAILED", `"${value}" is not a valid Fab ${label}.`);
+  }
+  return value;
+}
 
 /** Preference order when a listing's artifact is published for several platforms. An asset pack's
  * source .uasset files are the same whichever one is chosen; the first that exists wins. */
@@ -311,6 +335,8 @@ export class FabCli {
     return parsed.data.results.map((entry) => ({
       listingId: entry.customAttributes.find((attribute) => attribute.ListingIdentifier)
         ?.ListingIdentifier,
+      assetId: entry.assetId,
+      assetNamespace: entry.assetNamespace,
       title: entry.title || entry.description,
       url: entry.url,
       categories: entry.categories.flatMap((category) =>
@@ -416,6 +442,14 @@ export class FabCli {
     );
     const best = ranked[0];
     if (!best) return undefined;
+    // Two artifacts can tie on route and oldest engine and differ only by platform. Nothing then
+    // prefers one, so the sort's stable order (the listing's own) decides, and the reason says so.
+    const tied = ranked.some(
+      (entry) =>
+        entry !== best &&
+        entry.route === best.route &&
+        compareEngines(entry.engine, best.engine) === 0,
+    );
     const others = versions
       .filter((version) => version !== best.version)
       .map((version) => {
@@ -426,20 +460,31 @@ export class FabCli {
     const more = others.length > shown.length ? `, and ${others.length - shown.length} more` : "";
     return {
       version: best.version,
-      reason: `Chose artifact ${best.version.artifactId} (${best.engine}, ${best.route}) over ${shown.join(", ")}${more} by route preference; pass artifactId or engine to override.`,
+      reason: `Chose artifact ${best.version.artifactId} (${best.engine}, ${best.route}) over ${shown.join(", ")}${more} by route preference${tied ? ", then listing order" : ""}; pass artifactId or engine to override.`,
     };
   }
 
   /** Downloads an entitled artifact into an MCP-owned staging directory. Never claims or buys. */
   async download(request: FabDownloadRequest): Promise<void> {
     const tool = await this.tool();
-    const args = [
-      "download",
-      assertListingId(request.listingId),
-      "--output",
-      request.outputDir,
-    ];
-    if (request.engine) args.push("--engine", assertEngineVersion(request.engine));
+    const explicit =
+      request.artifactId !== undefined &&
+      request.assetId !== undefined &&
+      request.assetNamespace !== undefined;
+    const args = explicit
+      ? [
+          "download",
+          "--artifact-id",
+          assertCatalogId(request.artifactId, "artifact id"),
+          "--namespace",
+          assertCatalogId(request.assetNamespace, "asset namespace"),
+          "--asset-id",
+          assertCatalogId(request.assetId, "asset id"),
+          "--output",
+          request.outputDir,
+        ]
+      : ["download", assertListingId(request.listingId), "--output", request.outputDir];
+    if (!explicit && request.engine) args.push("--engine", assertEngineVersion(request.engine));
     if (request.platform) args.push("--platform", assertPlatform(request.platform));
     const run = await runBounded(tool.path, args, {
       timeoutMs: request.timeoutMs ?? 10_800_000,
