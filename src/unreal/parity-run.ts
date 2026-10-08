@@ -17,7 +17,7 @@ import { dirname, join, resolve } from "node:path";
 
 import type { FabOwnedListing } from "../fab/fabcli.js";
 import { decoderRoute, oldestEngine } from "../fab/routes.js";
-import type { PackScore } from "./parity.js";
+import type { MissAttribution, PackScore } from "./parity.js";
 
 export type ParityRoute = "umodel" | "mesh-description" | "cue4parse" | "unknown";
 export type ParityStatus = "pass" | "fail" | "unverified" | "error";
@@ -57,7 +57,18 @@ export interface ScorecardEntry {
     readonly s1: { readonly expected: number; readonly exported: number };
     readonly s2: { readonly violations: number };
     readonly s3: { readonly violations: number; readonly unverified: number };
-    readonly s4: { readonly share: number };
+    /** Everything beyond `share` is absent in scorecards written before PRD-538. */
+    readonly s4: {
+      readonly share: number;
+      readonly missesTotal?: number;
+      readonly expectsColour?: number;
+      readonly graphBaked?: number;
+      readonly graphUnsupported?: number;
+      readonly graphUnavailable?: number;
+      readonly unsupportedNodes?: Readonly<Record<string, number>>;
+      readonly unavailableReasons?: Readonly<Record<string, number>>;
+      readonly missAttribution?: MissAttribution;
+    };
   } | null;
   readonly durationMs: number;
   readonly error?: { readonly code: string; readonly message: string };
@@ -83,6 +94,27 @@ export interface ScorecardSummary {
   readonly passRateAttempted: number | null;
   readonly byRoute: Readonly<Record<string, RouteTally>>;
   readonly topFailureClasses: readonly { readonly class: string; readonly count: number }[];
+  /** Unsupported material-graph node classes by the number of sections naming them (PRD-538). */
+  readonly unsupportedNodeClasses: readonly {
+    readonly class: string;
+    readonly sections: number;
+    readonly packs: number;
+  }[];
+  /** Sections whose base colour came from the graph bake. */
+  readonly graphBaked: number;
+  /** Total S4 misses; null when no entry carries a miss count (scorecards from before PRD-538). */
+  readonly s4Misses: number | null;
+  /** Where the S4 sections ended up; absent keys of old entries count as zero. */
+  readonly s4MissAttribution: MissAttribution;
+  /** Set by the sweep script when `--baseline` is given. */
+  readonly s4VsBaseline?: S4Delta;
+}
+
+export interface S4Delta {
+  readonly baseline: number;
+  readonly now: number;
+  /** (now - baseline) / baseline x 100; null when the baseline is 0 and the count grew. */
+  readonly changePct: number | null;
 }
 
 export interface Scorecard {
@@ -185,7 +217,17 @@ export function summaryOf(score: PackScore): NonNullable<ScorecardEntry["summary
     s1: { expected: score.coverage.expected, exported: score.coverage.exported },
     s2: { violations: score.shape.violationsTotal },
     s3: { violations: score.identity.violationsTotal, unverified: score.identity.unverified },
-    s4: { share: score.colour.share },
+    s4: {
+      share: score.colour.share,
+      missesTotal: score.colour.missesTotal,
+      expectsColour: score.colour.expectsColour,
+      graphBaked: score.colour.graphBaked,
+      graphUnsupported: score.colour.graphUnsupported,
+      graphUnavailable: score.colour.graphUnavailable,
+      unsupportedNodes: score.colour.unsupportedNodes,
+      unavailableReasons: score.colour.unavailableReasons,
+      missAttribution: score.colour.missAttribution,
+    },
   };
 }
 
@@ -225,7 +267,24 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
   const total = emptyTally();
   const byRoute: Record<string, RouteTally> = {};
   const classCounts = new Map<string, number>();
+  const nodeSections = new Map<string, { sections: number; packs: number }>();
+  const attribution = { bakedAway: 0, bakedStillGrey: 0, unsupportedNode: 0, unavailable: 0, noGraph: 0 };
+  let graphBaked = 0;
+  let s4Misses: number | null = null;
   for (const entry of entries) {
+    const s4 = entry.summary?.s4;
+    if (s4) {
+      graphBaked += s4.graphBaked ?? 0;
+      if (s4.missesTotal !== undefined) s4Misses = (s4Misses ?? 0) + s4.missesTotal;
+      for (const [node, sections] of Object.entries(s4.unsupportedNodes ?? {})) {
+        const tally = nodeSections.get(node) ?? { sections: 0, packs: 0 };
+        tally.sections += sections;
+        tally.packs++;
+        nodeSections.set(node, tally);
+      }
+      for (const key of Object.keys(attribution) as (keyof MissAttribution)[])
+        attribution[key] += s4.missAttribution?.[key] ?? 0;
+    }
     const tally = (byRoute[entry.route] ??= emptyTally());
     for (const target of [total, tally]) {
       target.attempted++;
@@ -250,7 +309,73 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
     topFailureClasses: [...classCounts]
       .map(([name, count]) => ({ class: name, count }))
       .sort((a, b) => b.count - a.count || a.class.localeCompare(b.class)),
+    unsupportedNodeClasses: [...nodeSections]
+      .map(([name, tally]) => ({ class: name, ...tally }))
+      .sort((a, b) => b.sections - a.sections || a.class.localeCompare(b.class)),
+    graphBaked,
+    s4Misses,
+    s4MissAttribution: attribution,
   };
+}
+
+/** The S4 miss total of a summary (PRD-538 AC-4); null when its entries predate the count. */
+export function s4MissCount(summary: Pick<ScorecardSummary, "s4Misses">): number | null {
+  return summary.s4Misses;
+}
+
+export function s4Delta(baseline: number, now: number): S4Delta {
+  const changePct = baseline === 0 ? (now === 0 ? 0 : null) : ((now - baseline) / baseline) * 100;
+  return { baseline, now, changePct };
+}
+
+export function s4DeltaLine(delta: S4Delta): string {
+  const pct =
+    delta.changePct === null ? "n/a" : `${delta.changePct > 0 ? "+" : ""}${delta.changePct.toFixed(1)}%`;
+  return `S4 misses: ${delta.baseline} → ${delta.now} (${pct} change)`;
+}
+
+/**
+ * The S4 miss total of a baseline scorecard file. Reads `summary.s4Misses`, else sums the entries,
+ * and for entries from before PRD-538 falls back to `colour.missesTotal` in the per-pack file
+ * `packs/<listing8>-<artifact>.json` beside the scorecard. Null when any pack cannot be counted:
+ * a partial count would make the delta look better than it is.
+ */
+export function readBaselineS4Misses(path: string): number | null {
+  let parsed: { entries?: ScorecardEntry[]; summary?: { s4Misses?: number | null } };
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as typeof parsed;
+  } catch {
+    return null;
+  }
+  const recorded = parsed.summary?.s4Misses;
+  if (typeof recorded === "number") return recorded;
+  let total = 0;
+  for (const item of parsed.entries ?? []) {
+    const s4 = item.summary?.s4;
+    if (!s4) continue; // errored or unverified entries have no colour result
+    let misses = s4.missesTotal;
+    if (misses === undefined) {
+      try {
+        const label = `${item.listingId.slice(0, LISTING_PREFIX_LENGTH)}-${item.artifactId}`;
+        const pack = JSON.parse(readFileSync(join(dirname(path), "packs", `${label}.json`), "utf8")) as {
+          colour?: { missesTotal?: number };
+        };
+        misses = pack.colour?.missesTotal;
+      } catch {
+        misses = undefined;
+      }
+    }
+    if (typeof misses !== "number") return null;
+    total += misses;
+  }
+  return total;
+}
+
+/** The top node classes as `Divide x35 sections / 4 packs` lines for the sweep's final output. */
+export function unsupportedNodeLines(summary: ScorecardSummary, top = 5): string[] {
+  return summary.unsupportedNodeClasses
+    .slice(0, top)
+    .map((c) => `  ${c.class}: ${c.sections} sections in ${c.packs} pack(s)`);
 }
 
 /**
@@ -502,6 +627,8 @@ export interface ParityArgs {
   readonly keep: boolean;
   readonly out: string;
   readonly excludeSize: boolean;
+  /** A scorecard.json to compare this sweep's S4 miss count against. */
+  readonly baseline: string | undefined;
 }
 
 export const PARITY_USAGE = `Usage: npm run parity:fab -- [options]
@@ -520,6 +647,8 @@ Options:
   --out <dir>            Output directory (default: artifacts/parity)
   --exclude-size         Skip City Sample and MetaHumans (default on)
   --no-exclude-size      Include them
+  --baseline <file>      Compare this sweep's S4 miss count with that scorecard.json and print
+                         "S4 misses: <baseline> → <now> (<pct>% change)" (PRD-538 AC-4)
   -h, --help             Print this help
 
 Exit codes: 0 done, 1 error, 2 Fab session/download failure (partial scorecard written), 130 interrupted.`;
@@ -534,6 +663,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let out = "artifacts/parity";
   let excludeSize = true;
   let help = false;
+  let baseline: string | undefined;
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(`${flag} needs a value.`);
@@ -579,6 +709,9 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
       case "--no-exclude-size":
         excludeSize = false;
         break;
+      case "--baseline":
+        baseline = resolve(value(i++, arg));
+        break;
       default:
         throw new Error(`Unknown option "${arg}". Use --help.`);
     }
@@ -593,5 +726,6 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
     keep,
     out: resolve(out),
     excludeSize,
+    baseline,
   };
 }

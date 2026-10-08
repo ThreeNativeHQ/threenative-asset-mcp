@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it, onTestFinished } from "vitest";
 
 import type { FabOwnedListing } from "../src/fab/fabcli.js";
+import type { PackScore } from "../src/unreal/parity.js";
 import {
   acquireLock,
   buildCorpus,
@@ -14,6 +15,11 @@ import {
   isLockStale,
   isSettled,
   mergeScorecardEntries,
+  readBaselineS4Misses,
+  s4Delta,
+  s4DeltaLine,
+  s4MissCount,
+  summaryOf,
   parityLine,
   parseParityArgs,
   readPreviousEntries,
@@ -266,5 +272,112 @@ describe("scorecard files and arguments", () => {
     expect(() => parseParityArgs(["--corpus", "x"])).toThrow();
     expect(() => parseParityArgs(["--wat"])).toThrow(/Unknown option/);
     expect(() => parseParityArgs(["--out"])).toThrow(/needs a value/);
+  });
+});
+
+type S4 = NonNullable<ScorecardEntry["summary"]>["s4"];
+const withS4 = (s4: Partial<S4>, over: Partial<ScorecardEntry> = {}): ScorecardEntry =>
+  entry({
+    status: "fail",
+    summary: {
+      s1: { expected: 1, exported: 1 },
+      s2: { violations: 0 },
+      s3: { violations: 0, unverified: 0 },
+      s4: { share: 0, ...s4 },
+    },
+    ...over,
+  });
+
+describe("graph histogram and S4 attribution (PRD-538)", () => {
+  it("sums section counts per node class across packs and sorts by sections", () => {
+    const summary = summarizeEntries([
+      withS4({ graphBaked: 2, unsupportedNodes: { Divide: 35, Power: 3 }, missesTotal: 4 }, { artifactId: "A1" }),
+      withS4({ graphBaked: 1, unsupportedNodes: { Divide: 5, Lerp: 9 }, missesTotal: 2 }, { artifactId: "A2" }),
+      withS4({ unsupportedNodes: { Power: 3 }, missesTotal: 1 }, { artifactId: "A3" }),
+    ]);
+    expect(summary.unsupportedNodeClasses).toEqual([
+      { class: "Divide", sections: 40, packs: 2 },
+      { class: "Lerp", sections: 9, packs: 1 },
+      { class: "Power", sections: 6, packs: 2 },
+    ]);
+    expect(summary.graphBaked).toBe(3);
+    expect(s4MissCount(summary)).toBe(7);
+  });
+
+  it("totals the miss attribution table", () => {
+    const summary = summarizeEntries([
+      withS4({ missesTotal: 5, missAttribution: { bakedAway: 3, bakedStillGrey: 0, unsupportedNode: 2, unavailable: 1, noGraph: 2 } }, { artifactId: "A1" }),
+      withS4({ missesTotal: 1, missAttribution: { bakedAway: 0, bakedStillGrey: 1, unsupportedNode: 0, unavailable: 0, noGraph: 0 } }, { artifactId: "A2" }),
+    ]);
+    expect(summary.s4MissAttribution).toEqual({ bakedAway: 3, bakedStillGrey: 1, unsupportedNode: 2, unavailable: 1, noGraph: 2 });
+  });
+
+  it("summarises entries from scorecards written before PRD-538 without crashing", () => {
+    const summary = summarizeEntries([
+      entry({ status: "pass" }),
+      withS4({}, { artifactId: "A2" }), // s4 has only a share, as in PRD-537 scorecards
+    ]);
+    expect(summary.unsupportedNodeClasses).toEqual([]);
+    expect(summary.graphBaked).toBe(0);
+    expect(s4MissCount(summary)).toBeNull();
+  });
+
+  it("carries the graph fields from a PackScore into the entry summary", () => {
+    const score = {
+      coverage: { expected: 1, exported: 1, missingTotal: 0 },
+      shape: { violationsTotal: 0 },
+      identity: { violationsTotal: 0, unverified: 0 },
+      colour: {
+        share: 0.5,
+        missesTotal: 2,
+        expectsColour: 4,
+        graphBaked: 1,
+        graphUnsupported: 2,
+        graphUnavailable: 0,
+        unsupportedNodes: { Divide: 2 },
+        unavailableReasons: {},
+        missAttribution: { bakedAway: 1, bakedStillGrey: 0, unsupportedNode: 2, unavailable: 0, noGraph: 0 },
+      },
+    } as unknown as PackScore;
+    expect(summaryOf(score).s4).toMatchObject({ share: 0.5, missesTotal: 2, graphBaked: 1, unsupportedNodes: { Divide: 2 } });
+  });
+});
+
+describe("S4 baseline delta (PRD-538 AC-4)", () => {
+  it("computes the percent change and formats the line", () => {
+    expect(s4Delta(100, 40)).toEqual({ baseline: 100, now: 40, changePct: -60 });
+    expect(s4DeltaLine(s4Delta(100, 40))).toBe("S4 misses: 100 → 40 (-60.0% change)");
+    expect(s4DeltaLine(s4Delta(8, 10))).toBe("S4 misses: 8 → 10 (+25.0% change)");
+    expect(s4Delta(0, 0).changePct).toBe(0);
+    expect(s4Delta(0, 3).changePct).toBeNull();
+    expect(s4DeltaLine(s4Delta(0, 3))).toBe("S4 misses: 0 → 3 (n/a change)");
+  });
+
+  it("reads the baseline from summary, entries, or the pack files beside an old scorecard", async () => {
+    const directory = await scratch();
+    const { mkdir } = await import("node:fs/promises");
+    await writeFile(join(directory, "a.json"), JSON.stringify({ entries: [], summary: { s4Misses: 12 } }));
+    expect(readBaselineS4Misses(join(directory, "a.json"))).toBe(12);
+
+    const withMisses = withS4({ missesTotal: 4 }, { artifactId: "A1" });
+    await writeFile(join(directory, "b.json"), JSON.stringify({ entries: [withMisses] }));
+    expect(readBaselineS4Misses(join(directory, "b.json"))).toBe(4);
+
+    // PRD-537 era: the entry has only a share; the per-pack file beside it has the miss count.
+    const old = withS4({}, { artifactId: "A9", listingId: "bbbbbbbb-0000-0000-0000-000000000000" });
+    await mkdir(join(directory, "packs"));
+    await writeFile(join(directory, "packs", "bbbbbbbb-A9.json"), JSON.stringify({ colour: { missesTotal: 7 } }));
+    await writeFile(join(directory, "c.json"), JSON.stringify({ entries: [old] }));
+    expect(readBaselineS4Misses(join(directory, "c.json"))).toBe(7);
+
+    await writeFile(join(directory, "d.json"), JSON.stringify({ entries: [old, withS4({}, { artifactId: "A8" })] }));
+    expect(readBaselineS4Misses(join(directory, "d.json"))).toBeNull();
+    expect(readBaselineS4Misses(join(directory, "missing.json"))).toBeNull();
+  });
+
+  it("parses --baseline", () => {
+    expect(parseParityArgs(["--baseline", "/x/scorecard.json"]).baseline).toBe("/x/scorecard.json");
+    expect(parseParityArgs([]).baseline).toBeUndefined();
+    expect(() => parseParityArgs(["--baseline"])).toThrow(/needs a value/);
   });
 });
