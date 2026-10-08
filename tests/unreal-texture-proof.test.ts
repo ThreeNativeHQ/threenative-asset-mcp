@@ -309,6 +309,9 @@ fs.copyFileSync(pngs[filter], join(out, filter + ".png"));
     const converter = await fakeConverter(directory, { Mip: half });
     const proof = await crossDecodeProof(directory, ["Mip"], { converterPath: converter, sourceTextures: new Map([["Mip", viewer]]) });
     expect(proof).toMatchObject({ status: "agree", sizeMismatches: 1 });
+    // A pair at a different resolution is judged against the looser mip bar, not the exact one.
+    const strict = await crossDecodeProof(directory, ["Mip"], { converterPath: converter, sourceTextures: new Map([["Mip", viewer]]), resizedThreshold: 1.01 });
+    expect(strict.status).toBe("disagree");
     expect(proof.results[0]).toMatchObject({ width: 32, height: 32, sizeDiffers: true, viewerSize: "64x64", cue4parseSize: "32x32" });
   });
 

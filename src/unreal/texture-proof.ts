@@ -429,6 +429,11 @@ export function textureIdentityReason(proof: Pick<TextureProof, "compared" | "mi
 
 /** SSIM at or above which UE Viewer and CUE4Parse count as agreeing (mip/gamma/rounding tolerance). */
 export const CROSS_DECODE_SSIM = 0.999;
+/**
+ * The bar when the decoders chose different mips: one side is a downsample, and two mip chains
+ * built with different filters differ by a few percent even for the same texture.
+ */
+export const CROSS_DECODE_RESIZED_SSIM = 0.95;
 
 export interface CrossDecodeEntry {
   readonly texture: string;
@@ -469,6 +474,8 @@ export interface CrossDecodeOptions {
   /** How many textures to cross-decode, evenly spaced over the sorted names. Default 6. */
   readonly sample?: number;
   readonly threshold?: number;
+  /** Threshold for a pair compared after a resolution difference. Default `CROSS_DECODE_RESIZED_SSIM`. */
+  readonly resizedThreshold?: number;
   readonly timeoutMs?: number;
   readonly environment?: NodeJS.ProcessEnv;
 }
@@ -538,7 +545,7 @@ export async function crossDecodeProof(
       );
       results.push({
         texture: name,
-        status: compared.ssim >= threshold ? "agree" : "disagree",
+        status: compared.ssim >= (sizeDiffers ? (options.resizedThreshold ?? CROSS_DECODE_RESIZED_SSIM) : threshold) ? "agree" : "disagree",
         ssim: compared.ssim,
         mse: compared.mse,
         maxAbs: compared.maxAbs,
