@@ -32,6 +32,7 @@ import {
   licencesReader,
   mergeScorecardEntries,
   PARITY_USAGE,
+  blankTileWarnings,
   parseLicencesFile,
   parityLine,
   parseParityArgs,
@@ -449,7 +450,10 @@ async function main(): Promise<number> {
           importerVersion = report.importer.version;
           cue4parse = report.toolchain.modernConverter ?? cue4parse;
           entry = await scoreOne(item, base, sourceDir, report, environment, started, args.out, label, args.proof ? packProof : undefined);
-          if (args.sheets) entry = { ...entry, sheet: await sheetFor(sourceDir, outputDir, report, args.out, label) };
+          if (args.sheets) {
+            entry = { ...entry, sheet: await sheetFor(sourceDir, outputDir, report, args.out, label) };
+            for (const warning of entry.sheet?.warnings ?? []) console.log(`WARNING ${label}: ${warning}`);
+          }
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -562,6 +566,7 @@ async function sheetFor(
       total: result.meshesTotal,
       thumbnails: result.thumbnailsShown,
       judge: result.judgeSummary,
+      ...(blankTileWarnings(result.judge, result.thumbnailsShown).length > 0 ? { warnings: blankTileWarnings(result.judge, result.thumbnailsShown) } : {}),
       ...(sims.length > 0 ? { meanSimilarity: Math.round((sims.reduce((a, b) => a + b, 0) / sims.length) * 1000) / 1000 } : {}),
     };
   } catch (error) {
