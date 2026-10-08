@@ -52,7 +52,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 55;
+export const IMPORTER_VERSION = 56;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -795,7 +795,10 @@ export async function applyTextureTransform(
     if (!secondaryInput) throw new Error("Opacity source is missing for base-colour alpha composition.");
     const colourMetadata = await sharp(input).metadata();
     const opacityMetadata = await sharp(secondaryInput).metadata();
-    if (colourMetadata.width !== opacityMetadata.width || colourMetadata.height !== opacityMetadata.height) {
+    // The same UV layout at another resolution is fine (the mask is resized to the colour); another aspect is not.
+    const colourAspect = (colourMetadata.width ?? 1) / (colourMetadata.height ?? 1);
+    const opacityAspect = (opacityMetadata.width ?? 1) / (opacityMetadata.height ?? 1);
+    if (Math.abs(colourAspect / opacityAspect - 1) > 0.01) {
       throw new Error("Opacity and base-colour source dimensions do not match.");
     }
     const mask = await sharp(secondaryInput, { limitInputPixels: 268_435_456, unlimited: true })
@@ -1422,21 +1425,19 @@ export async function packageGlb(options: {
       const key = `${source}|${secondarySource ?? ""}|${binding.transform}`;
       let texture = cache.get(key);
       if (!texture) {
-        const image = options.imageCache
-          ? await options.imageCache.get(key, async () =>
-              applyTextureTransform(
-                await readFile(source),
-                binding.transform,
-                options.maxTextureSize,
-                secondarySource ? await readFile(secondarySource) : undefined,
-              ),
-            )
-          : await applyTextureTransform(
-              await readFile(source),
-              binding.transform,
-              options.maxTextureSize,
-              secondarySource ? await readFile(secondarySource) : undefined,
-            );
+        const produce = async (transform: TextureTransform, secondary: string | undefined) => {
+          const read = async () => applyTextureTransform(await readFile(source), transform, options.maxTextureSize, secondary ? await readFile(secondary) : undefined);
+          return options.imageCache ? options.imageCache.get(`${source}|${secondary ?? ""}|${transform}`, read) : read();
+        };
+        let image: { data: Buffer; mimeType: string };
+        try {
+          image = await produce(binding.transform, secondarySource);
+        } catch (error) {
+          // An inferred opacity map that cannot be composed (other aspect, unreadable) must not cost the model its colour.
+          if (binding.transform !== "redToBaseColorAlpha" || binding.source === "effect") throw error;
+          image = await produce("none", undefined);
+          packagingLimitations.push(`Opacity map ${binding.secondaryTexture ?? "?"} could not be composed into ${binding.texture}'s alpha (${error instanceof Error ? error.message : String(error)}); the base colour is bound without it.`);
+        }
         texture = document
           .createTexture(`${binding.texture}${binding.transform === "none" ? "" : `_${binding.transform}`}`)
           .setImage(new Uint8Array(image.data))

@@ -546,6 +546,8 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   let metallic: number | undefined;
   let roughness: number | undefined;
   let opacity: number | undefined;
+  /** Textures UE Viewer names as the material's opacity (`Opacity=` slot, or an `Other` named `*_Opacity*`), nearest material first. */
+  const opacityTextures: string[] = [];
 
   const bind = (
     plan: SlotPlan,
@@ -601,6 +603,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
         if (key === "Opacity" || key === "Mask") {
           claimed.add(texture);
           sawAlphaSource = true;
+          if (key === "Opacity" && !opacityTextures.includes(texture)) opacityTextures.push(texture);
           continue;
         }
         if (key === "Cube") {
@@ -656,6 +659,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
         if (claimed.has(texture)) continue;
         const plan = planForFileName(texture);
         if (plan) bind(plan, texture, "filename", "heuristic");
+        else if (/(?:^|_)opacity(?:_|\d|$)/i.test(texture) && !opacityTextures.includes(texture)) opacityTextures.push(texture);
       }
     }
 
@@ -818,6 +822,19 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     }
   }
 
+  // A masked or translucent section whose cut-out lives in a separate opacity map (a grass card's blades) keeps the
+  // base colour's RGB and takes the map's red channel as alpha. Without it the card is a solid rectangle, and an
+  // instance colour with a zero alpha would clip all of it.
+  const colourForAlpha = bindings.get("baseColor");
+  const opacityMap = opacityTextures.find((texture) => request.availableTextures.has(texture) && texture !== colourForAlpha?.texture);
+  if (
+    opacityMap && colourForAlpha && alphaMode !== "OPAQUE" && colourForAlpha.secondaryTexture === undefined &&
+    colourForAlpha.transform === "none" && request.availableTextures.has(colourForAlpha.texture)
+  ) {
+    bindings.set("baseColor", { ...colourForAlpha, secondaryTexture: opacityMap, confidence: "heuristic", transform: "redToBaseColorAlpha" });
+    limitations.add(`${opacityMap} is the material's opacity map: its red channel is the base colour's alpha; same UV layout is assumed (heuristic).`);
+  }
+
   // Masked foliage takes its cutout from the base colour's own alpha channel.
   if (inheritedBlend === undefined && alphaMode === "OPAQUE" && sawAlphaSource && baseColor) {
     alphaMode = "MASK";
@@ -847,8 +864,10 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     alphaMode,
     alphaCutoff,
     doubleSided,
+    // A colour parameter's alpha is not opacity in Unreal, and a `Tint` of A=0 is common on a surface that draws fully
+    // (a zero alpha here would clip every pixel of a masked section). Only a partial alpha is kept, as before.
     baseColorFactor: baseColorFactorValue
-      ? [baseColorFactorValue[0], baseColorFactorValue[1], baseColorFactorValue[2], opacity ?? baseColorFactorValue[3]]
+      ? [baseColorFactorValue[0], baseColorFactorValue[1], baseColorFactorValue[2], opacity ?? (baseColorFactorValue[3] > 0 ? baseColorFactorValue[3] : 1)]
       : opacity === undefined
         ? undefined
         : [1, 1, 1, opacity],
