@@ -247,6 +247,16 @@ export interface FakeFabCliOptions {
   readonly downloadStderr?: string;
   /** Fails a download that omits `--platform`, the way FabCLI does for a multi-platform artifact. */
   readonly requirePlatform?: boolean;
+  /**
+   * Per-artifact packs. The explicit-IDs form (`--artifact-id`) copies the entry with that id. The
+   * UID form filters by engine only, like the real CLI: it copies the FIRST entry that lists the
+   * engine, so overlapping engine lists deliver the wrong artifact, as FabCLI can.
+   */
+  readonly catalog?: readonly {
+    readonly artifactId: string;
+    readonly engineVersions: readonly string[];
+    readonly dir: string;
+  }[];
   readonly argvLog: string;
 }
 
@@ -285,7 +295,24 @@ if (argv[0] === "download") {
   }
   const out = argv[argv.indexOf("--output") + 1];
   fs.mkdirSync(out, { recursive: true });
-  if (options.downloadInto) fs.cpSync(options.downloadInto, out, { recursive: true });
+  let source = options.downloadInto;
+  if (options.catalog) {
+    const flag = (name) => (argv.indexOf(name) < 0 ? undefined : argv[argv.indexOf(name) + 1]);
+    const artifactId = flag("--artifact-id");
+    const entry = artifactId !== undefined
+      ? options.catalog.find((candidate) => candidate.artifactId === artifactId)
+      : options.catalog.find((candidate) => candidate.engineVersions.includes(flag("--engine")));
+    if (artifactId !== undefined && (!flag("--namespace") || !flag("--asset-id"))) {
+      process.stderr.write("--artifact-id requires --namespace and --asset-id\\n");
+      process.exit(2);
+    }
+    if (!entry) {
+      process.stderr.write("no matching artifact\\n");
+      process.exit(6);
+    }
+    source = entry.dir;
+  }
+  if (source) fs.cpSync(source, out, { recursive: true });
   fs.writeFileSync(join(out, ".fabcli-asset.json"), JSON.stringify({ listing_uid: "test" }));
   process.exit(0);
 }

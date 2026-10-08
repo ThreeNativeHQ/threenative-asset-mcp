@@ -516,6 +516,37 @@ export function createAssetImportUnrealHandler(dependencies: ImportUnrealDepende
   };
 }
 
+interface ExactArtifact {
+  readonly artifactId?: string;
+  readonly assetId?: string;
+  readonly assetNamespace?: string;
+}
+
+/**
+ * The catalog ids that let `fabcli download` name one artifact exactly. Empty when the library
+ * does not report them for this listing (older payloads) or cannot be read: the caller then keeps
+ * the engine filter, which is what it did before the ids were known.
+ */
+async function resolveCatalogIds(
+  fabCli: FabCli,
+  listingId: string,
+  artifactId: string,
+  log: (message: string) => void,
+): Promise<ExactArtifact> {
+  try {
+    const entry = (await fabCli.ownedListings()).find(
+      (owned) => owned.listingId?.toLowerCase() === listingId.toLowerCase(),
+    );
+    if (entry?.assetId === undefined || entry.assetNamespace === undefined) return {};
+    return { artifactId, assetId: entry.assetId, assetNamespace: entry.assetNamespace };
+  } catch (error) {
+    log(
+      `Could not read catalog ids from the Fab library (${error instanceof Error ? error.message : "lookup failed"}); using the engine filter.`,
+    );
+    return {};
+  }
+}
+
 export function fabDownloadRoot(environment: NodeJS.ProcessEnv = process.env): string {
   return (
     environment.THREENATIVE_FAB_DOWNLOAD_DIR?.trim() ||
@@ -579,12 +610,26 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
       const cached = await readFile(marker, "utf8").catch(() => undefined);
       if (cached === undefined || (await readdir(stagingDir)).length <= 1) {
         log(`Downloading ${selected.artifactId} from the Fab library…`);
+        // FabCLI's engine filter cannot tell apart artifacts whose engine lists overlap, so once
+        // an artifact has been chosen among several it is named exactly, by the catalog ids the
+        // library reports. With one artifact, or ids the library did not report, the engine
+        // filter is unambiguous or the only handle there is.
+        const exact: ExactArtifact =
+          versions.length > 1 || input.artifactId !== undefined || choiceReason !== undefined
+            ? await resolveCatalogIds(fabCli, listingId, selected.artifactId, log)
+            : {};
+        if (versions.length > 1 && exact.assetId === undefined) {
+          extraWarnings.push(
+            `Could not read the catalog ids of artifact ${selected.artifactId} from the Fab library, so it was downloaded through the engine filter; FabCLI may have fetched another artifact whose engines overlap.`,
+          );
+        }
         try {
           await fabCli.download({
             listingId,
             outputDir: stagingDir,
             engine,
             platform: input.platform,
+            ...exact,
           });
         } catch (error) {
           // A multi-platform artifact needs a platform picked. The source .uasset files are the
@@ -605,6 +650,7 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
             outputDir: stagingDir,
             engine,
             platform,
+            ...exact,
           });
         }
       } else {
