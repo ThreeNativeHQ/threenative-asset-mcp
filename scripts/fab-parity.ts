@@ -18,6 +18,8 @@ import { dumpEngineArg } from "../src/fab/routes.js";
 import { createFabImportAssetHandler, fabDownloadRoot } from "../src/tools/import-unreal.js";
 import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
 import { captureMaterialMetadata, type MaterialMetadataEntry, writeMaterialMetadataDump } from "../src/unreal/material-metadata.js";
+import { colouredGlbKeys, renderContactSheet } from "../src/unreal/contact-sheet.js";
+import { findThumbnails } from "../src/unreal/package-thumbnail.js";
 import { scorePack } from "../src/unreal/parity.js";
 import {
   acquireLock,
@@ -52,6 +54,7 @@ import {
   type CorpusMode,
   type HandlerError,
   type Scorecard,
+  type EntrySheet,
   type ScorecardEntry,
   type SkippedEntry,
 } from "../src/unreal/parity-run.js";
@@ -446,6 +449,7 @@ async function main(): Promise<number> {
           importerVersion = report.importer.version;
           cue4parse = report.toolchain.modernConverter ?? cue4parse;
           entry = await scoreOne(item, base, sourceDir, report, environment, started, args.out, label, args.proof ? packProof : undefined);
+          if (args.sheets) entry = { ...entry, sheet: await sheetFor(sourceDir, outputDir, report, args.out, label) };
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -525,6 +529,43 @@ async function crossDecode(
       threshold: 0.999,
       results: [{ texture: "*", status: "unavailable", reason: (error instanceof Error ? error.message : String(error)).slice(0, 240) }],
     };
+  }
+}
+
+/** Renders the pack's contact sheet (non-fatal): thumbnails beside renders, judged. */
+async function sheetFor(
+  sourceDir: string,
+  outputDir: string,
+  report: ImportReport,
+  out: string,
+  label: string,
+): Promise<EntrySheet> {
+  const rel = join("sheets", `${label}.jpg`);
+  const empty = { rendered: 0, total: report.models.length, thumbnails: 0, judge: { ok: 0, suspect: 0, fail: 0 } };
+  try {
+    await mkdir(join(out, "sheets"), { recursive: true });
+    const thumbnails = await findThumbnails({ sourceDir, report });
+    const result = await renderContactSheet({
+      glbPaths: report.models.map((m) => join(outputDir, m.glb)),
+      outPath: join(out, rel),
+      title: label,
+      subtitle: `${report.models.length} models | importer ${report.importer.version}`,
+      selection: "spread",
+      ...(thumbnails.size > 0 ? { thumbnails: new Map([...thumbnails].map(([k, v]) => [join(outputDir, k), v])) } : {}),
+      expectColoured: new Set([...colouredGlbKeys(report)].map((k) => join(outputDir, k))),
+    });
+    const sims = result.judge.flatMap((j) => (j.similarity === undefined ? [] : [j.similarity]));
+    writeJsonAtomic(join(out, "sheets", `${label}.json`), { sheet: rel, judge: result.judge });
+    return {
+      path: rel,
+      rendered: result.meshesRendered,
+      total: result.meshesTotal,
+      thumbnails: result.thumbnailsShown,
+      judge: result.judgeSummary,
+      ...(sims.length > 0 ? { meanSimilarity: Math.round((sims.reduce((a, b) => a + b, 0) / sims.length) * 1000) / 1000 } : {}),
+    };
+  } catch (error) {
+    return { ...empty, path: rel, error: (error instanceof Error ? error.message : String(error)).slice(0, 300) };
   }
 }
 

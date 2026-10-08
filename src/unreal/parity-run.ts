@@ -104,6 +104,23 @@ export interface ScorecardEntry {
   readonly error?: { readonly code: string; readonly message: string };
   /** Absent for a sweep run with `--no-proof`, an unscored pack, or a scorecard from before S5. */
   readonly proof?: EntryProof;
+  /** The contact sheet and visual judge result; absent for `--no-sheets` or a pack that did not import. */
+  readonly sheet?: EntrySheet;
+}
+
+/** The contact sheet kept in a scorecard entry: where it is, and what the visual judge said about it. */
+export interface EntrySheet {
+  /** Path relative to the sweep's output directory. */
+  readonly path: string;
+  readonly rendered: number;
+  readonly total: number;
+  /** Tiles drawn beside an Unreal editor thumbnail. */
+  readonly thumbnails: number;
+  readonly judge: { readonly ok: number; readonly suspect: number; readonly fail: number };
+  /** Mean colour similarity to the thumbnail over tiles that had a comparable one. */
+  readonly meanSimilarity?: number;
+  /** Why the sheet could not be made; the pack is unaffected. */
+  readonly error?: string;
 }
 
 /** The proof half of an entry: what `proveTextures` and `crossDecodeProof` found, summarised. */
@@ -204,6 +221,8 @@ export interface ScorecardSummary {
   readonly s4MissAttribution: MissAttribution;
   /** Set by the sweep script when `--baseline` is given. */
   readonly s4VsBaseline?: S4Delta;
+  /** Visual-judge tile totals over the packs with a sheet; absent for `--no-sheets` or an old scorecard. */
+  readonly sheets?: { readonly packs: number; readonly ok: number; readonly suspect: number; readonly fail: number };
   /** S5 totals; absent when no entry carries a proof (a `--no-proof` sweep or an old scorecard). */
   readonly proof?: {
     readonly compared: number;
@@ -530,6 +549,16 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
   const skippedNoContent: { title: string; artifactId: string }[] = [];
   let graphBaked = 0;
   let s4Misses: number | null = null;
+  let sheetTotals: { packs: number; ok: number; suspect: number; fail: number } | undefined;
+  for (const entry of entries) {
+    if (entry.sheet && entry.sheet.error === undefined) {
+      sheetTotals ??= { packs: 0, ok: 0, suspect: 0, fail: 0 };
+      sheetTotals.packs++;
+      sheetTotals.ok += entry.sheet.judge.ok;
+      sheetTotals.suspect += entry.sheet.judge.suspect;
+      sheetTotals.fail += entry.sheet.judge.fail;
+    }
+  }
   let proofTotals: { compared: number; identical: number; packsWithMismatch: number } | undefined;
   for (const entry of entries) {
     if (entry.proof) {
@@ -589,6 +618,7 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
     s4Misses,
     s4MissAttribution: attribution,
     ...(proofTotals ? { proof: proofTotals } : {}),
+    ...(sheetTotals ? { sheets: sheetTotals } : {}),
   };
 }
 
@@ -928,6 +958,8 @@ export interface ParityArgs {
   readonly exportMetadata: string | undefined;
   /** False for `--no-proof`: skip the S5 texture-identity proofs. */
   readonly proof: boolean;
+  /** False for `--no-sheets`: skip the contact sheets and the visual judge. */
+  readonly sheets: boolean;
 }
 
 export const PARITY_USAGE = `Usage: npm run parity:fab -- [options]
@@ -965,6 +997,10 @@ Options:
                          and, for UE Viewer packs, cross-decode 6 sampled textures with CUE4Parse. Any
                          differing texture fails the pack ("S5 texture identity: ...")
   --no-proof             Skip the proofs
+  --sheets               Contact sheet per pack (default on): <out>/sheets/<listing8>-<artifact>.jpg,
+                         each piece's Unreal editor thumbnail beside its render, with a visual-judge
+                         verdict per tile (white, ghost, specks, washed out, colour similarity)
+  --no-sheets            Skip the sheets
   -h, --help             Print this help
 
 Exit codes: 0 done, 1 error, 2 Fab session/download failure (partial scorecard written), 130 interrupted.`;
@@ -985,6 +1021,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let graphBake = true;
   let exportMetadata: string | undefined;
   let proof = true;
+  let sheets = true;
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(`${flag} needs a value.`);
@@ -1051,6 +1088,12 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
       case "--no-proof":
         proof = false;
         break;
+      case "--sheets":
+        sheets = true;
+        break;
+      case "--no-sheets":
+        sheets = false;
+        break;
       default:
         throw new Error(`Unknown option "${arg}". Use --help.`);
     }
@@ -1071,6 +1114,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
     graphBake,
     exportMetadata,
     proof,
+    sheets,
   };
 }
 

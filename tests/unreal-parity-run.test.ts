@@ -884,4 +884,29 @@ describe("S5 texture-identity proof in the scorecard", () => {
     expect(parseParityArgs(["--proof"]).proof).toBe(true);
     expect(parseParityArgs(["--no-proof"]).proof).toBe(false);
   });
+
+  it("defaults --sheets on and honours --no-sheets", () => {
+    expect(parseParityArgs([]).sheets).toBe(true);
+    expect(parseParityArgs(["--sheets"]).sheets).toBe(true);
+    expect(parseParityArgs(["--no-sheets"]).sheets).toBe(false);
+  });
+
+  it("totals the visual judge over packs that have a sheet, ignoring failed sheets", () => {
+    const sheet = (ok: number, suspect: number, fail: number, error?: string) => ({
+      path: "sheets/x.jpg",
+      rendered: ok + suspect + fail,
+      total: 20,
+      thumbnails: 3,
+      judge: { ok, suspect, fail },
+      ...(error === undefined ? {} : { error }),
+    });
+    const summary = summarizeEntries([
+      entry({ status: "pass", sheet: sheet(10, 2, 0) }),
+      entry({ status: "pass", artifactId: "b", sheet: sheet(5, 1, 1) }),
+      entry({ status: "pass", artifactId: "c", sheet: sheet(0, 0, 0, "chromium missing") }),
+      entry({ status: "pass", artifactId: "d" }),
+    ]);
+    expect(summary.sheets).toEqual({ packs: 2, ok: 15, suspect: 3, fail: 1 });
+    expect(summarizeEntries([entry({ status: "pass" })]).sheets).toBeUndefined();
+  });
 });
