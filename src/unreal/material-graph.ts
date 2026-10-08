@@ -121,6 +121,16 @@ const SUPPORTED_NODE_CLASSES = [
   "Reroute",
   "QualitySwitch",
   "ShadingModel",
+  "PathTracingQualitySwitch",
+  "ShadingPathSwitch",
+  "Abs",
+  "Frac",
+  "Min",
+  "Max",
+  "DotProduct",
+  "Normalize",
+  "ConstantBiasScale",
+  "SphereMask",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -136,6 +146,13 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "CustomRotator",
   "UVEdit",
   "ConvertFromDiffSpec",
+  "CheapContrast_RGB",
+  "MakeFloat2",
+  "MakeFloat3",
+  "MakeFloat4",
+  "BreakOutFloat2Components",
+  "BreakOutFloat3Components",
+  "BreakOutFloat4Components",
 ] as const;
 
 /**
@@ -665,6 +682,38 @@ class Compiler {
         // Like FeatureLevelSwitch, the bake targets the highest quality: the Default pin.
         return this.pin(node.inputs.Default) ?? this.markUnavailable(`QualitySwitch ${node.id} has no Default input`);
       }
+      case "PathTracingQualitySwitch":
+        // The path tracer is not the renderer the bake models: Normal is the real-time branch.
+        return this.pin(node.inputs.Normal) ?? this.markUnavailable(`PathTracingQualitySwitch ${node.id} has no Normal input`);
+      case "ShadingPathSwitch": {
+        // Deferred is the path the bake targets: the Default pin, else the deferred slot.
+        const wired = node.inputs.Default ?? node.inputs["Inputs[0]"];
+        return this.pin(wired) ?? this.markUnavailable(`ShadingPathSwitch ${node.id} has no Default or deferred input`);
+      }
+      case "Abs":
+      case "Frac": {
+        const input = this.vec(node.inputs.Input, `${node.class}.Input`);
+        if (!input) return this.markUnavailable(`${node.class} ${node.id} has no input`);
+        return this.unary(input, node.class === "Abs" ? Math.abs : (x) => x - Math.floor(x));
+      }
+      case "Min":
+        return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => (x < y ? x : y));
+      case "Max":
+        return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => (x > y ? x : y));
+      case "DotProduct":
+        return this.dotProduct(node);
+      case "Normalize":
+        return this.normalize(node);
+      case "ConstantBiasScale": {
+        // (Input + Bias) * Scale; Unreal's defaults are Bias 1 and Scale 0.5, which the dumper omits.
+        const input = this.vec(node.inputs.Input, "ConstantBiasScale.Input");
+        if (!input) return this.markUnavailable(`ConstantBiasScale ${node.id} has no input`);
+        const bias = typeof node.constants.Bias === "number" ? node.constants.Bias : 1;
+        const scale = typeof node.constants.Scale === "number" ? node.constants.Scale : 0.5;
+        return this.unary(input, (x) => (x + bias) * scale);
+      }
+      case "SphereMask":
+        return this.sphereMask(node);
       case "ShadingModel":
         // Its value only reaches the ShadingModel slot of a SetMaterialAttributes, never BaseColor.
         return this.constant([0], 1);
@@ -703,6 +752,85 @@ class Compiler {
             r[o + 1] = r[o + 2] = r[o + 3] = r[o]!;
           });
     return this.lerp(input, luminance, this.operand(node, "Fraction", "Fraction", 1));
+  }
+
+  private dotProduct(node: GraphNode): Compiled {
+    const a = this.vec(node.inputs.A, "DotProduct.A");
+    const b = this.vec(node.inputs.B, "DotProduct.B");
+    if (!a || !b) return this.markUnavailable(`DotProduct ${node.id} is missing an input`);
+    return this.dot(a, b);
+  }
+
+  /** Sum of component products over the wider operand; a scalar operand repeats. */
+  private dot(a: Val, b: Val): Val {
+    const sa = a.n === 1 ? 0 : 1;
+    const sb = b.n === 1 ? 0 : 1;
+    const n = Math.max(a.n, b.n);
+    return this.emit([a, b], 1, (o) => (r) => {
+      let sum = 0;
+      for (let index = 0; index < n; index++) sum += r[a.reg + index * sa]! * r[b.reg + index * sb]!;
+      r[o] = r[o + 1] = r[o + 2] = r[o + 3] = sum;
+    });
+  }
+
+  /** v / |v| over the vector's own components; the zero vector stays zero. */
+  private normalize(node: GraphNode): Compiled {
+    const input = this.vec(node.inputs.VectorInput ?? node.inputs.Input, "Normalize.VectorInput");
+    if (!input) return this.markUnavailable(`Normalize ${node.id} has no input`);
+    const n = input.n;
+    return this.emit([input], n, (o) => (r) => {
+      let sum = 0;
+      for (let index = 0; index < n; index++) sum += r[input.reg + index]! ** 2;
+      const length = Math.sqrt(sum);
+      for (let index = 0; index < 4; index++) r[o + index] = length > 0 && index < n ? r[input.reg + index]! / length : 0;
+    });
+  }
+
+  /**
+   * SphereMask(A, B, Radius, Hardness) = saturate((1 - |A - B| / Radius) / (1 - Hardness)), Hardness 0 soft and 1 hard.
+   * Reconstructed from the node's documented behaviour, not read from the engine source, so it is a heuristic.
+   * Unwired Radius and Hardness fall back to AttenuationRadius (256) and HardnessPercent / 100 (100 -> 1).
+   */
+  private sphereMask(node: GraphNode): Compiled {
+    const a = this.vec(node.inputs.A, "SphereMask.A");
+    const b = this.vec(node.inputs.B, "SphereMask.B");
+    if (!a || !b) return this.markUnavailable(`SphereMask ${node.id} is missing A or B`);
+    const radius = node.inputs.Radius ? this.vec(node.inputs.Radius, "SphereMask.Radius")! : this.constant([typeof node.constants.AttenuationRadius === "number" ? node.constants.AttenuationRadius : 256], 1);
+    const hardness = node.inputs.Hardness
+      ? this.vec(node.inputs.Hardness, "SphereMask.Hardness")!
+      : this.constant([(typeof node.constants.HardnessPercent === "number" ? node.constants.HardnessPercent : 100) / 100], 1);
+    this.approximations.add("SphereMask: formula reconstructed from the node's behaviour, not verified against the engine");
+    const sa = a.n === 1 ? 0 : 1;
+    const sb = b.n === 1 ? 0 : 1;
+    const n = Math.max(a.n, b.n);
+    return this.emit([a, b, radius, hardness], 1, (o) => (r) => {
+      let sum = 0;
+      for (let index = 0; index < n; index++) sum += (r[a.reg + index * sa]! - r[b.reg + index * sb]!) ** 2;
+      const normalised = Math.sqrt(sum) / Math.max(r[radius.reg]!, 1e-5);
+      const value = (1 - normalised) / Math.max(1 - r[hardness.reg]!, 1e-5);
+      r[o] = r[o + 1] = r[o + 2] = r[o + 3] = value < 0 ? 0 : value > 1 ? 1 : value;
+    });
+  }
+
+  /** Pins of an engine function call in the order the function declares its inputs; an unwired one is null. */
+  private orderedPins(node: GraphNode): (GraphInput | null)[] {
+    return Object.values(node.inputs).map((input) => input ?? null);
+  }
+
+  /** MakeFloatN: the first component of each input in declaration order; an unwired input is zero. */
+  private makeFloat(node: GraphNode, width: number, name: string): Compiled {
+    const parts = this.orderedPins(node).slice(0, width).map((input) => (input ? (this.vec(input, `${name}.input`) ?? this.constant([0], 1)) : this.constant([0], 1)));
+    while (parts.length < width) parts.push(this.constant([0], 1));
+    return this.emit(parts, width, (o) => (r) => {
+      for (let index = 0; index < 4; index++) r[o + index] = index < width ? r[parts[index]!.reg]! : 0;
+    });
+  }
+
+  /** BreakOutFloatNComponents: output i is component i of Input0. */
+  private breakOut(node: GraphNode, output: number, name: string): Compiled {
+    const input = this.vec(this.orderedPins(node)[0], `${name}.Input0`);
+    if (!input) return this.markUnavailable(`${name} ${node.id} has no input`);
+    return this.gather(input, [Math.max(0, Math.min(3, output))]);
   }
 
   /** Records an unsupported class and still walks its inputs, so the report names everything beneath it. */
@@ -1098,7 +1226,7 @@ class Compiler {
       if (!operands) return this.constant([0], 1);
       return this.binary(operands[0], operands[1], (x, y) => (x < 0.5 ? 2 * x * y : 1 - 2 * (1 - x) * (1 - y)));
     }
-    if (lower === "cheapcontrast") {
+    if (lower === "cheapcontrast" || lower === "cheapcontrast_rgb") {
       const operands = this.engineOperands(node, "in", "contrast", name!);
       if (!operands) return this.constant([0], 1);
       const [input, contrast] = operands;
@@ -1145,6 +1273,12 @@ class Compiler {
       return this.constant([0], 1);
     }
     const inner = node.fn?.outputs[output];
+    // Plain vector plumbing of the engine library. A pack that carries its own body of the same name keeps its body.
+    if (!node.fn?.outputs.some(Boolean)) {
+      const makeWidth = /^makefloat([234])$/.exec(lower)?.[1];
+      if (makeWidth) return this.makeFloat(node, Number(makeWidth), name!);
+      if (/^breakoutfloat[234]components$/.test(lower)) return this.breakOut(node, output, name!);
+    }
     if (inner) {
       const innerNode = this.nodes.get(inner);
       if (!innerNode) return this.markUnavailable(`function ${name ?? node.id} output refers to missing node ${inner}`);
