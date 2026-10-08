@@ -2,7 +2,8 @@
 
 Rules and hard-won facts for any agent working here. `README.md` documents what the tools do;
 this file covers what you would otherwise relearn the expensive way. Plans live in `docs/PRDs/`
-(finished ones in `docs/PRDs/done/`). PRD ids are shared with `threenative-engine`, so check that
+(finished ones in `docs/PRDs/done/`; ones waiting only on an owner action in
+`docs/PRDs/BLOCKED/<reason>/`). PRD ids are shared with `threenative-engine`, so check that
 repo's branches and PRs before taking a number.
 
 ## Verify

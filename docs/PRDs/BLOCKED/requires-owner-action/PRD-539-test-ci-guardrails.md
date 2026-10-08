@@ -1,8 +1,7 @@
 # PRD-539 — Tests, CI and guardrails catch what shipped broken
 
-**Closed:** 2026-10-08, PR #26, archived to `done/`.
-
-**Status:** DONE — 2026-10-08. Phases 1–2 and AC-1–AC-5, AC-7 verified; AC-6 and required checks on `main` are owner-only (see Blocked on).
+**Status:** PARTIAL — Phases 1–2 (AC-1–AC-5, AC-7) done with CI proof (PR #26); AC-6 and required checks on `main` remain.
+**Blocker:** João decides whether material/texture names from owned Fab packs may be committed to this public repository, and enables branch protection or a ruleset on `main`; AC-6 also needs `--export-metadata` in `scripts/fab-parity.ts`. See Blocked on.
 **Priority:** P1 — CI is advisory on an unprotected `main` and never runs parallel, fresh-host or temp-leak checks, so the regressions in Context reached `main` unseen (AC-2–AC-7 now closed by this PRD's CI legs).
 **Complexity:** 5 (MEDIUM) — 6–10 implementation files (2), new doctor/leak-gate module (+2), toolchain downloads from GitHub/gildor.org/dot.net (+1); risk override: none
 **Owner:** João
