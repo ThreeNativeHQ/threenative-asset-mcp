@@ -1,0 +1,84 @@
+# AGENTS.md — threenative-asset-mcp
+
+Rules and hard-won facts for any agent working here. `README.md` documents what the tools do;
+this file covers what you would otherwise relearn the expensive way. Plans live in `docs/PRDs/`
+(finished ones in `docs/PRDs/done/`). PRD ids are shared with `threenative-engine`, so check that
+repo's branches and PRs before taking a number.
+
+## Verify
+
+```sh
+npm run typecheck
+npm test                                    # builds first (pretest); runs every suite
+npx vitest run tests/mcp-smoke.test.ts      # packed-MCP smoke; CI runs it separately
+```
+
+- **Run the suite the way it fails.** CI uses `--maxWorkers=1`, so parallel races and load
+  timeouts never show there. Locally, run with default workers. To check for temp leaks, run
+  with an isolated `TMPDIR` and look at what is left:
+  `TMPDIR=$(mktemp -d) npx vitest run`. Only `node-compile-cache` may remain; a 0-byte
+  `.org.chromium.Chromium.*` file is a known open leak (PRD-539), not something you introduced.
+- **This desktop is often loaded by other sessions** (load average 40–70 seen). A test that only
+  fails under the full parallel suite is a timing bug in the test or the product, not noise.
+  Reproduce it in isolation, find the window, then fix it deterministically.
+- Local prerequisites that CI installs for you: `ffmpeg`/`ffprobe` (audio suites crash with
+  `spawnSync ffmpeg ENOENT` without them), Python 3 with NumPy and Pillow (creature preview's
+  `python-outline` backend; without them it falls back to `browser-silmetrics`), Playwright
+  Chromium.
+
+## Writing tests
+
+- Every `mkdtemp` needs cleanup (`onTestFinished` or an `afterEach` list). A test that leaks into
+  `/tmp` is a bug.
+- Never inject faults by racing `fs.watch` or timers against the code under test. Under load the
+  event arrives after the window has closed and the test hangs. Add an explicit hook instead, as
+  `CreaturePublicationHooks` (`src/creature/runner.ts`) does for publication and rollback.
+- Do not assert a backend or tool choice that depends on what the host has installed. Derive the
+  expectation from the host, or force the choice.
+- `testTimeout` is 30 s (`vitest.config.ts`): many tests spawn real ffmpeg, the pinned inspector
+  or the packed MCP. A timed-out test's work keeps running and writes into directories its cleanup
+  already removed, so a timeout also shows up as a temp leak.
+- For a race fix, write a test that holds the first caller inside the window (for example a
+  wrapper binary that sleeps) and starts the second one there. Confirm it goes red on the old code
+  for the right reason, not a timeout.
+
+## Toolchain provisioning (fresh hosts)
+
+Tools are cached under `~/.cache/threenative-asset-mcp/toolchain/` (`THREENATIVE_TOOLCHAIN_DIR`).
+Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
+
+- **FabCLI**: release archives wrap the binary in `fabcli-<tag>-<platform>/`. Look inside archives
+  with `findArchiveEntry`; never assume the root layout.
+- **UE Viewer**: the Linux prebuilt from gildor.org is a 32-bit i386 ELF, unrunnable without the
+  i386 loader, so 64-bit-only hosts build from source. The build needs `g++`, `perl`, `zlib1g-dev`,
+  `libpng-dev` and `libsdl2-dev`. `umodelBuildFailure` reads the compiler output and names the
+  missing package; keep that mapping current rather than listing guesses.
+- The uncooked converter provisions a Python venv; the modern converter installs a private .NET SDK
+  and publishes CUE4Parse. Neither needs root.
+- Nothing in CI provisions these from an empty cache yet (PRD-539 AC-4). Upstream archives change
+  without a commit here, so assume provisioning can break between runs.
+
+## Fab and Unreal imports
+
+- **Login is the user's.** The MCP never signs in. For an agent session with no display, run
+  `fabcli auth login --manual` under a pseudo-terminal (it refuses a non-TTY stdin). The user opens
+  the printed `epicgames.com/id/login?redirectUrl=…` link in the browser where they are already
+  signed in and gives you the `authorizationCode`. Codes expire in minutes and grant full account
+  access: pass one straight to FabCLI and never write it to a file. The session lives in the OS
+  keyring for about 90 days. `fabcli auth status` checks it.
+- **An artifact's format is its oldest listed engine.** `SoulCave418` lists UE 4.18–5.8 but is a
+  4.18 package. That version picks the decoder: UE Viewer (≤ 4.20), the MeshDescription converter
+  (4.21–4.27, object versions 517–522), CUE4Parse (UE5). Of the 35 importable listings in the
+  owner's library on 2026-10-07, 15 could only go through UE Viewer, and 9 offered more than one
+  route.
+- **UE Viewer's `.mat` for a MaterialInstance often shows the parent's defaults** when the
+  instance's parameter names are not ones it recognises. The instance's real textures are in
+  `TextureParameterValues` in `.props.txt`. Check the package name table (`strings -n 4 X.uasset`)
+  before trusting either. PRD-537 tracks the resolver fix.
+- **Some colour exists only in the material graph** (mask channels × tint vectors, no colour
+  texture). No texture binding can reproduce it; see PRD-538.
+- Fab downloads land in `~/.cache/threenative-asset-mcp/fab-downloads/<listing>/<artifact>`. They
+  are licensed, not redistributable: never commit pack contents. Delete what you downloaded when
+  you are done; FabCLI fetched Soul Cave (1.2 GB) in 17 s, so re-downloading is cheap.
+- Judge an import against its source package, not a screenshot. PRD-537 defines the structural
+  parity checks (coverage, shape, texture identity, colour presence).
