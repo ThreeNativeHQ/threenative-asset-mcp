@@ -431,6 +431,70 @@ describe("Fab import safety", () => {
     const downloads = (await test.invocations()).filter((argv) => argv[0] === "download");
     expect(downloads).toHaveLength(1);
   });
+
+  describe("artifactId selection", () => {
+    const OVERLAPPING = [
+      {
+        assetFormatType: { code: "unreal-engine" },
+        versions: [
+          { artifactId: "PackOld", engineVersions: ["UE_4.18", "UE_5.4"], targetPlatforms: ["Windows"] },
+          { artifactId: "PackNew", engineVersions: ["UE_5.0", "UE_5.4"], targetPlatforms: ["Windows"] },
+        ],
+      },
+    ];
+
+    it("imports each of two overlapping artifacts by id, downloading through its oldest engine", async () => {
+      const test = await harness({ formats: OVERLAPPING });
+      for (const [artifactId, oldest] of [
+        ["PackOld", "UE_4.18"],
+        ["PackNew", "UE_5.0"],
+      ] as const) {
+        const result = await test.handler({
+          listingIdOrUrl: LISTING,
+          outputDir: join(test.outputDir, artifactId),
+          artifactId,
+          acceptFabEula: true,
+        });
+        expect("isError" in result).toBe(false);
+        const download = (await test.invocations())
+          .filter((argv) => argv[0] === "download")
+          .find((argv) => argv[argv.indexOf("--output") + 1]?.endsWith(`/${artifactId}`));
+        expect(download?.[download.indexOf("--engine") + 1]).toBe(oldest);
+      }
+    });
+
+    it("lets artifactId win over a disagreeing engine and says so", async () => {
+      const test = await harness({ formats: OVERLAPPING });
+      const result = await test.handler({
+        listingIdOrUrl: LISTING,
+        outputDir: test.outputDir,
+        artifactId: "PackNew",
+        engine: "UE_4.18",
+        acceptFabEula: true,
+      });
+      if ("isError" in result) throw new Error(JSON.stringify(result));
+      const report = JSON.parse(
+        await readFile(join(test.outputDir, "import-report.json"), "utf8"),
+      ) as { warnings: string[] };
+      expect(report.warnings.join("\n")).toMatch(/UE_4\.18 is not published by artifact PackNew/);
+      const download = (await test.invocations()).find((argv) => argv[0] === "download");
+      expect(download?.[download.indexOf("--engine") + 1]).toBe("UE_5.0");
+    });
+
+    it("names the available artifacts when the id is absent", async () => {
+      const test = await harness({ formats: OVERLAPPING });
+      const result = await test.handler({
+        listingIdOrUrl: LISTING,
+        outputDir: test.outputDir,
+        artifactId: "Nope",
+        acceptFabEula: true,
+      });
+      const error = errorOf(result);
+      expect(error.code).toBe("FABCLI_ENGINE_AMBIGUOUS");
+      expect(error.message).toMatch(/PackOld.*PackNew/);
+      expect((await test.invocations()).some((argv) => argv[0] === "download")).toBe(false);
+    });
+  });
 });
 
 

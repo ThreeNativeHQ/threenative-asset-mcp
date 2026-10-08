@@ -358,7 +358,22 @@ export class FabCli {
   static selectVersion(
     versions: readonly FabUnrealVersion[],
     engine: string | undefined,
+    artifactId?: string,
   ): FabUnrealVersion {
+    // An artifact id names exactly one artifact, so it settles the choice even when several
+    // artifacts list overlapping engines and an engine selector could not tell them apart.
+    if (artifactId) {
+      const exact = versions.find((version) => version.artifactId === artifactId);
+      if (!exact) {
+        throw new FabCliError(
+          "FABCLI_ENGINE_AMBIGUOUS",
+          `No artifact "${artifactId}". Available: ${versions
+            .map((version) => `${version.artifactId} (${version.engineVersions.join(", ")})`)
+            .join("; ")}.`,
+        );
+      }
+      return exact;
+    }
     if (engine) {
       const wanted = assertEngineVersion(engine);
       const match = versions.find((version) => version.engineVersions.includes(wanted));
@@ -376,7 +391,7 @@ export class FabCli {
     if (versions.length === 1 && only) return only;
     throw new FabCliError(
       "FABCLI_ENGINE_AMBIGUOUS",
-      `This listing publishes ${versions.length} Unreal artifacts. Pass engine to choose one: ${versions
+      `This listing publishes ${versions.length} Unreal artifacts. Pass engine to choose one (or artifactId, which also separates artifacts whose engines overlap): ${versions
         .map((version) => `${version.artifactId} (${version.engineVersions.join(", ")})`)
         .join("; ")}.`,
     );

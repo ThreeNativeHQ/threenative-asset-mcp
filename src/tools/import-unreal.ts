@@ -6,6 +6,7 @@ import { z } from "zod";
 
 import { FabClient } from "../fab/client.js";
 import { FabCli, FabCliError, preferredPlatform } from "../fab/fabcli.js";
+import { oldestEngine } from "../fab/routes.js";
 import { classifyLicenses, type LicenseDecision } from "../fab/license.js";
 import { normalizeListing } from "../fab/normalize.js";
 import { ImportError, type ImportReport, importUnrealDirectory } from "../unreal/importer.js";
@@ -256,6 +257,14 @@ export const FabImportAssetInputSchema = z.object({
     .regex(/^UE_\d+\.\d+$/)
     .optional()
     .describe("Unreal engine selector, for example UE_4.21. Required when the listing publishes several artifacts."),
+  artifactId: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9._-]{1,128}$/)
+    .optional()
+    .describe(
+      "Exact Unreal artifact to import, as listed by the library. Wins over engine when both are given, and is the only way to pick between artifacts whose engine lists overlap.",
+    ),
   maxTextureSize: MaxTextureSizeSchema,
   platform: z
     .string()
@@ -546,20 +555,31 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
       await fabCli.requireAuthenticatedSession();
 
       const versions = await fabCli.unrealVersions(listingId);
-      const selected = FabCli.selectVersion(versions, input.engine);
+      const selected = FabCli.selectVersion(versions, input.engine, input.artifactId);
+      const extraWarnings: string[] = [];
+      // FabCLI filters by engine, not by artifact, so an explicit artifact is fetched through its
+      // oldest engine, the one that names its package format.
+      let engine = input.engine;
+      if (input.artifactId) {
+        engine = oldestEngine(selected.engineVersions);
+        if (input.engine && !selected.engineVersions.includes(input.engine)) {
+          extraWarnings.push(
+            `engine ${input.engine} is not published by artifact ${selected.artifactId} (${selected.engineVersions.join(", ")}); artifactId wins.`,
+          );
+        }
+      }
       const stagingDir = join(fabDownloadRoot(environment), listingId, selected.artifactId);
       await mkdir(stagingDir, { recursive: true });
 
       const marker = join(stagingDir, ".fabcli-asset.json");
       const cached = await readFile(marker, "utf8").catch(() => undefined);
-      const extraWarnings: string[] = [];
       if (cached === undefined || (await readdir(stagingDir)).length <= 1) {
         log(`Downloading ${selected.artifactId} from the Fab library…`);
         try {
           await fabCli.download({
             listingId,
             outputDir: stagingDir,
-            engine: input.engine,
+            engine,
             platform: input.platform,
           });
         } catch (error) {
@@ -579,7 +599,7 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
           await fabCli.download({
             listingId,
             outputDir: stagingDir,
-            engine: input.engine,
+            engine,
             platform,
           });
         }
@@ -592,7 +612,7 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
         sourceDir: stagingDir,
         outputDir,
         listingId,
-        engine: input.engine,
+        engine,
         sourceKind: "fab-listing",
         onlyPackages: input.packages,
         authenticatedDownload: true,
