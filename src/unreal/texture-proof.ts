@@ -434,6 +434,7 @@ export const CROSS_DECODE_SSIM = 0.999;
  * built with different filters differ by a few percent even for the same texture.
  */
 export const CROSS_DECODE_RESIZED_SSIM = 0.95;
+const COARSE_SIZE = 32;
 
 export interface CrossDecodeEntry {
   readonly texture: string;
@@ -446,6 +447,8 @@ export interface CrossDecodeEntry {
   readonly height?: number;
   /** The decoders produced different resolutions; `width`/`height` is the common size compared. */
   readonly sizeDiffers?: boolean;
+  /** SSIM of both decodes squeezed to 32x32; present when the sizes differ. */
+  readonly coarseSsim?: number;
   readonly viewerSize?: string;
   readonly cue4parseSize?: string;
 }
@@ -543,6 +546,17 @@ export async function crossDecodeProof(
         viewerIsSmaller ? await resizeRgba(cue4parse, target.width, target.height) : cue4parse,
         { premultiplied: true },
       );
+      // Where the sizes differ, also say how well the coarse picture agrees: it tells "a blurrier mip of
+      // the same texture" (high) from "a different or mis-decoded texture" (low).
+      const coarse = sizeDiffers
+        ? (
+            await compareImages(
+              await resizeRgba(viewer, COARSE_SIZE, COARSE_SIZE),
+              await resizeRgba(cue4parse, COARSE_SIZE, COARSE_SIZE),
+              { premultiplied: true },
+            )
+          ).ssim
+        : undefined;
       results.push({
         texture: name,
         status: compared.ssim >= (sizeDiffers ? (options.resizedThreshold ?? CROSS_DECODE_RESIZED_SSIM) : threshold) ? "agree" : "disagree",
@@ -552,7 +566,7 @@ export async function crossDecodeProof(
         width: compared.width,
         height: compared.height,
         ...(sizeDiffers
-          ? { sizeDiffers: true, viewerSize: `${viewer.width}x${viewer.height}`, cue4parseSize: `${cue4parse.width}x${cue4parse.height}` }
+          ? { sizeDiffers: true, ...(coarse === undefined ? {} : { coarseSsim: coarse }), viewerSize: `${viewer.width}x${viewer.height}`, cue4parseSize: `${cue4parse.width}x${cue4parse.height}` }
           : {}),
       });
     } catch (error) {
