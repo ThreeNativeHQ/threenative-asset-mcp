@@ -17,6 +17,8 @@ import {
   resolveMaterial,
 } from "./materials.js";
 import { readPackageCooking, readPackageObjectNames } from "./cooking.js";
+import { decodeMaterialPackage, type SourcePackage } from "./source-material-package.js";
+import { reduceSourceMaterial, sameSourceCoordinates, type SourceMaterial } from "./source-material.js";
 import { decodeGroomPayload, groomSidecar, type GroomStrands } from "./grooms.js";
 import { ImportError } from "./errors.js";
 import { extractUnrealFonts } from "./fonts.js";
@@ -47,7 +49,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 48;
+export const IMPORTER_VERSION = 51;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -82,6 +84,8 @@ export interface ImportedMaterialSection {
   }[];
   readonly unsupported: readonly { readonly texture: string; readonly reason: string }[];
   readonly alphaMode: string;
+  readonly alphaCutoff?: number;
+  readonly limitations: readonly string[];
   readonly doubleSided: boolean;
   readonly factors: {
     readonly baseColor: readonly [number, number, number, number];
@@ -537,6 +541,8 @@ interface ExportedAssets {
   readonly mat: Map<string, string>;
   readonly props: Map<string, string>;
   readonly png: Map<string, string>;
+  /** Basenames with multiple physical PNG producers cannot establish an exact source binding. */
+  readonly ambiguousPng?: ReadonlySet<string>;
   readonly audio: Map<string, string>;
   /** Embedded MetaHuman DNA blobs, keyed by the mesh whose export promoted them. */
   readonly dna: Map<string, string>;
@@ -548,6 +554,7 @@ async function indexExported(root: string): Promise<ExportedAssets> {
   const mat = new Map<string, string>();
   const props = new Map<string, string>();
   const png = new Map<string, string>();
+  const ambiguousPng = new Set<string>();
   const audio = new Map<string, string>();
   const dna = new Map<string, string>();
   for (const file of await listFiles(root).catch(() => [])) {
@@ -556,22 +563,25 @@ async function indexExported(root: string): Promise<ExportedAssets> {
     else if (name.endsWith(".mat")) mat.set(name.slice(0, -".mat".length), file.path);
     else if (name.endsWith(".gltf")) gltf.set(name.slice(0, -".gltf".length), file.path);
     else if (name.endsWith(".psa")) psa.set(name.slice(0, -".psa".length), file.path);
-    else if (name.endsWith(".png")) png.set(name.slice(0, -".png".length), file.path);
+    else if (name.endsWith(".png")) { const stem = name.slice(0, -".png".length); if (png.has(stem)) ambiguousPng.add(stem); png.set(stem, file.path); }
     else if (name.endsWith(".dna")) dna.set(name.slice(0, -".dna".length), file.path);
     else if (/\.(?:wav|ogg|mp3|flac)$/i.test(name)) audio.set(name.slice(0, name.lastIndexOf(".")), file.path);
   }
-  return { gltf, psa, mat, props, png, audio, dna };
+  return { gltf, psa, mat, props, png, ambiguousPng, audio, dna };
 }
 
 function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAssets {
   const merge = (first: Map<string, string>, second: Map<string, string>): Map<string, string> =>
     new Map([...first, ...second]);
+  const ambiguousPng = new Set([...(left.ambiguousPng ?? []), ...(right.ambiguousPng ?? [])]);
+  for (const [name, file] of right.png) if (left.png.has(name) && left.png.get(name) !== file) ambiguousPng.add(name);
   return {
     gltf: merge(left.gltf, right.gltf),
     psa: merge(left.psa, right.psa),
     mat: merge(left.mat, right.mat),
     props: merge(left.props, right.props),
     png: merge(left.png, right.png),
+    ambiguousPng,
     audio: merge(left.audio, right.audio),
     dna: merge(left.dna, right.dna),
   };
@@ -681,6 +691,26 @@ export async function applyTextureTransform(
     .raw()
     .toBuffer({ resolveWithObject: true });
   const pixels = info.width * info.height;
+  if (transform === "roughnessToOne") {
+    for (let index = 0; index < pixels; index += 1) data[index * 4 + 1] = 255;
+    return { data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6 }).toBuffer(), mimeType: "image/png" };
+  }
+  if (transform === "redToBaseColorAlpha") {
+    if (!secondaryInput) throw new Error("Opacity source is missing for base-colour alpha composition.");
+    const colourMetadata = await sharp(input).metadata();
+    const opacityMetadata = await sharp(secondaryInput).metadata();
+    if (colourMetadata.width !== opacityMetadata.width || colourMetadata.height !== opacityMetadata.height) {
+      throw new Error("Opacity and base-colour source dimensions do not match.");
+    }
+    const mask = await sharp(secondaryInput, { limitInputPixels: 268_435_456, unlimited: true })
+      .resize(info.width, info.height, { fit: "fill" })
+      .ensureAlpha().raw().toBuffer();
+    for (let index = 0; index < pixels; index += 1) data[index * 4 + 3] = mask[index * 4] ?? 0;
+    return {
+      data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer(),
+      mimeType: "image/png",
+    };
+  }
   const output = Buffer.alloc(pixels * 3);
   let secondary: Buffer | undefined;
   if (transform === "redRoughnessRedMetalness") {
@@ -1064,6 +1094,8 @@ export async function packageGlb(options: {
   readonly materialLookupNames?: ReadonlyMap<string, string>;
   /** Per-material isolated exports, required when two packages share an object basename. */
   readonly materialAssets?: ReadonlyMap<string, ExportedAssets>;
+  /** Scoped authored source lookup; library names are resolved to exact source packages. */
+  readonly sourceMaterial?: (name: string, lookupName: string) => SourceMaterial | undefined | Promise<SourceMaterial | undefined>;
 }): Promise<PackagedModel> {
   const io = separateLayoutIO();
   const document = await io.read(options.gltfPath);
@@ -1076,17 +1108,36 @@ export async function packageGlb(options: {
   if (options.copyright) root.getAsset().copyright = options.copyright;
   const sections: ImportedMaterialSection[] = [];
   const cache = new Map<string, Texture>();
+  const scalarRoughnessTextures = new Map<Texture, Texture>();
   let prunedUvSets = 0;
   let droppedTangents = 0;
   let repairedMorphDeltas = 0;
   let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
+  const sharedGraphs = new Map<ExportedAssets, Map<string, Set<string>>>();
+  for (const material of root.listMaterials()) {
+    const name = material.getName();
+    const lookup = options.materialLookupNames?.get(name) ?? name;
+    const assets = options.materialAssets?.get(name) ?? options.assets;
+    const path = assets.mat.get(lookup);
+    if (!path) continue;
+    const text = readMaterialSidecar(path);
+    if (!text) continue;
+    const graphs = sharedGraphs.get(assets) ?? new Map<string, Set<string>>();
+    const names = graphs.get(text) ?? new Set<string>();
+    names.add(lookup);
+    graphs.set(text, names);
+    sharedGraphs.set(assets, graphs);
+  }
 
   for (const [index, material] of root.listMaterials().entries()) {
     const name = material.getName();
     const lookupName = options.materialLookupNames?.get(name) ?? name;
     const materialAssets = options.materialAssets?.get(name) ?? options.assets;
     const availableTextures = new Set(materialAssets.png.keys());
+    const graphPath = materialAssets.mat.get(lookupName);
+    const graphText = graphPath ? readMaterialSidecar(graphPath) : undefined;
+    const graphNames = graphText ? sharedGraphs.get(materialAssets)?.get(graphText) : undefined;
     // UE Viewer names a section it could not resolve `dummy_material_<n>` and paints it a debug
     // colour. Shipping that name would put a placeholder into a game asset and let a reader
     // mistake it for a real material, so it is renamed to something that says what it is.
@@ -1094,7 +1145,7 @@ export async function packageGlb(options: {
     if (unresolvedSection) {
       material.setName(`${basename(options.glbPath, ".glb")}_unresolved_section_${index}`);
     }
-    const resolved: ResolvedMaterial = resolveMaterial({
+    let resolved: ResolvedMaterial = resolveMaterial({
       name: lookupName,
       readMat: (materialName) => {
         const path = materialAssets.mat.get(materialName);
@@ -1105,7 +1156,52 @@ export async function packageGlb(options: {
         return path === undefined ? undefined : readMaterialSidecar(path);
       },
       availableTextures,
+      ...(graphNames ? { sharedGraphMaterialNames: graphNames } : {}),
     });
+    const authored = await options.sourceMaterial?.(name, lookupName);
+    let authoredAoCoordinatesMatch = false;
+    let authoredAoBaseBinding: ResolvedMaterial["bindings"][number] | undefined;
+    let authoredAoCoordinateLimitation: string | undefined;
+    if (authored) {
+      const limitations = [...resolved.limitations, ...authored.limitations];
+      let roughnessFactor = resolved.roughnessFactor;
+      const roughness = authored.channels.Roughness;
+      if (roughness?.kind === "scalar") {
+        roughnessFactor = Math.min(1, Math.max(0, roughness.value));
+        limitations.push(`Source authored Roughness ${roughness.value}; glTF factor normalized to ${roughnessFactor}, without a claim about Unreal shader saturation.`);
+      } else if (roughness) limitations.push(`Source Roughness texture ${roughness.path}: channel/product packaging unsupported.`);
+      const metallic = authored.channels.Metallic;
+      if (metallic) limitations.push(`Source Metallic ${metallic.kind === "scalar" ? metallic.value : `${metallic.path}.${"RGBA"[metallic.channel]}`}: recovered authored value is not applied by this bounded packaging subset; prior metallic reconstruction retained.`);
+      const bindings = [...resolved.bindings];
+      const ao = authored.channels.AmbientOcclusion;
+      if (ao?.kind === "texture") {
+        bindings.splice(0, bindings.length, ...bindings.filter((binding) => binding.slot !== "occlusion"));
+        material.setOcclusionTexture(null);
+        const aoName = ao.path.slice(ao.path.lastIndexOf(".") + 1);
+        const base = bindings.find((binding) => binding.slot === "baseColor");
+        const samples = base ? authored.baseColorSamples.filter((s) => s.path.slice(s.path.lastIndexOf(".") + 1) === base.texture) : [];
+        const exactTexturePaths = new Set(samples.map((s) => s.path));
+        const matching = samples.length > 0 && exactTexturePaths.size === 1 && samples.every((s) => sameSourceCoordinates(ao.coordinates, s.coordinates));
+        if (ao.sampling.status !== "linear") limitations.push(`Source AmbientOcclusion ${ao.path}.R withheld: ${ao.sampling.reason}. Raw linear glTF AO would invent source color interpretation; filename AO bindings were withheld too.`);
+        else if (ao.factor !== 1) limitations.push(`Source AmbientOcclusion ${ao.path}.RGBA[${ao.channel}] multiplied by ${ao.factor}: nonidentity pixel multiplication unsupported; occlusionStrength is not equivalent.`);
+        else if (ao.channel !== 0) limitations.push(`Source AmbientOcclusion ${ao.path}: channel ${ao.channel} packing unsupported.`);
+        else if (materialAssets.ambiguousPng?.has(aoName) || (base && materialAssets.ambiguousPng?.has(base.texture))) limitations.push(`Source AmbientOcclusion ${ao.path}: ambiguous exported PNG basename ${materialAssets.ambiguousPng?.has(aoName) ? aoName : base!.texture}; exact source pixels cannot be selected.`);
+        else if (!matching) limitations.push(`Source AmbientOcclusion ${ao.path}: coordinates do not establish identity with the currently bound source albedo sampler.`);
+        else if (ao.coordinates.kind === "explicit" && (ao.coordinates.u !== 1 || ao.coordinates.v !== 1)) limitations.push(`Source AmbientOcclusion ${ao.path}: explicit UV tiling requires an established consumer transform; unsupported.`);
+        else if (!availableTextures.has(aoName)) limitations.push(`Source AmbientOcclusion exact texture ${ao.path} was not exported.`);
+        else {
+          // TextureInfo is applied after the existing base-colour binding has established its
+          // consumer coordinate. An omitted Unreal default is never converted into native UV0.
+          authoredAoCoordinatesMatch = true;
+          authoredAoBaseBinding = base;
+          bindings.splice(0, bindings.length, ...bindings.filter((binding) => binding.slot !== "occlusion"));
+          bindings.push({ slot: "occlusion", texture: aoName, source: "authored-source", confidence: "exact", transform: "none" });
+          if (ao.coordinates.kind === "implicit") authoredAoCoordinateLimitation = `Source AmbientOcclusion coordinates match the bound albedo's same-class omitted coordinate descriptor; effective Unreal coordinate default remains unresolved. Reused existing glTF albedo TextureInfo.`;
+          else if (ao.coordinates.kind === "explicit") authoredAoCoordinateLimitation = `Source AmbientOcclusion matches albedo source coordinate ${ao.coordinates.index}; reused existing glTF albedo mapping. Applying that Unreal index to the consumer albedo is unsupported.`;
+        }
+      } else if (ao) limitations.push(`Source AmbientOcclusion constant ${ao.value}: scalar occlusion packaging unsupported.`);
+      resolved = { ...resolved, bindings, roughnessFactor, limitations };
+    }
 
     // UE Viewer's exporter writes a per-section debug colour. Whether or not a texture replaces
     // it, it never survives into the output: a red/green/blue tint reported as a material is the
@@ -1120,6 +1216,9 @@ export async function packageGlb(options: {
     const ordered = [...resolved.bindings].sort(
       (left, right) => SLOT_ORDER.indexOf(left.slot) - SLOT_ORDER.indexOf(right.slot),
     );
+    const packagingLimitations = [...resolved.limitations];
+    let authoredAoApplied = false;
+    let authoredAoBaseAttached = false;
     const sidecarTextures: string[] = [];
     for (const unsupported of resolved.unsupported) {
       const source = materialAssets.png.get(unsupported.texture);
@@ -1151,7 +1250,7 @@ export async function packageGlb(options: {
       let texture = cache.get(key);
       if (!texture) {
         const image = options.imageCache
-          ? await options.imageCache.get(`${source}|${binding.transform}`, async () =>
+          ? await options.imageCache.get(key, async () =>
               applyTextureTransform(
                 await readFile(source),
                 binding.transform,
@@ -1172,6 +1271,19 @@ export async function packageGlb(options: {
         cache.set(key, texture);
       }
       attachTexture(material, binding, texture);
+      if (binding === authoredAoBaseBinding) authoredAoBaseAttached = true;
+      if (binding.source === "authored-source" && binding.slot === "occlusion") {
+        const baseInfo = material.getBaseColorTextureInfo();
+        if (authoredAoBaseAttached && baseInfo && authoredAoCoordinatesMatch) {
+          material.getOcclusionTextureInfo()?.setTexCoord(baseInfo.getTexCoord());
+          material.setOcclusionStrength(1);
+          authoredAoApplied = true;
+          if (authoredAoCoordinateLimitation) packagingLimitations.push(authoredAoCoordinateLimitation);
+        } else {
+          material.setOcclusionTexture(null);
+          packagingLimitations.push("Source AmbientOcclusion refused: its albedo reference was not bound, so relative coordinate identity cannot be applied.");
+        }
+      }
     }
 
     const boundBaseColour = material.getBaseColorTexture() !== null;
@@ -1203,13 +1315,27 @@ export async function packageGlb(options: {
     }
     if (resolved.emissiveFactor) material.setEmissiveFactor([...resolved.emissiveFactor]);
     if (resolved.metallicFactor !== undefined) material.setMetallicFactor(resolved.metallicFactor);
+    if (authored?.channels.Roughness?.kind === "scalar") {
+      const previous = material.getMetallicRoughnessTexture();
+      const image = previous?.getImage();
+      if (previous && image) {
+        let texture = scalarRoughnessTextures.get(previous);
+        if (!texture) {
+          const transformed = await applyTextureTransform(Buffer.from(image), "roughnessToOne", undefined);
+          texture = document.createTexture(`${previous.getName()}_roughnessToOne`).setImage(new Uint8Array(transformed.data)).setMimeType(transformed.mimeType);
+          scalarRoughnessTextures.set(previous, texture);
+        }
+        material.setMetallicRoughnessTexture(texture);
+        packagingLimitations.push("Source authored scalar roughness: prior roughness texture contribution replaced with G=1; packed metallic channel retained.");
+      }
+    }
     if (resolved.roughnessFactor !== undefined) material.setRoughnessFactor(resolved.roughnessFactor);
 
     sections.push({
       name: material.getName(),
       resolved: !unresolvedSection,
       sidecarTextures,
-      bindings: ordered.map((binding) => ({
+      bindings: ordered.filter((binding) => binding.source !== "authored-source" || binding.slot !== "occlusion" || authoredAoApplied).map((binding) => ({
         slot: binding.slot,
         texture: binding.texture,
         ...(binding.secondaryTexture ? { secondaryTexture: binding.secondaryTexture } : {}),
@@ -1219,6 +1345,8 @@ export async function packageGlb(options: {
       })),
       unsupported: [...resolved.unsupported.map((entry) => ({ ...entry })), ...rejectedMasks.splice(0)],
       alphaMode: material.getAlphaMode(),
+      ...(material.getAlphaMode() === "MASK" ? { alphaCutoff: material.getAlphaCutoff() } : {}),
+      limitations: packagingLimitations,
       doubleSided: material.getDoubleSided(),
       factors: {
         baseColor: material.getBaseColorFactor(),
@@ -1282,6 +1410,9 @@ export async function packageGlb(options: {
       // UE Viewer emits every Unreal UV channel, including lightmap sets no runtime material
       // reads. They are pure size in a source asset that a compiler will copy again.
       for (let set = 1; set < 8; set += 1) {
+        const material = primitive.getMaterial();
+        const usedInfos = material ? [material.getBaseColorTextureInfo(), material.getNormalTextureInfo(), material.getMetallicRoughnessTextureInfo(), material.getEmissiveTextureInfo(), material.getOcclusionTextureInfo()] : [];
+        if (usedInfos.some((info) => info?.getTexCoord() === set)) continue;
         const semantic = `TEXCOORD_${set}`;
         const attribute = primitive.getAttribute(semantic);
         if (!attribute) continue;
@@ -1849,6 +1980,92 @@ export async function importUnrealDirectory(
   const texturePackages = classified.filter((entry) => entry.hasTexture && !entry.hasFont && !entry.error);
   const cubemapPackages = classified.filter((entry) => entry.hasCubemap && !entry.error);
   const materialPackages = classified.filter((entry) => entry.hasMaterial && !entry.error);
+  // The Content directory defines a /Game namespace. Absolute roots separate downloaded
+  // projects even when their canonical object paths and basenames happen to be identical.
+  const sourceLocation = (file: string): { namespace: string; path: string } | undefined => {
+    const parts = file.split(sep); const content = parts.lastIndexOf("Content");
+    if (content < 0 || content >= parts.length - 1) return undefined;
+    const namespace = parts.slice(0, content + 1).join(sep);
+    const packageName = parts.slice(content + 1).join("/").slice(0, -extname(file).length);
+    return { namespace, path: `/Game/${packageName}` };
+  };
+  // Export selection does not remove source dependencies. Index filenames from the existing
+  // inventory, then read only the chosen material, exact parents and selected AO texture.
+  const sourceFiles = new Map<string, Map<string, { file: string; size: number }[]>>();
+  for (const entry of packages) {
+    if (extname(entry.path).toLowerCase() !== ".uasset") continue;
+    const location = sourceLocation(entry.path); if (!location) continue;
+    const namespace = sourceFiles.get(location.namespace) ?? new Map<string, { file: string; size: number }[]>();
+    const files = namespace.get(location.path) ?? []; files.push({ file: entry.path, size: entry.size });
+    namespace.set(location.path, files); sourceFiles.set(location.namespace, namespace);
+  }
+  const sourcePackages = new Map<string, Map<string, SourcePackage>>();
+  const sourcePackageLoads = new Map<string, Promise<SourcePackage>>();
+  const loadSourcePackage = (namespaceName: string, path: string): Promise<SourcePackage> => {
+    const key = `${namespaceName}\0${path}`; const cached = sourcePackageLoads.get(key); if (cached) return cached;
+    const pending = (async (): Promise<SourcePackage> => {
+      const matches = sourceFiles.get(namespaceName)?.get(path) ?? [];
+      const entry = matches[0];
+      const decoded: SourcePackage = matches.length !== 1 || !entry
+        ? { status: "unsupported", path, reason: "Exact source package namespace unavailable or ambiguous" }
+        : entry.size > 32 * 1024 * 1024
+          ? { status: "unsupported", path, reason: "Source package exceeds bounded 32 MiB metadata reader" }
+          : decodeMaterialPackage(await readFile(entry.file), path);
+      const namespace = sourcePackages.get(namespaceName) ?? new Map<string, SourcePackage>();
+      namespace.set(path, decoded); sourcePackages.set(namespaceName, namespace); return decoded;
+    })();
+    sourcePackageLoads.set(key, pending); return pending;
+  };
+  const sourceMaterialCache = new Map<string, Promise<SourceMaterial>>();
+  const sourceForFile = async (file: string, objectPath?: string): Promise<SourceMaterial | undefined> => {
+    const location = sourceLocation(file); if (!location) return undefined;
+    const key = `${location.namespace}\0${location.path}\0${objectPath ?? ""}`; const cached = sourceMaterialCache.get(key); if (cached) return cached;
+    const pending = (async () => {
+      const source = await loadSourcePackage(location.namespace, location.path);
+      const namespace = sourcePackages.get(location.namespace)!;
+      let path = objectPath ?? `${location.path}.${basename(file, extname(file))}`;
+      if (source.status === "decoded") {
+        const roots = source.exports.filter((e) => (e.className === "Material" || e.className === "MaterialInstanceConstant") && (!objectPath || e.path === objectPath));
+        if (roots.length !== 1) return { channels: {}, baseColorSamples: [], limitations: [`Authored source ${location.path}: material object unavailable or ambiguous; prior reconstruction retained.`] };
+        let current = roots[0]!; path = current.path; const seen = new Set<string>();
+        while (current.className === "MaterialInstanceConstant") {
+          if (seen.has(current.path) || seen.size >= 64) throw new Error("Source parent cycle/depth"); seen.add(current.path);
+          const parent = current.properties.find((p) => p.name === "Parent" && p.arrayIndex === 0);
+          const reference = parent?.value as { path?: unknown } | undefined;
+          if (parent?.unsupported || typeof reference?.path !== "string") break;
+          const pkg = await loadSourcePackage(location.namespace, reference.path.split(".")[0]!);
+          if (pkg.status !== "decoded") break;
+          const next = pkg.exports.find((e) => e.path === reference.path); if (!next) break; current = next;
+        }
+      }
+      let material = reduceSourceMaterial(namespace, path);
+      const ao = material.channels.AmbientOcclusion;
+      if (ao?.kind === "texture") {
+        const texturePath = ao.path.split(".")[0]!;
+        await loadSourcePackage(location.namespace, texturePath);
+        material = reduceSourceMaterial(namespace, path);
+      }
+      return material;
+    })();
+    sourceMaterialCache.set(key, pending); return pending;
+  };
+  const sourceForMesh = (file: string): ((name: string, lookup: string) => Promise<SourceMaterial | undefined>) => async (_name, lookup) => {
+    const location = sourceLocation(file); if (!location) return undefined;
+    const mesh = await loadSourcePackage(location.namespace, location.path);
+    const references = mesh.status === "decoded" ? [...new Set(mesh.imports.filter((ref) => (ref.className === "Material" || ref.className === "MaterialInstanceConstant") && ref.name === lookup && ref.path?.startsWith("/Game/")).map((ref) => ref.path!))] : [];
+    if (references.length > 1) return { channels: {}, baseColorSamples: [], limitations: [`Authored source material ${lookup}: ambiguous mesh material import references; prior reconstruction retained.`] };
+    if (references.length === 1) {
+      const objectPath = references[0]!;
+      const files = sourceFiles.get(location.namespace)?.get(objectPath.split(".")[0]!) ?? [];
+      if (files.length !== 1) return { channels: {}, baseColorSamples: [], limitations: [`Authored source material ${objectPath}: exact mesh import package unavailable or ambiguous; prior reconstruction retained.`] };
+      return sourceForFile(files[0]!.file, objectPath);
+    }
+    const matches = [...(sourceFiles.get(location.namespace)?.values() ?? [])].flat().filter((entry) => basename(entry.file, extname(entry.file)) === lookup);
+    if (matches.length === 0) return undefined;
+    if (matches.length !== 1) return { channels: {}, baseColorSamples: [], limitations: [`Authored source material ${lookup}: ambiguous exact package namespace; prior reconstruction retained.`] };
+    const material = await sourceForFile(matches[0]!.file);
+    return material ? { ...material, limitations: [...material.limitations, `Authored source material ${lookup}: unique source basename fallback used because an exact mesh material import was not recovered${mesh.status === "unsupported" ? ` (${mesh.reason})` : ""}; canonical mesh routing remains unresolved.`] } : undefined;
+  };
   const soundPackages = classified.filter((entry) => entry.hasSound && !entry.error);
   const dataPackages = classified.filter((entry) => entry.dataClass !== undefined && !entry.error);
   const textureStackPackages = classified.filter((entry) => entry.textureStackClass !== undefined && !entry.error);
@@ -2826,6 +3043,7 @@ export async function importUnrealDirectory(
             sidecars,
             geometryScale: fromMeshDescription ? 0.01 : 1,
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
+            sourceMaterial: sourceForMesh(entry.file),
           });
           prunedUvSets += packaged.prunedUvSets;
           droppedTangents += packaged.droppedTangents;
@@ -2948,6 +3166,7 @@ export async function importUnrealDirectory(
           copyright,
           sidecars,
           geometryScale: 1,
+          sourceMaterial: sourceForMesh(source.entry.file),
         });
         prunedUvSets += packaged.prunedUvSets;
         droppedTangents += packaged.droppedTangents;
@@ -3047,6 +3266,10 @@ export async function importUnrealDirectory(
           copyright,
           materialLookupNames: lookupNames,
           materialAssets: isolatedAssets,
+          sourceMaterial: (name) => {
+            const entry = materialEntries.find((e) => e.libraryName === name)?.entry;
+            return entry ? sourceForFile(entry.file) : undefined;
+          },
         });
         await validateGlb(glbPath);
         const sections = new Map(packaged.sections.map((section) => [section.name, section]));
@@ -3755,7 +3978,7 @@ export async function importUnrealDirectory(
     }
     if (prunedUvSets > 0) {
       warnings.push(
-        `Dropped ${prunedUvSets} extra UV channels (TEXCOORD_1 and above); Unreal lightmap UVs have no runtime consumer here.`,
+        `Dropped ${prunedUvSets} unused extra UV channels (TEXCOORD_1 and above); bound material coordinate sets were retained.`,
       );
     }
     if (repairedMorphDeltas > 0) {
@@ -3778,6 +4001,8 @@ export async function importUnrealDirectory(
         `${coverage.sections - coverage.textured} material sections have no base colour texture and use an explicit named PBR fallback.`,
       );
     }
+    const materialLimitations = [...new Set(sections.flatMap((section) => section.limitations))];
+    for (const limitation of materialLimitations) warnings.push(`Material reconstruction: ${limitation}`);
 
     const report: ImportReport = {
       importer: { name: "threenative-asset-mcp", version: IMPORTER_VERSION },
@@ -3804,7 +4029,7 @@ export async function importUnrealDirectory(
       },
       cacheKey,
       reused: false,
-      materials: coverage.textured === coverage.sections ? "complete" : "degraded",
+      materials: coverage.textured === coverage.sections && materialLimitations.length === 0 ? "complete" : "degraded",
       counts: {
         packages: candidates.length,
         exported: models.length,
