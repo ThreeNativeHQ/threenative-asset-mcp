@@ -14,6 +14,7 @@ import {
   validatePreviewPng,
 } from "../src/creature/preview.js";
 import type { CreatureRunner } from "../src/creature/runner.js";
+import { describeWithTools } from "./helpers/require-tool.js";
 
 const WYVERN_SPEC = {
   name: "ember_crown_wyvern",
@@ -543,7 +544,7 @@ describe("creature_preview failure boundaries", () => {
   });
 });
 
-describe("creature_preview installed MCP", () => {
+describeWithTools(["python-imaging"], "creature_preview installed MCP silhouettes", () => {
   it(
     "should return four nonblank silhouette views when the wyvern is compiled",
     async () => {
@@ -823,6 +824,9 @@ describe("creature_preview installed MCP", () => {
     120_000,
   );
 
+});
+
+describe("creature_preview installed MCP when Chromium cannot launch", () => {
   it(
     "should report unavailable hero rendering when Chromium cannot launch",
     async () => {
@@ -855,6 +859,9 @@ describe("creature_preview installed MCP", () => {
     },
   );
 
+});
+
+describeWithTools(["chromium"], "creature_preview installed MCP hero rendering", () => {
   it(
     "should capture a hero image when Chromium is available",
     async () => {

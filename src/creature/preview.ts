@@ -9,6 +9,7 @@ import { chromium } from "playwright";
 import sharp, { type Metadata } from "sharp";
 import { z } from "zod";
 
+import { browserTempEnvironment, createBrowserTempDir } from "../browser-temp.js";
 import {
   CreatureOperationError,
   type CreatureRunner,
@@ -175,10 +176,11 @@ async function runCommand(
   args: readonly string[],
   cwd: string,
   signal: AbortSignal,
+  extraEnvironment: NodeJS.ProcessEnv = {},
 ): Promise<CommandResult> {
   const child = spawn(command, args, {
     cwd,
-    env: commandEnvironment(),
+    env: { ...commandEnvironment(), ...extraEnvironment },
     shell: false,
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
@@ -430,21 +432,29 @@ async function packageDirectory(): Promise<string> {
   throw new CreatureOperationError("TOOLCHAIN_UNAVAILABLE", "The installed Playwright package could not be located for preview rendering.");
 }
 
-async function createBrowserHarness(payloadRoot: string): Promise<{ readonly root: string; readonly scriptRoot: string; readonly cleanup: () => Promise<void> }> {
+async function createBrowserHarness(payloadRoot: string): Promise<{ readonly root: string; readonly scriptRoot: string; readonly tmp: string; readonly cleanup: () => Promise<void> }> {
   const temporary = await mkdtemp(join(tmpdir(), "threenative-creature-render-"));
   const harness = join(temporary, "harness");
   const assets = join(harness, "assets");
-  await mkdir(assets, { recursive: true, mode: 0o700 });
-  for (const name of ["pwlaunch.mjs", "pwprobe.mjs", "silmetrics.mjs", "hero.mjs"]) {
-    await copyFile(join(payloadRoot, "harness", name), join(harness, name));
+  const tmp = join(temporary, "tmp");
+  try {
+    await mkdir(assets, { recursive: true, mode: 0o700 });
+    await mkdir(tmp, { recursive: true, mode: 0o700 });
+    for (const name of ["pwlaunch.mjs", "pwprobe.mjs", "silmetrics.mjs", "hero.mjs"]) {
+      await copyFile(join(payloadRoot, "harness", name), join(harness, name));
+    }
+    await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(assets, "three-bundle.js"));
+    const playwrightRoot = await packageDirectory();
+    await mkdir(join(temporary, "node_modules"), { recursive: true, mode: 0o700 });
+    await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
+  } catch (error) {
+    await rm(temporary, { recursive: true, force: true });
+    throw error;
   }
-  await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(assets, "three-bundle.js"));
-  const playwrightRoot = await packageDirectory();
-  await mkdir(join(temporary, "node_modules"), { recursive: true, mode: 0o700 });
-  await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
   return {
     root: temporary,
     scriptRoot: harness,
+    tmp,
     cleanup: () => rm(temporary, { recursive: true, force: true }),
   };
 }
@@ -509,6 +519,7 @@ async function probeChromiumWithRunner(
       [join(harness.scriptRoot, "pwprobe.mjs")],
       harness.root,
       signal,
+      browserTempEnvironment(harness.tmp),
     );
   } finally {
     await harness.cleanup();
@@ -541,13 +552,22 @@ export async function probeChromium(
     }
 
     const executablePath = process.env.PW_CHROMIUM_PATH?.trim();
-    const browser = await chromium.launch({
-      ...(executablePath ? { executablePath } : {}),
-      args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", ...(process.env.PW_NO_SANDBOX === "1" ? ["--no-sandbox"] : [])],
-      timeout: CHROMIUM_PROBE_TIMEOUT_MS,
-    });
-    await browser.close();
-    return { available: true };
+    const temp = await createBrowserTempDir();
+    try {
+      const browser = await chromium.launch({
+        ...(executablePath ? { executablePath } : {}),
+        args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", ...(process.env.PW_NO_SANDBOX === "1" ? ["--no-sandbox"] : [])],
+        timeout: CHROMIUM_PROBE_TIMEOUT_MS,
+        env: { ...process.env, ...temp.env },
+      });
+      try {
+        return { available: true };
+      } finally {
+        await browser.close();
+      }
+    } finally {
+      await temp.remove();
+    }
   } catch (error) {
     return {
       available: false,
@@ -579,7 +599,7 @@ async function runSilhouette(
   const harness = await createBrowserHarness(payloadRoot);
   try {
     throwIfPreviewAborted(signal);
-    const result = await runCommand(process.execPath, [join(harness.scriptRoot, "silmetrics.mjs"), glbPath, outputDirectory], harness.root, signal);
+    const result = await runCommand(process.execPath, [join(harness.scriptRoot, "silmetrics.mjs"), glbPath, outputDirectory], harness.root, signal, browserTempEnvironment(harness.tmp));
     throwIfPreviewAborted(signal);
     if (result.exitCode !== 0 || result.overflow) {
       throw new CreatureOperationError(
@@ -605,7 +625,7 @@ async function runHero(
   const harness = await createBrowserHarness(payloadRoot);
   try {
     throwIfPreviewAborted(signal);
-    const result = await runCommand(process.execPath, [join(harness.scriptRoot, "hero.mjs"), glbPath, outputDirectory], harness.root, signal);
+    const result = await runCommand(process.execPath, [join(harness.scriptRoot, "hero.mjs"), glbPath, outputDirectory], harness.root, signal, browserTempEnvironment(harness.tmp));
     throwIfPreviewAborted(signal);
     if (result.exitCode !== 0 || result.overflow) {
       throw new CreatureOperationError(

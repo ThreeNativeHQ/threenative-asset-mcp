@@ -5,6 +5,7 @@ import { basename, dirname, join, normalize } from "node:path";
 import { chromium } from "playwright";
 import sharp from "sharp";
 
+import { createBrowserTempDir } from "../browser-temp.js";
 import { RigAssetError } from "./inspect.js";
 
 const require = createRequire(import.meta.url);
@@ -221,10 +222,13 @@ export async function renderPreview(
   const port = typeof address === "object" && address ? address.port : 0;
 
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  let temp: Awaited<ReturnType<typeof createBrowserTempDir>> | undefined;
   const pageErrors: string[] = [];
   try {
+    temp = await createBrowserTempDir();
     browser = await chromium.launch({
       headless: true,
+      env: { ...process.env, ...temp.env },
       args: ["--no-sandbox", "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
     });
     const page = await browser.newPage({
@@ -314,6 +318,7 @@ export async function renderPreview(
     );
   } finally {
     await browser?.close().catch(() => undefined);
+    await temp?.remove().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 }

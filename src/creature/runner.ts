@@ -26,6 +26,7 @@ import { basename, delimiter, dirname, extname, isAbsolute, join, relative, reso
 import { Uint8ArrayReader, Uint8ArrayWriter, ZipReader, type Entry, type FileEntry } from "@zip.js/zip.js";
 import { z } from "zod";
 
+import { browserTempEnvironment } from "../browser-temp.js";
 import type { CreatureConfig, CreatureLimits } from "../config.js";
 
 const CompilerSummarySchema = z
@@ -497,27 +498,36 @@ async function installedPackageRoot(packageName: string): Promise<string> {
 async function createJudgeHarness(payloadRoot: string): Promise<{
   readonly root: string;
   readonly scriptRoot: string;
+  readonly tmp: string;
   readonly cleanup: () => Promise<void>;
 }> {
   const temporary = await mkdtemp(join(tmpdir(), "threenative-creature-judge-"));
   const scriptRoot = join(temporary, "harness");
+  const tmp = join(temporary, "tmp");
   const threeBuild = join(temporary, "node_modules", "three", "build");
   const threeLoaders = join(temporary, "node_modules", "three", "examples", "jsm", "loaders");
-  await mkdir(scriptRoot, { recursive: true, mode: 0o700 });
-  await mkdir(threeBuild, { recursive: true, mode: 0o700 });
-  await mkdir(threeLoaders, { recursive: true, mode: 0o700 });
-  await copyFile(join(payloadRoot, "harness", "judge.mjs"), join(scriptRoot, "judge.mjs"));
-  await copyFile(join(payloadRoot, "harness", "pwlaunch.mjs"), join(scriptRoot, "pwlaunch.mjs"));
-  await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(scriptRoot, "assets-three-bundle.js"));
-  await mkdir(join(scriptRoot, "assets"), { recursive: true, mode: 0o700 });
-  await rename(join(scriptRoot, "assets-three-bundle.js"), join(scriptRoot, "assets", "three-bundle.js"));
-  await writeFile(join(threeBuild, "three.module.js"), `${THREE_BROWSER_MODULE}\n`, { mode: 0o600 });
-  await writeFile(join(threeLoaders, "GLTFLoader.js"), `${GLTF_LOADER_BROWSER_MODULE}\n`, { mode: 0o600 });
-  const playwrightRoot = await installedPackageRoot("playwright");
-  await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
+  try {
+    await mkdir(scriptRoot, { recursive: true, mode: 0o700 });
+    await mkdir(tmp, { recursive: true, mode: 0o700 });
+    await mkdir(threeBuild, { recursive: true, mode: 0o700 });
+    await mkdir(threeLoaders, { recursive: true, mode: 0o700 });
+    await copyFile(join(payloadRoot, "harness", "judge.mjs"), join(scriptRoot, "judge.mjs"));
+    await copyFile(join(payloadRoot, "harness", "pwlaunch.mjs"), join(scriptRoot, "pwlaunch.mjs"));
+    await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(scriptRoot, "assets-three-bundle.js"));
+    await mkdir(join(scriptRoot, "assets"), { recursive: true, mode: 0o700 });
+    await rename(join(scriptRoot, "assets-three-bundle.js"), join(scriptRoot, "assets", "three-bundle.js"));
+    await writeFile(join(threeBuild, "three.module.js"), `${THREE_BROWSER_MODULE}\n`, { mode: 0o600 });
+    await writeFile(join(threeLoaders, "GLTFLoader.js"), `${GLTF_LOADER_BROWSER_MODULE}\n`, { mode: 0o600 });
+    const playwrightRoot = await installedPackageRoot("playwright");
+    await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
+  } catch (error) {
+    await rm(temporary, { recursive: true, force: true });
+    throw error;
+  }
   return {
     root: temporary,
     scriptRoot,
+    tmp,
     cleanup: () => rm(temporary, { recursive: true, force: true }),
   };
 }
@@ -1286,6 +1296,7 @@ export class CreatureRunner {
         ],
         harness.root,
         signal,
+        browserTempEnvironment(harness.tmp),
       );
       if (signal.aborted) throw this.abortError(signal);
       return {
@@ -1880,10 +1891,11 @@ export class CreatureRunner {
     args: readonly string[],
     cwd: string,
     signal: AbortSignal,
+    extraEnvironment: NodeJS.ProcessEnv = {},
   ): Promise<ProcessResult> {
     const child = spawn(command, args, {
       cwd,
-      env: childEnvironment(),
+      env: { ...childEnvironment(), ...extraEnvironment },
       shell: false,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],

@@ -272,6 +272,8 @@ async function probeBrowser(): Promise<SafeResult> {
       headless: HEADLESS,
       locale: "en-US",
       serviceWorkers: "block",
+      // Chromium's temp files stay inside the profile directory removed below.
+      env: { ...process.env, TMPDIR: profilePath, TMP: profilePath, TEMP: profilePath } as Record<string, string>,
     });
     const page = await initializeAnonymousPage(context);
     const response = await sameOriginJson(page, SEARCH_PATH);

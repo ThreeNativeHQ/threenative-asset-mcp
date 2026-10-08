@@ -13,11 +13,16 @@ npm test                                    # builds first (pretest); runs every
 npx vitest run tests/mcp-smoke.test.ts      # packed-MCP smoke; CI runs it separately
 ```
 
-- **Run the suite the way it fails.** CI uses `--maxWorkers=1`, so parallel races and load
-  timeouts never show there. Locally, run with default workers. To check for temp leaks, run
-  with an isolated `TMPDIR` and look at what is left:
-  `TMPDIR=$(mktemp -d) npx vitest run`. Only `node-compile-cache` may remain; a 0-byte
-  `.org.chromium.Chromium.*` file is a known open leak (PRD-539), not something you introduced.
+- **Run the suite the way it fails.** The `verify` leg uses `--maxWorkers=1`; the `parallel` leg
+  runs default workers and the `leak-gate` leg fails on any temp leftover. Locally, run with
+  default workers. To check for temp leaks: `npm run test:leaks` (or
+  `TMPDIR=$(mktemp -d) npx vitest run` and look at what is left). Only `node-compile-cache` may
+  remain; every Chromium launch gets its own removed `TMPDIR` (`src/browser-temp.ts`), so a
+  `.org.chromium.Chromium.*` file is a regression.
+- **`npm run doctor`** lists missing prerequisites with their fix (`-- --toolchain` adds the
+  Unreal build packages). A test that needs an external tool declares it with
+  `describeWithTools` (`tests/helpers/require-tool.ts`): it skips locally and fails under
+  `CI=true`.
 - **This desktop is often loaded by other sessions** (load average 40–70 seen). A test that only
   fails under the full parallel suite is a timing bug in the test or the product, not noise.
   Reproduce it in isolation, find the window, then fix it deterministically.
@@ -55,8 +60,9 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   missing package; keep that mapping current rather than listing guesses.
 - The uncooked converter provisions a Python venv; the modern converter installs a private .NET SDK
   and publishes CUE4Parse. Neither needs root.
-- Nothing in CI provisions these from an empty cache yet (PRD-539 AC-4). Upstream archives change
-  without a commit here, so assume provisioning can break between runs.
+- The `Fresh toolchain` workflow provisions all four from an empty cache in `debian:13` (weekly,
+  and on changes to the provisioners). Upstream archives change without a commit here, so assume
+  provisioning can break between runs. FabCLI also needs `libwebkit2gtk-4.1-0` at runtime.
 
 ## Fab and Unreal imports
 

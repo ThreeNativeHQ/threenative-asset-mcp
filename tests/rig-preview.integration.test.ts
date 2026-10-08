@@ -5,9 +5,10 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { previewAvailable, renderPreview } from "../src/rig/preview.js";
+import { renderPreview } from "../src/rig/preview.js";
 import { createAssetAutoRigHandler, createAssetPreviewAnimationHandler } from "../src/tools/rig.js";
 import { unriggedBipedGlb, withArmSwing } from "./helpers/rig-fixture.js";
+import { describeWithTools } from "./helpers/require-tool.js";
 
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
@@ -37,8 +38,8 @@ async function call(
   return (await handler(input as never)) as unknown as HandlerResult;
 }
 
-describe("asset_preview_animation", () => {
-  it("renders a nonblank multi-angle sheet for a rigged model, or reports unavailable", async () => {
+describeWithTools(["chromium"], "asset_preview_animation", () => {
+  it("renders a nonblank multi-angle sheet for a rigged model", async () => {
     const directory = await temporaryDirectory();
     const target = join(directory, "retopo.glb");
     await writeFile(target, await unriggedBipedGlb());
@@ -63,21 +64,16 @@ describe("asset_preview_animation", () => {
     });
     expect(result.isError).toBeUndefined();
 
-    if (previewAvailable()) {
-      expect(result.structuredContent.status).toBe("rendered");
-      expect(result.structuredContent.backend).toContain("playwright-chromium");
-      const images = result.structuredContent.images as Array<{ nonBlank: boolean }>;
-      expect(images).toHaveLength(2);
-      expect(images.every((image) => image.nonBlank)).toBe(true);
-      expect(existsSync(output)).toBe(true);
-    } else {
-      expect(result.structuredContent.status).toBe("unavailable");
-      expect(result.structuredContent.reason).toContain("Chromium");
-    }
+    expect(result.structuredContent.status).toBe("rendered");
+    expect(result.structuredContent.backend).toContain("playwright-chromium");
+    const images = result.structuredContent.images as Array<{ nonBlank: boolean }>;
+    expect(images).toHaveLength(2);
+    expect(images.every((image) => image.nonBlank)).toBe(true);
+    expect(existsSync(output)).toBe(true);
   });
 });
 
-describe("asset_preview_animation deformation is visible in every tile", () => {
+describeWithTools(["chromium"], "asset_preview_animation deformation is visible in every tile", () => {
   async function riggedFixture(): Promise<Uint8Array> {
     const directory = await temporaryDirectory();
     const target = join(directory, "retopo.glb");
@@ -95,7 +91,6 @@ describe("asset_preview_animation deformation is visible in every tile", () => {
   const size = { width: 96, height: 96, timeoutMs: 120_000 };
 
   it("applies the pose override to every angle, not only the first", async () => {
-    if (!previewAvailable()) return;
     const rigged = await riggedFixture();
     const base = await renderPreview(rigged, { times: [0], angles: 3, ...size });
     const posed = await renderPreview(rigged, {
@@ -114,7 +109,6 @@ describe("asset_preview_animation deformation is visible in every tile", () => {
   }, 240_000);
 
   it("advances the clip in every angle, not only the first", async () => {
-    if (!previewAvailable()) return;
     const animated = await withArmSwing(await riggedFixture(), "upper_arm.L");
     const sheet = await renderPreview(animated, {
       clipName: "Swing",
@@ -132,7 +126,6 @@ describe("asset_preview_animation deformation is visible in every tile", () => {
   }, 240_000);
 
   it("refuses a pose naming a bone the model does not have", async () => {
-    if (!previewAvailable()) return;
     const rigged = await riggedFixture();
     await expect(
       renderPreview(rigged, {
