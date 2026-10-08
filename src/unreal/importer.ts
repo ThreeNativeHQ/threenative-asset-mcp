@@ -2123,7 +2123,7 @@ export async function importUnrealDirectory(
     })();
     sourceMaterialCache.set(key, pending); return pending;
   };
-  const sourceForMesh = (file: string): ((name: string, lookup: string) => Promise<SourceMaterial | undefined>) => async (_name, lookup) => {
+  const sourceForMeshUnguarded = (file: string): ((name: string, lookup: string) => Promise<SourceMaterial | undefined>) => async (_name, lookup) => {
     const location = sourceLocation(file); if (!location) return undefined;
     const mesh = await loadSourcePackage(location.namespace, location.path);
     const references = mesh.status === "decoded" ? [...new Set(mesh.imports.filter((ref) => (ref.className === "Material" || ref.className === "MaterialInstanceConstant") && ref.name === lookup && ref.path?.startsWith("/Game/")).map((ref) => ref.path!))] : [];
@@ -2140,6 +2140,25 @@ export async function importUnrealDirectory(
     const material = await sourceForFile(matches[0]!.file);
     return material ? { ...material, limitations: [...material.limitations, `Authored source material ${lookup}: unique source basename fallback used because an exact mesh material import was not recovered${mesh.status === "unsupported" ? ` (${mesh.reason})` : ""}; canonical mesh routing remains unresolved.`] } : undefined;
   };
+  // The authored-source reader only refines roughness/AO. A malformed, cyclic or oversized source
+  // package must never abort a mesh import: it degrades to "no authored source" plus a limitation
+  // on the section and one warning per import. This is the single boundary for every call site.
+  let unreadableSourceWarned = false;
+  const guardSource = async (read: () => Promise<SourceMaterial | undefined>): Promise<SourceMaterial | undefined> => {
+    try { return await read(); } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 160);
+      if (!unreadableSourceWarned) {
+        unreadableSourceWarned = true;
+        warnings.push(`Source material unreadable (${message}); authored roughness/AO not applied. Affected materials keep their prior reconstruction.`);
+      }
+      return { channels: {}, baseColorSamples: [], limitations: [`Source material unreadable (${message}); authored roughness/AO not applied`] };
+    }
+  };
+  const sourceForMesh = (file: string): ((name: string, lookup: string) => Promise<SourceMaterial | undefined>) => {
+    const read = sourceForMeshUnguarded(file);
+    return (name, lookup) => guardSource(() => read(name, lookup));
+  };
+  const sourceForLibraryFile = (file: string): Promise<SourceMaterial | undefined> => guardSource(() => sourceForFile(file));
   // PRD-538: colour textures that only a material function references were never exported with the mesh.
   // Export exactly one such package on demand, serially, into the import's own staging directory.
   let textureIndex: Map<string, string[]> | undefined;
@@ -3414,7 +3433,7 @@ export async function importUnrealDirectory(
           materialAssets: isolatedAssets,
           sourceMaterial: (name) => {
             const entry = materialEntries.find((e) => e.libraryName === name)?.entry;
-            return entry ? sourceForFile(entry.file) : undefined;
+            return entry ? sourceForLibraryFile(entry.file) : undefined;
           },
           graphBaker,
         });
