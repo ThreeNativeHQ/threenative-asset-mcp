@@ -111,4 +111,16 @@ describe("material instance overrides beat parent defaults", () => {
     );
     expect(resolved.bindings.find((b) => b.slot === "normal")).toMatchObject({ texture: "T_Wall_N", source: "mat" });
   });
+
+  it("keeps a default that another, un-overridden parameter still uses", () => {
+    const resolved = resolve(
+      {
+        MI_Wall: { mat: "Normal=T_Wall_Shared_N\n", props: instanceProps("M_Wall", [["NRM", "T_Wall_Own_N"]]) },
+        M_Wall: { mat: "Normal=T_Wall_Shared_N\n", props: masterProps([["NRM", "T_Wall_Shared_N"], ["Detail", "T_Wall_Shared_N"]]) },
+      },
+      "MI_Wall",
+      ["T_Wall_Shared_N", "T_Wall_Own_N"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "normal")).toMatchObject({ texture: "T_Wall_Shared_N", source: "mat" });
+  });
 });
