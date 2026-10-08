@@ -8,10 +8,10 @@
  * deleted after each pack unless --keep is given. Nothing from a pack is written under the repo.
  */
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, rmdirSync, statSync } from "node:fs";
 import { mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { loadavg, platform, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { FabCli } from "../src/fab/fabcli.js";
 import { dumpEngineArg } from "../src/fab/routes.js";
@@ -123,8 +123,13 @@ async function main(): Promise<number> {
     throw error;
   }
 
-  const realTmp = tmpdir();
   const downloadParent = fabDownloadRoot(process.env);
+  // Importer output and staging reach tens of GiB for the big packs, and /tmp is often a RAM-backed
+  // tmpfs (16 GB here): a sweep there fills it and every later pack fails with a disk-space error.
+  // The run scratch therefore lives beside the download root, on the same disk-backed volume.
+  const scratchRoot = process.env.THREENATIVE_PARITY_TMP ?? join(dirname(downloadParent), "parity-tmp");
+  mkdirSync(scratchRoot, { recursive: true });
+  const realTmp = scratchRoot;
   const runId = `${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}-${randomBytes(3).toString("hex")}`;
   const runRoot = join(downloadParent, `parity-${runId}`);
   // ALL scratch is run-scoped: every os.tmpdir() consumer (tn-parity-*, tn-property-dump-*, importer
@@ -190,6 +195,11 @@ async function main(): Promise<number> {
     await rm(runRoot, { recursive: true, force: true }).catch(() => {});
     await rm(unrealCache, { recursive: true, force: true }).catch(() => {});
     await rm(runTmp, { recursive: true, force: true }).catch(() => {});
+    try {
+      rmdirSync(scratchRoot); // only when empty: another sweep may share it
+    } catch {
+      /* not empty or already gone */
+    }
   };
   const leftovers = (): { downloads: number; cache: number; tmp: number; parityDirs: number } => {
     let parityDirs = 0;
