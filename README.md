@@ -465,6 +465,14 @@ preserving the previous encoder's decoded RGBA and PNG metadata. Untouched textu
 retain their original bytes; their profiles, bit depth, and metadata are not
 re-encoded for storage savings.
 
+Importer version 56 stops a colour parameter's zero alpha from becoming the base
+colour factor's opacity (a `Tint` of `A=0` clipped every pixel of a masked grass
+card, so the GLB drew nothing), binds a masked or translucent material's separate
+opacity map (`Opacity=` or an `Other` named `*_Opacity*`) as the base colour's alpha
+heuristically, and composes an opacity map of another resolution when the aspect
+ratio matches. A sweep sheet tile that renders nothing although Unreal has a
+thumbnail for it is recorded under the entry's `sheet.warnings`.
+
 Legacy instance sidecars without override flags retain inherited settings for
 ambiguous opaque, false, and zero defaults. Their non-default values retain the
 previous behavior; missing flags are reported as a material limitation.

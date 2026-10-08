@@ -121,6 +121,30 @@ export interface EntrySheet {
   readonly meanSimilarity?: number;
   /** Why the sheet could not be made; the pack is unaffected. */
   readonly error?: string;
+  /**
+   * Recorded warnings (they never change S1-S5): a tile the judge found blank although Unreal drew that piece
+   * (it has an editor thumbnail) means a model that renders as nothing and still scores PASS.
+   */
+  readonly warnings?: readonly string[];
+}
+
+/** The judge's reason for an empty render (`judgeRender`). */
+const BLANK_REASON = "blank: nothing drawn";
+
+/**
+ * Warnings for blank tiles. A blank tile beside an Unreal thumbnail is a model that cannot be seen at all, which the
+ * structural scorecard cannot tell (an invisible material still has textures and bindings). `thumbnailed` is how many
+ * tiles had a thumbnail; every tile of a sheet built with thumbnails has one.
+ */
+export function blankTileWarnings(
+  judge: readonly { readonly name: string; readonly reasons: readonly string[] }[],
+  thumbnailed: number,
+): string[] {
+  if (thumbnailed <= 0) return [];
+  const blank = judge.filter((tile) => tile.reasons.includes(BLANK_REASON));
+  if (blank.length === 0) return [];
+  const names = blank.slice(0, 5).map((tile) => tile.name).join(", ");
+  return [`blank-with-thumbnail: ${blank.length} of ${judge.length} sheet tiles rendered nothing although Unreal drew them (${names}${blank.length > 5 ? ", ..." : ""})`];
 }
 
 /** The proof half of an entry: what `proveTextures` and `crossDecodeProof` found, summarised. */
