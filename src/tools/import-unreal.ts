@@ -6,7 +6,7 @@ import { z } from "zod";
 
 import { FabClient } from "../fab/client.js";
 import { FabCli, FabCliError, preferredPlatform } from "../fab/fabcli.js";
-import { oldestEngine } from "../fab/routes.js";
+import { decoderRoute, oldestEngine } from "../fab/routes.js";
 import { classifyLicenses, type LicenseDecision } from "../fab/license.js";
 import { normalizeListing } from "../fab/normalize.js";
 import { ImportError, type ImportReport, importUnrealDirectory } from "../unreal/importer.js";
@@ -256,7 +256,7 @@ export const FabImportAssetInputSchema = z.object({
     .trim()
     .regex(/^UE_\d+\.\d+$/)
     .optional()
-    .describe("Unreal engine selector, for example UE_4.21. Required when the listing publishes several artifacts."),
+    .describe("Unreal engine selector, for example UE_4.21. When the listing publishes several artifacts and neither engine nor artifactId is given, the artifact with the best decoder route is chosen and the choice is reported in warnings."),
   artifactId: z
     .string()
     .trim()
@@ -555,12 +555,16 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
       await fabCli.requireAuthenticatedSession();
 
       const versions = await fabCli.unrealVersions(listingId);
-      const selected = FabCli.selectVersion(versions, input.engine, input.artifactId);
-      const extraWarnings: string[] = [];
+      const { version: selected, reason: choiceReason } = FabCli.selectVersion(
+        versions,
+        input.engine,
+        input.artifactId,
+      );
+      const extraWarnings: string[] = choiceReason === undefined ? [] : [choiceReason];
       // FabCLI filters by engine, not by artifact, so an explicit artifact is fetched through its
       // oldest engine, the one that names its package format.
       let engine = input.engine;
-      if (input.artifactId) {
+      if (input.artifactId || choiceReason !== undefined) {
         engine = oldestEngine(selected.engineVersions);
         if (input.engine && !selected.engineVersions.includes(input.engine)) {
           extraWarnings.push(
@@ -643,6 +647,20 @@ const OwnedListingSchema = z.object({
   distributionMethod: z.string().max(60),
   hasUnrealArtifact: z.boolean(),
   engineVersions: z.array(z.string().max(20)).max(60),
+  artifacts: z
+    .array(
+      z.object({
+        artifactId: z.string().max(200),
+        engineVersions: z.array(z.string().max(20)).max(60),
+        oldestEngine: z.string().max(20).optional(),
+        route: z.enum(["umodel", "mesh-description", "cue4parse"]).optional(),
+        targetPlatforms: z.array(z.string().max(60)).max(40),
+      }),
+    )
+    .max(60)
+    .describe(
+      "Each Unreal artifact separately. An artifact's format is its oldest listed engine, which picks the decoder route.",
+    ),
 });
 
 export const FabListOwnedInputSchema = z.object({
@@ -709,6 +727,15 @@ export function createFabListOwnedHandler(dependencies: ImportUnrealDependencies
           engineVersions: [
             ...new Set(entry.unrealArtifacts.flatMap((artifact) => artifact.engineVersions)),
           ],
+          artifacts: entry.unrealArtifacts.map((artifact) => {
+            const oldest = oldestEngine(artifact.engineVersions);
+            return {
+              artifactId: artifact.artifactId,
+              engineVersions: artifact.engineVersions,
+              ...(oldest === undefined ? {} : { oldestEngine: oldest, route: decoderRoute(oldest) }),
+              targetPlatforms: artifact.targetPlatforms,
+            };
+          }),
         }));
       const output = FabListOwnedOutputSchema.parse({
         listings: matched.slice(0, 500),

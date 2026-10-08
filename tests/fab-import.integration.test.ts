@@ -308,16 +308,56 @@ describe("Fab import safety", () => {
     ).toThrow(FabCliError);
   });
 
-  it("refuses to guess when a listing publishes several Unreal artifacts", () => {
-    expect(() =>
+  it("chooses by route preference when a listing publishes several Unreal artifacts", () => {
+    const chosen = FabCli.selectVersion(
+      [
+        { artifactId: "A", engineVersions: ["UE_4.18", "UE_5.4"], targetPlatforms: [] },
+        { artifactId: "B", engineVersions: ["UE_5.1", "UE_5.4"], targetPlatforms: [] },
+      ],
+      undefined,
+    );
+    expect(chosen.version.artifactId).toBe("B");
+    expect(chosen.reason).toBe(
+      "Chose artifact B (UE_5.1, cue4parse) over A (umodel) by route preference; pass artifactId or engine to override.",
+    );
+  });
+
+  it("breaks a route tie with the artifact whose oldest engine is newest", () => {
+    const chosen = FabCli.selectVersion(
+      [
+        { artifactId: "A", engineVersions: ["UE_5.0"], targetPlatforms: [] },
+        { artifactId: "B", engineVersions: ["UE_5.3", "UE_5.4"], targetPlatforms: [] },
+        { artifactId: "C", engineVersions: ["UE_4.26"], targetPlatforms: [] },
+      ],
+      undefined,
+    );
+    expect(chosen.version.artifactId).toBe("B");
+  });
+
+  it("never auto-picks an artifact that lists no engine, and refuses when none is usable", () => {
+    const empty = { artifactId: "E", engineVersions: [], targetPlatforms: [] };
+    expect(
       FabCli.selectVersion(
-        [
-          { artifactId: "A", engineVersions: ["UE_4.18"], targetPlatforms: [] },
-          { artifactId: "B", engineVersions: ["UE_5.4"], targetPlatforms: [] },
-        ],
+        [empty, { artifactId: "U", engineVersions: ["UE_4.18"], targetPlatforms: [] }],
         undefined,
-      ),
+      ).version.artifactId,
+    ).toBe("U");
+    expect(() =>
+      FabCli.selectVersion([empty, { ...empty, artifactId: "F" }], undefined),
     ).toThrow(/Pass engine to choose one/);
+  });
+
+  it("lets an explicit engine win over the route preference", () => {
+    const chosen = FabCli.selectVersion(
+      [
+        { artifactId: "A", engineVersions: ["UE_4.18"], targetPlatforms: [] },
+        { artifactId: "B", engineVersions: ["UE_5.4"], targetPlatforms: [] },
+      ],
+      "UE_4.18",
+    );
+    expect(chosen).toEqual({
+      version: { artifactId: "A", engineVersions: ["UE_4.18"], targetPlatforms: [] },
+    });
   });
 
   it("reports a listing with no Unreal artifact rather than importing nothing", async () => {
@@ -481,6 +521,53 @@ describe("Fab import safety", () => {
       expect(download?.[download.indexOf("--engine") + 1]).toBe("UE_5.0");
     });
 
+    it("without engine or artifactId picks the best route, downloads through it, and says so", async () => {
+      const test = await harness({ formats: OVERLAPPING });
+      const result = await test.handler({
+        listingIdOrUrl: LISTING,
+        outputDir: test.outputDir,
+        acceptFabEula: true,
+      });
+      if ("isError" in result) throw new Error(JSON.stringify(result));
+      const report = JSON.parse(
+        await readFile(join(test.outputDir, "import-report.json"), "utf8"),
+      ) as { warnings: string[] };
+      expect(report.warnings.join("\n")).toContain(
+        "Chose artifact PackNew (UE_5.0, cue4parse) over PackOld (umodel) by route preference; pass artifactId or engine to override.",
+      );
+      const download = (await test.invocations()).find((argv) => argv[0] === "download");
+      expect(download?.[download.indexOf("--engine") + 1]).toBe("UE_5.0");
+    });
+
+    it("an explicit engine still wins and reports no route choice", async () => {
+      const test = await harness({ formats: OVERLAPPING });
+      const result = await test.handler({
+        listingIdOrUrl: LISTING,
+        outputDir: test.outputDir,
+        engine: "UE_4.18",
+        acceptFabEula: true,
+      });
+      if ("isError" in result) throw new Error(JSON.stringify(result));
+      const report = JSON.parse(
+        await readFile(join(test.outputDir, "import-report.json"), "utf8"),
+      ) as { warnings: string[] };
+      expect(report.warnings.join("\n")).not.toMatch(/Chose artifact/);
+    });
+
+    it("a single-artifact listing carries no choice warning", async () => {
+      const test = await harness();
+      const result = await test.handler({
+        listingIdOrUrl: LISTING,
+        outputDir: test.outputDir,
+        acceptFabEula: true,
+      });
+      if ("isError" in result) throw new Error(JSON.stringify(result));
+      const report = JSON.parse(
+        await readFile(join(test.outputDir, "import-report.json"), "utf8"),
+      ) as { warnings: string[] };
+      expect(report.warnings.join("\n")).not.toMatch(/Chose artifact/);
+    });
+
     it("names the available artifacts when the id is absent", async () => {
       const test = await harness({ formats: OVERLAPPING });
       const result = await test.handler({
@@ -555,6 +642,37 @@ describe("listing what the account already owns", () => {
     const result = await handler({ unrealOnly: true });
     if ("isError" in result) throw new Error(JSON.stringify(errorOf(result)));
     expect(result.structuredContent.listings.map((entry) => entry.title)).toEqual(["Soul: Cave"]);
+  });
+
+  it("lists each artifact separately with its oldest engine and decoder route", async () => {
+    const library = {
+      results: [
+        {
+          title: "Two Builds",
+          description: "",
+          url: "",
+          distributionMethod: "ASSET_PACK",
+          customAttributes: [{ ListingIdentifier: LISTING }],
+          categories: [],
+          projectVersions: [
+            { artifactId: "Old", engineVersions: ["UE_4.18", "UE_5.4"], targetPlatforms: ["Windows"] },
+            { artifactId: "New", engineVersions: ["UE_5.1", "UE_5.4"], targetPlatforms: ["Windows", "Linux"] },
+            { artifactId: "Mid", engineVersions: ["UE_4.26"], targetPlatforms: [] },
+          ],
+        },
+      ],
+    };
+    const test = await harness({ library });
+    const handler = createFabListOwnedHandler({ environment: test.environment });
+    const result = await handler({ unrealOnly: true });
+    if ("isError" in result) throw new Error(JSON.stringify(errorOf(result)));
+    const [listing] = result.structuredContent.listings;
+    expect(listing?.engineVersions).toEqual(["UE_4.18", "UE_5.4", "UE_5.1", "UE_4.26"]);
+    expect(listing?.artifacts).toEqual([
+      { artifactId: "Old", engineVersions: ["UE_4.18", "UE_5.4"], oldestEngine: "UE_4.18", route: "umodel", targetPlatforms: ["Windows"] },
+      { artifactId: "New", engineVersions: ["UE_5.1", "UE_5.4"], oldestEngine: "UE_5.1", route: "cue4parse", targetPlatforms: ["Windows", "Linux"] },
+      { artifactId: "Mid", engineVersions: ["UE_4.26"], oldestEngine: "UE_4.26", route: "mesh-description", targetPlatforms: [] },
+    ]);
   });
 
   it("filters by title or category without touching the network again", async () => {
