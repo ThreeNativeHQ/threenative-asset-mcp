@@ -719,6 +719,12 @@ The suite needs Chromium (`npx playwright install --with-deps chromium`),
 ffmpeg and Python with NumPy/Pillow for local render/audio fixtures. Live probes
 remain separate from deterministic acceptance tests.
 
+Run `npm run doctor` to see which of these your host has. Each missing tool is
+listed with its install command. Locally, a suite whose tool is missing is
+skipped with that command as the reason. With `CI=true` it fails instead.
+Add `--toolchain` to also require what the Unreal importers need on a fresh
+Linux host, or `--toolchain-only` to check only that group.
+
 
 ```bash
 npm ci

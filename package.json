@@ -47,6 +47,7 @@
     "browser:install": "playwright install chromium",
     "pretest": "npm run build",
     "start": "node dist/index.js",
+    "doctor": "tsx scripts/doctor.ts",
     "probe:fab": "tsx scripts/probe-fab.ts",
     "test": "vitest run",
     "test:ci": "vitest run --maxWorkers=1 --exclude tests/mcp-smoke.test.ts --reporter=default --reporter=junit --outputFile=artifacts/ci/tests.xml",
