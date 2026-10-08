@@ -557,7 +557,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   let sawAlphaSource = false;
   let baseColorFactorValue: [number, number, number, number] | undefined;
   /** Base-colour tint parameters in chain order; a mask-qualified tint is the surface colour (below). */
-  const baseColourTints: { readonly key: string; readonly value: readonly [number, number, number, number]; readonly mask: boolean }[] = [];
+  const baseColourTints: { readonly key: string; readonly value: readonly [number, number, number, number]; readonly mask: boolean; readonly override: boolean }[] = [];
   let emissive: [number, number, number] | undefined;
   let metallic: number | undefined;
   let roughness: number | undefined;
@@ -679,13 +679,13 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
       for (const parameter of props.vectorOverrides) {
         const key = normalizedParameterName(parameter.name);
         if (isBaseColourTintOverride(key) && !baseColourTints.some((tint) => tint.key === key)) {
-          baseColourTints.push({ key, value: parameter.value, mask: key.includes("mask") });
+          baseColourTints.push({ key, value: parameter.value, mask: key.includes("mask"), override: true });
         }
       }
       for (const parameter of props.vectors) {
         const key = normalizedParameterName(parameter.name);
         if (BASE_COLOUR_KEYS.has(key) && !baseColourTints.some((tint) => tint.key === key)) {
-          baseColourTints.push({ key, value: parameter.value, mask: false });
+          baseColourTints.push({ key, value: parameter.value, mask: false, override: false });
         }
       }
       for (const parameter of [...props.vectorOverrides, ...props.vectors]) {
@@ -709,11 +709,12 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     current = props?.parent;
   }
 
-  // The mask tint is the surface colour only when the instance also overrides a global base
-  // multiplier; a lone mask tint leaves the albedo untinted. Otherwise the nearest global tint.
-  const globalTint = baseColourTints.find((tint) => !tint.mask);
-  const maskTint = baseColourTints.find((tint) => tint.mask);
-  const chosenTint = globalTint && maskTint ? maskTint : globalTint;
+  // The mask tint is the surface colour only when the instance ITSELF overrides both a global base
+  // multiplier and a mask colour. A master's default global tint does not count: an instance that
+  // overrides only a mask tint (Old West's MI_Curtain_03a) keeps the nearest global tint, if any.
+  const maskOverride = baseColourTints.find((tint) => tint.mask && tint.override);
+  const globalOverride = baseColourTints.find((tint) => !tint.mask && tint.override);
+  const chosenTint = globalOverride && maskOverride ? maskOverride : baseColourTints.find((tint) => !tint.mask);
   if (chosenTint) {
     const value = chosenTint.value;
     baseColorFactorValue = [clamp01(value[0]), clamp01(value[1]), clamp01(value[2]), clamp01(value[3])];

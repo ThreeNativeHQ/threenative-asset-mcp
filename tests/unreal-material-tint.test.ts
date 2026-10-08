@@ -122,4 +122,28 @@ describe("an instance's tint vector reaches the base-colour factor", () => {
     );
     expect(pair.baseColorFactor).toEqual([0.15, 0.17, 0.22, 1]);
   });
+
+  it("does not let a master's default global tint promote a lone mask-tint override", () => {
+    // Old West's MI_Curtain_03a overrides only `Base Color Tint (Mask)`; the master's own default
+    // `Color` (white) is not an override, so the nearest global tint (white) stays the factor and
+    // the albedo is not painted with the mask colour (SM_Curtains_03c fell from 0.53 to 0.13).
+    const resolved = resolve(
+      {
+        MI_Cloth: {
+          mat: "Diffuse=T_Cloth_ALB\n",
+          props: instanceProps("MM_Master", [["Base Color Tint (Mask)", [0.42, 0.33, 0.29, 1]]]),
+        },
+        MM_Master: {
+          mat: "Diffuse=T_Fill_ALB\n",
+          props: masterProps([
+            ["Color", [1, 1, 1, 1]],
+            ["Base Color Tint (Mask)", [1, 0, 0, 1]],
+          ]),
+        },
+      },
+      "MI_Cloth",
+      ["T_Cloth_ALB", "T_Fill_ALB"],
+    );
+    expect(resolved.baseColorFactor).toEqual([1, 1, 1, 1]);
+  });
 });
