@@ -76,9 +76,10 @@ it("fails a render where the report expects colour but it is neutral", () => {
   expect(judgeRender(grey, { expectColoured: true, colourSimilarity: 0.1 }).verdict).toBe("fail");
 });
 
-it("a thumbnail never excuses a white render", () => {
+it("only a strong thumbnail agreement excuses a white render", () => {
   const white = tile(60, () => [250, 250, 250]);
-  expect(judgeRender(white, { expectColoured: true, colourSimilarity: 0.9 }).verdict).toBe("fail");
+  expect(judgeRender(white, { expectColoured: true, colourSimilarity: 0.4 }).verdict).toBe("fail");
+  expect(judgeRender(white, { expectColoured: true, colourSimilarity: 0.9 }).reasons.join()).not.toMatch(/report claims/);
 });
 
 it("flags specks: fail below 0.2% of the tile, suspect below the tiny threshold", () => {

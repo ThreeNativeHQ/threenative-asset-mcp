@@ -2,6 +2,8 @@ import type { RgbaImage } from "./image-diff.js";
 
 /** A thumbnail present and colour similarity below this makes the verdict `suspect`. */
 export const SUSPECT_COLOUR_SIMILARITY = 0.35;
+/** At or above this similarity Unreal's own thumbnail has the same colour, so white or neutral is real (a white floor panel). */
+export const STRONG_COLOUR_AGREEMENT = 0.6;
 /** An object covering less of the tile than this is a speck, not a render of the piece. */
 export const MIN_OBJECT_COVERAGE_FRACTION = 0.002;
 /** Share of object pixels that must be near-white (all channels above 235) to call a render white. */
@@ -138,13 +140,13 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
   if (isWhite) raise("suspect", `white: ${(stats.nearWhiteFraction * 100).toFixed(0)}% of object pixels are near-white`);
   else if (isGhost) raise("suspect", "ghost: uniform grey object with no shading, pale or close to the background");
   else if (isWashedOut) raise("suspect", "washed out: near-neutral and very bright");
-  // A merely neutral render (grey stone, a dark mesh) is real colour when Unreal's own thumbnail
-  // agrees with it; white, ghost and washed-out renders fail regardless of the thumbnail.
-  const neutralAgreesWithThumbnail =
-    !(isWhite || isGhost || isWashedOut) &&
+  // A neutral render (grey stone, a dark mesh) is real colour when Unreal's own thumbnail agrees with
+  // it; a white, ghost or washed-out render is excused only by strong agreement (a white panel whose
+  // thumbnail is white too), never by a mere pass of the suspect threshold.
+  const agrees =
     options.colourSimilarity !== undefined &&
-    options.colourSimilarity >= SUSPECT_COLOUR_SIMILARITY;
-  if (options.expectColoured === true && (isWhite || isGhost || isWashedOut || isNeutral) && !neutralAgreesWithThumbnail) {
+    options.colourSimilarity >= (isWhite || isGhost || isWashedOut ? STRONG_COLOUR_AGREEMENT : SUSPECT_COLOUR_SIMILARITY);
+  if (options.expectColoured === true && (isWhite || isGhost || isWashedOut || isNeutral) && !agrees) {
     raise("fail", "report claims coloured sections but render is white/neutral");
   }
   if (options.colourSimilarity !== undefined && options.colourSimilarity < SUSPECT_COLOUR_SIMILARITY) {
