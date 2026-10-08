@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -603,10 +603,16 @@ console.log("ready " + child.pid);
 setInterval(() => {}, 1000);
 `,
     );
+    // tsx keeps its own cache under TMPDIR (tsx-<uid>); give the child a private one, removed with the test,
+    // so the leak gate sees nothing left behind.
+    const tsxTmp = mkdtempSync(join(tmpdir(), "tsx-child-"));
+    onTestFinished(() => {
+      rmSync(tsxTmp, { recursive: true, force: true });
+    });
     const holder = spawn(
       process.execPath,
       ["--import", pathToFileURL(createRequireResolve("tsx/esm")).href, script, lockPath, runTmp, runRoot, cache],
-      { stdio: ["ignore", "pipe", "inherit"] },
+      { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, TMPDIR: tsxTmp } },
     );
     onTestFinished(() => {
       holder.kill("SIGKILL");
