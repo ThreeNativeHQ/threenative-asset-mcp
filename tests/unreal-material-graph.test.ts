@@ -2,6 +2,7 @@ import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
 import {
+  MATERIAL_ATTRIBUTE_GUIDS,
   bakeGraph,
   graphPathClasses,
   supportedEngineFunctions,
@@ -995,5 +996,184 @@ describe("named reroutes", () => {
     );
     const result = await bake(graph);
     expect(result.status).not.toBe("baked");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Real SetMaterialAttributes / GetMaterialAttributes shape: pins are generic `Inputs[i]` and the attribute each
+// carries is `attributeTypes[i - 1]` (hand-written from the Hornbeam MA_Foliage dump; no pack bytes).
+
+describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, QualitySwitch, ShadingModel", () => {
+  const G = MATERIAL_ATTRIBUTE_GUIDS;
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  const breakBaseColor = (source: string): Raw =>
+    node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: ["BaseColor", "Metallic"] });
+  const makeColour = (id: string, colour: string): Raw => node(id, "MakeMaterialAttributes", { inputs: { BaseColor: pin(colour, 0, RGB_MASK) } });
+  const reroute = (id: string, source: Raw): Raw => node(id, "Reroute", { inputs: { Input: source } });
+  const set = (inputs: Raw, attributeTypes: string[]): Raw => node("set", "SetMaterialAttributes", { inputs, attributeTypes });
+  // Texel (x, y) of a 2x2 sRGB texture; the 2x2 bake samples each texel centre exactly.
+  const bark: Rgb[][] = [
+    [[200, 100, 50], [10, 220, 30]],
+    [[255, 255, 255], [64, 128, 192]],
+  ];
+  const barkTexture = async (): Promise<Record<string, Fixture>> => ({ T_Bark: { png: await pngOf(2, 2, (x, y) => bark[y]![x]!), srgb: true } });
+  const tint: Rgb = [0.5, 1, 0.25];
+  const expectedBark = (x: number, y: number): number[] => bark[y]![x]!.map((byte, index) => encode(decode(byte) * tint[index]!));
+
+  it("takes BaseColor from the pin typed with the BaseColor guid, not from a guessed name or position", async () => {
+    // n2/n3 shape: Inputs[0] unwired, Inputs[1] BaseColor <- Reroute(Multiply(texture, tint)), Inputs[2] unknown attribute, Inputs[3] ShadingModel.
+    const graph = makeGraph(
+      [
+        breakBaseColor("set"),
+        set(
+          { "Inputs[0]": null, "Inputs[1]": pin("rr"), "Inputs[2]": pin("time"), "Inputs[3]": pin("rrShading") },
+          [G.BaseColor, "E8EBD0ADB1654CBEB079C3A8B39B9F15", G.ShadingModel],
+        ),
+        reroute("rr", pin("mul", 0, RGB_MASK)),
+        multiply("mul", pin("tex", 0, RGB_MASK), pin("tint")),
+        textureSample("tex", "T_Bark"),
+        constant3("tint", tint),
+        node("time", "Time"),
+        reroute("rrShading", pin("shading")),
+        node("shading", "ShadingModel"),
+      ],
+      pin("break", 0, RGB_MASK),
+    );
+    const result = await bake(graph, await barkTexture());
+    const pixel = await pixelsOf(result);
+    for (const [x, y] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) expect(pixel(x, y)).toEqual(expectedBark(x, y));
+    if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [], texturesUsed: ["T_Bark"] });
+  });
+
+  it("the BaseColor pin overrides the incoming attributes, wherever it sits among the pins", async () => {
+    const graph = makeGraph(
+      [
+        breakBaseColor("set"),
+        set({ "Inputs[0]": pin("make"), "Inputs[1]": pin("c"), "Inputs[2]": pin("c"), "Inputs[3]": pin("over", 0, RGB_MASK) }, [G.Roughness, G.Normal, G.BaseColor]),
+        makeColour("make", "c"),
+        constant3("c", [0.25, 0.5, 0.75]),
+        constant3("over", [0.5, 0.125, 1]),
+      ],
+      pin("break", 0, RGB_MASK),
+    );
+    expect((await pixelsOf(await bake(graph)))(0, 0)).toEqual([encode(0.5), encode(0.125), 255]);
+  });
+
+  it("an unwired BaseColor pin keeps the incoming BaseColor", async () => {
+    const graph = makeGraph(
+      [breakBaseColor("set"), set({ "Inputs[0]": pin("make"), "Inputs[1]": null, "Inputs[2]": pin("c") }, [G.BaseColor, G.Roughness]), makeColour("make", "c"), constant3("c", [0.25, 0.5, 0.75])],
+      pin("break", 0, RGB_MASK),
+    );
+    expect((await pixelsOf(await bake(graph)))(1, 1)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+  });
+
+  it("an unsupported node that feeds only a non-BaseColor pin does not block, and is not even visited", async () => {
+    const graph = makeGraph(
+      [
+        breakBaseColor("set"),
+        set(
+          { "Inputs[0]": pin("make"), "Inputs[1]": pin("wpo"), "Inputs[2]": pin("normal"), "Inputs[3]": pin("shading") },
+          [G.WorldPositionOffset, G.Normal, G.ShadingModel],
+        ),
+        makeColour("make", "c"),
+        constant3("c", [0.25, 0.5, 0.75]),
+        node("wpo", "RotateAboutAxis"),
+        node("normal", "VertexNormalWS"),
+        node("shading", "Fresnel"),
+      ],
+      pin("break", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    expect(graphPathClasses(graph, "baseColor")).toEqual(["BreakMaterialAttributes", "Constant3Vector", "MakeMaterialAttributes", "SetMaterialAttributes"]);
+  });
+
+  it("an unsupported node on the BaseColor pin or the incoming attributes still blocks", async () => {
+    const onColour = makeGraph(
+      [breakBaseColor("set"), set({ "Inputs[0]": pin("make"), "Inputs[1]": pin("bad") }, [G.BaseColor]), makeColour("make", "c"), constant3("c", [1, 1, 1]), node("bad", "Fresnel")],
+      pin("break", 0, RGB_MASK),
+    );
+    expect(await bake(onColour)).toMatchObject({ status: "unsupported", unsupported: ["Fresnel"] });
+    const onIncoming = makeGraph(
+      [breakBaseColor("set"), set({ "Inputs[0]": pin("bad"), "Inputs[1]": pin("c") }, [G.Roughness]), constant3("c", [1, 1, 1]), node("bad", "Fresnel")],
+      pin("break", 0, RGB_MASK),
+    );
+    expect(await bake(onIncoming)).toMatchObject({ status: "unsupported", unsupported: ["Fresnel"] });
+  });
+
+  it("falls back to by-name matching when the dump carries no attributeTypes", async () => {
+    const graph = makeGraph(
+      [breakBaseColor("set"), node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Base Color": pin("over", 0, RGB_MASK) } }), makeColour("make", "c"), constant3("c", [0.25, 0.5, 0.75]), constant3("over", [0.5, 0.125, 1])],
+      pin("break", 0, RGB_MASK),
+    );
+    expect((await pixelsOf(await bake(graph)))(0, 0)).toEqual([encode(0.5), encode(0.125), 255]);
+  });
+
+  it("GetMaterialAttributes reads only the output it is asked for", async () => {
+    // outputNames[0] is the attribute pass-through; attributeTypes[k - 1] types output k.
+    const get = (id: string, source: string): Raw =>
+      node(id, "GetMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: ["MaterialAttributes", "BaseColor", "Normal"], attributeTypes: [G.BaseColor, G.Normal] });
+    const nodes = (): Raw[] => [get("get", "make"), makeColour("make", "c"), constant3("c", [0.25, 0.5, 0.75])];
+    const colour = await bake(makeGraph(nodes(), pin("get", 1, RGB_MASK)));
+    expect((await pixelsOf(colour))(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    const passthrough = makeGraph([breakBaseColor("get"), get("get", "make"), makeColour("make", "c"), constant3("c", [0.25, 0.5, 0.75])], pin("break", 0, RGB_MASK));
+    expect((await pixelsOf(await bake(passthrough)))(1, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    const normal = await bake(makeGraph(nodes(), pin("get", 2, RGB_MASK)));
+    expect(normal).toMatchObject({ status: "unsupported", unsupported: ["GetMaterialAttributes.Normal"] });
+  });
+
+  it("BreakMaterialAttributes does not walk its input for an attribute that is not BaseColor", async () => {
+    const graph = makeGraph(
+      [node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("bad") }, outputNames: ["BaseColor", "Metallic"] }), node("bad", "Fresnel")],
+      pin("break", 1, RGB_MASK),
+    );
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Metallic"] });
+  });
+
+  it("Reroute is an exact pass-through of Input", async () => {
+    const result = await bake(makeGraph([reroute("a", pin("b")), reroute("b", pin("c", 0, RGB_MASK)), constant3("c", [0.25, 0.5, 0.75])], pin("a", 0, RGB_MASK)));
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+    expect(await bake(makeGraph([node("a", "Reroute")], pin("a", 0, RGB_MASK)))).toMatchObject({ status: "unavailable" });
+  });
+
+  it("QualitySwitch takes Default exactly and never visits the quality slots", async () => {
+    const graph = makeGraph(
+      [
+        node("q", "QualitySwitch", { inputs: { Default: pin("hi", 0, RGB_MASK), "Inputs[0]": pin("bad"), "Inputs[1]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }),
+        constant3("hi", [0.25, 0.5, 0.75]),
+        constant3("lo", [1, 0, 0]),
+        node("bad", "Fresnel"),
+      ],
+      pin("q", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+    expect(await bake(makeGraph([node("q", "QualitySwitch")], pin("q", 0, RGB_MASK)))).toMatchObject({ status: "unavailable" });
+  });
+
+  it("ShadingModel is a supported constant", async () => {
+    const result = await bake(makeGraph([node("s", "ShadingModel")], pin("s")));
+    expect(result.status).toBe("baked");
+    expect(supportedNodeClasses()).toEqual(expect.arrayContaining(["Reroute", "QualitySwitch", "ShadingModel", "GetMaterialAttributes"]));
+  });
+
+  it("DitherTemporalAA and FlattenNormal pass Input0 through as heuristics with named approximations", async () => {
+    const cases: [string, string][] = [
+      ["DitherTemporalAA", "DitherTemporalAA: dithering ignored; engine body unavailable"],
+      ["FlattenNormal", "FlattenNormal: normal-only function; BaseColor path unaffected (engine body unavailable)"],
+    ];
+    for (const [name, note] of cases) {
+      const graph = makeGraph(
+        [engineCall("f", name, { Input0: pin("c", 0, RGB_MASK), Input1: pin("bad") }), constant3("c", [0.25, 0.5, 0.75]), node("bad", "Fresnel")],
+        pin("f", 0, RGB_MASK),
+      );
+      const result = await bake(graph);
+      expect((await pixelsOf(result))(0, 0), name).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+      if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [note] });
+      expect(supportedEngineFunctions()).toContain(name);
+    }
   });
 });

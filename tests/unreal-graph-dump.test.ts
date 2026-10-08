@@ -128,9 +128,22 @@ describe("--dump-graphs converter mode", () => {
   it("is wired into the embedded program and the converter version is bumped", () => {
     expect(CUE4PARSE_PROGRAM).toContain("--dump-graphs");
     expect(CUE4PARSE_PROGRAM).toContain(".graph.json");
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.54");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.55");
     // The embedded program prints the same string `canRun` waits for, so a stale binary is rebuilt.
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
+  });
+
+  it("emits and accepts the attribute GUIDs of Set/GetMaterialAttributes", () => {
+    expect(CUE4PARSE_PROGRAM).toContain('"AttributeSetTypes" or "AttributeGetTypes"');
+    expect(CUE4PARSE_PROGRAM).toContain('node["attributeTypes"]');
+    const graph = materialGraphSchema.parse({
+      ...functionCallGraph(),
+      nodes: [
+        { id: "n0", class: "SetMaterialAttributes", inputs: { "Inputs[0]": null, "Inputs[1]": null }, constants: {}, attributeTypes: ["69B8D33616ED4D499AA497292F050F7A"] },
+        { id: "n1", class: "GetMaterialAttributes", inputs: {}, constants: {}, outputNames: ["MaterialAttributes", "Normal"], attributeTypes: ["0FA2821A200F4A4AB719B789C1259C64"] },
+      ],
+    });
+    expect(graph.nodes.map((node) => node.attributeTypes)).toEqual([["69B8D33616ED4D499AA497292F050F7A"], ["0FA2821A200F4A4AB719B789C1259C64"]]);
   });
 
   it("accepts a graph shaped like the Cave Rock master and keeps all four tint parameters reachable", () => {

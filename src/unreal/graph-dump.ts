@@ -53,6 +53,11 @@ export const graphNodeSchema = z
     switchValue: z.boolean().optional(),
     fn: functionSchema.optional(),
     outputNames: z.array(z.string()).optional(),
+    /**
+     * `SetMaterialAttributes`: attribute GUIDs, pin `Inputs[i]` carries `attributeTypes[i-1]` (`Inputs[0]` is the incoming attributes).
+     * `GetMaterialAttributes`: attribute GUIDs, output `i` is `attributeTypes[i]`.
+     */
+    attributeTypes: z.array(z.string()).optional(),
     error: z.string().optional(),
   })
   .strict();
