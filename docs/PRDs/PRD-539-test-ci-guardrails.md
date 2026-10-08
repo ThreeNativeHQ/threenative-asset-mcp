@@ -66,6 +66,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 
 - Required status checks on `main` — unblocked by João enabling branch protection or a ruleset on
   `jonit-dev/threenative-asset-mcp` (repository settings are the owner's call).
+- CI evidence for AC-2, AC-4 and AC-7 — unblocked by João approving throwaway branches `proof/539-green`, `proof/539-leak` and `proof/539-fabcli-revert` with draft PRs into `main` (the new legs only trigger on PRs into `main`, and #24 is not merged yet). Auto mode denied creating them. `proof/539-leak` adds a test that leaks a temp dir; `proof/539-fabcli-revert` swaps `findArchiveEntry` back to the root-layout path.
 - Committing pack-derived metadata (AC-6) — unblocked by João confirming that material and texture
   *names* from owned Fab packs may live in this public repository. The fallback is a private
   fixture repo or local-only replay.
@@ -93,6 +94,8 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 - 2026-10-07 (Claude): CI's `pull_request` trigger only covers PRs into `main`, so this PR (based on
   `fix/fresh-host-tests-and-import-prds`) proves its legs with `workflow_dispatch` runs on the branch.
 
+- 2026-10-07 (Claude): FabCLI needs `libwebkit2gtk-4.1.so.0` on Debian 13. The provisioner reports it only as "does not run on this host"; naming the package there belongs with PRD-537 AC-1, so this PRD only adds it to the CI install list and `doctor`.
+
 ## Execution Phases
 
 #### Phase 1: The suite is deterministic and strict about its tools
@@ -100,8 +103,8 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 **Files:** `src/audio/generate.ts`, `src/creature/runner.ts`, `vitest.config.ts`, `tests/helpers/require-tool.ts` (new), the audio/creature-preview test files, `.github/workflows/ci.yml` (`parallel` and `leak-gate` legs).
 **Implementation:** Landed so far: the fixes marked **Fixed** in Context. Remaining: `require-tool.ts` and its use in `audio-generation`, `audio-inspection` and `creature-preview`; a private, removed `TMPDIR` for every Chromium launch (`src/creature/preview.ts`, `src/fab/browser-transport.ts`); the two CI legs.
 - [x] AC-1 [local]: The full suite passes with default parallel workers on a loaded host. proof: `TMPDIR=<empty dir> npx vitest run --exclude tests/mcp-smoke.test.ts` — 48 files passed, 1 skipped; 455 tests passed, 2 skipped, 0 failed at load average 41→28. Final run including smoke: `TMPDIR=<empty dir> npx vitest run` — 49 files passed, 1 skipped; 473 passed, 2 skipped, 0 failed. Leftovers: `node-compile-cache`, plus one Chromium shm file in the final run (tracked under AC-7). 2026-10-07.
-- [ ] AC-2 [shared]: CI's `parallel` leg (default workers) runs on every PR. proof: CI run link — Evidence: pending.
-- [ ] AC-7 [shared]: CI's `leak-gate` leg fails on a deliberately leaking test in a throwaway branch. proof: CI run link (red on the throwaway, green on the PR) — Evidence: pending.
+- [ ] AC-2 [shared]: CI's `parallel` leg (default workers) runs on every PR. proof: CI run link — Evidence: pending. Written (`suite` job, `parallel` leg, `ci.yml`). Same command locally: `npx vitest run` at load ~30 — 51 files passed, 1 skipped; 480 tests passed, 2 skipped. Open until a run on a PR into `main` is green.
+- [ ] AC-7 [shared]: CI's `leak-gate` leg fails on a deliberately leaking test in a throwaway branch. proof: CI run link (red on the throwaway, green on the PR) — Evidence: pending. Written (`suite` job, `leak-gate` leg; `scripts/leak-gate.ts`). Locally: `npm run test:leaks` over the full suite — `leak-gate: clean`, which includes the Chromium paths; a child that `mkdtemp`s without cleanup exits 1 and lists `leak-*`. Open until the CI red/green runs exist.
 - [x] Every Chromium launch gets a private `TMPDIR` that is removed after the browser exits or fails to launch (creature probe and harnesses, claims judge, rig preview, Fab transport). proof: `npx vitest run tests/browser-temp.test.ts` — 3/3 pass; the fake-Chromium test goes red with the launch `env` removed (`expected '<tmp>' to be '<tmp>/threenative-browser-…'`). Commit 779b81e. 2026-10-07.
 - [x] AC-3 [local]: With ffmpeg hidden from `PATH`, the tool guard skips the audio suites with the install command as its reason, but fails them under `CI=true`. proof: `PATH=<without ffmpeg> npx vitest run tests/audio-*.test.ts`, with `CI` unset vs `CI=true` — CI unset: 44 skipped, titles `… [skipped: ffmpeg not found; install it with: sudo apt-get install --yes ffmpeg]`; `CI=true`: 2 failed (one `has its required tools` per file) with that reason. Helper `tests/helpers/require-tool.ts`, also on rig and creature preview (`chromium`, `python-imaging`). 2026-10-07.
 
@@ -110,7 +113,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 #### Phase 2: A fresh host is tested, and diagnosable
 **Status:** NOT STARTED
 **Files:** `scripts/doctor.ts` (new), `package.json` (`doctor`), `.github/workflows/ci.yml` (`fresh-toolchain` job + schedule), `README.md` (Verification).
-- [ ] AC-4 [shared]: The `fresh-toolchain` job provisions all four Unreal-side tools in `debian:13` from an empty cache. It goes red on a throwaway branch that reverts the PRD-537 `findArchiveEntry` fix (the pinned FabCLI release nests its binary). proof: CI run links (green on the branch, red on the revert) — Evidence: pending.
+- [ ] AC-4 [shared]: The `fresh-toolchain` job provisions all four Unreal-side tools in `debian:13` from an empty cache. It goes red on a throwaway branch that reverts the PRD-537 `findArchiveEntry` fix (the pinned FabCLI release nests its binary). proof: CI run links (green on the branch, red on the revert) — Evidence: pending. Written (`.github/workflows/fresh-toolchain.yml`, `scripts/provision-toolchain.ts`). Locally in `debian:13` amd64 with the workflow's exact apt list and an empty cache: fabcli 0.1.0 0.7s, umodel 22.8s, uncooked 4.27.2.0+threenative.7 7.1s, modern b4e95441+threenative.50 40.1s, exit 0. The first run failed on FabCLI: `libwebkit2gtk-4.1.so.0` missing; fixed in the apt list and `doctor`. Open until CI runs exist.
 - [x] AC-5 [local]: `npm run doctor` lists every prerequisite as ok/missing with its fix, exiting non-zero when one is missing. proof: run with vs without `ffmpeg` on `PATH` — exit 0 with it; exit 1 without, printing `missing ffmpeg … fix: sudo apt-get install --yes ffmpeg` (and ffprobe). `--toolchain` makes the Unreal build prerequisites required; `--toolchain-only` checks only those (used in the `debian:13` job). `tests/doctor.test.ts`. 2026-10-07.
 
 **Verification:** the boxes above.
