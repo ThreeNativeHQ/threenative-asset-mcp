@@ -5,6 +5,7 @@ node_modules/
 dist/
 coverage/
 artifacts/ci/
+artifacts/parity/
 *.tsbuildinfo
 outputs/*.tgz
 
