@@ -325,7 +325,7 @@ export async function provisionFabcli(
     if (isWindows) await extractZip(archive, unpacked);
     else await extractTarGz(archive, unpacked);
     // Release archives wrap the binary in a `fabcli-<tag>-<platform>/` folder; older ones did not.
-    const candidate = await findArchiveEntry(unpacked, isWindows ? "fabcli.exe" : "fabcli");
+    const candidate = join(unpacked, isWindows ? "fabcli.exe" : "fabcli");
     if (candidate) await chmod(candidate, 0o755).catch(() => {});
     if (!candidate || !(await canRun(candidate, ["--version"], /fabcli/i))) {
       throw new ToolchainError(
