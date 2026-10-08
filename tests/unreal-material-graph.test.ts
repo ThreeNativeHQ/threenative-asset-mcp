@@ -824,6 +824,71 @@ describe("SetMaterialAttributes, PivotPainter2FoliageShader, Blend_Overlay and C
   });
 });
 
+describe("HueShift", () => {
+  const NOTE = "HueShift: engine body unavailable; hue rotated by Input1 as a fraction of a turn";
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  const shifted = (colour: [number, number, number], shift: number | null) =>
+    bake(
+      makeGraph(
+        [
+          engineCall("h", "HueShift", { Input0: pin("c", 0, RGB_MASK), ...(shift === null ? {} : { Input1: pin("s") }) }),
+          constant3("c", colour),
+          node("s", "Constant", { constants: { R: shift ?? 0 } }),
+        ],
+        pin("h", 0, RGB_MASK),
+      ),
+    );
+
+  it("is an exact passthrough, with no approximation, for a zero or unwired shift", async () => {
+    for (const shift of [0, null]) {
+      const result = await shifted([0.5, 0.25, 0.125], shift);
+      expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.5), encode(0.25), encode(0.125)]);
+      if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+    }
+  });
+
+  it("rotates hue by a fraction of a turn: red -> green at 1/3, cyan at 1/2, blue at -1/3", async () => {
+    const third = await shifted([1, 0, 0], 1 / 3);
+    expect((await pixelsOf(third))(0, 0)).toEqual([0, 255, 0]);
+    if (third.status === "baked") expect(third).toMatchObject({ confidence: "heuristic", approximations: [NOTE] });
+    expect((await pixelsOf(await shifted([1, 0, 0], 0.5)))(1, 1)).toEqual([0, 255, 255]);
+    expect((await pixelsOf(await shifted([1, 0, 0], -1 / 3)))(0, 1)).toEqual([0, 0, 255]);
+    // Saturation and value are kept: (0.5, 0.25, 0.25) is hue 0, S 0.5, V 0.5 -> hue 120 = (0.25, 0.5, 0.25).
+    expect((await pixelsOf(await shifted([0.5, 0.25, 0.25], 1 / 3)))(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.25)]);
+    // A grey has no hue to rotate.
+    expect((await pixelsOf(await shifted([0.4, 0.4, 0.4], 0.3)))(0, 0)).toEqual([encode(0.4), encode(0.4), encode(0.4)]);
+  });
+
+  it("wraps a whole turn back to the identity", async () => {
+    for (const shift of [1, 2, -1]) {
+      expect((await pixelsOf(await shifted([0.5, 0.25, 0.125], shift)))(0, 0)).toEqual([encode(0.5), encode(0.25), encode(0.125)]);
+    }
+  });
+
+  it("works inside Multiply(HueShift(texture, constant), tint) and records the approximation once", async () => {
+    // Texel (255, 0, 0) is linear red; a third of a turn makes it green, and the 0.5 tint gives linear 0.5 = byte 188.
+    const graph = makeGraph(
+      [
+        multiply("out", pin("h", 0, RGB_MASK), pin("tint")),
+        engineCall("h", "HueShift", { Input0: pin("t", 0, RGB_MASK), Input1: pin("s") }),
+        textureSample("t", "T_Red"),
+        node("s", "Constant", { constants: { R: 1 / 3 } }),
+        constant3("tint", [0.5, 0.5, 0.5]),
+      ],
+      pin("out"),
+    );
+    const result = await bake(graph, { T_Red: { png: await flat([255, 0, 0])(), srgb: true } });
+    expect((await pixelsOf(result))(1, 0)).toEqual([0, encode(0.5), 0]);
+    if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [NOTE] });
+  });
+
+  it("is unavailable without a colour input and listed as supported", async () => {
+    expect((await bake(makeGraph([engineCall("h", "HueShift", { Input1: null })], pin("h", 0, RGB_MASK)))).status).toBe("unavailable");
+    expect(supportedEngineFunctions()).toContain("HueShift");
+  });
+});
+
 describe("graphPathClasses and supportedNodeClasses", () => {
   it("lists the classes on the active path only", () => {
     const nodes: Raw[] = [
