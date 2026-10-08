@@ -45,7 +45,7 @@ describe("scopeMaterialFiles", () => {
   });
 
   it("copes with an index that carries no candidate lists", () => {
-    const legacy = { ...assetsOf({}), matAll: undefined, propsAll: undefined } as Assets;
+    const { matAll: _matAll, propsAll: _propsAll, ...legacy } = assetsOf({});
     expect(scopeMaterialFiles(legacy, cliff)).toBe(legacy);
   });
 });
