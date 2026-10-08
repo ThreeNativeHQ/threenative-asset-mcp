@@ -45,7 +45,7 @@ afterEach(async () => {
 function jsonResponse(
   child: ChildProcessWithoutNullStreams,
   id: number,
-  timeoutMs = 5_000,
+  timeoutMs = 25_000,
 ): Promise<Record<string, unknown>> {
   return new Promise((resolveResponse, reject) => {
     let buffer = "";

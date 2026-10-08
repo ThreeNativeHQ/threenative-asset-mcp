@@ -1,11 +1,12 @@
 # PRD-539 — Tests, CI and guardrails catch what shipped broken
 
-**Status:** PARTIAL — Phases 1–2 (AC-1–AC-5, AC-7) done with CI proof (PR #26); AC-6 and required checks on `main` remain.
-**Blocker:** João decides whether material/texture names from owned Fab packs may be committed to this public repository, and enables branch protection or a ruleset on `main`; AC-6 also needs `--export-metadata` in `scripts/fab-parity.ts`. See Blocked on.
+**Closed:** 2026-10-08, archived to `done/`.
+
+**Status:** DONE — 2026-10-08. Phases 1–3 verified: AC-1–AC-5 and AC-7 with CI proof (PR #26), AC-6 and the merge gate in Phase 3.
 **Priority:** P1 — CI is advisory on an unprotected `main` and never runs parallel, fresh-host or temp-leak checks, so the regressions in Context reached `main` unseen (AC-2–AC-7 now closed by this PRD's CI legs).
 **Complexity:** 5 (MEDIUM) — 6–10 implementation files (2), new doctor/leak-gate module (+2), toolchain downloads from GitHub/gildor.org/dot.net (+1); risk override: none
 **Owner:** João
-**Depends on:** None. AC-6 uses PRD-537's corpus dumps when they exist.
+**Depends on:** None. AC-6's local replay uses PRD-537's corpus sweep when it has run.
 
 ## Context
 
@@ -53,21 +54,20 @@ toolchain.
      converter, each verified by its own probe (`--version` where the binary has one). Triggered by changes under `src/unreal/provision.ts`
      or `src/fab/fabcli.ts`, plus weekly on a schedule, because upstream archives change without a
      commit here (that is how the FabCLI break happened).
-- **Real-pack metadata fixtures.** PRD-537's parity dumps contain names, parameter overrides,
-  parent chains and expected bindings, with no pixels or geometry. A trimmed, owner-approved subset
-  becomes `tests/fixtures/fab-metadata/*.json`, replayed through `resolveMaterial` in normal CI.
-  Material-resolution regressions on real packs are then caught without the packs or credentials.
-- **Merge gate.** Required status checks on `main` (the `verify` matrix plus the three new legs).
+- **Material metadata replay.** `npm run parity:fab -- --export-metadata <dir>` writes, per pack, the
+  `.mat`/`.props.txt` texts each material resolution read plus the bindings it returned (no pixels or
+  geometry). `tests/fab-metadata.test.ts` replays a committed SYNTHETIC dump in normal CI and, when
+  `FAB_METADATA_DIR` is set, every licensed-pack dump in that directory. Pack-derived names are
+  local-only and never committed (João's call, 2026-10-08).
+- **Merge gate.** Required status checks on `main` (the `verify` matrix plus `parallel` and `leak-gate`; `fresh-toolchain` is path-filtered, so it cannot be required).
 
 ## Acceptance Criteria
 
-Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7 in Phase 1, AC-4 and AC-5 in Phase 2. AC-6 (metadata replay) was Phase 3 and now sits under Blocked on.
+Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7 in Phase 1, AC-4 and AC-5 in Phase 2, AC-6 and the merge gate in Phase 3.
 
 ## Blocked on
 
-- Required status checks on `main` — unblocked by João enabling branch protection or a ruleset on
-  `jonit-dev/threenative-asset-mcp` (repository settings are the owner's call).
-- AC-6 — replaying Soul Cave metadata through `resolveMaterial` (red on the pre-PRD-537 resolver, green after; proof: `npx vitest run tests/fab-metadata.test.ts` at both revisions). Needs (a) João confirming that material/texture *names* from owned Fab packs may live in this PUBLIC repository (the fallback is a private fixture repo or local-only replay) and (b) `--export-metadata` in `scripts/fab-parity.ts`, which PRD-537 does not have yet (its Phase 2 is done on #25). Not built with invented names: PRD-537's own fixture test already covers the generic resolver case.
+Nothing.
 
 ## Integration Ledger
 
@@ -76,7 +76,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 | Tool requirement guard | every test needing an external tool → `tests/helpers/require-tool.ts` | Replaces import-time `execFileSync` crashes | AC-3 |
 | Doctor | `npm run doctor` → `scripts/doctor.ts`; README Verification | New | AC-5 |
 | CI parallel / leak / fresh-toolchain legs | `.github/workflows/ci.yml` on PR, push and schedule | Additive to the `verify` matrix | AC-2, AC-4, AC-7 |
-| Metadata replay | `npm run test:ci` → `tests/fab-metadata.test.ts` → `resolveMaterial` | New; complements PRD-537's live parity run | AC-6 |
+| Metadata replay | `npm run test:ci` → `tests/fab-metadata.test.ts` → `replayMaterialMetadata` → `resolveMaterial`; capture via `parity:fab --export-metadata` → `onMaterialResolved` in `packageGlb` | New; complements PRD-537's live parity run | AC-6 |
 
 ## Decisions
 
@@ -93,7 +93,10 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 
 - 2026-10-07 (Claude): FabCLI needs `libwebkit2gtk-4.1.so.0` on Debian 13. The provisioner reports it only as "does not run on this host"; naming the package there belongs with PRD-537 AC-1, so this PRD only adds it to the CI install list and `doctor`.
 
-- 2026-10-08 (Claude, AFK): Phase 3 removed as a phase and AC-6 moved under Blocked on. It cannot be ticked without João's licence/visibility confirmation for a public repo and PRD-537's `--export-metadata`, so it was an untickable box (prd-lifecycle R3). Reopen it as a new PRD when both exist.
+- 2026-10-08 (Claude, AFK): Phase 3 had been removed and AC-6 parked, because it needed João's decision on pack names in a public repo and an `--export-metadata` flag. João then decided: pack-derived names stay local-only, and the main-branch ruleset may be enabled. Phase 3 is back with both boxes.
+- 2026-10-08 (Claude): AC-6 was re-scoped from "replay Soul Cave in CI" to "replay gate: synthetic fixture in CI, licensed dumps local via `FAB_METADATA_DIR`". The mechanism is proven in CI; the licensed replay cannot run in hosted CI by design. No real-pack dump exists yet (it needs PRD-537's sweep, which waits on the Fab browser check), so the first licensed replay is a local step after that sweep.
+- 2026-10-08 (Claude): The ruleset's bypass is the repository admin role, so João can still push in an emergency. It requires the four checks that run on every PR and blocks force-push and deletion of `main`. It does not require a PR or reviews.
+- 2026-10-08 (Claude): `tests/mcp-smoke.test.ts` waited 5 s for each MCP response against a 30 s `testTimeout`; `creature_status` launches Chromium and exceeded it twice in five loaded full-suite runs. The wait is now 25 s (0 of 3 failed after).
 
 ## Execution Phases
 
@@ -117,3 +120,11 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 
 **Verification:** the boxes above.
 
+#### Phase 3: Material resolution is replayable, and `main` is gated
+**Status:** DONE (2026-10-08)
+**Files:** `src/unreal/material-metadata.ts` (new), `src/unreal/importer.ts` and `src/tools/import-unreal.ts` (optional `onMaterialResolved`), `src/unreal/parity-run.ts` and `scripts/fab-parity.ts` (`--export-metadata`), `tests/fab-metadata.test.ts`, `tests/material-metadata.test.ts`, `tests/fixtures/material-metadata/synthetic.json`, `README.md`.
+**Implementation:** Capture records the texts a `resolveMaterial` call reads and its result; replay re-runs it from the texts and lists differences. Production behaviour is unchanged when the callback is unset.
+- [x] AC-6 [shared]: A recorded material-metadata dump replays through `resolveMaterial` with zero mismatches in CI, and goes red when the resolver regresses. proof: `npx vitest run tests/fab-metadata.test.ts tests/material-metadata.test.ts tests/unreal-parity-run.test.ts` — green (34 passed, 1 skipped: the `FAB_METADATA_DIR` block); with `FAB_METADATA_DIR` set to the fixture directory the block runs, 4/4 pass. Red: with `supersededDefaults` disabled in `resolveMaterial`, the replay fails with `MI_Synth_Panel: bindings expected [baseColor=T_Instance_D [props/exact/none]] but replay gave [baseColor=T_Parent_Default_D [mat/exact/none]]` (change not committed). Full suite 676 passed, 3 skipped, leak-gate clean. 2026-10-08.
+- [x] Required status checks guard `main`. proof: ruleset `main-required-checks` (id 24703164, `gh api repos/jonit-dev/threenative-asset-mcp/rulesets`), enforcement active, requires `Verify (Node 20.19.0)`, `Verify (Node 24.x)`, `parallel` and `leak-gate`, blocks deletion and non-fast-forward; admin role may bypass. 2026-10-08.
+
+**Verification:** the boxes above.

@@ -851,6 +851,8 @@ export interface ParityArgs {
   readonly licencesFile: string | undefined;
   /** False for `--no-graph-bake`: the importer skips graph baking (PRD-537 baseline). */
   readonly graphBake: boolean;
+  /** Directory for per-pack material metadata dumps (licensed names: local-only, never commit). */
+  readonly exportMetadata: string | undefined;
 }
 
 export const PARITY_USAGE = `Usage: npm run parity:fab -- [options]
@@ -880,6 +882,9 @@ Options:
                          error and the sweep continues. A bad file exits 2 before any download.
   --no-graph-bake        Import with graph baking off (THREENATIVE_GRAPH_BAKE=0): the PRD-537
                          baseline for comparing S4 misses
+  --export-metadata <dir> Write <dir>/<listing8>-<artifact>.json per pack: the material texts each
+                         resolution read, for replay (tests/fab-metadata.test.ts). Holds licensed
+                         names: local-only, never commit.
   -h, --help             Print this help
 
 Exit codes: 0 done, 1 error, 2 Fab session/download failure (partial scorecard written), 130 interrupted.`;
@@ -898,6 +903,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let baseline: string | undefined;
   let licencesFile: string | undefined;
   let graphBake = true;
+  let exportMetadata: string | undefined;
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(`${flag} needs a value.`);
@@ -955,6 +961,9 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
       case "--no-graph-bake":
         graphBake = false;
         break;
+      case "--export-metadata":
+        exportMetadata = resolve(value(i++, arg));
+        break;
       default:
         throw new Error(`Unknown option "${arg}". Use --help.`);
     }
@@ -973,6 +982,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
     baseline,
     licencesFile,
     graphBake,
+    exportMetadata,
   };
 }
 

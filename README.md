@@ -594,6 +594,13 @@ when the asset pack does not contain that mesh. Rectangular area lights are
 preserved in scene metadata and approximated as punctual point lights because
 glTF's standard punctual-light extension has no area-light type.
 
+### Parity sweep and material metadata dumps
+
+`npm run parity:fab` imports every owned Fab artifact and scores it against its source package
+(`scorecard.json`). `--export-metadata <dir>` also writes one replayable material dump per pack;
+replay them with `FAB_METADATA_DIR=<dir> npx vitest run tests/fab-metadata.test.ts`. Dumps hold
+licensed pack names and are local-only: never commit them.
+
 ## Configuration
 
 | Variable                        | Default                                            | Purpose                                                  |

@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "source": "synthetic",
+  "materials": [
+    {
+      "name": "MI_Synth_Panel",
+      "mat": {
+        "MI_Synth_Panel": "Diffuse=T_Parent_Default_D\n",
+        "M_Synth_Master": "Diffuse=T_Parent_Default_D\n"
+      },
+      "props": {
+        "MI_Synth_Panel": "Parent = Material3'Content/Synthetic/Materials/M_Synth_Master.M_Synth_Master'\nTextureParameterValues[1] =\n{\n    TextureParameterValues[0] =\n    {\n        ParameterInfo = { Name=None }\n        ParameterValue = Texture2D'Content/Synthetic/Textures/T_Instance_D.T_Instance_D'\n        ParameterName = Diffuse\n    }\n}",
+        "M_Synth_Master": "CollectedTextureParameters[1] =\n{\n    CollectedTextureParameters[0] =\n    {\n        Texture = Texture2D'Content/Synthetic/Textures/T_Parent_Default_D.T_Parent_Default_D'\n        Name = Diffuse\n        Group = Base\n    }\n}"
+      },
+      "availableTextures": [
+        "T_Instance_D",
+        "T_Parent_Default_D",
+        "T_Plain_D",
+        "T_Plain_N"
+      ],
+      "expected": {
+        "bindings": [
+          {
+            "slot": "baseColor",
+            "texture": "T_Instance_D",
+            "source": "props",
+            "confidence": "exact",
+            "transform": "none"
+          }
+        ],
+        "limitations": []
+      }
+    },
+    {
+      "name": "M_Synth_Plain",
+      "mat": {
+        "M_Synth_Plain": "Diffuse=T_Plain_D\nNormal=T_Plain_N\n"
+      },
+      "props": {},
+      "availableTextures": [
+        "T_Instance_D",
+        "T_Parent_Default_D",
+        "T_Plain_D",
+        "T_Plain_N"
+      ],
+      "expected": {
+        "bindings": [
+          {
+            "slot": "baseColor",
+            "texture": "T_Plain_D",
+            "source": "mat",
+            "confidence": "exact",
+            "transform": "none"
+          },
+          {
+            "slot": "normal",
+            "texture": "T_Plain_N",
+            "source": "mat",
+            "confidence": "exact",
+            "transform": "none"
+          }
+        ],
+        "limitations": []
+      }
+    }
+  ]
+}

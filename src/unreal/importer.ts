@@ -13,6 +13,7 @@ import {
   type MaterialTextureBinding,
   type UnsupportedTexture,
   type ResolvedMaterial,
+  type ResolveMaterialRequest,
   type TextureTransform,
   resolveMaterial,
 } from "./materials.js";
@@ -381,6 +382,8 @@ export interface ImportUnrealRequest {
   readonly modernConverter?: ExternalTool;
   /** Bake base colour from the Unreal material graph when no colour texture binds. Default true. */
   readonly graphBake?: boolean;
+  /** Receives each material's resolver request, for metadata capture. Production leaves it unset. */
+  readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
 }
 
 const UNSUPPORTED_EXTENSIONS = new Map<string, string>();
@@ -1155,6 +1158,7 @@ export async function packageGlb(options: {
   readonly sourceMaterial?: (name: string, lookupName: string) => SourceMaterial | undefined | Promise<SourceMaterial | undefined>;
   /** Bakes the Unreal material graph for a section no texture binding gave a base colour (PRD-538). */
   readonly graphBaker?: GraphBaker | undefined;
+  readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
 }): Promise<PackagedModel> {
   const io = separateLayoutIO();
   const document = await io.read(options.gltfPath);
@@ -1204,7 +1208,7 @@ export async function packageGlb(options: {
     if (unresolvedSection) {
       material.setName(`${basename(options.glbPath, ".glb")}_unresolved_section_${index}`);
     }
-    let resolved: ResolvedMaterial = resolveMaterial({
+    const materialRequest: ResolveMaterialRequest = {
       name: lookupName,
       readMat: (materialName) => {
         const path = materialAssets.mat.get(materialName);
@@ -1216,7 +1220,9 @@ export async function packageGlb(options: {
       },
       availableTextures,
       ...(graphNames ? { sharedGraphMaterialNames: graphNames } : {}),
-    });
+    };
+    let resolved: ResolvedMaterial = resolveMaterial(materialRequest);
+    options.onMaterialResolved?.(materialRequest);
     const authored = await options.sourceMaterial?.(name, lookupName);
     let authoredAoCoordinatesMatch = false;
     let authoredAoBaseBinding: ResolvedMaterial["bindings"][number] | undefined;
@@ -3303,6 +3309,7 @@ export async function importUnrealDirectory(
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
+            onMaterialResolved: request.onMaterialResolved,
           });
           prunedUvSets += packaged.prunedUvSets;
           droppedTangents += packaged.droppedTangents;
@@ -3427,6 +3434,7 @@ export async function importUnrealDirectory(
           geometryScale: 1,
           sourceMaterial: sourceForMesh(source.entry.file),
           graphBaker,
+          onMaterialResolved: request.onMaterialResolved,
         });
         prunedUvSets += packaged.prunedUvSets;
         droppedTangents += packaged.droppedTangents;
@@ -3531,6 +3539,7 @@ export async function importUnrealDirectory(
             return entry ? sourceForLibraryFile(entry.file) : undefined;
           },
           graphBaker,
+          onMaterialResolved: request.onMaterialResolved,
         });
         await validateGlb(glbPath);
         const sections = new Map(packaged.sections.map((section) => [section.name, section]));

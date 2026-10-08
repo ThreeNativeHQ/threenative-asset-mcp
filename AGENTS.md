@@ -92,5 +92,8 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
 - Fab downloads land in `~/.cache/threenative-asset-mcp/fab-downloads/<listing>/<artifact>`. They
   are licensed, not redistributable: never commit pack contents. Delete what you downloaded when
   you are done; FabCLI fetched Soul Cave (1.2 GB) in 17 s, so re-downloading is cheap.
+- **Metadata dumps are local-only.** `npm run parity:fab -- --export-metadata <dir>` records each
+  material resolution so `FAB_METADATA_DIR=<dir> npx vitest run tests/fab-metadata.test.ts` can
+  replay it. The dumps carry licensed pack names: keep them out of the repo.
 - Judge an import against its source package, not a screenshot. PRD-537 defines the structural
   parity checks (coverage, shape, texture identity, colour presence).

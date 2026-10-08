@@ -17,6 +17,7 @@ import { FabCli } from "../src/fab/fabcli.js";
 import { dumpEngineArg } from "../src/fab/routes.js";
 import { createFabImportAssetHandler, fabDownloadRoot } from "../src/tools/import-unreal.js";
 import type { ImportReport } from "../src/unreal/importer.js";
+import { captureMaterialMetadata, type MaterialMetadataEntry, writeMaterialMetadataDump } from "../src/unreal/material-metadata.js";
 import { scorePack } from "../src/unreal/parity.js";
 import {
   acquireLock,
@@ -96,6 +97,9 @@ async function main(): Promise<number> {
   if (args.help) {
     say(PARITY_USAGE);
     return 0;
+  }
+  if (args.exportMetadata !== undefined) {
+    say(`Metadata dumps in ${args.exportMetadata} hold licensed pack names: local-only, never commit them.`);
   }
 
   // Validate before anything is created or downloaded: a bad file exits 2.
@@ -286,9 +290,19 @@ async function main(): Promise<number> {
     say(`Sweeping ${todo.length} artifact(s) from ${new Set(todo.map((e) => e.listingId)).size} listing(s); skipped ${skipped.length}. Run ${runId}.`);
     writeScorecard();
 
+    // --export-metadata: each pack's material resolutions, deduplicated, written once the pack imported.
+    const packMaterials = new Map<string, MaterialMetadataEntry>();
     const handler = createFabImportAssetHandler({
       environment,
       ...(licences === undefined ? {} : { readLicenses: licencesReader(licences) }),
+      ...(args.exportMetadata === undefined
+        ? {}
+        : {
+            onMaterialResolved: (request) => {
+              const entry = captureMaterialMetadata(request);
+              packMaterials.set(JSON.stringify(entry), entry);
+            },
+          }),
     });
     let fatal: HandlerError | undefined;
     // Delays are overridable (comma-separated ms, e.g. "0,0,0") so a rehearsal need not wait minutes.
@@ -326,6 +340,7 @@ async function main(): Promise<number> {
       };
       let entry: ScorecardEntry;
       try {
+        packMaterials.clear();
         const run = await runWithRetries(
           async (attemptNumber) => {
             if (attemptNumber > 1) {
@@ -351,6 +366,13 @@ async function main(): Promise<number> {
             return sleepMs(ms);
           },
         );
+        if (args.exportMetadata !== undefined && packMaterials.size > 0) {
+          writeMaterialMetadataDump(args.exportMetadata, `${label}.json`, {
+            version: 1,
+            source: `fab:${label}`,
+            materials: [...packMaterials.values()],
+          });
+        }
         if (run.kind === "error") {
           const error = run.exhausted
             ? {
