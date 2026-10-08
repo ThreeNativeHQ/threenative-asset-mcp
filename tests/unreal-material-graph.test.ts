@@ -4,6 +4,7 @@ import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dum
 import {
   bakeGraph,
   graphPathClasses,
+  supportedEngineFunctions,
   supportedNodeClasses,
   type BakeResult,
   type GraphParameters,
@@ -561,6 +562,120 @@ describe("bakeGraph", () => {
     const result = await bakeGraph({ graph: masterGraph({ wrapped: true }), output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(wide).loadTexture, size: 1024 });
     expect(result.status).toBe("baked");
     expect(performance.now() - started).toBeLessThan(25_000);
+  });
+});
+
+describe("Desaturation and SpeedTreeColorVariation", () => {
+  const SOURCE: Rgb = [200, 100, 50];
+  const linear = SOURCE.map(decode) as [number, number, number];
+  const grey = (factors: readonly number[] = [0.3, 0.59, 0.11]) => linear[0] * factors[0]! + linear[1] * factors[1]! + linear[2] * factors[2]!;
+  const desaturate = async (desaturation: Raw, extra: Raw[] = []) => {
+    const graph = makeGraph([desaturation, textureSample("t", "T_Source"), ...extra], pin("d", 0, RGB_MASK));
+    const loader = makeLoader({ T_Source: { png: await flat(SOURCE)(), srgb: true } });
+    return bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 });
+  };
+
+  it("collapses to luminance when Fraction is unwired (Unreal's default is 1)", async () => {
+    const result = await desaturate(node("d", "Desaturation", { inputs: { Input: pin("t", 0, RGB_MASK) } }));
+    const pixel = await pixelsOf(result);
+    // Hand value: 0.3 * 0.5776 + 0.59 * 0.1274 + 0.11 * 0.0319 = 0.2518 -> sRGB byte 137 on every channel.
+    const byte = encode(grey());
+    expect(byte).toBe(137);
+    expect(pixel(2, 2)).toEqual([byte, byte, byte]);
+    if (result.status === "baked") expect(result.confidence).toBe("exact");
+  });
+
+  it("lerps from the input to its luminance by a wired Fraction", async () => {
+    const result = await desaturate(node("d", "Desaturation", { inputs: { Input: pin("t", 0, RGB_MASK), Fraction: pin("f") } }), [
+      node("f", "Constant", { constants: { R: 0.25 } }),
+    ]);
+    const pixel = await pixelsOf(result);
+    const g = grey();
+    expect(pixel(1, 1)).toEqual(linear.map((channel) => encode(channel + (g - channel) * 0.25)));
+    // Not the reversed lerp (grey + (input - grey) * 0.25), which would be much closer to the input.
+    expect(pixel(1, 1)).not.toEqual(linear.map((channel) => encode(g + (channel - g) * 0.25)));
+  });
+
+  it("returns the input untouched for Fraction 0 and honours a stored Fraction constant and custom LuminanceFactors", async () => {
+    const identity = await pixelsOf(await desaturate(node("d", "Desaturation", { inputs: { Input: pin("t", 0, RGB_MASK) }, constants: { Fraction: 0 } })));
+    expect(identity(0, 0)).toEqual([...SOURCE]);
+    const factors = [0.5, 0.25, 0.25];
+    const custom = await pixelsOf(
+      await desaturate(node("d", "Desaturation", { inputs: { Input: pin("t", 0, RGB_MASK) }, constants: { LuminanceFactors: [...factors, 0] } })),
+    );
+    const byte = encode(grey(factors));
+    expect(custom(3, 3)).toEqual([byte, byte, byte]);
+  });
+
+  it("reports a Desaturation without an input as unavailable", async () => {
+    const result = await desaturate(node("d", "Desaturation"));
+    expect(result.status).toBe("unavailable");
+  });
+
+  const treeCall = (inputs: Raw) => engineCall("v", "SpeedTreeColorVariation", inputs);
+  const APPROXIMATION = "SpeedTreeColorVariation: per-instance colour variation ignored; engine body unavailable";
+  const bakeVariation = async (inputs: Raw) => {
+    const graph = makeGraph([treeCall(inputs), textureSample("t", "T_Source")], pin("v", 0, RGB_MASK));
+    const loader = makeLoader({ T_Source: { png: await flat(SOURCE)(), srgb: true } });
+    return bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 });
+  };
+
+  it("passes the colour input of SpeedTreeColorVariation through as a heuristic", async () => {
+    for (const inputs of [{ "Base Color": pin("t", 0, RGB_MASK) }, { Input0: pin("t", 0, RGB_MASK) }, { Other: pin("t", 0, RGB_MASK) }]) {
+      const result = await bakeVariation(inputs);
+      expect((await pixelsOf(result))(0, 0)).toEqual([...SOURCE]);
+      if (result.status === "baked") {
+        expect(result.confidence).toBe("heuristic");
+        expect(result.approximations).toEqual([APPROXIMATION]);
+      }
+    }
+  });
+
+  it("prefers the pin named like a colour over earlier pins", async () => {
+    const other: Raw = pin("c", 0, RGB_MASK);
+    const graph = makeGraph(
+      [treeCall({ Input0: other, "Color Input": pin("t", 0, RGB_MASK) }), textureSample("t", "T_Source"), constant3("c", [0, 0, 1])],
+      pin("v", 0, RGB_MASK),
+    );
+    const loader = makeLoader({ T_Source: { png: await flat(SOURCE)(), srgb: true } });
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 });
+    expect((await pixelsOf(result))(0, 0)).toEqual([...SOURCE]);
+  });
+
+  it("names SpeedTreeColorVariation as unsupported when nothing is connected", async () => {
+    const result = await bakeVariation({ Input0: null });
+    expect(result.status).toBe("unsupported");
+    if (result.status === "unsupported") expect(result.unsupported).toEqual(["SpeedTreeColorVariation"]);
+  });
+
+  it("bakes Multiply(Desaturation(SpeedTreeColorVariation(texture)), tint) on the BaseColor path", async () => {
+    const graph = makeGraph(
+      [
+        multiply("out", pin("d", 0, RGB_MASK), pin("tint")),
+        node("d", "Desaturation", { inputs: { Input: pin("v", 0, RGB_MASK), Fraction: pin("f") } }),
+        node("f", "Constant", { constants: { R: 0.5 } }),
+        treeCall({ "Base Color": pin("t", 0, RGB_MASK) }),
+        textureSample("t", "T_Source"),
+        constant3("tint", [1, 0.5, 0]),
+      ],
+      pin("out"),
+    );
+    const loader = makeLoader({ T_Source: { png: await flat(SOURCE)(), srgb: true } });
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 });
+    const pixel = await pixelsOf(result);
+    const g = grey();
+    const tint = [1, 0.5, 0];
+    expect(pixel(2, 1)).toEqual(linear.map((channel, index) => encode((channel + (g - channel) * 0.5) * tint[index]!)));
+    if (result.status === "baked") {
+      expect(result.confidence).toBe("heuristic");
+      expect(result.approximations).toEqual([APPROXIMATION]);
+    }
+    expect(graphPathClasses(graph, "baseColor")).toEqual(expect.arrayContaining(["Desaturation", "FunctionCall", "Multiply"]));
+  });
+
+  it("lists both in the supported sets", () => {
+    expect(supportedNodeClasses()).toContain("Desaturation");
+    expect(supportedEngineFunctions()).toContain("SpeedTreeColorVariation");
   });
 });
 

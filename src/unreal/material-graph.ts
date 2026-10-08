@@ -96,6 +96,7 @@ const SUPPORTED_NODE_CLASSES = [
   "AppendVector",
   "OneMinus",
   "Saturate",
+  "Desaturation",
   "Clamp",
   "Power",
   "TextureCoordinate",
@@ -113,7 +114,7 @@ const SUPPORTED_NODE_CLASSES = [
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
-const SUPPORTED_ENGINE_FUNCTIONS = ["MatLayerBlend_Standard", "MatLayerBlend_AO", "MatLayerBlend_BakedNormal", "FuzzyShading"] as const;
+const SUPPORTED_ENGINE_FUNCTIONS = ["MatLayerBlend_Standard", "MatLayerBlend_AO", "MatLayerBlend_BakedNormal", "FuzzyShading", "SpeedTreeColorVariation"] as const;
 
 export function supportedNodeClasses(): readonly string[] {
   return SUPPORTED_NODE_CLASSES;
@@ -518,6 +519,8 @@ class Compiler {
         const input = this.vec(node.inputs.Input, "Saturate.Input");
         return input ? this.unary(input, (x) => (x < 0 ? 0 : x > 1 ? 1 : x)) : this.markUnavailable(`Saturate ${node.id} has no input`);
       }
+      case "Desaturation":
+        return this.desaturation(node);
       case "Clamp": {
         const input = this.vec(node.inputs.Input, "Clamp.Input");
         if (!input) return this.markUnavailable(`Clamp ${node.id} has no input`);
@@ -583,6 +586,26 @@ class Compiler {
       default:
         return this.unsupportedNode(node);
     }
+  }
+
+  /**
+   * MaterialExpressionDesaturation: lerp(Input, dot(Input.rgb, LuminanceFactors), Fraction). Unreal's defaults are
+   * LuminanceFactors (0.3, 0.59, 0.11) and, for an unwired Fraction, 1 (fully grey). Exact.
+   */
+  private desaturation(node: GraphNode): Compiled {
+    const input = this.vec(node.inputs.Input, "Desaturation.Input");
+    if (!input) return this.markUnavailable(`Desaturation ${node.id} has no input`);
+    const stored = node.constants.LuminanceFactors;
+    const factors = Array.isArray(stored) && stored.length >= 3 ? stored : [0.3, 0.59, 0.11];
+    const [fr, fg, fb] = [factors[0]!, factors[1]!, factors[2]!];
+    const luminance =
+      input.n === 1
+        ? this.unary(input, (x) => x * (fr + fg + fb))
+        : this.emit([input], 1, (o) => (r) => {
+            r[o] = r[input.reg]! * fr + r[input.reg + 1]! * fg + r[input.reg + 2]! * fb;
+            r[o + 1] = r[o + 2] = r[o + 3] = r[o]!;
+          });
+    return this.lerp(input, luminance, this.operand(node, "Fraction", "Fraction", 1));
   }
 
   /** Records an unsupported class and still walks its inputs, so the report names everything beneath it. */
@@ -710,6 +733,20 @@ class Compiler {
       this.approximations.add("view-dependent fuzzy shading ignored");
       const pin = node.inputs["Material Input"] ? "Material Input" : "Input0";
       return this.passThrough(node, pin, name!);
+    }
+    if (lower === "speedtreecolorvariation") {
+      // Per-instance colour variation driven by instance and world data, which a baked texture cannot hold.
+      // The colour input is the first wired pin named like a colour, else Input0, else the first wired pin.
+      const wired = Object.entries(node.inputs).filter(([, input]) => input);
+      const chosen = wired.find(([key]) => key.toLowerCase().includes("color")) ?? wired.find(([key]) => key === "Input0") ?? wired[0];
+      if (chosen) {
+        this.approximations.add(`${name}: per-instance colour variation ignored; engine body unavailable`);
+        return this.passThrough(node, chosen[0], name!);
+      }
+      // Nothing is connected, so there is no colour to pass through.
+      this.unsupported.add(name!);
+      this.classes.add(name!);
+      return this.constant([0], 1);
     }
     const inner = node.fn?.outputs[output];
     if (inner) {
