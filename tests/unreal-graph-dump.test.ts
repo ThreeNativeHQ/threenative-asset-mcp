@@ -225,4 +225,80 @@ writeFileSync(${JSON.stringify(outLog)}, argv[argv.indexOf("--dump-graphs") + 1]
     await writeFile(bad, JSON.stringify({ format: 1 }));
     await expect(readMaterialGraph(bad)).rejects.toThrow(/unexpected shape/);
   });
+
+  it("accepts every shape the converter can emit, including an unresolved node and string parameter defaults", () => {
+    const graph = materialGraphSchema.parse({
+      ...maskTintGraph("M_Emitted"),
+      nodes: [
+        // BuildMaterialGraph's Pin(): an expression that failed to load carries only id, class and error.
+        { id: "n0", class: "Unresolved", error: "expression could not be loaded" },
+        // GraphValue() can return a string (FName / string DefaultValue), and an input index is whatever the package stores.
+        { id: "n1", class: "FontSampleParameter", inputs: { A: { node: "n0", output: -1, mask: null } }, constants: { Name: "x" }, parameter: { name: "F", group: "" }, default: "Roboto" },
+        { id: "n2", class: "TextureCoordinate", inputs: {}, constants: {}, tiling: [2, 0.5] },
+        { id: "n3", class: "StaticSwitchParameter", inputs: { A: null, B: null }, constants: {}, parameter: { name: "S", group: "" }, default: false, switchValue: true },
+        { id: "n4", class: "FunctionCall", inputs: { In: null }, constants: {}, function: null, fn: { inputs: { In: null }, outputs: [null], output: null }, error: "material function could not be loaded" },
+      ],
+    });
+    expect(graph.nodes[0]).toMatchObject({ inputs: {}, constants: {} });
+    expect(graph.nodes[1]?.default).toBe("Roboto");
+  });
+
+  describe("one bad graph must not lose the others", () => {
+    const converterWriting = async (dir: string, files: Record<string, string>): Promise<string> =>
+      fakeConverter(
+        dir,
+        `import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const out = process.argv[process.argv.indexOf("--dump-graphs") + 1];
+for (const [name, text] of Object.entries(${JSON.stringify(files)})) writeFileSync(join(out, name), text);`,
+      );
+    const withNullOutput = () => {
+      const graph = maskTintGraph("M_Null") as unknown as { nodes: Array<{ inputs: Record<string, unknown> }> };
+      // The reported Agora shape: a null where the schema wants a number, deep inside the node list.
+      graph.nodes[12]!.inputs.A = { node: "n1", output: null, mask: null };
+      return graph;
+    };
+
+    it("skips an invalid graph, keeps the good ones, and records a short readable reason", async () => {
+      const dir = await scratch();
+      const converter = await converterWriting(dir, {
+        "M_Good.graph.json": JSON.stringify(maskTintGraph("M_Good")),
+        "M_Null.graph.json": JSON.stringify(withNullOutput()),
+        "M_Torn.graph.json": "{ not json",
+        "M_AlsoGood.graph.json": JSON.stringify(maskTintGraph("M_AlsoGood")),
+      });
+      const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+      expect([...graphs.keys()]).toEqual(["M_AlsoGood", "M_Good"]);
+      expect([...(graphs.invalid ?? new Map()).keys()].sort()).toEqual(["M_Null", "M_Torn"]);
+      const reason = graphs.invalid?.get("M_Null") ?? "";
+      expect(reason).toMatch(/^nodes\[12\]\.inputs\.A\.output: /);
+      expect(reason).toMatch(/number/);
+      expect(reason.length).toBeLessThanOrEqual(200);
+      expect(graphs.invalid?.get("M_Torn")).toMatch(/not valid JSON/);
+      expect((graphs.invalid?.get("M_Torn") ?? "").length).toBeLessThanOrEqual(200);
+    });
+
+    it("returns an empty graph map plus every reason when all graphs are invalid", async () => {
+      const dir = await scratch();
+      const converter = await converterWriting(dir, {
+        "M_One.graph.json": JSON.stringify({ format: 1, material: "M_One" }),
+        "M_Two.graph.json": JSON.stringify(withNullOutput()),
+      });
+      const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+      expect(graphs.size).toBe(0);
+      expect(graphs.invalid?.size).toBe(2);
+    });
+
+    it("readMaterialGraph reports a short reason, not a zod dump", async () => {
+      const dir = await scratch();
+      const bad = join(dir, "M_Null.graph.json");
+      await writeFile(bad, JSON.stringify(withNullOutput()));
+      const message = await readMaterialGraph(bad).then(
+        () => "",
+        (error: Error) => error.message,
+      );
+      expect(message).toMatch(/unexpected shape: nodes\[12\]\.inputs\.A\.output: /);
+      expect(message.length).toBeLessThan(300);
+    });
+  });
 });

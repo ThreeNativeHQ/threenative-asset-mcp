@@ -150,7 +150,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
   const size = Math.max(1, Math.min(options.maxTextureSize ?? MAX_BAKE_SIZE, MAX_BAKE_SIZE));
 
   let packages: Promise<Set<string>> | undefined;
-  let graphs: Promise<{ readonly graphs: ReadonlyMap<string, MaterialGraph> } | { readonly error: string }> | undefined;
+  let graphs: Promise<{ readonly graphs: ReadonlyMap<string, MaterialGraph>; readonly invalid: ReadonlyMap<string, string> } | { readonly error: string }> | undefined;
 
   const sourcePackages = (): Promise<Set<string>> => (packages ??= listUassetBasenames(options.sourceDir).catch(() => new Set<string>()));
   // With THREENATIVE_TOOLCHAIN_AUTOINSTALL=0 the dump resolves an installed converter or throws; either
@@ -161,15 +161,14 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         "Some sections have no base-colour texture; reading the pack's material graphs with CUE4Parse to bake them (the converter and its .NET SDK are installed once on first use; set graphBake:false or THREENATIVE_TOOLCHAIN_AUTOINSTALL=0 to skip).",
       );
       try {
-        return {
-          graphs: await dump(options.sourceDir, {
-            // The importer carries `UE_4.18`; the converter wants `4.18` and refuses anything else.
-            ...(options.engine && dumpEngineArg(options.engine) ? { engine: dumpEngineArg(options.engine)! } : {}),
-            environment,
-            ...(options.log ? { log: options.log } : {}),
-            ...(options.modernConverter ? { converterPath: options.modernConverter.path } : {}),
-          }),
-        };
+        const dumped = await dump(options.sourceDir, {
+          // The importer carries `UE_4.18`; the converter wants `4.18` and refuses anything else.
+          ...(options.engine && dumpEngineArg(options.engine) ? { engine: dumpEngineArg(options.engine)! } : {}),
+          environment,
+          ...(options.log ? { log: options.log } : {}),
+          ...(options.modernConverter ? { converterPath: options.modernConverter.path } : {}),
+        });
+        return { graphs: dumped, invalid: dumped.invalid ?? new Map<string, string>() };
       } catch (error) {
         return { error: error instanceof Error ? error.message : String(error) };
       }
@@ -234,6 +233,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       if (text) chain.push(parsePropsFile(text));
       graph = byName.get(current);
       if (graph) break;
+      const unreadable = dumped.invalid.get(current);
+      if (unreadable !== undefined) return unavailable(`graph for ${current} unreadable (${unreadable})`);
       current = text ? chain[chain.length - 1]!.parent : undefined;
     }
     if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);

@@ -12,7 +12,9 @@ const vec4Int = z.tuple([channel, channel, channel, channel]);
 export const graphInputSchema = z
   .object({
     node: z.string().min(1),
-    output: z.number().int().min(0),
+    // The converter copies the package's OutputIndex verbatim, so do not reject an out-of-range one here;
+    // the baker treats a missing output as an unsupported node.
+    output: z.number().int(),
     mask: vec4Int.nullable(),
   })
   .strict();
@@ -36,10 +38,12 @@ export const graphNodeSchema = z
     id: z.string().min(1),
     /** Unreal expression class without the `MaterialExpression` prefix, or `FunctionCall` for a function call. */
     class: z.string().min(1),
-    inputs: z.record(z.string(), graphInputSchema.nullable()),
-    constants: z.record(z.string(), constantSchema),
+    // An `Unresolved` node (an expression that failed to load) is emitted with only id, class and error.
+    inputs: z.record(z.string(), graphInputSchema.nullable()).default({}),
+    constants: z.record(z.string(), constantSchema).default({}),
     parameter: z.object({ name: z.string(), group: z.string() }).strict().optional(),
-    default: z.union([z.number(), z.boolean(), z.array(z.number())]).nullable().optional(),
+    // GraphValue() also yields a string for a name-valued DefaultValue.
+    default: z.union([z.number(), z.boolean(), z.string(), z.array(z.number())]).nullable().optional(),
     texture: z.string().nullable().optional(),
     samplerType: z.string().optional(),
     coordinates: graphInputSchema.nullable().optional(),
@@ -85,6 +89,28 @@ export type MaterialGraph = z.infer<typeof materialGraphSchema>;
 export type GraphNode = z.infer<typeof graphNodeSchema>;
 export type GraphInput = z.infer<typeof graphInputSchema>;
 
+const MAX_REASON = 200;
+
+function clip(text: string): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length <= MAX_REASON ? oneLine : `${oneLine.slice(0, MAX_REASON - 3)}...`;
+}
+
+function pathText(path: readonly PropertyKey[]): string {
+  return path.reduce<string>((text, part) => (typeof part === "number" ? `${text}[${part}]` : text ? `${text}.${String(part)}` : String(part)), "");
+}
+
+/** `nodes[12].inputs.A.output: expected number, received null`: the first issue only, one line, at most 200 characters. */
+export function describeGraphIssue(error: z.ZodError): string {
+  let issue: z.core.$ZodIssue | undefined = error.issues[0];
+  // A union reports "Invalid input" at the union; the first alternative's issue says what is actually wrong.
+  while (issue && issue.code === "invalid_union" && issue.errors[0]?.[0]) issue = issue.errors[0][0];
+  if (!issue) return "unexpected shape";
+  const message = issue.message.replace(/^Invalid input: /, "");
+  const where = pathText(issue.path);
+  return clip(where ? `${where}: ${message}` : message);
+}
+
 /** Reads and strictly validates one `<Material>.graph.json`. */
 export async function readMaterialGraph(file: string): Promise<MaterialGraph> {
   let parsed: unknown;
@@ -93,18 +119,25 @@ export async function readMaterialGraph(file: string): Promise<MaterialGraph> {
   } catch (error) {
     throw new ToolchainError(
       "UNREAL_TOOL_FAILED",
-      `Material graph ${basename(file)} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      `Material graph ${basename(file)} is not valid JSON: ${clip(error instanceof Error ? error.message : String(error))}`,
     );
   }
   const checked = materialGraphSchema.safeParse(parsed);
   if (!checked.success) {
     throw new ToolchainError(
       "UNREAL_TOOL_FAILED",
-      `Material graph ${basename(file)} has an unexpected shape: ${checked.error.message.slice(0, 1000)}`,
+      `Material graph ${basename(file)} has an unexpected shape: ${describeGraphIssue(checked.error)}`,
     );
   }
   return checked.data;
 }
+
+/**
+ * The usable graphs by material name. `invalid` maps the material (or the file stem when its name is not
+ * readable) of every graph file that was skipped to a one-line reason. It is a non-enumerable extra property so
+ * a plain `Map<string, MaterialGraph>` (tests, other callers) stays a valid value of this type.
+ */
+export type MaterialGraphDump = Map<string, MaterialGraph> & { readonly invalid?: ReadonlyMap<string, string> };
 
 export interface DumpMaterialGraphsOptions {
   engine?: string;
@@ -117,12 +150,13 @@ export interface DumpMaterialGraphsOptions {
 
 /**
  * Runs the converter's `--dump-graphs` mode and returns every `UMaterial` graph, keyed by material name
- * (by package path when two packages hold a material of the same name).
+ * (by package path when two packages hold a material of the same name). A graph file that cannot be read or does
+ * not match the schema is skipped and listed in `invalid`; it never fails the dump.
  */
 export async function dumpMaterialGraphs(
   sourceDir: string,
   options: DumpMaterialGraphsOptions = {},
-): Promise<Map<string, MaterialGraph>> {
+): Promise<MaterialGraphDump> {
   const executable =
     options.converterPath ?? (await ensureModernConverter(options.environment, options.log)).path;
   const scratch = await mkdtemp(join(tmpdir(), "tn-graph-dump-"));
@@ -141,9 +175,33 @@ export async function dumpMaterialGraphs(
       );
     }
     const graphs = new Map<string, MaterialGraph>();
+    const invalid = new Map<string, string>();
+    Object.defineProperty(graphs, "invalid", { value: invalid, enumerable: false });
     const files = (await readdir(scratch)).filter((name) => name.endsWith(".graph.json")).sort();
     for (const name of files) {
-      const graph = await readMaterialGraph(join(scratch, name));
+      const file = join(scratch, name);
+      let text: string;
+      try {
+        text = await readFile(file, "utf8");
+      } catch (error) {
+        invalid.set(name.slice(0, -".graph.json".length), `unreadable: ${clip(error instanceof Error ? error.message : String(error))}`);
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch (error) {
+        invalid.set(name.slice(0, -".graph.json".length), `not valid JSON: ${clip(error instanceof Error ? error.message : String(error))}`);
+        continue;
+      }
+      const checked = materialGraphSchema.safeParse(parsed);
+      if (!checked.success) {
+        const declared = (parsed as { material?: unknown } | null)?.material;
+        const key = typeof declared === "string" && declared ? declared : name.slice(0, -".graph.json".length);
+        if (!invalid.has(key)) invalid.set(key, describeGraphIssue(checked.error));
+        continue;
+      }
+      const graph = checked.data;
       graphs.set(graphs.has(graph.material) ? graph.package : graph.material, graph);
     }
     return graphs;

@@ -217,6 +217,56 @@ describe("createGraphBaker", () => {
     expect(dumps).toBe(1);
   });
 
+  it("bakes the good materials and marks only the unreadable one unavailable, with its reason", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    // The package list is read once, so the broken material's package must exist before the first request.
+    await writeFile(join(sourceDir, "Content", "Test", "M_Broken.uasset"), Buffer.alloc(16));
+    const baker = createGraphBaker({
+      sourceDir,
+      maxTextureSize: 8,
+      dumpGraphs: async () =>
+        Object.assign(new Map([["M_Master", masterGraph()]]), {
+          invalid: new Map([["M_Broken", "nodes[12].inputs.A.output: expected number, received null"]]),
+        }),
+    })!;
+    const good = await baker({ materialName: "MI_Rock_section", lookupName: "MI_Rock", assets, readProps });
+    expect(good.status).toBe("baked");
+    const broken = await baker({ materialName: "M_Broken_section", lookupName: "M_Broken", assets, readProps });
+    expect(broken).toMatchObject({
+      status: "unavailable",
+      reason: "graph for M_Broken unreadable (nodes[12].inputs.A.output: expected number, received null)",
+    });
+  });
+
+  it("a parent whose graph is unreadable makes the instance unavailable, naming the parent", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const baker = createGraphBaker({
+      sourceDir,
+      dumpGraphs: async () => Object.assign(new Map<string, MaterialGraph>(), { invalid: new Map([["M_Master", "nodes[0].class: expected string, received undefined"]]) }),
+    })!;
+    const outcome = await baker({ materialName: "MI_Rock_section", lookupName: "MI_Rock", assets, readProps });
+    expect(outcome).toMatchObject({ status: "unavailable" });
+    expect(outcome.status === "unavailable" && outcome.reason).toBe("graph for M_Master unreadable (nodes[0].class: expected string, received undefined)");
+  });
+
+  it("an all-invalid dump yields unavailable per section and never throws", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    let dumps = 0;
+    const baker = createGraphBaker({
+      sourceDir,
+      dumpGraphs: async () => {
+        dumps += 1;
+        return Object.assign(new Map<string, MaterialGraph>(), { invalid: new Map([["M_Master", "format: expected 1"]]) });
+      },
+    })!;
+    for (const name of ["MI_Rock", "M_Master"]) {
+      const outcome = await baker({ materialName: `${name}_s`, lookupName: name, assets, readProps });
+      expect(outcome.status).toBe("unavailable");
+      expect(outcome.status === "unavailable" && outcome.reason).toContain("unreadable (format: expected 1)");
+    }
+    expect(dumps).toBe(1);
+  });
+
   it("names the unsupported node class of a VertexColor graph", async () => {
     const { sourceDir, assets, readProps } = await fixture();
     const baker = createGraphBaker({
