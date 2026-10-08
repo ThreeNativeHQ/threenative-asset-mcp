@@ -237,6 +237,6 @@ describe("the pinned CUE4Parse build for uncooked UE4 SkeletalMesh packages", ()
   });
 
   it("is a new tool version, so a cached converter without the fix is rebuilt", () => {
-    expect(CUE4PARSE_SOURCE.version).not.toBe("b4e95441+threenative.58");
+    expect(CUE4PARSE_SOURCE.version).not.toBe("b4e95441+threenative.55");
   });
 });
