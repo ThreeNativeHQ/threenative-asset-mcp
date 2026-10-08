@@ -106,6 +106,12 @@ export interface PropsFile {
   /** `TextureParameterValues` — a MaterialInstanceConstant's own overrides of its parent's inputs.
    * The only place an instance's textures appear when umodel resolved the parent's instead. */
   readonly overrides: readonly CollectedTextureParameter[];
+  /**
+   * Names of `TextureParameterValues` entries whose value is `None`: UE Viewer cannot name an engine texture
+   * (`BaseFlattenNormalMap`, `WhiteSquareTexture`), so an override that points outside the pack prints as `None`.
+   * It still replaces whatever an ancestor bound to that parameter.
+   */
+  readonly unresolvedOverrides: readonly string[];
   readonly scalars: readonly ScalarParameter[];
   readonly scalarOverrides: readonly ScalarParameter[];
   readonly vectors: readonly VectorParameter[];
@@ -172,6 +178,7 @@ export function parsePropsFile(text: string): PropsFile {
   const collected: CollectedTextureParameter[] = [];
 
   const overrides: CollectedTextureParameter[] = [];
+  const unresolvedOverrides: string[] = [];
   const scalars: ScalarParameter[] = [];
   const scalarOverrides: ScalarParameter[] = [];
   const vectors: VectorParameter[] = [];
@@ -246,6 +253,7 @@ export function parsePropsFile(text: string): PropsFile {
     const name = readName(block);
     const texture = objectName(/ParameterValue\s*=\s*([^\r\n}]+)/.exec(block)?.[1] ?? "");
     if (name && texture) overrides.push({ name, texture });
+    else if (name && /ParameterValue\s*=\s*None\b/.test(block)) unresolvedOverrides.push(name);
   }
   const streamingTextures = indexedBlocks("TextureStreamingData")
     .filter((block) => !/TextureStreamingData\[\d+\]/.test(block))
@@ -309,6 +317,7 @@ export function parsePropsFile(text: string): PropsFile {
     // (a MaterialInstance has no expression nodes, so the collected block IS its overrides; on a
     // root Material it is the defaults). A real `TextureParameterValues` block wins; never both.
     overrides: parent !== undefined && overrides.length === 0 ? [...collected] : overrides,
+    unresolvedOverrides,
     scalars,
     scalarOverrides,
     vectors,
@@ -456,7 +465,8 @@ function referencedTextures(
 /** A parent's default texture that an instance below it replaces with its own. */
 interface SupersededDefault {
   readonly parameter: string;
-  readonly override: string;
+  /** The replacing texture; undefined when the override points outside the pack (an engine default). */
+  readonly override: string | undefined;
 }
 
 /**
@@ -479,9 +489,15 @@ function supersededDefaults(request: ResolveMaterialRequest): Map<string, Supers
   }
   const result = new Map<string, SupersededDefault>();
   const key = (name: string): string => name.trim().toLowerCase();
-  // An override at level i replaces defaults declared at levels above it (i + 1 and up).
+  // An override at level i replaces defaults declared at levels above it (i + 1 and up). An override whose
+  // value is `None` points at an engine texture UE Viewer cannot name (Paragon: MI_Generic_Metal sets Baked_Normal
+  // to the engine's flat normal map over its parent's T_EvilGate_Piece1_N); it supersedes the same way.
   for (let level = 0; level < chain.length; level += 1) {
-    for (const override of chain[level]!.overrides) {
+    const replacing: { name: string; texture: string | undefined }[] = [
+      ...chain[level]!.overrides,
+      ...chain[level]!.unresolvedOverrides.map((name) => ({ name, texture: undefined })),
+    ];
+    for (const override of replacing) {
       for (let ancestor = level + 1; ancestor < chain.length; ancestor += 1) {
         // The value a descendant replaces is the nearest ancestor's: an ancestor INSTANCE's own override
         // (Paragon: MM_Marble_Walls_Inst sets Plain_Wall_M, the leaf sets another) as much as a master's default.
@@ -497,7 +513,7 @@ function supersededDefaults(request: ResolveMaterialRequest): Map<string, Supers
   }
   // A texture that is also the effective value of a parameter nobody overrides is still in use;
   // suppressing it would drop a real binding.
-  const overridden = new Set(chain.flatMap((props) => props.overrides.map((override) => key(override.name))));
+  const overridden = new Set(chain.flatMap((props) => [...props.overrides.map((override) => override.name), ...props.unresolvedOverrides].map(key)));
   for (const props of chain) {
     for (const parameter of props.collected) {
       if (!overridden.has(key(parameter.name))) result.delete(parameter.texture);
@@ -542,7 +558,9 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
       // The instance replaces this parent default. A replacement for the same slot is bound
       // exactly; one for a different slot or a packed data map is never painted in its place.
       const replacementPlan = planForParameterName(replacement.parameter);
-      if (replacementPlan?.slot === plan.slot && !isDataTexture(replacement.override)) {
+      if (replacement.override === undefined) {
+        limitations.add(`${texture} is the parent default of "${replacement.parameter}", overridden by an engine texture outside the pack; it is not bound for ${plan.slot}.`);
+      } else if (replacementPlan?.slot === plan.slot && !isDataTexture(replacement.override)) {
         claimed.add(replacement.override);
         if (!bindings.has(plan.slot) && request.availableTextures.has(replacement.override)) {
           bindings.set(plan.slot, { slot: plan.slot, texture: replacement.override, source: "props", confidence: "exact", transform: replacementPlan.transform });

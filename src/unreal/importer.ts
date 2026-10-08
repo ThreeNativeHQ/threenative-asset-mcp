@@ -39,6 +39,7 @@ import {
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
 import { createGraphBaker, type GraphBaker } from "./graph-baker.js";
+import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
 import {
   assembleSceneGlb,
@@ -1124,8 +1125,11 @@ export async function packageGlb(options: {
   readonly copyright?: string | undefined;
   /** Collects textures no glTF slot fits, to be written beside the GLBs. */
   readonly sidecars?: Map<string, string>;
-  /** Multiplies positions before writing; uncooked MeshDescription coordinates are centimetres. */
-  readonly geometryScale?: number;
+  /**
+   * Multiplies positions before writing; uncooked MeshDescription coordinates are centimetres. A triple scales the
+   * glTF x, y and z axes separately (UE Viewer's `BuildScale3D`, see `mesh-build-scale.ts`).
+   */
+  readonly geometryScale?: number | readonly [number, number, number];
   /** Standalone ActorX animations exported by UE Viewer and matched to this model's joints. */
   readonly psaFiles?: readonly PsaFile[];
   /** Unique library material name -> Unreal object basename used for sidecar lookup. */
@@ -1453,13 +1457,15 @@ export async function packageGlb(options: {
       primitives += 1;
       const position = primitive.getAttribute("POSITION");
       if (!position) continue;
-      if (options.geometryScale !== undefined && options.geometryScale !== 1) {
+      const scale = options.geometryScale;
+      const factors = typeof scale === "number" ? [scale, scale, scale] : scale;
+      if (factors && factors.some((factor) => factor !== 1)) {
         const element = [0, 0, 0];
         for (let index = 0; index < position.getCount(); index += 1) {
           position.getElement(index, element);
-          element[0] = (element[0] ?? 0) * options.geometryScale;
-          element[1] = (element[1] ?? 0) * options.geometryScale;
-          element[2] = (element[2] ?? 0) * options.geometryScale;
+          element[0] = (element[0] ?? 0) * factors[0]!;
+          element[1] = (element[1] ?? 0) * factors[1]!;
+          element[2] = (element[2] ?? 0) * factors[2]!;
           position.setElement(index, element);
         }
       }
@@ -3254,6 +3260,11 @@ export async function importUnrealDirectory(
         continue;
       }
       const dnaSource = fromModernConverter ? assets.dna.get(name) : undefined;
+      // UE Viewer's raw mesh is not multiplied by the source model's BuildScale3D; Unreal's render data is.
+      const buildScale = !fromMeshDescription && !fromModernConverter && entry.meshKind !== "skeletal" ? await readPackageBuildScale3D(entry.file) : undefined;
+      if (buildScale && buildScale.some((factor) => factor !== 1)) {
+        warnings.push(`${name}: the source mesh carries BuildScale3D (${buildScale.join(", ")}); UE Viewer's geometry was scaled by it${new Set(buildScale).size > 1 ? " (non-uniform: normals are not adjusted)" : ""}.`);
+      }
       for (const { lod, path: gltfPath } of lodPaths) {
         const relativeGlb = fromMeshDescription || fromModernConverter
           ? lod === 0 ? `Models/${name}.glb` : `Models/${name}_LOD${lod}.glb`
@@ -3269,7 +3280,7 @@ export async function importUnrealDirectory(
             imageCache,
             copyright,
             sidecars,
-            geometryScale: fromMeshDescription ? 0.01 : 1,
+            geometryScale: fromMeshDescription ? 0.01 : buildScale ? ([buildScale[0], buildScale[2], buildScale[1]] as const) : 1,
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
