@@ -27,6 +27,25 @@ const FIXED = {
       importedTextures: ["/Game/Rock/T_Rock"],
       exports: [
         {
+          name: "SM_Rock",
+          class: "StaticMesh",
+          slots: [{ name: "Slot0", material: "/Game/Rock/MI_Rock.MI_Rock" }],
+          bounds: {
+            origin: [0, 0, 0],
+            boxExtent: [1100, 1100, 1100],
+            sphereRadius: 1905,
+            property: "ExtendedBounds",
+            positiveExtension: [1000, 1000, 1000],
+            negativeExtension: [1000, 1000, 1000],
+          },
+        },
+        {
+          name: "M_Rock_Master",
+          class: "Material",
+          textures: [],
+          functions: ["/Game/Rock/MF_Moss.MF_Moss"],
+        },
+        {
           name: "MI_Rock",
           class: "MaterialInstanceConstant",
           parent: "/Game/Rock/M_P.M_P",
@@ -45,6 +64,14 @@ describe("--dump-properties converter mode", () => {
     expect(CUE4PARSE_PROGRAM).toContain('"4.18" => EGame.GAME_UE4_18');
     expect(CUE4PARSE_PROGRAM).toContain('"4.0" => EGame.GAME_UE4_0');
     expect(CUE4PARSE_PROGRAM).toContain('"4.27" => EGame.GAME_UE4_27');
+    // bounds extension padding and material-function links (PRD parity S2/S3 false positives)
+    expect(CUE4PARSE_PROGRAM).toContain('"PositiveBoundsExtension"');
+    expect(CUE4PARSE_PROGRAM).toContain('"NegativeBoundsExtension"');
+    expect(CUE4PARSE_PROGRAM).toContain('["positiveExtension"]');
+    expect(CUE4PARSE_PROGRAM).toContain('["negativeExtension"]');
+    expect(CUE4PARSE_PROGRAM).toContain('"MaterialExpressionMaterialFunctionCall"');
+    expect(CUE4PARSE_PROGRAM).toContain('"MaterialFunction"');
+    expect(CUE4PARSE_PROGRAM).toContain('["functions"]');
   });
 
   it("returns the converter's JSON and passes argv through", async () => {
