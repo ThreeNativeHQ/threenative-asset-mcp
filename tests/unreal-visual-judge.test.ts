@@ -70,6 +70,15 @@ it("fails a render where the report expects colour but it is neutral", () => {
   const grey = tile(60, (x, y) => [70 + noise(x, y) * 40, 70 + noise(x, y) * 40, 70 + noise(x, y) * 40]);
   expect(judgeRender(grey).verdict).toBe("ok");
   expect(judgeRender(grey, { expectColoured: true }).verdict).toBe("fail");
+  // ...unless Unreal's own thumbnail has the same neutral colour: grey stone is real colour.
+  expect(judgeRender(grey, { expectColoured: true, colourSimilarity: 0.46 }).verdict).toBe("ok");
+  // A thumbnail that disagrees keeps it failing.
+  expect(judgeRender(grey, { expectColoured: true, colourSimilarity: 0.1 }).verdict).toBe("fail");
+});
+
+it("a thumbnail never excuses a white render", () => {
+  const white = tile(60, () => [250, 250, 250]);
+  expect(judgeRender(white, { expectColoured: true, colourSimilarity: 0.9 }).verdict).toBe("fail");
 });
 
 it("flags specks: fail below 0.2% of the tile, suspect below the tiny threshold", () => {
