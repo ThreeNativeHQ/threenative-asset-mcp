@@ -136,6 +136,8 @@ const SUPPORTED_NODE_CLASSES = [
   "Normalize",
   "ConstantBiasScale",
   "SphereMask",
+  "ObjectPositionWS",
+  "PerInstanceRandom",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -158,6 +160,8 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "BreakOutFloat2Components",
   "BreakOutFloat3Components",
   "BreakOutFloat4Components",
+  "SplitComponents",
+  "ObjectScale",
 ] as const;
 
 /**
@@ -358,6 +362,15 @@ interface CompileOptions {
 
 const PARTICLE_COLOR_NOTE =
   "ParticleColor evaluated as white: Unreal's value outside a particle emitter; the emitter's colour modules are not read";
+
+const OBJECT_POSITION_NOTE =
+  "ObjectPositionWS evaluated as the origin: a baked texture is shared by every placed instance, so one representative instance stands in";
+
+const PER_INSTANCE_RANDOM_NOTE =
+  "PerInstanceRandom evaluated as 0.5, the middle of its 0..1 range: a baked texture is shared by every placed instance";
+
+const OBJECT_SCALE_NOTE =
+  "ObjectScale evaluated as 1 (an unscaled instance): a placed instance's scale would change texture tiling; engine body unavailable";
 
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
@@ -653,6 +666,13 @@ class Compiler {
         this.approximations.add(color.every((channel) => channel === 1) ? PARTICLE_COLOR_NOTE : `ParticleColor evaluated as constant (${color.join(", ")})`);
         return this.constant([...color], 4);
       }
+      case "ObjectPositionWS":
+        // Per-instance data: the placement of the instance in the level. One representative instance (the origin).
+        this.approximations.add(OBJECT_POSITION_NOTE);
+        return this.constant([0, 0, 0], 3);
+      case "PerInstanceRandom":
+        this.approximations.add(PER_INSTANCE_RANDOM_NOTE);
+        return this.constant([0.5], 1);
       case "StaticBool":
         return this.constant([node.constants.Value === true ? 1 : 0], 1);
       case "StaticBoolParameter": {
@@ -839,6 +859,14 @@ class Compiler {
     return this.emit(parts, width, (o) => (r) => {
       for (let index = 0; index < 4; index++) r[o + index] = index < width ? r[parts[index]!.reg]! : 0;
     });
+  }
+
+  /** SplitComponents: output 0 is the whole RGB value, outputs 1..3 are R, G and B. Exact. */
+  private splitComponents(node: GraphNode, output: number, name: string): Compiled {
+    const input = this.vec(this.orderedPins(node)[0], `${name}.Input0`);
+    if (!input) return this.markUnavailable(`${name} ${node.id} has no input`);
+    if (output <= 0) return this.gather(input, [0, 1, 2]);
+    return this.gather(input, [Math.min(3, output) - 1]);
   }
 
   /** BreakOutFloatNComponents: output i is component i of Input0. */
@@ -1249,6 +1277,12 @@ class Compiler {
       return this.unary(stretched, (x) => (x < 0 ? 0 : x > 1 ? 1 : x));
     }
     if (lower === "hueshift") return this.hueShift(node, name!);
+    if (lower === "objectscale" && !node.fn?.outputs.some(Boolean)) {
+      // Outputs: Scale XYZ (vector), Scale X, Scale Y, Scale Z. The scale of the placed instance is not known to a bake.
+      this.approximations.add(OBJECT_SCALE_NOTE);
+      return output === 0 ? this.constant([1, 1, 1], 3) : this.constant([1], 1);
+    }
+    if (lower === "splitcomponents" && !node.fn?.outputs.some(Boolean)) return this.splitComponents(node, output, name!);
     // A pack that carries its own body (a Datasmith project holds UVEdit) is evaluated from that body instead.
     const hasBody = node.fn?.outputs[output] != null;
     if (lower === "customrotator" && !hasBody) return this.customRotator(node, name!);

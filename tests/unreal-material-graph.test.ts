@@ -1470,8 +1470,113 @@ describe("standard math nodes and engine utility functions seen on real BaseColo
   });
 
   it("scene and view dependent nodes stay unsupported", async () => {
-    for (const cls of ["SceneColor", "SceneTexture", "ViewProperty", "ObjectPositionWS", "PerInstanceRandom", "Time", "Panner"]) {
+    for (const cls of ["SceneColor", "SceneTexture", "ViewProperty", "Time", "Panner"]) {
       expect(await bake(makeGraph([node("u", cls)], pin("u", 0, RGB_MASK))), cls).toMatchObject({ status: "unsupported", unsupported: [cls] });
     }
+  });
+});
+
+describe("per-instance and engine utility nodes of layered cliff materials", () => {
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 4 });
+  /** An engine function with several outputs and no body, like the real ObjectScale and SplitComponents. */
+  const engineOutputs = (id: string, name: string, path: string, outputNames: string[], inputs: Raw = {}): Raw =>
+    node(id, "FunctionCall", {
+      inputs,
+      function: `/Engine/Functions/${path}/${name}.${name}`,
+      outputNames,
+      fn: { inputs: Object.fromEntries(Object.entries(inputs).map(([key, value]) => [key, value && (value as { node: string }).node])), outputs: [], output: null },
+      error: "material function could not be loaded (engine content is not in the pack)",
+    });
+  const OBJECT_SCALE = ["Scale XYZ", "Scale X", "Scale Y", "Scale Z"];
+  const SPLIT = ["RGB", "R", "G", "B"];
+
+  it("SplitComponents hands each channel of its input through exactly", async () => {
+    for (const [output, expected] of [[1, 0.2], [2, 0.4], [3, 0.6]] as const) {
+      const result = await bake(
+        makeGraph([engineOutputs("split", "SplitComponents", "Engine_MaterialFunctions02", SPLIT, { Input0: pin("c", 0, RGB_MASK) }), constant3("c", [0.2, 0.4, 0.6])], pin("split", output)),
+      );
+      expect((await pixelsOf(result))(0, 0)).toEqual([encode(expected), encode(expected), encode(expected)]);
+      if (result.status === "baked") expect(result.confidence).toBe("exact");
+    }
+    const whole = await bake(makeGraph([engineOutputs("split", "SplitComponents", "Engine_MaterialFunctions02", SPLIT, { Input0: pin("c", 0, RGB_MASK) }), constant3("c", [0.2, 0.4, 0.6])], pin("split", 0, RGB_MASK)));
+    expect((await pixelsOf(whole))(0, 0)).toEqual([encode(0.2), encode(0.4), encode(0.6)]);
+  });
+
+  it("ObjectScale is one for an unscaled instance, so world-scaled UVs keep their tiling, and says so", async () => {
+    // UV x (ObjectScale X x 2): scale 1 tiles the 2-texel stripes twice across 4 pixels. A scale that fell to 0 would read texel 0 everywhere.
+    const stripes = await pngOf(2, 2, (x) => (x === 0 ? [0, 0, 0] : [255, 255, 255]));
+    const graph = makeGraph(
+      [
+        textureSample("t", "T_Stripes", "Color", "scaled"),
+        multiply("scaled", pin("uv"), pin("scale")),
+        textureCoordinate("uv"),
+        multiply("scale", pin("objectScale", 1), pin("two")),
+        node("two", "Constant", { constants: { R: 2 } }),
+        engineOutputs("objectScale", "ObjectScale", "Engine_MaterialFunctions02/WorldPositionOffset", OBJECT_SCALE),
+      ],
+      pin("t", 0, RGB_MASK),
+    );
+    const result = await bake(graph, { T_Stripes: { png: stripes, srgb: true } });
+    const pixel = await pixelsOf(result);
+    expect([0, 1, 2, 3].map((x) => pixel(x, 0)[0])).toEqual([0, 255, 0, 255]);
+    expect(result.status === "baked" && result.confidence).toBe("heuristic");
+    expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("ObjectScale evaluated as 1"))).toBe(true);
+  });
+
+  it("PerInstanceRandom and ObjectPositionWS evaluate to one representative instance and are named, not left unsupported", async () => {
+    // BaseColor = Random x (0.4, 0.8, 0.2) + ObjectPosition x 0.01: 0.5 and the origin give (0.2, 0.4, 0.1).
+    const graph = makeGraph(
+      [
+        node("sum", "Add", { inputs: { A: pin("scaled"), B: pin("placed") } }),
+        multiply("scaled", pin("random"), pin("tint")),
+        node("random", "PerInstanceRandom"),
+        constant3("tint", [0.4, 0.8, 0.2]),
+        multiply("placed", pin("position"), pin("small")),
+        node("position", "ObjectPositionWS"),
+        node("small", "Constant", { constants: { R: 0.01 } }),
+      ],
+      pin("sum", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.2), encode(0.4), encode(0.1)]);
+    expect(result.status === "baked" && result.confidence).toBe("heuristic");
+    expect(result.status === "baked" && result.approximations).toEqual(
+      expect.arrayContaining([expect.stringMatching(/^PerInstanceRandom evaluated as 0\.5/), expect.stringMatching(/^ObjectPositionWS evaluated as the origin/)]),
+    );
+  });
+
+  it("the cliff-rock colour variation (frac of random and position, normalised) is a zero tint, not a black texture", async () => {
+    // MF_color-variation: Amount x ConstantBiasScale(dot(frac(Const(100,10,1) x Random + Position x 0.01).rg, .gb), -0.5, 2)
+    // x normalize(frac(...)), added to the texture. Real shape, node for node, on a flat 0.5 texture.
+    const flatTexture = await pngOf(2, 2, () => [128, 128, 128]);
+    const graph = makeGraph(
+      [
+        node("out", "Add", { inputs: { A: pin("variation"), B: pin("tex", 0, RGB_MASK) } }),
+        textureSample("tex", "T_Flat"),
+        multiply("variation", pin("amountTimesBias"), pin("direction")),
+        multiply("amountTimesBias", pin("amount", 0, RGB_MASK), pin("bias")),
+        vectorParameter("amount", "Variation", [0.02, 0, 0, 1]),
+        node("bias", "ConstantBiasScale", { inputs: { Input: pin("dot") }, constants: { Bias: -0.5, Scale: 2 } }),
+        node("dot", "DotProduct", { inputs: { A: pin("rg"), B: pin("gb") } }),
+        node("rg", "ComponentMask", { inputs: { Input: pin("frac") }, constants: { R: true, G: true }, channelMask: [1, 1, 0, 0] }),
+        node("gb", "ComponentMask", { inputs: { Input: pin("frac") }, constants: { G: true, B: true }, channelMask: [0, 1, 1, 0] }),
+        node("frac", "Frac", { inputs: { Input: pin("shifted") } }),
+        node("shifted", "Add", { inputs: { A: pin("randomScaled"), B: pin("positionScaled") } }),
+        multiply("randomScaled", pin("weights"), pin("random")),
+        constant3("weights", [100, 10, 1]),
+        node("random", "PerInstanceRandom"),
+        multiply("positionScaled", pin("position"), pin("small")),
+        node("position", "ObjectPositionWS"),
+        node("small", "Constant", { constants: { R: 0.01 } }),
+        node("direction", "Normalize", { inputs: { VectorInput: pin("frac") } }),
+      ],
+      pin("out", 0, RGB_MASK),
+    );
+    const result = await bake(graph, { T_Flat: { png: flatTexture, srgb: true } });
+    const texel = encode(decode(128));
+    const [r, g, b] = (await pixelsOf(result))(0, 0);
+    for (const channel of [r, g, b]) expect(Math.abs(channel! - texel)).toBeLessThanOrEqual(1);
+    expect(result.status === "baked" && result.confidence).toBe("heuristic");
   });
 });
