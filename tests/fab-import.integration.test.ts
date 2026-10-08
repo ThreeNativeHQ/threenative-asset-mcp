@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { NodeIO } from "@gltf-transform/core";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { FabCli, FabCliError, preferredPlatform } from "../src/fab/fabcli.js";
+import { FabCli, FabCliError, featuredImageUrl, preferredPlatform } from "../src/fab/fabcli.js";
 import { classifyLicenses } from "../src/fab/license.js";
 import { importUnrealDirectory } from "../src/unreal/importer.js";
 import { isFatalHandlerError, licencesReader } from "../src/unreal/parity-run.js";
@@ -855,6 +855,57 @@ describe("listing what the account already owns", () => {
     const result = await handler({ unrealOnly: true });
     if ("isError" in result) throw new Error(JSON.stringify(errorOf(result)));
     expect(result.structuredContent.total).toBe(120);
+  });
+});
+
+describe("gallery images in the library payload", () => {
+  const gallery = (images: unknown) => ({
+    results: [
+      {
+        title: "Pack",
+        description: "",
+        url: "",
+        distributionMethod: "ASSET_PACK",
+        customAttributes: [{ ListingIdentifier: LISTING }],
+        categories: [],
+        images,
+        projectVersions: [
+          { artifactId: "A", engineVersions: ["UE_5.4"], targetPlatforms: ["Windows"] },
+        ],
+      },
+    ],
+  });
+  const owned = async (library: unknown) => {
+    const test = await harness({ library });
+    const cli = new FabCli({
+      tool: { name: "fabcli", path: test.environment.THREENATIVE_FABCLI_PATH!, version: "0.1.0" },
+    });
+    return (await cli.ownedListings())[0]!;
+  };
+
+  it("parses images (string sizes as FabCLI sends them) and picks the Featured one", async () => {
+    const listing = await owned(
+      gallery([
+        { type: "Screenshot", url: "https://media.fab.com/a.jpg", width: "100", height: "50" },
+        { type: "Featured", url: "https://media.fab.com/f.jpg", width: "640", height: "349" },
+      ]),
+    );
+    expect(listing.images?.[1]).toEqual({
+      type: "Featured",
+      url: "https://media.fab.com/f.jpg",
+      width: 640,
+      height: 349,
+    });
+    expect(featuredImageUrl(listing)).toBe("https://media.fab.com/f.jpg");
+  });
+
+  it("falls back to the first image, and to undefined when there are none or they are malformed", async () => {
+    const first = await owned(gallery([{ type: "Screenshot", url: "https://media.fab.com/a.jpg" }]));
+    expect(featuredImageUrl(first)).toBe("https://media.fab.com/a.jpg");
+    expect(featuredImageUrl(await owned(gallery(null)))).toBeUndefined();
+    const malformed = await owned(gallery([{ type: "Featured" }, 7, { url: "https://x/y.png" }]));
+    expect(malformed.images).toHaveLength(1);
+    expect(featuredImageUrl(await owned({ results: [{ title: "No images" }] }))).toBeUndefined();
   });
 });
 
