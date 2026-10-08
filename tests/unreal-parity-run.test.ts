@@ -26,6 +26,7 @@ import {
   parityLine,
   parseParityArgs,
   carriedOverEntries,
+  entryFromHandlerError,
   licencesReader,
   parseLicencesFile,
   readPreviousEntries,
@@ -124,14 +125,73 @@ describe("summarizeEntries", () => {
     expect(summary.byRoute.cue4parse).toEqual({ attempted: 1, pass: 1, fail: 0, unverified: 0, error: 0 });
     expect(summary.topFailureClasses[0]).toEqual({ class: "S4:grey", count: 2 });
     expect(summary.topFailureClasses.map((c) => c.class)).toContain("error:UNREAL_TOOL_FAILED");
-    expect(parityLine(summary)).toBe("PARITY pass=2/4 (50.0% of scored) attempted=6 (33.3% of attempted) unverified=1 error=1");
+    expect(parityLine(summary)).toBe("PARITY pass=2/4 (50.0% of scored) attempted=6 (33.3% of attempted) unverified=1 error=1 skipped=0");
   });
 
   it("reports null rates for an empty run", () => {
     const summary = summarizeEntries([]);
     expect(summary.passRateScored).toBeNull();
     expect(summary.passRateAttempted).toBeNull();
-    expect(parityLine(summary)).toBe("PARITY pass=0/0 (n/a of scored) attempted=0 (n/a of attempted) unverified=0 error=0");
+    expect(parityLine(summary)).toBe("PARITY pass=0/0 (n/a of scored) attempted=0 (n/a of attempted) unverified=0 error=0 skipped=0");
+  });
+});
+
+describe("skipped: no importable content", () => {
+  const base = {
+    listingId: "bbbbbbbb-0000-0000-0000-000000000000",
+    title: "OpenRigLogic Sample Content",
+    artifactId: "ORL",
+    engines: ["UE_5.4"],
+    oldestEngine: "UE_5.4",
+    route: "cue4parse" as const,
+  };
+  const emptyMessage = `The source directory has no Unreal packages. ${"x".repeat(300)}`;
+
+  it("turns UNREAL_SOURCE_EMPTY into a skipped entry and keeps every other code an error", () => {
+    const skipped = entryFromHandlerError(base, { code: "UNREAL_SOURCE_EMPTY", message: emptyMessage, retryable: false }, 5);
+    expect(skipped).toMatchObject({
+      status: "skipped",
+      classes: ["skipped:no-importable-content"],
+      summary: null,
+      durationMs: 5,
+      error: { code: "UNREAL_SOURCE_EMPTY" },
+    });
+    expect(skipped.reasons).toEqual([`no importable content: ${emptyMessage.slice(0, 160)}`]);
+    for (const code of ["UNREAL_TOOL_FAILED", "UNKNOWN", "FAB_AUTH_REQUIRED"]) {
+      const other = entryFromHandlerError(base, { code, message: "boom", retryable: false }, 5);
+      expect(other).toMatchObject({ status: "error", classes: [], reasons: [`${code}: boom`], error: { code } });
+    }
+  });
+
+  it("excludes skipped entries from attempted and both rates, and lists them", () => {
+    const summary = summarizeEntries([
+      entry({ status: "pass" }),
+      entry({ status: "fail", artifactId: "A2" }),
+      entry({ ...base, status: "skipped", classes: ["skipped:no-importable-content"] }),
+    ]);
+    expect(summary).toMatchObject({ attempted: 2, pass: 1, fail: 1, error: 0, skipped: 1 });
+    expect(summary.passRateScored).toBeCloseTo(0.5);
+    expect(summary.passRateAttempted).toBeCloseTo(0.5);
+    expect(summary.skippedNoContent).toEqual([{ title: base.title, artifactId: "ORL" }]);
+    expect(parityLine(summary)).toBe(
+      "PARITY pass=1/2 (50.0% of scored) attempted=2 (50.0% of attempted) unverified=0 error=0 skipped=1",
+    );
+    const onlySkipped = summarizeEntries([entry({ ...base, status: "skipped" })]);
+    expect(onlySkipped.attempted).toBe(0);
+    expect(onlySkipped.passRateAttempted).toBeNull();
+    expect(onlySkipped.byRoute).toEqual({});
+  });
+
+  it("is settled: resume keeps it, carry-over keeps it and the merge keeps it", () => {
+    const skippedEntry = entry({ ...base, status: "skipped" });
+    expect(isSettled(skippedEntry)).toBe(true);
+    const corpus = [{ listingId: base.listingId, title: base.title, artifactId: "ORL", engines: base.engines, oldestEngine: "UE_5.4", route: "cue4parse" as const }];
+    const { todo, kept } = selectResume(corpus, [skippedEntry]);
+    expect(todo).toEqual([]);
+    expect(kept).toEqual([skippedEntry]);
+    const dropped = [{ listingId: base.listingId, title: base.title, artifactId: "ORL", reason: "skipped: duplicate" }];
+    expect(carriedOverEntries([skippedEntry], dropped)).toEqual([skippedEntry]);
+    expect(mergeScorecardEntries([skippedEntry], [])).toEqual([skippedEntry]);
   });
 });
 

@@ -39,6 +39,7 @@ import {
   selectResume,
   SweepLockHeldError,
   summarizeEntries,
+  entryFromHandlerError,
   summaryOf,
   unsupportedNodeLines,
   upsertEntry,
@@ -325,15 +326,7 @@ async function main(): Promise<number> {
         if ("isError" in result && result.isError) {
           const error = parseHandlerError(result.content[0]?.text);
           if (isFatalHandlerError(error)) fatal = error;
-          entry = {
-            ...base,
-            status: "error",
-            reasons: [`${error.code}: ${error.message}`],
-            classes: [],
-            summary: null,
-            durationMs: Date.now() - started,
-            error: { code: error.code, message: error.message },
-          };
+          entry = entryFromHandlerError(base, error, Date.now() - started);
         } else {
           const report = JSON.parse(await readFile(join(outputDir, "import-report.json"), "utf8")) as ImportReport;
           importerVersion = report.importer.version;

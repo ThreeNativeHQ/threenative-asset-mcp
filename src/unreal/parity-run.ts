@@ -24,7 +24,7 @@ import { compareEngines, decoderRoute, oldestEngine } from "../fab/routes.js";
 import type { MissAttribution, PackScore } from "./parity.js";
 
 export type ParityRoute = "umodel" | "mesh-description" | "cue4parse" | "unknown";
-export type ParityStatus = "pass" | "fail" | "unverified" | "error";
+export type ParityStatus = "pass" | "fail" | "unverified" | "error" | "skipped";
 
 /** Listing id prefixes (8 characters) of the two packs too large for a routine sweep. */
 export const SIZE_EXCLUDED_PREFIXES: readonly string[] = ["4898e707", "0281d63e"];
@@ -82,6 +82,32 @@ export interface ScorecardEntry {
   readonly error?: { readonly code: string; readonly message: string };
 }
 
+/** Handler error code for a download with no Unreal packages (a code plugin or sample shell). */
+export const SOURCE_EMPTY_CODE = "UNREAL_SOURCE_EMPTY";
+export const SKIPPED_NO_CONTENT_CLASS = "skipped:no-importable-content";
+
+/**
+ * The scorecard entry for an import the handler refused. An empty source is correct importer
+ * behaviour, not a failure: it is `skipped` and stays out of the pass-rate denominators. Every
+ * other code stays an `error`.
+ */
+export function entryFromHandlerError(
+  base: Pick<ScorecardEntry, "listingId" | "title" | "artifactId" | "engines" | "oldestEngine" | "route">,
+  error: HandlerError,
+  durationMs: number,
+): ScorecardEntry {
+  const skipped = error.code === SOURCE_EMPTY_CODE;
+  return {
+    ...base,
+    status: skipped ? "skipped" : "error",
+    reasons: [skipped ? `no importable content: ${error.message.slice(0, 160)}` : `${error.code}: ${error.message}`],
+    classes: skipped ? [SKIPPED_NO_CONTENT_CLASS] : [],
+    summary: null,
+    durationMs,
+    error: { code: error.code, message: error.message },
+  };
+}
+
 export interface RouteTally {
   attempted: number;
   pass: number;
@@ -96,6 +122,10 @@ export interface ScorecardSummary {
   readonly fail: number;
   readonly unverified: number;
   readonly error: number;
+  /** Entries with nothing to import; not counted in `attempted` or either rate. */
+  readonly skipped: number;
+  /** The skipped entries by title and artifact, so none is hidden. */
+  readonly skippedNoContent: readonly { readonly title: string; readonly artifactId: string }[];
   /** pass / (pass + fail); null when nothing was scored. */
   readonly passRateScored: number | null;
   /** pass / attempted; null when nothing was attempted. */
@@ -365,6 +395,7 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
   const classCounts = new Map<string, number>();
   const nodeSections = new Map<string, { sections: number; packs: number }>();
   const attribution = { bakedAway: 0, bakedStillGrey: 0, unsupportedNode: 0, unavailable: 0, noGraph: 0 };
+  const skippedNoContent: { title: string; artifactId: string }[] = [];
   let graphBaked = 0;
   let s4Misses: number | null = null;
   for (const entry of entries) {
@@ -380,6 +411,11 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
       }
       for (const key of Object.keys(attribution) as (keyof MissAttribution)[])
         attribution[key] += s4.missAttribution?.[key] ?? 0;
+    }
+    if (entry.status === "skipped") {
+      skippedNoContent.push({ title: entry.title, artifactId: entry.artifactId });
+      for (const name of entry.classes) classCounts.set(name, (classCounts.get(name) ?? 0) + 1);
+      continue;
     }
     const tally = (byRoute[entry.route] ??= emptyTally());
     for (const target of [total, tally]) {
@@ -399,6 +435,8 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
     fail: total.fail,
     unverified: total.unverified,
     error: total.error,
+    skipped: skippedNoContent.length,
+    skippedNoContent,
     passRateScored: scored === 0 ? null : total.pass / scored,
     passRateAttempted: total.attempted === 0 ? null : total.pass / total.attempted,
     byRoute,
@@ -481,7 +519,7 @@ export function unsupportedNodeLines(summary: ScorecardSummary, top = 5): string
 export function parityLine(summary: ScorecardSummary): string {
   const scored = summary.pass + summary.fail;
   const pct = (rate: number | null): string => (rate === null ? "n/a" : `${(rate * 100).toFixed(1)}%`);
-  return `PARITY pass=${summary.pass}/${scored} (${pct(summary.passRateScored)} of scored) attempted=${summary.attempted} (${pct(summary.passRateAttempted)} of attempted) unverified=${summary.unverified} error=${summary.error}`;
+  return `PARITY pass=${summary.pass}/${scored} (${pct(summary.passRateScored)} of scored) attempted=${summary.attempted} (${pct(summary.passRateAttempted)} of attempted) unverified=${summary.unverified} error=${summary.error} skipped=${summary.skipped}`;
 }
 
 // --- resume -------------------------------------------------------------------------------------
@@ -496,11 +534,11 @@ export function isAuthEntry(entry: ScorecardEntry): boolean {
 }
 
 /**
- * Only pass, fail and unverified are settled. Every error is re-run on `--resume`: licence,
+ * Only pass, fail, unverified and skipped (nothing to import) are settled. Every error is re-run on `--resume`: licence,
  * browser and network errors are transient, and a recorded error says nothing about the pack.
  */
 export function isSettled(entry: ScorecardEntry): boolean {
-  return entry.status === "pass" || entry.status === "fail" || entry.status === "unverified";
+  return entry.status === "pass" || entry.status === "fail" || entry.status === "unverified" || entry.status === "skipped";
 }
 
 export function selectResume(
