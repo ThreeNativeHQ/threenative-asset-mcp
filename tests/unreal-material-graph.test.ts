@@ -369,7 +369,7 @@ describe("bakeGraph", () => {
     const graph = makeGraph(
       [
         node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("contrast") }, outputNames: ["BaseColor", "Metallic"] }),
-        engineCall("contrast", "CheapContrast", { Input0: pin("make"), Input1: pin("amount") }),
+        engineCall("contrast", "MatLayerBlend_Tint", { Input0: pin("make"), Input1: pin("amount") }),
         node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("c") } }),
         constant3("c", [0.5, 0.5, 0.5]),
         node("amount", "Constant", { constants: { R: 0.2 } }),
@@ -377,7 +377,7 @@ describe("bakeGraph", () => {
       pin("break", 0, RGB_MASK),
     );
     const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
-    expect(result).toMatchObject({ status: "unsupported", unsupported: ["CheapContrast"] });
+    expect(result).toMatchObject({ status: "unsupported", unsupported: ["MatLayerBlend_Tint"] });
   });
 
   it("refuses a graph whose BaseColor needs another attribute of a Break node", async () => {
@@ -679,6 +679,151 @@ describe("Desaturation and SpeedTreeColorVariation", () => {
   });
 });
 
+describe("SetMaterialAttributes, PivotPainter2FoliageShader, Blend_Overlay and CheapContrast", () => {
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  const breakBaseColor = (source: string): Raw =>
+    node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: ["BaseColor", "Metallic"] });
+  const makeColour = (colour: string): Raw => node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin(colour, 0, RGB_MASK) } });
+  const PIVOT = "PivotPainter2FoliageShader: world-position offset ignored; engine body unavailable";
+
+  it("SetMaterialAttributes uses a wired Base Color override, else passes the incoming BaseColor through", async () => {
+    const overridden = await bake(
+      makeGraph([breakBaseColor("set"), node("set", "SetMaterialAttributes", { inputs: { MaterialAttributes: pin("make"), "Base Color": pin("over", 0, RGB_MASK) } }), makeColour("c"), constant3("c", [0.25, 0.5, 0.75]), constant3("over", [0.5, 0.125, 1])], pin("break", 0, RGB_MASK)),
+    );
+    expect((await pixelsOf(overridden))(0, 0)).toEqual([encode(0.5), encode(0.125), 255]);
+    if (overridden.status === "baked") expect(overridden.confidence).toBe("exact");
+    for (const incoming of ["MaterialAttributes", "Inputs[0]"]) {
+      const passed = await bake(
+        makeGraph([breakBaseColor("set"), node("set", "SetMaterialAttributes", { inputs: { [incoming]: pin("make"), Metallic: pin("c") } }), makeColour("c"), constant3("c", [0.25, 0.5, 0.75])], pin("break", 0, RGB_MASK)),
+      );
+      expect((await pixelsOf(passed))(1, 1)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    }
+  });
+
+  it("SetMaterialAttributes with neither attributes nor override is unavailable", async () => {
+    const result = await bake(makeGraph([breakBaseColor("set"), node("set", "SetMaterialAttributes")], pin("break", 0, RGB_MASK)));
+    expect(result.status).toBe("unavailable");
+  });
+
+  it("PivotPainter2FoliageShader passes its attributes through and names the ignored offset", async () => {
+    const result = await bake(
+      makeGraph([breakBaseColor("pp"), engineCall("pp", "PivotPainter2FoliageShader", { "Material Attributes": pin("make") }), makeColour("c"), constant3("c", [0.25, 0.5, 0.75])], pin("break", 0, RGB_MASK)),
+    );
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    if (result.status === "baked") {
+      expect(result.confidence).toBe("heuristic");
+      expect(result.approximations).toEqual([PIVOT]);
+    }
+  });
+
+  it("Blend_Overlay is exact per channel: 2*Base*Blend below 0.5, else 1-2*(1-Base)*(1-Blend)", async () => {
+    // Base (0.25, 0.5, 0.75), Blend (0.6, 0.2, 0.2) by hand:
+    //   R: 0.25 < 0.5      -> 2 * 0.25 * 0.6          = 0.3
+    //   G: 0.5 is not < 0.5 -> 1 - 2 * 0.5 * 0.8       = 0.2
+    //   B: 0.75            -> 1 - 2 * 0.25 * 0.8       = 0.6
+    for (const pins of [["Base", "Blend"], ["Input0", "Input1"]] as const) {
+      const result = await bake(
+        makeGraph(
+          [engineCall("o", "Blend_Overlay", { [pins[0]]: pin("base", 0, RGB_MASK), [pins[1]]: pin("blend", 0, RGB_MASK) }), constant3("base", [0.25, 0.5, 0.75]), constant3("blend", [0.6, 0.2, 0.2])],
+          pin("o", 0, RGB_MASK),
+        ),
+      );
+      expect((await pixelsOf(result))(0, 1)).toEqual([encode(0.3), encode(0.2), encode(0.6)]);
+      if (result.status === "baked") expect(result.confidence).toBe("exact");
+    }
+  });
+
+  it("CheapContrast is lerp(-Contrast, 1+Contrast, In) clamped to [0, 1]", async () => {
+    // Contrast 0.2: -0.2 + 1.4 * In. In (0.3, 0.5, 0.9) -> (0.22, 0.5, 1.06 -> 1).
+    for (const pins of [["In", "Contrast"], ["Input0", "Input1"]] as const) {
+      const result = await bake(
+        makeGraph(
+          [engineCall("c", "CheapContrast", { [pins[0]]: pin("in", 0, RGB_MASK), [pins[1]]: pin("amount") }), constant3("in", [0.3, 0.5, 0.9]), node("amount", "Constant", { constants: { R: 0.2 } })],
+          pin("c", 0, RGB_MASK),
+        ),
+      );
+      expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.22), encode(0.5), 255]);
+      if (result.status === "baked") expect(result.confidence).toBe("exact");
+    }
+    // A negative result clamps to 0: In 0.1 -> -0.06.
+    const dark = await bake(
+      makeGraph([engineCall("c", "CheapContrast", { In: pin("in", 0, RGB_MASK), Contrast: pin("amount") }), constant3("in", [0.1, 0.1, 0.1]), node("amount", "Constant", { constants: { R: 0.2 } })], pin("c", 0, RGB_MASK)),
+    );
+    expect((await pixelsOf(dark))(0, 0)).toEqual([0, 0, 0]);
+  });
+
+  it("CheapContrast clamps before downstream arithmetic sees the value", async () => {
+    // In (0.1, 0.5, 0.9), Contrast 0.2 -> raw (-0.06, 0.5, 1.06) -> clamped (0, 0.5, 1). Add 0.1: (0.1, 0.6, 1.1); Multiply 0.5 would give (0, 0.25, 0.5).
+    const graph = makeGraph(
+      [
+        node("sum", "Add", { inputs: { A: pin("c", 0, RGB_MASK) }, constants: { ConstB: 0.1 } }),
+        engineCall("c", "CheapContrast", { In: pin("in", 0, RGB_MASK), Contrast: pin("amount") }),
+        constant3("in", [0.1, 0.5, 0.9]),
+        node("amount", "Constant", { constants: { R: 0.2 } }),
+      ],
+      pin("sum", 0, RGB_MASK),
+    );
+    expect((await pixelsOf(await bake(graph)))(0, 0)).toEqual([encode(0.1), encode(0.6), 255]);
+    const scaled = makeGraph(
+      [
+        node("half", "Multiply", { inputs: { A: pin("c", 0, RGB_MASK) }, constants: { ConstB: 0.5 } }),
+        engineCall("c", "CheapContrast", { In: pin("in", 0, RGB_MASK), Contrast: pin("amount") }),
+        constant3("in", [0.1, 0.5, 0.9]),
+        node("amount", "Constant", { constants: { R: 0.2 } }),
+      ],
+      pin("half", 0, RGB_MASK),
+    );
+    expect((await pixelsOf(await bake(scaled)))(0, 0)).toEqual([0, encode(0.25), encode(0.5)]);
+  });
+
+  it("an engine function with an unwired colour input is unavailable", async () => {
+    for (const name of ["Blend_Overlay", "CheapContrast", "PivotPainter2FoliageShader"]) {
+      const result = await bake(makeGraph([engineCall("f", name, { Base: null })], pin("f", 0, RGB_MASK)));
+      expect(result.status).toBe("unavailable");
+    }
+  });
+
+  it("bakes Set(PivotPainter(Make(Multiply(Desaturation(SpeedTreeColorVariation(texture)), tint)))) and names only functions on the path", async () => {
+    const source: Rgb = [200, 100, 50];
+    const body = (withPivot: boolean): Raw[] => [
+      breakBaseColor("set"),
+      node("set", "SetMaterialAttributes", { inputs: { MaterialAttributes: pin(withPivot ? "pp" : "make") } }),
+      ...(withPivot ? [engineCall("pp", "PivotPainter2FoliageShader", { "Material Attributes": pin("make") })] : []),
+      makeColour("mul"),
+      multiply("mul", pin("d", 0, RGB_MASK), pin("tint")),
+      node("d", "Desaturation", { inputs: { Input: pin("v", 0, RGB_MASK), Fraction: pin("f") } }),
+      node("f", "Constant", { constants: { R: 0.5 } }),
+      engineCall("v", "SpeedTreeColorVariation", { "Base Color": pin("t", 0, RGB_MASK) }),
+      textureSample("t", "T_Source"),
+      constant3("tint", [1, 0.5, 0]),
+    ];
+    const textures = { T_Source: { png: await flat(source)(), srgb: true } };
+    const linear = source.map(decode);
+    const g = linear[0]! * 0.3 + linear[1]! * 0.59 + linear[2]! * 0.11;
+    const expected = linear.map((channel, index) => encode((channel + (g - channel) * 0.5) * [1, 0.5, 0][index]!));
+
+    const full = await bake(makeGraph(body(true), pin("break", 0, RGB_MASK)), textures);
+    expect((await pixelsOf(full))(1, 0)).toEqual(expected);
+    if (full.status === "baked") {
+      expect(full.confidence).toBe("heuristic");
+      expect(full.approximations).toEqual([PIVOT, "SpeedTreeColorVariation: per-instance colour variation ignored; engine body unavailable"]);
+    }
+    const bare = await bake(makeGraph(body(false), pin("break", 0, RGB_MASK)), textures);
+    if (bare.status === "baked") expect(bare.approximations).toEqual(["SpeedTreeColorVariation: per-instance colour variation ignored; engine body unavailable"]);
+    // Without the SpeedTree call either, nothing is approximated.
+    const exact = await bake(
+      makeGraph([breakBaseColor("set"), node("set", "SetMaterialAttributes", { inputs: { MaterialAttributes: pin("make") } }), makeColour("c"), constant3("c", [0.5, 0.5, 0.5])], pin("break", 0, RGB_MASK)),
+    );
+    if (exact.status === "baked") expect(exact).toMatchObject({ confidence: "exact", approximations: [] });
+  });
+
+  it("lists them in the supported sets", () => {
+    expect(supportedNodeClasses()).toContain("SetMaterialAttributes");
+    for (const name of ["PivotPainter2FoliageShader", "Blend_Overlay", "CheapContrast"]) expect(supportedEngineFunctions()).toContain(name);
+  });
+});
+
 describe("graphPathClasses and supportedNodeClasses", () => {
   it("lists the classes on the active path only", () => {
     const nodes: Raw[] = [
@@ -705,13 +850,13 @@ describe("graphPathClasses and supportedNodeClasses", () => {
     const graph = makeGraph(
       [
         node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("contrast") }, outputNames: ["BaseColor"] }),
-        engineCall("contrast", "CheapContrast", { Input0: pin("make") }),
+        engineCall("contrast", "MatLayerBlend_Tint", { Input0: pin("make") }),
         node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("v") } }),
         node("v", "VertexColor"),
       ],
       pin("break", 0, RGB_MASK),
     );
-    expect(graphPathClasses(graph, "baseColor")).toEqual(["BreakMaterialAttributes", "CheapContrast", "FunctionCall", "MakeMaterialAttributes", "VertexColor"]);
+    expect(graphPathClasses(graph, "baseColor")).toEqual(["BreakMaterialAttributes", "FunctionCall", "MakeMaterialAttributes", "MatLayerBlend_Tint", "VertexColor"]);
   });
 
   it("exposes the closed node set", () => {

@@ -111,10 +111,17 @@ const SUPPORTED_NODE_CLASSES = [
   "MakeMaterialAttributes",
   "BreakMaterialAttributes",
   "BlendMaterialAttributes",
+  "SetMaterialAttributes",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
-const SUPPORTED_ENGINE_FUNCTIONS = ["MatLayerBlend_Standard", "MatLayerBlend_AO", "MatLayerBlend_BakedNormal", "FuzzyShading", "SpeedTreeColorVariation"] as const;
+const SUPPORTED_ENGINE_FUNCTIONS = [
+  "MatLayerBlend_Standard", "MatLayerBlend_AO", "MatLayerBlend_BakedNormal", "FuzzyShading",
+  "SpeedTreeColorVariation",
+  "PivotPainter2FoliageShader",
+  "Blend_Overlay",
+  "CheapContrast",
+] as const;
 
 export function supportedNodeClasses(): readonly string[] {
   return SUPPORTED_NODE_CLASSES;
@@ -583,6 +590,8 @@ class Compiler {
         return this.breakAttributes(node, output);
       case "BlendMaterialAttributes":
         return this.blendAttributes(node);
+      case "SetMaterialAttributes":
+        return this.setAttributes(node);
       default:
         return this.unsupportedNode(node);
     }
@@ -709,6 +718,54 @@ class Compiler {
     return this.blendAttrs(a, b, alpha);
   }
 
+  /**
+   * SetMaterialAttributes: the incoming attributes (pin `MaterialAttributes`, else `Inputs[0]`/`Inputs`, else the
+   * first wired pin that evaluates to attributes) with per-attribute overrides. Only BaseColor is carried, so a wired
+   * `Base Color`/`BaseColor` pin replaces it and every other override is irrelevant to this bake.
+   */
+  private setAttributes(node: GraphNode): Compiled {
+    const override = this.namedPin(node, ["basecolor"]);
+    const incomingName = this.namedPin(node, ["materialattributes", "inputs0", "inputs"]);
+    let incoming: Attrs | undefined;
+    if (incomingName) incoming = this.attrs(incomingName, "SetMaterialAttributes.MaterialAttributes");
+    else {
+      for (const input of Object.values(node.inputs)) {
+        if (!input || input === override) continue;
+        const compiled = this.pin(input);
+        if (compiled?.kind === "attr") {
+          incoming = compiled;
+          break;
+        }
+      }
+    }
+    if (override) {
+      const colour = this.vec(override, "SetMaterialAttributes.BaseColor");
+      return { kind: "attr", baseColor: colour ?? null };
+    }
+    return incoming ?? this.markUnavailable(`SetMaterialAttributes ${node.id} has no MaterialAttributes input`);
+  }
+
+  /** The wired pin whose name, ignoring case and non-alphanumerics, equals one of `names` (tried in order). */
+  private namedPin(node: GraphNode, names: readonly string[]): GraphInput | undefined {
+    const normalised = Object.entries(node.inputs).map(([key, input]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ""), input] as const);
+    for (const wanted of names) {
+      const found = normalised.find(([key, input]) => key === wanted && input);
+      if (found) return found[1] ?? undefined;
+    }
+    return undefined;
+  }
+
+  /** Two colour operands of an engine function, by their documented pin names or Input0/Input1. */
+  private engineOperands(node: GraphNode, first: string, second: string, name: string): [Val, Val] | undefined {
+    const a = this.vec(this.namedPin(node, [first, "input0"]), `${name}.${first}`);
+    const b = this.vec(this.namedPin(node, [second, "input1"]), `${name}.${second}`);
+    if (!a || !b) {
+      this.markUnavailable(`${name} ${node.id} is missing its ${first} or ${second} input`);
+      return undefined;
+    }
+    return [a, b];
+  }
+
   private blendAttrs(base: Attrs, top: Attrs, alpha: Val): Attrs {
     const black = this.constant([0, 0, 0], 3);
     return { kind: "attr", baseColor: this.lerp(base.baseColor ?? black, top.baseColor ?? black, alpha) };
@@ -733,6 +790,24 @@ class Compiler {
       this.approximations.add("view-dependent fuzzy shading ignored");
       const pin = node.inputs["Material Input"] ? "Material Input" : "Input0";
       return this.passThrough(node, pin, name!);
+    }
+    if (lower === "pivotpainter2foliageshader") {
+      // It only writes world-position offset; the attributes it receives are the surface the bake wants.
+      this.approximations.add(`${name}: world-position offset ignored; engine body unavailable`);
+      const wired = this.namedPin(node, ["materialattributes", "materialinput", "input0"]);
+      return this.pin(wired ?? Object.values(node.inputs).find((input) => input)) ?? this.markUnavailable(`${name} ${node.id} has no attributes input`);
+    }
+    if (lower === "blend_overlay") {
+      const operands = this.engineOperands(node, "base", "blend", name!);
+      if (!operands) return this.constant([0], 1);
+      return this.binary(operands[0], operands[1], (x, y) => (x < 0.5 ? 2 * x * y : 1 - 2 * (1 - x) * (1 - y)));
+    }
+    if (lower === "cheapcontrast") {
+      const operands = this.engineOperands(node, "in", "contrast", name!);
+      if (!operands) return this.constant([0], 1);
+      const [input, contrast] = operands;
+      const stretched = this.lerp(this.unary(contrast, (x) => -x), this.unary(contrast, (x) => 1 + x), input);
+      return this.unary(stretched, (x) => (x < 0 ? 0 : x > 1 ? 1 : x));
     }
     if (lower === "speedtreecolorvariation") {
       // Per-instance colour variation driven by instance and world data, which a baked texture cannot hold.
