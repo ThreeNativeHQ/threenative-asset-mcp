@@ -121,6 +121,7 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "PivotPainter2FoliageShader",
   "Blend_Overlay",
   "CheapContrast",
+  "HueShift",
 ] as const;
 
 export function supportedNodeClasses(): readonly string[] {
@@ -809,6 +810,7 @@ class Compiler {
       const stretched = this.lerp(this.unary(contrast, (x) => -x), this.unary(contrast, (x) => 1 + x), input);
       return this.unary(stretched, (x) => (x < 0 ? 0 : x > 1 ? 1 : x));
     }
+    if (lower === "hueshift") return this.hueShift(node, name!);
     if (lower === "speedtreecolorvariation") {
       // Per-instance colour variation driven by instance and world data, which a baked texture cannot hold.
       // The colour input is the first wired pin named like a colour, else Input0, else the first wired pin.
@@ -834,6 +836,45 @@ class Compiler {
     if (name) this.classes.add(name);
     for (const input of Object.values(node.inputs)) this.pin(input);
     return this.constant([0], 1);
+  }
+
+  /**
+   * HueShift(Input0 = colour, Input1 = shift): the engine body is not in the pack, so Input1 is read as a fraction of
+   * a full turn and the colour's hue is rotated by it (saturation and value unchanged). A zero or unwired shift is
+   * the identity and exact; anything else is a heuristic.
+   */
+  private hueShift(node: GraphNode, name: string): Compiled {
+    const colour = this.vec(this.namedPin(node, ["input0"]), `${name}.Input0`);
+    if (!colour) return this.markUnavailable(`${name} ${node.id} has no Input0 input`);
+    const wired = this.namedPin(node, ["input1"]);
+    const shift = wired ? this.vec(wired, `${name}.Input1`) : undefined;
+    if (!shift || (shift.konst && this.registers[shift.reg] === 0)) return colour;
+    this.approximations.add(`${name}: engine body unavailable; hue rotated by Input1 as a fraction of a turn`);
+    return this.emit([colour, shift], colour.n, (o) => (r) => {
+      const red = r[colour.reg]!;
+      const green = r[colour.reg + 1]!;
+      const blue = r[colour.reg + 2]!;
+      const max = Math.max(red, green, blue);
+      const min = Math.min(red, green, blue);
+      const chroma = max - min;
+      let hue = 0;
+      if (chroma > 0) {
+        if (max === red) hue = ((green - blue) / chroma) % 6;
+        else if (max === green) hue = (blue - red) / chroma + 2;
+        else hue = (red - green) / chroma + 4;
+        hue /= 6;
+      }
+      const turned = (((hue + r[shift.reg]!) % 1) + 1) % 1;
+      const sector = turned * 6;
+      const second = chroma * (1 - Math.abs((sector % 2) - 1));
+      const floor = min;
+      const index = Math.min(5, Math.floor(sector));
+      const [dr, dg, db] = [[chroma, second, 0], [second, chroma, 0], [0, chroma, second], [0, second, chroma], [second, 0, chroma], [chroma, 0, second]][index]!;
+      r[o] = dr! + floor;
+      r[o + 1] = dg! + floor;
+      r[o + 2] = db! + floor;
+      r[o + 3] = r[colour.reg + 3]!;
+    });
   }
 
   private passThrough(node: GraphNode, pinName: string, name: string): Compiled {
