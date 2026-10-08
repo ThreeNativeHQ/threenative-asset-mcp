@@ -139,6 +139,20 @@ function headerPrerequisite(
   };
 }
 
+// FabCLI is dynamically linked against WebKitGTK; on a fresh Debian host it installs but will not start.
+function libraryPrerequisite(id: string, soname: string, apt: string): Prerequisite {
+  return {
+    id,
+    label: `${soname}`,
+    group: "toolchain",
+    check: linuxOnly(() => {
+      const result = spawnSync("ldconfig", ["-p"], { encoding: "utf8", timeout: 5_000, shell: false });
+      return { ok: result.status === 0 && result.stdout.includes(soname) };
+    }),
+    fix: installFix(apt, apt, `install the package that provides ${soname}`),
+  };
+}
+
 const nodePrerequisite: Prerequisite = {
   id: "node",
   label: "node",
@@ -193,6 +207,7 @@ export const PREREQUISITES: readonly Prerequisite[] = [
   headerPrerequisite("zlib", ["/usr/include/zlib.h"], "zlib1g-dev"),
   headerPrerequisite("libpng", ["/usr/include/png.h", "/usr/include/libpng16/png.h"], "libpng-dev"),
   headerPrerequisite("SDL2", ["/usr/include/SDL2/SDL.h"], "libsdl2-dev"),
+  libraryPrerequisite("webkit2gtk", "libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.1-0"),
   commandPrerequisite("git", "toolchain", ["--version"], "git", "git"),
   commandPrerequisite("tar", "toolchain", ["--version"], "tar", "gnu-tar"),
 ];
