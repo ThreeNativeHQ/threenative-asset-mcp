@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.55",
+  version: "b4e95441+threenative.56",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -158,7 +158,7 @@ index 5a23e98..8eacca2 100644
          if (Ar.Ver >= EUnrealEngineObjectUE3Version.DeprecatedOldLodformat)
          {
              if (skelMeshVer < FSkeletalMeshCustomVersion.Type.CombineSectionWithChunk)
-@@ -192,7 +226,23 @@ public FStaticLODModel(FAssetArchive Ar, bool bHasVertexColors) : this()
+@@ -192,7 +226,31 @@ public FStaticLODModel(FAssetArchive Ar, bool bHasVertexColors) : this()
 
          RequiredBones = Ar.ReadArray<short>();
          if (!stripDataFlags.IsEditorDataStripped())
@@ -179,11 +179,19 @@ index 5a23e98..8eacca2 100644
 +                _ = Ar.ReadBoolean();
 +                _ = Ar.ReadBoolean();
 +            }
++            else if (skelMeshVer >= FSkeletalMeshCustomVersion.Type.SplitModelAndRenderData)
++            {
++                // UE4.19-4.24 editor packages keep the imported source model inline as
++                // FRawSkeletalMeshBulkData: a bulk-data header, a GUID and bGuidIsHash.
++                _ = new FByteBulkData(Ar);
++                Ar.Position += 16;
++                _ = Ar.ReadBoolean();
++            }
 +        }
 
          if (Ar.Game != GAME_StateOfDecay2 && Ar.Ver >= EUnrealEngineObjectUE4Version.ADD_SKELMESH_MESHTOIMPORTVERTEXMAP)
          {
-@@ -324,6 +374,24 @@ public FStaticLODModel(FAssetArchive Ar, bool bHasVertexColors) : this()
+@@ -324,6 +382,24 @@ public FStaticLODModel(FAssetArchive Ar, bool bHasVertexColors) : this()
              }
          }
 
@@ -369,6 +377,13 @@ if (dumpAt < 0 && graphAt < 0)
     Directory.CreateDirectory(Path.Combine(output, "Grooms"));
 }
 ObjectTypeRegistry.RegisterClass(typeof(USkeletalMeshEditorData));
+// CUE4Parse swallows an export it cannot deserialize and logs it, which leaves a mesh with no
+// geometry and no explanation. Capturing those events lets a missing mesh name its real cause.
+var packageReadFailures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+CUE4Parse.CUE4ParseLog.UseLogger(new Serilog.LoggerConfiguration().MinimumLevel.Error().WriteTo.Sink(new PackageReadFailureSink(packageReadFailures)).CreateLogger());
+// Mesh name -> why no GLB was written. Reported on stderr as "threenative-mesh-failure" lines.
+var meshFailures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+string? olderEngineAttempts = null;
 
 var engineAt = Array.IndexOf(args, "--engine");
 var game = engineAt >= 0 ? ParseGame(args[engineAt + 1]) : DetectGame(root);
@@ -1297,6 +1312,7 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
         if (!ExportEditorStaticMesh(mesh, staticMaterials, target))
         {
             exportedMeshes.Remove(identity);
+            meshFailures[mesh.Name] = assetLookupDiagnostics.GetValueOrDefault(mesh.Name, "the uncooked static mesh could not be decoded");
             return false;
         }
     }
@@ -1310,10 +1326,12 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
         if (emitted is null || !File.Exists(emitted))
         {
             exportedMeshes.Remove(identity);
+            RecordMeshFailure(mesh.Name, "static mesh", results);
             return false;
         }
         if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
     }
+    meshFailures.Remove(mesh.Name);
     foreach (var materialName in staticMaterials.Select(slot => slot.MaterialInterface?.Name).Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase))
         await ExportMaterialAsync(materialName!);
     return true;
@@ -1381,6 +1399,52 @@ T? LoadAssetByName<T>(string name) where T : UObject
     return null;
 }
 
+void RecordMeshFailure(string name, string kind, IEnumerable<ExportResult> results)
+{
+    var parts = new List<string>();
+    if (packageReadFailures.TryGetValue(name, out var readFailure))
+        parts.Add($"the {kind} package could not be deserialized ({readFailure}{(olderEngineAttempts is null ? "" : "; it also failed under the " + olderEngineAttempts + " profiles")})");
+    var error = results.Select(result => result.Error).FirstOrDefault(candidate => candidate is not null);
+    if (error is not null) parts.Add($"the exporter failed ({error.GetType().Name}: {error.Message})");
+    if (parts.Count == 0) parts.Add($"the exporter wrote no glTF for this {kind}");
+    var flat = string.Join(' ', string.Join("; ", parts).Split(new[] { '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    meshFailures[name] = flat.Length <= 500 ? flat : flat[..500];
+}
+
+// A UE4 package that predates the run's engine profile lists fewer custom versions, so CUE4Parse
+// fills the gaps from the profile and reads the file in a later layout (a wider soft-vertex, for
+// one). The package then yields a SkeletalMesh with no LODs. Re-reading it under an older UE4
+// profile is the only decoder that can tell, and costs nothing for a mesh that already loaded.
+var olderEngineProviders = new Dictionary<EGame, DefaultFileProvider>();
+USkeletalMesh? ReloadSkeletalMeshWithOlderEngine(string packageKey, string meshName)
+{
+    if (game < EGame.GAME_UE4_0 || game >= EGame.GAME_UE5_0) return null;
+    foreach (var older in new[] { EGame.GAME_UE4_24, EGame.GAME_UE4_22, EGame.GAME_UE4_20 })
+    {
+        if (older >= game) continue;
+        try
+        {
+            if (!olderEngineProviders.TryGetValue(older, out var olderProvider))
+            {
+                olderProvider = new DefaultFileProvider(root, SearchOption.AllDirectories, new VersionContainer(older), StringComparer.OrdinalIgnoreCase);
+                if (mappings.Length == 1) olderProvider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
+                olderProvider.Initialize();
+                olderProvider.PostMount();
+                olderEngineProviders[older] = olderProvider;
+            }
+            var candidate = olderProvider.LoadPackage(packageKey).GetExports().OfType<USkeletalMesh>().FirstOrDefault(item => item.Name == meshName);
+            if (candidate?.LODModels is { Length: > 0 })
+            {
+                packageReadFailures.Remove(meshName);
+                return candidate;
+            }
+        }
+        catch (Exception) { }
+    }
+    olderEngineAttempts = "UE 4.24, 4.22 and 4.20";
+    return null;
+}
+
 async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
 {
     var identity = mesh.GetPathName();
@@ -1406,8 +1470,10 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
     if (glbByLod.Count == 0)
     {
         exportedMeshes.Remove(identity);
+        RecordMeshFailure(mesh.Name, "skeletal mesh", results);
         return false;
     }
+    meshFailures.Remove(mesh.Name);
     foreach (var (lod, path) in glbByLod)
     {
         var lodTarget = Path.Combine(output, "Meshes", lod == 0 ? mesh.Name + ".glb" : mesh.Name + "_LOD" + lod + ".glb");
@@ -1440,7 +1506,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
     foreach (var export in package.GetExports()) selectedExportTypes.Add(export.GetType().Name);
     foreach (var mesh in package.GetExports().OfType<USkeletalMesh>())
     {
-        if (await ExportSkeletalMeshAsync(mesh)) exported++;
+        var readable = mesh.LODModels is { Length: > 0 } ? mesh : ReloadSkeletalMeshWithOlderEngine(key, mesh.Name) ?? mesh;
+        if (await ExportSkeletalMeshAsync(readable)) exported++;
     }
     foreach (var mesh in package.GetExports().OfType<UStaticMesh>())
     {
@@ -2155,6 +2222,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
         exported++;
     }
 }
+foreach (var (failedMesh, failureDetail) in meshFailures)
+    Console.Error.WriteLine($"threenative-mesh-failure\t{failedMesh}\t{failureDetail}");
 if (exported == 0 && mappingRequired) throw new InvalidDataException("This cooked UE5 package uses unversioned properties. Place its game-compatible .usmap mapping file in the imported directory.");
 if (exported == 0 && lastLoadError is not null) throw new InvalidDataException("CUE4Parse could not decode the selected Unreal package.", lastLoadError);
 if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}.");
@@ -2691,6 +2760,20 @@ static EGame ParseGame(string version) => version switch
     "4.0" => EGame.GAME_UE4_0,
     _ => throw new ArgumentException($"unsupported --engine version {version}")
 };
+
+public sealed class PackageReadFailureSink(Dictionary<string, string> failures) : Serilog.Core.ILogEventSink
+{
+    public void Emit(Serilog.Events.LogEvent logEvent)
+    {
+        if (logEvent.Exception is null) return;
+        var match = System.Text.RegularExpressions.Regex.Match(logEvent.RenderMessage(), "^Could not read \"?(?<type>[^\"]+?)\"? named \"?(?<name>[^\"]+?)\"? correctly$");
+        if (!match.Success) return;
+        var root = logEvent.Exception;
+        while (root.InnerException is not null) root = root.InnerException;
+        var first = (root.Message.Split('\n')[0]).Trim();
+        failures.TryAdd(match.Groups["name"].Value, $"{match.Groups["type"].Value} {root.GetType().Name}: {first}");
+    }
+}
 
 public sealed class USkeletalMeshEditorData : UObject
 {
