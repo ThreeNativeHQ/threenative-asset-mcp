@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.51",
+  version: "b4e95441+threenative.52",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -312,6 +312,7 @@ using CUE4Parse.UE4.Readers;
 using CUE4Parse.UE4.Objects.Core.Compression;
 using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.Core.Math;
+using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Exporters;
@@ -321,9 +322,10 @@ using Newtonsoft.Json;
 
 if (args.Contains("--version")) { Console.WriteLine("threenative-cue4parse ${CUE4PARSE_SOURCE.version}"); return; }
 var dumpAt = Array.IndexOf(args, "--dump-properties");
-if (args.Length < 3 || (dumpAt < 0 && !args.Contains("--export-dir"))) throw new ArgumentException("usage: converter SOURCE --export-dir OUTPUT [--filter NAME] [--lods 0,1] | converter SOURCE --dump-properties OUT.json [--engine X] [--filter NAME]");
+var graphAt = Array.IndexOf(args, "--dump-graphs");
+if (args.Length < 3 || (dumpAt < 0 && graphAt < 0 && !args.Contains("--export-dir"))) throw new ArgumentException("usage: converter SOURCE --export-dir OUTPUT [--filter NAME] [--lods 0,1] | converter SOURCE --dump-properties OUT.json [--engine X] [--filter NAME] | converter SOURCE --dump-graphs OUT_DIR [--engine X] [--filter NAME]");
 var root = Path.GetFullPath(args[0]);
-var output = dumpAt >= 0 ? Path.GetFullPath(".") : Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
+var output = dumpAt >= 0 || graphAt >= 0 ? Path.GetFullPath(".") : Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
 var filterAt = Array.IndexOf(args, "--filter");
 var filter = filterAt >= 0 ? args[filterAt + 1] : null;
 // Source-model LODs of a skeletal mesh to export, as indices into its source model array.
@@ -352,7 +354,7 @@ bool MatchesFilter(string key)
     return Path.GetFileName(normalizedKey).Equals(Path.GetFileName(normalizedFilter), StringComparison.OrdinalIgnoreCase) &&
         (normalizedFilter.IndexOf('/') < 0 || normalizedKey.EndsWith(normalizedFilter, StringComparison.OrdinalIgnoreCase));
 }
-if (dumpAt < 0)
+if (dumpAt < 0 && graphAt < 0)
 {
     Directory.CreateDirectory(Path.Combine(output, "Meshes"));
     Directory.CreateDirectory(Path.Combine(output, "Textures"));
@@ -389,6 +391,467 @@ if (dumpAt >= 0)
     File.WriteAllText(dumpPath, JsonConvert.SerializeObject(dumpDocument, Formatting.Indented), new UTF8Encoding(false));
     Console.WriteLine($"dumped {dumpedPackages.Count} packages to {dumpPath}");
     return;
+}
+
+const int GraphNodeLimit = 2000;
+const int GraphFunctionDepthLimit = 8;
+// Properties that describe editor placement or bookkeeping, not the computation.
+var GraphIgnoredProperties = new HashSet<string>(StringComparer.Ordinal)
+{
+    "MaterialExpressionEditorX", "MaterialExpressionEditorY", "MaterialExpressionGuid", "Desc", "bCollapsed", "bRealtimePreview",
+    "bCommentBubbleVisible", "ParameterName", "Group", "SortPriority", "ExpressionGUID", "Id", "MenuCategories", "GraphNode",
+    "Material", "Function", "Texture", "MaterialFunction", "SamplerType", "Outputs", "FunctionInputs", "FunctionOutputs",
+    "FunctionExpressions",
+};
+var graphLegacyCache = new Dictionary<string, Dictionary<string, GraphLegacyInput>>(StringComparer.Ordinal);
+var graphPackageKeys = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+var graphPackageArchives = new Dictionary<string, FAssetArchive?>(StringComparer.OrdinalIgnoreCase);
+var GraphMaterialOutputs = new (string Output, string Property)[]
+{
+    ("baseColor", "BaseColor"), ("roughness", "Roughness"), ("metallic", "Metallic"), ("emissive", "EmissiveColor"),
+    ("opacity", "Opacity"), ("opacityMask", "OpacityMask"), ("normal", "Normal"), ("materialAttributes", "MaterialAttributes"),
+};
+
+if (graphAt >= 0)
+{
+    var graphDir = Path.GetFullPath(args[graphAt + 1]);
+    Directory.CreateDirectory(graphDir);
+    var graphFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var graphCount = 0;
+    foreach (var key in provider.Files.Keys
+        .Where(key => key.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) && MatchesFilter(key))
+        .OrderBy(key => key, StringComparer.OrdinalIgnoreCase))
+    {
+        try { graphCount += DumpMaterialGraphs(key, graphDir, graphFileNames); }
+        catch (Exception error) { Console.Error.WriteLine($"graph dump skipped {key}: {error.Message}"); }
+    }
+    Console.WriteLine($"dumped {graphCount} material graphs to {graphDir}");
+    return;
+}
+
+static object? GraphValue(object? value) => value switch
+{
+    null => null,
+    bool flag => flag,
+    float number => DumpNum(number),
+    double number => double.IsFinite(number) ? number : 0d,
+    int number => number,
+    uint number => number,
+    long number => number,
+    short number => number,
+    byte number => number,
+    FLinearColor color => new[] { DumpNum(color.R), DumpNum(color.G), DumpNum(color.B), DumpNum(color.A) },
+    FColor color => new[] { color.R / 255d, color.G / 255d, color.B / 255d, color.A / 255d },
+    FVector vector => DumpVec(vector),
+    FVector2D vector => new[] { DumpNum(vector.X), DumpNum(vector.Y) },
+    FName name => name.Text,
+    string text => text,
+    FScriptStruct script => GraphValue(script.StructType),
+    _ => null,
+};
+static string GraphEnumName(object? value, string prefix)
+{
+    var text = value switch { FName name => name.Text, null => "", _ => value.ToString() ?? "" };
+    var colons = text.LastIndexOf("::", StringComparison.Ordinal);
+    if (colons >= 0) text = text[(colons + 2)..];
+    return text.StartsWith(prefix, StringComparison.Ordinal) ? text[prefix.Length..] : text;
+}
+static string GraphText(object? value) => value switch { FName name => name.Text ?? "", string text => text, _ => "" };
+static string? GraphGuid(FPropertyTag? property) =>
+    property?.Tag?.GenericValue is FScriptStruct { StructType: FGuid guid } ? guid.ToString() : null;
+static bool GraphBool(UObject expr, string name) =>
+    expr.Properties.Any(property => property.Name.Text == name && property.Tag?.GenericValue is bool flag && flag);
+static FPropertyTag? GraphProperty(IPropertyHolder holder, string name) =>
+    holder.Properties.FirstOrDefault(property => property.Name.Text == name);
+static bool GraphIsInput(object? value) => value is GraphLegacyInput or FScriptStruct { StructType: FExpressionInput };
+// UE4 packages store an input as tagged properties inside FExpressionInput.FallbackStruct; newer ones serialize it natively.
+static (FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bool UseConstant) GraphReadInput(object? value)
+{
+    if (value is GraphLegacyInput legacy) return (legacy.Expression, legacy.Output, legacy.Mask, legacy.Constant, legacy.UseConstant);
+    var holder = value is FScriptStruct script ? script.StructType : value;
+    if (holder is not FExpressionInput input) return (null, 0, null, null, false);
+    FPackageIndex? expression;
+    int output, mask;
+    int[] channels;
+    object? constant = null;
+    var useConstant = false;
+    if (input.FallbackStruct is { } fallback)
+    {
+        expression = GraphProperty(fallback, "Expression")?.Tag?.GenericValue as FPackageIndex;
+        output = GraphProperty(fallback, "OutputIndex")?.Tag?.GenericValue is int outputIndex ? outputIndex : 0;
+        int Channel(string name) => GraphProperty(fallback, name)?.Tag?.GenericValue is int channel ? channel : 0;
+        mask = Channel("Mask");
+        channels = new[] { Channel("MaskR"), Channel("MaskG"), Channel("MaskB"), Channel("MaskA") };
+        useConstant = GraphProperty(fallback, "UseConstant")?.Tag?.GenericValue is true;
+        constant = GraphValue(GraphProperty(fallback, "Constant")?.Tag?.GenericValue);
+    }
+    else
+    {
+        expression = input.Expression;
+        output = input.OutputIndex;
+        mask = input.Mask;
+        channels = new[] { input.MaskR, input.MaskG, input.MaskB, input.MaskA };
+        var type = input.GetType();
+        useConstant = type.GetProperty("UseConstant")?.GetValue(input) is true;
+        constant = useConstant ? GraphValue(type.GetProperty("Constant")?.GetValue(input)) : null;
+    }
+    return (expression, output, mask != 0 ? channels : null, constant, useConstant);
+}
+
+// Real Unreal reads an input as tagged properties when the package does not record FCoreObjectVersion at all.
+// CUE4Parse guesses from --engine when the package records nothing, and that guess is wrong for packages saved by UE 4.5.
+static bool GraphTaggedInputs(IPackage? package) =>
+    package is Package legacy && (legacy.Summary.CustomVersionContainer?.Versions.All(version => version.Key != FCoreObjectVersion.GUID) ?? true);
+// Packages saved by UE 4.5 store each FExpressionInput as tagged properties that CUE4Parse mis-reads as the native layout and drops.
+// Re-read those struct payloads from the raw package bytes.
+Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
+{
+    var inputs = new Dictionary<string, GraphLegacyInput>(StringComparer.Ordinal);
+    if (expr.Owner is not Package legacy) return inputs;
+    var cacheKey = legacy.Name + "#" + expr.Name;
+    if (graphLegacyCache.TryGetValue(cacheKey, out var cached)) return cached;
+    graphLegacyCache[cacheKey] = inputs;
+    if (!graphPackageArchives.TryGetValue(legacy.Name, out var archive))
+    {
+        archive = null;
+        try
+        {
+            if (graphPackageKeys.TryGetValue(legacy.Name, out var key))
+            {
+                var bytes = provider.SaveAsset(key);
+                archive = new FAssetArchive(new FByteArchive(key, bytes, (VersionContainer) provider.Versions.Clone()), legacy);
+                _ = new FPackageFileSummary(archive);
+            }
+        }
+        catch { archive = null; }
+        graphPackageArchives[legacy.Name] = archive;
+    }
+    if (archive is null) return inputs;
+    var export = legacy.ExportMap.FirstOrDefault(item => item.ObjectName.Text == expr.Name);
+    if (export is null) return inputs;
+    archive.Position = export.SerialOffset;
+    while (true)
+    {
+        FPropertyTag tag;
+        try { tag = new FPropertyTag(archive, false); } catch { break; }
+        if (tag.Name.IsNone) break;
+        var end = archive.Position + tag.Size;
+        try
+        {
+            if (tag.PropertyType.Text == "StructProperty" && tag.TagData?.StructType is "ExpressionInput" or "ColorMaterialInput" or "ScalarMaterialInput" or "VectorMaterialInput" or "Vector2MaterialInput" or "MaterialAttributesInput")
+                inputs[tag.ArrayIndex > 0 ? $"{tag.Name.Text}[{tag.ArrayIndex}]" : tag.Name.Text] = GraphReadLegacyInput(archive, end);
+        }
+        catch { }
+        archive.Position = end;
+    }
+    return inputs;
+}
+static GraphLegacyInput GraphReadLegacyInput(FAssetArchive archive, long structEnd)
+{
+    FPackageIndex? expression = null;
+    int output = 0, mask = 0;
+    var channels = new int[4];
+    var useConstant = false;
+    object? constant = null;
+    while (archive.Position < structEnd)
+    {
+        var tag = new FPropertyTag(archive, false);
+        if (tag.Name.IsNone) break;
+        var end = archive.Position + tag.Size;
+        switch (tag.Name.Text)
+        {
+            case "Expression": expression = new FPackageIndex(archive); break;
+            case "OutputIndex": output = archive.Read<int>(); break;
+            case "Mask": mask = archive.Read<int>(); break;
+            case "MaskR": channels[0] = archive.Read<int>(); break;
+            case "MaskG": channels[1] = archive.Read<int>(); break;
+            case "MaskB": channels[2] = archive.Read<int>(); break;
+            case "MaskA": channels[3] = archive.Read<int>(); break;
+            case "UseConstant": useConstant = tag.TagData?.Bool == true; break;
+            case "Constant":
+                if (tag.PropertyType.Text == "FloatProperty") constant = GraphValue(archive.Read<float>());
+                else if (tag.TagData?.StructType == "Color") constant = GraphValue(archive.Read<FColor>());
+                else if (tag.TagData?.StructType == "LinearColor") constant = GraphValue(archive.Read<FLinearColor>());
+                else if (tag.TagData?.StructType == "Vector") constant = GraphValue(archive.Read<FVector>());
+                break;
+        }
+        archive.Position = end;
+    }
+    return new GraphLegacyInput(expression, output, mask != 0 ? channels : null, constant, useConstant);
+}
+
+int DumpMaterialGraphs(string key, string graphDir, HashSet<string> usedFileNames)
+{
+    IPackage package;
+    try { package = provider.LoadPackage(key); }
+    catch (Exception error) { Console.Error.WriteLine($"graph dump could not load {key}: {error.Message}"); return 0; }
+    var written = 0;
+    graphPackageKeys[package.Name] = key;
+    for (var index = 0; index < package.ExportsLazy.Length; index++)
+    {
+        string className, exportName;
+        try { className = DumpExportClass(package, index); exportName = DumpExportName(package, index); }
+        catch { continue; }
+        if (className != "Material") continue;
+        Dictionary<string, object?> document;
+        try { document = BuildMaterialGraph(package, package.ExportsLazy[index].Value, exportName); }
+        catch (Exception error)
+        {
+            document = new Dictionary<string, object?>
+            {
+                ["format"] = 1, ["material"] = exportName, ["package"] = DumpGamePath(package.Name), ["truncated"] = false, ["nodeCount"] = 0,
+                ["outputs"] = GraphMaterialOutputs.ToDictionary(item => item.Output, item => (object?) null),
+                ["nodes"] = new List<object>(), ["error"] = error.Message,
+            };
+        }
+        var fileName = exportName;
+        for (var suffix = 2; !usedFileNames.Add(fileName); suffix++) fileName = $"{exportName}__{suffix}";
+        File.WriteAllText(Path.Combine(graphDir, fileName + ".graph.json"), JsonConvert.SerializeObject(document, Formatting.Indented), new UTF8Encoding(false));
+        written++;
+    }
+    return written;
+}
+
+Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject material, string materialName)
+{
+    var nodes = new List<Dictionary<string, object?>>();
+    var ids = new Dictionary<string, string>(StringComparer.Ordinal);
+    var counter = 0;
+    var truncated = false;
+
+    Dictionary<string, object?>? Pin(object? value, string prefix, Dictionary<string, Dictionary<string, object?>?>? callInputs, int depth)
+    {
+        var (expression, output, mask, _, _) = GraphReadInput(value);
+        if (expression is null || expression.IsNull) return null;
+        UObject? target;
+        string? failure = null;
+        try { target = expression.Load<UObject>(); }
+        catch (Exception error) { target = null; failure = error.Message; }
+        string? id = null;
+        if (target is null)
+        {
+            if (nodes.Count >= GraphNodeLimit) { truncated = true; return null; }
+            id = prefix + "n" + counter++;
+            nodes.Add(new Dictionary<string, object?> { ["id"] = id, ["class"] = "Unresolved", ["error"] = failure ?? "expression could not be loaded" });
+        }
+        else id = EmitNode(target, prefix, callInputs, depth);
+        if (id is null) return null;
+        return new Dictionary<string, object?> { ["node"] = id, ["output"] = output, ["mask"] = mask };
+    }
+
+    string? EmitNode(UObject expr, string prefix, Dictionary<string, Dictionary<string, object?>?>? callInputs, int depth)
+    {
+        var key = prefix + expr.GetPathName();
+        if (ids.TryGetValue(key, out var existing)) return existing;
+        if (nodes.Count >= GraphNodeLimit) { truncated = true; return null; }
+        var id = prefix + "n" + counter++;
+        ids[key] = id;
+        var className = expr.ExportType;
+        if (className.StartsWith("MaterialExpression", StringComparison.Ordinal)) className = className["MaterialExpression".Length..];
+        var node = new Dictionary<string, object?> { ["id"] = id, ["class"] = className };
+        nodes.Add(node);
+        var inputs = new Dictionary<string, object?>();
+        var constants = new Dictionary<string, object?>();
+        node["inputs"] = inputs;
+        node["constants"] = constants;
+        var owner = expr.Owner;
+        try
+        {
+            var isFunctionCall = className == "MaterialFunctionCall";
+            var isFunctionInput = className == "FunctionInput";
+            if (isFunctionCall) { className = "FunctionCall"; node["class"] = className; }
+            Dictionary<string, GraphLegacyInput>? legacyInputs = null;
+            var taggedPackage = GraphTaggedInputs(owner);
+            foreach (var property in expr.Properties)
+            {
+                var name = property.Name.Text;
+                var value = property.Tag?.GenericValue;
+                try
+                {
+                    if (property.PropertyType.Text == "StructProperty" && (property.Tag is null || (taggedPackage && value is FScriptStruct { StructType: FExpressionInput })))
+                    {
+                        // CUE4Parse dropped this property; recover an expression input from the raw package or say so.
+                        var legacyName = property.ArrayIndex > 0 ? $"{name}[{property.ArrayIndex}]" : name;
+                        legacyInputs ??= GraphLegacyInputs(expr);
+                        if (legacyInputs.TryGetValue(legacyName, out var recovered)) value = recovered;
+                        else { node["error"] = $"property {name} ({property.PropertyType.Text}) could not be read"; continue; }
+                    }
+                    if (value is GraphLegacyInput or FScriptStruct { StructType: FExpressionInput })
+                    {
+                        // Fixed C arrays (FeatureLevelSwitch.Inputs, ...) arrive as one tag per element.
+                        var pinName = property.ArrayIndex > 0 || name == "Inputs" ? $"{name}[{property.ArrayIndex}]" : name;
+                        var (_, _, _, constant, useConstant) = GraphReadInput(value);
+                        inputs[pinName] = Pin(value, prefix, callInputs, depth);
+                        if (useConstant && constant is not null) constants[pinName] = constant;
+                    }
+                    else if (value is UScriptArray array)
+                    {
+                        if (name == "Outputs")
+                        {
+                            var names = new List<string>();
+                            foreach (var element in array.Properties)
+                                names.Add(element.GenericValue is FScriptStruct { StructType: FStructFallback outputItem } ? GraphText(GraphProperty(outputItem, "OutputName")?.Tag?.GenericValue) : "");
+                            node["outputNames"] = names;
+                        }
+                        else if (array.Properties.Count > 0 && array.Properties.All(element => GraphIsInput(element.GenericValue)))
+                        {
+                            for (var element = 0; element < array.Properties.Count; element++)
+                                inputs[$"{name}[{element}]"] = Pin(array.Properties[element].GenericValue, prefix, callInputs, depth);
+                        }
+                    }
+                    else if (!GraphIgnoredProperties.Contains(name) && !name.StartsWith("MaterialExpression", StringComparison.Ordinal))
+                    {
+                        var converted = GraphValue(value);
+                        if (converted is not null) constants[property.ArrayIndex > 0 ? $"{name}[{property.ArrayIndex}]" : name] = converted;
+                    }
+                }
+                catch (Exception error) { node["error"] = $"{name}: {error.Message}"; }
+            }
+
+            if (className.Contains("Parameter", StringComparison.Ordinal))
+            {
+                var parameterName = GraphText(GraphProperty(expr, "ParameterName")?.Tag?.GenericValue);
+                var group = GraphText(GraphProperty(expr, "Group")?.Tag?.GenericValue);
+                node["parameter"] = new Dictionary<string, object?> { ["name"] = parameterName, ["group"] = group };
+                var defaultTag = GraphProperty(expr, "DefaultValue")?.Tag?.GenericValue;
+                // Tagged serialization omits values equal to the class default, so an absent DefaultValue is the zero value.
+                constants.Remove("DefaultValue");
+                node["default"] = GraphValue(defaultTag) ?? (className.Contains("Vector", StringComparison.Ordinal) ? new[] { 0d, 0d, 0d, 0d }
+                    : className.Contains("Scalar", StringComparison.Ordinal) ? 0d
+                    : className.Contains("Static", StringComparison.Ordinal) ? false : null);
+            }
+            if (className.StartsWith("TextureSample", StringComparison.Ordinal) || className.StartsWith("TextureObject", StringComparison.Ordinal))
+            {
+                node["texture"] = GraphProperty(expr, "Texture")?.Tag?.GenericValue is FPackageIndex textureIndex && owner is not null ? DumpPath(owner, textureIndex) : null;
+                node["samplerType"] = GraphProperty(expr, "SamplerType") is { } sampler ? GraphEnumName(sampler.Tag?.GenericValue, "SAMPLERTYPE_") : "Color";
+                node["coordinates"] = inputs.TryGetValue("Coordinates", out var coordinates) ? coordinates : null;
+            }
+            // Unreal omits the pin names of a Break node when they equal the class default; indices 0-7 are the first eight attributes.
+            if (className == "BreakMaterialAttributes" && !node.ContainsKey("outputNames"))
+                node["outputNames"] = new[] { "BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal" };
+            if (className == "TextureCoordinate")
+            {
+                double Tile(string name) => GraphProperty(expr, name)?.Tag?.GenericValue is float tile ? DumpNum(tile) : 1d;
+                node["tiling"] = new[] { Tile("UTiling"), Tile("VTiling") };
+            }
+            if (className == "ComponentMask")
+                node["channelMask"] = new[] { GraphBool(expr, "R") ? 1 : 0, GraphBool(expr, "G") ? 1 : 0, GraphBool(expr, "B") ? 1 : 0, GraphBool(expr, "A") ? 1 : 0 };
+            if (className is "StaticSwitch" or "StaticSwitchParameter") node["switchValue"] = GraphBool(expr, "DefaultValue");
+
+            if (isFunctionInput)
+            {
+                // Inside an inlined function: the call's real input replaces the preview input.
+                var path = expr.GetPathName();
+                if (callInputs is not null && callInputs.TryGetValue(path, out var actual) && actual is not null) inputs["Input"] = actual;
+                else if (!inputs.ContainsKey("Input")) inputs["Input"] = null;
+                constants["InputName"] = GraphText(GraphProperty(expr, "InputName")?.Tag?.GenericValue);
+            }
+            if (isFunctionCall) InlineFunctionCall(expr, id, node, prefix, callInputs, depth);
+        }
+        catch (Exception error) { node["error"] = error.Message; }
+        return id;
+    }
+
+    void InlineFunctionCall(UObject call, string callId, Dictionary<string, object?> node, string prefix, Dictionary<string, Dictionary<string, object?>?>? outerInputs, int depth)
+    {
+        var owner = call.Owner;
+        var functionIndex = GraphProperty(call, "MaterialFunction")?.Tag?.GenericValue as FPackageIndex;
+        node["function"] = functionIndex is not null && owner is not null ? DumpPath(owner, functionIndex) : null;
+        var outerIds = new Dictionary<string, object?>();
+        var outputIds = new List<string?>();
+        var fn = new Dictionary<string, object?> { ["inputs"] = outerIds, ["outputs"] = outputIds, ["output"] = null };
+        node["fn"] = fn;
+        var callPins = (Dictionary<string, object?>) node["inputs"]!;
+        // The call stores each wired input and only a guid for the function input it feeds.
+        UObject? function = null;
+        try { function = functionIndex?.Load<UObject>(); } catch { }
+        var inputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
+        var outputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
+        if (function is not null && GraphProperty(function, "FunctionExpressions")?.Tag?.GenericValue is UScriptArray expressions)
+        {
+            foreach (var element in expressions.Properties)
+            {
+                UObject? candidate = null;
+                try { candidate = (element.GenericValue as FPackageIndex)?.Load<UObject>(); } catch { }
+                if (candidate is null) continue;
+                var guid = GraphGuid(GraphProperty(candidate, "Id"));
+                if (guid is null) continue;
+                if (candidate.ExportType == "MaterialExpressionFunctionInput") inputExpressions[guid] = candidate;
+                else if (candidate.ExportType == "MaterialExpressionFunctionOutput") outputExpressions[guid] = candidate;
+            }
+        }
+        var pins = new Dictionary<string, Dictionary<string, object?>?>(StringComparer.Ordinal);
+        if (GraphProperty(call, "FunctionInputs")?.Tag?.GenericValue is UScriptArray callInputs)
+        {
+            var position = 0;
+            foreach (var element in callInputs.Properties)
+            {
+                var slot = position++;
+                if (element.GenericValue is not FScriptStruct { StructType: FStructFallback item }) continue;
+                var actual = Pin(GraphProperty(item, "Input")?.Tag?.GenericValue, prefix, outerInputs, depth);
+                var guid = GraphGuid(GraphProperty(item, "ExpressionInputId"));
+                var inputName = $"Input{slot}";
+                if (guid is not null && inputExpressions.TryGetValue(guid, out var inputExpression))
+                {
+                    pins[inputExpression.GetPathName()] = actual;
+                    var named = GraphText(GraphProperty(inputExpression, "InputName")?.Tag?.GenericValue);
+                    if (named.Length > 0) inputName = named;
+                }
+                outerIds[inputName] = actual?["node"];
+                callPins[inputName] = actual;
+            }
+        }
+        if (function is null) { node["error"] = "material function could not be loaded (engine content is not in the pack)"; return; }
+        if (depth >= GraphFunctionDepthLimit) { node["error"] = "function nesting limit reached"; return; }
+        var inner = callId + "/";
+        var outputNames = new List<string>();
+        if (GraphProperty(call, "FunctionOutputs")?.Tag?.GenericValue is UScriptArray callOutputs)
+        {
+            foreach (var element in callOutputs.Properties)
+            {
+                string? innerId = null;
+                var outputName = "";
+                if (element.GenericValue is FScriptStruct { StructType: FStructFallback item } &&
+                    GraphGuid(GraphProperty(item, "ExpressionOutputId")) is { } guid &&
+                    outputExpressions.TryGetValue(guid, out var outputExpression))
+                {
+                    innerId = Pin(GraphProperty(outputExpression, "A")?.Tag?.GenericValue, inner, pins, depth + 1)?["node"] as string;
+                    outputName = GraphText(GraphProperty(outputExpression, "OutputName")?.Tag?.GenericValue);
+                }
+                outputIds.Add(innerId);
+                outputNames.Add(outputName);
+            }
+        }
+        fn["outputNames"] = outputNames;
+        fn["output"] = outputIds.FirstOrDefault(item => item is not null);
+    }
+
+    var outputs = new Dictionary<string, object?>();
+    var outputConstants = new Dictionary<string, object?>();
+    var editorOnly = GraphProperty(material, "EditorOnlyData")?.Tag?.GenericValue is FPackageIndex editorIndex ? editorIndex.Load<UObject>() : null;
+    foreach (var (outputName, propertyName) in GraphMaterialOutputs)
+    {
+        try
+        {
+            var outputProperty = GraphProperty(material, propertyName) ?? (editorOnly is null ? null : GraphProperty(editorOnly, propertyName));
+            var value = outputProperty?.Tag?.GenericValue;
+            if (outputProperty is not null && outputProperty.PropertyType.Text == "StructProperty" && (outputProperty.Tag is null || GraphTaggedInputs(material.Owner)))
+            {
+                var recovered = GraphLegacyInputs(material);
+                if (recovered.TryGetValue(propertyName, out var legacyOutput)) value = legacyOutput;
+                else outputConstants[outputName + "Error"] = $"property {propertyName} ({outputProperty.PropertyType.Text}) could not be read";
+            }
+            outputs[outputName] = Pin(value, "", null, 0);
+            var (_, _, _, constant, useConstant) = GraphReadInput(value);
+            if (useConstant && constant is not null) outputConstants[outputName] = constant;
+        }
+        catch (Exception error) { outputs[outputName] = null; outputConstants[outputName + "Error"] = error.Message; }
+    }
+    return new Dictionary<string, object?>
+    {
+        ["format"] = 1, ["material"] = materialName, ["package"] = DumpGamePath(package.Name), ["truncated"] = truncated,
+        ["nodeCount"] = nodes.Count, ["outputs"] = outputs, ["outputConstants"] = outputConstants, ["nodes"] = nodes,
+    };
 }
 
 static double DumpNum(float value) => float.IsFinite(value) ? value : 0d;
@@ -2196,6 +2659,7 @@ public sealed class USkeletalMeshEditorData : UObject
     }
 }
 
+sealed record GraphLegacyInput(FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bool UseConstant);
 sealed record EditorMesh(
     float[] Positions,
     int[] InstanceVertices,
