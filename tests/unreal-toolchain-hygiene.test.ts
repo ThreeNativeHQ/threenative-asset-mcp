@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { sweepStaleStaging } from "../src/unreal/importer.js";
-import { ensureUmodel } from "../src/unreal/provision.js";
+import { ensureUmodel, umodelBuildFailure } from "../src/unreal/provision.js";
 
 /** The 2022 upstream UE Viewer lists -psk in its help yet rejects it on the command line. */
 const OLD_UMODEL = `#!/bin/sh
@@ -60,6 +60,27 @@ describe("UE Viewer resolution", () => {
       code: "UNREAL_TOOL_UNUSABLE",
       message: expect.stringContaining("-psk"),
     });
+  });
+});
+
+describe("UE Viewer source build failures", () => {
+  it("names the package for the header the compiler could not find", () => {
+    // Verbatim from build.sh on a fresh Debian 13 host with SDL2 headers but no libpng.
+    const output = [
+      "Unreal/Wrappers/TexturePNG.cpp:1:10: fatal error: png.h: No such file or directory",
+      "compilation terminated.",
+      "make: *** [obj/umodel-linux64.mak:1586: obj/umodel-unix64/TexturePNG.o] Error 1",
+    ].join("\n");
+    expect(umodelBuildFailure(output)).toMatch(/png\.h is missing.*sudo apt install libpng-dev/);
+  });
+
+  it("maps a nested SDL header to its package", () => {
+    expect(umodelBuildFailure("x.cpp:3:10: fatal error: SDL2/SDL.h: No such file or directory"))
+      .toMatch(/SDL\.h is missing.*libsdl2-dev/);
+  });
+
+  it("keeps the full prerequisite list when the output names nothing", () => {
+    expect(umodelBuildFailure("make: *** Error 2")).toMatch(/zlib, libpng and SDL2/);
   });
 });
 
