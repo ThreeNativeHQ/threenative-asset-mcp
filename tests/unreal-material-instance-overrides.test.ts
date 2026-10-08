@@ -173,4 +173,24 @@ describe("modern-converter instance props (Parent + CollectedTextureParameters o
     const bound = resolved.bindings.flatMap((b) => [b.texture, b.secondaryTexture ?? []].flat());
     expect(bound).not.toContain("T_Wall_Default_D");
   });
+
+  it("supersedes a texture an ANCESTOR instance overrides, so the texture-set fallback cannot rebind it", () => {
+    // Paragon shape: the leaf instance and its parent instance both override `Mask`; the parent's
+    // texture ends up in the leaf's .mat `Other[]` and would otherwise be picked as a base colour.
+    const resolved = resolve(
+      {
+        MI_Leaf: {
+          mat: "Normal=T_Leaf_N\nOther[0]=T_Mid_M\nOther[1]=T_Mid_N\n",
+          props: instanceProps("MI_Mid", [["Mask", "T_Leaf_M"]]),
+        },
+        MI_Mid: { mat: "Normal=T_Mid_N\n", props: instanceProps("M_Base", [["Mask", "T_Mid_M"]]) },
+        M_Base: { mat: "Normal=T_Base_N\n", props: masterProps([["Mask", "T_Base_M"]]) },
+      },
+      "MI_Leaf",
+      ["T_Leaf_N", "T_Mid_M", "T_Mid_N", "T_Leaf_M", "T_Base_M", "T_Base_N"],
+    );
+    const bound = resolved.bindings.flatMap((b) => [b.texture, b.secondaryTexture ?? []].flat());
+    expect(bound).not.toContain("T_Mid_M");
+    expect(bound).not.toContain("T_Base_M");
+  });
 });

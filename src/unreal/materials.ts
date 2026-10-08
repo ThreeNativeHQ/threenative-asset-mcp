@@ -481,7 +481,11 @@ function supersededDefaults(request: ResolveMaterialRequest): Map<string, Supers
   for (let level = 0; level < chain.length; level += 1) {
     for (const override of chain[level]!.overrides) {
       for (let ancestor = level + 1; ancestor < chain.length; ancestor += 1) {
-        const parentDefault = chain[ancestor]!.collected.find((candidate) => key(candidate.name) === key(override.name));
+        // The value a descendant replaces is the nearest ancestor's: an ancestor INSTANCE's own override
+        // (Paragon: MM_Marble_Walls_Inst sets Plain_Wall_M, the leaf sets another) as much as a master's default.
+        const parentDefault =
+          chain[ancestor]!.overrides.find((candidate) => key(candidate.name) === key(override.name)) ??
+          chain[ancestor]!.collected.find((candidate) => key(candidate.name) === key(override.name));
         if (parentDefault && parentDefault.texture !== override.texture && !result.has(parentDefault.texture)) {
           result.set(parentDefault.texture, { parameter: override.name, override: override.texture });
           break;
