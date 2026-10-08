@@ -486,6 +486,14 @@ function supersededDefaults(request: ResolveMaterialRequest): Map<string, Supers
       }
     }
   }
+  // A texture that is also the effective value of a parameter nobody overrides is still in use;
+  // suppressing it would drop a real binding.
+  const overridden = new Set(chain.flatMap((props) => props.overrides.map((override) => key(override.name))));
+  for (const props of chain) {
+    for (const parameter of props.collected) {
+      if (!overridden.has(key(parameter.name))) result.delete(parameter.texture);
+    }
+  }
   return result;
 }
 
