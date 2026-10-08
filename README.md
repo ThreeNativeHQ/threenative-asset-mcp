@@ -484,6 +484,15 @@ left in `Other[]` still recovers its slot by parameter name, and a `.mat` that n
 slot (the modern converter's `Other[n]` references only) still falls back to the
 collected defaults.
 
+Importer version 60 recovers the cut-out of a masked foliage card whose UE Viewer `.mat`
+resolves `Opacity=` to the albedo itself, which has no alpha. When the material references a
+packed `<stem>_AORO` map (AO / roughness / opacity in R / G / B) beside that albedo, the map's
+blue channel becomes the base colour's alpha. Temperate Vegetation: conifer Bushes & Saplings
+had every needle card render as a solid rectangle (Pine_GroundTwig_01 as a full quad with the
+needle atlas painted inside it) because the mask was never applied. The binding is heuristic
+and named in the section's limitations; an opaque material, an unrelated texture stem, or a
+map the pack did not export is left alone.
+
 Importer version 59 applies a material instance's base-colour tint vector even when its
 parameter name carries extra words. Old West - VOL 5 Town Props overrides both
 `Albedo Color Tint (Base)` (a bright global multiplier) and `Base Color Tint (Mask)` (the
