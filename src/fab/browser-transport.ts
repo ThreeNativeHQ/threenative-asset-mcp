@@ -2,6 +2,7 @@ import { join, resolve } from "node:path";
 
 import { chromium } from "playwright";
 
+import { createBrowserTempDir } from "../browser-temp.js";
 import type { FabConfig } from "../config.js";
 import {
   assertAllowedFabApiUrl,
@@ -88,16 +89,36 @@ function playwrightContext(
     | "browserProfileDir"
   >,
 ): () => Promise<BrowserContextHandle> {
-  return async () =>
-    (await chromium.launchPersistentContext(config.browserProfileDir, {
-      headless: config.browserHeadless,
-      acceptDownloads: true,
-      serviceWorkers: "block",
-      // Keep MCP calls within common client deadlines even when a headed
-      // browser cannot start in the host environment.
-      timeout: Math.min(config.browserTimeoutMs, 10_000),
-      viewport: { width: 1280, height: 900 },
-    })) as unknown as BrowserContextHandle;
+  return async () => {
+    const temp = await createBrowserTempDir();
+    let context: BrowserContextHandle;
+    try {
+      context = (await chromium.launchPersistentContext(config.browserProfileDir, {
+        headless: config.browserHeadless,
+        acceptDownloads: true,
+        serviceWorkers: "block",
+        // Keep MCP calls within common client deadlines even when a headed
+        // browser cannot start in the host environment.
+        timeout: Math.min(config.browserTimeoutMs, 10_000),
+        viewport: { width: 1280, height: 900 },
+        env: { ...process.env, ...temp.env } as Record<string, string>,
+      })) as unknown as BrowserContextHandle;
+    } catch (error) {
+      await temp.remove();
+      throw error;
+    }
+    return {
+      pages: () => context.pages(),
+      newPage: () => context.newPage(),
+      close: async () => {
+        try {
+          await context.close();
+        } finally {
+          await temp.remove();
+        }
+      },
+    };
+  };
 }
 
 export class BrowserFabTransport implements FabTransport {
