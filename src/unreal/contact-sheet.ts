@@ -312,6 +312,7 @@ export async function renderContactSheet(
   // Left panel: the gallery image, fitted into a box no wider than the grid's share of the sheet.
   let galleryPanel: Buffer | undefined;
   let galleryWidth = Math.round(tile * 1.5);
+  let galleryHeight = bodyHeight;
   if (options.galleryImage !== undefined) {
     try {
       const maxWidth = Math.min(Math.round(tile * 1.7), MAX_SHEET_WIDTH - gridWidth);
@@ -323,6 +324,7 @@ export async function renderContactSheet(
         .toBuffer({ resolveWithObject: true });
       galleryPanel = resized.data;
       galleryWidth = resized.info.width;
+      galleryHeight = resized.info.height;
     } catch {
       galleryPanel = undefined;
     }
@@ -376,7 +378,7 @@ export async function renderContactSheet(
   svg.push(text(10, HEADER + bodyHeight + 76, 12, "#9a9aaa", `${selectedNote}; ${meshesFailed} not rendered`));
 
   const layers: OverlayOptions[] = [];
-  if (galleryPanel !== undefined) layers.push({ input: galleryPanel, left: 0, top: HEADER });
+  if (galleryPanel !== undefined) layers.push({ input: galleryPanel, left: 0, top: HEADER + Math.floor((bodyHeight - galleryHeight) / 2) });
   if (gridPng !== undefined) layers.push({ input: gridPng, left: galleryWidth, top: HEADER });
   else if (count > 0) {
     layers.push({
