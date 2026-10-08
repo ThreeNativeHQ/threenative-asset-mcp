@@ -125,3 +125,59 @@ it("maps report models to packages by path, falls back to a unique stem, skips a
   expect(found.get("P/SM_A.glb")?.equals(a)).toBe(true);
   expect(found.get("P/SM_B.glb")?.equals(b)).toBe(true);
 });
+
+/** A package with a real UE4 summary start: tag, legacy file version, random rest. */
+function ue4Package(image: Buffer, rec: Buffer, legacy: number): Buffer {
+  const head = Buffer.alloc(8);
+  head.writeUInt32LE(0x9e2a83c1, 0);
+  head.writeInt32LE(legacy, 4);
+  return Buffer.concat([head, randomBytes(300), rec, image, randomBytes(64)]);
+}
+
+async function pixel(bytes: Buffer): Promise<number[]> {
+  const { data } = await sharp(bytes).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  return [data[0]!, data[1]!, data[2]!];
+}
+
+it("swaps red and blue back for a UE4 package (legacy version -7) and returns a PNG", async () => {
+  const dir = await scratch();
+  const stored = await png(16, 8, { r: 40, g: 90, b: 200 });
+  const path = await write(dir, "SM_Ue4.uasset", ue4Package(stored, record(16, 8, stored.length), -7));
+  const out = await extractPackageThumbnail(path);
+  expect(out).toBeDefined();
+  expect(await pixel(out!)).toEqual([200, 90, 40]);
+  expect(await sharp(out!).metadata()).toMatchObject({ format: "png", width: 16, height: 8 });
+});
+
+it("swaps a JPEG thumbnail of a UE4 package too, and keeps alpha", async () => {
+  const dir = await scratch();
+  const jpeg = await sharp({ create: { width: 16, height: 16, channels: 3, background: { r: 200, g: 30, b: 20 } } }).jpeg({ quality: 100 }).toBuffer();
+  const out = await extractPackageThumbnail(await write(dir, "j.uasset", ue4Package(jpeg, record(16, 16, jpeg.length), -7)));
+  const [r, g, b] = await pixel(out!);
+  expect(b!).toBeGreaterThan(150);
+  expect(r!).toBeLessThan(60);
+  expect(g!).toBeLessThan(60);
+  const translucent = await sharp({ create: { width: 8, height: 8, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 0.5 } } }).png().toBuffer();
+  const swapped = await extractPackageThumbnail(await write(dir, "a.uasset", ue4Package(translucent, record(8, 8, translucent.length), -7)));
+  const raw = await sharp(swapped!).ensureAlpha().raw().toBuffer();
+  expect([raw[0], raw[1], raw[2]]).toEqual([0, 0, 255]);
+  expect(raw[3]).toBeGreaterThan(100);
+  expect(raw[3]).toBeLessThan(150);
+});
+
+it("leaves UE5 packages (legacy -8) and unrecognised headers as stored", async () => {
+  const dir = await scratch();
+  const stored = await png(8, 8, { r: 40, g: 90, b: 200 });
+  const ue5 = await write(dir, "ue5.uasset", ue4Package(stored, record(8, 8, stored.length), -8));
+  expect((await extractPackageThumbnail(ue5))?.equals(stored)).toBe(true);
+  const noTag = Buffer.concat([Buffer.alloc(8), randomBytes(300), record(8, 8, stored.length), stored, randomBytes(16)]);
+  expect((await extractPackageThumbnail(await write(dir, "notag.uasset", noTag)))?.equals(stored)).toBe(true);
+});
+
+it("findThumbnails returns the corrected colours for a UE4 package", async () => {
+  const dir = await scratch();
+  const stored = await png(8, 8, { r: 255, g: 0, b: 0 });
+  await write(dir, "Content/P/SM_R.uasset", ue4Package(stored, record(8, 8, stored.length), -7));
+  const found = await findThumbnails({ sourceDir: dir, report: { models: [{ name: "SM_R", package: "Content/P/SM_R.uasset", glb: "P/SM_R.glb" }] } });
+  expect(await pixel(found.get("P/SM_R.glb")!)).toEqual([0, 0, 255]);
+});

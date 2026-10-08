@@ -97,3 +97,8 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   replay it. The dumps carry licensed pack names: keep them out of the repo.
 - Judge an import against its source package, not a screenshot. PRD-537 defines the structural
   parity checks (coverage, shape, texture identity, colour presence).
+- **Editor thumbnails in UE4 packages have red and blue swapped** (`src/unreal/package-thumbnail.ts`
+  corrects it for legacy version -7 .. -1). A brown rock showed up as blue-grey, with a tan "floor" that is
+  really Unreal's blue-grey checker. Before blaming the import for a colour mismatch against a thumbnail,
+  compare the thumbnail of a *texture* package with UE Viewer's export of that texture: the swap shows up
+  there with no material graph involved. UE5 packages are returned as stored (order unverified).
