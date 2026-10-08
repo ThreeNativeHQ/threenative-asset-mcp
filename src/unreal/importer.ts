@@ -382,6 +382,16 @@ export interface ImportUnrealRequest {
 
 const UNSUPPORTED_EXTENSIONS = new Map<string, string>();
 
+export const WORLD_PARTITION_EXTERNAL_REASON = "World Partition external actor/object package (level data, not an asset)";
+
+/** True when a package path has a `__ExternalActors__` or `__ExternalObjects__` segment. */
+export function isWorldPartitionExternalPackage(path: string): boolean {
+  return path
+    .replace(/\\/g, "/")
+    .split("/")
+    .some((segment) => /^__external(actors|objects)__$/i.test(segment));
+}
+
 const UNSUPPORTED_CLASSES = new Map<string, string>([
   ["Blueprint", "Blueprint graph"],
   ["BlueprintGeneratedClass", "Blueprint class"],
@@ -1918,7 +1928,7 @@ export async function importUnrealDirectory(
 
   log(`Classifying ${candidates.length} Unreal packages…`);
   const concurrency = request.concurrency ?? Math.min(8, Math.max(2, candidates.length));
-  const classified = await mapWithConcurrency<
+  const classifiedAll = await mapWithConcurrency<
     (typeof candidates)[number],
     PackageClassification
   >(candidates, concurrency, async (entry) => {
@@ -2046,6 +2056,13 @@ export async function importUnrealDirectory(
       };
     }
   });
+
+  // World Partition keeps per-actor level data under __ExternalActors__/__ExternalObjects__. Those
+  // packages can list mesh-class exports but are never standalone assets, so they are skipped
+  // up front instead of being sent to a mesh converter and failing.
+  const externalActorEntries = classifiedAll.filter((entry) => isWorldPartitionExternalPackage(entry.package));
+  const externalActorFiles = new Set(externalActorEntries.map((entry) => entry.file));
+  const classified = classifiedAll.filter((entry) => !externalActorFiles.has(entry.file));
 
   const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error);
   const animationPackages = classified.filter((entry) => entry.hasAnimation && !entry.error);
@@ -2312,6 +2329,9 @@ export async function importUnrealDirectory(
   const assetMeshPackages = meshPackages.filter((entry) => !mapFiles.has(entry.file));
   const skipped: { package: string; reason: string }[] = [];
   const failed: { package: string; reason: string }[] = [];
+  for (const entry of externalActorEntries) {
+    skipped.push({ package: entry.package, reason: WORLD_PARTITION_EXTERNAL_REASON });
+  }
   for (const entry of classified) {
     if (
       (entry.meshKind !== undefined && !entry.error) ||

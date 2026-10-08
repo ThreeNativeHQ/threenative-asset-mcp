@@ -103,6 +103,25 @@ describe("parity key normalisation", () => {
 });
 
 describe("scorePack", () => {
+  it("does not expect meshes inside World Partition external actor packages, and counts them", () => {
+    const dump = dumpOf(
+      pkg("/Game/C/SM_Pillar", mesh("SM_Pillar", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar")),
+      pkg("/Game/C/MI_Cave_Rock_Pillar", pillarInstance),
+      pkg("/Game/C/M_Cave_Rock_MASTER", master),
+      pkg("/Game/__ExternalActors__/Pack/0/23/abc123", mesh("SM_Actor", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar")),
+      pkg("/Game/__ExternalObjects__/Pack/1/45/def456", mesh("SM_Object", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar")),
+    );
+    const score = scorePack(
+      dump,
+      reportOf([model(MESH_PKG, [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])])]),
+    );
+    expect(score.coverage.expected).toBe(1);
+    expect(score.coverage.missingTotal).toBe(0);
+    expect(score.coverage.externalActorPackages).toBe(2);
+    expect(score.reasons).toEqual([]);
+    expect(score.status).toBe("pass");
+  });
+
   it("passes a perfect pack", () => {
     const score = scorePack(
       caveDump(),

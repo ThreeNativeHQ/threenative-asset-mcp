@@ -3,6 +3,7 @@
  * CUE4Parse (`PropertyDump`), with what the importer reported (`ImportReport`). No I/O.
  */
 import type { ImportedMaterialSection, ImportedModel, ImportReport } from "./importer.js";
+import { isWorldPartitionExternalPackage } from "./importer.js";
 import type { PropertyDump } from "./property-dump.js";
 
 /** Every list in a score is capped at this many entries; a `…Total` count sits beside it. */
@@ -58,6 +59,8 @@ export interface PackScore {
     readonly exported: number;
     readonly missing: readonly MissingMesh[];
     readonly missingTotal: number;
+    /** World Partition external actor/object packages with mesh-class exports that were left out of `expected` (level data, not meshes). */
+    readonly externalActorPackages: number;
   };
   readonly shape: {
     readonly ok: boolean;
@@ -299,8 +302,13 @@ function isNeutral(factor: readonly number[]): boolean {
 export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   const meshes = new Map<string, SourceMesh>();
   const failedPackages = new Set<string>();
+  const externalActorKeys = new Set<string>();
   for (const pkg of dump.packages) {
     const key = packageKey(pkg.path);
+    if (isWorldPartitionExternalPackage(pkg.path)) {
+      if ((pkg.exports ?? []).some((exp) => isMeshClass(exp.class))) externalActorKeys.add(key);
+      continue;
+    }
     if (pkg.error) failedPackages.add(key);
     for (const exp of pkg.exports ?? []) {
       if (!isMeshClass(exp.class) || meshes.has(key)) continue;
@@ -482,6 +490,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       exported: models.size,
       missing: capped(missing),
       missingTotal: missing.length,
+      externalActorPackages: externalActorKeys.size,
     },
     shape: {
       ok: shapeOk,
