@@ -22,6 +22,21 @@ function compare(a: EngineVersion, b: EngineVersion): number {
   return a.major - b.major || a.minor - b.minor;
 }
 
+/**
+ * Routes ordered best to worst, used to choose among a listing's artifacts when the caller names
+ * neither `engine` nor `artifactId`. Prior pending calibration against the PRD-537 baseline
+ * scorecard (AC-6); change the order here when the scorecard says otherwise.
+ */
+export const ROUTE_PREFERENCE: readonly DecoderRoute[] = ["cue4parse", "mesh-description", "umodel"];
+
+/** Negative when `a` is the older `UE_x.y` selector; unparseable selectors sort oldest. */
+export function compareEngines(a: string, b: string): number {
+  const left = parseEngine(a);
+  const right = parseEngine(b);
+  if (!left || !right) return left ? 1 : right ? -1 : 0;
+  return compare(left, right);
+}
+
 /** The numerically oldest `UE_x.y` selector; entries that are not selectors are ignored. */
 export function oldestEngine(engines: readonly string[]): string | undefined {
   let best: { readonly engine: string; readonly version: EngineVersion } | undefined;

@@ -402,6 +402,13 @@ JSON the page shows, and paste it into the prompt within a few minutes. It needs
 interactive terminal. In Claude Code, run it with a `!` prefix. Never paste the code into an
 untrusted service: it grants full access to the Epic account.
 
+`fab_list_owned` lists each listing's Unreal artifacts separately (`artifacts[]`: `artifactId`,
+`engineVersions`, `oldestEngine`, decoder `route`, `targetPlatforms`). An artifact's format is its
+oldest listed engine, and that picks the decoder. When a listing has several artifacts and
+`fab_import_asset` gets neither `engine` nor `artifactId`, it takes the best route (CUE4Parse, then
+the MeshDescription converter, then UE Viewer; the newest source format breaks a tie) and says so
+in the report `warnings`. Pass `artifactId` or `engine` to override.
+
 | Input | Current result |
 | --- | --- |
 | Cooked loose UE4 static meshes and textures | GLB geometry, LOD sections, embedded textures, and common PBR reconstruction |

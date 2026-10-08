@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { ROUTE_PREFERENCE, compareEngines, decoderRoute, oldestEngine } from "./routes.js";
 import { ensureFabcli } from "../unreal/provision.js";
 import { type ExternalTool, ToolchainError, runBounded } from "../unreal/toolchain.js";
 
@@ -352,14 +353,16 @@ export class FabCli {
   }
 
   /**
-   * Picks the artifact for an engine selector. With no selector and more than one artifact the
-   * choice is the caller's: guessing would download several gigabytes of the wrong pack.
+   * Picks the artifact for an artifact id or engine selector; either one wins outright. With
+   * neither and more than one artifact, the best decoder route wins (`ROUTE_PREFERENCE`), the
+   * artifact with the newest source format breaks a tie, and `reason` says what was chosen over
+   * what so the caller can override it. Artifacts that list no engine are never auto-picked.
    */
   static selectVersion(
     versions: readonly FabUnrealVersion[],
     engine: string | undefined,
     artifactId?: string,
-  ): FabUnrealVersion {
+  ): { readonly version: FabUnrealVersion; readonly reason?: string } {
     // An artifact id names exactly one artifact, so it settles the choice even when several
     // artifacts list overlapping engines and an engine selector could not tell them apart.
     if (artifactId) {
@@ -372,7 +375,7 @@ export class FabCli {
             .join("; ")}.`,
         );
       }
-      return exact;
+      return { version: exact };
     }
     if (engine) {
       const wanted = assertEngineVersion(engine);
@@ -385,16 +388,46 @@ export class FabCli {
             .join("; ")}.`,
         );
       }
-      return match;
+      return { version: match };
     }
     const only = versions[0];
-    if (versions.length === 1 && only) return only;
+    if (versions.length === 1 && only) return { version: only };
+    const chosen = FabCli.#chooseByRoute(versions);
+    if (chosen) return chosen;
     throw new FabCliError(
       "FABCLI_ENGINE_AMBIGUOUS",
       `This listing publishes ${versions.length} Unreal artifacts. Pass engine to choose one (or artifactId, which also separates artifacts whose engines overlap): ${versions
         .map((version) => `${version.artifactId} (${version.engineVersions.join(", ")})`)
         .join("; ")}.`,
     );
+  }
+
+  static #chooseByRoute(
+    versions: readonly FabUnrealVersion[],
+  ): { readonly version: FabUnrealVersion; readonly reason: string } | undefined {
+    const ranked = versions.flatMap((version) => {
+      const engine = oldestEngine(version.engineVersions);
+      return engine === undefined ? [] : [{ version, engine, route: decoderRoute(engine) }];
+    });
+    ranked.sort(
+      (a, b) =>
+        ROUTE_PREFERENCE.indexOf(a.route) - ROUTE_PREFERENCE.indexOf(b.route) ||
+        compareEngines(b.engine, a.engine),
+    );
+    const best = ranked[0];
+    if (!best) return undefined;
+    const others = versions
+      .filter((version) => version !== best.version)
+      .map((version) => {
+        const engine = oldestEngine(version.engineVersions);
+        return `${version.artifactId} (${engine === undefined ? "no engine" : decoderRoute(engine)})`;
+      });
+    const shown = others.slice(0, 5);
+    const more = others.length > shown.length ? `, and ${others.length - shown.length} more` : "";
+    return {
+      version: best.version,
+      reason: `Chose artifact ${best.version.artifactId} (${best.engine}, ${best.route}) over ${shown.join(", ")}${more} by route preference; pass artifactId or engine to override.`,
+    };
   }
 
   /** Downloads an entitled artifact into an MCP-owned staging directory. Never claims or buys. */
