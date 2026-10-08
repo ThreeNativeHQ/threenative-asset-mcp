@@ -102,3 +102,14 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   really Unreal's blue-grey checker. Before blaming the import for a colour mismatch against a thumbnail,
   compare the thumbnail of a *texture* package with UE Viewer's export of that texture: the swap shows up
   there with no material graph involved. UE5 packages are returned as stored (order unverified).
+- **Visual regressions have their own guards.** `judgeRender` (`src/unreal/visual-judge.ts`) now measures a
+  camera-robust *fill ratio* (object pixels over their tight bounding box); when a piece has an Unreal
+  thumbnail it flags "solid card: render fill X vs thumbnail fill Y" if the render fills its box
+  `SOLID_CARD_FILL_FACTOR` (1.6x) more than the thumbnail's mask does, and both masks have enough pixels —
+  the solid-polygon conifer bug the colour and coverage rules missed. `tests/unreal-visual-regression.test.ts`
+  builds synthetic GLBs, renders them through the production tile renderer (`renderTiles`) with its fixed
+  camera, and asserts per-fixture judge invariants plus SSIM against small committed PNGs in
+  `tests/fixtures/visual-golden/` (threshold 0.90, to survive SwiftShader differences between hosts). The
+  zero-alpha-tint and emissive fixtures take their factors from the real material resolver, so reverting
+  those importer fixes turns the suite red. Regenerate goldens with `npm run goldens:update`; a failing diff
+  writes actual and difference PNGs under `artifacts/ci/visual-diff/`, which CI uploads.

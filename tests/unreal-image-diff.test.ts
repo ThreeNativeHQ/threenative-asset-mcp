@@ -6,6 +6,7 @@ import {
   decodeRgba,
   dHash,
   hammingDistance,
+  maskFillRatio,
   maxAbsDiff,
   mse,
   perceptualHash,
@@ -212,5 +213,32 @@ describe("perceptual hashes", () => {
     expect(hammingDistance("0000000000000000", "ffffffffffffffff")).toBe(64);
     expect(hammingDistance("0f", "f0")).toBe(8);
     expect(() => hammingDistance("0", "00")).toThrow(/same length/);
+  });
+});
+
+describe("maskFillRatio", () => {
+  it("is 1 for a mask that fills its own box, and lower for a ragged one", () => {
+    const solid = new Uint8Array(10 * 10).fill(1);
+    expect(maskFillRatio(solid, 10, 10)).toEqual({ pixels: 100, boundingBox: 100, fillRatio: 1 });
+    const ragged = new Uint8Array(10 * 10);
+    for (let i = 0; i < 10; i++) ragged[i * 10 + i] = 1; // a diagonal
+    const fill = maskFillRatio(ragged, 10, 10);
+    expect(fill.pixels).toBe(10);
+    expect(fill.boundingBox).toBe(100);
+    expect(fill.fillRatio).toBeCloseTo(0.1);
+  });
+
+  it("measures the tight bounding box, not the whole mask", () => {
+    const mask = new Uint8Array(10 * 10);
+    for (let y = 2; y < 8; y++) for (let x = 3; x < 9; x++) mask[y * 10 + x] = 1;
+    expect(maskFillRatio(mask, 10, 10)).toEqual({ pixels: 36, boundingBox: 36, fillRatio: 1 });
+    mask[0] = 1; // a stray pixel at the corner grows the box to 9 x 8
+    const stray = maskFillRatio(mask, 10, 10);
+    expect(stray.pixels).toBe(37);
+    expect(stray.boundingBox).toBe(9 * 8);
+  });
+
+  it("is zero for an empty mask", () => {
+    expect(maskFillRatio(new Uint8Array(16), 4, 4)).toEqual({ pixels: 0, boundingBox: 0, fillRatio: 0 });
   });
 });
