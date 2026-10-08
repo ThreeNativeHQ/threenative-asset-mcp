@@ -30,11 +30,11 @@
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jonit-dev/threenative-asset-mcp.git"
+    "url": "git+https://github.com/ThreeNativeHQ/threenative-asset-mcp.git"
   },
-  "homepage": "https://github.com/jonit-dev/threenative-asset-mcp#readme",
+  "homepage": "https://github.com/ThreeNativeHQ/threenative-asset-mcp#readme",
   "bugs": {
-    "url": "https://github.com/jonit-dev/threenative-asset-mcp/issues"
+    "url": "https://github.com/ThreeNativeHQ/threenative-asset-mcp/issues"
   },
   "publishConfig": {
     "access": "public"
