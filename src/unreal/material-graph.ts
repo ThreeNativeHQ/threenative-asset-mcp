@@ -114,6 +114,10 @@ const SUPPORTED_NODE_CLASSES = [
   "BreakMaterialAttributes",
   "BlendMaterialAttributes",
   "SetMaterialAttributes",
+  "GetMaterialAttributes",
+  "Reroute",
+  "QualitySwitch",
+  "ShadingModel",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -124,7 +128,40 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "Blend_Overlay",
   "CheapContrast",
   "HueShift",
+  "DitherTemporalAA",
+  "FlattenNormal",
 ] as const;
+
+/**
+ * Fixed GUIDs of the material attributes that `SetMaterialAttributes.AttributeSetTypes` and
+ * `GetMaterialAttributes.AttributeGetTypes` list (the dump emits them as `attributeTypes`). The format is the
+ * converter's `FGuid.ToString()`: 32 upper-case hex digits.
+ *
+ * Empirically derived from the European Hornbeam Megascans pack (UE 5.1; 4 `SetMaterialAttributes` nodes and 1
+ * `GetMaterialAttributes` node, in MA_Foliage and MA_Impostor_SimpleOffset_MS; UE source was not available).
+ * Every guid kept its meaning in every node it appears in (no inconsistency found). Evidence:
+ * - CERTAIN, Impostor_MS function (its named outputs wire to SetMaterialAttributes pins in order): BaseColor
+ *   (69B8..., 3 of 3 Set nodes), SubsurfaceColor (5B8F...), Specular (9FDA...), OpacityMask (679F...), Roughness
+ *   (D1DD...), Normal (0FA2...), WorldPositionOffset (F905...), PixelDepthOffset (0AC9...).
+ *   Normal is also named by the GetMaterialAttributes output name "Normal" and is fed by MF_adjustNormal; BaseColor is
+ *   fed by MF_BarkDetailer/MF_adjustBaseColor colour math in both foliage Set nodes and never by a normal function.
+ * - CERTAIN, the pin is fed by a `ShadingModel` node: ShadingModel (D942...).
+ * - INFERRED from the feeding function only (agrees with the Impostor_MS names): Specular (MF_generateSpecular),
+ *   Roughness (MF_Roughness), OpacityMask (MF_BranchBlending / MF_DecorationBlending), WorldPositionOffset (MF_AdvancedWind).
+ * - UNKNOWN, deliberately absent: E8EBD0AD... (fed by a Masks-sampled texture; Opacity or AmbientOcclusion is a guess),
+ *   Metallic, EmissiveColor, Opacity, AmbientOcclusion, and every other guid.
+ */
+export const MATERIAL_ATTRIBUTE_GUIDS = {
+  BaseColor: "69B8D33616ED4D499AA497292F050F7A",
+  SubsurfaceColor: "5B8FC67951CE40829D777BEEF4F72C44",
+  Specular: "9FDAB39925564CC98CD2D572C12C8FED",
+  OpacityMask: "679FFB172BB5422CAD520483166E0C75",
+  Roughness: "D1DD967C4CAD47D39E6346FB08ECF210",
+  Normal: "0FA2821A200F4A4AB719B789C1259C64",
+  WorldPositionOffset: "F905F895D5814314916D24348C40CE9E",
+  PixelDepthOffset: "0AC97EC3E3D047BAB610167DC4D919FF",
+  ShadingModel: "D9423FFFD77E4D828FF9CF5E055D1255",
+} as const;
 
 export function supportedNodeClasses(): readonly string[] {
   return SUPPORTED_NODE_CLASSES;
@@ -241,6 +278,12 @@ interface TextureSlot {
 function textureObjectName(reference: string): string {
   const afterSlash = reference.slice(reference.lastIndexOf("/") + 1);
   return afterSlash.slice(afterSlash.lastIndexOf(".") + 1);
+}
+
+/** GUIDs compare case-insensitively and ignoring dashes and braces. */
+function sameGuid(a: string, b: string): boolean {
+  const normal = (guid: string) => guid.replace(/[^0-9a-f]/gi, "").toUpperCase();
+  return normal(a) === normal(b);
 }
 
 function functionBaseName(reference: string | null | undefined): string | undefined {
@@ -592,12 +635,24 @@ class Compiler {
       }
       case "FunctionCall":
         return this.functionCall(node, output);
+      case "Reroute":
+        // A reroute node only carries its Input through.
+        return this.pin(node.inputs.Input) ?? this.markUnavailable(`Reroute ${node.id} is not wired`);
+      case "QualitySwitch": {
+        // Like FeatureLevelSwitch, the bake targets the highest quality: the Default pin.
+        return this.pin(node.inputs.Default) ?? this.markUnavailable(`QualitySwitch ${node.id} has no Default input`);
+      }
+      case "ShadingModel":
+        // Its value only reaches the ShadingModel slot of a SetMaterialAttributes, never BaseColor.
+        return this.constant([0], 1);
       case "MakeMaterialAttributes": {
         const baseColor = this.vec(node.inputs.BaseColor, "MakeMaterialAttributes.BaseColor") ?? null;
         return { kind: "attr", baseColor };
       }
       case "BreakMaterialAttributes":
         return this.breakAttributes(node, output);
+      case "GetMaterialAttributes":
+        return this.getAttributes(node, output);
       case "BlendMaterialAttributes":
         return this.blendAttributes(node);
       case "SetMaterialAttributes":
@@ -708,11 +763,31 @@ class Compiler {
   private breakAttributes(node: GraphNode, output: number): Compiled {
     const names = node.outputNames && node.outputNames.length > 0 ? node.outputNames : BREAK_ATTRIBUTES;
     const attribute = names[output] ?? BREAK_ATTRIBUTES[output] ?? `output${output}`;
-    const source = this.attrs(node.inputs.MaterialAttributes, "BreakMaterialAttributes.MaterialAttributes");
+    // Another attribute is never evaluated, so its source is not walked either.
     if (attribute !== "BaseColor") {
       this.unsupported.add(`BreakMaterialAttributes.${attribute}`);
       return this.constant([0], 1);
     }
+    const source = this.attrs(node.inputs.MaterialAttributes, "BreakMaterialAttributes.MaterialAttributes");
+    return source?.baseColor ?? this.constant([0, 0, 0], 3);
+  }
+
+  /**
+   * GetMaterialAttributes: output 0 passes the attributes through when `outputNames[0]` says so; the other outputs are
+   * typed by `attributeTypes` (offset by that pass-through output). Only BaseColor is carried, so any other attribute
+   * on the path is unsupported, and its source is not walked.
+   */
+  private getAttributes(node: GraphNode, output: number): Compiled {
+    const names = node.outputNames ?? [];
+    const passThrough = names[0] === "MaterialAttributes";
+    if (passThrough && output === 0) return this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes") ?? this.markUnavailable(`GetMaterialAttributes ${node.id} has no MaterialAttributes input`);
+    const guid = node.attributeTypes?.[output - (passThrough ? 1 : 0)];
+    if (guid === undefined) return this.markUnsupported(`GetMaterialAttributes.output${output}`);
+    if (!sameGuid(guid, MATERIAL_ATTRIBUTE_GUIDS.BaseColor)) {
+      this.unsupported.add(`GetMaterialAttributes.${names[output] || guid}`);
+      return this.constant([0], 1);
+    }
+    const source = this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes");
     return source?.baseColor ?? this.constant([0, 0, 0], 3);
   }
 
@@ -729,11 +804,25 @@ class Compiler {
   }
 
   /**
-   * SetMaterialAttributes: the incoming attributes (pin `MaterialAttributes`, else `Inputs[0]`/`Inputs`, else the
-   * first wired pin that evaluates to attributes) with per-attribute overrides. Only BaseColor is carried, so a wired
-   * `Base Color`/`BaseColor` pin replaces it and every other override is irrelevant to this bake.
+   * SetMaterialAttributes: the incoming attributes with per-attribute overrides. Only BaseColor is carried, and only the
+   * two pins that decide it are visited, so a node feeding any other slot (ShadingModel, Normal, WPO, ...) cannot block.
+   *
+   * Real dumps name the pins `Inputs[i]`: `Inputs[0]` is the incoming attributes and `Inputs[i]` (i >= 1) carries the
+   * attribute `attributeTypes[i - 1]`. The BaseColor pin is the one typed with the BaseColor guid; an unwired one keeps the
+   * incoming BaseColor. A dump without `attributeTypes` falls back to guessing from the pin names.
    */
   private setAttributes(node: GraphNode): Compiled {
+    if (node.attributeTypes) {
+      const colourIndex = node.attributeTypes.findIndex((guid) => sameGuid(guid, MATERIAL_ATTRIBUTE_GUIDS.BaseColor));
+      const override = colourIndex >= 0 ? node.inputs[`Inputs[${colourIndex + 1}]`] : undefined;
+      const incomingPin = node.inputs["Inputs[0]"];
+      const incoming = incomingPin ? this.attrs(incomingPin, "SetMaterialAttributes.Inputs[0]") : undefined;
+      if (override) {
+        const colour = this.vec(override, "SetMaterialAttributes.BaseColor");
+        return { kind: "attr", baseColor: colour ?? null };
+      }
+      return incoming ?? this.markUnavailable(`SetMaterialAttributes ${node.id} has no incoming attributes and no BaseColor input`);
+    }
     const override = this.namedPin(node, ["basecolor"]);
     const incomingName = this.namedPin(node, ["materialattributes", "inputs0", "inputs"]);
     let incoming: Attrs | undefined;
@@ -820,6 +909,16 @@ class Compiler {
       return this.unary(stretched, (x) => (x < 0 ? 0 : x > 1 ? 1 : x));
     }
     if (lower === "hueshift") return this.hueShift(node, name!);
+    if (lower === "dithertemporalaa") {
+      // Input0 is the opacity, Input1 the dither pattern: the result is a dithered opacity, which BaseColor never reads.
+      this.approximations.add("DitherTemporalAA: dithering ignored; engine body unavailable");
+      return this.passThrough(node, "Input0", name!);
+    }
+    if (lower === "flattennormal") {
+      // Input0 is a normal, Input1 the flatten amount. A normal does not feed BaseColor, so Input0 stands in for the result.
+      this.approximations.add("FlattenNormal: normal-only function; BaseColor path unaffected (engine body unavailable)");
+      return this.passThrough(node, "Input0", name!);
+    }
     if (lower === "speedtreecolorvariation") {
       // Per-instance colour variation driven by instance and world data, which a baked texture cannot hold.
       // The colour input is the first wired pin named like a colour, else Input0, else the first wired pin.

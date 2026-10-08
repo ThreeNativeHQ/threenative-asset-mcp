@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.54",
+  version: "b4e95441+threenative.55",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -692,6 +692,14 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                             foreach (var element in array.Properties)
                                 names.Add(element.GenericValue is FScriptStruct { StructType: FStructFallback outputItem } ? GraphText(GraphProperty(outputItem, "OutputName")?.Tag?.GenericValue) : "");
                             node["outputNames"] = names;
+                        }
+                        else if (name is "AttributeSetTypes" or "AttributeGetTypes")
+                        {
+                            // SetMaterialAttributes pin Inputs[i] carries attribute AttributeSetTypes[i-1]; GetMaterialAttributes output i is AttributeGetTypes[i].
+                            var guids = new List<string>();
+                            foreach (var element in array.Properties)
+                                guids.Add(element.GenericValue is FScriptStruct { StructType: FGuid attributeGuid } ? attributeGuid.ToString() : "");
+                            node["attributeTypes"] = guids;
                         }
                         else if (array.Properties.Count > 0 && array.Properties.All(element => GraphIsInput(element.GenericValue)))
                         {
