@@ -6,7 +6,9 @@ import { dumpMaterialGraphs } from "./graph-dump.js";
 import type { MaterialGraph } from "./graph-dump.js";
 import {
   bakeGraph,
+  emissiveOnlyEffect,
   graphPathClasses,
+  type EmissiveEffect,
   type BakeResult,
   type GraphParameters,
   type TextureRaster,
@@ -44,9 +46,16 @@ export interface GraphBakeRequest {
    * section carries `COLOR_0`; absent, VertexColor stays unsupported.
    */
   readonly vertexColor?: readonly [number, number, number, number] | undefined;
+  /**
+   * Only classify: report whether the material is an emissive-only effect and never bake. The importer probes a
+   * translucent section that already has a base-colour texture, which a plain request would not look at.
+   */
+  readonly probe?: boolean | undefined;
 }
 
 export type GraphBakeOutcome = BakeResult & {
+  /** Present when the material wires only Emissive: no albedo exists in the package (see `emissiveOnlyEffect`). */
+  readonly effect?: EmissiveEffect;
   /** The dumped graph that was evaluated (the root `Material` of the instance chain). */
   readonly graphMaterial?: string;
   /** The parameters the evaluator saw, after nearest-wins merging over the instance chain. */
@@ -239,6 +248,10 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     }
     if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);
 
+    const effect = emissiveOnlyEffect(graph);
+    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material };
+    if (request.probe) return unavailable(`${graph.material} has a BaseColor output`);
+
     const parameters = chainParameters(chain);
     const key = `${graph.material}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}`;
     let perAssets = bakes.get(request.assets);
@@ -258,6 +271,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         parameters,
         size,
         allowUvSetFallback: true,
+        // Unreal feeds white to ParticleColor outside a particle emitter.
+        particleColor: [1, 1, 1, 1],
         ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
         loadTexture: async (reference) => {
           const name = textureBasename(reference);
