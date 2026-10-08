@@ -60,13 +60,19 @@ Each criterion is a checkbox in the phase that delivers it: AC-1 in Phase 1, AC-
 | Graph dump | `importUnrealDirectory` → CUE4Parse adapter `ExportMaterialAsync` | Additive `.graph.json` beside the `.mat`/`.props.txt` it already writes | AC-1 |
 | Graph bake | `importUnrealDirectory` → `resolveMaterial` → new evaluator | Used only when no exact texture binding exists for the slot | AC-2, AC-3 |
 
+## Decisions (appended 2026-10-08, Claude, João asleep; for sign-off)
+
+- **The premise "no colour texture" was wrong for `M_Cave_Rock_MASTER`.** The graph samples colour textures inside material functions: `MF_Cave_Rock01` (RockTint × `T_Cave_Rock_01_D`) and `MF_Cave_Rock02` (DetailRockTint × `T_Cave_Rock_Detail_D`), plus a flat-grey `MF_Solid_Color` layer. `Mask` is a *blend mask*: its R, G and B channels are the alphas of three `MatLayerBlend_Standard` layers. BaseColor is `Diffuse Brightness × wetness-lerp(layer blend)`. So the bake is "blend of tinted colour textures by mask channels", not "mask × tint".
+- **Engine content functions are not in the pack** (`MatLayerBlend_Standard/AO/BakedNormal`, `FuzzyShading_JM`, `CheapContrast`, `FlattenNormal`; 84 call nodes across Soul Cave). They stay as named `FunctionCall` nodes. The evaluator implements a small table of them by name. Their bodies were not available to verify, so only `MatLayerBlend_Standard` (per-attribute lerp by alpha) is treated as exact; functions that only touch non-colour attributes (`_AO`, `_BakedNormal`) pass BaseColor through, and view-dependent `FuzzyShading` is ignored. A bake that relies on any of those is `confidence: "heuristic"` and names them in the report's limitations; the PRD's "exact only when every node is supported" is kept for `confidence: "exact"`.
+- **UE 4.5-era packages (object version 401) need a raw-property fallback** inside the dumper (16 of 89 Soul Cave materials).
+
 ## Execution Phases
 
 #### Phase 1: The graph reaches the importer
 **Status:** NOT STARTED
 **Files:** `src/unreal/cue4parse-adapter.ts`, `src/unreal/materials.ts` (parse `.graph.json`).
 **Implementation:** Dump only expressions reachable from the five outputs; cap at 2,000 nodes per material and report truncation. Function calls are inlined from their `MaterialFunction` packages.
-- [ ] AC-1 [local]: Importing Soul Cave writes a `M_Cave_Rock_MASTER.graph.json` whose BaseColor path names `Mask` and all four tint parameters. proof: `npm run parity:fab -- --listing 75f42402-40bb-4a1b-b557-18e2c9604273 --keep` — Evidence: pending.
+- [x] AC-1 [local]: Importing Soul Cave writes a `M_Cave_Rock_MASTER.graph.json` whose BaseColor path names `Mask` and the tint parameters. proof: `ThreeNativeConverter <pack> --dump-graphs <dir> --engine 4.18 --filter M_Cave_Rock_MASTER` via `dumpMaterialGraphs`, then a traversal from the BaseColor output — Evidence (2026-10-08): 160 nodes, 159 reachable, not truncated; reachable parameters include `Mask` (TextureSampleParameter2D), `RockTint` and `DetailRockTint` (VectorParameter), `Diffuse Brightness`, the wetness/fuzzy switches; reachable textures `T_Cave_Rock_01_D`, `T_Cave_Rock_Detail_D`, `T_Cave_Rock_Stalactite_M`. All 89 materials of the pack dump in ~2 s and pass the strict schema (`tests/unreal-graph-dump.test.ts`, 13 tests). The wording changed from "all four tint parameters": `Tint` and `Tint1` are *input names* of the functions `MF_Cave_Rock01`/`MF_Cave_Rock02`, fed by `RockTint`/`DetailRockTint` (see Decisions). The `parity:fab` command in the original proof is blocked by PRD-537's licence check, so the dump ran through `dumpMaterialGraphs` directly.
 
 **Verification:** the box above.
 
