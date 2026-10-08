@@ -52,7 +52,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 56;
+export const IMPORTER_VERSION = 57;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -621,6 +621,13 @@ interface ExportedAssets {
   readonly psa: Map<string, string>;
   readonly mat: Map<string, string>;
   readonly props: Map<string, string>;
+  /**
+   * Every `.mat` / `.props.txt` written for a basename, in index order. `mat` and `props` keep only the last one, so two
+   * packages that share an object name (`MI_Rock_Inst` in two folders) would silently share one file; `scopeMaterialFiles`
+   * uses these to pick the copy that sits beside the mesh being packaged.
+   */
+  readonly matAll?: ReadonlyMap<string, readonly string[]>;
+  readonly propsAll?: ReadonlyMap<string, readonly string[]>;
   readonly png: Map<string, string>;
   /** Basenames with multiple physical PNG producers cannot establish an exact source binding. */
   readonly ambiguousPng?: ReadonlySet<string>;
@@ -634,21 +641,74 @@ async function indexExported(root: string): Promise<ExportedAssets> {
   const psa = new Map<string, string>();
   const mat = new Map<string, string>();
   const props = new Map<string, string>();
+  const matAll = new Map<string, string[]>();
+  const propsAll = new Map<string, string[]>();
   const png = new Map<string, string>();
   const ambiguousPng = new Set<string>();
   const audio = new Map<string, string>();
   const dna = new Map<string, string>();
+  const collect = (all: Map<string, string[]>, key: string, path: string): void => {
+    const list = all.get(key) ?? [];
+    list.push(path);
+    all.set(key, list);
+  };
   for (const file of await listFiles(root).catch(() => [])) {
     const name = basename(file.path);
-    if (name.endsWith(".props.txt")) props.set(name.slice(0, -".props.txt".length), file.path);
-    else if (name.endsWith(".mat")) mat.set(name.slice(0, -".mat".length), file.path);
+    if (name.endsWith(".props.txt")) { const key = name.slice(0, -".props.txt".length); props.set(key, file.path); collect(propsAll, key, file.path); }
+    else if (name.endsWith(".mat")) { const key = name.slice(0, -".mat".length); mat.set(key, file.path); collect(matAll, key, file.path); }
     else if (name.endsWith(".gltf")) gltf.set(name.slice(0, -".gltf".length), file.path);
     else if (name.endsWith(".psa")) psa.set(name.slice(0, -".psa".length), file.path);
     else if (name.endsWith(".png")) { const stem = name.slice(0, -".png".length); if (png.has(stem)) ambiguousPng.add(stem); png.set(stem, file.path); }
     else if (name.endsWith(".dna")) dna.set(name.slice(0, -".dna".length), file.path);
     else if (/\.(?:wav|ogg|mp3|flac)$/i.test(name)) audio.set(name.slice(0, name.lastIndexOf(".")), file.path);
   }
-  return { gltf, psa, mat, props, png, ambiguousPng, audio, dna };
+  return { gltf, psa, mat, props, matAll, propsAll, png, ambiguousPng, audio, dna };
+}
+
+function mergeCandidates(
+  left: ReadonlyMap<string, readonly string[]> | undefined,
+  right: ReadonlyMap<string, readonly string[]> | undefined,
+): Map<string, string[]> {
+  const merged = new Map<string, string[]>();
+  for (const source of [left, right]) {
+    for (const [name, paths] of source ?? []) {
+      const list = merged.get(name) ?? [];
+      for (const path of paths) if (!list.includes(path)) list.push(path);
+      merged.set(name, list);
+    }
+  }
+  return merged;
+}
+
+const scopedMaterialFiles = new WeakMap<ExportedAssets, Map<string, ExportedAssets>>();
+
+/**
+ * UE Viewer keeps the package folders, but the importer indexes `.mat` / `.props.txt` by basename, so `MI_X_Inst` in two
+ * folders collapses to whichever was indexed last and a mesh gets another package's textures. A mesh's own folder is the
+ * best evidence of which copy it uses (the Landscape Pro rocks each have a same-named instance beside them), so for a
+ * name with several exports the copy beside the mesh wins. Returns `assets` itself when nothing needs choosing.
+ */
+export function scopeMaterialFiles(assets: ExportedAssets, meshDirectory: string): ExportedAssets {
+  const byDirectory = scopedMaterialFiles.get(assets) ?? new Map<string, ExportedAssets>();
+  scopedMaterialFiles.set(assets, byDirectory);
+  const known = byDirectory.get(meshDirectory);
+  if (known) return known;
+  const choose = (all: ReadonlyMap<string, readonly string[]> | undefined, current: Map<string, string>): Map<string, string> => {
+    let chosen: Map<string, string> | undefined;
+    for (const [name, paths] of all ?? []) {
+      if (paths.length < 2) continue;
+      const beside = paths.find((path) => dirname(path) === meshDirectory);
+      if (beside === undefined || current.get(name) === beside) continue;
+      chosen ??= new Map(current);
+      chosen.set(name, beside);
+    }
+    return chosen ?? current;
+  };
+  const mat = choose(assets.matAll, assets.mat);
+  const props = choose(assets.propsAll, assets.props);
+  const scoped = mat === assets.mat && props === assets.props ? assets : { ...assets, mat, props };
+  byDirectory.set(meshDirectory, scoped);
+  return scoped;
 }
 
 function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAssets {
@@ -661,6 +721,8 @@ function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAss
     psa: merge(left.psa, right.psa),
     mat: merge(left.mat, right.mat),
     props: merge(left.props, right.props),
+    matAll: mergeCandidates(left.matAll, right.matAll),
+    propsAll: mergeCandidates(left.propsAll, right.propsAll),
     png: merge(left.png, right.png),
     ambiguousPng,
     audio: merge(left.audio, right.audio),
@@ -1237,10 +1299,11 @@ export async function packageGlb(options: {
   let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
   const sharedGraphs = new Map<ExportedAssets, Map<string, Set<string>>>();
+  const meshAssets = scopeMaterialFiles(options.assets, dirname(options.gltfPath));
   for (const material of root.listMaterials()) {
     const name = material.getName();
     const lookup = options.materialLookupNames?.get(name) ?? name;
-    const assets = options.materialAssets?.get(name) ?? options.assets;
+    const assets = options.materialAssets?.get(name) ?? meshAssets;
     const path = assets.mat.get(lookup);
     if (!path) continue;
     const text = readMaterialSidecar(path);
@@ -1255,7 +1318,7 @@ export async function packageGlb(options: {
   for (const [index, material] of root.listMaterials().entries()) {
     const name = material.getName();
     const lookupName = options.materialLookupNames?.get(name) ?? name;
-    const materialAssets = options.materialAssets?.get(name) ?? options.assets;
+    const materialAssets = options.materialAssets?.get(name) ?? meshAssets;
     const availableTextures = new Set(materialAssets.png.keys());
     const graphPath = materialAssets.mat.get(lookupName);
     const graphText = graphPath ? readMaterialSidecar(graphPath) : undefined;
@@ -1282,6 +1345,18 @@ export async function packageGlb(options: {
     };
     let resolved: ResolvedMaterial = resolveMaterial(materialRequest);
     options.onMaterialResolved?.(materialRequest);
+    {
+      // Same-named exports in several folders and none beside the mesh: the pick is the last indexed, not evidence.
+      const copies = materialAssets.matAll?.get(lookupName) ?? [];
+      const chosen = materialAssets.mat.get(lookupName);
+      if (!options.materialAssets?.has(name) && copies.length > 1 && chosen !== undefined && dirname(chosen) !== dirname(options.gltfPath)) {
+        const folders = [...new Set(copies.map((path) => basename(dirname(path))))].join(", ");
+        resolved = {
+          ...resolved,
+          limitations: [...resolved.limitations, `Material ${lookupName} was exported from ${copies.length} folders (${folders}) and none beside this mesh; the one in ${basename(dirname(chosen))} was used, which may not be the package the mesh references.`],
+        };
+      }
+    }
     let effect: ImportedMaterialEffect | undefined;
     if (unresolvedSection && (await options.namesEngineDefaultMaterial?.())) {
       effect = {
