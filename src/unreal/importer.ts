@@ -69,6 +69,28 @@ export function uncookedMeshRoute(
   return fileVersionUE4 !== undefined && fileVersionUE4 <= MESH_DESCRIPTION_LAST_VERSION ? "mesh-description" : undefined;
 }
 
+/** One line per mesh the modern converter could not write: `threenative-mesh-failure<TAB>name<TAB>cause`. */
+const MODERN_MESH_FAILURE = /^threenative-mesh-failure\t([^\t]+)\t(.+)$/;
+
+/** Why the modern converter wrote no GLB for each mesh it named, keyed by package basename. */
+export function parseModernMeshFailures(stderr: string): Map<string, string> {
+  const failures = new Map<string, string>();
+  for (const line of stderr.split(/\r?\n/)) {
+    const match = MODERN_MESH_FAILURE.exec(line.trim());
+    if (match?.[1] && match[2] && !failures.has(match[1])) failures.set(match[1], match[2].trim());
+  }
+  return failures;
+}
+
+/**
+ * Whether UE Viewer is worth trying on a mesh the modern converter could not write. A UE5 package
+ * is beyond UE Viewer, and a UE4 static mesh already has its own route; the case this admits is a
+ * UE4 skeletal mesh, which UE Viewer reads for the object versions it decodes.
+ */
+function umodelCanRetry(meshKind: "static" | "skeletal" | undefined, legacyFileVersion: number | undefined): boolean {
+  return meshKind !== undefined && legacyFileVersion !== undefined && legacyFileVersion >= -7;
+}
+
 export { ImportError, type ImportErrorCode } from "./errors.js";
 
 export interface ImportedMaterialSection {
@@ -2703,6 +2725,8 @@ export async function importUnrealDirectory(
   let modernGroomPayloads = new Map<string, string[]>();
   /** Meshes UE Viewer exported after the modern converter failed on them. */
   const recoveredByUmodel = new Set<string>();
+  /** Why a mesh the modern converter ran on still has no GLB, by package basename. */
+  const modernMeshFailureReasons = new Map<string, string>();
   const modernSceneModelSources: {
     readonly entry: PackageClassification;
     readonly name: string;
@@ -2786,8 +2810,9 @@ export async function importUnrealDirectory(
       // honest when it covers everything: recovering part of the request would drop the rest
       // silently, so anything UE Viewer cannot supply reports the converter's own diagnostic.
       const retryable = modernPackages.filter(
-        ({ entry, fileVersionUE4 }) =>
-          entry.meshKind === "static" && uncookedMeshRoute("static", fileVersionUE4) === "umodel",
+        ({ entry, legacyFileVersion, fileVersionUE4 }) =>
+          (entry.meshKind === "static" && uncookedMeshRoute("static", fileVersionUE4) === "umodel") ||
+          (entry.meshKind === "skeletal" && umodelCanRetry(entry.meshKind, legacyFileVersion)),
       );
       const retried = await mapWithConcurrency(retryable, 1, async ({ entry }) => ({
         entry,
@@ -2805,7 +2830,7 @@ export async function importUnrealDirectory(
       }
       assets = mergeExported(assets, await indexExported(raw));
       warnings.push(
-        `The modern UE5 asset converter exited ${converted.code}; UE Viewer decoded ${recoveredByUmodel.size} static mesh package${recoveredByUmodel.size === 1 ? "" : "s"} it could read itself.`,
+        `The modern UE5 asset converter exited ${converted.code}; UE Viewer decoded ${recoveredByUmodel.size} mesh package${recoveredByUmodel.size === 1 ? "" : "s"} it could read itself.`,
       );
     } else {
       modernGlbs = await indexGlbs(modernRaw);
@@ -2814,6 +2839,35 @@ export async function importUnrealDirectory(
       warnings.push(
         `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
       );
+      // The converter exits zero when it wrote other packages, so a mesh it could not read is
+      // only visible as a missing GLB. Name its cause, and give UE Viewer the chance to read it.
+      const converterCauses = parseModernMeshFailures(converted.stderr);
+      const missingMeshes = modernPackages.filter(
+        ({ entry }) => entry.meshKind !== undefined && !modernGlbs.has(basename(entry.package, extname(entry.package))),
+      );
+      for (const { entry, legacyFileVersion } of missingMeshes) {
+        const name = basename(entry.package, extname(entry.package));
+        const cause = converterCauses.get(name);
+        if (!umodelCanRetry(entry.meshKind, legacyFileVersion)) {
+          if (cause) modernMeshFailureReasons.set(name, cause);
+          continue;
+        }
+        const retried = await exportMeshWithUmodel(entry, raw);
+        if (retried === undefined && (await indexExported(raw)).gltf.has(name)) {
+          recoveredByUmodel.add(name);
+        } else {
+          modernMeshFailureReasons.set(
+            name,
+            [cause, `UE Viewer retry: ${retried ?? "it wrote no glTF"}`].filter(Boolean).join("; "),
+          );
+        }
+      }
+      if (recoveredByUmodel.size > 0) {
+        assets = mergeExported(assets, await indexExported(raw));
+        warnings.push(
+          `The modern UE5 asset converter wrote no GLB for ${recoveredByUmodel.size} mesh package${recoveredByUmodel.size === 1 ? "" : "s"}; UE Viewer decoded ${recoveredByUmodel.size === 1 ? "it" : "them"} instead.`,
+        );
+      }
     }
   }
   if (modernTexturePackages.length > 0) {
@@ -3248,7 +3302,9 @@ export async function importUnrealDirectory(
           reason: fromMeshDescription
             ? "The uncooked MeshDescription converter produced no GLB for this package."
             : fromModernConverter
-              ? "The modern UE5 mesh converter produced no GLB for this package."
+              ? `The modern UE5 mesh converter produced no GLB for this package${
+                  modernMeshFailureReasons.has(name) ? `: ${modernMeshFailureReasons.get(name)}` : "."
+                }`
             : "UE Viewer produced no glTF for this package.",
         });
         continue;
