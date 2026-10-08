@@ -484,6 +484,18 @@ left in `Other[]` still recovers its slot by parameter name, and a `.mat` that n
 slot (the modern converter's `Other[n]` references only) still falls back to the
 collected defaults.
 
+Importer version 59 applies a material instance's base-colour tint vector even when its
+parameter name carries extra words. Old West - VOL 5 Town Props overrides both
+`Albedo Color Tint (Base)` (a bright global multiplier) and `Base Color Tint (Mask)` (the
+dark cloth colour) on a master that tints its albedo through a mask; the exact names missed
+both, so every curtain kept `baseColorFactor` [1,1,1] and rendered the untinted light-grey
+albedo. When both a global base multiplier and a mask colour are overridden, the mask tint is
+the surface colour that shows through. Only an instance's own override is matched broadly, so
+a master's placeholder default (the master's red `Base Color Tint (Mask)`) never paints an
+un-tinted instance; a lone mask tint with no global multiplier (the 03a curtain, whose editor
+mesh thumbnail is the untinted albedo) is left alone, and a `RockTint`-style name with no
+colour token beside `Tint` is left to the graph baker.
+
 Importer version 57 gives a mesh the `.mat` / `.props.txt` that sit beside it when two
 packages share an object name (a pack with `MI_Rock_Inst` in two folders bound one
 folder's normal map to the other's meshes); with none beside the mesh the pick is named
