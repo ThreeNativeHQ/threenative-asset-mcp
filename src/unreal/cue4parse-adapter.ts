@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.53",
+  version: "b4e95441+threenative.54",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -745,6 +745,37 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                 if (callInputs is not null && callInputs.TryGetValue(path, out var actual) && actual is not null) inputs["Input"] = actual;
                 else if (!inputs.ContainsKey("Input")) inputs["Input"] = null;
                 constants["InputName"] = GraphText(GraphProperty(expr, "InputName")?.Tag?.GenericValue);
+            }
+            if (className == "NamedRerouteUsage")
+            {
+                // A usage has no input of its own: link it to its declaration so the declaration's Input is followed.
+                var declarationGuid = GraphGuid(GraphProperty(expr, "DeclarationGuid"));
+                if (declarationGuid is not null) constants["DeclarationGuid"] = declarationGuid;
+                UObject? declaration = null;
+                if (GraphProperty(expr, "Declaration")?.Tag?.GenericValue is FPackageIndex declarationIndex && !declarationIndex.IsNull)
+                {
+                    try { declaration = declarationIndex.Load<UObject>(); } catch { }
+                }
+                if (declaration is null && declarationGuid is not null && owner is not null)
+                {
+                    for (var exportIndex = 0; exportIndex < owner.ExportsLazy.Length && declaration is null; exportIndex++)
+                    {
+                        try
+                        {
+                            if (!DumpExportClass(owner, exportIndex).EndsWith("NamedRerouteDeclaration", StringComparison.Ordinal)) continue;
+                            var candidate = owner.ExportsLazy[exportIndex].Value;
+                            if (GraphGuid(GraphProperty(candidate, "VariableGuid")) == declarationGuid) declaration = candidate;
+                        }
+                        catch { }
+                    }
+                }
+                if (declaration is null) node["error"] = "named reroute declaration could not be found";
+                else
+                {
+                    var declarationId = EmitNode(declaration, prefix, callInputs, depth);
+                    if (declarationId is null) node["error"] = "named reroute declaration could not be emitted (graph node limit)";
+                    else inputs["Input"] = new Dictionary<string, object?> { ["node"] = declarationId, ["output"] = 0, ["mask"] = null };
+                }
             }
             if (isFunctionCall) InlineFunctionCall(expr, id, node, prefix, callInputs, depth);
         }

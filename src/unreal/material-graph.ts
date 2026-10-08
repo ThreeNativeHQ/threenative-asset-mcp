@@ -108,6 +108,8 @@ const SUPPORTED_NODE_CLASSES = [
   "FunctionCall",
   "FunctionInput",
   "FunctionOutput",
+  "NamedRerouteUsage",
+  "NamedRerouteDeclaration",
   "MakeMaterialAttributes",
   "BreakMaterialAttributes",
   "BlendMaterialAttributes",
@@ -579,6 +581,13 @@ class Compiler {
       case "FunctionOutput": {
         const wired = Object.values(node.inputs).find((candidate) => candidate !== null && candidate !== undefined);
         return this.pin(wired) ?? this.markUnavailable(`function output ${node.id} is not wired`);
+      }
+      case "NamedRerouteDeclaration":
+        return this.pin(node.inputs.Input) ?? this.markUnavailable(`named reroute declaration ${node.id} is not wired`);
+      case "NamedRerouteUsage": {
+        // The dumper links a usage to its declaration through `Input`; a dump without that pin cannot be followed.
+        if (!node.inputs.Input) return this.unsupportedNode(node);
+        return this.pin(node.inputs.Input) ?? this.markUnavailable(`named reroute usage ${node.id} has no declaration`);
       }
       case "FunctionCall":
         return this.functionCall(node, output);
