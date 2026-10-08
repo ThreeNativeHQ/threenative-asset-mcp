@@ -99,6 +99,11 @@ export interface PackScore {
     readonly share: number;
     readonly misses: readonly ColourMiss[];
     readonly missesTotal: number;
+    /**
+     * Sections the source gives no albedo by design (the importer recorded an `effect`: emissive-only effect or
+     * engine default material) and that stayed neutral. They are neither coloured nor missed, so they leave `expectsColour`.
+     */
+    readonly effectNeutral: number;
     /** Sections (all models) by graph outcome; sections with no `graph` count in none of these. */
     readonly graphBaked: number;
     readonly graphUnsupported: number;
@@ -375,6 +380,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   let outsideDump = 0;
   let expectsColour = 0;
   let coloured = 0;
+  let effectNeutral = 0;
   const misses: ColourMiss[] = [];
   let graphBaked = 0;
   let graphUnsupported = 0;
@@ -468,8 +474,13 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       substituted += scoreIdentity(model.name, section, effective, identity);
       const hasColourTexture = [...effective.textures].some((t) => !effective.normalTextures.has(t));
       if (hasColourTexture || effective.hasVectors || effective.constantColors) {
-        expectsColour++;
         const isColoured = section.textured === true || (section.factors?.baseColor !== undefined && !isNeutral(section.factors.baseColor));
+        if (section.effect && !isColoured) {
+          // The importer named why this section has no albedo; the reason is in the report, so it is not a miss.
+          effectNeutral++;
+          continue;
+        }
+        expectsColour++;
         const graphStatus: GraphOutcome = section.graph?.status ?? "none";
         if (isColoured) {
           coloured++;
@@ -558,6 +569,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       share,
       misses: capped(misses),
       missesTotal: misses.length,
+      effectNeutral,
       graphBaked,
       graphUnsupported,
       graphUnavailable,
