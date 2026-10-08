@@ -157,6 +157,9 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
   // way a failure is memoised here as `unavailable` and never reaches the importer.
   const dumpedGraphs = (): NonNullable<typeof graphs> =>
     (graphs ??= (async () => {
+      options.log?.(
+        "Some sections have no base-colour texture; reading the pack's material graphs with CUE4Parse to bake them (the converter and its .NET SDK are installed once on first use; set graphBake:false or THREENATIVE_TOOLCHAIN_AUTOINSTALL=0 to skip).",
+      );
       try {
         return {
           graphs: await dump(options.sourceDir, {

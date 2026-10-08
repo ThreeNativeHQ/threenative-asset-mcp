@@ -33,7 +33,7 @@ it.each([{ meshOnly: false, duplicatePng: false }, { meshOnly: true, duplicatePn
   }
   const tool = join(directory, "umodel");
   await writeFakeUmodel(tool, { exportFrom: fixture, emptyExports: ["Master"], classes: { Mesh: ["StaticMesh"], Master: ["Material"], Instance: ["MaterialInstanceConstant"], Packed: ["Texture2D"], Huge: ["Texture2D"] } });
-  const report = await importUnrealDirectory({ sourceDir, outputDir, ...(meshOnly ? { onlyPackages: ["Mesh"] } : {}), concurrency: 1, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" } });
+  const report = await importUnrealDirectory({ sourceDir, outputDir, ...(meshOnly ? { onlyPackages: ["Mesh"] } : {}), concurrency: 1, graphBake: false, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" } });
   expect(report.models).toHaveLength(1);
   const section = report.models[0]!.materials[0]!;
   expect(section.factors.roughness).toBe(1);
@@ -163,7 +163,7 @@ it("keeps same-named source material caches in separate Content namespaces", asy
     await writeMeshFixture(fixture, { name: mesh, materialName: "Instance", mat: "Diffuse=Albedo", props: "", textures: ["Albedo"] });
   }
   const tool = join(directory, "umodel"); await writeFakeUmodel(tool, { exportFrom: fixture, emptyExports: ["Master", "Instance"], classes: { MeshOne: ["StaticMesh"], MeshTwo: ["StaticMesh"], Master: ["Material"], Instance: ["MaterialInstanceConstant"] } });
-  const report = await importUnrealDirectory({ sourceDir, outputDir, concurrency: 1, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" } });
+  const report = await importUnrealDirectory({ sourceDir, outputDir, concurrency: 1, graphBake: false, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" } });
   expect(report.models.find((m) => m.name === "MeshOne")!.materials[0]!.factors.roughness).toBe(1);
   expect(report.models.find((m) => m.name === "MeshTwo")!.materials[0]!.factors.roughness).toBeCloseTo(0.2);
 });
@@ -180,7 +180,7 @@ it.each([{ references: ["Kit"], expected: 1 }, { references: ["Winter"], expecte
   await writeFile(join(kit, "Mesh.uasset"), materialPackage([{ name: "Mesh", className: "StaticMesh", properties: [] }], external, { externalClasses: Object.fromEntries(external.map((path) => [path, "MaterialInstanceConstant"])) }));
   await writeMeshFixture(fixture, { name: "Mesh", materialName: "Instance", mat: "Diffuse=Albedo", props: "", textures: ["Albedo"] });
   const tool = join(directory, "umodel"); await writeFakeUmodel(tool, { exportFrom: fixture, classes: { Mesh: ["StaticMesh"] } });
-  const report = await importUnrealDirectory({ sourceDir, outputDir, onlyPackages: ["Mesh"], concurrency: 1, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" } });
+  const report = await importUnrealDirectory({ sourceDir, outputDir, onlyPackages: ["Mesh"], concurrency: 1, graphBake: false, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" } });
   expect(report.models).toHaveLength(1); expect(report.materialAssets).toHaveLength(0);
   const section = report.models[0]!.materials[0]!;
   expect(section.factors.roughness).toBeCloseTo(expected);
