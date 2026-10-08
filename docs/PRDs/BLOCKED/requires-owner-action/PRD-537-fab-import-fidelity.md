@@ -1,6 +1,7 @@
 # PRD-537 — Fab Unreal imports match their source packs for most of the library
 
-**Status:** DONE except the items under Blocked on (Fab licence check, owner action). Phases 1–3 code and fixture/fake-FabCLI tests landed; the corpus sweep (AC-3, AC-6, live AC-5, parity half of AC-7) has not run.
+**Status:** PARTIAL — Phases 1–3 code and fixture/fake-FabCLI tests landed (PR #25); the corpus sweep (AC-3, AC-6, live AC-5, parity half of AC-7) has not run.
+**Blocker:** João clears Fab's browser verification (run the MCP or `fab-parity` once with `FAB_BROWSER_HEADLESS=0` and solve the challenge in the dedicated profile) or approves an explicit `--assume-licence` flag for local scoring; see Blocked on.
 **Priority:** P1 — `fab_import_asset` is the primary Fab path and today fails outright on a fresh host (AC-1, AC-2) and silently binds the wrong textures on UE Viewer packs (AC-4).
 **Complexity:** 5 (MEDIUM) — 6–10 implementation files (2), new parity module (+2), Fab/FabCLI integration (+1); risk override: none
 **Owner:** João
