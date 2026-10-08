@@ -105,6 +105,53 @@ describe("a separate opacity map becomes the base colour's alpha", () => {
   });
 });
 
+describe("a packed `_AORO` map supplies a masked card's cut-out", () => {
+  const maskedMaster = (mat: string) => ({
+    Larch_Leaf: { mat, props: "BlendMode = BLEND_Masked (1)\nOpacityMaskClipValue = 0.333\n" },
+  });
+
+  it("takes the blue channel of the `<stem>_AORO` sibling when `Opacity=` names the diffuse", () => {
+    const resolved = resolve(
+      maskedMaster("Diffuse=LarchLeafs_A\nOpacity=LarchLeafs_A\nOther[0]=LarchLeafs_AORO\n"),
+      ["LarchLeafs_A", "LarchLeafs_AORO"],
+      "Larch_Leaf",
+    );
+    expect(resolved.alphaMode).toBe("MASK");
+    expect(resolved.bindings.find((b) => b.slot === "baseColor")).toMatchObject({
+      texture: "LarchLeafs_A",
+      secondaryTexture: "LarchLeafs_AORO",
+      transform: "blueToBaseColorAlpha",
+      confidence: "heuristic",
+    });
+    expect(resolved.unsupported.map((u) => u.texture)).not.toContain("LarchLeafs_AORO");
+  });
+
+  it("leaves an opaque material and an unrelated stem alone", () => {
+    const opaque = resolve(
+      { Larch_Leaf: { mat: "Diffuse=LarchLeafs_A\nOpacity=LarchLeafs_A\nOther[0]=LarchLeafs_AORO\n", props: "BlendMode = BLEND_Opaque (0)\n" } },
+      ["LarchLeafs_A", "LarchLeafs_AORO"],
+      "Larch_Leaf",
+    );
+    expect(opaque.bindings.find((b) => b.slot === "baseColor")?.secondaryTexture).toBeUndefined();
+
+    const otherStem = resolve(
+      maskedMaster("Diffuse=LarchLeafs_A\nOpacity=LarchLeafs_A\nOther[0]=PineLeaves_AORO\n"),
+      ["LarchLeafs_A", "PineLeaves_AORO"],
+      "Larch_Leaf",
+    );
+    expect(otherStem.bindings.find((b) => b.slot === "baseColor")?.secondaryTexture).toBeUndefined();
+  });
+
+  it("does not invent the sibling the pack did not export", () => {
+    const resolved = resolve(
+      maskedMaster("Diffuse=LarchLeafs_A\nOpacity=LarchLeafs_A\nOther[0]=LarchLeafs_AORO\n"),
+      ["LarchLeafs_A"],
+      "Larch_Leaf",
+    );
+    expect(resolved.bindings.find((b) => b.slot === "baseColor")?.secondaryTexture).toBeUndefined();
+  });
+});
+
 describe("redToBaseColorAlpha composes opacity maps of another resolution", () => {
   const png = (width: number, height: number, rgb: [number, number, number]) =>
     sharp({ create: { width, height, channels: 3, background: { r: rgb[0], g: rgb[1], b: rgb[2] } } }).png().toBuffer();
@@ -120,6 +167,15 @@ describe("redToBaseColorAlpha composes opacity maps of another resolution", () =
 
   it("refuses a mask with another aspect ratio", async () => {
     await expect(applyTextureTransform(await png(4, 4, [1, 2, 3]), "redToBaseColorAlpha", undefined, await png(8, 4, [255, 255, 255]))).rejects.toThrow(/dimensions/);
+  });
+
+  it("takes a packed map's blue channel, not its red", async () => {
+    const colour = await png(4, 4, [10, 200, 30]);
+    // Red 255 (the packed AO channel) and blue 0 (the packed opacity channel): only blue may clip.
+    const packed = await png(16, 16, [255, 255, 0]);
+    const out = await applyTextureTransform(colour, "blueToBaseColorAlpha", undefined, packed);
+    const { data } = await sharp(out.data).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect([data[0], data[1], data[2], data[3]]).toEqual([10, 200, 30, 0]);
   });
 });
 

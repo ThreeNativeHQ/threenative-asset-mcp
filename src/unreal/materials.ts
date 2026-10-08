@@ -39,7 +39,9 @@ export type TextureTransform =
   /** Already packed glTF image: force G to one so an authored scalar supplies all roughness. */
   | "roughnessToOne"
   /** Preserve diffuse RGB, with a separate opacity map's red channel as alpha. */
-  | "redToBaseColorAlpha";
+  | "redToBaseColorAlpha"
+  /** Preserve diffuse RGB, with a packed data map's blue channel as alpha (`*_AORO`). */
+  | "blueToBaseColorAlpha";
 
 /** `effect`: an emissive-only effect material's mask, bound as emissive and alpha because the package has no albedo. */
 export type BindingSource = "mat" | "props" | "filename" | "texture-set" | "authored-source" | "graph" | "effect";
@@ -439,6 +441,21 @@ function isDataTexture(texture: string): boolean {
 /** `*_D_R` textures carry roughness in alpha; the same image serves both slots. */
 export function packsRoughnessInAlpha(texture: string): boolean {
   return /_d(?:\d+)?(?:_[a-z0-9]+)*_r$/i.test(texture);
+}
+
+/**
+ * A packed data map that carries opacity in a named channel: `*_AORO` packs AO, roughness and opacity
+ * into R, G and B. The channel is a naming convention, not a pack identity; the map is only consulted
+ * for a masked section whose own opacity source turned out to be the base colour.
+ */
+function packedOpacityTransform(texture: string): TextureTransform | undefined {
+  return /_aoro$/i.test(texture) ? "blueToBaseColorAlpha" : undefined;
+}
+
+/** Whether `candidate` belongs to `base`'s texture set (`LarchLeafs_AORO` beside `LarchLeafs_A`). */
+function sharesTextureStem(base: string, candidate: string): boolean {
+  const stem = base.replace(/_[^_]+$/, "").toLowerCase();
+  return stem !== "" && candidate.toLowerCase().startsWith(`${stem}_`);
 }
 
 export interface ResolveMaterialRequest {
@@ -887,6 +904,21 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   ) {
     bindings.set("baseColor", { ...colourForAlpha, secondaryTexture: opacityMap, confidence: "heuristic", transform: "redToBaseColorAlpha" });
     limitations.add(`${opacityMap} is the material's opacity map: its red channel is the base colour's alpha; same UV layout is assumed (heuristic).`);
+  } else if (
+    colourForAlpha && alphaMode !== "OPAQUE" && opacityTextures.length > 0 && colourForAlpha.secondaryTexture === undefined &&
+    colourForAlpha.transform === "none" && request.availableTextures.has(colourForAlpha.texture)
+  ) {
+    // UE Viewer resolves a masked foliage master's `Opacity=` to the base colour itself even though that
+    // albedo has no alpha; the cut-out is the blue channel of a packed `<stem>_AORO` (AO / Roughness /
+    // Opacity) sibling in `Other[]`. Without it the masked card draws as a solid rectangle.
+    const packed = [...referenced].find(
+      (texture) => request.availableTextures.has(texture) && packedOpacityTransform(texture) !== undefined &&
+        sharesTextureStem(colourForAlpha.texture, texture),
+    );
+    if (packed) {
+      bindings.set("baseColor", { ...colourForAlpha, secondaryTexture: packed, confidence: "heuristic", transform: packedOpacityTransform(packed)! });
+      limitations.add(`${packed} is the material's packed opacity map: its blue channel is the base colour's alpha; same UV layout is assumed (heuristic).`);
+    }
   }
 
   // Masked foliage takes its cutout from the base colour's own alpha channel.

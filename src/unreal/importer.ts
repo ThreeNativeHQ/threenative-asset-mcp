@@ -52,7 +52,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 59;
+export const IMPORTER_VERSION = 60;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -853,7 +853,7 @@ export async function applyTextureTransform(
     for (let index = 0; index < pixels; index += 1) data[index * 4 + 1] = 255;
     return { data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6 }).toBuffer(), mimeType: "image/png" };
   }
-  if (transform === "redToBaseColorAlpha") {
+  if (transform === "redToBaseColorAlpha" || transform === "blueToBaseColorAlpha") {
     if (!secondaryInput) throw new Error("Opacity source is missing for base-colour alpha composition.");
     const colourMetadata = await sharp(input).metadata();
     const opacityMetadata = await sharp(secondaryInput).metadata();
@@ -866,7 +866,8 @@ export async function applyTextureTransform(
     const mask = await sharp(secondaryInput, { limitInputPixels: 268_435_456, unlimited: true })
       .resize(info.width, info.height, { fit: "fill" })
       .ensureAlpha().raw().toBuffer();
-    for (let index = 0; index < pixels; index += 1) data[index * 4 + 3] = mask[index * 4] ?? 0;
+    const channel = transform === "blueToBaseColorAlpha" ? 2 : 0;
+    for (let index = 0; index < pixels; index += 1) data[index * 4 + 3] = mask[index * 4 + channel] ?? 0;
     return {
       data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer(),
       mimeType: "image/png",
@@ -1509,7 +1510,7 @@ export async function packageGlb(options: {
           image = await produce(binding.transform, secondarySource);
         } catch (error) {
           // An inferred opacity map that cannot be composed (other aspect, unreadable) must not cost the model its colour.
-          if (binding.transform !== "redToBaseColorAlpha" || binding.source === "effect") throw error;
+          if ((binding.transform !== "redToBaseColorAlpha" && binding.transform !== "blueToBaseColorAlpha") || binding.source === "effect") throw error;
           image = await produce("none", undefined);
           packagingLimitations.push(`Opacity map ${binding.secondaryTexture ?? "?"} could not be composed into ${binding.texture}'s alpha (${error instanceof Error ? error.message : String(error)}); the base colour is bound without it.`);
         }
