@@ -1,6 +1,6 @@
 # PRD-538 — Bake common Unreal material graphs into glTF PBR textures
 
-**Status:** NOT STARTED
+**Status:** DONE except AC-4 (Blocked on: needs PRD-537's corpus baseline, which needs the Fab licence check cleared by the owner).
 **Priority:** P2 — follows PRD-537. Sections whose colour exists only in the material graph still import grey (AC-1, AC-2); PRD-537's S4 failures will size how much of the library this affects.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new graph-evaluation module (+2), crosses the .NET converter / Node importer boundary (+2); risk override: none
 **Owner:** João
@@ -66,10 +66,23 @@ Each criterion is a checkbox in the phase that delivers it: AC-1 in Phase 1, AC-
 - **Engine content functions are not in the pack** (`MatLayerBlend_Standard/AO/BakedNormal`, `FuzzyShading_JM`, `CheapContrast`, `FlattenNormal`; 84 call nodes across Soul Cave). They stay as named `FunctionCall` nodes. The evaluator implements a small table of them by name. Their bodies were not available to verify, so only `MatLayerBlend_Standard` (per-attribute lerp by alpha) is treated as exact; functions that only touch non-colour attributes (`_AO`, `_BakedNormal`) pass BaseColor through, and view-dependent `FuzzyShading` is ignored. A bake that relies on any of those is `confidence: "heuristic"` and names them in the report's limitations; the PRD's "exact only when every node is supported" is kept for `confidence: "exact"`.
 - **UE 4.5-era packages (object version 401) need a raw-property fallback** inside the dumper (16 of 89 Soul Cave materials).
 
+- **`VertexColor` is evaluated as white when no primitive using the material carries `COLOR_0`** (Unreal's default for a mesh without a colour buffer). All 35 Soul Cave moss sections qualify (checked: none of their GLBs has `COLOR_0`; UE Viewer does emit it when present and the importer does not prune it). The bake is `heuristic` and says so, because a level instance could paint differently. A mesh that does carry `COLOR_0` keeps the node unsupported, as the PRD wanted. This moved S4 from 75.6 % to 93.2 %.
+- **`TextureCoordinate` with `CoordinateIndex` 2 is read as UV0** (`allowUvSetFallback`; heuristic, named in the report). The importer drops extra UV sets and the graph does not say what set 2 is.
+- **Graph-only textures are exported on demand.** The colour textures of a layered master live inside material functions, so UE Viewer never exported them (37 sections failed with "texture could not be loaded" until this). They are exported one at a time into the import's staging directory; UE Viewer silently writes nothing when the output path exceeds ~256 characters, so a long staging path goes through a short temporary symlink.
+- **Bug only the real pack could show:** the importer carries the engine as `UE_4.18` but the converter accepts only `4.18`, so every graph dump exited 1 and no section baked. The fake-converter tests could not see it; a test now pins the normalisation, and the real run is the evidence.
+- **`Divide` defaults** (`ConstA` 0, `ConstB` 1 when the dump omits them) are not verified against Unreal's class defaults (recalled as 1 and 2). It matters only for an unwired, omitted input.
+- **The parity scorer exempts `source: "graph"` bindings from S3's foreign-texture check** (a baked texture is derived from several pack textures); the report does not list the textures the bake read, so S3 cannot check them yet.
+- **The section report keeps a mask the PRD-537 path rejected as a base colour next to the graph binding** (`MI_Cave_Rock_Pillar` lists `baseColor=T_Cave_Rock_Pillar_M texture-set` and the graph binding); the GLB carries only the graph one. Pre-existing reporting behaviour, noted rather than changed.
+- PRD filing: moved to `done/` as the goal instructed, although `AGENTS.md` now names `docs/PRDs/BLOCKED/<reason>/` for PRDs that wait only on an owner action; `git mv` it there if preferred.
+
+## Blocked on
+
+- **AC-4** S4 failures across the PRD-537 corpus fall by at least half from PRD-537's final baseline. proof: `npm run parity:fab -- --corpus library --baseline <PRD-537 scorecard>`. Needs the corpus sweep, which needs the owner to clear Fab's browser verification (or approve `--assume-licence`); see PRD-537 Blocked on. The tooling is done: the scorecard carries the unsupported-node histogram, S4-miss attribution and `--baseline` delta. On the one pack available, S4 misses fell 97 → 12 (−88 %); the next nodes by count are `MatLayerBlend_Tint` (4 sections) and `DepthFade` (3).
+
 ## Execution Phases
 
 #### Phase 1: The graph reaches the importer
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-08)
 **Files:** `src/unreal/cue4parse-adapter.ts`, `src/unreal/materials.ts` (parse `.graph.json`).
 **Implementation:** Dump only expressions reachable from the five outputs; cap at 2,000 nodes per material and report truncation. Function calls are inlined from their `MaterialFunction` packages.
 - [x] AC-1 [local]: Importing Soul Cave writes a `M_Cave_Rock_MASTER.graph.json` whose BaseColor path names `Mask` and the tint parameters. proof: `ThreeNativeConverter <pack> --dump-graphs <dir> --engine 4.18 --filter M_Cave_Rock_MASTER` via `dumpMaterialGraphs`, then a traversal from the BaseColor output — Evidence (2026-10-08): 160 nodes, 159 reachable, not truncated; reachable parameters include `Mask` (TextureSampleParameter2D), `RockTint` and `DetailRockTint` (VectorParameter), `Diffuse Brightness`, the wetness/fuzzy switches; reachable textures `T_Cave_Rock_01_D`, `T_Cave_Rock_Detail_D`, `T_Cave_Rock_Stalactite_M`. All 89 materials of the pack dump in ~2 s and pass the strict schema (`tests/unreal-graph-dump.test.ts`, 13 tests). The wording changed from "all four tint parameters": `Tint` and `Tint1` are *input names* of the functions `MF_Cave_Rock01`/`MF_Cave_Rock02`, fed by `RockTint`/`DetailRockTint` (see Decisions). The `parity:fab` command in the original proof is blocked by PRD-537's licence check, so the dump ran through `dumpMaterialGraphs` directly.
@@ -77,17 +90,16 @@ Each criterion is a checkbox in the phase that delivers it: AC-1 in Phase 1, AC-
 **Verification:** the box above.
 
 #### Phase 2: Mask × tint materials bake to base colour
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-08)
 **Files:** `src/unreal/material-graph.ts` (new evaluator), `src/unreal/materials.ts`, `tests/unreal-material-graph.test.ts`.
 **Implementation:** Evaluate per texel. Fixture graphs are hand-written JSON copying the node shapes above, plus a 4×4 mask PNG with expected output pixels computed by hand.
-- [ ] AC-2 [local]: `MI_Cave_Rock_Pillar` ships a baked base colour whose mean differs from the neutral fallback, and its binding is `source: "graph"`. proof: parity run on Soul Cave + `npx vitest run tests/unreal-material-graph.test.ts` — Evidence: pending.
+- [x] AC-2 [local]: `MI_Cave_Rock_Pillar` ships a baked base colour whose mean differs from the neutral fallback, and its binding is `source: "graph"`. proof: parity run on Soul Cave + `npx vitest run tests/unreal-material-graph.test.ts` — Evidence (2026-10-08): full `importUnrealDirectory` on the live Soul Cave pack (importer v53) → section `MI_Cave_Rock_Pillar` has binding `baseColor=MI_Cave_Rock_Pillar_graph_baseColor` `source: graph`, `confidence: heuristic`, `textured: true`; the bake's mean colour is (0.404, 0.369, 0.308) in sRGB against the 0.8 grey fallback; three.js renders show the white rocks becoming cracked brown rock with unchanged geometry and normals. Unit evidence: `tests/unreal-material-graph.test.ts` (21 tests, pixel-exact fixtures with mutation checks on lerp, V orientation, sRGB decode, tiling) and `tests/unreal-graph-bake.integration.test.ts` (9 tests; the importer-level cases failed with the baker disabled). Run through `importUnrealDirectory` directly, because the `parity:fab` command is blocked by PRD-537's licence check (see Blocked on). Confidence is `heuristic`, not `exact`, because the master uses engine functions whose bodies are not in the pack (see Decisions).
 
 **Verification:** the box above.
 
 #### Phase 3: The library measures the gain
-**Status:** NOT STARTED
+**Status:** DONE except AC-4 (Blocked on)
 **Files:** `scripts/fab-parity.ts` (unsupported-node histogram), `src/unreal/material-graph.ts` (the top node classes by count).
-- [ ] AC-3 [local]: Soul Cave passes S4 (≥ 90 % sections with colour). proof: parity run on Soul Cave — Evidence: pending.
-- [ ] AC-4 [local]: S4 failures across the PRD-537 corpus fall by at least half from PRD-537's final baseline. proof: `npm run parity:fab -- --corpus library` summary — Evidence: pending.
+- [x] AC-3 [local]: Soul Cave passes S4 (≥ 90 % sections with colour). proof: parity run on Soul Cave — Evidence (2026-10-08): live pack, 203 import sections, 176 expect colour: **164 coloured = 93.2 %** (S4 `ok: true`), up from 79 = 44.9 % before this PRD (misses 97 → 12, −88 %). Graph outcomes: 88 baked (20 exact, 68 heuristic), 10 unsupported (`MatLayerBlend_Tint` 4, `DepthFade` 3, `ParticleColor` 2, one particle material), 33 unavailable (13 no source package, 11 parent graph outside the pack, 4 texture sample without texture, 3 no BaseColor output, 2 other). S3 identity stays at 0 violations over 190 verified sections. Measured with `importUnrealDirectory` + `dumpUnrealProperties` + `scorePack` (the same code `parity:fab` runs), not the CLI.
 
 **Verification:** the boxes above.
