@@ -103,7 +103,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 - [ ] AC-2 [shared]: CI's `parallel` leg (default workers) runs on every PR. proof: CI run link — Evidence: pending.
 - [ ] AC-7 [shared]: CI's `leak-gate` leg fails on a deliberately leaking test in a throwaway branch. proof: CI run link (red on the throwaway, green on the PR) — Evidence: pending.
 - [x] Every Chromium launch gets a private `TMPDIR` that is removed after the browser exits or fails to launch (creature probe and harnesses, claims judge, rig preview, Fab transport). proof: `npx vitest run tests/browser-temp.test.ts` — 3/3 pass; the fake-Chromium test goes red with the launch `env` removed (`expected '<tmp>' to be '<tmp>/threenative-browser-…'`). Commit 779b81e. 2026-10-07.
-- [ ] AC-3 [local]: With ffmpeg hidden from `PATH`, the tool guard skips the audio suites with the install command as its reason, but fails them under `CI=true`. proof: `PATH=<without ffmpeg> npx vitest run tests/audio-*.test.ts`, with `CI` unset vs `CI=true` — Evidence: pending.
+- [x] AC-3 [local]: With ffmpeg hidden from `PATH`, the tool guard skips the audio suites with the install command as its reason, but fails them under `CI=true`. proof: `PATH=<without ffmpeg> npx vitest run tests/audio-*.test.ts`, with `CI` unset vs `CI=true` — CI unset: 44 skipped, titles `… [skipped: ffmpeg not found; install it with: sudo apt-get install --yes ffmpeg]`; `CI=true`: 2 failed (one `has its required tools` per file) with that reason. Helper `tests/helpers/require-tool.ts`, also on rig and creature preview (`chromium`, `python-imaging`). 2026-10-07.
 
 **Verification:** the boxes above.
 
@@ -111,7 +111,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 **Status:** NOT STARTED
 **Files:** `scripts/doctor.ts` (new), `package.json` (`doctor`), `.github/workflows/ci.yml` (`fresh-toolchain` job + schedule), `README.md` (Verification).
 - [ ] AC-4 [shared]: The `fresh-toolchain` job provisions all four Unreal-side tools in `debian:13` from an empty cache. It goes red on a throwaway branch that reverts the PRD-537 `findArchiveEntry` fix (the pinned FabCLI release nests its binary). proof: CI run links (green on the branch, red on the revert) — Evidence: pending.
-- [ ] AC-5 [local]: `npm run doctor` lists every prerequisite as ok/missing with its fix, exiting non-zero when one is missing. proof: run with vs without `ffmpeg` on `PATH` — Evidence: pending.
+- [x] AC-5 [local]: `npm run doctor` lists every prerequisite as ok/missing with its fix, exiting non-zero when one is missing. proof: run with vs without `ffmpeg` on `PATH` — exit 0 with it; exit 1 without, printing `missing ffmpeg … fix: sudo apt-get install --yes ffmpeg` (and ffprobe). `--toolchain` makes the Unreal build prerequisites required; `--toolchain-only` checks only those (used in the `debian:13` job). `tests/doctor.test.ts`. 2026-10-07.
 
 **Verification:** the boxes above.
 
