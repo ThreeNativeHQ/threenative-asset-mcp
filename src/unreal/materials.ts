@@ -448,6 +448,47 @@ function referencedTextures(
   return referenced;
 }
 
+/** A parent's default texture that an instance below it replaces with its own. */
+interface SupersededDefault {
+  readonly parameter: string;
+  readonly override: string;
+}
+
+/**
+ * UE Viewer writes a material instance's `.mat` from the parent's graph when it does not
+ * recognise the instance's parameter names, so the instance's slots can hold the parent's
+ * default textures. The instance's `TextureParameterValues` are what Unreal actually renders.
+ * Returns each parent default (by texture) that some instance in the chain overrides with a
+ * different texture, keyed by the parent's texture.
+ */
+function supersededDefaults(request: ResolveMaterialRequest): Map<string, SupersededDefault> {
+  const chain: PropsFile[] = [];
+  const visited = new Set<string>();
+  for (let current: string | undefined = request.name; current && chain.length < MAX_PARENT_DEPTH; ) {
+    if (visited.has(current)) break;
+    visited.add(current);
+    const text = request.readProps(current);
+    const props = text ? parsePropsFile(text) : undefined;
+    if (props) chain.push(props);
+    current = props?.parent;
+  }
+  const result = new Map<string, SupersededDefault>();
+  const key = (name: string): string => name.trim().toLowerCase();
+  // An override at level i replaces defaults declared at levels above it (i + 1 and up).
+  for (let level = 0; level < chain.length; level += 1) {
+    for (const override of chain[level]!.overrides) {
+      for (let ancestor = level + 1; ancestor < chain.length; ancestor += 1) {
+        const parentDefault = chain[ancestor]!.collected.find((candidate) => key(candidate.name) === key(override.name));
+        if (parentDefault && parentDefault.texture !== override.texture && !result.has(parentDefault.texture)) {
+          result.set(parentDefault.texture, { parameter: override.name, override: override.texture });
+          break;
+        }
+      }
+    }
+  }
+  return result;
+}
+
 /**
  * Resolves one material, following `Parent` chains with a visited set so a self-referential or
  * mutually-referential instance terminates instead of recursing forever.
@@ -458,6 +499,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   const seenMaterials = new Set<string>();
   const parents: string[] = [];
   const limitations = new Set<string>();
+  const superseded = supersededDefaults(request);
 
   let alphaMode: ResolvedMaterial["alphaMode"] = "OPAQUE";
   let alphaCutoff: number | undefined;
@@ -478,6 +520,21 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     confidence: BindingConfidence,
   ): void => {
     claimed.add(texture);
+    const replacement = superseded.get(texture);
+    if (replacement) {
+      // The instance replaces this parent default. A replacement for the same slot is bound
+      // exactly; one for a different slot or a packed data map is never painted in its place.
+      const replacementPlan = planForParameterName(replacement.parameter);
+      if (replacementPlan?.slot === plan.slot && !isDataTexture(replacement.override)) {
+        claimed.add(replacement.override);
+        if (!bindings.has(plan.slot) && request.availableTextures.has(replacement.override)) {
+          bindings.set(plan.slot, { slot: plan.slot, texture: replacement.override, source: "props", confidence: "exact", transform: replacementPlan.transform });
+        }
+      } else {
+        limitations.add(`${texture} is the parent default of "${replacement.parameter}", overridden by ${replacement.override}; the override has no standard PBR slot here, so neither is bound for ${plan.slot}.`);
+      }
+      return;
+    }
     if (bindings.has(plan.slot)) return;
     if (!request.availableTextures.has(texture)) return;
     bindings.set(plan.slot, {
@@ -588,7 +645,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     // being bound to a slot, not having been considered.
     const boundAlready = new Set([...bindings.values()].map((binding) => binding.texture));
     const unmapped = [...referencedTextures(request, seenMaterials)].filter(
-      (texture) => !boundAlready.has(texture) && request.availableTextures.has(texture),
+      (texture) => !boundAlready.has(texture) && !superseded.has(texture) && request.availableTextures.has(texture),
     );
     const stems = new Map<string, string[]>();
     for (const texture of unmapped) {
@@ -624,7 +681,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
 
   // glTF has one combined metallic-roughness texture while Unreal commonly references two
   // grayscale images. Preserve both by packing roughness.red -> G and metalness.red -> B.
-  const referenced = referencedTextures(request, seenMaterials);
+  const referenced = new Set([...referencedTextures(request, seenMaterials)].filter((texture) => !superseded.has(texture)));
 
   // A shared graph can emit unrelated first samples as Diffuse and Normal. Correct only that
   // contradiction, using one coherent referenced family. A name or streaming record is a
