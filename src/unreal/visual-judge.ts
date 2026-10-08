@@ -138,7 +138,13 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
   if (isWhite) raise("suspect", `white: ${(stats.nearWhiteFraction * 100).toFixed(0)}% of object pixels are near-white`);
   else if (isGhost) raise("suspect", "ghost: uniform grey object with no shading, pale or close to the background");
   else if (isWashedOut) raise("suspect", "washed out: near-neutral and very bright");
-  if (options.expectColoured === true && (isWhite || isGhost || isWashedOut || isNeutral)) {
+  // A merely neutral render (grey stone, a dark mesh) is real colour when Unreal's own thumbnail
+  // agrees with it; white, ghost and washed-out renders fail regardless of the thumbnail.
+  const neutralAgreesWithThumbnail =
+    !(isWhite || isGhost || isWashedOut) &&
+    options.colourSimilarity !== undefined &&
+    options.colourSimilarity >= SUSPECT_COLOUR_SIMILARITY;
+  if (options.expectColoured === true && (isWhite || isGhost || isWashedOut || isNeutral) && !neutralAgreesWithThumbnail) {
     raise("fail", "report claims coloured sections but render is white/neutral");
   }
   if (options.colourSimilarity !== undefined && options.colourSimilarity < SUSPECT_COLOUR_SIMILARITY) {
