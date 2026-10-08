@@ -1,6 +1,6 @@
 # PRD-537 — Fab Unreal imports match their source packs for most of the library
 
-**Status:** IN PROGRESS
+**Status:** IN PROGRESS — Phase 1 code complete, baseline sweep blocked on the Fab licence check; Phase 2 done; Phase 3 in progress
 **Priority:** P1 — `fab_import_asset` is the primary Fab path and today fails outright on a fresh host (AC-1, AC-2) and silently binds the wrong textures on UE Viewer packs (AC-4).
 **Complexity:** 5 (MEDIUM) — 6–10 implementation files (2), new parity module (+2), Fab/FabCLI integration (+1); risk override: none
 **Owner:** João
@@ -136,6 +136,10 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
   committed Soul Cave import, is the consumer that is actually shipping the bug, so it stays here.
   Splitting it into its own PRD would leave the fix unverified where it matters.
 
+## Blocked on
+
+- **Fab licence check** (AC-3, AC-6 baseline and final; unblocks the live `npm run parity:fab` proofs). `fab_import_asset` reads each listing's licence anonymously before downloading, and Fab answers `FAB_BROWSER_ATTENTION_REQUIRED` (manual verification in the MCP's browser profile). One headed attempt passed once, then failed on every later call; FabCLI exposes no licence field. Unblocked by João completing the verification (`FAB_BROWSER_HEADLESS=0`) or approving an explicit `--assume-licence` for local scoring of owned packs. The script is ready to run the moment either happens. Decided 2026-10-07 (Claude): no fake licence verdict was injected, because that would bypass the project's own guard.
+
 ## Execution Phases
 
 #### Phase 1: Fresh host works, and the corpus has a baseline score
@@ -144,19 +148,19 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 **Implementation:** The corpus comes from `fab_list_owned --unrealOnly` with a size cap. The script runs each artifact through the real `fab_import_asset` handler, not `importUnrealDirectory`, so download and selection are exercised. On FabCLI auth/download errors it stops and reports, rather than continuing.
 - [x] AC-1 [local]: FabCLI installs on a fresh host from the current release archive. proof: `ensureFabcli` run on this host — installed `~/.cache/threenative-asset-mcp/toolchain/fabcli/fabcli`, `fabcli 0.1.0`; fix in `src/unreal/provision.ts` (`findArchiveEntry`).
 - [x] AC-2 [local]: On a 64-bit-only Debian host, UE Viewer either provisions or fails with one error naming the missing package. It skips the i386 prebuilt when no i386 loader exists. proof: `ensureUmodel` run on this host from an empty cache — logged "prebuilt is 32-bit and this host has no i386 loader; building from source", built `Compiled Oct  7 2026 (build 1)`; `npx vitest run tests/unreal-toolchain-hygiene.test.ts` — 7 passed (`umodelBuildFailure` maps `png.h`→`libpng-dev`, `SDL2/SDL.h`→`libsdl2-dev`). 2026-10-07.
-- [ ] AC-3 [local]: `npm run parity:fab` scores every corpus pack into `artifacts/parity/scorecard.json`, marking unreadable ones `unverified`. proof: `npm run parity:fab -- --corpus library` — Evidence: pending.
+- [ ] AC-3 [local]: `npm run parity:fab` scores every corpus pack into `artifacts/parity/scorecard.json`, marking unreadable ones `unverified`. proof: `npm run parity:fab -- --corpus library` — Evidence: built (`scripts/fab-parity.ts`, `src/unreal/parity.ts`, `src/unreal/property-dump.ts`; `--help` exits 0; unit suites green) but the sweep itself is blocked: see Blocked on.
 - [ ] AC-7 [local]: Neither `npm test` nor a parity run leaves files in `/tmp` or the Fab download root (only `artifacts/parity/` remains). proof: before/after `ls /tmp ~/.cache/threenative-asset-mcp/fab-downloads` diff — Evidence: test-suite half met (PRD-539 AC-1: isolated `TMPDIR` run left only `node-compile-cache`); parity-run half pending.
 
 **Verification:** the boxes above; record the baseline AC-6 numbers on the PRD.
 
 #### Phase 2: Material instances use their own textures
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-07)
 **Files:** `src/unreal/materials.ts`, `tests/unreal-import.integration.test.ts` (fixture `.mat`/`.props.txt` pair shaped like `MI_Cave_Rock_Pillar`: parent default in the `.mat`, instance override in `TextureParameterValues`).
 **Implementation:** First check what PR #23 already changes: it adds legacy instance flag handling and a tagged-package reader that may already expose `TextureParameterValues`. Build on it rather than adding a parallel path. While walking the parent chain, record each parent's `CollectedTextureParameters` name → texture. A `.mat` slot whose texture equals a parent default for parameter *P*, where the instance overrides *P*, takes the override with `confidence: "exact"`. A packed-mask override still goes through the existing mask detector and is never painted as base colour.
-- [ ] AC-4 [local]: Soul Cave scores 0 S3 violations: `MI_Cave_Rock_Pillar` binds `T_Cave_Rock_Pillar_N` and no `T_Cave_Rock_Stalactite_*`. proof: `npm run parity:fab -- --listing 75f42402-40bb-4a1b-b557-18e2c9604273` — Evidence: pending.
-- [ ] AC-9 [local]: The committed Soul Cave import in `threenative-sandbox/soul-cave/assets/fab/soul-cave/` is regenerated with the fixed importer, so the game stops shipping the parent-default textures. proof: its `import-report.json` shows `importer.version` ≥ the fix and 0 sections binding `T_Cave_Rock_Stalactite_*` outside the stalactite materials — Evidence: pending.
+- [x] AC-4 [local]: Soul Cave scores 0 S3 violations: `MI_Cave_Rock_Pillar` binds `T_Cave_Rock_Pillar_N` and no `T_Cave_Rock_Stalactite_*`. proof: `npm run parity:fab -- --listing 75f42402-40bb-4a1b-b557-18e2c9604273` — Evidence (2026-10-07): the CLI path is blocked by the Fab licence check (see Blocked on), so the same code ran directly: live pack downloaded with FabCLI (601 packages, UE4.18), `dumpUnrealProperties` (173 meshes, 78 instances, 0 package errors) → `importUnrealDirectory` (importer v52, 171/173 meshes) → `scorePack`: **S3 0 violations over 190 verified sections** (13 unverified); the same scorer on the committed sandbox import (importer v1) reports 11 (`MI_Cave_Rock_Pillar` and `MI_Soul_Statue_Torso` bind parent defaults). Note on the wording: the real instance overrides `NRM → T_Cave_Rock_Pillar_N` *and* `MainNormal → T_Cave_Rock_Large_N`, so its normal slot is legitimately `Large_N`; the criterion that holds is zero parent-default leakage. Fixture red→green: `tests/unreal-material-instance-overrides.test.ts` (3 of 5 failed before the fix).
+- [x] AC-9 [local]: The committed Soul Cave import in `threenative-sandbox/soul-cave/assets/fab/soul-cave/` is regenerated with the fixed importer, so the game stops shipping the parent-default textures. proof: its `import-report.json` shows `importer.version` ≥ the fix and 0 sections binding `T_Cave_Rock_Stalactite_*` outside the stalactite materials — Evidence (2026-10-07): sandbox commit `40773fe` on local branch `reimport/soul-cave-prd537` (worktree `threenative-sandbox/.worktrees/soul-cave-prd537`): `importer.version` 52, same 32 meshes/GLB paths, 19 of 37 sections textured (was 6 of 21), 0 sections binding `Stalactite` outside stalactite materials. The game's `soul` mask moved to `T_Cave_Statue_Torso_M` (the torso's own; the old import had it wearing `T_Soul_Statue_M`), and every `MASKS` path exists. **Not pushed** (public remote). Game build and playtests not run: its dependencies are not installed here.
 
-**Verification:** Fixture test red → green; AC-4 on the live pack; parity rerun shows no S3 regression on other packs.
+**Verification:** Fixture test red → green; AC-4 on the live pack; parity rerun shows no S3 regression on other packs (pending the sweep).
 
 #### Phase 3: The importer picks the artifact, and the corpus clears the bar
 **Status:** NOT STARTED
