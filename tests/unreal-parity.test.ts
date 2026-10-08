@@ -400,6 +400,41 @@ describe("scorePack", () => {
       expect(score.colour.missesTotal).toBe(4);
     });
 
+    describe("a share above 90 % cannot hide a miss the importer knows is real", () => {
+      // Ten meshes on the same pillar instance; nine coloured sections and one grey one with the given graph outcome.
+      const packOf = (lastGraph: ImportedMaterialSection["graph"] | undefined) => {
+        const meshes = Array.from({ length: 10 }, (_, i) => `SM_Pillar${i}`);
+        const dump = dumpOf(
+          ...meshes.map((name) => pkg(`/Game/C/${name}`, mesh(name, "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar"))),
+          pkg("/Game/C/MI_Cave_Rock_Pillar", pillarInstance),
+          pkg("/Game/C/M_Cave_Rock_MASTER", master),
+        );
+        const models = meshes.map((name, i) =>
+          model(`Content/C/${name}.uasset`, [i < 9 ? section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"]) : grey("MI_Cave_Rock_Pillar", lastGraph)]),
+        );
+        return scorePack(dump, reportOf(models));
+      };
+
+      it("fails a pack whose miss names graph nodes the evaluator cannot run (12 white rocks of 132 sections)", () => {
+        const score = packOf(unsupported("ObjectScale", "SplitComponents"));
+        expect(score.colour.share).toBe(0.9);
+        expect(score.colour.ok).toBe(false);
+        expect(score.status).toBe("fail");
+        expect(score.reasons).toEqual([expect.stringMatching(/^S4 colour: 1 section\(s\) have source colour the importer left neutral \(1 on unsupported graph nodes: ObjectScale, SplitComponents, 0 baked/)]);
+      });
+
+      it("fails a pack whose bake came out neutral", () => {
+        const score = packOf({ status: "baked", unsupportedNodes: [], approximations: [] });
+        expect(score.status).toBe("fail");
+        expect(score.colour.missAttribution.bakedStillGrey).toBe(1);
+      });
+
+      it("still passes when the miss is one the importer could not look into (no graph, unavailable)", () => {
+        expect(packOf(undefined).status).toBe("pass");
+        expect(packOf({ status: "unavailable", unsupportedNodes: [], approximations: [], reason: "no dumped graph for X or its parents" }).status).toBe("pass");
+      });
+    });
+
     it("scores an older report with no graph field without crashing", () => {
       const score = scorePack(caveDump(), reportOf([model(MESH_PKG, [grey("MI_Cave_Rock_Pillar")])]));
       expect(score.colour.graphBaked).toBe(0);

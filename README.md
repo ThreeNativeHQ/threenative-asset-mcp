@@ -473,6 +473,15 @@ heuristically, and composes an opacity map of another resolution when the aspect
 ratio matches. A sweep sheet tile that renders nothing although Unreal has a
 thumbnail for it is recorded under the entry's `sheet.warnings`.
 
+Importer version 57 gives a mesh the `.mat` / `.props.txt` that sit beside it when two
+packages share an object name (a pack with `MI_Rock_Inst` in two folders bound one
+folder's normal map to the other's meshes); with none beside the mesh the pick is named
+in the section's limitations. The graph bake now evaluates `ObjectScale` (1),
+`PerInstanceRandom` (0.5) and `ObjectPositionWS` (origin) as named heuristic
+approximations and `SplitComponents` exactly, which lets layered cliff-rock masters bake
+their colour texture instead of falling back to neutral grey. The parity S4 check no
+longer lets a 90% colour share hide sections whose graph is known to carry colour.
+
 Legacy instance sidecars without override flags retain inherited settings for
 ambiguous opaque, false, and zero defaults. Their non-default values retain the
 previous behavior; missing flags are reported as a material limitation.

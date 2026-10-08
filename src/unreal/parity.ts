@@ -506,7 +506,10 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   const coverageOk = missing.length === 0;
   const shapeOk = shape.length === 0;
   const identityOk = identity.length === 0;
-  const colourOk = share >= COLOUR_PASS_SHARE;
+  // A section the importer knows has source colour (its graph names nodes it cannot evaluate, or a bake came out neutral)
+  // and left neutral is a real miss. The share must not average it away: 12 white rocks among 132 sections is 91%.
+  const knownColourMisses = missAttribution.unsupportedNode + missAttribution.bakedStillGrey;
+  const colourOk = share >= COLOUR_PASS_SHARE && knownColourMisses === 0;
 
   const reasons: string[] = [];
   let status: PackScore["status"];
@@ -520,7 +523,13 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
     if (!coverageOk) reasons.push(`S1 coverage: ${missing.length} mesh package(s) not exported`);
     if (!shapeOk) reasons.push(`S2 shape: ${shape.length} violation(s)`);
     if (!identityOk) reasons.push(`S3 identity: ${identity.length} violation(s)`);
-    if (!colourOk) reasons.push(`S4 colour: ${coloured}/${expectsColour} sections coloured (below 90%)`);
+    if (share < COLOUR_PASS_SHARE) reasons.push(`S4 colour: ${coloured}/${expectsColour} sections coloured (below 90%)`);
+    else if (!colourOk) {
+      const nodes = Object.keys(cappedRecord(unsupportedNodes)).slice(0, 4).join(", ");
+      reasons.push(
+        `S4 colour: ${knownColourMisses} section(s) have source colour the importer left neutral (${missAttribution.unsupportedNode} on unsupported graph nodes${nodes ? `: ${nodes}` : ""}, ${missAttribution.bakedStillGrey} baked but still neutral); ${coloured}/${expectsColour} coloured hides them`,
+      );
+    }
     status = reasons.length === 0 ? "pass" : "fail";
   }
   if (unverifiedModels > 0) {
