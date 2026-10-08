@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.55",
+  version: "b4e95441+threenative.56",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -1103,6 +1103,7 @@ Dictionary<string, object?> DumpPackage(string key)
 var exported = 0;
 var mappingRequired = false;
 Exception? lastLoadError = null;
+var textureFailures = new List<string>();
 var selectedExportTypes = new HashSet<string>(StringComparer.Ordinal);
 var exportedMaterials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 var exportedSprites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1951,10 +1952,19 @@ foreach (var key in provider.Files.Keys.Where(key =>
             var textureFile = candidates.FirstOrDefault(candidate =>
                 normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
                 ?? (candidates.Length == 1 ? candidates[0] : null);
-            if (textureFile is null || new FileInfo(textureFile).Length > 1_073_741_824) continue;
+            if (textureFile is null || new FileInfo(textureFile).Length > 1_073_741_824)
+            {
+                textureFailures.Add(ReportTextureFailure(texture, results, textureFile is null ? "texture package file not found on disk" : "texture package exceeds 1 GiB", []));
+                continue;
+            }
             var packageBytes = await File.ReadAllBytesAsync(textureFile);
-            var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
-            if (sourcePng is null) continue;
+            var payloadFailures = new List<string>();
+            var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes, payloadFailures);
+            if (sourcePng is null)
+            {
+                textureFailures.Add(ReportTextureFailure(texture, results, "no decodable pixel data", payloadFailures));
+                continue;
+            }
             await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, texture));
         }
         exported++;
@@ -2157,7 +2167,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
 }
 if (exported == 0 && mappingRequired) throw new InvalidDataException("This cooked UE5 package uses unversioned properties. Place its game-compatible .usmap mapping file in the imported directory.");
 if (exported == 0 && lastLoadError is not null) throw new InvalidDataException("CUE4Parse could not decode the selected Unreal package.", lastLoadError);
-if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}.");
+if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
 
 static byte[] EncodeBgre8AsRadiance(byte[] source, int width, int height)
 {
@@ -2222,14 +2232,36 @@ static byte[]? ExtractCompressedPayloadWave(byte[] bytes)
     return null;
 }
 
-static byte[]? ExtractCompressedPayloadPng(byte[] bytes)
+// A texture the converter cannot write is reported with the evidence that decides the cause, so the
+// importer can say "pixel data not present in the pack" instead of a bare exit code.
+static string ReportTextureFailure(UTexture2D texture, IEnumerable<ExportResult> results, string reason, List<string> payloadFailures)
+{
+    var source = texture.GetOrDefault<FStructFallback?>("Source", null);
+    var mip = texture.GetFirstMip();
+    var exportErrors = string.Join(" | ", results.Where(item => item.Error is not null).Select(item => item.Error!.GetType().Name + ": " + item.Error.Message));
+    var message =
+        $"threenative-texture-failure {texture.Name}: {reason}; " +
+        $"platformFormat={texture.PlatformData?.PixelFormat}, mips={texture.PlatformData?.Mips?.Length ?? 0}, firstMipBulk={(mip?.BulkData is { } bulk ? bulk.Header.ElementCount : -1)}, " +
+        $"compression={texture.CompressionSettings}, srgb={texture.SRGB}, sourceFormat={source?.GetOrDefault<FName>("Format").Text}, " +
+        $"sourceCompression={source?.GetOrDefault<FName>("CompressionFormat").Text}, " +
+        $"editorPayload={(texture.EditorData is { } editor ? $"{editor.Payload.Header.Method}/{editor.Payload.Header.TotalRawSize}B/offset {editor.OffsetInFile}" : "none")}, " +
+        $"exportErrors=[{exportErrors}], payload=[{string.Join(" | ", payloadFailures)}]";
+    Console.Error.WriteLine(message);
+    return message;
+}
+
+static byte[]? ExtractCompressedPayloadPng(byte[] bytes, List<string>? failures = null)
 {
     ReadOnlySpan<byte> magic = [0xb7, 0x75, 0x63, 0x62];
     var searchAt = 0;
     while (searchAt <= bytes.Length - magic.Length)
     {
         var relativeAt = bytes.AsSpan(searchAt).IndexOf(magic);
-        if (relativeAt < 0) return null;
+        if (relativeAt < 0)
+        {
+            if (searchAt == 0) failures?.Add("the package holds no editor source payload and no cooked mip (pixel data is not in the pack)");
+            return null;
+        }
         var payloadAt = searchAt + relativeAt;
         searchAt = payloadAt + magic.Length;
         try
@@ -2241,10 +2273,12 @@ static byte[]? ExtractCompressedPayloadPng(byte[] bytes)
             var raw = DecompressEditorPayload(payload);
             var png = ExtractLargestPng(raw);
             if (png is not null) return png;
+            failures?.Add($"payload at {payloadAt} ({payload.Header.Method}, {payload.Header.TotalRawSize} bytes) decoded but holds no PNG");
         }
-        catch
+        catch (Exception error)
         {
             // The magic may occur in unrelated bulk bytes. Continue to the next bounded candidate.
+            failures?.Add($"payload at {payloadAt}: {error.GetType().Name}: {error.Message}");
         }
     }
     return null;
@@ -2579,7 +2613,12 @@ static byte[] DecompressEditorPayload(FCompressedBuffer payload)
             throw new InvalidDataException("Truncated editor payload block.");
         var rawSize = Math.Min(1 << header.BlockSizeExponent, output.Length - outputOffset);
         if (rawSize <= 0) throw new InvalidDataException("Editor payload contains excess blocks.");
-        Compression.Decompress(payload.Data, inputOffset, compressedSize, output, outputOffset, rawSize, method);
+        // UE stores a block verbatim when compression did not shrink it (compressed size == raw
+        // size); the block table holds the same size for both, and the decoder returns 0 bytes for
+        // such a block. Incompressible source art (PNG) is mostly verbatim blocks, so a texture
+        // whose payload has one never decoded.
+        if (compressedSize == rawSize) payload.Data.AsSpan(inputOffset, rawSize).CopyTo(output.AsSpan(outputOffset, rawSize));
+        else Compression.Decompress(payload.Data, inputOffset, compressedSize, output, outputOffset, rawSize, method);
         inputOffset += compressedSize;
         outputOffset += rawSize;
     }

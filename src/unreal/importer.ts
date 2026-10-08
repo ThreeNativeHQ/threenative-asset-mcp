@@ -648,6 +648,21 @@ function isEngineProfileMismatch(output: string): boolean {
 }
 
 /**
+ * The converter explains a texture it could not write on stderr (`threenative-texture-failure
+ * <name>: <reason>; <evidence>`), ahead of the generic "no output" exception. Surfacing that line
+ * turns a bare exit code into a stated pack limitation, such as pixel data that is not in the pack.
+ */
+export function modernConverterFailureCause(output: { readonly stdout: string; readonly stderr: string }): string | undefined {
+  const lines = `${output.stderr}\n${output.stdout}`.split(/\r?\n/);
+  const explained = lines.find((line) => line.startsWith("threenative-texture-failure "));
+  const cause = explained?.slice("threenative-texture-failure ".length)
+    ?? lines.find((line) => /^Unhandled exception\. /.test(line))?.replace(/^Unhandled exception\. [\w.]+: /, "");
+  const trimmed = cause?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > 800 ? `${trimmed.slice(0, 800)}…` : trimmed;
+}
+
+/**
  * Unversioned UE5.6 and UE5.7 packages both use LegacyFileVersion -9, so the package header alone
  * cannot select the serializer. Each attempt writes to a private sibling and only a complete exit
  * zero is renamed into the caller's staging path; failed partial exports never leak forward.
@@ -2250,7 +2265,8 @@ export async function importUnrealDirectory(
             maxOutputBytes: 32 * 1024 * 1024,
           });
           if (converted.code !== 0) {
-            log(`Graph texture ${name}: the modern converter exited ${converted.code}.`);
+            const cause = modernConverterFailureCause(converted);
+            log(`Graph texture ${name}: the modern converter exited ${converted.code}${cause ? `: ${cause}` : "."}`);
             return undefined;
           }
           const png = (await indexExported(isolated)).png.get(name);
@@ -2835,7 +2851,10 @@ export async function importUnrealDirectory(
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
       );
-      if (converted.code !== 0) return { entry, reason: `The modern UE5 texture converter exited ${converted.code}.` };
+      if (converted.code !== 0) {
+        const cause = modernConverterFailureCause(converted);
+        return { entry, reason: `The modern UE5 texture converter exited ${converted.code}${cause ? `: ${cause}` : "."}` };
+      }
       const exported = await indexExported(isolated);
       const source = exported.png.get(name);
       return source
