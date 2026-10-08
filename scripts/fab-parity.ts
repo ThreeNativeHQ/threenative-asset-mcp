@@ -8,7 +8,8 @@
  * deleted after each pack unless --keep is given. Nothing from a pack is written under the repo.
  */
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readdirSync, statSync } from "node:fs";
 import { mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { loadavg, platform, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,7 @@ import {
   buildCorpus,
   failureClasses,
   isFatalHandlerError,
+  mergeScorecardEntries,
   PARITY_USAGE,
   parityLine,
   parseParityArgs,
@@ -43,6 +45,64 @@ import { dumpUnrealProperties } from "../src/unreal/property-dump.js";
 
 const HIGH_LOAD = 20;
 const TMP_PREFIX = "tn-parity-";
+const RUN_TMP_PREFIX = "tn-parity-run-";
+const SIGNAL_GRACE_MS = 2000;
+
+/** Number of files (recursively) under `root`; 0 when it does not exist. */
+function countFiles(root: string): number {
+  let count = 0;
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return 0;
+  }
+  for (const name of names) {
+    const path = join(root, name);
+    try {
+      if (statSync(path).isDirectory()) count += countFiles(path);
+      else count++;
+    } catch {
+      /* vanished */
+    }
+  }
+  return count;
+}
+
+/** Every process below this one (children, grandchildren), via pgrep; best effort. */
+function descendantPids(root = process.pid): number[] {
+  const found: number[] = [];
+  const queue = [root];
+  while (queue.length > 0) {
+    const parent = queue.shift()!;
+    let output = "";
+    try {
+      output = execFileSync("pgrep", ["-P", String(parent)], { encoding: "utf8" });
+    } catch {
+      continue; // no children (exit 1) or no pgrep
+    }
+    for (const line of output.split("\n")) {
+      const pid = Number.parseInt(line, 10);
+      if (Number.isInteger(pid) && !found.includes(pid)) {
+        found.push(pid);
+        queue.push(pid);
+      }
+    }
+  }
+  return found;
+}
+
+function signalDescendants(signal: NodeJS.Signals): void {
+  for (const pid of descendantPids()) {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
 function say(message: string): void {
   console.log(message);
@@ -79,62 +139,97 @@ async function main(): Promise<number> {
     throw error;
   }
 
+  const realTmp = tmpdir();
+  const downloadParent = fabDownloadRoot(process.env);
   const runId = `${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}-${randomBytes(3).toString("hex")}`;
-  const runRoot = join(fabDownloadRoot(process.env), `parity-${runId}`);
-  const environment: NodeJS.ProcessEnv = { ...process.env, THREENATIVE_FAB_DOWNLOAD_DIR: runRoot };
+  const runRoot = join(downloadParent, `parity-${runId}`);
+  // ALL scratch is run-scoped: every os.tmpdir() consumer (tn-parity-*, tn-property-dump-*, importer
+  // temp, FabCLI/UE Viewer staging) lands in runTmp, and the importer cache lives inside it too.
+  const runTmp = await mkdtemp(join(realTmp, RUN_TMP_PREFIX));
+  const unrealCache = join(runTmp, "unreal-cache");
+  process.env.TMPDIR = runTmp;
+  process.env.THREENATIVE_UNREAL_CACHE_DIR = unrealCache;
+  const environment: NodeJS.ProcessEnv = {
+    ...process.env,
+    THREENATIVE_FAB_DOWNLOAD_DIR: runRoot,
+    THREENATIVE_UNREAL_CACHE_DIR: unrealCache,
+    TMPDIR: runTmp,
+  };
   const scorecardPath = join(args.out, "scorecard.json");
 
   let entries: ScorecardEntry[] = [];
+  /** Entries already on disk when a --resume run started; merged under this run's entries. */
+  let previousEntries: ScorecardEntry[] = [];
   let skipped: SkippedEntry[] = [];
   let importerVersion: number | null = null;
   let cue4parse: string | null = null;
   const cleanups: Array<() => Promise<void>> = [];
-  let finishing = false;
+  let stopping = false;
+  let finishPromise: Promise<number> | undefined;
+  // scorecard.json is only written once there is something to put in it: a run that dies in setup
+  // (auth, ownedListings, ...) must never replace an existing scorecard with an empty one.
+  let writable = false;
 
-  const writeScorecard = (): Scorecard => {
+  const writeScorecard = (): Scorecard | undefined => {
+    if (!writable) return undefined;
+    const all = args.resume ? mergeScorecardEntries(previousEntries, entries) : entries;
     const scorecard: Scorecard = {
       generatedAt: new Date().toISOString(),
       host: { load1: loadavg()[0] ?? 0, platform: platform() },
       toolchain: { importerVersion, cue4parse },
-      entries,
+      entries: all,
       skipped,
-      summary: summarizeEntries(entries),
+      summary: summarizeEntries(all),
     };
     writeJsonAtomic(scorecardPath, scorecard);
     return scorecard;
   };
 
-  /** Deletes the run's downloads and any temp output, then reports what is left. */
+  /** The single cleanup path: pack cleanups, then the run's downloads, importer cache and tmp. */
   const sweepCleanup = async (): Promise<void> => {
     for (const cleanup of cleanups.splice(0)) await cleanup().catch(() => {});
-    if (!args.keep) await rm(runRoot, { recursive: true, force: true }).catch(() => {});
+    if (args.keep) return;
+    await rm(runRoot, { recursive: true, force: true }).catch(() => {});
+    await rm(unrealCache, { recursive: true, force: true }).catch(() => {});
+    await rm(runTmp, { recursive: true, force: true }).catch(() => {});
   };
-  const leftovers = (): { downloads: number; tmp: number } => {
-    let downloads = 0;
+  const leftovers = (): { downloads: number; cache: number; tmp: number; parityDirs: number } => {
+    let parityDirs = 0;
     try {
-      downloads = readdirSync(runRoot).length;
+      parityDirs = readdirSync(downloadParent).filter((name) => name.startsWith("parity-")).length;
     } catch {
-      downloads = 0;
+      parityDirs = 0;
     }
-    const tmp = readdirSync(tmpdir()).filter((name) => name.startsWith(TMP_PREFIX)).length;
-    return { downloads, tmp };
+    return { downloads: countFiles(runRoot), cache: countFiles(unrealCache), tmp: countFiles(runTmp), parityDirs };
   };
 
-  const finish = async (code: number): Promise<number> => {
-    finishing = true;
-    await sweepCleanup();
-    const scorecard = writeScorecard();
-    lock.release();
-    const left = leftovers();
-    say(`LEFTOVER downloads=${left.downloads} tmp=${left.tmp}${args.keep ? " (--keep)" : ""}`);
-    say(parityLine(scorecard.summary));
-    return code;
+  const finish = (code: number): Promise<number> => {
+    finishPromise ??= (async () => {
+      await sweepCleanup();
+      const scorecard = writeScorecard();
+      lock.release();
+      const left = leftovers();
+      say(
+        `LEFTOVER downloads=${left.downloads} unreal-cache=${left.cache} tmp=${left.tmp} fab-downloads/parity-*=${left.parityDirs}${args.keep ? " (--keep)" : ""}`,
+      );
+      if (scorecard) say(parityLine(scorecard.summary));
+      return code;
+    })();
+    return finishPromise;
   };
 
-  const onSignal = (signal: NodeJS.Signals) => {
-    if (finishing) return;
-    console.error(`${signal}: cleaning up and stopping.`);
-    void finish(130).then((code) => process.exit(code));
+  const onSignal = (signal: NodeJS.Signals): void => {
+    if (stopping) return;
+    stopping = true; // stop starting new work; the loop checks this
+    console.error(`${signal}: stopping children, cleaning up.`);
+    void (async () => {
+      // The handler's children are spawned deep inside it, so they are found by walking the tree.
+      signalDescendants("SIGTERM");
+      const deadline = Date.now() + SIGNAL_GRACE_MS;
+      while (Date.now() < deadline && descendantPids().length > 0) await sleep(100);
+      signalDescendants("SIGKILL");
+      process.exit(await finish(130));
+    })();
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
@@ -145,8 +240,7 @@ async function main(): Promise<number> {
       await fabCli.requireAuthenticatedSession();
     } catch (error) {
       console.error(`Fab session unusable: ${error instanceof Error ? error.message : String(error)}`);
-      lock.release();
-      return 2;
+      return await finish(2);
     }
     const owned = await fabCli.ownedListings();
     const corpus = buildCorpus(owned, {
@@ -158,24 +252,26 @@ async function main(): Promise<number> {
     skipped = corpus.skipped;
     if (corpus.entries.length === 0) {
       console.error("The corpus is empty: no owned listing matches the selection.");
-      lock.release();
-      return 1;
+      return await finish(1);
     }
 
     let todo: CorpusEntry[] = corpus.entries;
     if (args.resume) {
-      const resumed = selectResume(corpus.entries, readPreviousEntries(scorecardPath));
+      previousEntries = readPreviousEntries(scorecardPath);
+      const resumed = selectResume(corpus.entries, previousEntries);
       todo = resumed.todo;
       entries = resumed.kept;
+      writable = true; // previous entries are merged back in, so nothing settled can be lost
       say(`Resuming: ${resumed.kept.length} settled, ${todo.length} to run.`);
     }
     say(`Sweeping ${todo.length} artifact(s) from ${new Set(todo.map((e) => e.listingId)).size} listing(s); skipped ${skipped.length}. Run ${runId}.`);
     writeScorecard();
 
-    const handler = createFabImportAssetHandler({ environment });
+  const handler = createFabImportAssetHandler({ environment });
     let fatal: HandlerError | undefined;
 
     for (const [index, item] of todo.entries()) {
+      if (stopping) break;
       const label = `${item.listingId.slice(0, 8)}-${item.artifactId}`;
       say(`[${index + 1}/${todo.length}] ${item.title} (${item.artifactId}, ${item.oldestEngine ?? "no engine"}, ${item.route})`);
       const started = Date.now();
@@ -241,7 +337,9 @@ async function main(): Promise<number> {
         cleanups.splice(cleanups.indexOf(packCleanup), 1);
       }
 
+      if (stopping) break; // interrupted mid-pack: the signal path cleans up; this entry is not a result
       entries = upsertEntry(entries, entry);
+      writable = true;
       writeScorecard();
       say(`    ${entry.status}${entry.reasons.length > 0 ? ` - ${entry.reasons.join("; ")}` : ""} (${(entry.durationMs / 1000).toFixed(1)}s)`);
 
@@ -250,6 +348,7 @@ async function main(): Promise<number> {
         return await finish(2);
       }
     }
+    if (stopping) return await finish(130);
     return await finish(0);
   } catch (error) {
     console.error(error instanceof Error ? error.stack ?? error.message : String(error));

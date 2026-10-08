@@ -3,7 +3,16 @@
  * selection, scorecard aggregation, `--resume`, the single-sweep lock and argument parsing. Nothing
  * here downloads, imports or spawns anything.
  */
-import { closeSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  linkSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import type { FabOwnedListing } from "../fab/fabcli.js";
@@ -184,21 +193,26 @@ export function summaryOf(score: PackScore): NonNullable<ScorecardEntry["summary
 export function failureClasses(score: PackScore): string[] {
   const classes: string[] = [];
   if (score.status === "unverified") {
-    const reason = score.reasons[0] ?? "";
+    const reason = score.reasons.find((r) => !/unreadable/.test(r)) ?? score.reasons[0] ?? "";
     classes.push(
       /no readable/.test(reason)
         ? "unverified:no-meshes"
         : /outside the dump/.test(reason)
           ? "unverified:material-outside-dump"
-          : "unverified:other",
+          : /unreadable/.test(reason)
+            ? "unverified:unreadable-mesh"
+            : "unverified:other",
     );
     return classes;
   }
   if (!score.coverage.ok) {
     for (let i = 0; i < score.coverage.missingTotal; i++) classes.push("S1:missing");
   }
-  for (const violation of score.shape.violations) classes.push(`S2:${violation.kind}`);
-  for (const violation of score.identity.violations) classes.push(`S3:${violation.kind}`);
+  // Counted from the uncapped per-kind totals: `violations` is capped at PARITY_LIST_CAP.
+  for (const [kind, count] of Object.entries(score.shape.byKind))
+    for (let i = 0; i < count; i++) classes.push(`S2:${kind}`);
+  for (const [kind, count] of Object.entries(score.identity.byKind))
+    for (let i = 0; i < count; i++) classes.push(`S3:${kind}`);
   if (!score.colour.ok) classes.push("S4:grey");
   return classes;
 }
@@ -239,10 +253,14 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
   };
 }
 
+/**
+ * Prints both rates. PRD-537 AC-6 is judged on the ATTEMPTED rate (pass / attempted): a pack that
+ * errored or could not be verified is not a pass, so the scored rate alone flatters the sweep.
+ */
 export function parityLine(summary: ScorecardSummary): string {
   const scored = summary.pass + summary.fail;
-  const pct = summary.passRateScored === null ? "n/a" : `${(summary.passRateScored * 100).toFixed(1)}%`;
-  return `PARITY pass=${summary.pass}/${scored} (${pct}) attempted=${summary.attempted} unverified=${summary.unverified} error=${summary.error}`;
+  const pct = (rate: number | null): string => (rate === null ? "n/a" : `${(rate * 100).toFixed(1)}%`);
+  return `PARITY pass=${summary.pass}/${scored} (${pct(summary.passRateScored)} of scored) attempted=${summary.attempted} (${pct(summary.passRateAttempted)} of attempted) unverified=${summary.unverified} error=${summary.error}`;
 }
 
 // --- resume -------------------------------------------------------------------------------------
@@ -256,9 +274,12 @@ export function isAuthEntry(entry: ScorecardEntry): boolean {
   );
 }
 
-/** pass, fail, unverified and a non-auth error are settled; anything else runs again. */
+/**
+ * Only pass, fail and unverified are settled. Every error is re-run on `--resume`: licence,
+ * browser and network errors are transient, and a recorded error says nothing about the pack.
+ */
 export function isSettled(entry: ScorecardEntry): boolean {
-  return entry.status === "error" ? !isAuthEntry(entry) : true;
+  return entry.status === "pass" || entry.status === "fail" || entry.status === "unverified";
 }
 
 export function selectResume(
@@ -288,6 +309,20 @@ export function upsertEntry(
   const next = [...entries];
   next[index] = entry;
   return next;
+}
+
+/**
+ * The scorecard to write for a (possibly narrowed) `--resume` run: every entry already on disk is
+ * kept in place, entries the run produced replace the ones with the same key, new ones are appended.
+ * A narrowed corpus (`--listing`, `--limit`, `--artifact`) therefore never drops a settled entry.
+ */
+export function mergeScorecardEntries(
+  previous: readonly ScorecardEntry[],
+  current: readonly ScorecardEntry[],
+): ScorecardEntry[] {
+  let merged: ScorecardEntry[] = [...previous];
+  for (const entry of current) merged = upsertEntry(merged, entry);
+  return merged;
 }
 
 // --- files --------------------------------------------------------------------------------------
@@ -331,22 +366,98 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
-/** A lock whose recorded pid is unreadable or no longer running is stale. */
-export function isLockStale(content: string, alive: (pid: number) => boolean = isPidAlive): boolean {
+/** An unreadable pid is only believed to be abandoned once the file is this old (ms). */
+export const LOCK_UNPARSEABLE_GRACE_MS = 10_000;
+
+/**
+ * A lock is stale when its recorded pid is not running. A file with an empty or unparseable pid may
+ * belong to a writer between create and write, so it counts as held until it is older than
+ * LOCK_UNPARSEABLE_GRACE_MS.
+ */
+export function isLockStale(
+  content: string,
+  alive: (pid: number) => boolean = isPidAlive,
+  ageMs = 0,
+): boolean {
   const pid = Number.parseInt(content.trim(), 10);
-  return !Number.isInteger(pid) || !alive(pid);
+  if (!Number.isInteger(pid)) return ageMs > LOCK_UNPARSEABLE_GRACE_MS;
+  return !alive(pid);
 }
 
-/** Takes `<out>/.lock` exclusively (O_EXCL). Reclaims a stale lock once; otherwise fails fast. */
+/** Creates `path` exclusively with its content already in place (hard link of a complete file). */
+function createLockFile(path: string): void {
+  const temporary = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  writeFileSync(temporary, `${process.pid}\n`, { flag: "wx" });
+  try {
+    linkSync(temporary, path); // fails with EEXIST when the lock exists; never exposes a partial pid
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      /* gone */
+    }
+  }
+}
+
+function lockAgeMs(path: string): number {
+  try {
+    return Date.now() - statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Removes a stale lock under a short-lived `<path>.reclaim` guard, re-reading the lock inside the
+ * guard: if it changed since it was judged stale, someone else already reclaimed it and nothing is
+ * removed. Returns false when another reclaimer holds the guard.
+ */
+function reclaimStaleLock(path: string, judged: string): boolean {
+  const guard = `${path}.reclaim`;
+  try {
+    closeSync(openSync(guard, "wx"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (lockAgeMs(guard) > LOCK_UNPARSEABLE_GRACE_MS) {
+      try {
+        unlinkSync(guard); // a reclaimer died holding it
+      } catch {
+        /* someone else cleaned it */
+      }
+    }
+    return false;
+  }
+  try {
+    let current: string;
+    try {
+      current = readFileSync(path, "utf8");
+    } catch {
+      return true; // already gone
+    }
+    if (current !== judged) return false;
+    try {
+      unlinkSync(path);
+    } catch {
+      /* gone */
+    }
+    return true;
+  } finally {
+    try {
+      unlinkSync(guard);
+    } catch {
+      /* gone */
+    }
+  }
+}
+
+/** Takes `<out>/.lock` exclusively. Reclaims a stale lock; otherwise fails fast. */
 export function acquireLock(
   path: string,
   alive: (pid: number) => boolean = isPidAlive,
 ): { release(): void } {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      const fd = openSync(path, "wx");
-      writeFileSync(fd, `${process.pid}\n`);
-      closeSync(fd);
+      createLockFile(path);
       let released = false;
       return {
         release() {
@@ -366,16 +477,14 @@ export function acquireLock(
       try {
         content = readFileSync(path, "utf8");
       } catch {
-        continue; // vanished between open and read: try again
+        continue; // vanished between create and read: try again
       }
-      if (!isLockStale(content, alive)) {
+      if (!isLockStale(content, alive, lockAgeMs(path))) {
         throw new SweepLockHeldError(path, Number.parseInt(content.trim(), 10));
       }
-      try {
-        unlinkSync(path);
-      } catch {
-        /* someone else reclaimed it first */
-      }
+      // Reclaim, then loop: the create is exclusive, so a rival that got there first makes this
+      // attempt see a live lock instead of both winning.
+      reclaimStaleLock(path, content);
     }
   }
   throw new SweepLockHeldError(path, -1);

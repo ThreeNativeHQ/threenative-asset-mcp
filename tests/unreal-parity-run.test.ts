@@ -1,3 +1,4 @@
+import { utimesSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +12,8 @@ import {
   entryKey,
   isFatalHandlerError,
   isLockStale,
+  isSettled,
+  mergeScorecardEntries,
   parityLine,
   parseParityArgs,
   readPreviousEntries,
@@ -109,14 +112,14 @@ describe("summarizeEntries", () => {
     expect(summary.byRoute.cue4parse).toEqual({ attempted: 1, pass: 1, fail: 0, unverified: 0, error: 0 });
     expect(summary.topFailureClasses[0]).toEqual({ class: "S4:grey", count: 2 });
     expect(summary.topFailureClasses.map((c) => c.class)).toContain("error:UNREAL_TOOL_FAILED");
-    expect(parityLine(summary)).toBe("PARITY pass=2/4 (50.0%) attempted=6 unverified=1 error=1");
+    expect(parityLine(summary)).toBe("PARITY pass=2/4 (50.0% of scored) attempted=6 (33.3% of attempted) unverified=1 error=1");
   });
 
   it("reports null rates for an empty run", () => {
     const summary = summarizeEntries([]);
     expect(summary.passRateScored).toBeNull();
     expect(summary.passRateAttempted).toBeNull();
-    expect(parityLine(summary)).toBe("PARITY pass=0/0 (n/a) attempted=0 unverified=0 error=0");
+    expect(parityLine(summary)).toBe("PARITY pass=0/0 (n/a of scored) attempted=0 (n/a of attempted) unverified=0 error=0");
   });
 });
 
@@ -130,16 +133,39 @@ describe("selectResume", () => {
     route: "umodel" as const,
   }));
 
-  it("keeps settled entries, reruns auth errors and entries never seen", () => {
+  it("keeps pass, fail and unverified; reruns every error and entries never seen", () => {
     const previous = [
       entry({ status: "pass", artifactId: "A1" }),
       entry({ status: "fail", artifactId: "A2" }),
       entry({ status: "error", artifactId: "A3", error: { code: "UNREAL_TOOL_FAILED", message: "boom" } }),
       entry({ status: "error", artifactId: "A4", error: { code: "FABCLI_UNAUTHENTICATED", message: "no session" } }),
+      entry({ status: "unverified", artifactId: "A5" }),
     ];
     const { todo, kept } = selectResume(corpus, previous);
-    expect(kept.map((e) => e.artifactId)).toEqual(["A1", "A2", "A3"]);
-    expect(todo.map((e) => e.artifactId)).toEqual(["A4", "A5"]);
+    expect(kept.map((e) => e.artifactId)).toEqual(["A1", "A2", "A5"]);
+    expect(todo.map((e) => e.artifactId)).toEqual(["A3", "A4"]);
+    expect(isSettled(entry({ status: "error", error: { code: "BROWSER_LAUNCH_FAILED", message: "x" } }))).toBe(false);
+    expect(isSettled(entry({ status: "unverified" }))).toBe(true);
+  });
+
+  it("merges a narrowed run over the existing scorecard without losing settled entries", () => {
+    const previous = [
+      entry({ status: "pass", artifactId: "A1" }),
+      entry({ status: "fail", artifactId: "A2" }),
+      entry({ status: "error", artifactId: "A3", error: { code: "X", message: "x" } }),
+      entry({ status: "unverified", artifactId: "A4" }),
+    ];
+    const current = [entry({ status: "pass", artifactId: "A3" }), entry({ status: "fail", artifactId: "A9" })];
+    const merged = mergeScorecardEntries(previous, current);
+    expect(merged.map((e) => [e.artifactId, e.status])).toEqual([
+      ["A1", "pass"],
+      ["A2", "fail"],
+      ["A3", "pass"],
+      ["A4", "unverified"],
+      ["A9", "fail"],
+    ]);
+    expect(mergeScorecardEntries(previous, [])).toEqual(previous);
+    expect(mergeScorecardEntries([], current)).toEqual(current);
   });
 
   it("matches listing ids case-insensitively and upserts by key", () => {
@@ -166,8 +192,42 @@ describe("sweep lock", () => {
   it("treats a dead or unreadable pid as stale", () => {
     expect(isLockStale("123\n", () => false)).toBe(true);
     expect(isLockStale("123\n", () => true)).toBe(false);
-    expect(isLockStale("", () => true)).toBe(true);
-    expect(isLockStale("not-a-pid", () => true)).toBe(true);
+    // An unreadable pid may be a writer between create and write: held until the file is old.
+    expect(isLockStale("", () => true, 0)).toBe(false);
+    expect(isLockStale("not-a-pid", () => true, 9_000)).toBe(false);
+    expect(isLockStale("", () => true, 11_000)).toBe(true);
+    expect(isLockStale("not-a-pid", () => true, 11_000)).toBe(true);
+  });
+
+  it("treats a fresh empty lock file as held and an old one as stale", async () => {
+    const path = join(await scratch(), ".lock");
+    await writeFile(path, "");
+    expect(() => acquireLock(path, () => false)).toThrow(SweepLockHeldError);
+    expect(await readFile(path, "utf8")).toBe("");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(path, old, old);
+    const reclaimed = acquireLock(path, () => false);
+    expect(await readFile(path, "utf8")).toBe(`${process.pid}\n`);
+    reclaimed.release();
+  });
+
+  it("lets only one of two racing reclaimers win a stale lock", async () => {
+    const path = join(await scratch(), ".lock");
+    await writeFile(path, "999999999\n");
+    let rival: { release(): void } | undefined;
+    let first = true;
+    // While the first reclaimer is deciding the lock is stale, a second one reclaims it and wins.
+    const alive = (pid: number): boolean => {
+      if (first) {
+        first = false;
+        rival = acquireLock(path, () => false);
+        return false;
+      }
+      return pid === process.pid;
+    };
+    expect(() => acquireLock(path, alive)).toThrow(SweepLockHeldError);
+    expect(await readFile(path, "utf8")).toBe(`${process.pid}\n`);
+    rival?.release();
   });
 
   it("fails fast while the holder is alive and reclaims a stale lock", async () => {

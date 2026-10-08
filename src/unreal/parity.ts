@@ -46,10 +46,17 @@ export interface PackScore {
     readonly ok: boolean;
     readonly checked: number;
     readonly unmatchedModels: number;
+    /**
+     * Models whose source mesh could not be read (export or package `error`, or no slots): S2 and
+     * S3 cannot judge them, so they are never counted as violations and never as a pass.
+     */
+    readonly unverifiedModels: number;
     readonly unusedSlots: number;
     readonly boundsUnverified: number;
     readonly violations: readonly ShapeViolation[];
     readonly violationsTotal: number;
+    /** Uncapped violation count per kind; `violations` is capped, this is not. */
+    readonly byKind: Readonly<Record<string, number>>;
   };
   readonly identity: {
     readonly ok: boolean;
@@ -58,6 +65,8 @@ export interface PackScore {
     readonly unverified: number;
     readonly violations: readonly IdentityViolation[];
     readonly violationsTotal: number;
+    /** Uncapped violation count per kind; `violations` is capped, this is not. */
+    readonly byKind: Readonly<Record<string, number>>;
   };
   readonly colour: {
     readonly ok: boolean;
@@ -103,6 +112,21 @@ function capped<T>(list: readonly T[]): readonly T[] {
 
 const isMeshClass = (c: string): boolean => c === "StaticMesh" || c === "SkeletalMesh";
 const isNormalName = (name: string): boolean => /(_n|_nrm|_normal|normal)$/i.test(name);
+
+function countByKind(list: readonly { readonly kind: string }[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const item of list) counts[item.kind] = (counts[item.kind] ?? 0) + 1;
+  return counts;
+}
+
+export const UNREADABLE_MESH_REASON =
+  "mesh(es) unreadable in the dump (export or package error, or no slots); S2/S3 cannot verify them";
+
+interface SourceMesh {
+  readonly exp: DumpExport;
+  /** The export or its package carries an error, or it has no slots to compare against. */
+  readonly unreadable: boolean;
+}
 
 interface Located {
   readonly pkg: string;
@@ -208,10 +232,16 @@ function isNeutral(factor: readonly number[]): boolean {
 }
 
 export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
-  const meshes = new Map<string, DumpExport>();
+  const meshes = new Map<string, SourceMesh>();
+  const failedPackages = new Set<string>();
   for (const pkg of dump.packages) {
     const key = packageKey(pkg.path);
-    for (const exp of pkg.exports ?? []) if (isMeshClass(exp.class) && !meshes.has(key)) meshes.set(key, exp);
+    if (pkg.error) failedPackages.add(key);
+    for (const exp of pkg.exports ?? []) {
+      if (!isMeshClass(exp.class) || meshes.has(key)) continue;
+      const unreadable = Boolean(pkg.error) || Boolean(exp.error) || (exp.slots?.length ?? 0) === 0;
+      meshes.set(key, { exp, unreadable });
+    }
   }
   const models = new Map<string, ImportedModel>();
   for (const model of report.models) models.set(packageKey(model.package), model);
@@ -231,18 +261,27 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   const shape: ShapeViolation[] = [];
   let checked = 0;
   let unmatchedModels = 0;
+  let unverifiedModels = 0;
   let unusedSlots = 0;
   let boundsUnverified = 0;
   const identity: IdentityViolation[] = [];
   let sections = 0;
   let unverified = 0;
+  // Sections of readable meshes only: the "material data outside the dump" rule must not count
+  // sections that are unverified because their mesh was unreadable.
+  let readableSections = 0;
+  let outsideDump = 0;
   let expectsColour = 0;
   let coloured = 0;
   const misses: ColourMiss[] = [];
 
   for (const [key, model] of models) {
-    const mesh = meshes.get(key);
-    if (mesh) {
+    const source = meshes.get(key);
+    // A package that failed to load has no mesh export, yet the importer may still list a model.
+    const unreadable = source ? source.unreadable : failedPackages.has(key);
+    const mesh = unreadable ? undefined : source?.exp;
+    if (unreadable) unverifiedModels++;
+    else if (mesh) {
       checked++;
       const expectedSlots = mesh.slots?.length ?? 0;
       const actualSlots = new Set(model.materials.map((m) => m.name)).size;
@@ -269,13 +308,20 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       }
     } else unmatchedModels++;
 
+    if (unreadable) {
+      sections += model.materials.length;
+      unverified += model.materials.length;
+      continue;
+    }
     const slotMaterials = new Set((mesh?.slots ?? []).map((s) => s.material).filter((m): m is string => !!m));
     for (const section of model.materials) {
       sections++;
+      readableSections++;
       const located = locateSection(index, section.name, slotMaterials);
       const effective = located ? effectiveSet(index, located) : undefined;
       if (!located || !effective) {
         unverified++;
+        outsideDump++;
         continue;
       }
       scoreIdentity(model.name, section, effective, identity);
@@ -300,15 +346,20 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   if (meshes.size === 0) {
     status = "unverified";
     reasons.push("dump has no readable StaticMesh or SkeletalMesh exports");
-  } else if (sections > 0 && unverified * 2 > sections) {
+  } else if (readableSections > 0 && outsideDump * 2 > readableSections) {
     status = "unverified";
-    reasons.push(`${unverified} of ${sections} sections have material data outside the dump`);
+    reasons.push(`${outsideDump} of ${readableSections} sections have material data outside the dump`);
   } else {
     if (!coverageOk) reasons.push(`S1 coverage: ${missing.length} mesh package(s) not exported`);
     if (!shapeOk) reasons.push(`S2 shape: ${shape.length} violation(s)`);
     if (!identityOk) reasons.push(`S3 identity: ${identity.length} violation(s)`);
     if (!colourOk) reasons.push(`S4 colour: ${coloured}/${expectsColour} sections coloured (below 90%)`);
     status = reasons.length === 0 ? "pass" : "fail";
+  }
+  if (unverifiedModels > 0) {
+    // A pack with an unreadable mesh is never a pass: it is unverified unless a verified check failed.
+    reasons.push(`${unverifiedModels} ${UNREADABLE_MESH_REASON}`);
+    if (status === "pass") status = "unverified";
   }
 
   return {
@@ -325,10 +376,12 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       ok: shapeOk,
       checked,
       unmatchedModels,
+      unverifiedModels,
       unusedSlots,
       boundsUnverified,
       violations: capped(shape),
       violationsTotal: shape.length,
+      byKind: countByKind(shape),
     },
     identity: {
       ok: identityOk,
@@ -337,6 +390,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       unverified,
       violations: capped(identity),
       violationsTotal: identity.length,
+      byKind: countByKind(identity),
     },
     colour: {
       ok: colourOk,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ImportedMaterialSection, ImportedModel, ImportReport } from "../src/unreal/importer.js";
 import { objectName, packageKey, scorePack } from "../src/unreal/parity.js";
+import { failureClasses } from "../src/unreal/parity-run.js";
 import type { PropertyDump } from "../src/unreal/property-dump.js";
 
 type Exp = NonNullable<PropertyDump["packages"][number]["exports"]>[number];
@@ -205,5 +206,90 @@ describe("scorePack", () => {
 
   it("is unverified when the dump has no meshes", () => {
     expect(scorePack(dumpOf(pkg("/Game/C/M", master)), reportOf([])).status).toBe("unverified");
+  });
+});
+
+describe("unreadable meshes", () => {
+  const goodSections = [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])];
+  const dumpWith = (...meshPackages: PropertyDump["packages"]): PropertyDump =>
+    dumpOf(
+      ...meshPackages,
+      pkg("/Game/C/MI_Cave_Rock_Pillar", pillarInstance),
+      pkg("/Game/C/M_Cave_Rock_MASTER", master),
+    );
+  const MAT = "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar";
+  const GOOD_PKG = "Content/C/SM_Good.uasset";
+
+  it("treats a mesh export that carries an error as unverified, not a slot-count violation", () => {
+    const broken: Exp = { name: "SM_Pillar", class: "StaticMesh", error: "could not read", slots: [] };
+    const score = scorePack(dumpWith(pkg("/Game/C/SM_Pillar", broken)), reportOf([model(MESH_PKG, goodSections)]));
+    expect(score.shape.violationsTotal).toBe(0);
+    expect(score.shape.unverifiedModels).toBe(1);
+    expect(score.identity.unverified).toBe(1);
+    expect(score.status).toBe("unverified");
+    expect(score.reasons.join(" ")).toMatch(/unreadable/);
+  });
+
+  it("treats a mesh with an empty slot list as unreadable", () => {
+    const empty: Exp = { name: "SM_Pillar", class: "StaticMesh", slots: [], bounds: null };
+    const score = scorePack(dumpWith(pkg("/Game/C/SM_Pillar", empty)), reportOf([model(MESH_PKG, goodSections)]));
+    expect(score.shape.violations).toEqual([]);
+    expect(score.shape.unverifiedModels).toBe(1);
+    expect(score.status).toBe("unverified");
+  });
+
+  it("treats a mesh in a package that failed to load as unreadable", () => {
+    const m = mesh("SM_Pillar", MAT);
+    const withPackageError = scorePack(
+      dumpWith({ path: "/Game/C/SM_Pillar", error: "bad magic", exports: [m] }),
+      reportOf([model(MESH_PKG, goodSections)]),
+    );
+    expect(withPackageError.shape.unverifiedModels).toBe(1);
+    expect(withPackageError.shape.violationsTotal).toBe(0);
+    expect(withPackageError.status).toBe("unverified");
+
+    // The package failed to load, so it has no exports at all, yet the report exported a model.
+    const noExports = scorePack(
+      dumpWith({ path: "/Game/C/SM_Pillar", error: "bad magic" }, pkg("/Game/C/SM_Good", mesh("SM_Good", MAT))),
+      reportOf([model(GOOD_PKG, goodSections), model(MESH_PKG, goodSections)]),
+    );
+    expect(noExports.shape.unverifiedModels).toBe(1);
+    expect(noExports.shape.checked).toBe(1);
+    expect(noExports.status).toBe("unverified");
+  });
+
+  it("never passes a pack with one unreadable mesh, but a verified failure still wins", () => {
+    const broken: Exp = { name: "SM_Bad", class: "StaticMesh", error: "x" };
+    const dump = dumpWith(pkg("/Game/C/SM_Good", mesh("SM_Good", MAT)), pkg("/Game/C/SM_Bad", broken));
+    const good = model(GOOD_PKG, goodSections);
+    const bad = model("Content/C/SM_Bad.uasset", goodSections);
+    const mixed = scorePack(dump, reportOf([good, bad]));
+    expect(mixed.status).toBe("unverified");
+    expect(mixed.reasons.join(" ")).toMatch(/unreadable/);
+
+    const wrongBounds = model(GOOD_PKG, goodSections, [20, 1, 4]);
+    const failing = scorePack(dump, reportOf([wrongBounds, bad]));
+    expect(failing.status).toBe("fail");
+    expect(failing.reasons.join(" ")).toMatch(/unreadable/);
+  });
+
+  it("counts failure classes from the uncapped totals", () => {
+    const packages: PropertyDump["packages"] = [];
+    const models: ImportedModel[] = [];
+    const secs = [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])];
+    for (let i = 0; i < 55; i++) {
+      packages.push(pkg(`/Game/C/SM_${i}`, mesh(`SM_${i}`, "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar")));
+      models.push(model(`Content/C/SM_${i}.uasset`, secs, [2, 4, 1]));
+    }
+    const score = scorePack(dumpWith(...packages), reportOf(models));
+    expect(score.shape.violationsTotal).toBe(55);
+    expect(score.shape.violations).toHaveLength(50);
+    expect(failureClasses(score).filter((c) => c === "S2:bounds-axis")).toHaveLength(55);
+  });
+
+  it("classifies an unreadable-mesh pack", () => {
+    const broken: Exp = { name: "SM_Pillar", class: "StaticMesh", error: "x" };
+    const score = scorePack(dumpWith(pkg("/Game/C/SM_Pillar", broken)), reportOf([model(MESH_PKG, goodSections)]));
+    expect(failureClasses(score)).toEqual(["unverified:unreadable-mesh"]);
   });
 });
