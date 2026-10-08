@@ -252,7 +252,7 @@ process.exit(run.status === null ? 1 : run.status);
   await chmod(path, 0o755);
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean }) {
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; vertexColors?: boolean }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -270,6 +270,14 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     props: instanceProps("M_Master", options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]]),
     textures: [],
   });
+  if (options.vertexColors) {
+    // UE Viewer's glTF writer emits COLOR_0 for a mesh that has a vertex colour buffer.
+    const io = new NodeIO();
+    const document = await io.read(join(exported, "Mesh.gltf"));
+    const primitive = document.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    primitive.setAttribute("COLOR_0", document.createAccessor("COLOR_0").setType("VEC4").setArray(new Float32Array([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1])).setBuffer(document.getRoot().listBuffers()[0]!));
+    await io.write(join(exported, "Mesh.gltf"), document);
+  }
   await writePng(join(exported, "T_InstanceMask.png"), [200, 100, 50, 255], 4);
   await writePng(join(exported, "T_MasterMask.png"), [10, 10, 10, 255], 4);
   const umodel = join(root, "umodel");
@@ -340,8 +348,8 @@ describe("importUnrealDirectory graph bake", () => {
     expect(dumped).toBe(""); // the converter was never spawned
   });
 
-  it("names the unsupported node class and stays neutral for a VertexColor graph", async () => {
-    const { report, material } = await importWithGraph({ graph: masterGraph("vertex-color") });
+  it("names the unsupported node class and stays neutral for a VertexColor graph on a painted mesh", async () => {
+    const { report, material } = await importWithGraph({ graph: masterGraph("vertex-color"), vertexColors: true });
     expect(material.getBaseColorTexture()).toBeNull();
     expect(material.getBaseColorFactor().slice(0, 3).every((value) => Math.abs(value - 0.8) < 1e-6)).toBe(true);
     const section = report.models[0]!.materials[0]!;
@@ -349,6 +357,19 @@ describe("importUnrealDirectory graph bake", () => {
     expect(section.graph?.unsupportedNodes).toContain("VertexColor");
     expect(section.bindings.some((binding) => binding.source === "graph")).toBe(false);
     expect(report.materialCoverage.graphBaked).toBe(0);
+  });
+
+  it("evaluates VertexColor as white for a mesh without COLOR_0 and reports the approximation", async () => {
+    const { report, material } = await importWithGraph({ graph: masterGraph("vertex-color") });
+    const texture = material.getBaseColorTexture();
+    expect(texture).not.toBeNull();
+    expect(await firstPixel(texture!.getImage()!)).toEqual([encode(0.5), encode(0.25), encode(1)]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.graph).toMatchObject({ status: "baked", confidence: "heuristic", unsupportedNodes: [] });
+    expect(section.graph?.approximations.join("\n")).toContain("VertexColor evaluated as white: the mesh carries no vertex colours");
+    expect(section.limitations.join("\n")).toContain("VertexColor evaluated as white");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ source: "graph", confidence: "heuristic" }));
+    expect(report.materialCoverage.graphBaked).toBe(1);
   });
 });
 

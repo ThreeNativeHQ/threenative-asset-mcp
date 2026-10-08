@@ -56,6 +56,11 @@ export interface BakeRequest {
    * refusing it. Off by default: which mesh UV set an index refers to is not in the graph.
    */
   allowUvSetFallback?: boolean;
+  /**
+   * Linear value every `VertexColor` node evaluates to. Pass white for a mesh without a colour buffer, which is what
+   * Unreal feeds the node. Absent, VertexColor is unsupported.
+   */
+  vertexColor?: readonly [number, number, number, number];
 }
 
 export type BakeResult =
@@ -265,7 +270,11 @@ const BREAK_ATTRIBUTES = ["BaseColor", "Metallic", "Specular", "Roughness", "Emi
 
 interface CompileOptions {
   allowUvSetFallback: boolean;
+  vertexColor?: readonly [number, number, number, number] | undefined;
 }
+
+const VERTEX_COLOR_WHITE_NOTE =
+  "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
 
 class Compiler {
   registers = new Float64Array(256);
@@ -384,7 +393,7 @@ class Compiler {
     if (!node) return this.markUnavailable(`pin refers to missing node ${input.node}`);
     const compiled = this.nodeOutput(node, input.output);
     if (compiled.kind === "attr") return compiled;
-    const fallbackMask = node.class.startsWith("TextureSample") && input.output >= 0 && input.output < TEXTURE_OUTPUT_MASKS.length ? TEXTURE_OUTPUT_MASKS[input.output]! : null;
+    const fallbackMask = (node.class.startsWith("TextureSample") || node.class === "VertexColor") && input.output >= 0 && input.output < TEXTURE_OUTPUT_MASKS.length ? TEXTURE_OUTPUT_MASKS[input.output]! : null;
     return this.applyMask(compiled, input.mask ?? fallbackMask);
   }
 
@@ -526,6 +535,14 @@ class Compiler {
         return this.append(node);
       case "TextureCoordinate":
         return this.textureCoordinate(node);
+      case "VertexColor": {
+        const color = this.options.vertexColor;
+        if (!color) return this.unsupportedNode(node);
+        // Only the default (white) is faithful for a mesh without a colour buffer; any other value is the caller's claim.
+        if (color.some((channel) => channel !== 1)) this.approximations.add(`VertexColor evaluated as constant (${color.join(", ")})`);
+        else this.approximations.add(VERTEX_COLOR_WHITE_NOTE);
+        return this.constant([...color], 4);
+      }
       case "StaticBool":
         return this.constant([node.constants.Value === true ? 1 : 0], 1);
       case "StaticBoolParameter": {
@@ -776,7 +793,7 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
     return { status: "unavailable", reason: `graph ${graph.material} has no BaseColor output` };
   }
 
-  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true });
+  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor });
   if (compiler.unsupported.size > 0) {
     const unsupported = [...compiler.unsupported].sort();
     return { status: "unsupported", unsupported, reason: `BaseColor of ${graph.material} depends on unsupported nodes: ${unsupported.join(", ")}` };

@@ -135,6 +135,20 @@ describe("scorePack", () => {
     expect(score.identity.violations[0]?.kind).toBe("foreign");
   });
 
+  it("does not call a baked graph texture foreign (it is derived, not one of the pack's textures)", () => {
+    const fromGraph = (s: ImportedMaterialSection): ImportedMaterialSection => ({
+      ...s,
+      bindings: s.bindings.map((b, i) => (i === 0 ? { ...b, source: "graph" } : b)),
+    });
+    const baked = fromGraph(section("MI_Cave_Rock_Pillar", ["MI_Cave_Rock_Pillar_graph_baseColor", "T_Cave_Rock_Pillar_N"]));
+    const ok = scorePack(caveDump(), reportOf([model(MESH_PKG, [baked])]));
+    expect(ok.identity.violationsTotal).toBe(0);
+    // A pack texture that really is foreign is still caught next to a graph binding.
+    const mixed = fromGraph(section("MI_Cave_Rock_Pillar", ["MI_Cave_Rock_Pillar_graph_baseColor", "T_Other_D"]));
+    const bad = scorePack(caveDump(), reportOf([model(MESH_PKG, [mixed])]));
+    expect(bad.identity.violations.map((v) => v.texture)).toEqual(["t_other_d"]);
+  });
+
   it("fails coverage with the report's reason when a mesh is missing", () => {
     const score = scorePack(
       caveDump(),

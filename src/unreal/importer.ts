@@ -1088,6 +1088,13 @@ async function writeMaterialLibrarySource(
   await separateLayoutIO().write(path, document);
 }
 
+/** True when any primitive that renders with `material` carries a COLOR_0 attribute. */
+function usesVertexColors(root: ReturnType<Document["getRoot"]>, material: Material): boolean {
+  return root
+    .listMeshes()
+    .some((mesh) => mesh.listPrimitives().some((primitive) => primitive.getMaterial() === material && primitive.getAttribute("COLOR_0") !== null));
+}
+
 /** Glass, mirror and light sections keep their named PBR fallbacks; no graph bake is attempted for them. */
 function hasNamedFallback(materialName: string): boolean {
   const lower = materialName.toLowerCase();
@@ -1316,6 +1323,9 @@ export async function packageGlb(options: {
         materialName: material.getName(),
         lookupName,
         assets: materialAssets,
+        // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
+        // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
+        ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
         readProps: (propsName) => {
           const propsPath = materialAssets.props.get(propsName);
           return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);

@@ -459,6 +459,36 @@ describe("bakeGraph", () => {
     expect((await pixelsOf(result))(0, 0)).toEqual([encode(100 / 255 / 2), 0, encode(255 / 255 / 4)]);
   });
 
+  it("evaluates VertexColor as the supplied constant only when asked, and says so", async () => {
+    // Lerp(red, blue, VertexColor.A) x VertexColor.RGB(0.5 grey): alpha 1 picks the B layer, so (0, 0, 1) x 0.5.
+    const graph = makeGraph(
+      [
+        multiply("m", pin("mix", 0, RGB_MASK), pin("vc", 0, RGB_MASK)),
+        node("mix", "LinearInterpolate", { inputs: { A: pin("red"), B: pin("blue"), Alpha: pin("vc", 4, [0, 0, 0, 1]) } }),
+        constant3("red", [1, 0, 0]),
+        constant3("blue", [0, 0, 1]),
+        node("vc", "VertexColor"),
+      ],
+      pin("m"),
+    );
+    const loader = makeLoader({});
+    const without = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 2 });
+    expect(without).toMatchObject({ status: "unsupported", unsupported: ["VertexColor"] });
+    const white = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 2, vertexColor: [1, 1, 1, 1] });
+    expect((await pixelsOf(white))(0, 0)).toEqual([0, 0, 255]);
+    expect(white).toMatchObject({
+      confidence: "heuristic",
+      approximations: ["VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ"],
+    });
+    // A non-white constant is still honoured (alpha 0.5 halves the blend), but it is not the white claim.
+    const grey = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 2, vertexColor: [0.5, 0.5, 0.5, 0.5] });
+    expect((await pixelsOf(grey))(0, 0)).toEqual([encode(0.5 * 0.5), 0, encode(0.5 * 0.5)]);
+    // Not on the active path: no approximation is claimed.
+    const unused = makeGraph([constant3("red", [1, 0, 0]), node("vc", "VertexColor")], pin("red"));
+    const plain = await bakeGraph({ graph: unused, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 2, vertexColor: [1, 1, 1, 1] });
+    expect(plain).toMatchObject({ confidence: "exact", approximations: [] });
+  });
+
   it("keeps the texture's row order: v = 0 is the first PNG row", async () => {
     // Every texel is distinct and non-symmetric: (x, y) = (40x + 10, 60y + 5, 77).
     const texel = (x: number, y: number): Rgb => [40 * x + 10, 60 * y + 5, 77];

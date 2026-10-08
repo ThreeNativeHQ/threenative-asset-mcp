@@ -39,6 +39,11 @@ export interface GraphBakeRequest {
   readonly assets: GraphBakeAssets;
   /** Returns the `.props.txt` text for a material (or texture) name, or undefined. */
   readonly readProps: (name: string) => string | undefined;
+  /**
+   * Linear value `VertexColor` nodes evaluate to. The importer passes white when no mesh primitive using the
+   * section carries `COLOR_0`; absent, VertexColor stays unsupported.
+   */
+  readonly vertexColor?: readonly [number, number, number, number] | undefined;
 }
 
 export type GraphBakeOutcome = BakeResult & {
@@ -231,7 +236,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);
 
     const parameters = chainParameters(chain);
-    const key = `${graph.material}|${parametersKey(parameters)}`;
+    const key = `${graph.material}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}`;
     let perAssets = bakes.get(request.assets);
     if (!perAssets) {
       perAssets = new Map();
@@ -249,6 +254,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         parameters,
         size,
         allowUvSetFallback: true,
+        ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
         loadTexture: async (reference) => {
           const name = textureBasename(reference);
           const path = request.assets.png.get(name) ?? (await options.exportTexture?.(name));

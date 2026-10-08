@@ -528,6 +528,8 @@ function scoreIdentity(
 ): void {
   const actual = new Set<string>();
   for (const b of section.bindings) {
+    // A baked graph texture is derived from several pack textures, so it is not itself one of them.
+    if (b.source === "graph") continue;
     actual.add(objectName(b.texture));
     if (b.secondaryTexture) actual.add(objectName(b.secondaryTexture));
   }
