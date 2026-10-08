@@ -213,6 +213,42 @@ function darkWoodFactor(): readonly [number, number, number, number] {
   return resolved.baseColorFactor ?? [1, 1, 1, 1];
 }
 
+/**
+ * Old West wood: the instance's resolved `.mat` names Diffuse/Normal only, but its master declares an
+ * `Emissive` texture parameter whose default is the neutral fill that is also the diffuse. Resolved for
+ * real; if an emissive slot is bound, the importer would emit the flat grey (mean about 0.72) at factor 1.
+ */
+function unwiredEmissiveGrey(): readonly [number, number, number] {
+  const tex = (name: string): string => `Texture2D'Content/Pack/Textures/${name}.${name}'`;
+  const collected = (name: string, texture: string, index: number): string[] => [
+    `    CollectedTextureParameters[${index}] =`,
+    "    {",
+    `        Texture = ${tex(texture)}`,
+    `        Name = ${name}`,
+    "        Group = Base",
+    "    }",
+  ];
+  const masterProps = [
+    "CollectedTextureParameters[2] =",
+    "{",
+    ...collected("Albedo", "TX_Fill_ALB", 0),
+    ...collected("Emissive", "TX_Fill_ALB", 1),
+    "}",
+  ].join("\n");
+  const resolved = resolve({
+    name: "MI_Chair",
+    availableTextures: new Set(["TX_Chair_ALB", "TX_Fill_ALB"]),
+    files: {
+      MI_Chair: {
+        mat: "Diffuse=TX_Chair_ALB\nOther[0]=TX_Fill_ALB\n",
+        props: "Parent = Material3'Content/Pack/Materials/MM_Master.MM_Master'\n",
+      },
+      MM_Master: { mat: "Diffuse=TX_Fill_ALB\n", props: masterProps },
+    },
+  });
+  return resolved.bindings.some((binding) => binding.slot === "emissive") ? [0.72, 0.72, 0.72] : [0, 0, 0];
+}
+
 interface Fixture {
   readonly name: string;
   readonly path: string;
@@ -229,6 +265,12 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
   };
 
   await write("dark-wood", { geometry: "quad", baseColorFactor: darkWoodFactor(), texture: wood });
+  await write("wood-unwired-emissive", {
+    geometry: "quad",
+    baseColorFactor: darkWoodFactor(),
+    texture: wood,
+    emissiveFactor: unwiredEmissiveGrey(),
+  });
   await write("cutout-card", {
     geometry: "quad",
     baseColorFactor: [1, 1, 1, 1],
@@ -338,6 +380,15 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(result.stats.meanLuma).toBeLessThan(180);
     expect(result.stats.meanLuma).toBeLessThan(WASHED_OUT_LUMA);
     expect(result.verdict).not.toBe("fail");
+  });
+
+  it("an unwired Emissive default does not wash dark wood out (Old West)", () => {
+    const wood = judgeRender(byName.get("dark-wood")!);
+    const washed = judgeRender(byName.get("wood-unwired-emissive")!);
+    expect(washed.stats.objectPixels).toBeGreaterThan(200);
+    expect(washed.stats.meanLuma).toBeLessThan(180);
+    expect(washed.stats.meanLuma).toBeLessThan(wood.stats.meanLuma + 25);
+    expect(washed.reasons.join()).not.toMatch(/washed out|white/);
   });
 
   it("the solid box hue matches its base-colour factor", () => {
