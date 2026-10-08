@@ -380,4 +380,10 @@ describe("S4 baseline delta (PRD-538 AC-4)", () => {
     expect(parseParityArgs([]).baseline).toBeUndefined();
     expect(() => parseParityArgs(["--baseline"])).toThrow(/needs a value/);
   });
+
+  it("parses --export-metadata", () => {
+    expect(parseParityArgs(["--export-metadata", "/x/dumps"]).exportMetadata).toBe("/x/dumps");
+    expect(parseParityArgs([]).exportMetadata).toBeUndefined();
+    expect(() => parseParityArgs(["--export-metadata"])).toThrow(/needs a value/);
+  });
 });

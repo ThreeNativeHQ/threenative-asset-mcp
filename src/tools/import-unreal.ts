@@ -10,6 +10,7 @@ import { decoderRoute, oldestEngine } from "../fab/routes.js";
 import { classifyLicenses, type LicenseDecision } from "../fab/license.js";
 import { normalizeListing } from "../fab/normalize.js";
 import { ImportError, type ImportReport, importUnrealDirectory } from "../unreal/importer.js";
+import type { ResolveMaterialRequest } from "../unreal/materials.js";
 import { ToolchainError } from "../unreal/toolchain.js";
 import { parseListingId } from "./get-asset.js";
 
@@ -445,6 +446,8 @@ export interface ImportUnrealDependencies {
   readonly fabCli?: FabCli;
   /** Injected in tests; production reads the listing's published licences from Fab. */
   readonly readLicenses?: (listingId: string) => Promise<readonly string[]>;
+  /** Material metadata capture (scripts/fab-parity.ts --export-metadata). Unset in production. */
+  readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
 }
 
 /**
@@ -673,6 +676,7 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
         extraWarnings,
         environment,
         log,
+        onMaterialResolved: dependencies.onMaterialResolved,
       });
       const output = summarize(report, outputDir);
       return {

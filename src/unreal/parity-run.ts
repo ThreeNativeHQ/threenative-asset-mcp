@@ -629,6 +629,8 @@ export interface ParityArgs {
   readonly excludeSize: boolean;
   /** A scorecard.json to compare this sweep's S4 miss count against. */
   readonly baseline: string | undefined;
+  /** Directory for per-pack material metadata dumps (licensed names: local-only, never commit). */
+  readonly exportMetadata: string | undefined;
 }
 
 export const PARITY_USAGE = `Usage: npm run parity:fab -- [options]
@@ -649,6 +651,9 @@ Options:
   --no-exclude-size      Include them
   --baseline <file>      Compare this sweep's S4 miss count with that scorecard.json and print
                          "S4 misses: <baseline> → <now> (<pct>% change)" (PRD-538 AC-4)
+  --export-metadata <dir> Write <dir>/<listing8>-<artifact>.json per pack: the material texts each
+                         resolution read, for replay (tests/fab-metadata.test.ts). Holds licensed
+                         names: local-only, never commit.
   -h, --help             Print this help
 
 Exit codes: 0 done, 1 error, 2 Fab session/download failure (partial scorecard written), 130 interrupted.`;
@@ -664,6 +669,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let excludeSize = true;
   let help = false;
   let baseline: string | undefined;
+  let exportMetadata: string | undefined;
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(`${flag} needs a value.`);
@@ -712,6 +718,9 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
       case "--baseline":
         baseline = resolve(value(i++, arg));
         break;
+      case "--export-metadata":
+        exportMetadata = resolve(value(i++, arg));
+        break;
       default:
         throw new Error(`Unknown option "${arg}". Use --help.`);
     }
@@ -727,5 +736,6 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
     out: resolve(out),
     excludeSize,
     baseline,
+    exportMetadata,
   };
 }

@@ -18,6 +18,7 @@ import { FabCli } from "../src/fab/fabcli.js";
 import { dumpEngineArg } from "../src/fab/routes.js";
 import { createFabImportAssetHandler, fabDownloadRoot } from "../src/tools/import-unreal.js";
 import type { ImportReport } from "../src/unreal/importer.js";
+import { captureMaterialMetadata, type MaterialMetadataEntry, writeMaterialMetadataDump } from "../src/unreal/material-metadata.js";
 import { scorePack } from "../src/unreal/parity.js";
 import {
   acquireLock,
@@ -125,6 +126,9 @@ async function main(): Promise<number> {
   if (args.help) {
     say(PARITY_USAGE);
     return 0;
+  }
+  if (args.exportMetadata !== undefined) {
+    say(`Metadata dumps in ${args.exportMetadata} hold licensed pack names: local-only, never commit them.`);
   }
 
   const load1 = loadavg()[0] ?? 0;
@@ -287,7 +291,19 @@ async function main(): Promise<number> {
     say(`Sweeping ${todo.length} artifact(s) from ${new Set(todo.map((e) => e.listingId)).size} listing(s); skipped ${skipped.length}. Run ${runId}.`);
     writeScorecard();
 
-  const handler = createFabImportAssetHandler({ environment });
+  // --export-metadata: each pack's material resolutions, deduplicated, written once the pack imported.
+  const packMaterials = new Map<string, MaterialMetadataEntry>();
+  const handler = createFabImportAssetHandler({
+    environment,
+    ...(args.exportMetadata === undefined
+      ? {}
+      : {
+          onMaterialResolved: (request) => {
+            const entry = captureMaterialMetadata(request);
+            packMaterials.set(JSON.stringify(entry), entry);
+          },
+        }),
+  });
     let fatal: HandlerError | undefined;
 
     for (const [index, item] of todo.entries()) {
@@ -316,6 +332,7 @@ async function main(): Promise<number> {
       };
       let entry: ScorecardEntry;
       try {
+        packMaterials.clear();
         const result = await handler({
           listingIdOrUrl: item.listingId,
           outputDir,
@@ -323,6 +340,13 @@ async function main(): Promise<number> {
           maxTextureSize: 1024,
           acceptFabEula: true,
         });
+        if (args.exportMetadata !== undefined && packMaterials.size > 0) {
+          writeMaterialMetadataDump(args.exportMetadata, `${label}.json`, {
+            version: 1,
+            source: `fab:${label}`,
+            materials: [...packMaterials.values()],
+          });
+        }
         if ("isError" in result && result.isError) {
           const error = parseHandlerError(result.content[0]?.text);
           if (isFatalHandlerError(error)) fatal = error;
