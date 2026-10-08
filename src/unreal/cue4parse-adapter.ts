@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.55",
+  version: "b4e95441+threenative.56",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -404,6 +404,7 @@ var GraphIgnoredProperties = new HashSet<string>(StringComparer.Ordinal)
     "FunctionExpressions",
 };
 var graphLegacyCache = new Dictionary<string, Dictionary<string, GraphLegacyInput>>(StringComparer.Ordinal);
+Dictionary<string, string>? graphFunctionKeys = null;
 var graphPackageKeys = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var graphPackageArchives = new Dictionary<string, FAssetArchive?>(StringComparer.OrdinalIgnoreCase);
 var GraphMaterialOutputs = new (string Output, string Property)[]
@@ -791,6 +792,76 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         return id;
     }
 
+    // A pack may mount its content under any folder (Polyphoria/Polyphoria/...), so a reference that does not load
+    // as given is found again by its file name among the pack's own packages. Engine content is never in the pack.
+    UObject? GraphLoadFunction(FPackageIndex? functionIndex, string? path)
+    {
+        try { if (functionIndex?.Load<UObject>() is { } direct) return direct; } catch { }
+        if (string.IsNullOrEmpty(path) || path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return null;
+        var slash = path.LastIndexOf('/');
+        var functionName = path[(slash + 1)..];
+        var dot = functionName.IndexOf('.');
+        if (dot >= 0) functionName = functionName[..dot];
+        if (functionName.Length == 0) return null;
+        if (graphFunctionKeys is null)
+        {
+            graphFunctionKeys = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var key in provider.Files.Keys.Where(key => key.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)).OrderBy(key => key, StringComparer.Ordinal))
+                graphFunctionKeys.TryAdd(Path.GetFileNameWithoutExtension(key), key);
+        }
+        if (!graphFunctionKeys.TryGetValue(functionName, out var packageKey)) return null;
+        try
+        {
+            var functionPackage = provider.LoadPackage(packageKey);
+            for (var index = 0; index < functionPackage.ExportsLazy.Length; index++)
+            {
+                if (DumpExportName(functionPackage, index) == functionName) return functionPackage.ExportsLazy[index].Value;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // UE4 and 5.0 keep the expression list on the function; 5.1+ moves it to EditorOnlyData.ExpressionCollection.
+    // The package exports are the last resort, because the inputs and outputs are exports whatever the layout.
+    List<UObject> GraphFunctionExpressions(UObject function)
+    {
+        var found = new List<UObject>();
+        void Collect(object? array)
+        {
+            if (array is not UScriptArray list) return;
+            foreach (var element in list.Properties)
+            {
+                try { if ((element.GenericValue as FPackageIndex)?.Load<UObject>() is { } candidate) found.Add(candidate); } catch { }
+            }
+        }
+        Collect(GraphProperty(function, "FunctionExpressions")?.Tag?.GenericValue);
+        if (found.Count == 0)
+        {
+            try
+            {
+                var editorOnly = GraphProperty(function, "EditorOnlyData")?.Tag?.GenericValue is FPackageIndex editorIndex ? editorIndex.Load<UObject>() : null;
+                if (editorOnly is not null &&
+                    GraphProperty(editorOnly, "ExpressionCollection")?.Tag?.GenericValue is FScriptStruct { StructType: FStructFallback collection })
+                    Collect(GraphProperty(collection, "Expressions")?.Tag?.GenericValue);
+            }
+            catch { }
+        }
+        if (found.Count == 0 && function.Owner is { } functionOwner)
+        {
+            for (var index = 0; index < functionOwner.ExportsLazy.Length; index++)
+            {
+                try
+                {
+                    var export = functionOwner.ExportsLazy[index].Value;
+                    if (export.ExportType is "MaterialExpressionFunctionInput" or "MaterialExpressionFunctionOutput") found.Add(export);
+                }
+                catch { }
+            }
+        }
+        return found;
+    }
+
     void InlineFunctionCall(UObject call, string callId, Dictionary<string, object?> node, string prefix, Dictionary<string, Dictionary<string, object?>?>? outerInputs, int depth)
     {
         var owner = call.Owner;
@@ -802,17 +873,13 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         node["fn"] = fn;
         var callPins = (Dictionary<string, object?>) node["inputs"]!;
         // The call stores each wired input and only a guid for the function input it feeds.
-        UObject? function = null;
-        try { function = functionIndex?.Load<UObject>(); } catch { }
+        var function = GraphLoadFunction(functionIndex, node["function"] as string);
         var inputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
         var outputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
-        if (function is not null && GraphProperty(function, "FunctionExpressions")?.Tag?.GenericValue is UScriptArray expressions)
+        if (function is not null)
         {
-            foreach (var element in expressions.Properties)
+            foreach (var candidate in GraphFunctionExpressions(function))
             {
-                UObject? candidate = null;
-                try { candidate = (element.GenericValue as FPackageIndex)?.Load<UObject>(); } catch { }
-                if (candidate is null) continue;
                 var guid = GraphGuid(GraphProperty(candidate, "Id"));
                 if (guid is null) continue;
                 if (candidate.ExportType == "MaterialExpressionFunctionInput") inputExpressions[guid] = candidate;

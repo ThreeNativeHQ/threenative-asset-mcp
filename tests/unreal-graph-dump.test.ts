@@ -128,9 +128,25 @@ describe("--dump-graphs converter mode", () => {
   it("is wired into the embedded program and the converter version is bumped", () => {
     expect(CUE4PARSE_PROGRAM).toContain("--dump-graphs");
     expect(CUE4PARSE_PROGRAM).toContain(".graph.json");
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.55");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.56");
     // The embedded program prints the same string `canRun` waits for, so a stale binary is rebuilt.
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
+  });
+
+  it("finds a function's inputs and outputs in UE5 EditorOnlyData or the package exports, not only FunctionExpressions", () => {
+    // Paladin RPG Set (UE 5.8): MF_RGBA_PatternBlend loaded fine but inlined to nothing because UE5.1+ keeps
+    // the expression list in EditorOnlyData.ExpressionCollection and the loader only read FunctionExpressions.
+    expect(CUE4PARSE_PROGRAM).toContain("GraphFunctionExpressions(function)");
+    expect(CUE4PARSE_PROGRAM).toContain('"ExpressionCollection"');
+    expect(CUE4PARSE_PROGRAM).toContain('"Expressions"');
+    expect(CUE4PARSE_PROGRAM).toContain("function.Owner");
+    expect(CUE4PARSE_PROGRAM).not.toContain('GraphProperty(function, "FunctionExpressions")?.Tag?.GenericValue is UScriptArray expressions');
+  });
+
+  it("resolves a pack-local function under any content mount by its file name", () => {
+    expect(CUE4PARSE_PROGRAM).toContain("GraphLoadFunction(functionIndex");
+    expect(CUE4PARSE_PROGRAM).toContain("graphFunctionKeys");
+    expect(CUE4PARSE_PROGRAM).toContain('StartsWith("/Engine/"');
   });
 
   it("emits and accepts the attribute GUIDs of Set/GetMaterialAttributes", () => {
