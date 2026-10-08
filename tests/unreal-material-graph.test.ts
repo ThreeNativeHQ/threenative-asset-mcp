@@ -1177,3 +1177,125 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
     }
   });
 });
+
+describe("standard math nodes and engine utility functions seen on real BaseColor paths", () => {
+  const bake = (graph: MaterialGraph) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  const rgbOf = async (nodes: Raw[], root: string) => (await pixelsOf(await bake(makeGraph(nodes, pin(root, 0, RGB_MASK)))))(0, 0);
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  /** Linear 0.25 / 0.5 / 0.75 encodes to different bytes, so a swapped channel fails. */
+  const unary = (cls: string, input: string, pinName = "Input"): Raw[] => [node("u", cls, { inputs: { [pinName]: pin("c", 0, RGB_MASK) } }), constant3("c", [input === "neg" ? -0.25 : 0.25, 0.5, 0.75])];
+  const exact = async (nodes: Raw[], root = "u") => {
+    const result = await bake(makeGraph(nodes, pin(root, 0, RGB_MASK)));
+    if (result.status !== "baked") throw new Error(`expected baked, got ${result.status}`);
+    expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+    return (await pixelsOf(result))(0, 0);
+  };
+
+  it("PathTracingQualitySwitch takes Normal and never visits the path-traced branch", async () => {
+    const nodes = [
+      node("q", "PathTracingQualitySwitch", { inputs: { Normal: pin("hi", 0, RGB_MASK), PathTraced: pin("bad") } }),
+      constant3("hi", [0.25, 0.5, 0.75]),
+      node("bad", "Fresnel"),
+    ];
+    expect(await exact(nodes, "q")).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    expect(await bake(makeGraph([node("q", "PathTracingQualitySwitch")], pin("q", 0, RGB_MASK)))).toMatchObject({ status: "unavailable" });
+  });
+
+  it("ShadingPathSwitch takes Default, else the deferred slot Inputs[0]", async () => {
+    const withDefault = [
+      node("s", "ShadingPathSwitch", { inputs: { Default: pin("hi", 0, RGB_MASK), "Inputs[0]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }),
+      constant3("hi", [0.25, 0.5, 0.75]), constant3("lo", [1, 0, 0]), node("bad", "Fresnel"),
+    ];
+    expect(await exact(withDefault, "s")).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    const slotOnly = [node("s", "ShadingPathSwitch", { inputs: { "Inputs[0]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }), constant3("lo", [1, 0, 0]), node("bad", "Fresnel")];
+    expect(await exact(slotOnly, "s")).toEqual([255, 0, 0]);
+    expect(await bake(makeGraph([node("s", "ShadingPathSwitch")], pin("s", 0, RGB_MASK)))).toMatchObject({ status: "unavailable" });
+  });
+
+  it("Abs and Frac work per component", async () => {
+    expect(await exact(unary("Abs", "neg"))).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    expect(await exact([node("u", "Frac", { inputs: { Input: pin("s") } }), scalar("s", 2.75)])).toEqual([encode(0.75), encode(0.75), encode(0.75)]);
+    // Frac of a negative is x - floor(x), not the C remainder.
+    expect(await exact([node("u", "Frac", { inputs: { Input: pin("s") } }), scalar("s", -0.25)])).toEqual([encode(0.75), encode(0.75), encode(0.75)]);
+  });
+
+  it("Min and Max take operands from pins or ConstA/ConstB", async () => {
+    const pair = (cls: string) => [node("u", cls, { inputs: { A: pin("a", 0, RGB_MASK), B: pin("b", 0, RGB_MASK) } }), constant3("a", [0.25, 0.5, 0.75]), constant3("b", [0.5, 0.5, 0.5])];
+    expect(await exact(pair("Max"))).toEqual([encode(0.5), encode(0.5), encode(0.75)]);
+    expect(await exact(pair("Min"))).toEqual([encode(0.25), encode(0.5), encode(0.5)]);
+    expect(await exact([node("u", "Max", { inputs: { A: pin("a", 0, RGB_MASK) }, constants: { ConstB: 0.6 } }), constant3("a", [0.25, 0.5, 0.75])])).toEqual([encode(0.6), encode(0.6), encode(0.75)]);
+  });
+
+  it("DotProduct sums the component products and Normalize divides by the length", async () => {
+    const dot = [node("u", "DotProduct", { inputs: { A: pin("a", 0, RGB_MASK), B: pin("b", 0, RGB_MASK) } }), constant3("a", [0.5, 0.25, 0.5]), constant3("b", [0.5, 1, 0.5])];
+    expect(await exact(dot)).toEqual([encode(0.75), encode(0.75), encode(0.75)]);
+    // (0, 0.6, 0.8) has length 1; (0, 3, 4) / 5 is the same direction.
+    const normalised = [node("u", "Normalize", { inputs: { VectorInput: pin("c", 0, RGB_MASK) } }), constant3("c", [0, 3, 4])];
+    expect(await exact(normalised)).toEqual([0, encode(0.6), encode(0.8)]);
+  });
+
+  it("ConstantBiasScale is (Input + Bias) * Scale with Unreal's defaults of 1 and 0.5", async () => {
+    expect(await exact(unary("ConstantBiasScale", "pos"))).toEqual([encode(0.625), encode(0.75), encode(0.875)]);
+    const custom = [node("u", "ConstantBiasScale", { inputs: { Input: pin("c", 0, RGB_MASK) }, constants: { Bias: -0.25, Scale: 2 } }), constant3("c", [0.5, 0.75, 1])];
+    expect(await exact(custom)).toEqual([encode(0.5), encode(1), encode(1)]);
+  });
+
+  it("SphereMask is a heuristic: saturate((1 - distance / Radius) / (1 - Hardness)) with a named approximation", async () => {
+    const mask = (hardness: number) => [
+      node("m", "SphereMask", { inputs: { A: pin("a", 0, RGB_MASK), B: pin("b", 0, RGB_MASK), Radius: pin("r"), Hardness: pin("h") } }),
+      constant3("a", [0.5, 0, 0]), constant3("b", [0, 0, 0]), scalar("r", 1), scalar("h", hardness),
+    ];
+    const soft = await bake(makeGraph(mask(0), pin("m")));
+    expect((await pixelsOf(soft))(0, 0)).toEqual([encode(0.5), encode(0.5), encode(0.5)]);
+    if (soft.status === "baked") expect(soft).toMatchObject({ confidence: "heuristic", approximations: [expect.stringContaining("SphereMask")] });
+    const firm = await bake(makeGraph(mask(0.5), pin("m")));
+    expect((await pixelsOf(firm))(0, 0)).toEqual([255, 255, 255]);
+    // Outside the radius it is zero.
+    const outside = [
+      node("m", "SphereMask", { inputs: { A: pin("a", 0, RGB_MASK), B: pin("b", 0, RGB_MASK) }, constants: { AttenuationRadius: 0.25, HardnessPercent: 0 } }),
+      constant3("a", [0.5, 0, 0]), constant3("b", [0, 0, 0]),
+    ];
+    expect((await pixelsOf(await bake(makeGraph(outside, pin("m")))))(0, 0)).toEqual([0, 0, 0]);
+  });
+
+  it("MakeFloat2/3 and BreakOutFloat2/3Components work by position when the engine body is absent", async () => {
+    const make = [engineCall("u", "MakeFloat3", { Input0: pin("x"), Input1: pin("y"), Input2: pin("z") }), scalar("x", 0.25), scalar("y", 0.5), scalar("z", 0.75)];
+    expect(await exact(make)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    // An unwired component is zero, like an unwired function input.
+    expect(await exact([engineCall("u", "MakeFloat3", { Input0: pin("x"), Input1: null, Input2: pin("z") }), scalar("x", 0.25), scalar("z", 0.75)])).toEqual([encode(0.25), 0, encode(0.75)]);
+    for (const [name, output, expected] of [["BreakOutFloat3Components", 0, 0.25], ["BreakOutFloat3Components", 1, 0.5], ["BreakOutFloat3Components", 2, 0.75], ["BreakOutFloat2Components", 1, 0.5]] as const) {
+      const graph = makeGraph([engineCall("u", name, { Input0: pin("c", 0, RGB_MASK) }), constant3("c", [0.25, 0.5, 0.75])], pin("u", output));
+      const result = await bake(graph);
+      expect((await pixelsOf(result))(0, 0), `${name}.${output}`).toEqual([encode(expected), encode(expected), encode(expected)]);
+      if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+    }
+    const joined = [
+      engineCall("u", "MakeFloat3", { Input0: pin("b", 2), Input1: pin("b", 1), Input2: pin("b", 0) }),
+      engineCall("b", "BreakOutFloat3Components", { Input0: pin("c", 0, RGB_MASK) }),
+      constant3("c", [0.25, 0.5, 0.75]),
+    ];
+    expect(await exact(joined)).toEqual([encode(0.75), encode(0.5), encode(0.25)]);
+  });
+
+  it("CheapContrast_RGB matches CheapContrast", async () => {
+    const result = await bake(
+      makeGraph([engineCall("c", "CheapContrast_RGB", { Input0: pin("in", 0, RGB_MASK), Input1: pin("amount") }), constant3("in", [0.3, 0.5, 0.9]), scalar("amount", 0.2)], pin("c", 0, RGB_MASK)),
+    );
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.22), encode(0.5), 255]);
+    if (result.status === "baked") expect(result.confidence).toBe("exact");
+  });
+
+  it("registers the new node classes and engine function names", () => {
+    expect(supportedNodeClasses()).toEqual(
+      expect.arrayContaining(["PathTracingQualitySwitch", "ShadingPathSwitch", "Abs", "Frac", "Min", "Max", "DotProduct", "Normalize", "ConstantBiasScale", "SphereMask"]),
+    );
+    expect(supportedEngineFunctions()).toEqual(expect.arrayContaining(["MakeFloat2", "MakeFloat3", "BreakOutFloat2Components", "BreakOutFloat3Components", "CheapContrast_RGB"]));
+  });
+
+  it("scene and view dependent nodes stay unsupported", async () => {
+    for (const cls of ["SceneColor", "SceneTexture", "ViewProperty", "ObjectPositionWS", "PerInstanceRandom", "Time", "Panner"]) {
+      expect(await bake(makeGraph([node("u", cls)], pin("u", 0, RGB_MASK))), cls).toMatchObject({ status: "unsupported", unsupported: [cls] });
+    }
+  });
+});
