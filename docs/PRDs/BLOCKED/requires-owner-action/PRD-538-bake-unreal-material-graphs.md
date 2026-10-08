@@ -1,6 +1,7 @@
 # PRD-538 — Bake common Unreal material graphs into glTF PBR textures
 
-**Status:** DONE except AC-4 (Blocked on: needs PRD-537's corpus baseline, which needs the Fab licence check cleared by the owner).
+**Status:** PARTIAL — Phases 1–3 landed (PR #31); AC-1–AC-3 ticked on the live Soul Cave pack.
+**Blocker:** AC-4 needs PRD-537's corpus baseline, which needs João to clear Fab's browser verification (or approve `--assume-licence`); see Blocked on.
 **Priority:** P2 — follows PRD-537. Sections whose colour exists only in the material graph still import grey (AC-1, AC-2); PRD-537's S4 failures will size how much of the library this affects.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new graph-evaluation module (+2), crosses the .NET converter / Node importer boundary (+2); risk override: none
 **Owner:** João
@@ -73,7 +74,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1 in Phase 1, AC-
 - **`Divide` defaults** (`ConstA` 0, `ConstB` 1 when the dump omits them) are not verified against Unreal's class defaults (recalled as 1 and 2). It matters only for an unwired, omitted input.
 - **The parity scorer exempts `source: "graph"` bindings from S3's foreign-texture check** (a baked texture is derived from several pack textures); the report does not list the textures the bake read, so S3 cannot check them yet.
 - **The section report keeps a mask the PRD-537 path rejected as a base colour next to the graph binding** (`MI_Cave_Rock_Pillar` lists `baseColor=T_Cave_Rock_Pillar_M texture-set` and the graph binding); the GLB carries only the graph one. Pre-existing reporting behaviour, noted rather than changed.
-- PRD filing: moved to `done/` as the goal instructed, although `AGENTS.md` now names `docs/PRDs/BLOCKED/<reason>/` for PRDs that wait only on an owner action; `git mv` it there if preferred.
+- PRD filing: filed under `docs/PRDs/BLOCKED/requires-owner-action/` as PARTIAL, because AC-4 waits only on an owner action (`AGENTS.md`).
 
 ## Blocked on
 
@@ -98,7 +99,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1 in Phase 1, AC-
 **Verification:** the box above.
 
 #### Phase 3: The library measures the gain
-**Status:** DONE except AC-4 (Blocked on)
+**Status:** PARTIAL — AC-3 ticked; AC-4 is under Blocked on
 **Files:** `scripts/fab-parity.ts` (unsupported-node histogram), `src/unreal/material-graph.ts` (the top node classes by count).
 - [x] AC-3 [local]: Soul Cave passes S4 (≥ 90 % sections with colour). proof: parity run on Soul Cave — Evidence (2026-10-08): live pack, 203 import sections, 176 expect colour: **164 coloured = 93.2 %** (S4 `ok: true`), up from 79 = 44.9 % before this PRD (misses 97 → 12, −88 %). Graph outcomes: 88 baked (20 exact, 68 heuristic), 10 unsupported (`MatLayerBlend_Tint` 4, `DepthFade` 3, `ParticleColor` 2, one particle material), 33 unavailable (13 no source package, 11 parent graph outside the pack, 4 texture sample without texture, 3 no BaseColor output, 2 other). S3 identity stays at 0 violations over 190 verified sections. Measured with `importUnrealDirectory` + `dumpUnrealProperties` + `scorePack` (the same code `parity:fab` runs), not the CLI.
 
