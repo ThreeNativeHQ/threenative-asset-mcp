@@ -422,6 +422,40 @@ export function objectMask(image: RgbaImage, tolerance = BACKGROUND_TOLERANCE): 
   return mask;
 }
 
+export interface MaskFill {
+  /** Pixels set in the mask. */
+  readonly pixels: number;
+  /** Area of the tight bounding box around the set pixels; 0 for an empty mask. */
+  readonly boundingBox: number;
+  /** `pixels / boundingBox`; 1 means the set pixels fill their box (a flat card). 0 for an empty mask. */
+  readonly fillRatio: number;
+}
+
+/**
+ * How much of its own bounding box a binary mask fills. A flat card fills its box (ratio 1); a ragged
+ * cut-out — a grass blade card, a needle spray — leaves gaps and sits well below 1. Scale-invariant, so
+ * a large editor thumbnail and a small render of the same piece can be compared directly.
+ */
+export function maskFillRatio(mask: Uint8Array, width: number, height: number): MaskFill {
+  let pixels = 0;
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!mask[y * width + x]) continue;
+      pixels++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  const boundingBox = maxX < 0 ? 0 : (maxX - minX + 1) * (maxY - minY + 1);
+  return { pixels, boundingBox, fillRatio: boundingBox === 0 ? 0 : pixels / boundingBox };
+}
+
 function srgbToLinear(value: number): number {
   const v = value / 255;
   return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;

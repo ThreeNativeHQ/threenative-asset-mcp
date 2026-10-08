@@ -26,6 +26,16 @@ export const GHOST_MAX_STDDEV = 12;
 export const GHOST_BACKGROUND_LUMA_BAND = 40;
 /** A near-neutral object brighter than this mean luma is washed out even if not near-white everywhere. */
 export const WASHED_OUT_LUMA = 200;
+/**
+ * A render whose object fills this much more of its bounding box than the thumbnail's object does is a
+ * solid card where the real piece is a cut-out. Calibrated against synthetic cases: a dense
+ * needle-spray-like cut-out (a ragged alpha mask leaving about 30-45% of its box set) versus a solid
+ * quad (ratio 1.0) differs by 2.2-3.3x; a legitimately dense foliage card at 65-70% differs by only
+ * 1.4-1.5x. 1.6 catches the solid-card regression while leaving dense real cards alone.
+ */
+export const SOLID_CARD_FILL_FACTOR = 1.6;
+/** Object pixels below this make a fill ratio meaningless: a handful of pixels trivially fills its box. */
+export const MIN_FILL_MASK_PIXELS = 200;
 const NEAR_WHITE = 235;
 const NEUTRAL_SPREAD = 12;
 /** Colour distance from the tile background above which a pixel is object. */
@@ -44,6 +54,11 @@ export interface JudgeStats {
   meanSaturation: number;
   meanLuma: number;
   lumaStdDev: number;
+  /**
+   * objectPixels / area of the object's tight bounding box. A flat card facing the camera fills its box
+   * (ratio near 1); a ragged cut-out leaves gaps and sits well below 1. Scale-invariant.
+   */
+  fillRatio: number;
 }
 
 export interface JudgeResult {
@@ -59,6 +74,10 @@ export interface JudgeOptions {
   background?: { r: number; g: number; b: number };
   /** Colour similarity (0..1) to the Unreal thumbnail, when there is one and it is comparable. */
   colourSimilarity?: number;
+  /** Fill ratio of the Unreal thumbnail's object mask (see `JudgeStats.fillRatio`), when there is one. */
+  thumbnailFillRatio?: number;
+  /** Object pixels of the Unreal thumbnail's mask; the silhouette check needs enough of both. */
+  thumbnailObjectPixels?: number;
 }
 
 const RANK: Record<Verdict, number> = { ok: 0, suspect: 1, fail: 2 };
@@ -76,6 +95,10 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
   let saturation = 0;
   let luma = 0;
   let lumaSquares = 0;
+  let minX = image.width;
+  let minY = image.height;
+  let maxX = -1;
+  let maxY = -1;
   for (let i = 0; i < tilePixels; i++) {
     const o = i * 4;
     const r = image.data[o]!;
@@ -89,6 +112,12 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
       continue;
     }
     objectPixels++;
+    const px = i % image.width;
+    const py = (i - px) / image.width;
+    if (px < minX) minX = px;
+    if (px > maxX) maxX = px;
+    if (py < minY) minY = py;
+    if (py > maxY) maxY = py;
     const max = Math.max(r, g, b);
     const min = Math.min(r, g, b);
     if (min > NEAR_WHITE) white++;
@@ -100,6 +129,7 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
   }
   const n = Math.max(1, objectPixels);
   const meanLuma = luma / n;
+  const boundingBox = maxX < 0 ? 0 : (maxX - minX + 1) * (maxY - minY + 1);
   const stats: JudgeStats = {
     tilePixels,
     objectPixels,
@@ -109,6 +139,7 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
     meanSaturation: saturation / n,
     meanLuma,
     lumaStdDev: Math.sqrt(Math.max(0, lumaSquares / n - meanLuma * meanLuma)),
+    fillRatio: boundingBox === 0 ? 0 : objectPixels / boundingBox,
   };
 
   let verdict: Verdict = "ok";
@@ -140,6 +171,17 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
   if (isWhite) raise("suspect", `white: ${(stats.nearWhiteFraction * 100).toFixed(0)}% of object pixels are near-white`);
   else if (isGhost) raise("suspect", "ghost: uniform grey object with no shading, pale or close to the background");
   else if (isWashedOut) raise("suspect", "washed out: near-neutral and very bright");
+  // Silhouette: a flat card that ignores its alpha cut-out renders as a solid rectangle, filling its
+  // bounding box far more than the real cut-out does. Compare only when both masks have enough pixels
+  // for the ratio to mean anything.
+  if (
+    options.thumbnailFillRatio !== undefined &&
+    (options.thumbnailObjectPixels ?? 0) >= MIN_FILL_MASK_PIXELS &&
+    objectPixels >= MIN_FILL_MASK_PIXELS &&
+    stats.fillRatio > options.thumbnailFillRatio * SOLID_CARD_FILL_FACTOR
+  ) {
+    raise("suspect", `solid card: render fill ${stats.fillRatio.toFixed(2)} vs thumbnail fill ${options.thumbnailFillRatio.toFixed(2)}`);
+  }
   // A neutral render (grey stone, a dark mesh) is real colour when Unreal's own thumbnail agrees with
   // it; a white, ghost or washed-out render is excused only by strong agreement (a white panel whose
   // thumbnail is white too), never by a mere pass of the suspect threshold.

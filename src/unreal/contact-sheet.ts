@@ -7,7 +7,7 @@ import { chromium } from "playwright";
 import sharp, { type OverlayOptions } from "sharp";
 
 import { createBrowserTempDir } from "../browser-temp.js";
-import { colourSimilarity, decodeRgba, type RgbaImage } from "./image-diff.js";
+import { colourSimilarity, decodeRgba, maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 import { judgeRender, type JudgeStats, type Verdict } from "./visual-judge.js";
 
 const require = createRequire(import.meta.url);
@@ -403,6 +403,7 @@ export async function renderContactSheet(
     const pixels = cutTile(decodedGrid, tile, index % columns, Math.floor(index / columns));
     let similarity: number | undefined;
     let meanColourDelta: number | undefined;
+    let thumbnailFill: { fillRatio: number; objectPixels: number } | undefined;
     if (candidate.thumbnail !== undefined) {
       try {
         const reference = await decodeRgba(candidate.thumbnail);
@@ -411,6 +412,8 @@ export async function renderContactSheet(
           similarity = comparison.similarity;
           meanColourDelta = comparison.meanColourDelta;
         }
+        const referenceFill = maskFillRatio(objectMask(reference), reference.width, reference.height);
+        thumbnailFill = { fillRatio: referenceFill.fillRatio, objectPixels: referenceFill.pixels };
         thumbnailTiles.push(
           await sharp(candidate.thumbnail).removeAlpha().resize({ width: tile, height: tile, fit: "contain", background: PANEL }).png().toBuffer(),
         );
@@ -423,6 +426,9 @@ export async function renderContactSheet(
     const result = judgeRender(pixels, {
       ...(candidate.expectColoured ? { expectColoured: true } : {}),
       ...(similarity !== undefined ? { colourSimilarity: similarity } : {}),
+      ...(thumbnailFill !== undefined
+        ? { thumbnailFillRatio: thumbnailFill.fillRatio, thumbnailObjectPixels: thumbnailFill.objectPixels }
+        : {}),
     });
     judge.push({
       tile: index,

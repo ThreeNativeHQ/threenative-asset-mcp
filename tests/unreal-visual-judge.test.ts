@@ -2,6 +2,7 @@ import { expect, it } from "vitest";
 
 import type { RgbaImage } from "../src/unreal/image-diff.js";
 import {
+  SOLID_CARD_FILL_FACTOR,
   SUSPECT_COLOUR_SIMILARITY,
   TINY_COVERAGE_FRACTION,
   judgeRender,
@@ -17,6 +18,21 @@ function tile(side: number, paint: (x: number, y: number) => [number, number, nu
     for (let x = 0; x < SIZE; x++) {
       const inside = x >= lo && x < lo + side && y >= lo && y < lo + side;
       const [r, g, b] = inside ? paint(x, y) : [128, 128, 128];
+      data.set([r, g, b, 255], (y * SIZE + x) * 4);
+    }
+  }
+  return { width: SIZE, height: SIZE, data };
+}
+
+/** Grey 128 tile with a ragged spray of `side` px bbox: about 30% of the box is painted (a needle cut-out). */
+function sprayTile(side: number): RgbaImage {
+  const data = new Uint8Array(SIZE * SIZE * 4);
+  const lo = Math.floor((SIZE - side) / 2);
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const inside = x >= lo && x < lo + side && y >= lo && y < lo + side;
+      const paint = inside && (x * 7 + y * 13) % 10 < 3;
+      const [r, g, b] = paint ? colouredStone(x, y) : [128, 128, 128];
       data.set([r, g, b, 255], (y * SIZE + x) * 4);
     }
   }
@@ -113,4 +129,35 @@ it("honours a custom background", () => {
   const white = judgeRender({ width: SIZE, height: SIZE, data }, { background: { r: 255, g: 255, b: 255 } });
   expect(white.verdict).toBe("fail");
   expect(white.reasons[0]).toMatch(/^blank/);
+});
+
+it("measures fill ratio: a solid square fills its bounding box, a sparse spray does not", () => {
+  const solid = judgeRender(tile(60, colouredStone));
+  expect(solid.stats.fillRatio).toBeCloseTo(1, 1);
+  const spray = judgeRender(sprayTile(60));
+  expect(spray.stats.fillRatio).toBeLessThan(0.6);
+  expect(spray.stats.objectPixels).toBeGreaterThan(200);
+});
+
+it("flags a solid card when its fill ratio dwarfs the thumbnail's cut-out", () => {
+  const solid = judgeRender(tile(60, colouredStone), { thumbnailFillRatio: 0.3, thumbnailObjectPixels: 5000 });
+  expect(solid.verdict).toBe("suspect");
+  expect(solid.reasons.join(" ")).toContain("solid card: render fill");
+});
+
+it("does not flag a render whose fill matches the thumbnail's", () => {
+  const card = judgeRender(sprayTile(60), { thumbnailFillRatio: 0.3, thumbnailObjectPixels: 5000 });
+  expect(card.reasons.join(" ")).not.toContain("solid card");
+  // A legitimately dense real card stays below the factor.
+  const dense = judgeRender(tile(60, colouredStone), { thumbnailFillRatio: 0.7, thumbnailObjectPixels: 5000 });
+  expect(dense.stats.fillRatio).toBeLessThan(0.7 * SOLID_CARD_FILL_FACTOR);
+  expect(dense.reasons.join(" ")).not.toContain("solid card");
+});
+
+it("ignores the silhouette rule when either mask has too few pixels, or there is no thumbnail", () => {
+  const tinyRender = judgeRender(tile(8, colouredStone), { thumbnailFillRatio: 0.1, thumbnailObjectPixels: 5000 });
+  expect(tinyRender.reasons.join(" ")).not.toContain("solid card");
+  const tinyThumbnail = judgeRender(tile(60, colouredStone), { thumbnailFillRatio: 0.3, thumbnailObjectPixels: 50 });
+  expect(tinyThumbnail.reasons.join(" ")).not.toContain("solid card");
+  expect(judgeRender(tile(60, colouredStone)).reasons.join(" ")).not.toContain("solid card");
 });
