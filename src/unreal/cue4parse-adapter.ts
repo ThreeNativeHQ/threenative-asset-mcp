@@ -2166,9 +2166,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
     }
 }
 if (exported == 0 && mappingRequired) throw new InvalidDataException("This cooked UE5 package uses unversioned properties. Place its game-compatible .usmap mapping file in the imported directory.");
-if (exported == 0 && textureFailures.Count > 0) throw new InvalidDataException(string.Join("\n", textureFailures));
 if (exported == 0 && lastLoadError is not null) throw new InvalidDataException("CUE4Parse could not decode the selected Unreal package.", lastLoadError);
-if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}.");
+if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
 
 static byte[] EncodeBgre8AsRadiance(byte[] source, int width, int height)
 {
@@ -2213,7 +2212,11 @@ static byte[]? ExtractCompressedPayloadWave(byte[] bytes)
     while (searchAt <= bytes.Length - magic.Length)
     {
         var relativeAt = bytes.AsSpan(searchAt).IndexOf(magic);
-        if (relativeAt < 0) return null;
+        if (relativeAt < 0)
+        {
+            if (searchAt == 0) failures?.Add("the package holds no editor source payload and no cooked mip (pixel data is not in the pack)");
+            return null;
+        }
         var payloadAt = searchAt + relativeAt;
         searchAt = payloadAt + magic.Length;
         try
@@ -2245,6 +2248,7 @@ static string ReportTextureFailure(UTexture2D texture, IEnumerable<ExportResult>
         $"platformFormat={texture.PlatformData?.PixelFormat}, mips={texture.PlatformData?.Mips?.Length ?? 0}, firstMipBulk={(mip?.BulkData is { } bulk ? bulk.Header.ElementCount : -1)}, " +
         $"compression={texture.CompressionSettings}, srgb={texture.SRGB}, sourceFormat={source?.GetOrDefault<FName>("Format").Text}, " +
         $"sourceCompression={source?.GetOrDefault<FName>("CompressionFormat").Text}, " +
+        $"editorPayload={(texture.EditorData is { } editor ? $"{editor.Payload.Header.Method}/{editor.Payload.Header.TotalRawSize}B/offset {editor.OffsetInFile}" : "none")}, " +
         $"exportErrors=[{exportErrors}], payload=[{string.Join(" | ", payloadFailures)}]";
     Console.Error.WriteLine(message);
     return message;
@@ -2257,7 +2261,11 @@ static byte[]? ExtractCompressedPayloadPng(byte[] bytes, List<string>? failures 
     while (searchAt <= bytes.Length - magic.Length)
     {
         var relativeAt = bytes.AsSpan(searchAt).IndexOf(magic);
-        if (relativeAt < 0) return null;
+        if (relativeAt < 0)
+        {
+            if (searchAt == 0) failures?.Add("the package holds no editor source payload and no cooked mip (pixel data is not in the pack)");
+            return null;
+        }
         var payloadAt = searchAt + relativeAt;
         searchAt = payloadAt + magic.Length;
         try
@@ -2580,26 +2588,6 @@ static byte[] LinearToSrgb8(byte[] png)
     }
 }
 
-// Editor payloads (uncooked UE5 source art, mesh descriptions, audio) are Oodle-compressed. The
-// managed fallback CUE4Parse registers by default cannot inflate them (it returns 0 bytes), and the
-// bundled natives library ships without Oodle. The native runtime is fetched once, next to the
-// converter, the same way CUE4Parse's own tools do; without it the failure names that cause.
-static void EnsureOodleRuntime()
-{
-    if (OodleHelper.Instance is not null) return;
-    var library = Path.Combine(AppContext.BaseDirectory, OodleHelper.OodleFileName);
-    try
-    {
-        OodleHelper.Initialize(library);
-    }
-    catch (Exception error) when (error is not OutOfMemoryException)
-    {
-        throw new InvalidDataException($"The Oodle runtime {OodleHelper.OodleFileName} could not be loaded ({error.Message}); editor-compressed pixel data cannot be decoded without it.", error);
-    }
-    if (OodleHelper.Instance is null)
-        throw new InvalidDataException($"The Oodle runtime {OodleHelper.OodleFileName} is not available and could not be downloaded; editor-compressed pixel data cannot be decoded without it.");
-}
-
 static byte[] DecompressEditorPayload(FCompressedBuffer payload)
 {
     var header = payload.Header;
@@ -2615,7 +2603,6 @@ static byte[] DecompressEditorPayload(FCompressedBuffer payload)
     if (header.BlockCount == 0 || header.BlockCount > 1_000_000 || header.BlockSizeExponent > 30)
         throw new InvalidDataException("Invalid editor payload block table.");
 
-    if (header.Method == FCompressedBufferHeader.EMethod.Oodle) EnsureOodleRuntime();
     var tableBytes = checked((int) header.BlockCount * sizeof(uint));
     if (tableBytes > payload.Data.Length) throw new InvalidDataException("Truncated editor payload block table.");
     var inputOffset = tableBytes;
@@ -2630,8 +2617,10 @@ static byte[] DecompressEditorPayload(FCompressedBuffer payload)
             throw new InvalidDataException("Truncated editor payload block.");
         var rawSize = Math.Min(1 << header.BlockSizeExponent, output.Length - outputOffset);
         if (rawSize <= 0) throw new InvalidDataException("Editor payload contains excess blocks.");
-        // UE stores a block verbatim when compression did not shrink it (compressed size == raw size).
-        // Incompressible source art such as PNG hits this for most blocks.
+        // UE stores a block verbatim when compression did not shrink it (compressed size == raw
+        // size); the block table holds the same size for both, and the decoder returns 0 bytes for
+        // such a block. Incompressible source art (PNG) is mostly verbatim blocks, so a texture
+        // whose payload has one never decoded.
         if (compressedSize == rawSize) payload.Data.AsSpan(inputOffset, rawSize).CopyTo(output.AsSpan(outputOffset, rawSize));
         else Compression.Decompress(payload.Data, inputOffset, compressedSize, output, outputOffset, rawSize, method);
         inputOffset += compressedSize;
