@@ -2212,11 +2212,7 @@ static byte[]? ExtractCompressedPayloadWave(byte[] bytes)
     while (searchAt <= bytes.Length - magic.Length)
     {
         var relativeAt = bytes.AsSpan(searchAt).IndexOf(magic);
-        if (relativeAt < 0)
-        {
-            if (searchAt == 0) failures?.Add("the package holds no editor source payload and no cooked mip (pixel data is not in the pack)");
-            return null;
-        }
+        if (relativeAt < 0) return null;
         var payloadAt = searchAt + relativeAt;
         searchAt = payloadAt + magic.Length;
         try
