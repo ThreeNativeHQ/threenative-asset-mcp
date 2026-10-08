@@ -64,6 +64,11 @@ export interface BakeRequest {
    * Unreal feeds the node. Absent, VertexColor is unsupported.
    */
   vertexColor?: readonly [number, number, number, number];
+  /**
+   * Linear value every `ParticleColor` node evaluates to. Outside a particle emitter Unreal feeds the node white, so the
+   * importer passes white; the emitter's own colour modules are not read. Absent, ParticleColor is unsupported.
+   */
+  particleColor?: readonly [number, number, number, number];
 }
 
 export type BakeResult =
@@ -348,7 +353,11 @@ const BREAK_ATTRIBUTES = ["BaseColor", "Metallic", "Specular", "Roughness", "Emi
 interface CompileOptions {
   allowUvSetFallback: boolean;
   vertexColor?: readonly [number, number, number, number] | undefined;
+  particleColor?: readonly [number, number, number, number] | undefined;
 }
+
+const PARTICLE_COLOR_NOTE =
+  "ParticleColor evaluated as white: Unreal's value outside a particle emitter; the emitter's colour modules are not read";
 
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
@@ -474,7 +483,7 @@ class Compiler {
     if (!node) return this.markUnavailable(`pin refers to missing node ${input.node}`);
     const compiled = this.nodeOutput(node, input.output);
     if (compiled.kind === "attr") return compiled;
-    const fallbackMask = (node.class.startsWith("TextureSample") || node.class === "VertexColor") && input.output >= 0 && input.output < TEXTURE_OUTPUT_MASKS.length ? TEXTURE_OUTPUT_MASKS[input.output]! : null;
+    const fallbackMask = (node.class.startsWith("TextureSample") || node.class === "VertexColor" || node.class === "ParticleColor") && input.output >= 0 && input.output < TEXTURE_OUTPUT_MASKS.length ? TEXTURE_OUTPUT_MASKS[input.output]! : null;
     return this.applyMask(compiled, input.mask ?? fallbackMask);
   }
 
@@ -636,6 +645,12 @@ class Compiler {
         // Only the default (white) is faithful for a mesh without a colour buffer; any other value is the caller's claim.
         if (color.some((channel) => channel !== 1)) this.approximations.add(`VertexColor evaluated as constant (${color.join(", ")})`);
         else this.approximations.add(VERTEX_COLOR_WHITE_NOTE);
+        return this.constant([...color], 4);
+      }
+      case "ParticleColor": {
+        const color = this.options.particleColor;
+        if (!color) return this.unsupportedNode(node);
+        this.approximations.add(color.every((channel) => channel === 1) ? PARTICLE_COLOR_NOTE : `ParticleColor evaluated as constant (${color.join(", ")})`);
         return this.constant([...color], 4);
       }
       case "StaticBool":
@@ -1388,6 +1403,49 @@ export function graphPathClasses(graph: MaterialGraph, output: "baseColor", para
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Emissive-only effect materials
+
+export interface EmissiveEffect {
+  /** Object names (no package path) of the textures on the Emissive path. */
+  textures: string[];
+  reason: string;
+}
+
+/**
+ * A graph whose only colour output is Emissive: no BaseColor and no MaterialAttributes pin, Emissive wired. That is an
+ * unlit or additive effect (flipbook splash, spark, flying paper): its colour is emitted light, often multiplied by a
+ * particle or collection colour, so no albedo exists in the package and a lit PBR base colour cannot reproduce it.
+ * `textures` are the textures sampled on the Emissive path (through nodes and their coordinate pins; function bodies
+ * are not entered), so the importer can tell an emissive mask from a real albedo.
+ */
+export function emissiveOnlyEffect(graph: MaterialGraph): EmissiveEffect | undefined {
+  if (graph.truncated || graph.error) return undefined;
+  const { baseColor, materialAttributes, emissive } = graph.outputs;
+  if (baseColor || materialAttributes || !emissive) return undefined;
+  const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
+  const seen = new Set<string>();
+  const textures = new Set<string>();
+  const stack = [emissive.node];
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const node = nodes.get(id);
+    if (!node) continue;
+    if (node.texture) {
+      const reference = node.texture;
+      const afterSlash = reference.slice(reference.lastIndexOf("/") + 1);
+      textures.add(afterSlash.includes(".") ? afterSlash.slice(afterSlash.lastIndexOf(".") + 1) : afterSlash);
+    }
+    for (const input of [...Object.values(node.inputs), node.coordinates]) if (input) stack.push(input.node);
+  }
+  return {
+    textures: [...textures].sort(),
+    reason: `${graph.material} wires only Emissive (no BaseColor): an unlit or additive effect whose colour is emitted light, so the package has no albedo`,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Bake
 
 export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
@@ -1399,7 +1457,7 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
     return { status: "unavailable", reason: `graph ${graph.material} has no BaseColor output` };
   }
 
-  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor });
+  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor });
   if (compiler.unsupported.size > 0) {
     const unsupported = [...compiler.unsupported].sort();
     return { status: "unsupported", unsupported, reason: `BaseColor of ${graph.material} depends on unsupported nodes: ${unsupported.join(", ")}` };

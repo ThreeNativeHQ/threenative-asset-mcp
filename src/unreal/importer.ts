@@ -39,7 +39,7 @@ import {
   type PaperTileMapDescriptor,
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
-import { createGraphBaker, type GraphBaker } from "./graph-baker.js";
+import { createGraphBaker, type GraphBakeRequest, type GraphBaker } from "./graph-baker.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
 import {
@@ -52,7 +52,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 54;
+export const IMPORTER_VERSION = 55;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -95,6 +95,20 @@ function umodelCanRetry(meshKind: "static" | "skeletal" | undefined, legacyFileV
 
 export { ImportError, type ImportErrorCode } from "./errors.js";
 
+/**
+ * Why a section is legitimately without albedo. A visual judge or the parity scorer reads this to tell "the source has
+ * no base colour here" from "the importer failed to find it".
+ */
+export interface ImportedMaterialEffect {
+  /**
+   * `emissive`: the material wires only Emissive (an unlit or additive effect), so its colour is emitted light.
+   * `engine-default-material`: the slot holds Unreal's default material (WorldGridMaterial, an engine asset outside the
+   * pack); a particle emitter or placing actor supplies the real material at runtime.
+   */
+  readonly kind: "emissive" | "engine-default-material";
+  readonly reason: string;
+}
+
 export interface ImportedMaterialSection {
   readonly name: string;
   /** False when UE Viewer could not resolve a material for the section at all. */
@@ -121,6 +135,8 @@ export interface ImportedMaterialSection {
     readonly roughness: number;
   };
   readonly textured: boolean;
+  /** Present when the source has no albedo for this section by design (see `ImportedMaterialEffect`). */
+  readonly effect?: ImportedMaterialEffect;
   /** Textures written beside the GLB because no glTF slot honestly fits them. */
   readonly sidecarTextures: readonly string[];
   /** Present only when a material-graph bake was attempted for the section (PRD-538). */
@@ -364,6 +380,8 @@ export interface ImportReport {
     readonly unresolved: number;
     /** Sections whose base colour was baked from the Unreal material graph (PRD-538). */
     readonly graphBaked?: number;
+    /** Sections with no albedo by design (emissive-only effects, engine default material); they carry `effect` with the reason. */
+    readonly effect?: number;
   };
   readonly transforms: Readonly<Record<string, number>>;
   /** Relative paths of textures written beside the models because no glTF slot fits them. */
@@ -1192,6 +1210,8 @@ export async function packageGlb(options: {
   readonly sourceMaterial?: (name: string, lookupName: string) => SourceMaterial | undefined | Promise<SourceMaterial | undefined>;
   /** Bakes the Unreal material graph for a section no texture binding gave a base colour (PRD-538). */
   readonly graphBaker?: GraphBaker | undefined;
+  /** Lazily answers whether the mesh package names the engine default material; asked only for an unresolved section. */
+  readonly namesEngineDefaultMaterial?: (() => Promise<boolean>) | undefined;
   readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
   /** Collects texture name -> source PNG path for every texture embedded without a pixel transform. */
   readonly proofSources?: Map<string, string[]> | undefined;
@@ -1259,6 +1279,58 @@ export async function packageGlb(options: {
     };
     let resolved: ResolvedMaterial = resolveMaterial(materialRequest);
     options.onMaterialResolved?.(materialRequest);
+    let effect: ImportedMaterialEffect | undefined;
+    if (unresolvedSection && (await options.namesEngineDefaultMaterial?.())) {
+      effect = {
+        kind: "engine-default-material",
+        reason: "the mesh package names Unreal's default material (/Engine/EngineMaterials/WorldGridMaterial) and no pack material for this slot; the engine's default is not part of the pack, and a particle emitter or placing actor supplies the real material at runtime",
+      };
+    }
+    const graphRequest = (probe: boolean): GraphBakeRequest => ({
+      materialName: material.getName(),
+      lookupName,
+      assets: materialAssets,
+      probe,
+      // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
+      // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
+      ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
+      readProps: (propsName) => {
+        const propsPath = materialAssets.props.get(propsName);
+        return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
+      },
+    });
+    // A translucent section with a base-colour texture is not otherwise looked at by the graph baker, yet an unlit or
+    // additive effect names its emissive mask `Diffuse`. Ask the graph whether Emissive is its only colour output.
+    if (
+      options.graphBaker &&
+      resolved.alphaMode === "BLEND" &&
+      resolved.bindings.some((binding) => binding.slot === "baseColor") &&
+      !hasNamedFallback(material.getName())
+    ) {
+      const probed = await options.graphBaker(graphRequest(true));
+      if (probed.effect) {
+        effect = { kind: "emissive", reason: probed.effect.reason };
+        const emissiveMask = resolved.bindings.find((binding) => binding.slot === "baseColor" && probed.effect!.textures.includes(binding.texture));
+        resolved = {
+          ...resolved,
+          bindings: [
+            ...resolved.bindings
+              // An unlit effect has no specular: the `SpecPower` the exporter read from the same mask is not roughness.
+              .filter((binding) => !(emissiveMask && binding.slot === "metallicRoughness" && binding.texture === emissiveMask.texture))
+              .map((binding) => (binding === emissiveMask ? { ...binding, slot: "emissive" as const } : binding)),
+            // glTF has no additive blending, so the mask also drives alpha: bright where the effect emits, clear where it
+            // does not, instead of an opaque sheet. An approximation, named by source "effect" and by the limitation below.
+            ...(emissiveMask
+              ? [{ slot: "baseColor" as const, texture: emissiveMask.texture, secondaryTexture: emissiveMask.texture, source: "effect" as const, confidence: "heuristic" as const, transform: "redToBaseColorAlpha" as const }]
+              : []),
+          ],
+          limitations: [
+            ...resolved.limitations,
+            ...(emissiveMask ? [`${emissiveMask.texture} is an emissive mask: it is bound as emissive, and its red channel also drives alpha because glTF has no additive blending.`] : []),
+          ],
+        };
+      }
+    }
     const authored = await options.sourceMaterial?.(name, lookupName);
     let authoredAoCoordinatesMatch = false;
     let authoredAoBaseBinding: ResolvedMaterial["bindings"][number] | undefined;
@@ -1330,7 +1402,7 @@ export async function packageGlb(options: {
     for (const binding of ordered) {
       const source = materialAssets.png.get(binding.texture);
       if (!source) continue;
-      if (binding.slot === "baseColor") {
+      if (binding.slot === "baseColor" && binding.source !== "effect") {
         const verdict = await classifyAlbedo(await readFile(source));
         if (!verdict.isAlbedo) {
           // Not a photograph of a surface. Leave the slot on its neutral fallback and hand the
@@ -1397,18 +1469,8 @@ export async function packageGlb(options: {
     const graphBindings: MaterialTextureBinding[] = [];
     let graphReport: ImportedMaterialSection["graph"];
     if (material.getBaseColorTexture() === null && options.graphBaker && !hasNamedFallback(material.getName())) {
-      const outcome = await options.graphBaker({
-        materialName: material.getName(),
-        lookupName,
-        assets: materialAssets,
-        // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
-        // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
-        ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
-        readProps: (propsName) => {
-          const propsPath = materialAssets.props.get(propsName);
-          return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
-        },
-      });
+      const outcome = await options.graphBaker(graphRequest(false));
+      if (outcome.effect && !effect) effect = { kind: "emissive", reason: outcome.effect.reason };
       if (outcome.status === "baked") {
         const binding: MaterialTextureBinding = {
           slot: "baseColor",
@@ -1436,6 +1498,8 @@ export async function packageGlb(options: {
     }
 
     const boundBaseColour = material.getBaseColorTexture() !== null;
+    // An effect's emissive mask also drives alpha (above); the instance's colour factor has nothing to tint there.
+    const effectBinding = ordered.some((binding) => binding.source === "effect");
     if (!boundBaseColour) {
       const materialName = material.getName().toLowerCase();
       if (materialName.includes("glass")) {
@@ -1456,13 +1520,19 @@ export async function packageGlb(options: {
         material.setBaseColorFactor([0.8, 0.8, 0.8, 1]);
       }
     }
-    // A baked graph already contains its tints; multiplying the instance's colour factor in again would apply them twice.
-    if (resolved.baseColorFactor && graphBindings.length === 0) {
+    if (resolved.baseColorFactor && graphBindings.length === 0 && !effectBinding) {
       material.setBaseColorFactor([...resolved.baseColorFactor]);
       if (resolved.baseColorFactor[3] < 1 && material.getAlphaMode() === "OPAQUE") {
         material.setAlphaMode("BLEND");
       }
+    } else if (resolved.baseColorFactor && resolved.baseColorFactor[3] < 1) {
+      // A baked graph already contains its tints (multiplying the instance's colour in again would apply them twice)
+      // and an emissive effect has no albedo tint to apply, but the instance's opacity still holds. Only alpha carries over.
+      const [r, g, b] = material.getBaseColorFactor();
+      material.setBaseColorFactor([r, g, b, resolved.baseColorFactor[3]]);
+      if (material.getAlphaMode() === "OPAQUE") material.setAlphaMode("BLEND");
     }
+    if (effect) packagingLimitations.push(effect.reason);
     if (resolved.emissiveFactor) material.setEmissiveFactor([...resolved.emissiveFactor]);
     if (resolved.metallicFactor !== undefined) material.setMetallicFactor(resolved.metallicFactor);
     if (authored?.channels.Roughness?.kind === "scalar") {
@@ -1505,7 +1575,8 @@ export async function packageGlb(options: {
         metallic: material.getMetallicFactor(),
         roughness: material.getRoughnessFactor(),
       },
-      textured: boundBaseColour,
+      textured: boundBaseColour && !effectBinding,
+      ...(effect ? { effect } : {}),
       ...(graphReport ? { graph: graphReport } : {}),
     });
   }
@@ -3393,6 +3464,7 @@ export async function importUnrealDirectory(
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
+            namesEngineDefaultMaterial: async () => (await readPackageObjectNames(entry.file)).has("WorldGridMaterial"),
             onMaterialResolved: request.onMaterialResolved,
             proofSources: proofFor(glbPath),
           });
@@ -4328,6 +4400,7 @@ export async function importUnrealDirectory(
       unsupported: sections.reduce((sum, section) => sum + section.unsupported.length, 0),
       unresolved: sections.filter((section) => !section.resolved).length,
       graphBaked: sections.filter((section) => section.graph?.status === "baked").length,
+      effect: sections.filter((section) => section.effect !== undefined).length,
     };
     if (droppedTangents > 0) {
       warnings.push(
@@ -4352,6 +4425,13 @@ export async function importUnrealDirectory(
     if (coverage.unresolved > 0) {
       warnings.push(
         `${coverage.unresolved} mesh sections had no material UE Viewer could resolve; they are named "<mesh>_unresolved_section_<n>" and carry a neutral grey, not a debug colour.`,
+      );
+    }
+    const effectSections = sections.filter((section) => section.effect !== undefined);
+    if (effectSections.length > 0) {
+      const byKind = (kind: string): number => effectSections.filter((section) => section.effect?.kind === kind).length;
+      warnings.push(
+        `${effectSections.length} material sections have no albedo by design and are not failures (${byKind("emissive")} emissive-only effect, ${byKind("engine-default-material")} engine default material); each carries "effect" with the reason.`,
       );
     }
     if (coverage.textured < coverage.sections) {

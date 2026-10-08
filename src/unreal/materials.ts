@@ -41,7 +41,8 @@ export type TextureTransform =
   /** Preserve diffuse RGB, with a separate opacity map's red channel as alpha. */
   | "redToBaseColorAlpha";
 
-export type BindingSource = "mat" | "props" | "filename" | "texture-set" | "authored-source" | "graph";
+/** `effect`: an emissive-only effect material's mask, bound as emissive and alpha because the package has no albedo. */
+export type BindingSource = "mat" | "props" | "filename" | "texture-set" | "authored-source" | "graph" | "effect";
 export type BindingConfidence = "exact" | "heuristic";
 
 export interface MaterialTextureBinding {
