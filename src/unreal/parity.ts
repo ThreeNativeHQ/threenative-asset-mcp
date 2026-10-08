@@ -70,6 +70,8 @@ export interface PackScore {
     readonly unverifiedModels: number;
     readonly unusedSlots: number;
     readonly boundsUnverified: number;
+    /** Meshes whose size is within the tolerance but more than 1 % off the authored bounds. */
+    readonly boundsDrift: number;
     readonly violations: readonly ShapeViolation[];
     readonly violationsTotal: number;
     /** Uncapped violation count per kind; `violations` is capped, this is not. */
@@ -281,6 +283,8 @@ function effectiveSet(index: Map<string, Located[]>, start: Located): Effective 
   };
 }
 
+const BOUNDS_TOLERANCE = 0.1;
+
 function near(a: number, b: number, tolerance: number): boolean {
   return Math.abs(a - b) <= tolerance;
 }
@@ -325,6 +329,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   let unverifiedModels = 0;
   let unusedSlots = 0;
   let boundsUnverified = 0;
+  let boundsDrift = 0;
   const identity: IdentityViolation[] = [];
   let sections = 0;
   let unverified = 0;
@@ -374,7 +379,11 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
         const size = extent.map((e) => (e * 2) / 100);
         const expected = [size[0]!, size[2]!, size[1]!];
         const actual = model.boundsMetres;
-        const tolerance = Math.max(0.01 * Math.max(...expected), 0.001);
+        // `ExtendedBounds` is an authored, cached value and can lag the geometry (Soul Cave: 4 of 173
+        // meshes sit 2-8 % off). Scale, unit and axis errors are factors, so 10 % still catches them;
+        // the 1-10 % band is counted as drift, not failed.
+        const tolerance = Math.max(BOUNDS_TOLERANCE * Math.max(...expected), 0.001);
+        if (triplesMatch(expected, actual, tolerance) && !triplesMatch(expected, actual, Math.max(0.01 * Math.max(...expected), 0.001))) boundsDrift++;
         if (!triplesMatch(expected, actual, tolerance)) {
           const sortedE = [...expected].sort((a, b) => a - b);
           const sortedA = [...actual].sort((a, b) => a - b);
@@ -474,6 +483,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       unverifiedModels,
       unusedSlots,
       boundsUnverified,
+      boundsDrift,
       violations: capped(shape),
       violationsTotal: shape.length,
       byKind: countByKind(shape),

@@ -168,6 +168,19 @@ describe("scorePack", () => {
     expect(wrong.shape.violations[0]?.kind).toBe("bounds-size");
   });
 
+  it("tolerates authored bounds that lag the geometry by up to 10 % and counts the drift", () => {
+    const secs = [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])];
+    // expected (2, 1, 4); the geometry is 5 % bigger on the long axis, a Soul Cave-style stale bound
+    const drifted = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4.2])]));
+    expect(drifted.shape.violations).toEqual([]);
+    expect(drifted.shape.boundsDrift).toBe(1);
+    const exact = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4])]));
+    expect(exact.shape.boundsDrift).toBe(0);
+    // a 2.54x unit error is still a violation
+    const unit = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4 * 2.54])]));
+    expect(unit.shape.violations[0]?.kind).toBe("bounds-size");
+  });
+
   it("flags more sections than slots and tolerates unverified bounds", () => {
     const d = dumpOf(
       pkg("/Game/C/SM_Pillar", mesh("SM_Pillar", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar", null)),
