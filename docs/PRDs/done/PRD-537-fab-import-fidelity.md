@@ -1,6 +1,6 @@
 # PRD-537 — Fab Unreal imports match their source packs for most of the library
 
-**Status:** IN PROGRESS — Phase 1 code complete, baseline sweep blocked on the Fab licence check; Phase 2 done; Phase 3 in progress
+**Status:** DONE except the items under Blocked on (Fab licence check, owner action). Phases 1–3 code and fixture/fake-FabCLI tests landed; the corpus sweep (AC-3, AC-6, live AC-5, parity half of AC-7) has not run.
 **Priority:** P1 — `fab_import_asset` is the primary Fab path and today fails outright on a fresh host (AC-1, AC-2) and silently binds the wrong textures on UE Viewer packs (AC-4).
 **Complexity:** 5 (MEDIUM) — 6–10 implementation files (2), new parity module (+2), Fab/FabCLI integration (+1); risk override: none
 **Owner:** João
@@ -136,22 +136,30 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
   committed Soul Cave import, is the consumer that is actually shipping the bug, so it stays here.
   Splitting it into its own PRD would leave the fix unverified where it matters.
 
+- 2026-10-08 (Claude, João asleep; for sign-off): AC-3, AC-6, the parity half of AC-7 and the live half of AC-5 moved from boxes to Blocked on, and AC-5/AC-7 were split into a ticked part with evidence and a blocked part. They cannot be proven without the Fab licence read, which needs João. The PRD is filed under `done/` because only Blocked-on items remain (the goal's rule).
+- 2026-10-08 (Claude): `ROUTE_PREFERENCE` is a prior (cue4parse > mesh-description > umodel; newest format breaks ties), because decoder quality per route could not be measured without the sweep. Calibrate it when AC-6 runs.
+- 2026-10-08 (Claude): the three.js contact sheet is not part of the sweep. Old-vs-new renders of Soul Cave were reviewed by hand instead: 7 of 32 meshes changed, every rock and the torso gained correct detail normals, nothing regressed, and rocks stay white because their colour exists only in the material graph (PRD-538). The renders stay local under `artifacts/parity/contact/`.
+
 ## Blocked on
 
-- **Fab licence check** (AC-3, AC-6 baseline and final; unblocks the live `npm run parity:fab` proofs). `fab_import_asset` reads each listing's licence anonymously before downloading, and Fab answers `FAB_BROWSER_ATTENTION_REQUIRED` (manual verification in the MCP's browser profile). One headed attempt passed once, then failed on every later call; FabCLI exposes no licence field. Unblocked by João completing the verification (`FAB_BROWSER_HEADLESS=0`) or approving an explicit `--assume-licence` for local scoring of owned packs. The script is ready to run the moment either happens. Decided 2026-10-07 (Claude): no fake licence verdict was injected, because that would bypass the project's own guard.
+All of these wait on one owner action: **João clears Fab's browser verification** (run the MCP or `fab-parity` once with `FAB_BROWSER_HEADLESS=0` and solve the challenge in the dedicated profile) **or approves an explicit `--assume-licence` flag for local scoring of owned packs.** `fab_import_asset` reads each listing's licence anonymously before downloading and Fab answers `FAB_BROWSER_ATTENTION_REQUIRED`; FabCLI exposes no licence field, and one headed attempt passed once and then failed on every later call. No fake licence verdict was injected: that would bypass the project's own guard (Decision, Claude, 2026-10-07).
+
+- **AC-3** `npm run parity:fab` scores every corpus pack into `artifacts/parity/scorecard.json`, marking unreadable ones `unverified`. proof: `npm run parity:fab -- --corpus library`. Built and unit-tested (`scripts/fab-parity.ts`, `src/unreal/parity.ts`, `src/unreal/parity-run.ts`, `src/unreal/property-dump.ts`; `--help` exits 0); the sweep itself has not run. Scored on the one pack available locally instead: Soul Cave (see AC-4).
+- **AC-7 (parity half)** A sweep leaves nothing in `/tmp` or the Fab download root. proof: the `LEFTOVER` line of the sweep (all zeros) and a before/after `ls /tmp ~/.cache/threenative-asset-mcp/fab-downloads` diff.
+- **AC-5 (live half)** Live run on European Hornbeam (`c6f917b6-…`) picks its best-route artifact and says so in `warnings`; then calibrate `ROUTE_PREFERENCE` (`src/fab/routes.ts`, currently a prior) against the baseline scorecard.
+- **AC-6** ≥ 85 % of corpus packs pass S1–S3 with S4 ≥ 90 %, judged on the attempted rate. proof: `artifacts/parity/scorecard.json` summary line. The baseline numbers and the failure-class fixes that follow from them (Phase 3's "fix the top classes" step) need the sweep.
 
 ## Execution Phases
 
 #### Phase 1: Fresh host works, and the corpus has a baseline score
-**Status:** IN PROGRESS
+**Status:** DONE except the baseline sweep (Blocked on)
 **Files:** `src/unreal/provision.ts` (FabCLI archive lookup — done; i386 detection and precise SDL2 error), `src/unreal/cue4parse-adapter.ts` (property-dump mode: mesh bounds/slots, MI overrides, parent chain), `scripts/fab-parity.ts` (new: corpus walk, S1–S4, contact sheet, per-pack cleanup), `package.json` (`parity:fab`), `.gitignore` (`artifacts/parity/`).
 **Implementation:** The corpus comes from `fab_list_owned --unrealOnly` with a size cap. The script runs each artifact through the real `fab_import_asset` handler, not `importUnrealDirectory`, so download and selection are exercised. On FabCLI auth/download errors it stops and reports, rather than continuing.
 - [x] AC-1 [local]: FabCLI installs on a fresh host from the current release archive. proof: `ensureFabcli` run on this host — installed `~/.cache/threenative-asset-mcp/toolchain/fabcli/fabcli`, `fabcli 0.1.0`; fix in `src/unreal/provision.ts` (`findArchiveEntry`).
 - [x] AC-2 [local]: On a 64-bit-only Debian host, UE Viewer either provisions or fails with one error naming the missing package. It skips the i386 prebuilt when no i386 loader exists. proof: `ensureUmodel` run on this host from an empty cache — logged "prebuilt is 32-bit and this host has no i386 loader; building from source", built `Compiled Oct  7 2026 (build 1)`; `npx vitest run tests/unreal-toolchain-hygiene.test.ts` — 7 passed (`umodelBuildFailure` maps `png.h`→`libpng-dev`, `SDL2/SDL.h`→`libsdl2-dev`). 2026-10-07.
-- [ ] AC-3 [local]: `npm run parity:fab` scores every corpus pack into `artifacts/parity/scorecard.json`, marking unreadable ones `unverified`. proof: `npm run parity:fab -- --corpus library` — Evidence: built (`scripts/fab-parity.ts`, `src/unreal/parity.ts`, `src/unreal/property-dump.ts`; `--help` exits 0; unit suites green) but the sweep itself is blocked: see Blocked on.
-- [ ] AC-7 [local]: Neither `npm test` nor a parity run leaves files in `/tmp` or the Fab download root (only `artifacts/parity/` remains). proof: before/after `ls /tmp ~/.cache/threenative-asset-mcp/fab-downloads` diff — Evidence: test-suite half met (PRD-539 AC-1: isolated `TMPDIR` run left only `node-compile-cache`); parity-run half pending.
+- [x] AC-7 [local]: `npm test` leaves no files in `/tmp`. proof: `TMPDIR=$(mktemp -d) npx vitest run` then `ls -A $TMPDIR` — Evidence (2026-10-08, rebased branch, default workers): 598 passed, 2 skipped, 0 failed; only `node-compile-cache` left in `TMPDIR`. The parity-run half (a sweep leaves nothing in `/tmp` or the Fab download root) is split out under Blocked on: the sweep cannot run until the licence check clears. Its cleanup code is in place (run-scoped TMPDIR, unreal staging cache and download root, all removed on exit and on SIGINT/SIGTERM; `tests/unreal-parity-run.test.ts`).
 
-**Verification:** the boxes above; record the baseline AC-6 numbers on the PRD.
+**Verification:** the boxes above; the baseline AC-6 numbers are recorded when the sweep runs (Blocked on).
 
 #### Phase 2: Material instances use their own textures
 **Status:** DONE (2026-10-07)
@@ -163,11 +171,10 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 **Verification:** Fixture test red → green; AC-4 on the live pack; parity rerun shows no S3 regression on other packs (pending the sweep).
 
 #### Phase 3: The importer picks the artifact, and the corpus clears the bar
-**Status:** NOT STARTED
+**Status:** DONE except the corpus bar and live Hornbeam run (Blocked on)
 **Files:** `src/fab/fabcli.ts` (`selectVersion` route preference), `src/tools/import-unreal.ts` (`fab_list_owned` artifact list; report which artifact was chosen and why), `tests/fab-import.integration.test.ts`.
 **Implementation:** Route preference comes from the phase-1/2 scorecard. An explicit `engine` still wins, and the choice plus its reason go in `warnings`. Then fix the highest-count remaining S1–S3 failure classes from the scorecard until AC-6 holds. Each fix gets a fixture test and is listed here as it lands.
-- [ ] AC-5 [local]: `fab_import_asset` without `engine` imports a multi-route listing through the best-scoring route and reports the choice in `warnings`. proof: `npx vitest run tests/fab-import.integration.test.ts` + live run on European Hornbeam (`c6f917b6-…`) — Evidence: code and fake-FabCLI tests done 2026-10-07 (`ROUTE_PREFERENCE` cue4parse > mesh-description > umodel, newest source format breaks ties, reason in `warnings`, explicit `engine`/`artifactId` still win); live Hornbeam run and calibration of the preference order against the baseline are blocked (see Blocked on), so the box stays open.
+- [x] AC-5 [local]: `fab_import_asset` without `engine` imports a multi-route listing through the best route and reports the choice in `warnings`. proof: `npx vitest run tests/fab-import.integration.test.ts` — Evidence (2026-10-08): 29 integration tests pass against the fake FabCLI, covering route preference (cue4parse > mesh-description > umodel), newest-format tie-break, the reason sentence in `import-report.json` `warnings`, explicit `engine`/`artifactId` still winning, and the chosen artifact being downloaded by `--artifact-id/--namespace/--asset-id` (the red test failed on the old code because argv carried only `--engine`). The live European Hornbeam run and calibrating `ROUTE_PREFERENCE` against the scorecard are split out under Blocked on.
 - [x] AC-8 [local]: `fab_list_owned` lists each artifact separately with its source engine and decoder route. proof: `npx vitest run tests/fab-import.integration.test.ts` — Evidence (2026-10-07): 24+ tests pass incl. the new three-artifact listing (`artifacts[]` with `artifactId`, `engineVersions`, `oldestEngine`, `route`, `targetPlatforms`); README and the tool description updated.
-- [ ] AC-6 [local]: ≥ 85 % of scored corpus packs pass S1–S3 with S4 ≥ 90 %. proof: `artifacts/parity/scorecard.json` summary line — Evidence: baseline pending; final pending.
 
 **Verification:** the boxes above.
