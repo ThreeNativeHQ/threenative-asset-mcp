@@ -82,6 +82,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Keep visual-regression diffs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: visual-diff-node-${{ matrix.node }}
+          path: artifacts/ci/visual-diff/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Summarize verification
         if: always()
         env:
@@ -161,5 +170,14 @@ jobs:
         with:
           name: test-reports-${{ matrix.leg }}
           path: artifacts/ci/*.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Keep visual-regression diffs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: visual-diff-${{ matrix.leg }}
+          path: artifacts/ci/visual-diff/*.png
           if-no-files-found: ignore
           retention-days: 7
