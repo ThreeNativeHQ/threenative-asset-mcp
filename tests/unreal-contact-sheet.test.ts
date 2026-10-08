@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -6,7 +6,7 @@ import { Document, NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { expect, it, onTestFinished } from "vitest";
 
-import { renderContactSheet } from "../src/unreal/contact-sheet.js";
+import { colouredGlbKeys, renderContactSheet } from "../src/unreal/contact-sheet.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
 async function scratch(): Promise<string> {
@@ -203,5 +203,99 @@ describeWithTools(["chromium"], "unreal contact sheet", () => {
     const out = join(dir, "sheet.jpg");
     const result = await renderContactSheet({ glbPaths: [], outPath: out, title: "Bad", galleryImage: Buffer.from("nope"), tile: 160 });
     expect(result.galleryIncluded).toBe(false);
+  });
+
+  it("judges every tile, with a verdict and statistics, and counts them", async () => {
+    const dir = await scratch();
+    const red = join(dir, "SM_Red.glb");
+    await writeCube(red, [1, 0, 0]);
+    const white = join(dir, "SM_White.glb");
+    await writeCube(white, [1, 1, 1], 0.5);
+    const out = join(dir, "sheet.jpg");
+
+    const result = await renderContactSheet({
+      glbPaths: [red, white],
+      outPath: out,
+      title: "Judged",
+      tile: 160,
+      expectColoured: new Set(["SM_White.glb"]),
+    });
+
+    expect(result.judge).toHaveLength(2);
+    const byName = Object.fromEntries(result.judge.map((j) => [j.name, j]));
+    expect(byName.SM_Red).toMatchObject({ verdict: "ok", reasons: [] });
+    expect(byName.SM_White!.verdict).toBe("fail");
+    expect(byName.SM_White!.reasons.join(" ")).toContain("report claims coloured sections");
+    expect(result.judgeSummary).toEqual({ ok: 1, suspect: 0, fail: 1 });
+    expect(result.thumbnailsShown).toBe(0);
+  });
+
+  it("shows the Unreal thumbnail beside each render, only for pieces that have one, with colour similarity", async () => {
+    const dir = await scratch();
+    const red = join(dir, "Meshes", "SM_Red.glb");
+    const blue = join(dir, "Meshes", "SM_Blue.glb");
+    const nothumb = join(dir, "Meshes", "SM_NoThumb.glb");
+    await mkdir(join(dir, "Meshes"), { recursive: true });
+    await writeCube(red, [1, 0, 0]);
+    await writeCube(blue, [0, 0, 1], 0.9);
+    await writeCube(nothumb, [0, 1, 0], 0.8);
+    // A thumbnail looks like the editor's: a checkered floor with the object in the middle.
+    const thumbnail = async (r: number, g: number, b: number): Promise<Buffer> => {
+      const floor = Buffer.alloc(64 * 64 * 3);
+      for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 64; x++) {
+          const v = ((x >> 3) + (y >> 3)) % 2 === 0 ? 150 : 100;
+          floor.set([v, v - 10, v - 30], (y * 64 + x) * 3);
+        }
+      }
+      const base = sharp(floor, { raw: { width: 64, height: 64, channels: 3 } }).resize(256, 256, { kernel: "nearest" });
+      const square = await sharp({ create: { width: 110, height: 110, channels: 3, background: { r, g, b } } }).png().toBuffer();
+      return base.composite([{ input: square, left: 73, top: 73 }]).png().toBuffer();
+    };
+    const out = join(dir, "sheet.jpg");
+
+    const result = await renderContactSheet({
+      glbPaths: [red, blue, nothumb],
+      outPath: out,
+      title: "Pairs",
+      galleryImage: await galleryPng(),
+      tile: 200,
+      // Red cube gets a red thumbnail, the blue cube a red one too (a deliberate colour mismatch).
+      thumbnails: new Map([
+        ["Meshes/SM_Red.glb", await thumbnail(220, 20, 20)],
+        ["Meshes/SM_Blue.glb", await thumbnail(220, 20, 20)],
+      ]),
+    });
+
+    expect(result).toMatchObject({ meshesRendered: 2, thumbnailsShown: 2, galleryIncluded: true });
+    expect(result.judge.map((j) => j.name).sort()).toEqual(["SM_Blue", "SM_Red"]);
+    const byName = Object.fromEntries(result.judge.map((j) => [j.name, j]));
+    expect(byName.SM_Red!.similarity).toBeGreaterThan(0.6);
+    expect(byName.SM_Red!.verdict).toBe("ok");
+    expect(byName.SM_Blue!.similarity).toBeLessThan(0.35);
+    expect(byName.SM_Blue!.verdict).toBe("suspect");
+    expect(byName.SM_Blue!.reasons[0]).toContain("colour similarity");
+
+    // Tile 0 (the larger blue cube is volume 0.73, red is 1: red first). Thumbnail left, render right.
+    const top = 132;
+    const [tr, tg, tb] = await meanColor(out, { left: 80, top: top + 80, width: 40, height: 40 });
+    expect(tr).toBeGreaterThan(tg * 3);
+    expect(tr).toBeGreaterThan(tb * 3);
+    const [rr, rg, rb] = await meanColor(out, { left: 200 + 80, top: top + 80, width: 40, height: 40 });
+    expect(rr).toBeGreaterThan(rg * 2);
+    expect(rr).toBeGreaterThan(rb * 2);
+    // Second pair: render is blue.
+    const [br, , bb] = await meanColor(out, { left: 400 + 200 + 80, top: top + 80, width: 40, height: 40 });
+    expect(bb).toBeGreaterThan(br * 2);
+  });
+
+  it("derives expected-coloured GLBs from a report's textured sections", () => {
+    const keys = colouredGlbKeys({
+      models: [
+        { glb: "a.glb", materials: [{ textured: true }] },
+        { glb: "b.glb", materials: [{ textured: false }] },
+      ],
+    });
+    expect([...keys]).toEqual(["a.glb"]);
   });
 });

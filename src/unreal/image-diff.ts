@@ -354,3 +354,187 @@ export async function compareImages(
     pHashDistance: exact ? 0 : hammingDistance(perceptualHash(left), perceptualHash(right)),
   };
 }
+
+// --- colour similarity of unlike views ---------------------------------------------------------------
+//
+// An editor thumbnail and our render of the same piece differ in camera, lighting, ground and
+// background, so pixel metrics such as SSIM say nothing useful. What can still be compared honestly
+// is the colour of the object itself: the mean colour in Lab, and how the object's pixels distribute
+// over colour and hue. It answers "is this roughly the same colour of thing", not "is it the same".
+
+const PALETTE_STEP = 16;
+const PALETTE_MIN_SHARE = 0.004;
+const BACKGROUND_TOLERANCE = 18;
+/** An object smaller than this share of the image is too small to describe by colour. */
+export const MIN_OBJECT_COVERAGE = 0.002;
+/** Mean-colour distance (CIE76 delta E) at which the mean-colour component reaches 0. */
+const DELTA_E_ZERO = 50;
+const HUE_BINS = 24;
+
+/**
+ * Marks object pixels: those that are not close to one of the colours the image border is made of.
+ * A flat studio background has one such colour; an editor thumbnail's checkered floor and sky have a
+ * handful. Pixels that are mostly transparent are background.
+ */
+export function objectMask(image: RgbaImage, tolerance = BACKGROUND_TOLERANCE): Uint8Array {
+  const { width, height, data } = image;
+  const bins = new Map<number, { count: number; r: number; g: number; b: number }>();
+  let borderPixels = 0;
+  const addBorder = (x: number, y: number): void => {
+    const o = (y * width + x) * 4;
+    if (data[o + 3]! < 128) return;
+    const key = ((data[o]! >> 4) << 8) | ((data[o + 1]! >> 4) << 4) | (data[o + 2]! >> 4);
+    const bin = bins.get(key) ?? { count: 0, r: 0, g: 0, b: 0 };
+    bin.count++;
+    bin.r += data[o]!;
+    bin.g += data[o + 1]!;
+    bin.b += data[o + 2]!;
+    bins.set(key, bin);
+    borderPixels++;
+  };
+  for (let x = 0; x < width; x++) {
+    addBorder(x, 0);
+    addBorder(x, height - 1);
+  }
+  for (let y = 1; y < height - 1; y++) {
+    addBorder(0, y);
+    addBorder(width - 1, y);
+  }
+  const palette: [number, number, number][] = [];
+  for (const bin of bins.values()) {
+    if (bin.count >= Math.max(2, borderPixels * PALETTE_MIN_SHARE)) {
+      palette.push([bin.r / bin.count, bin.g / bin.count, bin.b / bin.count]);
+    }
+  }
+  const mask = new Uint8Array(width * height);
+  for (let i = 0; i < width * height; i++) {
+    const o = i * 4;
+    if (data[o + 3]! < 128) continue;
+    let background = false;
+    for (const [r, g, b] of palette) {
+      if (Math.abs(data[o]! - r) <= tolerance && Math.abs(data[o + 1]! - g) <= tolerance && Math.abs(data[o + 2]! - b) <= tolerance) {
+        background = true;
+        break;
+      }
+    }
+    mask[i] = background ? 0 : 1;
+  }
+  return mask;
+}
+
+function srgbToLinear(value: number): number {
+  const v = value / 255;
+  return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+}
+
+/** sRGB (0-255) to CIE L*a*b*, D65. */
+export function rgbToLab(r: number, g: number, b: number): [number, number, number] {
+  const lr = srgbToLinear(r);
+  const lg = srgbToLinear(g);
+  const lb = srgbToLinear(b);
+  const f = (t: number): number => (t > 216 / 24389 ? Math.cbrt(t) : (24389 / 27 * t + 16) / 116);
+  const fx = f((0.4124564 * lr + 0.3575761 * lg + 0.1804375 * lb) / 0.95047);
+  const fy = f(0.2126729 * lr + 0.7151522 * lg + 0.072175 * lb);
+  const fz = f((0.0193339 * lr + 0.119192 * lg + 0.9503041 * lb) / 1.08883);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+interface ObjectColour {
+  pixels: number;
+  coverage: number;
+  meanLab: [number, number, number];
+  colourHistogram: Float64Array;
+  hueHistogram: Float64Array;
+}
+
+function describeObject(image: RgbaImage, mask: Uint8Array): ObjectColour {
+  const colourHistogram = new Float64Array(512);
+  const hueHistogram = new Float64Array(HUE_BINS + 1);
+  let pixels = 0;
+  let l = 0;
+  let a = 0;
+  let bb = 0;
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    const o = i * 4;
+    const r = image.data[o]!;
+    const g = image.data[o + 1]!;
+    const b = image.data[o + 2]!;
+    pixels++;
+    const lab = rgbToLab(r, g, b);
+    l += lab[0];
+    a += lab[1];
+    bb += lab[2];
+    colourHistogram[((r >> 5) << 6) | ((g >> 5) << 3) | (b >> 5)]! += 1;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    if (max < 25 || (max - min) / max < 0.1) {
+      hueHistogram[HUE_BINS]! += 1;
+    } else {
+      const d = max - min;
+      let hue = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+      if (hue < 0) hue += 6;
+      hueHistogram[Math.min(HUE_BINS - 1, Math.floor((hue / 6) * HUE_BINS))]! += 1;
+    }
+  }
+  if (pixels > 0) {
+    for (const histogram of [colourHistogram, hueHistogram]) {
+      for (let i = 0; i < histogram.length; i++) histogram[i]! /= pixels;
+    }
+  }
+  return {
+    pixels,
+    coverage: pixels / Math.max(1, mask.length),
+    meanLab: pixels > 0 ? [l / pixels, a / pixels, bb / pixels] : [0, 0, 0],
+    colourHistogram,
+    hueHistogram,
+  };
+}
+
+function intersection(a: Float64Array, b: Float64Array): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += Math.min(a[i]!, b[i]!);
+  return sum;
+}
+
+export interface ColourSimilarity {
+  /** 0..1, higher is more alike in object colour. 0 when `comparable` is false. */
+  readonly similarity: number;
+  /** CIE76 distance between the objects' mean Lab colours. */
+  readonly meanColourDelta: number;
+  /** 1 - deltaE / 50, floored at 0. */
+  readonly meanColourScore: number;
+  /** Intersection of the 8x8x8 RGB histograms of the object pixels. */
+  readonly colourHistogramIntersection: number;
+  /** Intersection of the 24-bin hue histograms plus one neutral bin. */
+  readonly hueHistogramIntersection: number;
+  readonly objectCoverage: { readonly a: number; readonly b: number };
+  /** False when either image has too little object to describe; the numbers are then not meaningful. */
+  readonly comparable: boolean;
+}
+
+/**
+ * "Colour similarity" between two views of one piece, on the object pixels only (each image's
+ * border-colour background is masked out). The score is 0.4 mean-colour + 0.3 colour histogram +
+ * 0.3 hue histogram. It ignores shape, shading, camera and lighting, so it is a sanity signal, not a match.
+ */
+export function colourSimilarity(a: RgbaImage, b: RgbaImage): ColourSimilarity {
+  const left = describeObject(a, objectMask(a));
+  const right = describeObject(b, objectMask(b));
+  const comparable = left.coverage >= MIN_OBJECT_COVERAGE && right.coverage >= MIN_OBJECT_COVERAGE;
+  const delta = comparable
+    ? Math.hypot(left.meanLab[0] - right.meanLab[0], left.meanLab[1] - right.meanLab[1], left.meanLab[2] - right.meanLab[2])
+    : Number.NaN;
+  const meanColourScore = comparable ? Math.max(0, 1 - delta / DELTA_E_ZERO) : 0;
+  const colourHistogramIntersection = comparable ? intersection(left.colourHistogram, right.colourHistogram) : 0;
+  const hueHistogramIntersection = comparable ? intersection(left.hueHistogram, right.hueHistogram) : 0;
+  return {
+    similarity: comparable ? 0.4 * meanColourScore + 0.3 * colourHistogramIntersection + 0.3 * hueHistogramIntersection : 0,
+    meanColourDelta: delta,
+    meanColourScore,
+    colourHistogramIntersection,
+    hueHistogramIntersection,
+    objectCoverage: { a: left.coverage, b: right.coverage },
+    comparable,
+  };
+}
