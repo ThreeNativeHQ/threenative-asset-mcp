@@ -8,7 +8,6 @@
  * deleted after each pack unless --keep is given. Nothing from a pack is written under the repo.
  */
 import { randomBytes } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { mkdirSync, readdirSync, statSync } from "node:fs";
 import { mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { loadavg, platform, tmpdir } from "node:os";
@@ -22,6 +21,8 @@ import { scorePack } from "../src/unreal/parity.js";
 import {
   acquireLock,
   buildCorpus,
+  carriedOverEntries,
+  emergencyCleanup,
   failureClasses,
   isFatalHandlerError,
   licencesReader,
@@ -43,6 +44,7 @@ import {
   upsertEntry,
   writeJsonAtomic,
   type CorpusEntry,
+  type CorpusMode,
   type HandlerError,
   type Scorecard,
   type ScorecardEntry,
@@ -53,7 +55,6 @@ import { dumpUnrealProperties } from "../src/unreal/property-dump.js";
 const HIGH_LOAD = 20;
 const TMP_PREFIX = "tn-parity-";
 const RUN_TMP_PREFIX = "tn-parity-run-";
-const SIGNAL_GRACE_MS = 2000;
 
 /** Number of files (recursively) under `root`; 0 when it does not exist. */
 function countFiles(root: string): number {
@@ -75,41 +76,6 @@ function countFiles(root: string): number {
   }
   return count;
 }
-
-/** Every process below this one (children, grandchildren), via pgrep; best effort. */
-function descendantPids(root = process.pid): number[] {
-  const found: number[] = [];
-  const queue = [root];
-  while (queue.length > 0) {
-    const parent = queue.shift()!;
-    let output = "";
-    try {
-      output = execFileSync("pgrep", ["-P", String(parent)], { encoding: "utf8" });
-    } catch {
-      continue; // no children (exit 1) or no pgrep
-    }
-    for (const line of output.split("\n")) {
-      const pid = Number.parseInt(line, 10);
-      if (Number.isInteger(pid) && !found.includes(pid)) {
-        found.push(pid);
-        queue.push(pid);
-      }
-    }
-  }
-  return found;
-}
-
-function signalDescendants(signal: NodeJS.Signals): void {
-  for (const pid of descendantPids()) {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      /* already gone */
-    }
-  }
-}
-
-const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
 function say(message: string): void {
   console.log(message);
@@ -174,6 +140,7 @@ async function main(): Promise<number> {
     TMPDIR: runTmp,
     ...(args.graphBake ? {} : { THREENATIVE_GRAPH_BAKE: "0" }),
   };
+  const corpusMode: CorpusMode = args.allArtifacts ? "all-artifacts" : "per-route";
   const scorecardPath = join(args.out, "scorecard.json");
   // Read before the sweep: --baseline may name the scorecard this run is about to rewrite.
   const baselineMisses = args.baseline === undefined ? null : readBaselineS4Misses(args.baseline);
@@ -204,6 +171,7 @@ async function main(): Promise<number> {
       host: { load1: loadavg()[0] ?? 0, platform: platform() },
       toolchain: { importerVersion, cue4parse },
       graphBake: args.graphBake,
+      corpus: corpusMode,
       entries: all,
       skipped,
       summary:
@@ -253,18 +221,17 @@ async function main(): Promise<number> {
     return finishPromise;
   };
 
+  // Everything the handler does is synchronous: it ends in process.exit, so an await would race the
+  // exit and the dying children, which is how the lock and the scratch directories were left behind.
   const onSignal = (signal: NodeJS.Signals): void => {
     if (stopping) return;
-    stopping = true; // stop starting new work; the loop checks this
+    stopping = true;
     console.error(`${signal}: stopping children, cleaning up.`);
-    void (async () => {
-      // The handler's children are spawned deep inside it, so they are found by walking the tree.
-      signalDescendants("SIGTERM");
-      const deadline = Date.now() + SIGNAL_GRACE_MS;
-      while (Date.now() < deadline && descendantPids().length > 0) await sleep(100);
-      signalDescendants("SIGKILL");
-      process.exit(await finish(130));
-    })();
+    emergencyCleanup({
+      lock,
+      paths: args.keep ? [] : [runRoot, unrealCache, runTmp],
+    });
+    process.exit(130);
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
@@ -283,6 +250,7 @@ async function main(): Promise<number> {
       artifact: args.artifact,
       limit: args.limit,
       excludeSize: args.excludeSize,
+      allArtifacts: args.allArtifacts,
     });
     skipped = corpus.skipped;
     if (corpus.entries.length === 0) {
@@ -297,7 +265,10 @@ async function main(): Promise<number> {
       todo = resumed.todo;
       entries = resumed.kept;
       writable = true; // previous entries are merged back in, so nothing settled can be lost
-      say(`Resuming: ${resumed.kept.length} settled, ${todo.length} to run.`);
+      const carried = carriedOverEntries(previousEntries, skipped).length;
+      say(
+        `Resuming: ${resumed.kept.length} settled, ${todo.length} to run${carried > 0 ? `, ${carried} kept from artifacts the per-route dedupe now skips` : ""}.`,
+      );
     }
     say(`Sweeping ${todo.length} artifact(s) from ${new Set(todo.map((e) => e.listingId)).size} listing(s); skipped ${skipped.length}. Run ${runId}.`);
     writeScorecard();

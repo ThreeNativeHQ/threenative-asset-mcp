@@ -1,7 +1,10 @@
-import { utimesSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { describe, expect, it, onTestFinished } from "vitest";
 
@@ -22,6 +25,7 @@ import {
   summaryOf,
   parityLine,
   parseParityArgs,
+  carriedOverEntries,
   licencesReader,
   parseLicencesFile,
   readPreviousEntries,
@@ -79,7 +83,7 @@ describe("buildCorpus", () => {
     listing("22222222-0000-0000-0000-000000000000", []),
     { ...listing("x", [["N", ["UE_4.27"]]]), listingId: undefined },
   ] satisfies FabOwnedListing[];
-  const base = { listings: [], artifact: undefined, limit: undefined, excludeSize: true };
+  const base = { listings: [], artifact: undefined, limit: undefined, excludeSize: true, allArtifacts: true };
 
   it("makes one entry per listing x artifact, skipping size and non-Unreal listings", () => {
     const { entries, skipped } = buildCorpus(owned, base);
@@ -269,6 +273,8 @@ describe("scorecard files and arguments", () => {
     const args = parseParityArgs(["--listing", "a", "--listing", "b", "--artifact", "X", "--limit", "3", "--resume", "--keep", "--out", "/x"]);
     expect(args).toMatchObject({ listings: ["a", "b"], artifact: "X", limit: 3, resume: true, keep: true, out: "/x", excludeSize: true });
     expect(parseParityArgs(["--help"]).help).toBe(true);
+    expect(parseParityArgs([]).allArtifacts).toBe(false);
+    expect(parseParityArgs(["--all-artifacts"]).allArtifacts).toBe(true);
     expect(parseParityArgs(["--no-exclude-size"]).excludeSize).toBe(false);
     expect(() => parseParityArgs(["--limit", "0"])).toThrow();
     expect(() => parseParityArgs(["--corpus", "x"])).toThrow();
@@ -276,6 +282,199 @@ describe("scorecard files and arguments", () => {
     expect(() => parseParityArgs(["--out"])).toThrow(/needs a value/);
   });
 });
+
+describe("buildCorpus per-route dedupe", () => {
+  const perRoute = { listings: [], artifact: undefined, limit: undefined, excludeSize: true, allArtifacts: false };
+  const nature = "33333333-0000-0000-0000-000000000000";
+  const owned = [
+    listing(
+      nature,
+      [
+        ["N48", ["UE_4.8", "UE_4.10"]],
+        ["N49", ["UE_4.9", "UE_4.10"]],
+        ["N410", ["UE_4.10"]],
+        ["N27", ["UE_4.27", "UE_5.0"]],
+        ["N421", ["UE_4.21"]],
+        ["N50", ["UE_5.0"]],
+        ["N54", ["UE_5.4"]],
+      ],
+      "Procedural Nature",
+    ),
+    listing("44444444-0000-0000-0000-000000000000", [["Solo", ["UE_4.18"]]], "Solo"),
+  ];
+
+  it("keeps the artifact whose oldest engine is newest in each route, one per route", () => {
+    const { entries } = buildCorpus(owned, perRoute);
+    expect(entries.map((e) => [e.artifactId, e.route])).toEqual([
+      ["N410", "umodel"],
+      ["N27", "mesh-description"],
+      ["N54", "cue4parse"],
+      ["Solo", "umodel"],
+    ]);
+  });
+
+  it("lets the first listed artifact win a tie on route and oldest engine", () => {
+    const tied = [listing(nature, [["First", ["UE_4.10", "UE_5.0"]], ["Second", ["UE_4.10"]]])];
+    expect(buildCorpus(tied, perRoute).entries.map((e) => e.artifactId)).toEqual(["First"]);
+  });
+
+  it("records every dropped artifact as skipped with the artifact that represents its route", () => {
+    const { skipped } = buildCorpus(owned, perRoute);
+    expect(skipped.map((s) => [s.artifactId, s.reason])).toEqual([
+      ["N48", "same route as N410"],
+      ["N49", "same route as N410"],
+      ["N421", "same route as N27"],
+      ["N50", "same route as N54"],
+    ]);
+    expect(skipped.every((s) => s.listingId === nature && s.title === "Procedural Nature")).toBe(true);
+  });
+
+  it("restores one entry per artifact with --all-artifacts", () => {
+    const all = buildCorpus(owned, { ...perRoute, allArtifacts: true });
+    expect(all.entries).toHaveLength(8);
+    expect(all.skipped).toEqual([]);
+  });
+
+  it("bypasses the dedupe for a named listing or artifact", () => {
+    const listed = buildCorpus(owned, { ...perRoute, listings: [nature] });
+    expect(listed.entries).toHaveLength(7);
+    expect(listed.skipped).toEqual([]);
+    const named = buildCorpus(owned, { ...perRoute, artifact: "N48" });
+    expect(named.entries.map((e) => e.artifactId)).toEqual(["N48"]);
+    expect(named.skipped).toEqual([]);
+  });
+
+  it("applies --limit after the dedupe", () => {
+    expect(buildCorpus(owned, { ...perRoute, limit: 2 }).entries.map((e) => e.artifactId)).toEqual(["N410", "N27"]);
+  });
+
+  it("keeps size skips next to route skips", () => {
+    const city = listing("4898e707-7855-404b-af0e-a505ee690e68", [["City", ["UE_5.4"]]], "City Sample");
+    const { skipped } = buildCorpus([city, ...owned], perRoute);
+    expect(skipped[0]).toMatchObject({ title: "City Sample", reason: "skipped: size" });
+    expect(skipped).toHaveLength(5);
+  });
+});
+
+describe("resume with the per-route dedupe", () => {
+  const listingId = "33333333-0000-0000-0000-000000000000";
+  const owned = [listing(listingId, [["N48", ["UE_4.8"]], ["N410", ["UE_4.10"]]])];
+  const opts = { listings: [], artifact: undefined, limit: undefined, excludeSize: true, allArtifacts: false };
+
+  it("keys resume by listing and artifact and counts entries the dedupe now skips", () => {
+    const { entries, skipped } = buildCorpus(owned, opts);
+    const previous = [
+      entry({ status: "pass", listingId, artifactId: "N48" }),
+      entry({ status: "error", listingId, artifactId: "N410", error: { code: "X", message: "x" } }),
+    ];
+    const resumed = selectResume(entries, previous);
+    // The old artifact is not re-run in its own right and the new representative is not settled.
+    expect(resumed.kept).toEqual([]);
+    expect(resumed.todo.map((e) => e.artifactId)).toEqual(["N410"]);
+    const carried = carriedOverEntries(previous, skipped);
+    expect(carried.map((e) => e.artifactId)).toEqual(["N48"]);
+    // The scorecard keeps the carried entry beside the new ones.
+    expect(mergeScorecardEntries(previous, []).map((e) => e.artifactId)).toContain("N48");
+  });
+
+  it("does not carry over errors or entries of artifacts that were not skipped", () => {
+    const { skipped } = buildCorpus(owned, opts);
+    const previous = [
+      entry({ status: "error", listingId, artifactId: "N48", error: { code: "X", message: "x" } }),
+      entry({ status: "pass", listingId, artifactId: "N410" }),
+    ];
+    expect(carriedOverEntries(previous, skipped)).toEqual([]);
+  });
+});
+
+describe("emergency cleanup on SIGTERM", () => {
+  it("removes the lock, scratch dirs and children before exiting 130, leaving the scorecard", async () => {
+    const root = await scratch();
+    const out = join(root, "out");
+    const runRoot = join(root, "fab-downloads", "parity-run");
+    const cache = join(root, "run-tmp", "unreal-cache");
+    const runTmp = join(root, "run-tmp");
+    for (const dir of [out, runRoot, cache]) mkdirSync(join(dir, "nested"), { recursive: true });
+    writeFileSync(join(runRoot, "nested", "pack.uasset"), "x");
+    writeFileSync(join(cache, "nested", "cached"), "x");
+    writeFileSync(join(runTmp, "scratch"), "x");
+    const scorecard = join(out, "scorecard.json");
+    writeFileSync(scorecard, '{"entries":[]}');
+    const lockPath = join(out, ".lock");
+
+    const module = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "../src/unreal/parity-run.ts")).href;
+    const script = join(root, "holder.mjs");
+    writeFileSync(
+      script,
+      `import { spawn } from "node:child_process";
+import { acquireLock, emergencyCleanup } from ${JSON.stringify(module)};
+const [lockPath, runTmp, ...rest] = process.argv.slice(2);
+const lock = acquireLock(lockPath);
+// A child that ignores SIGTERM, so the cleanup has to escalate to SIGKILL.
+const child = spawn("sh", ["-c", 'trap "" TERM; while :; do sleep 1; done'], { stdio: "ignore" });
+process.on("SIGTERM", () => {
+  emergencyCleanup({ lock, paths: [...rest, runTmp], graceMs: 300 });
+  process.exit(130);
+});
+console.log("ready " + child.pid);
+setInterval(() => {}, 1000);
+`,
+    );
+    const holder = spawn(
+      process.execPath,
+      ["--import", pathToFileURL(createRequireResolve("tsx/esm")).href, script, lockPath, runTmp, runRoot, cache],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+    onTestFinished(() => {
+      holder.kill("SIGKILL");
+    });
+    let shellPid = 0;
+    await new Promise<void>((resolveReady, reject) => {
+      let text = "";
+      holder.stdout.on("data", (chunk: Buffer) => {
+        text += chunk.toString();
+        const match = /ready (\d+)/.exec(text);
+        if (match) {
+          shellPid = Number(match[1]);
+          resolveReady();
+        }
+      });
+      holder.once("exit", (code) => reject(new Error(`holder exited ${code} before it was ready`)));
+    });
+    expect(existsSync(lockPath)).toBe(true);
+    onTestFinished(() => {
+      try {
+        process.kill(shellPid, "SIGKILL");
+      } catch {
+        /* gone */
+      }
+    });
+
+    const exit = new Promise<number | null>((done) => holder.once("exit", (code) => done(code)));
+    holder.kill("SIGTERM");
+    expect(await exit).toBe(130);
+
+    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(runRoot)).toBe(false);
+    expect(existsSync(cache)).toBe(false);
+    expect(existsSync(runTmp)).toBe(false);
+    expect(existsSync(scorecard)).toBe(true);
+    expect(isAlive(shellPid)).toBe(false);
+  }, 20_000);
+});
+
+function createRequireResolve(specifier: string): string {
+  return createRequire(import.meta.url).resolve(specifier);
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 type S4 = NonNullable<ScorecardEntry["summary"]>["s4"];
 const withS4 = (s4: Partial<S4>, over: Partial<ScorecardEntry> = {}): ScorecardEntry =>

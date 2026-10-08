@@ -3,12 +3,14 @@
  * selection, scorecard aggregation, `--resume`, the single-sweep lock and argument parsing. Nothing
  * here downloads, imports or spawns anything.
  */
+import { execFileSync } from "node:child_process";
 import {
   closeSync,
   linkSync,
   openSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -18,7 +20,7 @@ import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 
 import type { FabOwnedListing } from "../fab/fabcli.js";
-import { decoderRoute, oldestEngine } from "../fab/routes.js";
+import { compareEngines, decoderRoute, oldestEngine } from "../fab/routes.js";
 import type { MissAttribution, PackScore } from "./parity.js";
 
 export type ParityRoute = "umodel" | "mesh-description" | "cue4parse" | "unknown";
@@ -41,8 +43,12 @@ export interface CorpusEntry {
 export interface SkippedEntry {
   readonly listingId: string;
   readonly title: string;
+  /** Set for an artifact the per-route dedupe dropped; absent for a whole listing skipped by size. */
+  readonly artifactId?: string;
   readonly reason: string;
 }
+
+export type CorpusMode = "per-route" | "all-artifacts";
 
 export interface ScorecardEntry {
   readonly listingId: string;
@@ -125,6 +131,8 @@ export interface Scorecard {
   readonly toolchain: { readonly importerVersion: number | null; readonly cue4parse: string | null };
   /** False for a `--no-graph-bake` baseline sweep (PRD-537's state). */
   readonly graphBake: boolean;
+  /** `per-route`: one artifact per listing and decoder route (default); else one per artifact. */
+  readonly corpus: CorpusMode;
   readonly entries: readonly ScorecardEntry[];
   readonly skipped: readonly SkippedEntry[];
   readonly summary: ScorecardSummary;
@@ -137,6 +145,8 @@ export interface CorpusOptions {
   readonly artifact: string | undefined;
   readonly limit: number | undefined;
   readonly excludeSize: boolean;
+  /** True keeps every artifact; false keeps one per (listing, decoder route). */
+  readonly allArtifacts: boolean;
 }
 
 export function listingPrefix(listingId: string): string {
@@ -148,8 +158,12 @@ export function routeFor(engine: string | undefined): ParityRoute {
 }
 
 /**
- * One entry per listing x Unreal artifact, library order. A listing the caller named explicitly is
- * never size-excluded: asking for City Sample by id is a decision, not an accident.
+ * One entry per listing x decoder route, library order: of the artifacts that share a route, the
+ * one whose oldest engine is newest (the tie-break of `FabCli`'s choice among artifacts; the first
+ * listed wins a full tie). The rest are returned in `skipped` with the artifact that stands for
+ * them. `allArtifacts`, a named `artifact` and a named listing all keep every artifact. A listing
+ * the caller named explicitly is never size-excluded: asking for City Sample by id is a decision,
+ * not an accident.
  */
 export function buildCorpus(
   owned: readonly FabOwnedListing[],
@@ -171,10 +185,11 @@ export function buildCorpus(
       skipped.push({ listingId, title: listing.title, reason: SIZE_SKIP_REASON });
       continue;
     }
+    const candidates: CorpusEntry[] = [];
     for (const artifact of listing.unrealArtifacts) {
       if (options.artifact !== undefined && artifact.artifactId !== options.artifact) continue;
       const oldest = oldestEngine(artifact.engineVersions);
-      entries.push({
+      candidates.push({
         listingId,
         title: listing.title,
         artifactId: artifact.artifactId,
@@ -183,11 +198,40 @@ export function buildCorpus(
         route: routeFor(oldest),
       });
     }
+    const dedupe = !options.allArtifacts && !explicit && options.artifact === undefined;
+    if (!dedupe) {
+      entries.push(...candidates);
+      continue;
+    }
+    const winners = new Map<ParityRoute, CorpusEntry>();
+    for (const candidate of candidates) {
+      const current = winners.get(candidate.route);
+      if (!current || newerOldestEngine(candidate, current)) winners.set(candidate.route, candidate);
+    }
+    for (const candidate of candidates) {
+      const winner = winners.get(candidate.route)!;
+      if (winner === candidate) entries.push(candidate);
+      else {
+        skipped.push({
+          listingId,
+          title: listing.title,
+          artifactId: candidate.artifactId,
+          reason: `same route as ${winner.artifactId}`,
+        });
+      }
+    }
   }
   return {
     entries: options.limit === undefined ? entries : entries.slice(0, options.limit),
     skipped,
   };
+}
+
+/** Strictly newer oldest engine; an artifact with no engine never beats one that has one. */
+function newerOldestEngine(a: CorpusEntry, b: CorpusEntry): boolean {
+  if (a.oldestEngine === undefined) return false;
+  if (b.oldestEngine === undefined) return true;
+  return compareEngines(a.oldestEngine, b.oldestEngine) > 0;
 }
 
 export const entryKey = (entry: { listingId: string; artifactId: string }): string =>
@@ -475,6 +519,21 @@ export function selectResume(
   return { todo, kept };
 }
 
+/**
+ * Settled entries already on disk for artifacts the per-route dedupe now skips. They stay in the
+ * scorecard (`mergeScorecardEntries` keeps every previous entry) and are not re-run; the caller
+ * reports how many there are so a smaller `todo` is not mistaken for lost work.
+ */
+export function carriedOverEntries(
+  previous: readonly ScorecardEntry[],
+  skipped: readonly SkippedEntry[],
+): ScorecardEntry[] {
+  const skippedKeys = new Set(
+    skipped.flatMap((entry) => (entry.artifactId === undefined ? [] : [entryKey({ ...entry, artifactId: entry.artifactId })])),
+  );
+  return previous.filter((entry) => isSettled(entry) && skippedKeys.has(entryKey(entry)));
+}
+
 /** Replaces the entry with the same key, or appends it. */
 export function upsertEntry(
   entries: readonly ScorecardEntry[],
@@ -679,6 +738,8 @@ export interface ParityArgs {
   readonly keep: boolean;
   readonly out: string;
   readonly excludeSize: boolean;
+  /** `--all-artifacts`: one corpus entry per artifact instead of per (listing, decoder route). */
+  readonly allArtifacts: boolean;
   /** A scorecard.json to compare this sweep's S4 miss count against. */
   readonly baseline: string | undefined;
   /** A JSON map of listing id to licence slugs read from fab.com; replaces the anonymous lookup. */
@@ -696,7 +757,10 @@ each pack unless --keep is given.
 Options:
   --corpus library       Corpus to sweep (default; the only one)
   --listing <uid>        Only this listing (repeatable); overrides the size exclusion
-  --artifact <id>        Only this artifact id
+  --artifact <id>        Only this artifact id; overrides the per-route dedupe
+  --all-artifacts        One corpus entry per artifact (default: one per listing and decoder
+                         route, the artifact whose oldest engine is newest; the rest are listed
+                         under "skipped" as "same route as <artifactId>")
   --limit <N>            Stop after N corpus entries
   --resume               Skip entries already settled in <out>/scorecard.json
   --keep                 Keep downloads and import output (default: delete after each pack)
@@ -724,6 +788,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let keep = false;
   let out = "artifacts/parity";
   let excludeSize = true;
+  let allArtifacts = false;
   let help = false;
   let baseline: string | undefined;
   let licencesFile: string | undefined;
@@ -773,6 +838,9 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
       case "--no-exclude-size":
         excludeSize = false;
         break;
+      case "--all-artifacts":
+        allArtifacts = true;
+        break;
       case "--baseline":
         baseline = resolve(value(i++, arg));
         break;
@@ -796,8 +864,97 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
     keep,
     out: resolve(out),
     excludeSize,
+    allArtifacts,
     baseline,
     licencesFile,
     graphBake,
   };
+}
+
+// --- interruption -------------------------------------------------------------------------------
+
+const isZombie = (pid: number): boolean => {
+  try {
+    // "<pid> (<comm>) <state> ...": comm may contain spaces and parentheses, so cut at the last ")".
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) === "Z";
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Every live process below `root` (children, grandchildren), via pgrep; best effort. Zombies are
+ * left out: a blocked event loop cannot reap them, and they are already dead.
+ */
+export function descendantPids(root = process.pid): number[] {
+  const found: number[] = [];
+  const queue = [root];
+  while (queue.length > 0) {
+    const parent = queue.shift()!;
+    let output = "";
+    try {
+      output = execFileSync("pgrep", ["-P", String(parent)], { encoding: "utf8" });
+    } catch {
+      continue; // no children (exit 1) or no pgrep
+    }
+    for (const line of output.split("\n")) {
+      const pid = Number.parseInt(line, 10);
+      if (Number.isInteger(pid) && !found.includes(pid)) {
+        found.push(pid);
+        queue.push(pid);
+      }
+    }
+  }
+  return found.filter((pid) => !isZombie(pid));
+}
+
+const sleepSync = (ms: number): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+
+export interface EmergencyCleanupOptions {
+  /** The sweep lock to release. */
+  readonly lock?: { release(): void };
+  /** Directories to delete: the run's downloads, importer cache and tmp. Empty with `--keep`. */
+  readonly paths: readonly string[];
+  /** How long children get after SIGTERM before SIGKILL. Default 2000 ms. */
+  readonly graceMs?: number;
+}
+
+/**
+ * The whole cleanup of an interrupted sweep, synchronously. It runs inside the signal handler and
+ * the process exits right after it, so nothing here may await: an async cleanup races the exit and
+ * the dying children still writing into the directories being removed. Children are terminated
+ * first (SIGTERM, then SIGKILL after the grace period), then the directories removed, then the lock
+ * released. The scorecard is not touched: it is rewritten atomically after every pack.
+ */
+export function emergencyCleanup(options: EmergencyCleanupOptions): void {
+  const signalAll = (signal: NodeJS.Signals): void => {
+    for (const pid of descendantPids()) {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+  const deadline = Date.now() + (options.graceMs ?? 2000);
+  signalAll("SIGTERM");
+  while (Date.now() < deadline && descendantPids().length > 0) sleepSync(50);
+  signalAll("SIGKILL");
+  // A SIGKILLed child is gone once the kernel has torn it down; give that a moment before rm.
+  for (let i = 0; i < 20 && descendantPids().length > 0; i++) sleepSync(25);
+  for (const path of options.paths) {
+    try {
+      rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    } catch {
+      /* best effort: the remaining paths and the lock still go */
+    }
+  }
+  try {
+    options.lock?.release();
+  } catch {
+    /* already gone */
+  }
 }
