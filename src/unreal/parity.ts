@@ -405,7 +405,11 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
     else if (mesh) {
       checked++;
       const expectedSlots = mesh.slots?.length ?? 0;
-      const actualSlots = new Set(model.materials.map((m) => m.name)).size;
+      // UE Viewer gives every section it cannot resolve its own `dummy_material_<section>`, so the importer's
+      // `<mesh>_unresolved_section_<n>` names count sections, not slots. They stand for the slots with no material
+      // (SternInhibitor2: 29 of them for one null slot), which no name can tell apart: count them as one.
+      const resolvedSlots = new Set(model.materials.filter((m) => m.resolved !== false).map((m) => m.name)).size;
+      const actualSlots = resolvedSlots + (model.materials.some((m) => m.resolved === false) ? 1 : 0);
       if (actualSlots > expectedSlots || actualSlots === 0) {
         shape.push({ kind: "slot-count", model: model.name, expected: expectedSlots, actual: actualSlots });
       } else unusedSlots += expectedSlots - actualSlots;
