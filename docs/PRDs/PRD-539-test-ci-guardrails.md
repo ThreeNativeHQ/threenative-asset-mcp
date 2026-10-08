@@ -87,6 +87,12 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
   The hooks are a constructor option that production code never passes, so the publish path itself
   is unchanged.
 
+- 2026-10-07 (Claude): AC-4's red case reverts `findArchiveEntry` instead of pointing `FABCLI_RELEASE`
+  at a nested archive. `FABCLI_RELEASE` is a constant, not an environment variable, and the pinned
+  release already nests its binary, so the revert alone reproduces the original break.
+- 2026-10-07 (Claude): CI's `pull_request` trigger only covers PRs into `main`, so this PR (based on
+  `fix/fresh-host-tests-and-import-prds`) proves its legs with `workflow_dispatch` runs on the branch.
+
 ## Execution Phases
 
 #### Phase 1: The suite is deterministic and strict about its tools
@@ -96,6 +102,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 - [x] AC-1 [local]: The full suite passes with default parallel workers on a loaded host. proof: `TMPDIR=<empty dir> npx vitest run --exclude tests/mcp-smoke.test.ts` — 48 files passed, 1 skipped; 455 tests passed, 2 skipped, 0 failed at load average 41→28. Final run including smoke: `TMPDIR=<empty dir> npx vitest run` — 49 files passed, 1 skipped; 473 passed, 2 skipped, 0 failed. Leftovers: `node-compile-cache`, plus one Chromium shm file in the final run (tracked under AC-7). 2026-10-07.
 - [ ] AC-2 [shared]: CI's `parallel` leg (default workers) runs on every PR. proof: CI run link — Evidence: pending.
 - [ ] AC-7 [shared]: CI's `leak-gate` leg fails on a deliberately leaking test in a throwaway branch. proof: CI run link (red on the throwaway, green on the PR) — Evidence: pending.
+- [x] Every Chromium launch gets a private `TMPDIR` that is removed after the browser exits or fails to launch (creature probe and harnesses, claims judge, rig preview, Fab transport). proof: `npx vitest run tests/browser-temp.test.ts` — 3/3 pass; the fake-Chromium test goes red with the launch `env` removed (`expected '<tmp>' to be '<tmp>/threenative-browser-…'`). Commit 779b81e. 2026-10-07.
 - [ ] AC-3 [local]: With ffmpeg hidden from `PATH`, the tool guard skips the audio suites with the install command as its reason, but fails them under `CI=true`. proof: `PATH=<without ffmpeg> npx vitest run tests/audio-*.test.ts`, with `CI` unset vs `CI=true` — Evidence: pending.
 
 **Verification:** the boxes above.
@@ -103,7 +110,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1–AC-3 and AC-7
 #### Phase 2: A fresh host is tested, and diagnosable
 **Status:** NOT STARTED
 **Files:** `scripts/doctor.ts` (new), `package.json` (`doctor`), `.github/workflows/ci.yml` (`fresh-toolchain` job + schedule), `README.md` (Verification).
-- [ ] AC-4 [shared]: The `fresh-toolchain` job provisions all four Unreal-side tools in `debian:13` from an empty cache. It goes red when `FABCLI_RELEASE` points at a nested archive with the PRD-537 `findArchiveEntry` fix reverted. proof: CI run links (green on the branch, red on the revert) — Evidence: pending.
+- [ ] AC-4 [shared]: The `fresh-toolchain` job provisions all four Unreal-side tools in `debian:13` from an empty cache. It goes red on a throwaway branch that reverts the PRD-537 `findArchiveEntry` fix (the pinned FabCLI release nests its binary). proof: CI run links (green on the branch, red on the revert) — Evidence: pending.
 - [ ] AC-5 [local]: `npm run doctor` lists every prerequisite as ok/missing with its fix, exiting non-zero when one is missing. proof: run with vs without `ffmpeg` on `PATH` — Evidence: pending.
 
 **Verification:** the boxes above.
