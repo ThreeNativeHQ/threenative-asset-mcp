@@ -1,11 +1,11 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { NodeIO } from "@gltf-transform/core";
 import { KHRMaterialsUnlit } from "@gltf-transform/extensions";
 import sharp from "sharp";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 
 import { parsePaperTileMapDescriptor, parsePaperTileSetDescriptor, writePaperTileMapGlb } from "../src/unreal/paper-tilemaps.js";
 
@@ -28,6 +28,7 @@ const tileMap = {
 describe("PaperTileMap conversion", () => {
   it("writes populated cells as an indexed unlit GLB", async () => {
     const root = await mkdtemp(join(tmpdir(), "tn-tilemap-"));
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
     const texturePath = join(root, "Tiles.png");
     const outputPath = join(root, "Map.glb");
     await sharp({ create: { width: 4, height: 2, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 1 } } }).png().toFile(texturePath);
