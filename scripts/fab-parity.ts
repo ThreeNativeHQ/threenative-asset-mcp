@@ -22,6 +22,7 @@ import {
   acquireLock,
   buildCorpus,
   carriedOverEntries,
+  DOWNLOAD_RETRY_DELAYS_MS,
   emergencyCleanup,
   failureClasses,
   isFatalHandlerError,
@@ -33,6 +34,7 @@ import {
   parseParityArgs,
   readBaselineS4Misses,
   readPreviousEntries,
+  runWithRetries,
   s4Delta,
   s4DeltaLine,
   s4MissCount,
@@ -289,6 +291,14 @@ async function main(): Promise<number> {
       ...(licences === undefined ? {} : { readLicenses: licencesReader(licences) }),
     });
     let fatal: HandlerError | undefined;
+    // Delays are overridable (comma-separated ms, e.g. "0,0,0") so a rehearsal need not wait minutes.
+    const retryDelaysMs = (process.env.PARITY_DOWNLOAD_RETRY_DELAYS_MS ?? "")
+      .split(",")
+      .filter((part) => part.trim() !== "")
+      .map((part) => Number(part))
+      .filter((n) => Number.isFinite(n) && n >= 0);
+    if (retryDelaysMs.length === 0) retryDelaysMs.push(...DOWNLOAD_RETRY_DELAYS_MS);
+    const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
     for (const [index, item] of todo.entries()) {
       if (stopping) break;
@@ -316,15 +326,38 @@ async function main(): Promise<number> {
       };
       let entry: ScorecardEntry;
       try {
-        const result = await handler({
-          listingIdOrUrl: item.listingId,
-          outputDir,
-          artifactId: item.artifactId,
-          maxTextureSize: 1024,
-          acceptFabEula: true,
-        });
-        if ("isError" in result && result.isError) {
-          const error = parseHandlerError(result.content[0]?.text);
+        const run = await runWithRetries(
+          async (attemptNumber) => {
+            if (attemptNumber > 1) {
+              // A retry starts clean: drop the partial download and any half-written output.
+              await rm(sourceDir, { recursive: true, force: true });
+              await rm(outputDir, { recursive: true, force: true });
+            }
+            return handler({
+              listingIdOrUrl: item.listingId,
+              outputDir,
+              artifactId: item.artifactId,
+              maxTextureSize: 1024,
+              acceptFabEula: true,
+            });
+          },
+          {
+            errorOf: (result) =>
+              "isError" in result && result.isError ? parseHandlerError(result.content[0]?.text) : undefined,
+            delaysMs: retryDelaysMs,
+          },
+          (ms) => {
+            say(`    download failed; waiting ${ms / 1000}s before retrying this pack`);
+            return sleepMs(ms);
+          },
+        );
+        if (run.kind === "error") {
+          const error = run.exhausted
+            ? {
+                ...run.error,
+                message: `${run.error.message} (after ${retryDelaysMs.length} attempts: retried ${retryDelaysMs.length} times, ${run.attempts} tries in all)`,
+              }
+            : run.error;
           if (isFatalHandlerError(error)) fatal = error;
           entry = entryFromHandlerError(base, error, Date.now() - started);
         } else {

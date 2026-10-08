@@ -275,19 +275,86 @@ export interface HandlerError {
   readonly retryable?: boolean;
 }
 
+export interface RetryPolicy {
+  /** The same pack is worth trying again after a wait (transient CDN or network failure). */
+  readonly retry: boolean;
+  /** The whole sweep cannot continue (no session, keystore gone, network down). */
+  readonly fatal: boolean;
+}
+
+/** Waits before retry 1, 2 and 3 of a pack whose download failed. */
+export const DOWNLOAD_RETRY_DELAYS_MS: readonly number[] = [30_000, 90_000, 180_000];
+
 /**
- * Whether a failed import means the whole sweep cannot continue (no session, keystore gone,
- * network down), as opposed to one pack that simply could not be converted.
+ * Classify a failed import. Auth, session and keystore failures are fatal: no pack can succeed.
+ * A download failure (HTTP 503 from the CDN, a decode error, `exited 5`) is about one moment, so it
+ * is retried and never stops the sweep. Licence refusals concern one listing and are neither.
  */
-export function isFatalHandlerError(error: HandlerError): boolean {
+export function retryPolicyFor(error: HandlerError): RetryPolicy {
   // A licence refusal or lookup failure is about one listing; its text mentions "download".
-  if (error.code.startsWith("FABCLI_LICENSE_")) return false;
-  if (/^FABCLI_(AUTH|UNAUTH|SESSION|KEYSTORE|DOWNLOAD)/.test(error.code)) return true;
-  return (
-    error.code.startsWith("FABCLI_") &&
-    error.retryable === false &&
-    /auth|download|network/i.test(error.message)
-  );
+  if (error.code.startsWith("FABCLI_LICENSE_")) return { retry: false, fatal: false };
+  if (/^FABCLI_(AUTH|UNAUTH|SESSION|KEYSTORE)/.test(error.code)) return { retry: false, fatal: true };
+  if (error.code === "FABCLI_DOWNLOAD_FAILED") return { retry: true, fatal: false };
+  if (!error.code.startsWith("FABCLI_")) return { retry: false, fatal: false };
+  if (error.retryable === false && /auth|network/i.test(error.message) && !/download/i.test(error.message)) {
+    return { retry: false, fatal: true };
+  }
+  if (/download/i.test(error.message)) return { retry: true, fatal: false };
+  return { retry: false, fatal: false };
+}
+
+/** Whether a failed import means the whole sweep cannot continue, as opposed to one pack. */
+export function isFatalHandlerError(error: HandlerError): boolean {
+  return retryPolicyFor(error).fatal;
+}
+
+export interface RetryOptions<T> {
+  /** The handler error carried by one attempt's result, if it failed. */
+  readonly errorOf: (result: T) => HandlerError | undefined;
+  /** Waits before each retry; its length is the number of retries. */
+  readonly delaysMs: readonly number[];
+}
+
+export type RetryRun<T> =
+  | { readonly kind: "result"; readonly value: T; readonly attempts: number }
+  | { readonly kind: "error"; readonly error: HandlerError; readonly attempts: number; readonly exhausted: boolean };
+
+function thrownHandlerError(thrown: unknown): HandlerError | undefined {
+  if (!(thrown instanceof Error)) return undefined;
+  const code = (thrown as { code?: unknown }).code;
+  if (typeof code !== "string" || !code.startsWith("FABCLI_")) return undefined;
+  return { code, message: thrown.message };
+}
+
+/**
+ * Run `attempt` (called with the 1-based attempt number), retrying while the error's policy says
+ * so, sleeping `delaysMs[i]` before retry i+1. A non-retryable result or error comes back after one
+ * attempt; a thrown error that is not a FABCLI_* error is rethrown.
+ */
+export async function runWithRetries<T>(
+  attempt: (attemptNumber: number) => Promise<T>,
+  options: RetryOptions<T>,
+  sleep: (ms: number) => Promise<void>,
+): Promise<RetryRun<T>> {
+  for (let attempts = 1; ; attempts += 1) {
+    let error: HandlerError | undefined;
+    let value: T | undefined;
+    try {
+      value = await attempt(attempts);
+      error = options.errorOf(value);
+    } catch (thrown) {
+      error = thrownHandlerError(thrown);
+      if (error === undefined) throw thrown;
+    }
+    if (error === undefined) return { kind: "result", value: value as T, attempts };
+    if (!retryPolicyFor(error).retry) {
+      // A failed result is still a result for the caller to record; only thrown errors become "error".
+      return { kind: "error", error, attempts, exhausted: false };
+    }
+    const delay = options.delaysMs[attempts - 1];
+    if (delay === undefined) return { kind: "error", error, attempts, exhausted: true };
+    await sleep(delay);
+  }
 }
 
 // --- licences file ------------------------------------------------------------------------------

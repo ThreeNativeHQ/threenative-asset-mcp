@@ -16,6 +16,10 @@ import {
   entryKey,
   isFatalHandlerError,
   isLockStale,
+  retryPolicyFor,
+  runWithRetries,
+  DOWNLOAD_RETRY_DELAYS_MS,
+  type HandlerError,
   isSettled,
   mergeScorecardEntries,
   readBaselineS4Misses,
@@ -249,14 +253,133 @@ describe("selectResume", () => {
 });
 
 describe("isFatalHandlerError", () => {
-  it("stops on session and download failures, not on one bad pack", () => {
+  it("stops on session failures, not on one bad pack or a transient download failure", () => {
     expect(isFatalHandlerError({ code: "FABCLI_UNAUTHENTICATED", message: "" })).toBe(true);
     expect(isFatalHandlerError({ code: "FABCLI_SESSION_EXPIRED", message: "" })).toBe(true);
-    expect(isFatalHandlerError({ code: "FABCLI_DOWNLOAD_FAILED", message: "" })).toBe(true);
+    expect(isFatalHandlerError({ code: "FABCLI_DOWNLOAD_FAILED", message: "" })).toBe(false);
     expect(isFatalHandlerError({ code: "FABCLI_KEYSTORE_UNREACHABLE", message: "" })).toBe(true);
     expect(isFatalHandlerError({ code: "FABCLI_NOT_OWNED", message: "not yours", retryable: false })).toBe(false);
     expect(isFatalHandlerError({ code: "FABCLI_LICENSE_NOT_PERMITTED", message: "no" })).toBe(false);
     expect(isFatalHandlerError({ code: "UNREAL_TOOL_FAILED", message: "download of x failed", retryable: false })).toBe(false);
+  });
+});
+
+describe("retryPolicyFor", () => {
+  it("retries transient download failures and never treats them as fatal", () => {
+    for (const message of [
+      "chunk 12 download failed: HTTP 503 Service Unavailable",
+      "error decoding response body",
+      "fabcli exited 5",
+      "",
+    ]) {
+      expect(retryPolicyFor({ code: "FABCLI_DOWNLOAD_FAILED", message })).toEqual({ retry: true, fatal: false });
+    }
+    expect(retryPolicyFor({ code: "FABCLI_UNKNOWN", message: "Download stalled", retryable: false })).toEqual({ retry: true, fatal: false });
+  });
+
+  it("makes auth, session and keystore failures fatal and not retried", () => {
+    for (const code of ["FABCLI_AUTH_REQUIRED", "FABCLI_UNAUTHENTICATED", "FABCLI_SESSION_EXPIRED", "FABCLI_KEYSTORE_UNREACHABLE"]) {
+      expect(retryPolicyFor({ code, message: "download failed" })).toEqual({ retry: false, fatal: true });
+    }
+  });
+
+  it("leaves licence errors and other pack-level errors alone", () => {
+    expect(retryPolicyFor({ code: "FABCLI_LICENSE_UNVERIFIED", message: "download no network", retryable: false })).toEqual({ retry: false, fatal: false });
+    expect(retryPolicyFor({ code: "FABCLI_LICENSE_NOT_PERMITTED", message: "download auth" })).toEqual({ retry: false, fatal: false });
+    expect(retryPolicyFor({ code: "FABCLI_NOT_OWNED", message: "not yours", retryable: false })).toEqual({ retry: false, fatal: false });
+    expect(retryPolicyFor({ code: "UNREAL_TOOL_FAILED", message: "download of x failed", retryable: false })).toEqual({ retry: false, fatal: false });
+  });
+});
+
+describe("runWithRetries", () => {
+  const failure: HandlerError = { code: "FABCLI_DOWNLOAD_FAILED", message: "HTTP 503" };
+  type Outcome = { error?: HandlerError; value?: string };
+  const errorOf = (outcome: Outcome): HandlerError | undefined => outcome.error;
+  const sleeps = (): { slept: number[]; sleep: (ms: number) => Promise<void> } => {
+    const slept: number[] = [];
+    return { slept, sleep: async (ms) => void slept.push(ms) };
+  };
+
+  it("defaults to 30 s, 90 s, 180 s backoff", () => {
+    expect(DOWNLOAD_RETRY_DELAYS_MS).toEqual([30_000, 90_000, 180_000]);
+  });
+
+  it("succeeds on the third attempt, sleeping the first two delays", async () => {
+    const { slept, sleep } = sleeps();
+    const numbers: number[] = [];
+    const run = await runWithRetries<Outcome>(
+      async (n) => {
+        numbers.push(n);
+        return n < 3 ? { error: failure } : { value: "ok" };
+      },
+      { errorOf, delaysMs: [0, 1, 2] },
+      sleep,
+    );
+    expect(run).toEqual({ kind: "result", value: { value: "ok" }, attempts: 3 });
+    expect(numbers).toEqual([1, 2, 3]);
+    expect(slept).toEqual([0, 1]);
+  });
+
+  it("gives up after the retries and returns the last error", async () => {
+    const { slept, sleep } = sleeps();
+    let calls = 0;
+    const run = await runWithRetries<Outcome>(
+      async () => {
+        calls += 1;
+        return { error: failure };
+      },
+      { errorOf, delaysMs: [30, 90, 180] },
+      sleep,
+    );
+    expect(run).toEqual({ kind: "error", error: failure, attempts: 4, exhausted: true });
+    expect(calls).toBe(4);
+    expect(slept).toEqual([30, 90, 180]);
+  });
+
+  it("does not retry a fatal error", async () => {
+    const { slept, sleep } = sleeps();
+    const fatal: HandlerError = { code: "FABCLI_SESSION_EXPIRED", message: "log in" };
+    let calls = 0;
+    const run = await runWithRetries<Outcome>(
+      async () => {
+        calls += 1;
+        return { error: fatal };
+      },
+      { errorOf, delaysMs: [0, 0, 0] },
+      sleep,
+    );
+    expect(run).toEqual({ kind: "error", error: fatal, attempts: 1, exhausted: false });
+    expect(calls).toBe(1);
+    expect(slept).toEqual([]);
+  });
+
+  it("returns a pack-level error unchanged without retrying", async () => {
+    const { slept, sleep } = sleeps();
+    const licence: HandlerError = { code: "FABCLI_LICENSE_NOT_PERMITTED", message: "download not allowed" };
+    const run = await runWithRetries<Outcome>(async () => ({ error: licence }), { errorOf, delaysMs: [0] }, sleep);
+    expect(run).toEqual({ kind: "error", error: licence, attempts: 1, exhausted: false });
+    expect(slept).toEqual([]);
+  });
+
+  it("retries a thrown FABCLI download error and rethrows anything else", async () => {
+    const { sleep } = sleeps();
+    const thrown = Object.assign(new Error("chunk download failed: HTTP 503"), { code: "FABCLI_DOWNLOAD_FAILED" });
+    let calls = 0;
+    const run = await runWithRetries<Outcome>(
+      async () => {
+        calls += 1;
+        if (calls < 2) throw thrown;
+        return { value: "ok" };
+      },
+      { errorOf, delaysMs: [0, 0] },
+      sleep,
+    );
+    expect(run).toMatchObject({ kind: "result", attempts: 2 });
+
+    const boom = new Error("disk full");
+    await expect(
+      runWithRetries<Outcome>(async () => { throw boom; }, { errorOf, delaysMs: [0] }, sleep),
+    ).rejects.toBe(boom);
   });
 });
 
