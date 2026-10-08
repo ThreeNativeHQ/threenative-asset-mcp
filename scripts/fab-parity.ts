@@ -9,14 +9,14 @@
  */
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readdirSync, rmdirSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { loadavg, platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { FabCli } from "../src/fab/fabcli.js";
 import { dumpEngineArg } from "../src/fab/routes.js";
 import { createFabImportAssetHandler, fabDownloadRoot } from "../src/tools/import-unreal.js";
-import type { ImportReport } from "../src/unreal/importer.js";
+import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
 import { captureMaterialMetadata, type MaterialMetadataEntry, writeMaterialMetadataDump } from "../src/unreal/material-metadata.js";
 import { scorePack } from "../src/unreal/parity.js";
 import {
@@ -46,6 +46,7 @@ import {
   summaryOf,
   unsupportedNodeLines,
   upsertEntry,
+  withTextureProof,
   writeJsonAtomic,
   type CorpusEntry,
   type CorpusMode,
@@ -55,8 +56,34 @@ import {
   type SkippedEntry,
 } from "../src/unreal/parity-run.js";
 import { dumpUnrealProperties } from "../src/unreal/property-dump.js";
+import { ensureModernConverter } from "../src/unreal/provision.js";
+import {
+  crossDecodeProof,
+  flattenProofSources,
+  proveTextures,
+  sampleEvenly,
+  type CrossDecodeProof,
+  type TextureProof,
+} from "../src/unreal/texture-proof.js";
 
 const HIGH_LOAD = 20;
+/** Textures cross-decoded with CUE4Parse per UE Viewer pack. */
+const CROSS_DECODE_SAMPLE = 6;
+/** Most textures image-diffed per pack; `PARITY_PROOF_SAMPLE` overrides. */
+const PROOF_SAMPLE = Number(process.env.PARITY_PROOF_SAMPLE) > 0 ? Number(process.env.PARITY_PROOF_SAMPLE) : 500;
+
+/**
+ * S5 proof state of the pack being imported. The importer deletes its staging PNGs (the exporter's
+ * pixels) when it returns, so the identity proof runs inside its `proofSources` hook, and the few
+ * UE Viewer PNGs the cross-decode needs are copied out for after scoring.
+ */
+interface PackProof {
+  texture?: TextureProof;
+  /** Why the proof could not run; the pack is then unproven, not failed. */
+  error?: string;
+  /** Copies of the sampled UE Viewer PNGs, by texture name. */
+  crossSources?: Map<string, string>;
+}
 const TMP_PREFIX = "tn-parity-";
 const RUN_TMP_PREFIX = "tn-parity-run-";
 
@@ -292,8 +319,39 @@ async function main(): Promise<number> {
 
     // --export-metadata: each pack's material resolutions, deduplicated, written once the pack imported.
     const packMaterials = new Map<string, MaterialMetadataEntry>();
+    let packProof: PackProof = {};
+    const proofImport: typeof importUnrealDirectory = (request) =>
+      importUnrealDirectory({
+        ...request,
+        proofSources: async (sources, report) => {
+          const state = packProof;
+          try {
+            const flat = await flattenProofSources(sources);
+            state.texture = await proveTextures({
+              report,
+              outputDir: request.outputDir,
+              sourceTextures: flat.sourceTextures,
+              sourcesByGlb: sources,
+              ambiguous: flat.ambiguous,
+              maxTextureSize: request.maxTextureSize,
+              sample: PROOF_SAMPLE,
+            });
+            const crossDir = join(dirname(request.outputDir), "cross-decode");
+            await mkdir(crossDir, { recursive: true });
+            state.crossSources = new Map();
+            for (const name of sampleEvenly([...flat.sourceTextures.keys()].filter((n) => !flat.ambiguous.has(n)).sort(), CROSS_DECODE_SAMPLE)) {
+              const copy = join(crossDir, `${name}.png`);
+              await copyFile(flat.sourceTextures.get(name)!, copy);
+              state.crossSources.set(name, copy);
+            }
+          } catch (error) {
+            state.error = error instanceof Error ? error.message : String(error);
+          }
+        },
+      });
     const handler = createFabImportAssetHandler({
       environment,
+      ...(args.proof ? { importDirectory: proofImport } : {}),
       ...(licences === undefined ? {} : { readLicenses: licencesReader(licences) }),
       ...(args.exportMetadata === undefined
         ? {}
@@ -343,6 +401,7 @@ async function main(): Promise<number> {
         packMaterials.clear();
         const run = await runWithRetries(
           async (attemptNumber) => {
+            packProof = {}; // each attempt starts with an empty proof
             if (attemptNumber > 1) {
               // A retry starts clean: drop the partial download and any half-written output.
               await rm(sourceDir, { recursive: true, force: true });
@@ -386,7 +445,7 @@ async function main(): Promise<number> {
           const report = JSON.parse(await readFile(join(outputDir, "import-report.json"), "utf8")) as ImportReport;
           importerVersion = report.importer.version;
           cue4parse = report.toolchain.modernConverter ?? cue4parse;
-          entry = await scoreOne(item, base, sourceDir, report, environment, started, args.out, label);
+          entry = await scoreOne(item, base, sourceDir, report, environment, started, args.out, label, args.proof ? packProof : undefined);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -436,6 +495,39 @@ function parseHandlerError(text: string | undefined): HandlerError {
   }
 }
 
+/** CUE4Parse's decode of the sampled textures against UE Viewer's, for packs UE Viewer decoded. */
+async function crossDecode(
+  item: CorpusEntry,
+  sourceDir: string,
+  proof: PackProof,
+  environment: NodeJS.ProcessEnv,
+  engine: string | undefined,
+): Promise<CrossDecodeProof | undefined> {
+  if (item.route !== "umodel" || proof.crossSources === undefined || proof.crossSources.size === 0) return undefined;
+  try {
+    const converter = await ensureModernConverter(environment);
+    return await crossDecodeProof(sourceDir, [...proof.crossSources.keys()], {
+      converterPath: converter.path,
+      sourceTextures: proof.crossSources,
+      engine,
+      sample: CROSS_DECODE_SAMPLE,
+      environment,
+    });
+  } catch (error) {
+    return {
+      status: "unavailable",
+      requested: proof.crossSources.size,
+      compared: 0,
+      agreeing: 0,
+      unavailable: proof.crossSources.size,
+      sizeMismatches: 0,
+      minSsim: null,
+      threshold: 0.999,
+      results: [{ texture: "*", status: "unavailable", reason: (error instanceof Error ? error.message : String(error)).slice(0, 240) }],
+    };
+  }
+}
+
 async function scoreOne(
   item: CorpusEntry,
   base: Pick<ScorecardEntry, "listingId" | "title" | "artifactId" | "engines" | "oldestEngine" | "route">,
@@ -445,8 +537,14 @@ async function scoreOne(
   started: number,
   out: string,
   label: string,
+  proof: PackProof | undefined,
 ): Promise<ScorecardEntry> {
   const engine = item.oldestEngine === undefined ? undefined : dumpEngineArg(item.oldestEngine);
+  // S5 is judged from the staging pixels captured during the import, so it does not depend on the dump.
+  const cross = proof ? await crossDecode(item, sourceDir, proof, environment, engine) : undefined;
+  const proofDetail = proof ? { texture: proof.texture, cross, error: proof.error } : undefined;
+  const judged = (entry: ScorecardEntry): ScorecardEntry =>
+    proof?.texture ? withTextureProof(entry, proof.texture, cross) : entry;
   let dump;
   try {
     dump = await dumpUnrealProperties(sourceDir, {
@@ -455,39 +553,45 @@ async function scoreOne(
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const entry: ScorecardEntry = {
+    const entry = judged({
       ...base,
       status: "unverified",
       reasons: [`property dump failed: ${message.slice(0, 300)}`],
       classes: ["unverified:dump-failed"],
       summary: null,
       durationMs: Date.now() - started,
-    };
+    });
     writeJsonAtomic(join(out, "packs", `${label}.json`), {
       ...entry,
       importer: { version: report.importer.version },
       reused: report.reused,
+      ...(proofDetail ? { proof: proofDetail } : {}),
     });
     return entry;
   }
   const score = scorePack(dump, report);
   const durationMs = Date.now() - started;
-  writeJsonAtomic(join(out, "packs", `${label}.json`), {
-    ...base,
-    ...score,
-    route: item.route,
-    durationMs,
-    importer: { version: report.importer.version },
-    reused: report.reused,
-  });
-  return {
+  const entry = judged({
     ...base,
     status: score.status,
     reasons: score.reasons,
     classes: failureClasses(score),
     summary: summaryOf(score),
     durationMs,
-  };
+  });
+  writeJsonAtomic(join(out, "packs", `${label}.json`), {
+    ...base,
+    ...score,
+    // The verdict after S5: a texture-identity failure turns a scored pass into a fail.
+    status: entry.status,
+    reasons: entry.reasons,
+    route: item.route,
+    durationMs,
+    importer: { version: report.importer.version },
+    reused: report.reused,
+    ...(proofDetail ? { proof: proofDetail } : {}),
+  });
+  return entry;
 }
 
 main().then(

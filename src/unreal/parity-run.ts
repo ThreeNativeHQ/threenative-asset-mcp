@@ -22,6 +22,7 @@ import { z } from "zod";
 import type { FabOwnedListing } from "../fab/fabcli.js";
 import { compareEngines, decoderRoute, oldestEngine } from "../fab/routes.js";
 import type { MissAttribution, PackScore } from "./parity.js";
+import { textureIdentityReason, type CrossDecodeProof, type TextureProof } from "./texture-proof.js";
 
 export type ParityRoute = "umodel" | "mesh-description" | "cue4parse" | "unknown";
 export type ParityStatus = "pass" | "fail" | "unverified" | "error" | "skipped";
@@ -49,6 +50,27 @@ export interface SkippedEntry {
 }
 
 export type CorpusMode = "per-route" | "all-artifacts";
+
+/** The S5 texture-identity result kept in a scorecard entry (the full detail is in the pack JSON). */
+export interface EntryProof {
+  readonly compared: number;
+  readonly identical: number;
+  /** Lowest SSIM among the compared textures; null when none were compared. */
+  readonly minSsim: number | null;
+  /** Compared textures whose source was downscaled by the importer first. */
+  readonly resized?: number;
+  /** Graph-baked textures that decoded, vary and differ from the neutral fallback / all checked. */
+  readonly graph?: { readonly ok: number; readonly checked: number };
+  /** UE Viewer vs CUE4Parse decode of sampled textures (umodel-route packs only). */
+  readonly cross?: {
+    readonly status: CrossDecodeProof["status"];
+    readonly compared: number;
+    readonly agreeing: number;
+    readonly minSsim: number | null;
+    /** Compared textures the two decoders produced at different resolutions. */
+    readonly sizeMismatches?: number;
+  };
+}
 
 export interface ScorecardEntry {
   readonly listingId: string;
@@ -80,6 +102,42 @@ export interface ScorecardEntry {
   } | null;
   readonly durationMs: number;
   readonly error?: { readonly code: string; readonly message: string };
+  /** Absent for a sweep run with `--no-proof`, an unscored pack, or a scorecard from before S5. */
+  readonly proof?: EntryProof;
+}
+
+/** The proof half of an entry: what `proveTextures` and `crossDecodeProof` found, summarised. */
+export function entryProofOf(proof: TextureProof, cross?: CrossDecodeProof): EntryProof {
+  return {
+    compared: proof.compared,
+    identical: proof.identical,
+    minSsim: proof.minSsim,
+    ...(proof.resized > 0 ? { resized: proof.resized } : {}),
+    ...(proof.graph.checked > 0 ? { graph: { ok: proof.graph.ok, checked: proof.graph.checked } } : {}),
+    ...(cross
+      ? { cross: { status: cross.status, compared: cross.compared, agreeing: cross.agreeing, minSsim: cross.minSsim, sizeMismatches: cross.sizeMismatches } }
+      : {}),
+  };
+}
+
+/** Failure class of an S5 mismatch; one per differing texture, like the S2/S3 classes. */
+export const S5_CLASS = "S5:texture-mismatch";
+
+/**
+ * Applies the S5 verdict to a scored entry. A compared exact texture that is not identical (SSIM < 1
+ * after the importer's own resize) fails the pack with a reason naming the textures. Entries that
+ * errored or were skipped have no scored import to judge and are left alone.
+ */
+export function withTextureProof(entry: ScorecardEntry, proof: TextureProof, cross?: CrossDecodeProof): ScorecardEntry {
+  const base: ScorecardEntry = { ...entry, proof: entryProofOf(proof, cross) };
+  const reason = textureIdentityReason(proof);
+  if (reason === undefined || base.status === "error" || base.status === "skipped") return base;
+  return {
+    ...base,
+    status: "fail",
+    reasons: [...base.reasons, reason],
+    classes: [...base.classes, ...Array.from({ length: proof.mismatchCount }, () => S5_CLASS)],
+  };
 }
 
 /** Handler error code for a download with no Unreal packages (a code plugin or sample shell). */
@@ -146,6 +204,13 @@ export interface ScorecardSummary {
   readonly s4MissAttribution: MissAttribution;
   /** Set by the sweep script when `--baseline` is given. */
   readonly s4VsBaseline?: S4Delta;
+  /** S5 totals; absent when no entry carries a proof (a `--no-proof` sweep or an old scorecard). */
+  readonly proof?: {
+    readonly compared: number;
+    readonly identical: number;
+    /** Packs with at least one compared texture that is not identical. */
+    readonly packsWithMismatch: number;
+  };
 }
 
 export interface S4Delta {
@@ -465,7 +530,14 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
   const skippedNoContent: { title: string; artifactId: string }[] = [];
   let graphBaked = 0;
   let s4Misses: number | null = null;
+  let proofTotals: { compared: number; identical: number; packsWithMismatch: number } | undefined;
   for (const entry of entries) {
+    if (entry.proof) {
+      proofTotals ??= { compared: 0, identical: 0, packsWithMismatch: 0 };
+      proofTotals.compared += entry.proof.compared;
+      proofTotals.identical += entry.proof.identical;
+      if (entry.proof.identical < entry.proof.compared) proofTotals.packsWithMismatch++;
+    }
     const s4 = entry.summary?.s4;
     if (s4) {
       graphBaked += s4.graphBaked ?? 0;
@@ -516,6 +588,7 @@ export function summarizeEntries(entries: readonly ScorecardEntry[]): ScorecardS
     graphBaked,
     s4Misses,
     s4MissAttribution: attribution,
+    ...(proofTotals ? { proof: proofTotals } : {}),
   };
 }
 
@@ -586,7 +659,7 @@ export function unsupportedNodeLines(summary: ScorecardSummary, top = 5): string
 export function parityLine(summary: ScorecardSummary): string {
   const scored = summary.pass + summary.fail;
   const pct = (rate: number | null): string => (rate === null ? "n/a" : `${(rate * 100).toFixed(1)}%`);
-  return `PARITY pass=${summary.pass}/${scored} (${pct(summary.passRateScored)} of scored) attempted=${summary.attempted} (${pct(summary.passRateAttempted)} of attempted) unverified=${summary.unverified} error=${summary.error} skipped=${summary.skipped}`;
+  return `PARITY pass=${summary.pass}/${scored} (${pct(summary.passRateScored)} of scored) attempted=${summary.attempted} (${pct(summary.passRateAttempted)} of attempted) unverified=${summary.unverified} error=${summary.error} skipped=${summary.skipped}${summary.proof ? ` proof=${summary.proof.identical}/${summary.proof.compared}` : ""}`;
 }
 
 // --- resume -------------------------------------------------------------------------------------
@@ -853,6 +926,8 @@ export interface ParityArgs {
   readonly graphBake: boolean;
   /** Directory for per-pack material metadata dumps (licensed names: local-only, never commit). */
   readonly exportMetadata: string | undefined;
+  /** False for `--no-proof`: skip the S5 texture-identity proofs. */
+  readonly proof: boolean;
 }
 
 export const PARITY_USAGE = `Usage: npm run parity:fab -- [options]
@@ -885,6 +960,11 @@ Options:
   --export-metadata <dir> Write <dir>/<listing8>-<artifact>.json per pack: the material texts each
                          resolution read, for replay (tests/fab-metadata.test.ts). Holds licensed
                          names: local-only, never commit.
+  --proof                S5 texture-identity proofs (default on): after scoring a pack, compare every
+                         exactly bound embedded texture with the exporter's PNG (image diff: SSIM, MSE)
+                         and, for UE Viewer packs, cross-decode 6 sampled textures with CUE4Parse. Any
+                         differing texture fails the pack ("S5 texture identity: ...")
+  --no-proof             Skip the proofs
   -h, --help             Print this help
 
 Exit codes: 0 done, 1 error, 2 Fab session/download failure (partial scorecard written), 130 interrupted.`;
@@ -904,6 +984,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let licencesFile: string | undefined;
   let graphBake = true;
   let exportMetadata: string | undefined;
+  let proof = true;
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(`${flag} needs a value.`);
@@ -964,6 +1045,12 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
       case "--export-metadata":
         exportMetadata = resolve(value(i++, arg));
         break;
+      case "--proof":
+        proof = true;
+        break;
+      case "--no-proof":
+        proof = false;
+        break;
       default:
         throw new Error(`Unknown option "${arg}". Use --help.`);
     }
@@ -983,6 +1070,7 @@ export function parseParityArgs(argv: readonly string[]): ParityArgs {
     licencesFile,
     graphBake,
     exportMetadata,
+    proof,
   };
 }
 

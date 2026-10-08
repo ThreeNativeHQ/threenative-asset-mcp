@@ -406,6 +406,18 @@ export interface ImportUnrealRequest {
   readonly graphBake?: boolean;
   /** Receives each material's resolver request, for metadata capture. Production leaves it unset. */
   readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
+  /**
+   * Called once after the output is promoted and before the staging directory is deleted, with the
+   * exporter's source PNG of every texture embedded without a pixel transform: GLB path (relative
+   * to the output directory) -> texture name -> source path(s). More than one path for a name means
+   * the name is ambiguous inside that GLB. The paths are valid only until the callback returns.
+   * It also receives the report. Not called when the import is served from the cache. Used by the
+   * texture-identity proof.
+   */
+  readonly proofSources?: (
+    sources: ReadonlyMap<string, ReadonlyMap<string, readonly string[]>>,
+    report: ImportReport,
+  ) => void | Promise<void>;
 }
 
 const UNSUPPORTED_EXTENSIONS = new Map<string, string>();
@@ -1181,6 +1193,8 @@ export async function packageGlb(options: {
   /** Bakes the Unreal material graph for a section no texture binding gave a base colour (PRD-538). */
   readonly graphBaker?: GraphBaker | undefined;
   readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
+  /** Collects texture name -> source PNG path for every texture embedded without a pixel transform. */
+  readonly proofSources?: Map<string, string[]> | undefined;
 }): Promise<PackagedModel> {
   const io = separateLayoutIO();
   const document = await io.read(options.gltfPath);
@@ -1358,6 +1372,11 @@ export async function packageGlb(options: {
         cache.set(key, texture);
       }
       attachTexture(material, binding, texture);
+      if (options.proofSources && binding.transform === "none") {
+        const paths = options.proofSources.get(binding.texture) ?? [];
+        if (!paths.includes(source)) paths.push(source);
+        options.proofSources.set(binding.texture, paths);
+      }
       if (binding === authoredAoBaseBinding) authoredAoBaseAttached = true;
       if (binding.source === "authored-source" && binding.slot === "occlusion") {
         const baseInfo = material.getBaseColorTextureInfo();
@@ -3269,6 +3288,15 @@ export async function importUnrealDirectory(
   );
 
   const promotion = await mkdtemp(join(promotionParent, ".threenative-import-"));
+  /** GLB path (relative to the output) -> texture name -> source PNG paths; see `ImportUnrealRequest.proofSources`. */
+  const proofByGlb = new Map<string, Map<string, string[]>>();
+  const proofFor = (glbPath: string): Map<string, string[]> | undefined => {
+    if (!request.proofSources) return undefined;
+    const key = relative(promotion, glbPath).split(sep).join("/");
+    const sources = proofByGlb.get(key) ?? new Map<string, string[]>();
+    proofByGlb.set(key, sources);
+    return sources;
+  };
 
   // Only a verified entitlement earns a copyright line. A local pack whose licence nobody
   // checked stays blank so the game's asset health check keeps saying "unknown".
@@ -3366,6 +3394,7 @@ export async function importUnrealDirectory(
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
             onMaterialResolved: request.onMaterialResolved,
+            proofSources: proofFor(glbPath),
           });
           prunedUvSets += packaged.prunedUvSets;
           droppedTangents += packaged.droppedTangents;
@@ -3491,6 +3520,7 @@ export async function importUnrealDirectory(
           sourceMaterial: sourceForMesh(source.entry.file),
           graphBaker,
           onMaterialResolved: request.onMaterialResolved,
+          proofSources: proofFor(glbPath),
         });
         prunedUvSets += packaged.prunedUvSets;
         droppedTangents += packaged.droppedTangents;
@@ -3596,6 +3626,7 @@ export async function importUnrealDirectory(
           },
           graphBaker,
           onMaterialResolved: request.onMaterialResolved,
+          proofSources: proofFor(glbPath),
         });
         await validateGlb(glbPath);
         const sections = new Map(packaged.sections.map((section) => [section.name, section]));
@@ -4399,6 +4430,8 @@ export async function importUnrealDirectory(
 
     await writeFile(join(promotion, "import-report.json"), `${JSON.stringify(report, null, 2)}\n`);
     await rename(promotion, outputDir);
+    // The staging PNGs are still on disk here and are removed in `finally`.
+    if (request.proofSources) await request.proofSources(proofByGlb, report);
     log(
       `Promoted ${models.length} model GLB${models.length === 1 ? "" : "s"}, ${textures.length} texture PNG${textures.length === 1 ? "" : "s"}, ${cubemaps.length} cubemap environment map${cubemaps.length === 1 ? "" : "s"}, ${textureStacks.length} multidimensional texture stack${textureStacks.length === 1 ? "" : "s"}, ${standaloneMaterials.length} material asset${standaloneMaterials.length === 1 ? "" : "s"}, ${audio.length} audio file${audio.length === 1 ? "" : "s"}, ${fonts.length} font face${fonts.length === 1 ? "" : "s"}, ${bitmapFonts.length} bitmap font${bitmapFonts.length === 1 ? "" : "s"}, ${sprites.length} sprite GLB${sprites.length === 1 ? "" : "s"}, ${flipbooks.length} flipbook manifest${flipbooks.length === 1 ? "" : "s"}, ${dataAssets.length} data JSON file${dataAssets.length === 1 ? "" : "s"}, and ${scenes.length} scene GLB${scenes.length === 1 ? "" : "s"} to ${outputDir}.`,
     );
