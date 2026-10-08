@@ -67,6 +67,8 @@ export interface EntryProof {
     readonly compared: number;
     readonly agreeing: number;
     readonly minSsim: number | null;
+    /** Compared textures the two decoders produced at different resolutions. */
+    readonly sizeMismatches?: number;
   };
 }
 
@@ -113,7 +115,7 @@ export function entryProofOf(proof: TextureProof, cross?: CrossDecodeProof): Ent
     ...(proof.resized > 0 ? { resized: proof.resized } : {}),
     ...(proof.graph.checked > 0 ? { graph: { ok: proof.graph.ok, checked: proof.graph.checked } } : {}),
     ...(cross
-      ? { cross: { status: cross.status, compared: cross.compared, agreeing: cross.agreeing, minSsim: cross.minSsim } }
+      ? { cross: { status: cross.status, compared: cross.compared, agreeing: cross.agreeing, minSsim: cross.minSsim, sizeMismatches: cross.sizeMismatches } }
       : {}),
   };
 }

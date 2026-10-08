@@ -320,7 +320,7 @@ async function main(): Promise<number> {
         proofSources: async (sources, report) => {
           const state = packProof;
           try {
-            const flat = flattenProofSources(sources);
+            const flat = await flattenProofSources(sources);
             state.texture = await proveTextures({
               report,
               outputDir: request.outputDir,
@@ -498,6 +498,7 @@ async function crossDecode(
       compared: 0,
       agreeing: 0,
       unavailable: proof.crossSources.size,
+      sizeMismatches: 0,
       minSsim: null,
       threshold: 0.999,
       results: [{ texture: "*", status: "unavailable", reason: (error instanceof Error ? error.message : String(error)).slice(0, 240) }],

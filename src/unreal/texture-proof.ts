@@ -18,7 +18,7 @@ import { join, resolve, sep } from "node:path";
 import { NodeIO, type Document, type Material, type Texture } from "@gltf-transform/core";
 import { ALL_EXTENSIONS } from "@gltf-transform/extensions";
 
-import { compareImages, decodeRgba, type ImageComparison, type RgbaImage } from "./image-diff.js";
+import { compareImages, decodeRgba, resizeRgba, type ImageComparison, type RgbaImage } from "./image-diff.js";
 import { applyTextureTransform, type ImportReport, type ImportedMaterialSection } from "./importer.js";
 import { PARITY_LIST_CAP } from "./parity.js";
 import { runBounded } from "./toolchain.js";
@@ -97,20 +97,48 @@ export interface ProveTexturesOptions {
   readonly sample?: number | undefined;
 }
 
-/** The flat view of the importer's per-GLB source map; names with differing files are `ambiguous`. */
-export function flattenProofSources(
+const fileHash = async (path: string): Promise<string> => createHash("sha256").update(await readFile(path)).digest("hex");
+
+/**
+ * One path per distinct file content. UE Viewer writes the same texture once per material export,
+ * into different directories; those copies are one source, not an ambiguity.
+ */
+export async function distinctByContent(paths: readonly string[]): Promise<string[]> {
+  if (paths.length <= 1) return [...paths];
+  const seen = new Map<string, string>();
+  for (const path of paths) {
+    let hash: string;
+    try {
+      hash = await fileHash(path);
+    } catch {
+      hash = `unreadable:${path}`;
+    }
+    if (!seen.has(hash)) seen.set(hash, path);
+  }
+  return [...seen.values()];
+}
+
+/**
+ * The flat view of the importer's per-GLB source map. A name is `ambiguous` only when files with
+ * different content carry it; byte-identical copies in different directories collapse to one.
+ */
+export async function flattenProofSources(
   byGlb: ReadonlyMap<string, ReadonlyMap<string, readonly string[]>>,
-): { sourceTextures: Map<string, string>; ambiguous: Set<string> } {
+): Promise<{ sourceTextures: Map<string, string>; ambiguous: Set<string> }> {
+  const paths = new Map<string, Set<string>>();
+  for (const textures of byGlb.values()) {
+    for (const [name, found] of textures) {
+      const held = paths.get(name) ?? new Set<string>();
+      for (const path of found) held.add(path);
+      paths.set(name, held);
+    }
+  }
   const sourceTextures = new Map<string, string>();
   const ambiguous = new Set<string>();
-  for (const textures of byGlb.values()) {
-    for (const [name, paths] of textures) {
-      for (const path of paths) {
-        const known = sourceTextures.get(name);
-        if (known !== undefined && known !== path) ambiguous.add(name);
-        sourceTextures.set(name, path);
-      }
-    }
+  for (const [name, held] of paths) {
+    const distinct = await distinctByContent([...held].sort());
+    sourceTextures.set(name, distinct[0]!);
+    if (distinct.length > 1) ambiguous.add(name);
   }
   return { sourceTextures, ambiguous };
 }
@@ -329,7 +357,8 @@ export async function proveTextures(options: ProveTexturesOptions): Promise<Text
           skip("not-embedded: slot holds another texture");
           continue;
         }
-        const perGlb = options.sourcesByGlb?.get(entry.glb)?.get(binding.texture);
+        const found = options.sourcesByGlb?.get(entry.glb)?.get(binding.texture);
+        const perGlb = found === undefined ? undefined : await distinctByContent(found);
         let sourcePath: string | undefined;
         if (perGlb !== undefined) {
           if (perGlb.length !== 1) {
@@ -410,7 +439,10 @@ export interface CrossDecodeEntry {
   readonly maxAbs?: number;
   readonly width?: number;
   readonly height?: number;
+  /** The decoders produced different resolutions; `width`/`height` is the common size compared. */
   readonly sizeDiffers?: boolean;
+  readonly viewerSize?: string;
+  readonly cue4parseSize?: string;
 }
 
 export interface CrossDecodeProof {
@@ -420,6 +452,8 @@ export interface CrossDecodeProof {
   readonly compared: number;
   readonly agreeing: number;
   readonly unavailable: number;
+  /** Compared textures the two decoders produced at different resolutions. */
+  readonly sizeMismatches: number;
   readonly minSsim: number | null;
   readonly threshold: number;
   readonly results: readonly CrossDecodeEntry[];
@@ -489,11 +523,19 @@ export async function crossDecodeProof(
         results.push({ texture: name, status: "unavailable", reason: "CUE4Parse wrote no PNG for this texture" });
         continue;
       }
+      const viewer = await decodeRgba(await readFile(viewerPath));
+      const cue4parse = await decodeRgba(await readFile(decoded));
+      // Decoders may keep different mips. The pixels are compared at the smaller of the two sizes
+      // (the larger one is downsampled), and the size difference is reported on its own.
+      const sizeDiffers = viewer.width !== cue4parse.width || viewer.height !== cue4parse.height;
+      const viewerIsSmaller = viewer.width * viewer.height <= cue4parse.width * cue4parse.height;
+      const target = viewerIsSmaller ? viewer : cue4parse;
       // Premultiplied: the two decoders may keep different colour behind alpha 0, which no one can see.
-      const compared = await compareImages(await decodeRgba(await readFile(viewerPath)), await decodeRgba(await readFile(decoded)), {
-        resizeToMatch: true,
-        premultiplied: true,
-      });
+      const compared = await compareImages(
+        viewerIsSmaller ? viewer : await resizeRgba(viewer, target.width, target.height),
+        viewerIsSmaller ? await resizeRgba(cue4parse, target.width, target.height) : cue4parse,
+        { premultiplied: true },
+      );
       results.push({
         texture: name,
         status: compared.ssim >= threshold ? "agree" : "disagree",
@@ -502,7 +544,9 @@ export async function crossDecodeProof(
         maxAbs: compared.maxAbs,
         width: compared.width,
         height: compared.height,
-        ...(compared.resized ? { sizeDiffers: true } : {}),
+        ...(sizeDiffers
+          ? { sizeDiffers: true, viewerSize: `${viewer.width}x${viewer.height}`, cue4parseSize: `${cue4parse.width}x${cue4parse.height}` }
+          : {}),
       });
     } catch (error) {
       results.push({ texture: name, status: "unavailable", reason: (error instanceof Error ? error.message : String(error)).slice(0, 240) });
@@ -518,6 +562,7 @@ export async function crossDecodeProof(
     compared: compared.length,
     agreeing,
     unavailable: results.length - compared.length,
+    sizeMismatches: compared.filter((r) => r.sizeDiffers).length,
     minSsim: compared.length === 0 ? null : Math.min(...compared.map((r) => r.ssim ?? 0)),
     threshold,
     results: results.slice(0, PARITY_LIST_CAP),

@@ -832,13 +832,13 @@ describe("S5 texture-identity proof in the scorecard", () => {
       worst: [], skipped: {}, graph: { checked: 0, ok: 0, failures: [] }, ...overrides,
     };
   }
-  const cross: CrossDecodeProof = { status: "agree", requested: 2, compared: 2, agreeing: 2, unavailable: 0, minSsim: 0.9995, threshold: 0.999, results: [] };
+  const cross: CrossDecodeProof = { status: "agree", requested: 2, compared: 2, agreeing: 2, unavailable: 0, sizeMismatches: 0, minSsim: 0.9995, threshold: 0.999, results: [] };
 
   it("records the proof on a passing entry without changing its verdict", () => {
     const judged = withTextureProof(entry({ status: "pass" }), proof(), cross);
     expect(judged.status).toBe("pass");
     expect(judged.reasons).toEqual([]);
-    expect(judged.proof).toEqual({ compared: 4, identical: 4, minSsim: 1, resized: 1, cross: { status: "agree", compared: 2, agreeing: 2, minSsim: 0.9995 } });
+    expect(judged.proof).toEqual({ compared: 4, identical: 4, minSsim: 1, resized: 1, cross: { status: "agree", compared: 2, agreeing: 2, minSsim: 0.9995, sizeMismatches: 0 } });
   });
 
   it("fails a pack whose compared texture differs and names the textures", () => {

@@ -87,7 +87,7 @@ async function importPack(size: number, maxTextureSize?: number): Promise<Import
 }
 
 async function prove(imported: Imported, maxTextureSize?: number) {
-  const flat = flattenProofSources(imported.byGlb);
+  const flat = await flattenProofSources(imported.byGlb);
   return proveTextures({
     report: imported.report,
     outputDir: imported.outputDir,
@@ -148,7 +148,7 @@ describe("proveTextures", () => {
 
   it("does not compare a source that is ambiguous or missing, and says why", async () => {
     const imported = await importPack(16);
-    const flat = flattenProofSources(imported.byGlb);
+    const flat = await flattenProofSources(imported.byGlb);
     const proof = await proveTextures({
       report: imported.report,
       outputDir: imported.outputDir,
@@ -160,9 +160,27 @@ describe("proveTextures", () => {
     expect(proof.skipped).toEqual({ "ambiguous source": 1, "no source png": 1 });
   });
 
+  it("treats byte-identical copies of a texture as one source and differing copies as ambiguous", async () => {
+    const directory = await scratch();
+    const one = join(directory, "one.png");
+    const copy = join(directory, "copy.png");
+    const other = join(directory, "other.png");
+    await writeAsymmetricPng(one, 16, 1);
+    await writeFile(copy, await readFile(one));
+    await writeAsymmetricPng(other, 16, 2);
+    const flat = await flattenProofSources(
+      new Map([
+        ["a.glb", new Map([["Same", [one, copy]], ["Differs", [one, other]]])],
+        ["b.glb", new Map([["Same", [copy]]])],
+      ]),
+    );
+    expect([...flat.ambiguous]).toEqual(["Differs"]);
+    expect(flat.sourceTextures.get("Same")).toBe(copy);
+  });
+
   it("caps the work with an even sample and says so", async () => {
     const imported = await importPack(16);
-    const flat = flattenProofSources(imported.byGlb);
+    const flat = await flattenProofSources(imported.byGlb);
     const proof = await proveTextures({
       report: imported.report,
       outputDir: imported.outputDir,
@@ -194,7 +212,7 @@ describe("proveTextures", () => {
       environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: join(directory, "cache") },
       umodel: { name: "umodel", path: tool, version: "fixture" },
       proofSources: async (sources, report) => {
-        const flat = flattenProofSources(sources);
+        const flat = await flattenProofSources(sources);
         sourcePath = flat.sourceTextures.get("T_Rock_D")!;
         inHook = await proveTextures({ report, outputDir, sourceTextures: flat.sourceTextures });
       },
@@ -277,6 +295,21 @@ fs.copyFileSync(pngs[filter], join(out, filter + ".png"));
       sourceTextures: new Map([["A", a], ["B", a]]),
     });
     expect(proof).toMatchObject({ status: "agree", requested: 2, compared: 2, agreeing: 2, unavailable: 0, minSsim: 1 });
+  });
+
+  it("compares at the smaller resolution when the decoders disagree on size, and reports the sizes", async () => {
+    const directory = await scratch();
+    const width = 64;
+    const data = Buffer.alloc(width * width * 4);
+    for (let y = 0; y < width; y++) for (let x = 0; x < width; x++) data.set([x * 4, y * 4, 128, 255], (y * width + x) * 4);
+    const viewer = join(directory, "viewer.png");
+    const half = join(directory, "half.png");
+    await writeFile(viewer, await sharp(data, { raw: { width, height: width, channels: 4 } }).png().toBuffer());
+    await writeFile(half, await sharp(data, { raw: { width, height: width, channels: 4 } }).resize(32, 32).png().toBuffer());
+    const converter = await fakeConverter(directory, { Mip: half });
+    const proof = await crossDecodeProof(directory, ["Mip"], { converterPath: converter, sourceTextures: new Map([["Mip", viewer]]) });
+    expect(proof).toMatchObject({ status: "agree", sizeMismatches: 1 });
+    expect(proof.results[0]).toMatchObject({ width: 32, height: 32, sizeDiffers: true, viewerSize: "64x64", cue4parseSize: "32x32" });
   });
 
   it("flags a disagreement below the ssim threshold", async () => {
