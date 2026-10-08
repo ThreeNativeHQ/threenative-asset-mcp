@@ -343,11 +343,15 @@ class Compiler {
   private readonly active = new Set<string>();
   private readonly textureRegisters = new Map<string, Val>();
   private readonly nodes = new Map<string, GraphNode>();
+  /** Texture parameters this compile reached that the instance chain does not bind (and the graph gives no texture). */
+  readonly unboundTextures = new Set<string>();
 
   constructor(
-    graph: MaterialGraph,
+    private readonly graph: MaterialGraph,
     private readonly parameters: GraphParameters,
     private readonly options: CompileOptions,
+    /** Branch choices of unoverridden static switches, shared with the trial compilers so each switch is decided once. */
+    private readonly switchChoices: Map<string, { value: boolean; flipped: boolean }> = new Map(),
   ) {
     for (const node of graph.nodes) this.nodes.set(node.id, node);
   }
@@ -608,7 +612,8 @@ class Compiler {
       case "StaticSwitchParameter": {
         const override = node.parameter ? this.parameters.switches.get(node.parameter.name.toLowerCase()) : undefined;
         const stored = typeof node.default === "boolean" ? node.default : node.switchValue === true;
-        return this.branch(node, override ?? stored);
+        if (override !== undefined) return this.branch(node, override);
+        return this.branch(node, this.unoverriddenSwitch(node, stored));
       }
       case "StaticSwitch":
         return this.branch(node, this.staticBool(node.inputs.Value, node.switchValue === true, "StaticSwitch.Value"));
@@ -689,6 +694,33 @@ class Compiler {
     return this.constant([0], 1);
   }
 
+  /**
+   * The dump carries no static-switch overrides of a material instance, so an unoverridden switch falls back to the
+   * parent's default. When that default branch samples a texture parameter that neither the instance chain nor the
+   * graph binds (Unreal would sample its black default), it cannot be the branch the instance is using, and the other
+   * branch is taken if every texture it samples is bound. Recorded as an approximation.
+   */
+  private unoverriddenSwitch(node: GraphNode, stored: boolean): boolean {
+    let choice = this.switchChoices.get(node.id);
+    if (!choice) {
+      choice = { value: stored, flipped: false };
+      this.switchChoices.set(node.id, choice);
+      const unboundIn = (value: boolean): boolean => {
+        const trial = new Compiler(this.graph, this.parameters, this.options, this.switchChoices);
+        trial.pin(value ? (node.inputs.A ?? node.inputs.True) : (node.inputs.B ?? node.inputs.False));
+        return trial.unboundTextures.size > 0;
+      };
+      if (unboundIn(stored) && !unboundIn(!stored)) choice = { value: !stored, flipped: true };
+      this.switchChoices.set(node.id, choice);
+    }
+    if (choice.flipped) {
+      this.approximations.add(
+        `static switch "${node.parameter?.name ?? node.id}" taken as ${choice.value}: its default branch samples a texture parameter the material instance does not bind`,
+      );
+    }
+    return choice.value;
+  }
+
   private branch(node: GraphNode, value: boolean): Compiled {
     const chosen = value ? (node.inputs.A ?? node.inputs.True) : (node.inputs.B ?? node.inputs.False);
     return this.pin(chosen) ?? this.markUnavailable(`${node.class} ${node.id} has no ${value ? "A (true)" : "B (false)"} input`);
@@ -733,6 +765,7 @@ class Compiler {
       if (textureObject) this.classes.add(textureObject.class);
       reference = textureObject?.texture ?? undefined;
     }
+    if (!reference) this.unboundTextures.add(node.id);
     if (!reference) return this.markUnavailable(`texture sample ${node.id}${parameterName ? ` (parameter "${node.parameter?.name}")` : ""} has no texture`);
 
     const coordinates = node.inputs.Coordinates ? this.vec(node.inputs.Coordinates, "TextureSample.Coordinates") : undefined;
