@@ -334,20 +334,23 @@ export async function compareImages(
     left = premultiplyAlpha(left);
     right = premultiplyAlpha(right);
   }
-  const scores = ssimScores(left, right);
   const maxAbs = maxAbsDiff(left, right);
+  // Bit-identical pixels score perfectly by definition; skipping the windows keeps a sweep over
+  // hundreds of textures fast, because identity is the common case.
+  const exact = maxAbs === 0;
+  const scores = exact ? { luma: 1, channelMean: 1, ssim: 1 } : ssimScores(left, right);
   return {
     width: left.width,
     height: left.height,
-    mse: mse(left, right),
-    psnr: psnr(left, right),
+    mse: exact ? 0 : mse(left, right),
+    psnr: exact ? Infinity : psnr(left, right),
     ssim: scores.ssim,
     ssimLuma: scores.luma,
     ssimChannels: scores.channelMean,
     maxAbs,
-    identical: maxAbs === 0 && !resized,
+    identical: exact && !resized,
     resized,
-    dHashDistance: hammingDistance(dHash(left), dHash(right)),
-    pHashDistance: hammingDistance(perceptualHash(left), perceptualHash(right)),
+    dHashDistance: exact ? 0 : hammingDistance(dHash(left), dHash(right)),
+    pHashDistance: exact ? 0 : hammingDistance(perceptualHash(left), perceptualHash(right)),
   };
 }
