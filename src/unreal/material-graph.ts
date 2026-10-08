@@ -22,7 +22,10 @@ import type { GraphInput, GraphNode, MaterialGraph } from "./graph-dump.js";
  *   texture's row order. Sampling is bilinear with wrap/repeat; texel centres sit at (i + 0.5) / extent.
  * - Minification: when a sample's coordinates are TextureCoordinate x tiling, the sample reads the mip
  *   level closest to the texel-to-pixel ratio (box-filtered in linear space), so a tiling-8 texture baked
- *   at 1024 does not alias.
+ *   at 1024 does not alias. The scale is carried through Multiply/Divide/Add/Subtract by a constant and through
+ *   CustomRotator and UVEdit, so tiled and rotated coordinates keep their mip level.
+ * - Texture coordinates are a general per-texel value (2 floats): UV-producing nodes (TextureCoordinate, Add/Multiply/
+ *   Divide on UVs, AppendVector, ComponentMask, CustomRotator, UVEdit) compose freely and feed any `Coordinates` pin.
  */
 
 export interface GraphParameters {
@@ -130,6 +133,9 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "HueShift",
   "DitherTemporalAA",
   "FlattenNormal",
+  "CustomRotator",
+  "UVEdit",
+  "ConvertFromDiffSpec",
 ] as const;
 
 /**
@@ -548,15 +554,27 @@ class Compiler {
         return this.constant([values[0] ?? 0, values[1] ?? 0, values[2] ?? 0, values[3] ?? 0], node.class === "Constant3Vector" ? 3 : 4);
       }
       // Class defaults below are Unreal's; the dumper omits a constant that equals its default.
-      case "Multiply":
-        return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => x * y);
-      case "Divide":
+      case "Multiply": {
+        const a = this.operand(node, "A", "ConstA", 0);
+        const b = this.operand(node, "B", "ConstB", 1);
+        return this.carryUvScale(this.binary(a, b, (x, y) => x * y), a, b, "mul");
+      }
+      case "Divide": {
+        const a = this.operand(node, "A", "ConstA", 0);
+        const b = this.operand(node, "B", "ConstB", 1);
         // A divisor within 1e-6 of zero is pushed out to 1e-6, keeping its sign, so a black texel yields a large finite value.
-        return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => x / (Math.abs(y) < 1e-6 ? (y < 0 ? -1e-6 : 1e-6) : y));
-      case "Add":
-        return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => x + y);
-      case "Subtract":
-        return this.binary(this.operand(node, "A", "ConstA", 1), this.operand(node, "B", "ConstB", 1), (x, y) => x - y);
+        return this.carryUvScale(this.binary(a, b, (x, y) => x / (Math.abs(y) < 1e-6 ? (y < 0 ? -1e-6 : 1e-6) : y)), a, b, "div");
+      }
+      case "Add": {
+        const a = this.operand(node, "A", "ConstA", 0);
+        const b = this.operand(node, "B", "ConstB", 1);
+        return this.carryUvScale(this.binary(a, b, (x, y) => x + y), a, b, "add");
+      }
+      case "Subtract": {
+        const a = this.operand(node, "A", "ConstA", 1);
+        const b = this.operand(node, "B", "ConstB", 1);
+        return this.carryUvScale(this.binary(a, b, (x, y) => x - y), a, b, "sub");
+      }
       case "LinearInterpolate":
         return this.lerp(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), this.operand(node, "Alpha", "ConstAlpha", 0.5));
       case "Power": {
@@ -713,7 +731,18 @@ class Compiler {
       if (!this.options.allowUvSetFallback) return this.markUnsupported(`TextureCoordinate[${index}]`);
       this.approximations.add(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
     }
-    const [su, sv] = node.tiling ?? [1, 1];
+    return this.uvSource(node.tiling ?? [1, 1]);
+  }
+
+  private defaultUvVal: Val | undefined;
+
+  /** The mesh UV0 an unwired UV input of an engine function falls back to (a TextureCoordinate with tiling 1). */
+  private defaultUv(): Val {
+    this.defaultUvVal ??= this.uvSource([1, 1]);
+    return this.defaultUvVal;
+  }
+
+  private uvSource([su, sv]: readonly [number, number]): Val {
     const reg = this.allocate();
     this.program.push((r, texel) => {
       r[reg] = texel.u * su;
@@ -870,6 +899,141 @@ class Compiler {
     return { kind: "attr", baseColor: this.lerp(base.baseColor ?? black, top.baseColor ?? black, alpha) };
   }
 
+  // -- texture coordinates --------------------------------------------------------------------------------
+
+  /** Component `index` of a value that is constant at compile time (a scalar broadcasts). */
+  private constComponent(value: Val, index: number): number {
+    return this.registers[value.reg + (value.n === 1 ? 0 : index)]!;
+  }
+
+  /**
+   * Carries a UV value's `uvScale` through arithmetic with a compile-time constant, so a sample keeps choosing its mip
+   * level after `uv * tiling`, `uv / tiling` or `uv + offset`. Anything else drops it (the sample reads level 0).
+   */
+  private carryUvScale(result: Val, a: Val, b: Val, kind: "mul" | "div" | "add" | "sub"): Val {
+    const scaled = (uv: Val, constant: Val, apply: (scale: number, factor: number) => number): void => {
+      result.uvScale = [apply(uv.uvScale![0], this.constComponent(constant, 0)), apply(uv.uvScale![1], this.constComponent(constant, 1))];
+    };
+    if (a.uvScale && b.konst) {
+      if (kind === "mul") scaled(a, b, (scale, factor) => scale * Math.abs(factor));
+      else if (kind === "div") scaled(a, b, (scale, factor) => scale / Math.max(Math.abs(factor), 1e-6));
+      else result.uvScale = a.uvScale;
+    } else if (b.uvScale && a.konst) {
+      if (kind === "mul") scaled(b, a, (scale, factor) => scale * Math.abs(factor));
+      else if (kind === "add") result.uvScale = b.uvScale;
+    }
+    return result;
+  }
+
+  /**
+   * Rotates a 2D coordinate about `center` by `turns` full turns: with d = uv - center, uv' = (cos*dx - sin*dy,
+   * sin*dx + cos*dy) + center, angle = 2*pi*turns. This is Unreal's `Rotator` matrix with a 0..1 angle. Returns the
+   * input untouched when the angle is a compile-time zero.
+   */
+  private rotateUv(uv: Val, center: Val, turns: Val): Val {
+    if (turns.konst && this.registers[turns.reg] === 0) return uv;
+    const uvStride = uv.n === 1 ? 0 : 1;
+    const centerStride = center.n === 1 ? 0 : 1;
+    const rotated = this.emit([uv, center, turns], 2, (o) => (r) => {
+      const angle = r[turns.reg]! * 2 * Math.PI;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const cx = r[center.reg]!;
+      const cy = r[center.reg + centerStride]!;
+      const dx = r[uv.reg]! - cx;
+      const dy = r[uv.reg + uvStride]! - cy;
+      r[o] = cos * dx - sin * dy + cx;
+      r[o + 1] = sin * dx + cos * dy + cy;
+      r[o + 2] = r[o + 3] = 0;
+    });
+    if (uv.uvScale) {
+      const magnitude = Math.max(Math.abs(uv.uvScale[0]), Math.abs(uv.uvScale[1]));
+      rotated.uvScale = [magnitude, magnitude];
+    }
+    return rotated;
+  }
+
+  /**
+   * CustomRotator(Input0 = UVs, Input1 = Rotation Center, Input2 = Rotation Angle (0-1)): the real dumps wire the angle as
+   * degrees / -360. Unwired UVs are UV0 and an unwired centre is (0.5, 0.5), the function's defaults. A zero angle is the
+   * identity and exact; any other angle uses the Rotator matrix, which is a heuristic because the body is engine content.
+   */
+  private customRotator(node: GraphNode, name: string): Compiled {
+    const wiredUv = this.namedPin(node, ["input0", "uvs"]);
+    const uv = wiredUv ? this.vec(wiredUv, `${name}.UVs`) : this.defaultUv();
+    if (!uv) return this.markUnavailable(`${name} ${node.id} has no UVs input`);
+    const wiredCenter = this.namedPin(node, ["input1", "rotationcenter"]);
+    const center = (wiredCenter ? this.vec(wiredCenter, `${name}.Rotation Center`) : undefined) ?? this.constant([0.5, 0.5], 2);
+    const wiredAngle = this.namedPin(node, ["input2", "rotationangle0"]);
+    const turns = (wiredAngle ? this.vec(wiredAngle, `${name}.Rotation Angle`) : undefined) ?? this.constant([0], 1);
+    const result = this.rotateUv(uv, center, turns);
+    if (result !== uv) this.approximations.add(`${name}: engine body unavailable; UVs rotated about the centre by the angle as a fraction of a turn (Rotator matrix)`);
+    return result;
+  }
+
+  /**
+   * Datasmith UVEdit(Input0 = UV, Input1 = Tiling_Pivot, Input2 = UV_Tiling, Input3 = Mirror_U, Input4 = Mirror_V,
+   * Input5 = Rotation_Pivot, Input6 = W_Rotation, Input7 = UV_Offset; the real dump names them like that). Body not in the
+   * pack, so the order is the 3ds Max texture-transform order: scale about the tiling pivot, mirror-repeat the flagged axes,
+   * rotate about the rotation pivot (W_Rotation as a fraction of a turn), then add the offset. Always heuristic.
+   * Unwired inputs are the identity (no pivot, tiling 1, no mirror, no rotation, no offset).
+   */
+  private uvEdit(node: GraphNode, name: string): Compiled {
+    const wiredUv = node.inputs.Input0;
+    const uv = wiredUv ? this.vec(wiredUv, `${name}.UV`) : this.defaultUv();
+    if (!uv) return this.markUnavailable(`${name} ${node.id} has no UV input`);
+    const optional = (pinName: string, fallback: readonly number[]): Val => (node.inputs[pinName] ? this.vec(node.inputs[pinName], `${name}.${pinName}`) : undefined) ?? this.constant(fallback, fallback.length);
+    const tilingPivot = optional("Input1", [0, 0]);
+    const tiling = optional("Input2", [1, 1]);
+    const mirrorU = this.staticBool(node.inputs.Input3, false, `${name}.Mirror_U`);
+    const mirrorV = this.staticBool(node.inputs.Input4, false, `${name}.Mirror_V`);
+    const rotationPivot = optional("Input5", [0, 0]);
+    const rotation = optional("Input6", [0]);
+    const offset = optional("Input7", [0, 0]);
+    this.approximations.add(`${name}: engine body unavailable; UV scaled about the tiling pivot, mirrored per axis, rotated (W_Rotation as a fraction of a turn) about the rotation pivot, then offset`);
+
+    const uvStride = uv.n === 1 ? 0 : 1;
+    const stride = (value: Val) => (value.n === 1 ? 0 : 1);
+    const pivotStride = stride(tilingPivot);
+    const tilingStride = stride(tiling);
+    const scaled = this.emit([uv, tilingPivot, tiling], 2, (o) => (r) => {
+      const pu = r[tilingPivot.reg]!;
+      const pv = r[tilingPivot.reg + pivotStride]!;
+      r[o] = (r[uv.reg]! - pu) * r[tiling.reg]! + pu;
+      r[o + 1] = (r[uv.reg + uvStride]! - pv) * r[tiling.reg + tilingStride]! + pv;
+      r[o + 2] = r[o + 3] = 0;
+    });
+    if (uv.uvScale) scaled.uvScale = [uv.uvScale[0] * Math.abs(this.maybeConstant(tiling, 0)), uv.uvScale[1] * Math.abs(this.maybeConstant(tiling, 1))];
+    // Mirror-repeat: x in [0, 1] stays, [1, 2] folds back, period 2.
+    const fold = (x: number): number => {
+      const wrapped = ((x % 2) + 2) % 2;
+      return wrapped > 1 ? 2 - wrapped : wrapped;
+    };
+    const mirrored =
+      mirrorU || mirrorV
+        ? this.emit([scaled], 2, (o) => (r) => {
+            r[o] = mirrorU ? fold(r[scaled.reg]!) : r[scaled.reg]!;
+            r[o + 1] = mirrorV ? fold(r[scaled.reg + 1]!) : r[scaled.reg + 1]!;
+            r[o + 2] = r[o + 3] = 0;
+          })
+        : scaled;
+    if (mirrored !== scaled && scaled.uvScale) mirrored.uvScale = scaled.uvScale;
+    const rotated = this.rotateUv(mirrored, rotationPivot, rotation);
+    const offsetStride = stride(offset);
+    const result = this.emit([rotated, offset], 2, (o) => (r) => {
+      r[o] = r[rotated.reg]! + r[offset.reg]!;
+      r[o + 1] = r[rotated.reg + 1]! + r[offset.reg + offsetStride]!;
+      r[o + 2] = r[o + 3] = 0;
+    });
+    if (rotated.uvScale) result.uvScale = rotated.uvScale;
+    return result;
+  }
+
+  /** Component of `value` when it is a compile-time constant, else 1 (the scale is then only a mip hint). */
+  private maybeConstant(value: Val, index: number): number {
+    return value.konst ? this.constComponent(value, index) : 1;
+  }
+
   // -- function calls -------------------------------------------------------------------------------------
 
   private functionCall(node: GraphNode, output: number): Compiled {
@@ -909,6 +1073,20 @@ class Compiler {
       return this.unary(stretched, (x) => (x < 0 ? 0 : x > 1 ? 1 : x));
     }
     if (lower === "hueshift") return this.hueShift(node, name!);
+    // A pack that carries its own body (a Datasmith project holds UVEdit) is evaluated from that body instead.
+    const hasBody = node.fn?.outputs[output] != null;
+    if (lower === "customrotator" && !hasBody) return this.customRotator(node, name!);
+    if (lower === "uvedit" && !hasBody) return this.uvEdit(node, name!);
+    if (lower === "convertfromdiffspec" && !hasBody) {
+      const attribute = node.outputNames?.[output] ?? ["BaseColor", "Metallic", "Specular"][output] ?? `output${output}`;
+      if (attribute !== "BaseColor") {
+        // Only BaseColor is evaluated; the Metallic/Specular split of the diffuse+specular pair is the engine body's.
+        this.unsupported.add(`${name}.${attribute}`);
+        return this.constant([0], 1);
+      }
+      this.approximations.add("ConvertFromDiffSpec: BaseColor taken from the diffuse input; engine body unavailable");
+      return this.passThrough(node, "Input0", name!);
+    }
     if (lower === "dithertemporalaa") {
       // Input0 is the opacity, Input1 the dither pattern: the result is a dithered opacity, which BaseColor never reads.
       this.approximations.add("DitherTemporalAA: dithering ignored; engine body unavailable");

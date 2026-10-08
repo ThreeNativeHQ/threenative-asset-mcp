@@ -1177,3 +1177,179 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
     }
   });
 });
+
+describe("UV-producing nodes: CustomRotator, UVEdit, UV arithmetic, ConvertFromDiffSpec", () => {
+  // Asymmetric 4x4 texture: every texel distinct, so a transposed, mirrored or wrongly rotated bake cannot match.
+  const texel = (x: number, y: number): Rgb => [40 * x + 10, 60 * y + 5, 77];
+  const ROTATOR_NOTE = "CustomRotator: engine body unavailable; UVs rotated about the centre by the angle as a fraction of a turn (Rotator matrix)";
+  const UVEDIT_NOTE =
+    "UVEdit: engine body unavailable; UV scaled about the tiling pivot, mirrored per axis, rotated (W_Rotation as a fraction of a turn) about the rotation pivot, then offset";
+
+  const bake = async (graph: MaterialGraph, textures: Record<string, Fixture>, size = 4) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size });
+  const orient = async (): Promise<Record<string, Fixture>> => ({ T_Orient: { png: await pngOf(4, 4, texel), srgb: true } });
+  const expectMapping = async (result: BakeResult, source: (x: number, y: number) => [number, number], size = 4) => {
+    const pixel = await pixelsOf(result);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) expect(pixel(x, y), `pixel ${x},${y}`).toEqual([...texel(...source(x, y))]);
+  };
+  const constant2 = (id: string, r: number, g: number): Raw => node(id, "Constant2Vector", { constants: { R: r, G: g } });
+  const scalar = (id: string, r: number): Raw => node(id, "Constant", { constants: { R: r } });
+  /** The PSR function's angle: degrees / -360, as dumped from the Playground Apocalypse master. */
+  const degreesAngle = (id: string, degrees: number): Raw[] => [
+    node(id, "Divide", { inputs: { A: pin(`${id}/deg`) }, constants: { ConstB: -360 } }),
+    scalar(`${id}/deg`, degrees),
+  ];
+  const rotatorGraph = (inputs: Raw, extra: Raw[] = []) =>
+    makeGraph([textureSample("t", "T_Orient", "Color", "rot"), engineCall("rot", "CustomRotator", inputs), textureCoordinate("uv"), ...extra], pin("t", 0, RGB_MASK));
+
+  it("CustomRotator turns the UVs a quarter about the default centre: output(x, y) = texture(3 - y, x)", async () => {
+    // angle = -90 / -360 = 0.25 turn; d = uv - 0.5; uv' = (cos*dx - sin*dy, sin*dx + cos*dy) + 0.5 = (0.5 - dy, 0.5 + dx).
+    // Output pixel (x, y) has dx = (x - 1.5) / 4, dy = (y - 1.5) / 4, so u' texel = 3 - y and v' texel = x, on texel centres.
+    const graph = rotatorGraph({ Input0: pin("uv"), Input1: null, Input2: pin("angle") }, degreesAngle("angle", -90));
+    const result = await bake(graph, await orient());
+    await expectMapping(result, (x, y) => [3 - y, x]);
+    if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [ROTATOR_NOTE] });
+  });
+
+  it("CustomRotator half turn is a point reflection, and a wired centre moves the pivot", async () => {
+    const half = await bake(rotatorGraph({ Input0: pin("uv"), Input2: pin("half") }, [scalar("half", 0.5)]), await orient());
+    await expectMapping(half, (x, y) => [3 - x, 3 - y]);
+    // Centre (0.25, 0.25): uv' = (0.25 - (v - 0.25), 0.25 + (u - 0.25)) = (0.5 - v, u): u' texel = (1 - y) mod 4, v' texel = x.
+    const moved = await bake(rotatorGraph({ Input0: pin("uv"), Input1: pin("centre", 0, [1, 1, 0, 0]), Input2: pin("quarter") }, [constant2("centre", 0.25, 0.25), scalar("quarter", 0.25)]), await orient());
+    await expectMapping(moved, (x, y) => [(1 - y + 4) % 4, x]);
+  });
+
+  it("CustomRotator with a zero or unwired angle is an exact identity, as in the Playground Rotation = 0 default", async () => {
+    // Playground shape: Add(Divide(CustomRotator(TexCoord, null, 0 / -360), Append(1, 1)), Append(0, 0)).
+    const nodes: Raw[] = [
+      textureSample("t", "T_Orient", "Color", "sum"),
+      node("sum", "Add", { inputs: { A: pin("div"), B: pin("offset") } }),
+      node("div", "Divide", { inputs: { A: pin("rot"), B: pin("tiling") } }),
+      engineCall("rot", "CustomRotator", { Input0: pin("uv"), Input1: null, Input2: pin("angle") }),
+      textureCoordinate("uv"),
+      ...degreesAngle("angle", 0),
+      node("tiling", "AppendVector", { inputs: { A: pin("one"), B: pin("one") } }),
+      node("offset", "AppendVector", { inputs: { A: pin("zero"), B: pin("zero") } }),
+      scalar("one", 1),
+      scalar("zero", 0),
+    ];
+    const result = await bake(makeGraph(nodes, pin("t", 0, RGB_MASK)), await orient());
+    await expectMapping(result, (x, y) => [x, y]);
+    if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+    const unwired = await bake(rotatorGraph({ Input0: pin("uv") }), await orient());
+    await expectMapping(unwired, (x, y) => [x, y]);
+    expect(supportedEngineFunctions()).toEqual(expect.arrayContaining(["CustomRotator", "UVEdit", "ConvertFromDiffSpec"]));
+  });
+
+  it("CustomRotator without UVs reads UV0", async () => {
+    const result = await bake(rotatorGraph({ Input2: pin("half") }, [scalar("half", 0.5)]), await orient());
+    await expectMapping(result, (x, y) => [3 - x, 3 - y]);
+  });
+
+  const uvEditGraph = (inputs: Raw, extra: Raw[], extraName = "UVEdit") =>
+    makeGraph([textureSample("t", "T_Orient", "Color", "edit"), engineCall("edit", extraName, { Input0: pin("uv"), ...inputs }), textureCoordinate("uv"), ...extra], pin("t", 0, RGB_MASK));
+
+  it("UVEdit offset adds to the UV: texture((x + 1) mod 4, (y + 2) mod 4) for offset (0.25, 0.5)", async () => {
+    const result = await bake(uvEditGraph({ Input7: pin("offset", 0, [1, 1, 0, 0]) }, [constant2("offset", 0.25, 0.5)]), await orient());
+    await expectMapping(result, (x, y) => [(x + 1) % 4, (y + 2) % 4]);
+    if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [UVEDIT_NOTE] });
+  });
+
+  it("UVEdit tiling scales about the tiling pivot", async () => {
+    // 2x2 stripes (column 0 black, column 1 white), output 4 wide, tiling (2, 1): uv_x = 2u - pivot. Pivot 0 reads texel x mod 2
+    // (0, 255, 0, 255); pivot 0.5 shifts by one texel: pos = x - 1 -> (255, 0, 255, 0).
+    const stripes = { T_Orient: { png: await pngOf(2, 2, (x) => (x === 0 ? [0, 0, 0] : [255, 255, 255])), srgb: true } };
+    const row = async (pivot: number) => {
+      const result = await bake(uvEditGraph({ Input1: pin("pivot", 0, [1, 1, 0, 0]), Input2: pin("tiling", 0, [1, 1, 0, 0]) }, [constant2("pivot", pivot, 0), constant2("tiling", 2, 1)]), stripes);
+      const pixel = await pixelsOf(result);
+      return [0, 1, 2, 3].map((x) => pixel(x, 0)[0]);
+    };
+    expect(await row(0)).toEqual([0, 255, 0, 255]);
+    expect(await row(0.5)).toEqual([255, 0, 255, 0]);
+  });
+
+  it("UVEdit mirrors a flagged axis (period-2 fold) and leaves the other alone", async () => {
+    // Texture varies along x only. Output 8 wide, tiling (2, 1): uv_x = (x + 0.5) / 4 -> texel x for x < 4, then folds: 7 - x.
+    const columns = { T_Orient: { png: await pngOf(4, 4, (x) => [40 * x + 10, 100, 77]), srgb: true } };
+    const run = async (mirror: boolean) => {
+      const graph = uvEditGraph({ Input2: pin("tiling", 0, [1, 1, 0, 0]), Input3: pin("mirror") }, [constant2("tiling", 2, 1), node("mirror", "StaticBool", { constants: { Value: mirror } })]);
+      const pixel = await pixelsOf(await bake(graph, columns, 8));
+      return [0, 1, 2, 3, 4, 5, 6, 7].map((x) => pixel(x, 3)[0]);
+    };
+    const red = (x: number) => 40 * x + 10;
+    expect(await run(true)).toEqual([0, 1, 2, 3, 3, 2, 1, 0].map(red));
+    expect(await run(false)).toEqual([0, 1, 2, 3, 0, 1, 2, 3].map(red));
+  });
+
+  it("UVEdit rotates about its pivot before adding the offset", async () => {
+    // W_Rotation 0.25 about (0.5, 0.5) is texture(3 - y, x); the offset (0.25, 0) then shifts u' by one texel: (4 - y) mod 4.
+    // Offset-then-rotate would land between texel centres and could not match these exact bytes.
+    const graph = uvEditGraph(
+      { Input5: pin("pivot", 0, [1, 1, 0, 0]), Input6: pin("turn"), Input7: pin("offset", 0, [1, 1, 0, 0]) },
+      [constant2("pivot", 0.5, 0.5), scalar("turn", 0.25), constant2("offset", 0.25, 0)],
+    );
+    await expectMapping(await bake(graph, await orient()), (x, y) => [(4 - y) % 4, x]);
+  });
+
+  it("UVEdit evaluates the pack's own body when it carries one, with no approximation", async () => {
+    // Datasmith projects ship UVEdit; an inlined body (here: UV + (0.25, 0)) wins over the name-matched approximation.
+    const call = node("edit", "FunctionCall", {
+      inputs: { Input0: pin("uv") },
+      function: "/DatasmithContent/Materials/UVEdit.UVEdit",
+      outputNames: ["Result"],
+      fn: { inputs: { Input0: "uv" }, outputs: ["edit/add"], output: "edit/add", outputNames: [""] },
+    });
+    const graph = makeGraph([textureSample("t", "T_Orient", "Color", "edit"), call, textureCoordinate("uv"), node("edit/add", "Add", { inputs: { A: pin("uv"), B: pin("edit/off") } }), constant2("edit/off", 0.25, 0)], pin("t", 0, RGB_MASK));
+    const result = await bake(graph, await orient());
+    await expectMapping(result, (x, y) => [(x + 1) % 4, y]);
+    if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+  });
+
+  it("composes general UV values: Append(TexCoord.r, 1 - TexCoord.g) flips V", async () => {
+    const graph = makeGraph(
+      [
+        textureSample("t", "T_Orient", "Color", "flip"),
+        node("flip", "AppendVector", { inputs: { A: pin("uv", 0, [1, 0, 0, 0]), B: pin("inv") } }),
+        node("inv", "OneMinus", { inputs: { Input: pin("uv", 0, [0, 1, 0, 0]) } }),
+        textureCoordinate("uv"),
+      ],
+      pin("t", 0, RGB_MASK),
+    );
+    const result = await bake(graph, await orient());
+    await expectMapping(result, (x, y) => [x, 3 - y]);
+    if (result.status === "baked") expect(result.confidence).toBe("exact");
+  });
+
+  it("keeps the mip level through Multiply by a constant UV scale", async () => {
+    // A 4x4 texture with one white texel baked to 1x1 through TexCoord * (2, 2). The scale reaches the sample, so it reads
+    // the 1x1 mip (linear 1/16). Without it level 0 is sampled at uv (1, 1): a quarter of the white texel (0.25).
+    const dot = { T_Dot: { png: await pngOf(4, 4, (x, y) => (x === 0 && y === 0 ? [255, 255, 255] : [0, 0, 0])), srgb: true } };
+    const graph = makeGraph(
+      [textureSample("t", "T_Dot", "Color", "scaled"), node("scaled", "Multiply", { inputs: { A: pin("uv"), B: pin("two") } }), textureCoordinate("uv"), constant2("two", 2, 2)],
+      pin("t", 0, RGB_MASK),
+    );
+    expect((await pixelsOf(await bake(graph, dot, 1)))(0, 0)).toEqual([encode(1 / 16), encode(1 / 16), encode(1 / 16)]);
+  });
+
+  describe("ConvertFromDiffSpec", () => {
+    const convert = (output: number) =>
+      makeGraph(
+        [
+          { ...engineCall("conv", "ConvertFromDiffSpec", { Input0: pin("diffuse", 0, RGB_MASK), Input1: pin("spec") }), outputNames: ["BaseColor", "Metallic", "Specular"] },
+          constant3("diffuse", [0.25, 0.5, 0.75]),
+          scalar("spec", 0.04),
+        ],
+        pin("conv", output, output === 0 ? null : RGB_MASK),
+      );
+
+    it("takes BaseColor from the diffuse input and says so", async () => {
+      const result = await bake(convert(0), {}, 2);
+      expect((await pixelsOf(result))(1, 1)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+      if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: ["ConvertFromDiffSpec: BaseColor taken from the diffuse input; engine body unavailable"] });
+    });
+
+    it("does not guess its Metallic output", async () => {
+      expect(await bake(convert(1), {}, 2)).toMatchObject({ status: "unsupported", unsupported: ["ConvertFromDiffSpec.Metallic"] });
+    });
+  });
+});
