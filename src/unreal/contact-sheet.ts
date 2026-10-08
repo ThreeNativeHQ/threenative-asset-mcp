@@ -316,6 +316,46 @@ async function renderGrid(
   }
 }
 
+export interface RenderedTiles {
+  /** The full grid PNG, before any labels or panels are composited. */
+  png: Buffer;
+  /** One raw tile per input GLB, row-major; a failed tile is the untouched grey background. */
+  tiles: RgbaImage[];
+  /** Whether each input rendered a model. */
+  rendered: boolean[];
+}
+
+/**
+ * Renders GLBs to a grid of raw tiles with the same production renderer the contact sheet uses (same
+ * fixed camera, same lighting, same swiftshader flags). The camera frames each model to fit, so a tile
+ * depends only on the model and the renderer, which makes it a stable golden image. The visual
+ * regression suite calls this directly rather than going through the JPEG contact sheet.
+ */
+export async function renderTiles(options: {
+  readonly glbPaths: readonly string[];
+  /** Tile edge in pixels. Default 160. */
+  readonly tile?: number;
+  readonly timeoutMs?: number;
+}): Promise<RenderedTiles> {
+  const tile = Math.max(16, Math.round(options.tile ?? 160));
+  const paths = options.glbPaths;
+  const columns = paths.length <= 1 ? 1 : paths.length <= 4 ? 2 : paths.length <= 9 ? 3 : 4;
+  const rows = Math.max(1, Math.ceil(paths.length / columns));
+  const candidates: Candidate[] = paths.map((path) => ({
+    path,
+    name: basename(path, extname(path)),
+    score: 0,
+    failed: false,
+  }));
+  const grid = await renderGrid(candidates, tile, columns, rows, options.timeoutMs ?? 180_000);
+  const decoded = await decodeRgba(grid.png);
+  return {
+    png: grid.png,
+    rendered: grid.rendered,
+    tiles: paths.map((_, index) => cutTile(decoded, tile, index % columns, Math.floor(index / columns))),
+  };
+}
+
 /** Raw RGBA of one tile cut out of the decoded grid. */
 function cutTile(grid: RgbaImage, tile: number, column: number, row: number): RgbaImage {
   const data = new Uint8Array(tile * tile * 4);
