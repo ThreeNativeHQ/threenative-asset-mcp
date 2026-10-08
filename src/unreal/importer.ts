@@ -2164,6 +2164,7 @@ export async function importUnrealDirectory(
   let textureIndex: Map<string, string[]> | undefined;
   let textureExports: Promise<unknown> = Promise.resolve();
   let textureExportCount = 0;
+  let graphTextureConverter: Promise<ExternalTool> | undefined;
   const exportedTextures = new Map<string, Promise<string | undefined>>();
   const exportTexture = (name: string): Promise<string | undefined> => {
     const known = exportedTextures.get(name);
@@ -2184,36 +2185,65 @@ export async function importUnrealDirectory(
         return undefined;
       }
       const selector = relative(sourceDir, matches[0]!).split(sep).join("/").slice(0, -extname(matches[0]!).length);
-      const isolated = join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
-      // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the
-      // package's own folders are appended to it. A deep staging path is reached through a short
-      // symlink (removed below); the files still land inside the staging directory.
-      let link: string | undefined;
-      try {
-        await mkdir(isolated, { recursive: true });
-        let out = isolated;
-        if (isolated.length > 120) {
-          link = join(tmpdir(), `tn-gt-${randomBytes(6).toString("hex")}`);
-          await symlink(isolated, link);
-          out = link;
+      const nextDirectory = (): string => join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
+      const viaUmodel = async (): Promise<string | undefined> => {
+        const isolated = nextDirectory();
+        // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the
+        // package's own folders are appended to it. A deep staging path is reached through a short
+        // symlink (removed below); the files still land inside the staging directory.
+        let link: string | undefined;
+        try {
+          await mkdir(isolated, { recursive: true });
+          let out = isolated;
+          if (isolated.length > 120) {
+            link = join(tmpdir(), `tn-gt-${randomBytes(6).toString("hex")}`);
+            await symlink(isolated, link);
+            out = link;
+          }
+          const exportRun = await runBounded(umodel.path, [`-path=${sourceDir}`, "-export", "-png", `-out=${out}`, selector], {
+            timeoutMs: 300_000,
+            maxOutputBytes: 32 * 1024 * 1024,
+          });
+          if (exportRun.code !== 0) {
+            log(`Graph texture ${name}: UE Viewer exited ${exportRun.code}.`);
+            return undefined;
+          }
+          const png = (await indexExported(isolated)).png.get(name);
+          if (!png) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
+          return png;
+        } catch (error) {
+          log(`Graph texture ${name}: export failed (${error instanceof Error ? error.message : String(error)}).`);
+          return undefined;
+        } finally {
+          if (link) await rm(link, { force: true });
         }
-        const exportRun = await runBounded(umodel.path, [`-path=${sourceDir}`, "-export", "-png", `-out=${out}`, selector], {
-          timeoutMs: 300_000,
-          maxOutputBytes: 32 * 1024 * 1024,
-        });
-        if (exportRun.code !== 0) {
-          log(`Graph texture ${name}: UE Viewer exited ${exportRun.code}.`);
+      };
+      // UE5 packages are unreadable to UE Viewer: the modern converter decodes the one package into
+      // its own staging directory (it names every texture Textures/<name>.png, hence the isolation).
+      const viaConverter = async (): Promise<string | undefined> => {
+        try {
+          graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
+          const converter = await graphTextureConverter;
+          const isolated = nextDirectory();
+          const converted = await runModernConverter(converter.path, sourceDir, isolated, ["--filter", selector], {
+            timeoutMs: 1_800_000,
+            maxOutputBytes: 32 * 1024 * 1024,
+          });
+          if (converted.code !== 0) {
+            log(`Graph texture ${name}: the modern converter exited ${converted.code}.`);
+            return undefined;
+          }
+          const png = (await indexExported(isolated)).png.get(name);
+          if (!png) log(`Graph texture ${name}: the modern converter wrote no PNG.`);
+          return png;
+        } catch (error) {
+          log(`Graph texture ${name}: modern export failed (${error instanceof Error ? error.message : String(error)}).`);
           return undefined;
         }
-        const png = (await indexExported(isolated)).png.get(name);
-        if (!png) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
-        return png;
-      } catch (error) {
-        log(`Graph texture ${name}: export failed (${error instanceof Error ? error.message : String(error)}).`);
-        return undefined;
-      } finally {
-        if (link) await rm(link, { force: true });
-      }
+      };
+      const modernHeader = (await readPackageCooking(matches[0]!)).legacyFileVersion;
+      if (modernHeader !== undefined && modernHeader <= -8) return viaConverter();
+      return (await viaUmodel()) ?? viaConverter();
     });
     textureExports = run;
     exportedTextures.set(name, run);

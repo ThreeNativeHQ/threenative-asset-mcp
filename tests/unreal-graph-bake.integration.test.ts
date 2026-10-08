@@ -6,7 +6,8 @@ import { NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { describe, expect, it, onTestFinished } from "vitest";
 
-import { createGraphBaker } from "../src/unreal/graph-baker.js";
+import { chainParameters, createGraphBaker } from "../src/unreal/graph-baker.js";
+import { parsePropsFile } from "../src/unreal/materials.js";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
 import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
 import { writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fixture.js";
@@ -84,6 +85,32 @@ async function firstPixel(png: Buffer | Uint8Array): Promise<number[]> {
   const { data } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   return [...data.subarray(0, 3)];
 }
+
+describe("chainParameters over modern-converter props", () => {
+  const collected = (parent: string | undefined, entries: [string, string][]): string =>
+    [
+      ...(parent ? [`Parent = Material'${parent}.${parent}'`] : []),
+      `CollectedTextureParameters[${entries.length}] =`,
+      "{",
+      ...entries.flatMap(([name, texture], index) => [
+        `    CollectedTextureParameters[${index}] =`,
+        "    {",
+        `        Texture = Texture2D'/Game/Test/${texture}.${texture}'`,
+        `        Name = ${name}`,
+        "        Group = None",
+        "    }",
+      ]),
+      "}",
+    ].join("\n");
+
+  it("the instance's collected block is its override and beats the parent's collected default", () => {
+    const instance = parsePropsFile(collected("M_Master", [["Color", "T_Own"]]));
+    const master = parsePropsFile(collected(undefined, [["Color", "T_Default"], ["Mask", "T_Mask"]]));
+    const parameters = chainParameters([instance, master]);
+    expect(parameters.textures.get("color")).toBe("T_Own");
+    expect(parameters.textures.get("mask")).toBe("T_Mask");
+  });
+});
 
 describe("createGraphBaker", () => {
   async function fixture() {
@@ -205,7 +232,7 @@ describe("createGraphBaker", () => {
 // ---------------------------------------------------------------------------------------------------------
 // The importer end to end: fake umodel + a fake modern converter that answers `--dump-graphs`.
 
-async function writeFakeConverter(path: string, graph: MaterialGraph, argvLog: string): Promise<void> {
+async function writeFakeConverter(path: string, graph: MaterialGraph, argvLog: string, textureFrom?: string): Promise<void> {
   await writeFile(
     path,
     `#!/usr/bin/env node
@@ -220,6 +247,13 @@ if (at >= 0) {
   fs.writeFileSync(join(argv[at + 1], ${JSON.stringify(`${graph.material}.graph.json`)}), ${JSON.stringify(JSON.stringify(graph))});
   process.exit(0);
 }
+const exportAt = argv.indexOf("--export-dir");
+const filterAt = argv.indexOf("--filter");
+if (exportAt >= 0 && filterAt >= 0 && ${JSON.stringify(textureFrom ?? "")}) {
+  const name = argv[filterAt + 1].split("/").pop();
+  fs.mkdirSync(join(argv[exportAt + 1], "Textures"), { recursive: true });
+  fs.copyFileSync(join(${JSON.stringify(textureFrom ?? "")}, name + ".png"), join(argv[exportAt + 1], "Textures", name + ".png"));
+}
 process.exit(0);
 `,
   );
@@ -227,7 +261,7 @@ process.exit(0);
 }
 
 /** A umodel that exports `hiddenFrom` for the one texture package `T_Hidden` and defers everything else to `base`. */
-async function writeDispatchingUmodel(path: string, base: string, hiddenFrom: string, log: string): Promise<void> {
+async function writeDispatchingUmodel(path: string, base: string, hiddenFrom: string | undefined, log: string): Promise<void> {
   await writeFile(
     path,
     `#!/usr/bin/env node
@@ -240,8 +274,10 @@ const selector = argv.filter((entry) => !entry.startsWith("-")).pop() || "";
 if (argv.includes("-export") && basename(selector) === "T_Hidden") {
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(argv) + "\\n");
   const out = argv.find((entry) => entry.indexOf("-out=") === 0).slice("-out=".length);
-  fs.mkdirSync(join(out, "Group"), { recursive: true });
-  fs.cpSync(${JSON.stringify(hiddenFrom)}, join(out, "Group"), { recursive: true });
+  if (${JSON.stringify(hiddenFrom)}) {
+    fs.mkdirSync(join(out, "Group"), { recursive: true });
+    fs.cpSync(${JSON.stringify(hiddenFrom)}, join(out, "Group"), { recursive: true });
+  }
   process.exit(0);
 }
 const run = spawnSync(${JSON.stringify(base)}, argv, { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
@@ -252,7 +288,7 @@ process.exit(run.status === null ? 1 : run.status);
   await chmod(path, 0o755);
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; vertexColors?: boolean }) {
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -285,17 +321,21 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   const cacheDir = join(root, "cache");
   if (options.hiddenTexture) {
     // T_Hidden is referenced only by the graph: the mesh export does not carry it, only its own package export does.
-    await writeFile(join(content, "T_Hidden.uasset"), Buffer.alloc(16));
+    const header = Buffer.alloc(24);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    // UE5 packages (LegacyFileVersion <= -8) are routed straight to the modern converter.
+    header.writeInt32LE(options.hiddenVia === "modern-header" ? -8 : -7, 4);
+    await writeFile(join(content, "T_Hidden.uasset"), header);
     await mkdir(join(root, "hidden"), { recursive: true });
     await writePng(join(root, "hidden", "T_Hidden.png"), [80, 160, 240, 255], 4);
     await writeFakeUmodel(join(root, "umodel-base"), { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
-    await writeDispatchingUmodel(umodel, join(root, "umodel-base"), join(root, "hidden"), textureLog);
+    await writeDispatchingUmodel(umodel, join(root, "umodel-base"), (options.hiddenVia ?? "umodel") === "umodel" ? join(root, "hidden") : undefined, textureLog);
   } else {
     await writeFakeUmodel(umodel, { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
   }
   const converter = join(root, "converter");
   const converterLog = join(root, "converter.log");
-  await writeFakeConverter(converter, options.graph, converterLog);
+  await writeFakeConverter(converter, options.graph, converterLog, options.hiddenTexture && options.hiddenVia && options.hiddenVia !== "umodel" ? join(root, "hidden") : undefined);
   const report = await importUnrealDirectory({
     sourceDir,
     outputDir,
@@ -412,5 +452,26 @@ describe("graph textures that only a material function references", () => {
     expect(textureExports[0]).toContain("-png");
     expect(textureExports[0]).toContain("Content/Test/T_Hidden");
     expect(leftovers.filter((entry) => entry.includes("graph-textures"))).toEqual([]);
+  });
+
+  const hiddenPixel = [encode((80 / 255) * 0.5), encode((160 / 255) * 0.25), encode(240 / 255)];
+
+  it("importer: falls back to the modern converter when UE Viewer yields no PNG, serially, leaving nothing behind", async () => {
+    const { report, material, textureExports, dumped, leftovers } = await importWithGraph({ graph: masterGraph("mask-tint", "T_Hidden"), hiddenTexture: true, hiddenVia: "converter" });
+    expect(textureExports).toHaveLength(1); // UE Viewer was tried first, once
+    expect(dumped.split("\n").filter((line) => line.includes("--filter"))).toHaveLength(1);
+    expect(dumped).toContain("Content/Test/T_Hidden");
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked" });
+    expect(await firstPixel(material.getBaseColorTexture()!.getImage()!)).toEqual(hiddenPixel);
+    expect(leftovers.filter((entry) => entry.includes("graph-textures") || entry.includes(".engine-"))).toEqual([]);
+  });
+
+  it("importer: a UE5 package header goes straight to the converter and UE Viewer never sees it", async () => {
+    const { report, material, textureExports, dumped, leftovers } = await importWithGraph({ graph: masterGraph("mask-tint", "T_Hidden"), hiddenTexture: true, hiddenVia: "modern-header" });
+    expect(textureExports).toEqual([]);
+    expect(dumped).toContain("--filter");
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked" });
+    expect(await firstPixel(material.getBaseColorTexture()!.getImage()!)).toEqual(hiddenPixel);
+    expect(leftovers.filter((entry) => entry.includes("graph-textures") || entry.includes(".engine-"))).toEqual([]);
   });
 });

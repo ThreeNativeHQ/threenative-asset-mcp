@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveMaterial } from "../src/unreal/materials.js";
+import { parsePropsFile, resolveMaterial } from "../src/unreal/materials.js";
 
 const tex = (name: string): string => `Texture2D'Content/Pack/Textures/${name}.${name}'`;
 
@@ -122,5 +122,55 @@ describe("material instance overrides beat parent defaults", () => {
       ["T_Wall_Shared_N", "T_Wall_Own_N"],
     );
     expect(resolved.bindings.find((b) => b.slot === "normal")).toMatchObject({ texture: "T_Wall_Shared_N", source: "mat" });
+  });
+});
+
+// The modern converter writes an instance's own overrides as `CollectedTextureParameters` (an
+// instance has no expression nodes, so the collected block is exactly its overrides).
+describe("modern-converter instance props (Parent + CollectedTextureParameters only)", () => {
+  const modernInstance = (parent: string, overrides: Array<[string, string]>): string =>
+    `Parent = Material'${parent}.${parent}'\n${masterProps(overrides)}`;
+
+  it("parsePropsFile exposes the collected entries of an instance as overrides", () => {
+    const parsed = parsePropsFile(modernInstance("M_Wall", [["NRM", "T_Wall_Own_N"], ["Color", "T_Wall_Own_D"]]));
+    expect(parsed.overrides).toEqual([
+      { name: "NRM", texture: "T_Wall_Own_N" },
+      { name: "Color", texture: "T_Wall_Own_D" },
+    ]);
+    expect(parsed.collected).toHaveLength(2);
+  });
+
+  it("does not turn a root material's defaults into overrides, nor double count real overrides", () => {
+    expect(parsePropsFile(masterProps([["NRM", "T_Wall_Default_N"]])).overrides).toEqual([]);
+    const both = `${instanceProps("M_Wall", [["NRM", "T_Wall_Own_N"]])}\n${masterProps([["NRM", "T_Wall_Own_N"]])}`;
+    expect(parsePropsFile(both).overrides).toEqual([{ name: "NRM", texture: "T_Wall_Own_N" }]);
+  });
+
+  it("binds the instance's override, not the parent's collected default", () => {
+    const resolved = resolve(
+      {
+        MI_Wall: { mat: "Normal=T_Wall_Default_N\n", props: modernInstance("M_Wall", [["NRM", "T_Wall_Own_N"]]) },
+        M_Wall: { mat: "Normal=T_Wall_Default_N\n", props: masterProps([["NRM", "T_Wall_Default_N"]]) },
+      },
+      "MI_Wall",
+      ["T_Wall_Default_N", "T_Wall_Own_N"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "normal")).toMatchObject({ texture: "T_Wall_Own_N", source: "props" });
+    const bound = resolved.bindings.flatMap((b) => [b.texture, b.secondaryTexture ?? []].flat());
+    expect(bound).not.toContain("T_Wall_Default_N");
+  });
+
+  it("supersedes the parent default of the same parameter even when the .mat names it", () => {
+    const resolved = resolve(
+      {
+        MI_Wall: { mat: "Diffuse=T_Wall_Default_D\n", props: modernInstance("M_Wall", [["Color", "T_Wall_Own_D"]]) },
+        M_Wall: { mat: "Diffuse=T_Wall_Default_D\n", props: masterProps([["Color", "T_Wall_Default_D"]]) },
+      },
+      "MI_Wall",
+      ["T_Wall_Default_D", "T_Wall_Own_D"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "baseColor")).toMatchObject({ texture: "T_Wall_Own_D" });
+    const bound = resolved.bindings.flatMap((b) => [b.texture, b.secondaryTexture ?? []].flat());
+    expect(bound).not.toContain("T_Wall_Default_D");
   });
 });

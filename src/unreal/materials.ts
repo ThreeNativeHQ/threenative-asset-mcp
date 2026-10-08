@@ -303,7 +303,10 @@ export function parsePropsFile(text: string): PropsFile {
     blendMode: effective("BlendMode", blendMode, "BLEND_Opaque"),
     opacityMaskClipValue: effective("OpacityMaskClipValue", opacityMaskClipValue, 0),
     collected,
-    overrides,
+    // The modern converter writes an instance's own overrides as `CollectedTextureParameters`
+    // (a MaterialInstance has no expression nodes, so the collected block IS its overrides; on a
+    // root Material it is the defaults). A real `TextureParameterValues` block wins; never both.
+    overrides: parent !== undefined && overrides.length === 0 ? [...collected] : overrides,
     scalars,
     scalarOverrides,
     vectors,
