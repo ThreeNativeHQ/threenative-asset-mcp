@@ -10,6 +10,7 @@ import { describe, expect, it, onTestFinished } from "vitest";
 
 import type { FabOwnedListing } from "../src/fab/fabcli.js";
 import type { PackScore } from "../src/unreal/parity.js";
+import type { CrossDecodeProof, TextureProof, TextureProofEntry } from "../src/unreal/texture-proof.js";
 import {
   acquireLock,
   buildCorpus,
@@ -38,6 +39,7 @@ import {
   SweepLockHeldError,
   summarizeEntries,
   upsertEntry,
+  withTextureProof,
   writeJsonAtomic,
   type ScorecardEntry,
 } from "../src/unreal/parity-run.js";
@@ -816,5 +818,64 @@ describe("--licences-file and --no-graph-bake", () => {
     expect(isFatalHandlerError({ code: "FABCLI_LICENSE_UNVERIFIED", message: "x", retryable: true })).toBe(false);
     expect(isFatalHandlerError({ code: "FABCLI_LICENSE_UNVERIFIED", message: "no network", retryable: false })).toBe(false);
     expect(isFatalHandlerError({ code: "FABCLI_LICENSE_NOT_PERMITTED", message: "download auth", retryable: false })).toBe(false);
+  });
+});
+
+
+describe("S5 texture-identity proof in the scorecard", () => {
+  const mismatch = (texture: string): TextureProofEntry => ({
+    texture, model: "m.glb", section: "s", slot: "baseColor", ssim: 0.97, mse: 12, maxAbs: 40, identical: false, resized: false,
+  });
+  function proof(overrides: Partial<TextureProof> = {}): TextureProof {
+    return {
+      compared: 4, identical: 4, minSsim: 1, resized: 1, candidates: 4, sampled: false, mismatches: [], mismatchCount: 0,
+      worst: [], skipped: {}, graph: { checked: 0, ok: 0, failures: [] }, ...overrides,
+    };
+  }
+  const cross: CrossDecodeProof = { status: "agree", requested: 2, compared: 2, agreeing: 2, unavailable: 0, minSsim: 0.9995, threshold: 0.999, results: [] };
+
+  it("records the proof on a passing entry without changing its verdict", () => {
+    const judged = withTextureProof(entry({ status: "pass" }), proof(), cross);
+    expect(judged.status).toBe("pass");
+    expect(judged.reasons).toEqual([]);
+    expect(judged.proof).toEqual({ compared: 4, identical: 4, minSsim: 1, resized: 1, cross: { status: "agree", compared: 2, agreeing: 2, minSsim: 0.9995 } });
+  });
+
+  it("fails a pack whose compared texture differs and names the textures", () => {
+    const judged = withTextureProof(
+      entry({ status: "pass" }),
+      proof({ identical: 2, minSsim: 0.97, mismatchCount: 2, mismatches: [mismatch("T_Rock_D"), mismatch("T_Rock_N")] }),
+    );
+    expect(judged.status).toBe("fail");
+    expect(judged.reasons).toEqual(["S5 texture identity: 2 of 4 textures differ (T_Rock_D, T_Rock_N)"]);
+    expect(judged.classes).toEqual(["S5:texture-mismatch", "S5:texture-mismatch"]);
+    expect(judged.proof).toMatchObject({ compared: 4, identical: 2, minSsim: 0.97 });
+  });
+
+  it("keeps earlier failures and leaves errored or skipped entries unjudged", () => {
+    const failed = withTextureProof(entry({ status: "fail", reasons: ["S4"], classes: ["S4:grey"] }), proof({ identical: 3, mismatchCount: 1, mismatches: [mismatch("T_A")] }));
+    expect(failed.reasons).toEqual(["S4", "S5 texture identity: 1 of 4 textures differ (T_A)"]);
+    expect(failed.classes).toEqual(["S4:grey", "S5:texture-mismatch"]);
+    const errored = withTextureProof(entry({ status: "error" }), proof({ identical: 3, mismatchCount: 1, mismatches: [mismatch("T_A")] }));
+    expect(errored.status).toBe("error");
+    expect(errored.reasons).toEqual([]);
+  });
+
+  it("totals the proofs, counts packs with a mismatch, and adds proof= to the PARITY line", () => {
+    const summary = summarizeEntries([
+      withTextureProof(entry({ status: "pass" }), proof()),
+      withTextureProof(entry({ status: "pass", artifactId: "A2" }), proof({ compared: 5, identical: 4, mismatchCount: 1, mismatches: [mismatch("T_X")] })),
+      entry({ status: "fail", artifactId: "A3" }),
+    ]);
+    expect(summary.proof).toEqual({ compared: 9, identical: 8, packsWithMismatch: 1 });
+    expect(summary).toMatchObject({ pass: 1, fail: 2 });
+    expect(parityLine(summary)).toMatch(/ skipped=0 proof=8\/9$/);
+    expect(summarizeEntries([entry({ status: "pass" })]).proof).toBeUndefined();
+  });
+
+  it("defaults --proof on and honours --no-proof", () => {
+    expect(parseParityArgs([]).proof).toBe(true);
+    expect(parseParityArgs(["--proof"]).proof).toBe(true);
+    expect(parseParityArgs(["--no-proof"]).proof).toBe(false);
   });
 });

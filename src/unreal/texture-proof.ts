@@ -135,7 +135,7 @@ function slotTexture(material: Material, slot: string): Texture | null {
 const sha = (data: Uint8Array): string => createHash("sha256").update(data).digest("hex");
 
 /** Deterministic, evenly spaced subset of `items`. */
-function evenlySpaced<T>(items: readonly T[], count: number): T[] {
+export function sampleEvenly<T>(items: readonly T[], count: number): T[] {
   if (count >= items.length) return [...items];
   if (count <= 0) return [];
   const picked: T[] = [];
@@ -361,7 +361,7 @@ export async function proveTextures(options: ProveTexturesOptions): Promise<Text
   }
 
   const all = [...candidates.values()].sort((a, b) => a.texture.localeCompare(b.texture) || a.model.localeCompare(b.model));
-  const chosen = options.sample === undefined ? all : evenlySpaced(all, options.sample);
+  const chosen = options.sample === undefined ? all : sampleEvenly(all, options.sample);
   const entries: TextureProofEntry[] = [];
   for (const candidate of chosen) entries.push(await compareEntry(candidate, options.maxTextureSize));
 
@@ -464,7 +464,7 @@ export async function crossDecodeProof(
   options: CrossDecodeOptions,
 ): Promise<CrossDecodeProof> {
   const threshold = options.threshold ?? CROSS_DECODE_SSIM;
-  const names = evenlySpaced([...new Set(textureNames)].sort(), options.sample ?? 6);
+  const names = sampleEvenly([...new Set(textureNames)].sort(), options.sample ?? 6);
   const results: CrossDecodeEntry[] = [];
   for (const name of names) {
     const viewerPath = options.sourceTextures.get(name);
