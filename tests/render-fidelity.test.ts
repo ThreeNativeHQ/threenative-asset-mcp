@@ -282,3 +282,36 @@ describe("closedSolidity and the mass ratio", () => {
     expect(fidelityVerdict(metrics).verdict).toBe("ok");
   });
 });
+
+describe("bounding-box fill is only a solid card when the mass agrees (camera and stems move the box)", () => {
+  /** A solid 20x20 blob, optionally with a 1px stem rising 40px above it (the thumbnail's view of a sprig). */
+  function blob(withStem: boolean): RgbaImage {
+    const data = new Uint8Array(SIZE * SIZE * 4);
+    for (let i = 0; i < SIZE * SIZE; i++) {
+      const x = i % SIZE;
+      const y = Math.floor(i / SIZE);
+      const inBlob = x >= 22 && x < 42 && y >= 38 && y < 58;
+      const inStem = withStem && x === 32 && y >= 0 && y < 38;
+      data.set(inBlob || inStem ? [60, 150, 50, 255] : [128, 128, 128, 255], i * 4);
+    }
+    return { width: SIZE, height: SIZE, data };
+  }
+
+  it("does not call a compact render a solid card because the reference's box is stretched by a stem", () => {
+    const metrics = measureFidelity(blob(true), blob(false));
+    expect(metrics.densityRatio).toBeGreaterThan(1.6);
+    expect(metrics.massRatio).toBeGreaterThan(0.8);
+    expect(metrics.massRatio).toBeLessThan(1.25);
+    expect(fidelityVerdict(metrics).verdict).toBe("ok");
+    const judged = judgeRender(blob(false), { fidelity: metrics, thumbnailFillRatio: 0.35, thumbnailObjectPixels: 440 });
+    expect(judged.reasons.join(" ")).not.toContain("solid card");
+  });
+
+  it("still flags a solid render of a hollow cut-out reference: the mass says so", () => {
+    const metrics = measureFidelity(stripes(3, 40), stripes(1, 40));
+    expect(metrics.massRatio).toBeGreaterThan(1.5);
+    expect(fidelityVerdict(metrics).verdict).not.toBe("ok");
+    const judged = judgeRender(stripes(1, 40), { fidelity: metrics, thumbnailFillRatio: 0.33, thumbnailObjectPixels: 500 });
+    expect(judged.reasons.join(" ")).toContain("solid card");
+  });
+});

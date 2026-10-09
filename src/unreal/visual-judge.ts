@@ -1,5 +1,5 @@
 import type { RgbaImage } from "./image-diff.js";
-import { fidelityVerdict, type FidelityMetrics } from "./render-fidelity.js";
+import { fidelityVerdict, massAgrees, type FidelityMetrics } from "./render-fidelity.js";
 
 /** A thumbnail present and colour similarity below this makes the verdict `suspect`. */
 export const SUSPECT_COLOUR_SIMILARITY = 0.35;
@@ -181,7 +181,9 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
     options.thumbnailFillRatio !== undefined &&
     (options.thumbnailObjectPixels ?? 0) >= MIN_FILL_MASK_PIXELS &&
     objectPixels >= MIN_FILL_MASK_PIXELS &&
-    stats.fillRatio > options.thumbnailFillRatio * SOLID_CARD_FILL_FACTOR
+    stats.fillRatio > options.thumbnailFillRatio * SOLID_CARD_FILL_FACTOR &&
+    // The box fill moves with the thumbnail's camera and stems; a render as massive as the reference is not a solid card.
+    !(options.fidelity?.comparable && massAgrees(options.fidelity))
   ) {
     raise("suspect", `solid card: render fill ${stats.fillRatio.toFixed(2)} vs thumbnail fill ${options.thumbnailFillRatio.toFixed(2)}`);
   }

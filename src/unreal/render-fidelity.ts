@@ -53,6 +53,16 @@ export const MASS_RADIUS_FRACTION = 0.015;
  */
 export const MASS_SUSPECT: readonly [number, number] = [0.65, 1.5];
 export const MASS_FAIL: readonly [number, number] = [0.4, 2.5];
+/**
+ * A render whose silhouette mass agrees with the reference's (within this band) is not a solid card, however much more of its
+ * bounding box it fills: the box moves with the thumbnail's camera and the long thin stem of a sprig (the Fern Collection's
+ * `fern_04_*`/`fern_06_*` read 1.5-2.1x bounding-box fill at mass 0.95-1.05). A true solid card has a mass ratio near the
+ * cut-out's solidity gap, 1.5 and up.
+ */
+export const MASS_AGREES: readonly [number, number] = [0.8, 1.25];
+export function massAgrees(metrics: { readonly massRatio: number }): boolean {
+  return Number.isFinite(metrics.massRatio) && metrics.massRatio >= MASS_AGREES[0] && metrics.massRatio <= MASS_AGREES[1];
+}
 
 export interface Described {
   pixels: number;
@@ -348,7 +358,9 @@ export function fidelityVerdict(metrics: FidelityMetrics): FidelityVerdict {
   else if (outside(metrics.saturationRatio, SATURATION_SUSPECT)) suspect.push(saturation);
   if (metrics.hueEmdDegrees > HUE_FAIL_DEGREES) failing.push(`hue off by ${metrics.hueEmdDegrees.toFixed(0)}°`);
   else if (metrics.hueEmdDegrees > HUE_SUSPECT_DEGREES) suspect.push(`hue off by ${metrics.hueEmdDegrees.toFixed(0)}°`);
-  if (Number.isFinite(metrics.densityRatio)) {
+  // Bounding-box fill above the reference's is only a solid card when the mass says so too (see `MASS_AGREES`).
+  const boxOnly = metrics.densityRatio > 1 && massAgrees(metrics);
+  if (Number.isFinite(metrics.densityRatio) && !boxOnly) {
     if (outside(metrics.densityRatio, DENSITY_FAIL)) failing.push(density);
     else if (outside(metrics.densityRatio, DENSITY_SUSPECT)) suspect.push(density);
   }
