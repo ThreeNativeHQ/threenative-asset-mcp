@@ -454,6 +454,12 @@ function isDataTexture(texture: string): boolean {
   return tokens.some((token) => DATA_TOKENS.has(token)) || tokens.at(-1) === "g";
 }
 
+/** The texture's name gives it a slot other than base colour, or marks it as a data map. */
+function namesAnotherChannel(texture: string): boolean {
+  const plan = planForFileName(texture);
+  return (plan !== undefined && plan.slot !== "baseColor") || isDataTexture(texture);
+}
+
 /** `*_D_R` textures carry roughness in alpha; the same image serves both slots. */
 export function packsRoughnessInAlpha(texture: string): boolean {
   return /_d(?:\d+)?(?:_[a-z0-9]+)*_r$/i.test(texture);
@@ -782,7 +788,9 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     for (const [, members] of stems) {
       if (members.length < 2) continue;
       const normal = members.find((texture) => /_n(?:_tex)?$/i.test(texture));
-      const colour = members.find((texture) => texture !== normal);
+      // A sibling whose own name says it is another channel (`_S` specular, `_R` roughness, `_AO`, a mask) is not
+      // the colour map: binding a skin's pore specular as albedo painted a character's head in black spots.
+      const colour = members.find((texture) => texture !== normal && !namesAnotherChannel(texture));
       if (!normal || !colour) continue;
       bind({ slot: "baseColor", transform: "none" }, colour, "texture-set", "heuristic");
       // The set's own normal is more specific than whatever the parent resolved.

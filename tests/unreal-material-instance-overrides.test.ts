@@ -240,6 +240,32 @@ describe("modern-converter instance props (Parent + CollectedTextureParameters o
     expect(bound).not.toContain("T_Wall_Default_D");
   });
 
+  it("does not take a set's specular or roughness sibling as its colour map", () => {
+    // A 5.8 skin instance: its albedo sits behind a parameter with no PBR slot ("Skin Texture"), and the material also
+    // references a pore detail set `<stem>_S` / `<stem>_N` / `<stem>_R`. The texture-set fallback bound the pore
+    // specular as albedo and painted the head in black spots; leaving base colour unbound lets the graph bake it.
+    const resolved = resolve(
+      {
+        MI_Skin: { mat: "", props: modernInstance("M_Skin", [["Skin Texture", "T_Head_Own_D"]]) },
+        M_Skin: { mat: "", props: masterProps([["Skin Texture", "T_Head_Default_D"], ["Pore Spec", "T_Pore__S"], ["Pore Normal", "T_Pore__N"], ["Pore Rough", "T_Pore__R"]]) },
+      },
+      "MI_Skin",
+      ["T_Head_Own_D", "T_Head_Default_D", "T_Pore__S", "T_Pore__N", "T_Pore__R"],
+    );
+    const base = resolved.bindings.find((b) => b.slot === "baseColor");
+    expect(base?.texture).not.toBe("T_Pore__S");
+    expect(base?.texture).not.toBe("T_Pore__R");
+  });
+
+  it("still completes a texture set whose sibling names no other channel", () => {
+    const resolved = resolve(
+      { MI_Rock: { mat: "", props: masterProps([["Blend A", "T_Rock_Var"], ["Blend A Normal", "T_Rock_N"]]) } },
+      "MI_Rock",
+      ["T_Rock_Var", "T_Rock_N"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "baseColor")).toMatchObject({ texture: "T_Rock_Var", source: "texture-set" });
+  });
+
   it("supersedes a texture an ANCESTOR instance overrides, so the texture-set fallback cannot rebind it", () => {
     // Paragon shape: the leaf instance and its parent instance both override `Mask`; the parent's
     // texture ends up in the leaf's .mat `Other[]` and would otherwise be picked as a base colour.
