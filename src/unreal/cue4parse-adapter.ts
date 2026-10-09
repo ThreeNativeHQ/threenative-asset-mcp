@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.58",
+  version: "b4e95441+threenative.59",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2407,9 +2407,9 @@ static byte[]? ExtractCompressedPayloadPng(byte[] bytes, List<string>? failures 
             var payload = new FCompressedBuffer(archive);
             if (payload.Header.TotalRawSize == 0 || payload.Header.TotalRawSize > 1_073_741_824) continue;
             var raw = DecompressEditorPayload(payload);
-            var png = ExtractLargestPng(raw);
+            var png = ExtractLargestPng(raw) ?? ExtractLargestJpegAsPng(raw);
             if (png is not null) return png;
-            failures?.Add($"payload at {payloadAt} ({payload.Header.Method}, {payload.Header.TotalRawSize} bytes) decoded but holds no PNG");
+            failures?.Add($"payload at {payloadAt} ({payload.Header.Method}, {payload.Header.TotalRawSize} bytes) decoded but holds no PNG or JPEG");
         }
         catch (Exception error)
         {
@@ -2636,6 +2636,8 @@ static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string n
 static byte[] NormalizeSourcePng(byte[] png, UTexture? texture)
 {
     if (texture is null) return png;
+    // A JPEG source (TSCF_JPEG) is decoded to true colour by Skia, so it needs no channel fix-up.
+    if (JpegDerived.Table.TryGetValue(png, out _)) return png;
     var format = texture.GetOrDefault<FStructFallback?>("Source", null)?.GetOrDefault<FName>("Format").Text ?? "";
     try
     {
@@ -2760,6 +2762,36 @@ static byte[] DecompressEditorPayload(FCompressedBuffer payload)
     }
     if (outputOffset != output.Length) throw new InvalidDataException("Editor payload is incomplete.");
     return output;
+}
+
+// A texture saved with TSCF_JPEG source compression keeps JPEG bytes (SOI FF D8 FF) in its editor payload. The
+// largest decodable image wins; it is re-encoded as PNG so every later stage sees the format it already reads.
+static byte[]? ExtractLargestJpegAsPng(byte[] bytes)
+{
+    byte[]? best = null;
+    long bestArea = 0;
+    for (var start = 0; start <= bytes.Length - 3; start++)
+    {
+        if (bytes[start] != 0xff || bytes[start + 1] != 0xd8 || bytes[start + 2] != 0xff) continue;
+        try
+        {
+            using var bitmap = SkiaSharp.SKBitmap.Decode(bytes.AsSpan(start));
+            if (bitmap is null) continue;
+            var area = (long) bitmap.Width * bitmap.Height;
+            if (area <= bestArea) continue;
+            using var image = SkiaSharp.SKImage.FromBitmap(bitmap);
+            using var encoded = image.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+            if (encoded is null) continue;
+            best = encoded.ToArray();
+            bestArea = area;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            // A false-positive marker inside compressed bytes; keep scanning.
+        }
+    }
+    if (best is not null) JpegDerived.Table.Add(best, new object());
+    return best;
 }
 
 static byte[]? ExtractLargestPng(byte[] bytes)
@@ -2898,6 +2930,11 @@ public sealed class USkeletalMeshEditorData : UObject
     }
 }
 
+// PNGs that were re-encoded from a JPEG source payload, by reference, so NormalizeSourcePng can tell them apart.
+static class JpegDerived
+{
+    public static readonly System.Runtime.CompilerServices.ConditionalWeakTable<byte[], object> Table = new();
+}
 sealed record GraphLegacyInput(FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bool UseConstant);
 sealed record EditorMesh(
     float[] Positions,

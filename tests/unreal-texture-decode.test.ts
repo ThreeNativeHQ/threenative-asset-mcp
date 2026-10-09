@@ -42,6 +42,15 @@ describe("editor texture payload decode (converter program)", () => {
     );
   });
 
+  it("decodes a JPEG editor source (TSCF_JPEG) to a PNG and leaves its channels alone", () => {
+    // Rusty Cars: nine of ten colour textures keep a JPEG source payload, so the PNG-only scan reported "no decodable
+    // pixel data" and 29 of 32 sections stayed neutral. A TSF_BGRA8 PNG source needs red and blue swapped; a JPEG does not.
+    expect(CUE4PARSE_PROGRAM).toMatch(/ExtractLargestPng\(raw\) \?\? ExtractLargestJpegAsPng\(raw\)/);
+    expect(CUE4PARSE_PROGRAM).toMatch(/bytes\[start\] != 0xff \|\| bytes\[start \+ 1\] != 0xd8 \|\| bytes\[start \+ 2\] != 0xff/);
+    expect(CUE4PARSE_PROGRAM).toMatch(/if \(JpegDerived\.Table\.TryGetValue\(png, out _\)\) return png;/);
+    expect(CUE4PARSE_PROGRAM).toContain("holds no PNG or JPEG");
+  });
+
   it("reports why a texture produced no PNG, and keeps the message the engine fallback keys on", () => {
     expect(CUE4PARSE_PROGRAM).toContain("threenative-texture-failure");
     for (const evidence of ["platformFormat=", "firstMipBulk=", "sourceCompression=", "editorPayload=", "exportErrors=", "payload="]) {
@@ -57,7 +66,7 @@ describe("editor texture payload decode (converter program)", () => {
   });
 
   it("bumps the converter version so a stale binary is rebuilt", () => {
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.58");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.59");
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
   });
 });
