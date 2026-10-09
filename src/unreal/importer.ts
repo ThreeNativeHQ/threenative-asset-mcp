@@ -5,8 +5,8 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { Document, NodeIO, VertexLayout, type Material, type Primitive, type Texture } from "@gltf-transform/core";
-import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsUnlit } from "@gltf-transform/extensions";
+import { Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Texture } from "@gltf-transform/core";
+import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsSpecular, KHRMaterialsUnlit } from "@gltf-transform/extensions";
 import { attachPsaAnimations, parsePsa, type PsaFile } from "./psa.js";
 
 import {
@@ -53,7 +53,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 64;
+export const IMPORTER_VERSION = 65;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -580,6 +580,8 @@ interface PackageClassification {
   readonly paperClass: "PaperSprite" | "PaperFlipbook" | "PaperTileMap" | "PaperTileSet" | undefined;
   readonly hasGroom: boolean;
   readonly needsModernConverter: boolean;
+  /** A texture package whose mip generation setting is `TMGS_NoMipmaps` (see `PackageCooking.noMipmapsHint`). */
+  readonly noMipmaps?: boolean;
   readonly error: string | undefined;
 }
 
@@ -1242,7 +1244,7 @@ function repairSeamMorphDeltas(primitive: Primitive): { readonly repaired: numbe
  */
 function separateLayoutIO(): NodeIO {
   return new NodeIO()
-    .registerExtensions([KHRLightsPunctual, EXTMeshGPUInstancing, KHRMaterialsUnlit])
+    .registerExtensions([KHRLightsPunctual, EXTMeshGPUInstancing, KHRMaterialsUnlit, KHRMaterialsSpecular])
     .setVertexLayout(VertexLayout.SEPARATE);
 }
 
@@ -1340,6 +1342,8 @@ export async function packageGlb(options: {
   readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
   /** Collects texture name -> source PNG path for every texture embedded without a pixel transform. */
   readonly proofSources?: Map<string, string[]> | undefined;
+  /** Source textures with no mip chain in Unreal; a cut-out card sampling one keeps an unmipped sampler. */
+  readonly noMipmapTextures?: ReadonlySet<string> | undefined;
 }): Promise<PackagedModel> {
   const io = separateLayoutIO();
   const document = await io.read(options.gltfPath);
@@ -1583,6 +1587,18 @@ export async function packageGlb(options: {
         cache.set(key, texture);
       }
       attachTexture(material, binding, texture);
+      // Thin cut-outs (needles, grass) lose coverage as mips average the mask toward its mean, and the averaged edge pixels
+      // pull in the off-leaf colour around the cut-out. Unreal does neither for a mask with no mip chain, so neither do we.
+      if (
+        binding.slot === "baseColor" &&
+        resolved.alphaMode !== "OPAQUE" &&
+        (options.noMipmapTextures?.has(binding.secondaryTexture ?? "") === true || (binding.secondaryTexture === undefined && options.noMipmapTextures?.has(binding.texture) === true))
+      ) {
+        const info = material.getBaseColorTextureInfo();
+        info?.setMinFilter(TextureInfo.MinFilter.LINEAR as 9729);
+        info?.setMagFilter(TextureInfo.MagFilter.LINEAR as 9729);
+        packagingLimitations.push(`${binding.secondaryTexture ?? binding.texture} has no mip chain in Unreal (TMGS_NoMipmaps): the base colour sampler is unmipmapped so the cut-out keeps its coverage.`);
+      }
       if (options.proofSources && binding.transform === "none") {
         const paths = options.proofSources.get(binding.texture) ?? [];
         if (!paths.includes(source)) paths.push(source);
@@ -1698,6 +1714,17 @@ export async function packageGlb(options: {
       }
     }
     if (resolved.roughnessFactor !== undefined) material.setRoughnessFactor(resolved.roughnessFactor);
+    // Unreal's `Specular` input is a dielectric F0 of 0.08 x Specular (0.5 gives the glTF default 0.04). A matte foliage
+    // master with Specular 0.1 has F0 0.008, a fifth of glTF's default, so leaving the default adds a pale sheen that
+    // washes the green out. Only a constant is applied; 0.5 (the engine default) changes nothing.
+    const specular = authored?.channels.Specular;
+    if (specular?.kind === "scalar" && Number.isFinite(specular.value) && specular.value >= 0) {
+      const factor = Math.min(1, (0.08 * specular.value) / 0.04);
+      if (Math.abs(factor - 1) > 1e-6) {
+        const extension = document.createExtension(KHRMaterialsSpecular);
+        material.setExtension("KHR_materials_specular", extension.createSpecular().setSpecularFactor(factor));
+      }
+    }
 
     sections.push({
       name: material.getName(),
@@ -2318,6 +2345,7 @@ export async function importUnrealDirectory(
         paperClass,
         hasGroom,
         needsModernConverter,
+        ...(hasTexture && cooking?.noMipmapsHint === true ? { noMipmaps: true } : {}),
         error:
           run.code === 0 || needsModernConverter || nonImportableClass !== undefined || hasFont || paperClass !== undefined || cooking?.levelHint === true
             ? undefined
@@ -2353,6 +2381,10 @@ export async function importUnrealDirectory(
   const externalActorEntries = classifiedAll.filter((entry) => isWorldPartitionExternalPackage(entry.package));
   const externalActorFiles = new Set(externalActorEntries.map((entry) => entry.file));
   const classified = classifiedAll.filter((entry) => !externalActorFiles.has(entry.file));
+  /** Texture basenames the editor builds no mip chain for; their sampler must not average them either. */
+  const noMipmapTextures: ReadonlySet<string> = new Set(
+    classified.filter((entry) => entry.noMipmaps === true).map((entry) => basename(entry.package, extname(entry.package))),
+  );
 
   const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error);
   const animationPackages = classified.filter((entry) => entry.hasAnimation && !entry.error);
@@ -3612,6 +3644,7 @@ export async function importUnrealDirectory(
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
+            noMipmapTextures,
             namesEngineDefaultMaterial: async () => (await readPackageObjectNames(entry.file)).has("WorldGridMaterial"),
             onMaterialResolved: request.onMaterialResolved,
             proofSources: proofFor(glbPath),
@@ -3739,6 +3772,7 @@ export async function importUnrealDirectory(
           geometryScale: 1,
           sourceMaterial: sourceForMesh(source.entry.file),
           graphBaker,
+          noMipmapTextures,
           onMaterialResolved: request.onMaterialResolved,
           proofSources: proofFor(glbPath),
         });
@@ -3845,6 +3879,7 @@ export async function importUnrealDirectory(
             return entry ? sourceForLibraryFile(entry.file) : undefined;
           },
           graphBaker,
+          noMipmapTextures,
           onMaterialResolved: request.onMaterialResolved,
           proofSources: proofFor(glbPath),
         });

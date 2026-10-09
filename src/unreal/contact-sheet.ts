@@ -7,7 +7,7 @@ import { chromium } from "playwright";
 import sharp, { type OverlayOptions } from "sharp";
 
 import { createBrowserTempDir } from "../browser-temp.js";
-import { measureFidelity, type FidelityMetrics } from "./render-fidelity.js";
+import { measureFidelity, withoutFloorShadow, type FidelityMetrics } from "./render-fidelity.js";
 import { colourSimilarity, decodeRgba, maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 import { judgeRender, type JudgeStats, type Verdict } from "./visual-judge.js";
 
@@ -379,6 +379,14 @@ const REFERENCE_BAND = 132;
 const VERDICT_COLOUR: Record<Verdict, string> = { ok: "#3ddc84", suspect: "#ffc233", fail: "#ff4d4d" };
 
 /**
+ * The piece in an Unreal editor thumbnail: the border-palette object mask minus the floor's cast shadow. Counting the shadow
+ * inflates the bounding box, so a correct cut-out render reads as a "solid card" against it (the conifer ground twigs).
+ */
+export function referenceObjectMask(reference: RgbaImage): Uint8Array {
+  return withoutFloorShadow(reference, objectMask(reference));
+}
+
+/**
  * One comparison sheet. Without thumbnails: the listing's gallery image on the left, neutral three.js
  * renders of the imported GLBs on the right. With thumbnails: for each piece that has one, the Unreal
  * editor thumbnail ("ORIGINAL") immediately beside our render ("AFTER IMPORT"), the gallery image
@@ -470,7 +478,7 @@ export async function renderContactSheet(
           similarity = comparison.similarity;
           meanColourDelta = comparison.meanColourDelta;
         }
-        const referenceFill = maskFillRatio(objectMask(reference), reference.width, reference.height);
+        const referenceFill = maskFillRatio(referenceObjectMask(reference), reference.width, reference.height);
         thumbnailFill = { fillRatio: referenceFill.fillRatio, objectPixels: referenceFill.pixels };
         thumbnailTiles.push(
           await sharp(candidate.thumbnail).removeAlpha().resize({ width: tile, height: tile, fit: "contain", background: PANEL }).png().toBuffer(),

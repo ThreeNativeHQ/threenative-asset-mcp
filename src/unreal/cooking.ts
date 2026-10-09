@@ -43,6 +43,12 @@ export interface PackageCooking {
   readonly meshKindHint: "static" | "skeletal" | undefined;
   /** High-confidence Texture2D hint used only when UE Viewer cannot parse a newer header. */
   readonly textureHint: boolean;
+  /**
+   * The texture's `MipGenSettings` is `TMGS_NoMipmaps`: the editor builds no mip chain for it. A tagged enum value is a name
+   * in the name table (a default is never written), so the whole entry is positive evidence. Foliage packs set it on the
+   * packed `_AORO` opacity map so thin cut-outs keep their coverage at a distance.
+   */
+  readonly noMipmapsHint: boolean;
   /** High-confidence TextureCube hint used only when UE Viewer cannot parse a newer header. */
   readonly cubemapHint: boolean;
   /** High-confidence SoundWave hint used only when UE Viewer cannot parse a newer header. */
@@ -79,6 +85,7 @@ const UNKNOWN: PackageCooking = Object.freeze({
   naniteHint: false,
   meshKindHint: undefined,
   textureHint: false,
+  noMipmapsHint: false,
   cubemapHint: false,
   soundHint: false,
   dataClassHint: undefined,
@@ -188,6 +195,7 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     textureHint:
       hasTextureClass &&
       (markers.includes("AssetImportData") || head.includes("\0TextureSource\0", 0, "latin1")),
+    noMipmapsHint: hasTextureClass && head.includes("\0TMGS_NoMipmaps\0", 0, "latin1"),
     cubemapHint: hasCubemapClass && markers.includes("AssetImportData"),
     soundHint: hasSoundClass && markers.includes("AssetImportData"),
     dataClassHint,

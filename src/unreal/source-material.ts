@@ -197,7 +197,15 @@ export function reduceSourceMaterial(packages: ReadonlyMap<string, SourcePackage
       collect(edge, channel);
       const reduced = evaluate(edge, channel);
       if (["Roughness", "AmbientOcclusion", "Metallic"].includes(channel)) channels[channel] = reduced;
-      else if (channel === "Specular") limitations.add(`Source Specular${reduced.kind === "texture" ? ` ${reduced.path}.${"RGBA"[reduced.channel]}` : ` ${reduced.value}`}: exact UE4.19 reflectance conversion unsupported`);
+      else if (channel === "Specular") {
+        // A constant is applied (KHR_materials_specular, see the importer); a texture-driven one is not.
+        if (reduced.kind === "scalar") channels[channel] = reduced;
+        limitations.add(
+          reduced.kind === "scalar"
+            ? `Source Specular ${reduced.value}: dielectric F0 = 0.08 x Specular applied as a KHR_materials_specular factor; the engine's own specular shading is not reproduced`
+            : `Source Specular ${reduced.path}.${"RGBA"[reduced.channel]}: exact UE4.19 reflectance conversion unsupported`,
+        );
+      }
       else limitations.add(`Source ${channel}: authored output retained as unsupported by bounded scalar PBR subset`);
     } catch (error) { if (!(error instanceof UnsupportedPath)) throw error; limitations.add(`Source ${channel}: ${error.message}`); }
   }

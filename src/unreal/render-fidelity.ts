@@ -70,9 +70,53 @@ export function srgbToLinear(value: number): number {
   return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
 }
 
+/** Chromaticity distance (r, g of r+g+b) from the floor's within which a bluish dark pixel is the floor's shadow. */
+const SHADOW_CHROMA_RADIUS = 0.12;
+/** A floor whose own chroma (max - min over max) is below this is neutral grey; shadows there are grey and not separable by colour. */
+const TINTED_FLOOR_SATURATION = 0.04;
+
+/**
+ * Removes a cast shadow from the object mask. An editor thumbnail's floor is blue-grey and the piece casts a dark,
+ * bluer copy of it (sky tint); the border-palette mask counts that blob as object, which drags hue toward blue and
+ * saturation down and inflates the bounding box. A shadow is the floor's own chromaticity pushed toward blue and
+ * darker: blue the largest channel, within `SHADOW_CHROMA_RADIUS` of the floor's chromaticity, darker than the floor.
+ * A flat neutral background (our own render) has no tinted floor, so nothing is removed there.
+ */
+export function withoutFloorShadow(image: RgbaImage, mask: Uint8Array): Uint8Array {
+  const floor: [number, number, number][] = [];
+  for (let i = 0; i < mask.length; i += 7) {
+    if (mask[i]) continue;
+    const o = i * 4;
+    if (image.data[o + 3]! < 128) continue;
+    floor.push([image.data[o]!, image.data[o + 1]!, image.data[o + 2]!]);
+  }
+  if (floor.length < 50) return mask;
+  const med = (channel: 0 | 1 | 2): number => floor.map((p) => p[channel]).sort((x, y) => x - y)[Math.floor(floor.length / 2)]!;
+  const fr = med(0);
+  const fg = med(1);
+  const fb = med(2);
+  const fmax = Math.max(fr, fg, fb);
+  if ((fmax - Math.min(fr, fg, fb)) / Math.max(1, fmax) < TINTED_FLOOR_SATURATION) return mask;
+  const floorSum = fr + fg + fb;
+  const floorLuma = 0.2126 * fr + 0.7152 * fg + 0.0722 * fb;
+  const out = new Uint8Array(mask);
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    const o = i * 4;
+    const r = image.data[o]!;
+    const g = image.data[o + 1]!;
+    const b = image.data[o + 2]!;
+    const sum = r + g + b;
+    if (sum < 1 || b < Math.max(r, g)) continue;
+    if (0.2126 * r + 0.7152 * g + 0.0722 * b > floorLuma * 0.85) continue;
+    if (Math.hypot(r / sum - fr / floorSum, g / sum - fg / floorSum) <= SHADOW_CHROMA_RADIUS) out[i] = 0;
+  }
+  return out;
+}
+
 /** The statistics of a render's (or thumbnail's) object pixels. */
 export function describeObject(image: RgbaImage): Described {
-  const mask = objectMask(image, MASK_TOLERANCE);
+  const mask = withoutFloorShadow(image, objectMask(image, MASK_TOLERANCE));
     const pixelsRgb: [number, number, number, number][] = [];
   for (let i = 0; i < mask.length; i++) {
     if (!mask[i]) continue;
