@@ -195,3 +195,14 @@ describe("measureFidelity ignores the floor's cast shadow", () => {
     expect(fidelityVerdict(measureFidelity(thumbnailWithShadow(true), wrong)).verdict).not.toBe("ok");
   });
 });
+
+describe("referenceObjectMask (the solid-card check's thumbnail fill)", () => {
+  it("does not grow the thumbnail's bounding box with the floor's shadow", async () => {
+    const { referenceObjectMask } = await import("../src/unreal/contact-sheet.js");
+    const { maskFillRatio } = await import("../src/unreal/image-diff.js");
+    const fill = (image: RgbaImage) => maskFillRatio(referenceObjectMask(image), image.width, image.height).fillRatio;
+    // With the shadow counted, the plant's bounding box spans the shadow blob too and its fill drops by about half, which
+    // made a correct cut-out render read as "solid card" (fill 0.2 vs 0.08 on the conifer ground twigs).
+    expect(fill(thumbnailWithShadow(true))).toBeCloseTo(fill(thumbnailWithShadow(false)), 1);
+  });
+});
