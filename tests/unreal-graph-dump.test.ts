@@ -161,6 +161,16 @@ describe("--dump-graphs converter mode", () => {
     expect(CUE4PARSE_PROGRAM).toContain("graphPackageKeys[legacy.Name] = located");
   });
 
+  it("reads a native input whose pin name is an FString because the package records no FFrameworkObjectVersion", () => {
+    // Open World Demo Collection, UE 4.21 re-saves: CUE4Parse guesses an FName from --engine, reads every mask four bytes off and
+    // drops a connected Color/Scalar input, so five foliage materials came back with no BaseColor output at all.
+    expect(CUE4PARSE_PROGRAM).toContain("GraphPinsAsString(");
+    expect(CUE4PARSE_PROGRAM).toContain("FFrameworkObjectVersion.Type.PinsStoreFName) archive.ReadFName();");
+    expect(CUE4PARSE_PROGRAM).toContain("else archive.ReadFString();");
+    expect(CUE4PARSE_PROGRAM).toContain("GraphReadNativeInput(archive, legacy)");
+    expect(CUE4PARSE_PROGRAM).toContain("GraphRawInputs(material.Owner)");
+  });
+
   it("emits and accepts the attribute GUIDs of Set/GetMaterialAttributes", () => {
     expect(CUE4PARSE_PROGRAM).toContain('"AttributeSetTypes" or "AttributeGetTypes"');
     expect(CUE4PARSE_PROGRAM).toContain('node["attributeTypes"]');

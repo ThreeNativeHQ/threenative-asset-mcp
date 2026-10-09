@@ -519,6 +519,12 @@ static (FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bo
 // CUE4Parse guesses from --engine when the package records nothing, and that guess is wrong for packages saved by UE 4.5.
 static bool GraphTaggedInputs(IPackage? package) =>
     package is Package legacy && (legacy.Summary.CustomVersionContainer?.Versions.All(version => version.Key != FCoreObjectVersion.GUID) ?? true);
+// A native package that records no FFrameworkObjectVersion keeps a pin's InputName as an FString (Unreal reads a missing custom version as the
+// oldest), but CUE4Parse guesses an FName from --engine and misreads every input's mask, or drops a connected Color/Scalar input outright.
+static bool GraphPinsAsString(IPackage? package) =>
+    package is Package legacy && (legacy.Summary.CustomVersionContainer?.Versions.All(version => version.Key != FFrameworkObjectVersion.GUID) ?? false);
+// Inputs CUE4Parse cannot be trusted with: re-read from the raw bytes.
+static bool GraphRawInputs(IPackage? package) => GraphTaggedInputs(package) || GraphPinsAsString(package);
 // Packages saved by UE 4.5 store each FExpressionInput as tagged properties that CUE4Parse mis-reads as the native layout and drops.
 // Re-read those struct payloads from the raw package bytes.
 FAssetArchive? GraphRawArchive(Package legacy)
@@ -556,6 +562,7 @@ List<GraphLegacyInput>? GraphLegacyFunctionInputs(UObject call)
     var archive = GraphRawArchive(legacy);
     var export = legacy.ExportMap.FirstOrDefault(item => item.ObjectName.Text == call.Name);
     if (archive is null || export is null) return null;
+    var native = !GraphTaggedInputs(legacy);
     archive.Position = export.SerialOffset;
     List<GraphLegacyInput>? result = null;
     while (true)
@@ -579,7 +586,7 @@ List<GraphLegacyInput>? GraphLegacyFunctionInputs(UObject call)
                         var item = new FPropertyTag(archive, false);
                         if (item.Name.IsNone) break;
                         var itemEnd = archive.Position + item.Size;
-                        if (item.Name.Text == "Input") input = GraphReadLegacyInput(archive, itemEnd);
+                        if (item.Name.Text == "Input") input = native ? GraphReadNativeInput(archive, legacy) : GraphReadLegacyInput(archive, itemEnd);
                         archive.Position = itemEnd;
                     }
                     elements.Add(input);
@@ -599,7 +606,7 @@ object? GraphInputValue(UObject expr, string name)
     var property = GraphProperty(expr, name);
     var value = property?.Tag?.GenericValue;
     if (property is not null && property.PropertyType.Text == "StructProperty" &&
-        (property.Tag is null || (GraphTaggedInputs(expr.Owner) && value is FScriptStruct { StructType: FExpressionInput })))
+        (property.Tag is null || (GraphRawInputs(expr.Owner) && value is FScriptStruct { StructType: FExpressionInput })))
         return GraphLegacyInputs(expr).TryGetValue(name, out var recovered) ? recovered : null;
     return value;
 }
@@ -614,6 +621,9 @@ Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
     if (archive is null) return inputs;
     var export = legacy.ExportMap.FirstOrDefault(item => item.ObjectName.Text == expr.Name);
     if (export is null) return inputs;
+    // A package that records FCoreObjectVersion stores an input natively; CUE4Parse's own read of a connected Color/Scalar input
+    // of such a package can still fail and drop the property (a UE 4.21 re-save), so the native payload is re-read here too.
+    var native = !GraphTaggedInputs(legacy);
     archive.Position = export.SerialOffset;
     while (true)
     {
@@ -624,12 +634,24 @@ Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
         try
         {
             if (tag.PropertyType.Text == "StructProperty" && tag.TagData?.StructType is "ExpressionInput" or "ColorMaterialInput" or "ScalarMaterialInput" or "VectorMaterialInput" or "Vector2MaterialInput" or "MaterialAttributesInput")
-                inputs[tag.ArrayIndex > 0 ? $"{tag.Name.Text}[{tag.ArrayIndex}]" : tag.Name.Text] = GraphReadLegacyInput(archive, end);
+                inputs[tag.ArrayIndex > 0 ? $"{tag.Name.Text}[{tag.ArrayIndex}]" : tag.Name.Text] = native ? GraphReadNativeInput(archive, legacy) : GraphReadLegacyInput(archive, end);
         }
         catch { }
         archive.Position = end;
     }
     return inputs;
+}
+// The native layout (Expression, OutputIndex, InputName, Mask, MaskR..A); the UseConstant/Constant tail is not needed for a wired input.
+static GraphLegacyInput GraphReadNativeInput(FAssetArchive archive, Package legacy)
+{
+    var expression = new FPackageIndex(archive);
+    var output = archive.Read<int>();
+    if (legacy.Summary.CustomVersionContainer?.Versions.FirstOrDefault(version => version.Key == FFrameworkObjectVersion.GUID) is { } framework &&
+        framework.Version >= (int) FFrameworkObjectVersion.Type.PinsStoreFName) archive.ReadFName();
+    else archive.ReadFString();
+    var mask = archive.Read<int>();
+    var channels = new[] { archive.Read<int>(), archive.Read<int>(), archive.Read<int>(), archive.Read<int>() };
+    return new GraphLegacyInput(expression, output, mask != 0 ? channels : null, null, false);
 }
 static GraphLegacyInput GraphReadLegacyInput(FAssetArchive archive, long structEnd)
 {
@@ -746,7 +768,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
             var isFunctionInput = className == "FunctionInput";
             if (isFunctionCall) { className = "FunctionCall"; node["class"] = className; }
             Dictionary<string, GraphLegacyInput>? legacyInputs = null;
-            var taggedPackage = GraphTaggedInputs(owner);
+            var taggedPackage = GraphRawInputs(owner);
             foreach (var property in expr.Properties)
             {
                 var name = property.Name.Text;
@@ -974,7 +996,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         if (GraphProperty(call, "FunctionInputs")?.Tag?.GenericValue is UScriptArray callInputs)
         {
             // A package that records no FCoreObjectVersion stores each nested input as tagged properties; read them from the raw bytes.
-            var legacyInputs = GraphTaggedInputs(owner) ? GraphLegacyFunctionInputs(call) : null;
+            var legacyInputs = GraphRawInputs(owner) ? GraphLegacyFunctionInputs(call) : null;
             if (legacyInputs is not null && legacyInputs.Count != callInputs.Properties.Count) legacyInputs = null;
             var position = 0;
             foreach (var element in callInputs.Properties)
@@ -1028,7 +1050,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         {
             var outputProperty = GraphProperty(material, propertyName) ?? (editorOnly is null ? null : GraphProperty(editorOnly, propertyName));
             var value = outputProperty?.Tag?.GenericValue;
-            if (outputProperty is not null && outputProperty.PropertyType.Text == "StructProperty" && (outputProperty.Tag is null || GraphTaggedInputs(material.Owner)))
+            if (outputProperty is not null && outputProperty.PropertyType.Text == "StructProperty" && (outputProperty.Tag is null || GraphRawInputs(material.Owner)))
             {
                 var recovered = GraphLegacyInputs(material);
                 if (recovered.TryGetValue(propertyName, out var legacyOutput)) value = legacyOutput;
