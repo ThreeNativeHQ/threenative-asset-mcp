@@ -975,7 +975,7 @@ describe("graphPathClasses and supportedNodeClasses", () => {
     for (const name of ["TextureSample", "TextureSampleParameter2D", "LinearInterpolate", "FunctionCall", "StaticSwitch", "FeatureLevelSwitch", "Fresnel", "DepthFade", "TwoSidedSign", "WorldPosition"]) {
       expect(supported).toContain(name);
     }
-    for (const name of ["VertexColor", "Panner", "Time", "ReflectionVectorWS", "TextureSampleParameterCube"]) expect(supported).not.toContain(name);
+    for (const name of ["VertexColor", "CameraVectorWS", "ReflectionVectorWS", "TextureSampleParameterCube"]) expect(supported).not.toContain(name);
   });
 });
 
@@ -1125,7 +1125,7 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
         constant3("c", [0.25, 0.5, 0.75]),
         node("wpo", "RotateAboutAxis"),
         node("normal", "VertexNormalWS"),
-        node("shading", "Panner"),
+        node("shading", "ReflectionVectorWS"),
       ],
       pin("break", 0, RGB_MASK),
     );
@@ -1136,15 +1136,15 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
 
   it("an unsupported node on the BaseColor pin or the incoming attributes still blocks", async () => {
     const onColour = makeGraph(
-      [breakBaseColor("set"), set({ "Inputs[0]": pin("make"), "Inputs[1]": pin("bad") }, [G.BaseColor]), makeColour("make", "c"), constant3("c", [1, 1, 1]), node("bad", "Panner")],
+      [breakBaseColor("set"), set({ "Inputs[0]": pin("make"), "Inputs[1]": pin("bad") }, [G.BaseColor]), makeColour("make", "c"), constant3("c", [1, 1, 1]), node("bad", "ReflectionVectorWS")],
       pin("break", 0, RGB_MASK),
     );
-    expect(await bake(onColour)).toMatchObject({ status: "unsupported", unsupported: ["Panner"] });
+    expect(await bake(onColour)).toMatchObject({ status: "unsupported", unsupported: ["ReflectionVectorWS"] });
     const onIncoming = makeGraph(
-      [breakBaseColor("set"), set({ "Inputs[0]": pin("bad"), "Inputs[1]": pin("c") }, [G.Roughness]), constant3("c", [1, 1, 1]), node("bad", "Panner")],
+      [breakBaseColor("set"), set({ "Inputs[0]": pin("bad"), "Inputs[1]": pin("c") }, [G.Roughness]), constant3("c", [1, 1, 1]), node("bad", "ReflectionVectorWS")],
       pin("break", 0, RGB_MASK),
     );
-    expect(await bake(onIncoming)).toMatchObject({ status: "unsupported", unsupported: ["Panner"] });
+    expect(await bake(onIncoming)).toMatchObject({ status: "unsupported", unsupported: ["ReflectionVectorWS"] });
   });
 
   it("falls back to by-name matching when the dump carries no attributeTypes", async () => {
@@ -1170,7 +1170,7 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
 
   it("BreakMaterialAttributes does not walk its input for an attribute that is not BaseColor", async () => {
     const graph = makeGraph(
-      [node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("bad") }, outputNames: ["BaseColor", "Metallic"] }), node("bad", "Panner")],
+      [node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("bad") }, outputNames: ["BaseColor", "Metallic"] }), node("bad", "ReflectionVectorWS")],
       pin("break", 1, RGB_MASK),
     );
     expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Metallic"] });
@@ -1189,7 +1189,7 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
         node("q", "QualitySwitch", { inputs: { Default: pin("hi", 0, RGB_MASK), "Inputs[0]": pin("bad"), "Inputs[1]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }),
         constant3("hi", [0.25, 0.5, 0.75]),
         constant3("lo", [1, 0, 0]),
-        node("bad", "Panner"),
+        node("bad", "ReflectionVectorWS"),
       ],
       pin("q", 0, RGB_MASK),
     );
@@ -1212,7 +1212,7 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
     ];
     for (const [name, note] of cases) {
       const graph = makeGraph(
-        [engineCall("f", name, { Input0: pin("c", 0, RGB_MASK), Input1: pin("bad") }), constant3("c", [0.25, 0.5, 0.75]), node("bad", "Panner")],
+        [engineCall("f", name, { Input0: pin("c", 0, RGB_MASK), Input1: pin("bad") }), constant3("c", [0.25, 0.5, 0.75]), node("bad", "ReflectionVectorWS")],
         pin("f", 0, RGB_MASK),
       );
       const result = await bake(graph);
@@ -1417,7 +1417,7 @@ describe("standard math nodes and engine utility functions seen on real BaseColo
     const nodes = [
       node("q", "PathTracingQualitySwitch", { inputs: { Normal: pin("hi", 0, RGB_MASK), PathTraced: pin("bad") } }),
       constant3("hi", [0.25, 0.5, 0.75]),
-      node("bad", "Panner"),
+      node("bad", "ReflectionVectorWS"),
     ];
     expect(await exact(nodes, "q")).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
     expect(await bake(makeGraph([node("q", "PathTracingQualitySwitch")], pin("q", 0, RGB_MASK)))).toMatchObject({ status: "unavailable" });
@@ -1426,10 +1426,10 @@ describe("standard math nodes and engine utility functions seen on real BaseColo
   it("ShadingPathSwitch takes Default, else the deferred slot Inputs[0]", async () => {
     const withDefault = [
       node("s", "ShadingPathSwitch", { inputs: { Default: pin("hi", 0, RGB_MASK), "Inputs[0]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }),
-      constant3("hi", [0.25, 0.5, 0.75]), constant3("lo", [1, 0, 0]), node("bad", "Panner"),
+      constant3("hi", [0.25, 0.5, 0.75]), constant3("lo", [1, 0, 0]), node("bad", "ReflectionVectorWS"),
     ];
     expect(await exact(withDefault, "s")).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
-    const slotOnly = [node("s", "ShadingPathSwitch", { inputs: { "Inputs[0]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }), constant3("lo", [1, 0, 0]), node("bad", "Panner")];
+    const slotOnly = [node("s", "ShadingPathSwitch", { inputs: { "Inputs[0]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }), constant3("lo", [1, 0, 0]), node("bad", "ReflectionVectorWS")];
     expect(await exact(slotOnly, "s")).toEqual([255, 0, 0]);
     expect(await bake(makeGraph([node("s", "ShadingPathSwitch")], pin("s", 0, RGB_MASK)))).toMatchObject({ status: "unavailable" });
   });
@@ -1515,7 +1515,7 @@ describe("standard math nodes and engine utility functions seen on real BaseColo
   });
 
   it("scene and view dependent nodes stay unsupported", async () => {
-    for (const cls of ["SceneColor", "SceneTexture", "ViewProperty", "Time", "Panner"]) {
+    for (const cls of ["SceneColor", "SceneTexture", "ViewProperty", "CameraVectorWS", "ReflectionVectorWS"]) {
       expect(await bake(makeGraph([node("u", cls)], pin("u", 0, RGB_MASK))), cls).toMatchObject({ status: "unsupported", unsupported: [cls] });
     }
   });
@@ -1862,5 +1862,312 @@ describe("view-dependent nodes of sky and effect materials", () => {
     );
     const result = await bake(graph);
     expect(result).toMatchObject({ status: "unsupported", unsupported: ["ImposterUVs"] });
+  });
+});
+
+describe("layered architecture masters: texture objects, render-path switches, surface and layer functions", () => {
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}, extra: Partial<Parameters<typeof bakeGraph>[0]> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 4, ...extra });
+  const notes = (result: BakeResult): string[] => (result.status === "baked" ? result.approximations : []);
+  /** An engine function with no body in the pack, at its real engine path. */
+  const engineFn = (id: string, path: string, inputs: Raw, outputNames: string[] = ["Blended Material"]): Raw => {
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    return node(id, "FunctionCall", {
+      inputs,
+      function: `/Engine/Functions/${path}.${name}`,
+      outputNames,
+      fn: { inputs: Object.fromEntries(Object.entries(inputs).map(([key, value]) => [key, value && (value as { node: string }).node])), outputs: [], output: null },
+      error: "material function could not be loaded (engine content is not in the pack)",
+    });
+  };
+  const layer = (id: string, rgb: [number, number, number]): Raw[] => [node(id, "MakeMaterialAttributes", { inputs: { BaseColor: pin(`${id}/c`) } }), constant3(`${id}/c`, rgb)];
+  const breakColour = (id: string, source: string): Raw => node(id, "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: ["BaseColor"] });
+  const surfaceOf = (size: number, normalAt: (x: number) => [number, number, number]) => {
+    const normals = new Float32Array(size * size * 3);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) normals.set(normalAt(x), (y * size + x) * 3);
+    return { width: size, height: size, normals, covered: size * size };
+  };
+
+  it("a sample's wired TextureObject replaces its own preview texture, and a TextureObjectParameter honours the instance", async () => {
+    // A layer function samples its BaseColorTexture input; the sample's own Texture property is the function's DefaultDiffuse preview.
+    const red = flat([255, 0, 0]);
+    const blue = flat([0, 0, 255]);
+    const green = flat([0, 255, 0]);
+    const graph = makeGraph(
+      [
+        node("sample", "TextureSample", { inputs: { TextureObject: pin("input") }, texture: "/Engine/EngineMaterials/DefaultDiffuse.DefaultDiffuse", samplerType: "Color" }),
+        node("input", "FunctionInput", { inputs: { Preview: pin("preview"), Input: pin("object") }, constants: { InputName: "BaseColorTexture", InputType: "FunctionInput_Texture2D" } }),
+        node("preview", "TextureObject", { texture: "/Engine/EngineMaterials/DefaultDiffuse.DefaultDiffuse", samplerType: "Color" }),
+        node("object", "TextureObjectParameter", { parameter: { name: "Gold", group: "" }, default: null, texture: "/Game/Test/T_Gold.T_Gold", samplerType: "Color" }),
+      ],
+      pin("sample", 0, RGB_MASK),
+    );
+    const textures = { DefaultDiffuse: { png: await red(), srgb: true }, T_Gold: { png: await blue(), srgb: true }, T_Override: { png: await green(), srgb: true } };
+    const own = await bake(graph, textures);
+    expect((await pixelsOf(own))(0, 0)).toEqual([0, 0, 255]);
+    expect(own.status === "baked" && own.confidence).toBe("exact");
+    const overridden = await bake(graph, textures, { parameters: params({ textures: { gold: "/Game/Test/T_Override.T_Override" } }) });
+    expect((await pixelsOf(overridden))(0, 0)).toEqual([0, 255, 0]);
+  });
+
+  it("LightmassReplace and MaterialProxyReplace take Realtime exactly and never visit the other branch", async () => {
+    for (const [cls, other] of [["LightmassReplace", "Lightmass"], ["MaterialProxyReplace", "MaterialProxy"]] as const) {
+      const graph = makeGraph(
+        [node("r", cls, { inputs: { Realtime: pin("c", 0, RGB_MASK), [other]: pin("bad") } }), constant3("c", [0.25, 0.5, 0.75]), node("bad", "ReflectionVectorWS")],
+        pin("r", 0, RGB_MASK),
+      );
+      const result = await bake(graph);
+      expect((await pixelsOf(result))(0, 0), cls).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+      expect(result.status === "baked" && result.confidence, cls).toBe("exact");
+    }
+  });
+
+  it("PrecomputedAOMask is 0, Unreal's value without built static lighting, and says so", async () => {
+    // The jungle master's AO function: lerp(AO+ = 1.7, AO- = -3, PrecomputedAOMask) drives the wall colour mix.
+    const graph = makeGraph(
+      [
+        node("mix", "LinearInterpolate", { inputs: { A: pin("dark"), B: pin("light"), Alpha: pin("clamp") } }),
+        constant3("dark", [0.1, 0.1, 0.1]),
+        constant3("light", [0.5, 0.4, 0.3]),
+        node("clamp", "Clamp", { inputs: { Input: pin("ao") } }),
+        node("ao", "LinearInterpolate", { inputs: { A: pin("plus"), B: pin("minus"), Alpha: pin("mask") } }),
+        node("plus", "Constant", { constants: { R: 1.7 } }),
+        node("minus", "Constant", { constants: { R: -3 } }),
+        node("mask", "PrecomputedAOMask"),
+      ],
+      pin("mix", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.5), encode(0.4), encode(0.3)]);
+    expect(notes(result).some((note) => note.startsWith("PrecomputedAOMask evaluated as 0"))).toBe(true);
+  });
+
+  it("VertexNormalWS is the mesh's own normal in Unreal axes (glTF +Y is Unreal Z) when the bake has the surface, and unsupported without it", async () => {
+    // abs(VertexNormalWS.b) picks the leak colour on up-facing texels (left half) and the wall colour on side-facing ones.
+    const graph = makeGraph(
+      [
+        node("mix", "LinearInterpolate", { inputs: { A: pin("wall"), B: pin("leak"), Alpha: pin("abs") } }),
+        constant3("wall", [0.6, 0.6, 0.6]),
+        constant3("leak", [0.2, 0.1, 0.0]),
+        node("abs", "Abs", { inputs: { Input: pin("z") } }),
+        node("z", "ComponentMask", { inputs: { Input: pin("normal") }, channelMask: [0, 0, 1, 0] }),
+        node("normal", "VertexNormalWS"),
+      ],
+      pin("mix", 0, RGB_MASK),
+    );
+    const surface = surfaceOf(4, (x) => (x < 2 ? [0, 1, 0] : [0, 0, 1]));
+    const result = await bake(graph, {}, { surface });
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(0.2), encode(0.1), encode(0)]);
+    expect(pixel(3, 0)).toEqual([encode(0.6), encode(0.6), encode(0.6)]);
+    expect(notes(result).some((note) => note.startsWith("VertexNormalWS evaluated as the mesh's own vertex normal"))).toBe(true);
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["VertexNormalWS"] });
+  });
+
+  it("Transform carries a flat tangent-space normal to the vertex normal, keeps Local/World as the identity, and names other spaces", async () => {
+    // The moss layer: dot(Transform(BreakNormal(attributes)), (0, 0, 1)) is the up-facing mask; a flat normal map gives the vertex normal.
+    const moss = (transform: Raw) =>
+      makeGraph(
+        [
+          node("dot", "DotProduct", { inputs: { A: pin("t"), B: pin("up") } }),
+          transform,
+          engineFn("flat", "MaterialLayerFunctions/MatLayerBlend_BreakNormal", { Input0: pin("attrs") }, ["Normal"]),
+          ...layer("attrs", [0.5, 0.5, 0.5]),
+          constant3("up", [0, 0, 1]),
+        ],
+        pin("dot"),
+      );
+    const surface = surfaceOf(4, (x) => (x < 2 ? [0, 1, 0] : [1, 0, 0]));
+    const tangent = await bake(moss(node("t", "Transform", { inputs: { Input: pin("flat") } })), {}, { surface });
+    const pixel = await pixelsOf(tangent);
+    expect(pixel(0, 0)).toEqual([255, 255, 255]);
+    expect(pixel(3, 0)).toEqual([0, 0, 0]);
+    expect(notes(tangent)).toEqual(expect.arrayContaining([expect.stringMatching(/^Transform from Tangent to World/), expect.stringMatching(/^MatLayerBlend_BreakNormal/)]));
+    const local = await bake(moss(node("t", "Transform", { inputs: { Input: pin("flat") }, constants: { TransformSourceType: "TRANSFORMSOURCE_Local" } })));
+    expect((await pixelsOf(local))(0, 0)).toEqual([255, 255, 255]);
+    expect(notes(local).some((note) => note.startsWith("Transform between Local and World"))).toBe(true);
+    const view = await bake(moss(node("t", "Transform", { inputs: { Input: pin("flat") }, constants: { TransformSourceType: "TRANSFORMSOURCE_World", TransformType: "TRANSFORM_View" } })), {}, { surface });
+    expect(view).toMatchObject({ status: "unsupported", unsupported: ["Transform(World to View)"] });
+    expect(await bake(moss(node("t", "Transform", { inputs: { Input: pin("flat") } })))).toMatchObject({ status: "unsupported", unsupported: ["Transform(Tangent to World)"] });
+  });
+
+  it("ObjectRadius is the mesh's bounding radius: UV x scale x radius / 250 tiles the detail mask with the mesh size", async () => {
+    // The jungle detail function: TextureSample(T, UV x 2 x ObjectRadius / 250). A 250 cm radius tiles the stripes twice; 125 cm once.
+    const stripes = await pngOf(2, 2, (x) => (x === 0 ? [0, 0, 0] : [255, 255, 255]));
+    const graph = makeGraph(
+      [
+        textureSample("t", "T_Stripes", "Color", "coords"),
+        multiply("coords", pin("radius"), pin("scaled")),
+        node("radius", "Divide", { inputs: { A: pin("r") }, constants: { ConstB: 250 } }),
+        node("r", "ObjectRadius"),
+        multiply("scaled", pin("uv"), pin("two")),
+        textureCoordinate("uv"),
+        node("two", "Constant", { constants: { R: 2 } }),
+      ],
+      pin("t", 0, RGB_MASK),
+    );
+    const textures = { T_Stripes: { png: stripes, srgb: true } };
+    const large = await pixelsOf(await bake(graph, textures, { objectRadius: 250 }));
+    expect([0, 1, 2, 3].map((x) => large(x, 0)[0])).toEqual([0, 255, 0, 255]);
+    // 125 cm tiles once: the same pixels as the graph with the radius written in as a constant, and not the 250 cm pixels.
+    const small = await pixelsOf(await bake(graph, textures, { objectRadius: 125 }));
+    const constant = makeGraph(graph.nodes.map((entry) => (entry.id === "r" ? node("r", "Constant", { constants: { R: 125 } }) : entry)) as Raw[], pin("t", 0, RGB_MASK));
+    const reference = await pixelsOf(await bake(constant, textures));
+    expect([0, 1, 2, 3].map((x) => small(x, 0))).toEqual([0, 1, 2, 3].map((x) => reference(x, 0)));
+    expect(small(0, 0)).not.toEqual(large(0, 0));
+    expect(await bake(graph, textures)).toMatchObject({ status: "unsupported", unsupported: ["ObjectRadius"] });
+  });
+
+  it("WorldAlignedTexture reads its texture object's average colour, honouring a TextureObjectParameter override", async () => {
+    // Half black, half white (linear Masks sampler): the average of every output is 0.5, whatever the size input says.
+    const half = await pngOf(4, 4, (x) => (x < 2 ? [0, 0, 0] : [255, 255, 255]));
+    const quarter = await pngOf(4, 4, (x) => (x < 3 ? [0, 0, 0] : [255, 255, 255]));
+    const graph = (output: number) =>
+      makeGraph(
+        [
+          node("mask", "ComponentMask", { inputs: { Input: pin("wat", output) }, channelMask: [0, 1, 0, 0] }),
+          engineFn("wat", "Engine_MaterialFunctions01/Texturing/WorldAlignedTexture", { Input0: pin("object"), Input1: pin("size") }, ["XY Texture", "Z Texture", "XYZ Texture"]),
+          node("object", "TextureObjectParameter", { parameter: { name: "Details Mask", group: "" }, default: null, texture: "/Game/Test/T_Half.T_Half", samplerType: "Masks" }),
+          node("size", "ScalarParameter", { parameter: { name: "MaskScale", group: "" }, default: 800 }),
+        ],
+        pin("mask"),
+      );
+    const textures = { T_Half: { png: half, srgb: false }, T_Quarter: { png: quarter, srgb: false } };
+    for (const output of [0, 1, 2]) {
+      const result = await bake(graph(output), textures);
+      expect((await pixelsOf(result))(0, 0), `output ${output}`).toEqual([encode(0.5), encode(0.5), encode(0.5)]);
+      expect(notes(result).some((note) => note.startsWith("WorldAlignedTexture evaluated as its texture's average colour"))).toBe(true);
+    }
+    const overridden = await bake(graph(2), textures, { parameters: params({ textures: { "details mask": "/Game/Test/T_Quarter.T_Quarter" } }) });
+    expect((await pixelsOf(overridden))(3, 3)).toEqual([encode(0.25), encode(0.25), encode(0.25)]);
+  });
+
+  it("MatLayerBlend_TenLayerBlend lerps the layers over Input20 from Input18 (next to the base) up to Input0 (top), ignoring Input21", async () => {
+    // A turret master: dirt (Input0) over lights (Input6) over gold (Input18) over marble (Input20); Input21 is a baked normal map.
+    const tenLayers = (alphas: { dirt: number; gold: number }) =>
+      makeGraph(
+        [
+          breakColour("out", "ten"),
+          engineFn("ten", "MaterialLayerFunctions/MatLayerBlend_TenLayerBlend", {
+            ...Object.fromEntries(Array.from({ length: 22 }, (_, index) => [`Input${index}`, null])),
+            Input0: pin("dirt"),
+            Input1: pin("dirtAlpha"),
+            Input18: pin("gold"),
+            Input19: pin("goldAlpha"),
+            Input20: pin("marble"),
+            Input21: pin("normalMap", 0, RGB_MASK),
+          }),
+          ...layer("dirt", [0.1, 0.08, 0.06]),
+          ...layer("gold", [1, 0.8, 0.3]),
+          ...layer("marble", [0.7, 0.7, 0.7]),
+          node("dirtAlpha", "Constant", { constants: { R: alphas.dirt } }),
+          node("goldAlpha", "Constant", { constants: { R: alphas.gold } }),
+          node("normalMap", "ReflectionVectorWS"),
+        ],
+        pin("out", 0, RGB_MASK),
+      );
+    const base = await bake(tenLayers({ dirt: 0, gold: 0 }));
+    expect((await pixelsOf(base))(0, 0)).toEqual([encode(0.7), encode(0.7), encode(0.7)]);
+    // Both masks full: the top layer (Input0) wins over the one beside the base.
+    expect((await pixelsOf(await bake(tenLayers({ dirt: 1, gold: 1 }))))(0, 0)).toEqual([encode(0.1), encode(0.08), encode(0.06)]);
+    const half = await bake(tenLayers({ dirt: 0.5, gold: 1 }));
+    expect((await pixelsOf(half))(0, 0)).toEqual([encode(0.55), encode(0.44), encode(0.18)]);
+    expect(notes(half).some((note) => note.startsWith("MatLayerBlend_TenLayerBlend"))).toBe(true);
+  });
+
+  it("MatLayerBlend helpers: Break/Override/MultiplyBaseColor act on BaseColor, the others pass it through, without walking their other pins", async () => {
+    const base = layer("base", [0.2, 0.4, 0.6]);
+    const call = (name: string, inputs: Raw) => engineFn("f", `MaterialLayerFunctions/${name}`, inputs, name === "MatLayerBlend_BreakBaseColor" ? ["BaseColor"] : ["Blended Material"]);
+    const colourOf = async (nodes: Raw[], root: ReturnType<typeof pin>) => {
+      const result = await bake(makeGraph(nodes, root));
+      return { pixel: (await pixelsOf(result))(0, 0), result };
+    };
+    const broken = await colourOf([call("MatLayerBlend_BreakBaseColor", { Input0: pin("base") }), ...base], pin("f", 0, RGB_MASK));
+    expect(broken.pixel).toEqual([encode(0.2), encode(0.4), encode(0.6)]);
+    const overridden = await colourOf([breakColour("out", "f"), call("MatLayerBlend_OverrideBaseColor", { Input0: pin("base"), Input1: pin("c", 0, RGB_MASK), Input2: null }), constant3("c", [0.9, 0.1, 0.1]), ...base], pin("out", 0, RGB_MASK));
+    expect(overridden.pixel).toEqual([encode(0.9), encode(0.1), encode(0.1)]);
+    const multiplied = await colourOf([breakColour("out", "f"), call("MatLayerBlend_MultiplyBaseColor", { Input0: pin("base"), Input1: pin("c", 0, RGB_MASK), Input2: pin("amount") }), constant3("c", [0.5, 0.5, 0]), node("amount", "Constant", { constants: { R: 0.5 } }), ...base], pin("out", 0, RGB_MASK));
+    expect(multiplied.pixel).toEqual([encode(0.15), encode(0.3), encode(0.3)]);
+    for (const name of ["MatLayerBlend_Emissive", "MatLayerBlend_ModulateRoughness", "MatLayerBlend_ModulateSpecular", "MatLayerBlend_ReplaceNormals", "MatLayerBlend_NormalFlatten", "MatLayerBlend_OverrideWorldPositionOffset", "MatLayerBlend_LightmassReplace"]) {
+      const passed = await colourOf([breakColour("out", "f"), call(name, { Input0: pin("base"), Input1: pin("bad") }), node("bad", "ReflectionVectorWS"), ...base], pin("out", 0, RGB_MASK));
+      expect(passed.pixel, name).toEqual([encode(0.2), encode(0.4), encode(0.6)]);
+      expect(notes(passed.result).some((note) => note.startsWith(`${name}: BaseColor passed through`)), name).toBe(true);
+    }
+    expect(supportedEngineFunctions()).toEqual(expect.arrayContaining(["MatLayerBlend_TenLayerBlend", "MatLayerBlend_BreakBaseColor", "WorldAlignedTexture", "Lerp_ScratchGrime"]));
+  });
+
+  it("Lerp_ScratchGrime lays scratch then grime over the base, and MetallicShading passes its colour through", async () => {
+    const graph = makeGraph(
+      [
+        engineFn("shade", "Engine_MaterialFunctions01/Shading/MetallicShading", { Input0: pin("lerp") }, ["Result"]),
+        engineFn("lerp", "Engine_MaterialFunctions03/Blends/Lerp_ScratchGrime", { Input0: pin("base", 0, RGB_MASK), Input1: pin("scratch", 0, RGB_MASK), Input2: pin("grime", 0, RGB_MASK), Input3: pin("scratchMask"), Input4: pin("grimeMask") }, ["Result"]),
+        constant3("base", [0.8, 0.8, 0.8]),
+        constant3("scratch", [1, 1, 1]),
+        constant3("grime", [0, 0, 0]),
+        node("scratchMask", "Constant", { constants: { R: 0.25 } }),
+        node("grimeMask", "Constant", { constants: { R: 0.5 } }),
+      ],
+      pin("shade", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    // lerp(lerp(0.8, 1, 0.25), 0, 0.5) = 0.425; grime first would be lerp(lerp(0.8, 0, 0.5), 1, 0.25) = 0.55.
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.425), encode(0.425), encode(0.425)]);
+    expect(notes(result)).toEqual(expect.arrayContaining([expect.stringMatching(/^Lerp_ScratchGrime/), expect.stringMatching(/^MetallicShading/)]));
+  });
+
+  it("Time is the first frame and Panner its coordinate unpanned; Sine, Ceil and Floor are exact", async () => {
+    // Stripes sampled through Panner(UV x 2, Time): at t = 0 the stripes tile twice and are not shifted.
+    const stripes = await pngOf(2, 2, (x) => (x === 0 ? [0, 0, 0] : [255, 255, 255]));
+    for (const wiredTime of [false, true]) {
+      const graph = makeGraph(
+        [
+          textureSample("t", "T_Stripes", "Color", "pan"),
+          node("pan", "Panner", { inputs: { Coordinate: pin("scaled"), ...(wiredTime ? { Time: pin("time") } : {}) }, constants: { SpeedX: 0.37 } }),
+          node("time", "Time"),
+          multiply("scaled", pin("uv"), pin("two")),
+          textureCoordinate("uv"),
+          node("two", "Constant", { constants: { R: 2 } }),
+        ],
+        pin("t", 0, RGB_MASK),
+      );
+      const result = await bake(graph, { T_Stripes: { png: stripes, srgb: true } });
+      const pixel = await pixelsOf(result);
+      expect([0, 1, 2, 3].map((x) => pixel(x, 0)[0]), `wired time ${wiredTime}`).toEqual([0, 255, 0, 255]);
+      expect(notes(result).some((note) => note.startsWith(wiredTime ? "Time evaluated as 0" : "Panner evaluated at time 0"))).toBe(true);
+    }
+    // Sine(0.25, Period 1) = 1; Ceil(0.2) = 1; Floor(0.7) = 0: (1, 1, 0).
+    const maths = makeGraph(
+      [
+        node("rg", "AppendVector", { inputs: { A: pin("sine"), B: pin("ceil") } }),
+        node("rgb", "AppendVector", { inputs: { A: pin("rg"), B: pin("floor") } }),
+        node("sine", "Sine", { inputs: { Input: pin("quarter") } }),
+        node("ceil", "Ceil", { inputs: { Input: pin("small") } }),
+        node("floor", "Floor", { inputs: { Input: pin("large") } }),
+        node("quarter", "Constant", { constants: { R: 0.25 } }),
+        node("small", "Constant", { constants: { R: 0.2 } }),
+        node("large", "Constant", { constants: { R: 0.7 } }),
+      ],
+      pin("rgb"),
+    );
+    const exact = await bake(maths);
+    expect((await pixelsOf(exact))(0, 0)).toEqual([255, 255, 0]);
+    expect(exact.status === "baked" && exact.confidence).toBe("exact");
+  });
+
+  it("an unconnected function input that uses its preview value as default is its PreviewValue, sized by InputType (zero when omitted)", async () => {
+    const graph = (constants: Raw) =>
+      makeGraph(
+        [
+          node("mix", "LinearInterpolate", { inputs: { A: pin("a"), B: pin("b"), Alpha: pin("mask") } }),
+          constant3("a", [0.2, 0.2, 0.2]),
+          constant3("b", [1, 0, 0]),
+          node("mask", "FunctionInput", { inputs: { Input: null }, constants: { InputName: "ScratchMASK", InputType: "FunctionInput_Scalar", ...constants } }),
+        ],
+        pin("mix", 0, RGB_MASK),
+      );
+    expect((await pixelsOf(await bake(graph({ bUsePreviewValueAsDefault: true }))))(0, 0)).toEqual([encode(0.2), encode(0.2), encode(0.2)]);
+    expect((await pixelsOf(await bake(graph({ bUsePreviewValueAsDefault: true, PreviewValue: [1, 0, 0, 0] }))))(0, 0)).toEqual([255, 0, 0]);
+    // Without the flag Unreal refuses to compile a missing function input.
+    expect((await bake(graph({}))).status).toBe("unavailable");
   });
 });

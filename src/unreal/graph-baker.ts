@@ -62,6 +62,8 @@ export interface GraphBakeRequest {
    * surface (a world-normal blend), so a graph that does not never pays for the raster or loses its shared bake.
    */
   readonly surface?: (() => SurfaceNormals | undefined) | undefined;
+  /** The mesh's bounding-sphere radius in Unreal units, built on demand for a graph that reads `ObjectRadius`. */
+  readonly objectRadius?: (() => number | undefined) | undefined;
 }
 
 export type GraphBakeOutcome = BakeResult & {
@@ -165,7 +167,17 @@ function unavailable(reason: string): GraphBakeOutcome {
 
 /** True when the graph has a node whose value follows the surface normal (see `surface-normals.ts`). */
 export function graphReadsSurface(graph: MaterialGraph): boolean {
-  return graph.nodes.some((node) => node.class === "FunctionCall" && /(?:^|\/)WorldAlignedBlend\./i.test(node.function ?? "") && !node.fn?.outputs.some(Boolean));
+  return graph.nodes.some(
+    (node) =>
+      (node.class === "FunctionCall" && /(?:^|\/)WorldAlignedBlend\./i.test(node.function ?? "") && !node.fn?.outputs.some(Boolean)) ||
+      node.class === "VertexNormalWS" ||
+      (node.class === "Transform" && String(node.constants.TransformSourceType ?? "TRANSFORMSOURCE_Tangent") === "TRANSFORMSOURCE_Tangent"),
+  );
+}
+
+/** True when the graph reads the mesh's bounding radius (`ObjectRadius`), so a bake depends on the mesh. */
+export function graphReadsObjectRadius(graph: MaterialGraph): boolean {
+  return graph.nodes.some((node) => node.class === "ObjectRadius");
 }
 
 /** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
@@ -294,7 +306,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
 
     const parameters = chainParameters(chain);
     const surface = request.surface && graphReadsSurface(graph) ? request.surface() : undefined;
-    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}`;
+    const objectRadius = request.objectRadius && graphReadsObjectRadius(graph) ? request.objectRadius() : undefined;
+    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}|radius:${objectRadius ?? "none"}`;
     let perAssets = bakes.get(request.assets);
     if (!perAssets) {
       perAssets = new Map();
@@ -317,6 +330,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         ...(request.alpha ? { alpha: request.alpha } : {}),
         ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
         ...(surface ? { surface } : {}),
+        ...(objectRadius !== undefined ? { objectRadius } : {}),
         loadTexture: async (reference) => {
           const name = textureBasename(reference);
           const path = request.assets.png.get(name) ?? (await options.exportTexture?.(name));

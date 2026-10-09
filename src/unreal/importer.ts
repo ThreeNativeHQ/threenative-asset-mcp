@@ -56,7 +56,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 68;
+export const IMPORTER_VERSION = 69;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1110,6 +1110,42 @@ function surfaceOf(root: Root, material: Material): SurfaceNormals | undefined {
   return surface;
 }
 
+/**
+ * The mesh's bounding-sphere radius in Unreal units (centimetres), what `ObjectRadius` reads for an unscaled instance: the
+ * largest distance of a vertex from the centre of the bounding box. `geometryScale` is the factor still to be applied to the
+ * glTF positions (they are metres once it is applied).
+ */
+function objectRadiusOf(root: Root, geometryScale: number | readonly [number, number, number] | undefined): number | undefined {
+  const factors = typeof geometryScale === "number" ? [geometryScale, geometryScale, geometryScale] : geometryScale ?? [1, 1, 1];
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  const positions: ArrayLike<number>[] = [];
+  for (const mesh of root.listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      const array = primitive.getAttribute("POSITION")?.getArray();
+      if (!array) continue;
+      positions.push(array);
+      for (let at = 0; at + 2 < array.length; at += 3) {
+        for (let axis = 0; axis < 3; axis++) {
+          const value = array[at + axis]! * factors[axis]!;
+          if (value < min[axis]!) min[axis] = value;
+          if (value > max[axis]!) max[axis] = value;
+        }
+      }
+    }
+  }
+  if (positions.length === 0 || !Number.isFinite(min[0]!)) return undefined;
+  const centre = [0, 1, 2].map((axis) => (min[axis]! + max[axis]!) / 2);
+  let radius = 0;
+  for (const array of positions) {
+    for (let at = 0; at + 2 < array.length; at += 3) {
+      const distance = Math.hypot(array[at]! * factors[0]! - centre[0]!, array[at + 1]! * factors[1]! - centre[1]!, array[at + 2]! * factors[2]! - centre[2]!);
+      if (distance > radius) radius = distance;
+    }
+  }
+  return radius * 100;
+}
+
 function attachTexture(
   material: Material,
   binding: MaterialTextureBinding,
@@ -1390,6 +1426,8 @@ export async function packageGlb(options: {
   const rejectedMasks: UnsupportedTexture[] = [];
   const sharedGraphs = new Map<ExportedAssets, Map<string, Set<string>>>();
   const meshAssets = scopeMaterialFiles(options.assets, dirname(options.gltfPath));
+  // Computed on the first bake that reads ObjectRadius; null when the mesh has no positions.
+  let meshRadius: number | null | undefined;
   for (const material of root.listMaterials()) {
     const name = material.getName();
     const lookup = options.materialLookupNames?.get(name) ?? name;
@@ -1466,6 +1504,10 @@ export async function packageGlb(options: {
       // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
       ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
       surface: () => surfaceOf(root, material),
+      objectRadius: () => {
+        if (meshRadius === undefined) meshRadius = objectRadiusOf(root, options.geometryScale) ?? null;
+        return meshRadius ?? undefined;
+      },
       readProps: (propsName) => {
         const propsPath = materialAssets.props.get(propsName);
         return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);

@@ -78,6 +78,11 @@ export interface BakeRequest {
   alpha?: "opacity" | "opacityMask";
   /** The mesh's vertex normals in UV space. With it a `WorldAlignedBlend` follows the surface; without, it is 0.5. */
   surface?: SurfaceNormals | undefined;
+  /**
+   * Bounding-sphere radius of the mesh in Unreal units (centimetres), which `ObjectRadius` reads for an unscaled instance.
+   * Absent, ObjectRadius is unsupported.
+   */
+  objectRadius?: number | undefined;
 }
 
 export type BakeResult =
@@ -154,6 +159,19 @@ const SUPPORTED_NODE_CLASSES = [
   "DepthFade",
   "TwoSidedSign",
   "WorldPosition",
+  "TextureObject",
+  "TextureObjectParameter",
+  "LightmassReplace",
+  "MaterialProxyReplace",
+  "PrecomputedAOMask",
+  "VertexNormalWS",
+  "Transform",
+  "ObjectRadius",
+  "Time",
+  "Panner",
+  "Ceil",
+  "Floor",
+  "Sine",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -179,6 +197,22 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "SplitComponents",
   "ObjectScale",
   "WorldAlignedBlend",
+  "WorldAlignedTexture",
+  "MatLayerBlend_Emissive",
+  "MatLayerBlend_ModulateRoughness",
+  "MatLayerBlend_ModulateSpecular",
+  "MatLayerBlend_ReplaceNormals",
+  "MatLayerBlend_NormalFlatten",
+  "MatLayerBlend_OverrideWorldPositionOffset",
+  "MatLayerBlend_LightmassReplace",
+  "MatLayerBlend_TopNormal",
+  "MatLayerBlend_BreakBaseColor",
+  "MatLayerBlend_BreakNormal",
+  "MatLayerBlend_OverrideBaseColor",
+  "MatLayerBlend_MultiplyBaseColor",
+  "MatLayerBlend_TenLayerBlend",
+  "Lerp_ScratchGrime",
+  "MetallicShading",
 ] as const;
 
 /**
@@ -361,7 +395,16 @@ interface Attrs {
   kind: "attr";
   baseColor: Val | null;
 }
-type Compiled = Val | Attrs;
+/**
+ * A texture object (`TextureObject`, `TextureObjectParameter`, or a function input carrying one): not a value, only a
+ * texture that a sample or an engine function reads. `reference` is null when nothing binds it (Unreal samples black).
+ */
+interface TexRef {
+  kind: "tex";
+  reference: string | null;
+  samplerType: string;
+}
+type Compiled = Val | Attrs | TexRef;
 
 interface TexelContext {
   u: number;
@@ -383,6 +426,8 @@ interface CompileOptions {
   surface?: boolean | undefined;
   vertexColor?: readonly [number, number, number, number] | undefined;
   particleColor?: readonly [number, number, number, number] | undefined;
+  /** Bounding-sphere radius of the mesh in Unreal units, for `ObjectRadius`. */
+  objectRadius?: number | undefined;
 }
 
 const PARTICLE_COLOR_NOTE =
@@ -429,6 +474,38 @@ const MAT_LAYER_TINT_NOTE =
 
 const WORLD_POSITION_NOTE =
   "WorldPosition evaluated as the origin, and a texture sampled at a coordinate derived from it as that texture's average colour: a baked texture is shared by every placed instance, so a world-space tiling mask stands in as its mean";
+
+const PRECOMPUTED_AO_MASK_NOTE =
+  "PrecomputedAOMask evaluated as 0: Unreal's value without built static lighting (the editor thumbnail, a movable or unbuilt mesh); a level built with Lightmass's AO material mask would darken crevices";
+
+const VERTEX_NORMAL_NOTE =
+  "VertexNormalWS evaluated as the mesh's own vertex normal (unrotated instance): Unreal Z (up) is glTF +Y; the horizontal axes follow UE Viewer's export order (X = glTF x, Y = glTF z)";
+
+const TRANSFORM_LOCAL_WORLD_NOTE =
+  "Transform between Local and World space is the identity: the bake is one unrotated, unscaled instance";
+
+const TRANSFORM_TANGENT_NOTE =
+  "Transform from Tangent to World space keeps only the vector's normal component (z x vertex normal): the mesh's tangent frame is not in the bake, so in-plane components are dropped (exact for a flat tangent-space normal)";
+
+const OBJECT_RADIUS_NOTE =
+  "ObjectRadius evaluated as the mesh's bounding-sphere radius (an unscaled instance); a scaled placement would change the tiling it drives";
+
+const WORLD_ALIGNED_TEXTURE_NOTE =
+  "WorldAlignedTexture evaluated as its texture's average colour: the projection follows world position, which a baked texture shared by every instance does not have, and every planar projection of a tiling texture averages to the same value; engine body unavailable";
+
+const TIME_NOTE =
+  "Time evaluated as 0 (the first frame): a baked texture is one snapshot; a snapshot keeps a panning texture's detail, which a time average would blur, and a sine of time is at its mean there";
+
+const PANNER_NOTE =
+  "Panner evaluated at time 0: its coordinate unpanned; a tiling texture panned by any amount has the same look";
+
+const MAT_LAYER_PASS_NOTE = (name: string) => `${name}: BaseColor passed through (the function writes another attribute); engine body unavailable`;
+
+const BREAK_NORMAL_NOTE =
+  "MatLayerBlend_BreakNormal: only BaseColor is carried through layers, so a flat tangent-space normal (0, 0, 1) stands in for the layer's normal (normal-map detail ignored)";
+
+const TEN_LAYER_NOTE =
+  "MatLayerBlend_TenLayerBlend: Input20 is the base, Input21 the baked normal, and each (Input2k = layer, Input2k+1 = alpha) is lerped over the result from k = 9 (next to the base) up to k = 0 (top); inferred from the pins, engine body unavailable";
 
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
@@ -556,7 +633,7 @@ class Compiler {
     const node = this.nodes.get(input.node);
     if (!node) return this.markUnavailable(`pin refers to missing node ${input.node}`);
     const compiled = this.nodeOutput(node, input.output);
-    if (compiled.kind === "attr") return compiled;
+    if (compiled.kind !== "vec") return compiled;
     const fallbackMask = (node.class.startsWith("TextureSample") || node.class === "VertexColor" || node.class === "ParticleColor") && input.output >= 0 && input.output < TEXTURE_OUTPUT_MASKS.length ? TEXTURE_OUTPUT_MASKS[input.output]! : null;
     return this.applyMask(compiled, input.mask ?? fallbackMask);
   }
@@ -566,13 +643,25 @@ class Compiler {
     const compiled = this.pin(input);
     if (!compiled) return undefined;
     if (compiled.kind === "attr") return this.markUnavailable(`${label} received a MaterialAttributes value`);
+    if (compiled.kind === "tex") return this.markUnavailable(`${label} received a texture object, not a value`);
+    return compiled;
+  }
+
+  /** A pin that must carry a texture object. */
+  private texture(input: GraphInput | null | undefined, label: string): TexRef | undefined {
+    const compiled = this.pin(input);
+    if (!compiled) return undefined;
+    if (compiled.kind !== "tex") {
+      this.markUnavailable(`${label} expected a texture object`);
+      return undefined;
+    }
     return compiled;
   }
 
   private attrs(input: GraphInput | null | undefined, label: string): Attrs | undefined {
     const compiled = this.pin(input);
     if (!compiled) return undefined;
-    if (compiled.kind === "vec") {
+    if (compiled.kind !== "attr") {
       this.markUnavailable(`${label} expected MaterialAttributes`);
       return { kind: "attr", baseColor: null };
     }
@@ -772,6 +861,56 @@ class Compiler {
         // which is OpacityDefault (1) when unwired. FadeDistance only scales the factor and is not walked.
         this.approximations.add(DEPTH_FADE_NOTE);
         return this.operand(node, "InOpacity", "OpacityDefault", 1);
+      case "TextureObject":
+        return { kind: "tex", reference: node.texture ?? null, samplerType: node.samplerType ?? "Color" };
+      case "TextureObjectParameter": {
+        const override = node.parameter ? this.parameters.textures.get(node.parameter.name.toLowerCase()) : undefined;
+        return { kind: "tex", reference: override ?? node.texture ?? null, samplerType: node.samplerType ?? "Color" };
+      }
+      case "LightmassReplace":
+        // Realtime is what the renderer evaluates; Lightmass only feeds the static-lighting bake.
+        return this.pin(node.inputs.Realtime) ?? this.markUnavailable(`LightmassReplace ${node.id} has no Realtime input`);
+      case "MaterialProxyReplace":
+        // Realtime is the material itself; MaterialProxy only feeds merged-actor (HLOD) proxy baking.
+        return this.pin(node.inputs.Realtime) ?? this.markUnavailable(`MaterialProxyReplace ${node.id} has no Realtime input`);
+      case "PrecomputedAOMask":
+        this.approximations.add(PRECOMPUTED_AO_MASK_NOTE);
+        return this.constant([0], 1);
+      case "VertexNormalWS":
+        if (!this.options.surface) return this.unsupportedNode(node);
+        this.approximations.add(VERTEX_NORMAL_NOTE);
+        return this.emit([], 3, (o) => (r, texel) => {
+          r[o] = texel.nx ?? 0;
+          r[o + 1] = texel.nz ?? 0;
+          r[o + 2] = texel.ny ?? 1;
+          r[o + 3] = 0;
+        }, true);
+      case "Transform":
+        return this.transform(node);
+      case "ObjectRadius": {
+        const radius = this.options.objectRadius;
+        if (radius === undefined || !Number.isFinite(radius)) return this.unsupportedNode(node);
+        this.approximations.add(OBJECT_RADIUS_NOTE);
+        return this.constant([radius], 1);
+      }
+      case "Time":
+        this.approximations.add(TIME_NOTE);
+        return this.constant([0], 1);
+      case "Panner":
+        return this.panner(node);
+      case "Ceil":
+      case "Floor": {
+        const input = this.vec(node.inputs.Input, `${node.class}.Input`);
+        if (!input) return this.markUnavailable(`${node.class} ${node.id} has no input`);
+        return this.unary(input, node.class === "Ceil" ? Math.ceil : Math.floor);
+      }
+      case "Sine": {
+        // sin(Input * 2 pi / Period) for a positive Period (default 1), else sin(Input).
+        const input = this.vec(node.inputs.Input, "Sine.Input");
+        if (!input) return this.markUnavailable(`Sine ${node.id} has no input`);
+        const period = typeof node.constants.Period === "number" ? node.constants.Period : 1;
+        return this.unary(input, (x) => Math.sin(period > 0 ? (x * 2 * Math.PI) / period : x));
+      }
       case "StaticBool":
         return this.constant([node.constants.Value === true ? 1 : 0], 1);
       case "StaticBoolParameter": {
@@ -794,6 +933,16 @@ class Compiler {
       case "FunctionInput": {
         // The dumper replaces the preview with the call's real pin; an unwired input keeps its preview value.
         const wired = node.inputs.Input ?? node.inputs.Preview;
+        if (!wired && node.constants.bUsePreviewValueAsDefault === true) {
+          // Unreal compiles an unconnected input with "use preview value as default" to its PreviewValue constant, sized by
+          // InputType (default Vector3). Tagged serialization omits a zero PreviewValue, so an absent one is (0, 0, 0, 0).
+          const width = { FunctionInput_Scalar: 1, FunctionInput_Vector2: 2, FunctionInput_Vector3: 3, FunctionInput_Vector4: 4 }[String(node.constants.InputType ?? "FunctionInput_Vector3")];
+          if (width !== undefined) {
+            const preview = node.constants.PreviewValue;
+            const values = Array.isArray(preview) ? preview : typeof preview === "number" ? [preview] : [0, 0, 0, 0];
+            return this.constant([0, 1, 2, 3].map((index) => values[index] ?? 0), width);
+          }
+        }
         return this.pin(wired) ?? this.markUnavailable(`function input "${String(node.constants.InputName ?? node.id)}" is not wired and has no preview value`);
       }
       case "FunctionOutput": {
@@ -946,6 +1095,69 @@ class Compiler {
     });
   }
 
+  /**
+   * Transform(Input) from TransformSourceType (default Tangent) to TransformType (default World). The bake is one unrotated,
+   * unscaled instance, so Local and World coincide. Tangent to World needs the tangent frame; only the vertex normal is known,
+   * so the vector's z (normal) component is carried along it. View, camera and particle spaces are unsupported.
+   */
+  private transform(node: GraphNode): Compiled {
+    const source = String(node.constants.TransformSourceType ?? "TRANSFORMSOURCE_Tangent").replace(/^TRANSFORMSOURCE_/, "");
+    const target = String(node.constants.TransformType ?? "TRANSFORM_World").replace(/^TRANSFORM_/, "");
+    const objectOrWorld = (space: string) => space === "Local" || space === "World";
+    if (source !== target && !(objectOrWorld(source) && objectOrWorld(target)) && !(source === "Tangent" && objectOrWorld(target))) {
+      this.unsupported.add(`Transform(${source} to ${target})`);
+      return this.constant([0], 1);
+    }
+    if (source === "Tangent" && target !== "Tangent" && !this.options.surface) {
+      this.unsupported.add(`Transform(${source} to ${target})`);
+      return this.constant([0], 1);
+    }
+    const input = this.vec(node.inputs.Input, "Transform.Input");
+    if (!input) return this.markUnavailable(`Transform ${node.id} has no input`);
+    if (source === target) return input;
+    if (objectOrWorld(source)) {
+      this.approximations.add(TRANSFORM_LOCAL_WORLD_NOTE);
+      return input;
+    }
+    this.approximations.add(TRANSFORM_TANGENT_NOTE);
+    return this.emit([input], 3, (o) => (r, texel) => {
+      const z = input.n >= 3 ? r[input.reg + 2]! : input.n === 1 ? r[input.reg]! : 0;
+      r[o] = z * (texel.nx ?? 0);
+      r[o + 1] = z * (texel.nz ?? 0);
+      r[o + 2] = z * (texel.ny ?? 1);
+      r[o + 3] = 0;
+    }, true);
+  }
+
+  /**
+   * Panner: Coordinate + (SpeedX, SpeedY) x Time. An unwired Time pin is the global time, evaluated at 0 (the coordinate
+   * itself, see `TIME_NOTE`); a wired one is evaluated. An unwired Coordinate is the UV set ConstCoordinate.
+   */
+  private panner(node: GraphNode): Compiled {
+    const index = typeof node.constants.ConstCoordinate === "number" ? node.constants.ConstCoordinate : 0;
+    let coordinate: Val | undefined;
+    if (node.inputs.Coordinate) coordinate = this.vec(node.inputs.Coordinate, "Panner.Coordinate");
+    else if (index > 0 && !this.options.allowUvSetFallback) return this.markUnsupported(`TextureCoordinate[${index}]`);
+    else {
+      if (index > 0) this.approximations.add(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
+      coordinate = this.defaultUv();
+    }
+    if (!coordinate) return this.markUnavailable(`Panner ${node.id} has no coordinate`);
+    if (!node.inputs.Time) {
+      this.approximations.add(PANNER_NOTE);
+      return coordinate;
+    }
+    const time = this.vec(node.inputs.Time, "Panner.Time");
+    if (!time) return coordinate;
+    const speed = node.inputs.Speed
+      ? (this.vec(node.inputs.Speed, "Panner.Speed") ?? this.constant([0, 0], 2))
+      : this.constant([typeof node.constants.SpeedX === "number" ? node.constants.SpeedX : 0, typeof node.constants.SpeedY === "number" ? node.constants.SpeedY : 0], 2);
+    const offset = this.binary(speed, time, (s, t) => s * t);
+    const panned = this.binary(coordinate, this.gather(offset, [0, 1]), (c, d) => c + d);
+    if (coordinate.uvScale) panned.uvScale = coordinate.uvScale;
+    return panned;
+  }
+
   /** Pins of an engine function call in the order the function declares its inputs; an unwired one is null. */
   private orderedPins(node: GraphNode): (GraphInput | null)[] {
     return Object.values(node.inputs).map((input) => input ?? null);
@@ -1068,12 +1280,12 @@ class Compiler {
     if (cached) return cached;
     const parameterName = node.class === "TextureSampleParameter2D" && node.parameter ? node.parameter.name.toLowerCase() : undefined;
     let reference = parameterName ? this.parameters.textures.get(parameterName) : undefined;
-    reference ??= node.texture ?? undefined;
-    if (!reference) {
-      const textureObject = node.inputs.TextureObject ? this.nodes.get(node.inputs.TextureObject.node) : undefined;
-      if (textureObject) this.classes.add(textureObject.class);
-      reference = textureObject?.texture ?? undefined;
-    }
+    // A wired TextureObject pin replaces the node's own Texture property (inside a function that property is only the
+    // preview, e.g. DefaultDiffuse), and a TextureObjectParameter there honours the instance's override.
+    if (!reference && node.inputs.TextureObject) {
+      const object = this.texture(node.inputs.TextureObject, `${node.class}.TextureObject`);
+      reference = object?.reference ?? undefined;
+    } else reference ??= node.texture ?? undefined;
     if (!reference) this.unboundTextures.add(node.id);
     if (!reference) return this.markUnavailable(`texture sample ${node.id}${parameterName ? ` (parameter "${node.parameter?.name}")` : ""} has no texture`);
 
@@ -1401,6 +1613,10 @@ class Compiler {
       return this.unary(stretched, (x) => (x < 0 ? 0 : x > 1 ? 1 : x));
     }
     if (lower === "hueshift") return this.hueShift(node, name!);
+    if (!node.fn?.outputs.some(Boolean)) {
+      const layered = this.layerFunction(node, lower, name!);
+      if (layered) return layered;
+    }
     if (lower === "objectscale" && !node.fn?.outputs.some(Boolean)) {
       // Outputs: Scale XYZ (vector), Scale X, Scale Y, Scale Z. The scale of the placed instance is not known to a bake.
       this.approximations.add(OBJECT_SCALE_NOTE);
@@ -1521,6 +1737,127 @@ class Compiler {
     });
   }
 
+  /**
+   * Engine content functions of the layered-material library and its helpers, recognised by name when the pack carries no
+   * body. Each is inferred from its pins (the bodies are engine content), so each records an approximation. Returns
+   * undefined for a function this does not handle.
+   */
+  private layerFunction(node: GraphNode, lower: string, name: string): Compiled | undefined {
+    switch (lower) {
+      // Attribute -> attribute functions that write something other than BaseColor: Input0 is the incoming attributes.
+      case "matlayerblend_emissive":
+      case "matlayerblend_modulateroughness":
+      case "matlayerblend_modulatespecular":
+      case "matlayerblend_replacenormals":
+      case "matlayerblend_normalflatten":
+      case "matlayerblend_overrideworldpositionoffset":
+      case "matlayerblend_lightmassreplace": // Input0 is the realtime attributes, Input1 the Lightmass-only colour.
+        this.approximations.add(MAT_LAYER_PASS_NOTE(name));
+        return this.passThrough(node, "Input0", name);
+      case "matlayerblend_topnormal":
+        // (Input0 = base, Input1 = top, Input2 = alpha): the top layer's normal is kept whole; the other attributes blend
+        // like MatLayerBlend_Standard.
+        this.approximations.add(`${name}: BaseColor lerped by alpha like MatLayerBlend_Standard; engine body unavailable`);
+        return this.layerBlendStandard(node, name);
+      case "matlayerblend_breakbasecolor": {
+        // One output, BaseColor, of the attributes on Input0.
+        const source = this.attrs(node.inputs.Input0, `${name}.Input0`);
+        if (!source) return this.markUnavailable(`${name} ${node.id} has no Input0`);
+        this.approximations.add(`${name}: the BaseColor of Input0; engine body unavailable`);
+        return source.baseColor ?? this.constant([0, 0, 0], 3);
+      }
+      case "matlayerblend_breaknormal":
+        // The attributes on Input0 are not walked: only their normal is read, and a normal is not carried.
+        this.approximations.add(BREAK_NORMAL_NOTE);
+        return this.constant([0, 0, 1], 3);
+      case "matlayerblend_overridebasecolor": {
+        // (Input0 = attributes, Input1 = colour, Input2 = alpha, unwired = a full override).
+        const base = this.attrs(node.inputs.Input0, `${name}.Input0`);
+        if (!base) return this.markUnavailable(`${name} ${node.id} has no Input0`);
+        this.approximations.add(`${name}: BaseColor replaced by Input1 (lerped by Input2 when wired); engine body unavailable`);
+        const colour = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
+        if (!colour) return base;
+        if (!node.inputs.Input2) return { kind: "attr", baseColor: colour };
+        const alpha = this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1);
+        return { kind: "attr", baseColor: this.lerp(base.baseColor ?? this.constant([0, 0, 0], 3), colour, alpha) };
+      }
+      case "matlayerblend_multiplybasecolor": {
+        // (Input0 = attributes, Input1 = colour, Input2 = amount, unwired = 1): BaseColor x lerp(1, colour, amount).
+        const base = this.attrs(node.inputs.Input0, `${name}.Input0`);
+        if (!base) return this.markUnavailable(`${name} ${node.id} has no Input0`);
+        this.approximations.add(`${name}: BaseColor multiplied by lerp(1, Input1, Input2); engine body unavailable`);
+        const colour = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
+        if (!colour || !base.baseColor) return base;
+        const amount = node.inputs.Input2 ? (this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1)) : this.constant([1], 1);
+        return { kind: "attr", baseColor: this.binary(base.baseColor, this.lerp(this.constant([1], 1), colour, amount), (x, y) => x * y) };
+      }
+      case "matlayerblend_tenlayerblend":
+        return this.tenLayerBlend(node, name);
+      case "lerp_scratchgrime": {
+        // (Input0 = base colour, Input1 = scratch colour, Input2 = grime colour, Input3 = scratch mask, Input4 = grime mask):
+        // lerp(lerp(base, scratch, scratch mask), grime, grime mask). An unwired colour or mask leaves its stage out.
+        let result = this.vec(node.inputs.Input0, `${name}.Input0`);
+        if (!result) return this.markUnavailable(`${name} ${node.id} has no Input0`);
+        this.approximations.add(`${name}: lerp(lerp(base, scratch, scratch mask), grime, grime mask); engine body unavailable`);
+        for (const [colourPin, maskPin] of [["Input1", "Input3"], ["Input2", "Input4"]] as const) {
+          if (!node.inputs[colourPin] || !node.inputs[maskPin]) continue;
+          const colour = this.vec(node.inputs[colourPin], `${name}.${colourPin}`);
+          const mask = this.vec(node.inputs[maskPin], `${name}.${maskPin}`);
+          if (colour && mask) result = this.lerp(result, colour, mask);
+        }
+        return result;
+      }
+      case "metallicshading":
+        // A view-dependent sheen over the colour on Input0; like FuzzyShading, the albedo is what a bake can hold.
+        this.approximations.add(`${name}: view-dependent shading ignored, Input0 colour passed through; engine body unavailable`);
+        return this.passThrough(node, "Input0", name);
+      case "worldalignedtexture":
+        return this.worldAlignedTexture(node, name);
+      default:
+        return undefined;
+    }
+  }
+
+  /** See `TEN_LAYER_NOTE`. An unwired layer or alpha leaves that layer out. */
+  private tenLayerBlend(node: GraphNode, name: string): Compiled {
+    const count = Object.keys(node.inputs).filter((pinName) => /^Input\d+$/.test(pinName)).length;
+    if (count !== 22) return this.markUnsupported(`${name}(${count} inputs)`);
+    let result = this.attrs(node.inputs.Input20, `${name}.Input20`);
+    if (!result) return this.markUnavailable(`${name} ${node.id} has no base material (Input20)`);
+    this.approximations.add(TEN_LAYER_NOTE);
+    for (let layer = 9; layer >= 0; layer--) {
+      const topPin = node.inputs[`Input${layer * 2}`];
+      const alphaPin = node.inputs[`Input${layer * 2 + 1}`];
+      if (!topPin || !alphaPin) continue;
+      const top = this.attrs(topPin, `${name}.Input${layer * 2}`);
+      const alpha = this.vec(alphaPin, `${name}.Input${layer * 2 + 1}`);
+      if (!top || !alpha) return this.markUnavailable(`${name} ${node.id} layer ${layer} could not be read`);
+      result = this.blendAttrs(result, top, alpha);
+    }
+    return result;
+  }
+
+  /** WorldAlignedTexture(Input0 = texture object, Input1 = size, ...): every output is the texture's average (see the note). */
+  private worldAlignedTexture(node: GraphNode, name: string): Compiled {
+    const object = this.texture(node.inputs.Input0, `${name}.Input0`);
+    if (!object) return this.markUnavailable(`${name} ${node.id} has no texture object`);
+    if (!object.reference) {
+      this.unboundTextures.add(node.id);
+      return this.markUnavailable(`${name} ${node.id} samples a texture object nothing binds`);
+    }
+    this.approximations.add(WORLD_ALIGNED_TEXTURE_NOTE);
+    const key = `${node.id}#wat`;
+    const cached = this.textureRegisters.get(key);
+    if (cached) return cached;
+    const slot: TextureSlot = { name: textureObjectName(object.reference), colorSampler: object.samplerType.toLowerCase() === "color", lodFor: () => 40 };
+    this.slots.push(slot);
+    const reg = this.allocate();
+    this.program.push((r) => sampleLevel(slot.level!, 0.5, 0.5, r, reg));
+    const value: Val = { kind: "vec", reg, n: 4, konst: false };
+    this.textureRegisters.set(key, value);
+    return value;
+  }
+
   private passThrough(node: GraphNode, pinName: string, name: string): Compiled {
     const wired = node.inputs[pinName];
     return this.pin(wired) ?? this.markUnavailable(`${name} ${node.id} has no ${pinName} input`);
@@ -1572,6 +1909,7 @@ class Compiler {
     const compiled = this.pin(wired);
     if (!compiled) return undefined;
     if (compiled.kind === "vec") return compiled;
+    if (compiled.kind === "tex") return this.markUnavailable("BaseColor is wired to a texture object, not a value");
     return compiled.baseColor ?? this.constant([0, 0, 0], 3);
   }
 
@@ -1729,7 +2067,7 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
     return { status: "unavailable", reason: `graph ${graph.material} has no BaseColor output` };
   }
 
-  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined });
+  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined, objectRadius: request.objectRadius });
   if (compiler.unsupported.size > 0) {
     const unsupported = [...compiler.unsupported].sort();
     return { status: "unsupported", unsupported, reason: `BaseColor of ${graph.material} depends on unsupported nodes: ${unsupported.join(", ")}` };
@@ -1757,7 +2095,7 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
   let alphaSummary: { pin: "opacity" | "opacityMask"; opaqueShare: number; binary: boolean } | undefined;
   if (alphaPin) {
     // The cut-out is its own compile, so an alpha path the evaluator cannot read costs only the cut-out: the colour stays.
-    const alphaCompiler = new Compiler(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined });
+    const alphaCompiler = new Compiler(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined, objectRadius: request.objectRadius });
     const alphaValue = alphaCompiler.compileAlpha(graph, alphaPin);
     if (alphaCompiler.unsupported.size > 0 || alphaCompiler.unavailable.length > 0 || !alphaValue) {
       const why = alphaCompiler.unsupported.size > 0 ? `unsupported nodes ${[...alphaCompiler.unsupported].sort().join(", ")}` : alphaCompiler.unavailable.join("; ") || "no readable path";

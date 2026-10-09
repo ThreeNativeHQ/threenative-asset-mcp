@@ -268,6 +268,42 @@ describe("createGraphBaker", () => {
     expect(second).toBe(first);
   });
 
+  it("hands a VertexNormalWS graph the surface and an ObjectRadius graph the mesh radius, baking per value", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const graph = (nodes: Raw[]) =>
+      materialGraphSchema.parse({
+        format: 1,
+        material: "M_Master",
+        package: "/Game/Test/M_Master",
+        truncated: false,
+        nodeCount: nodes.length,
+        outputs: { baseColor: pin("out"), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+        nodes,
+      });
+    // BaseColor = abs(VertexNormalWS.z): white on an up-facing surface, black on a side-facing one.
+    const upness = graph([node("out", "Abs", { inputs: { Input: pin("z") } }), node("z", "ComponentMask", { inputs: { Input: pin("n") }, channelMask: [0, 0, 1, 0] }), node("n", "VertexNormalWS")]);
+    const surfaceOf = (normal: number[]) => ({ width: 2, height: 2, normals: new Float32Array(12).map((_, index) => normal[index % 3]!), covered: 4 });
+    const normals = createGraphBaker({ sourceDir, maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", upness]]) })!;
+    const up = await normals({ materialName: "s", lookupName: "MI_Rock", assets, readProps, surface: () => surfaceOf([0, 1, 0]) });
+    const side = await normals({ materialName: "s", lookupName: "MI_Rock", assets, readProps, surface: () => surfaceOf([1, 0, 0]) });
+    if (up.status !== "baked" || side.status !== "baked") throw new Error(`expected bakes, got ${up.status} and ${side.status}`);
+    expect(await firstPixel(up.png)).toEqual([255, 255, 255]);
+    expect(await firstPixel(side.png)).toEqual([0, 0, 0]);
+
+    // BaseColor = ObjectRadius / 1000: radius 500 cm is 0.5, radius 250 cm is 0.25; the radius is asked only by this graph.
+    const radius = graph([node("out", "Divide", { inputs: { A: pin("r") }, constants: { ConstB: 1000 } }), node("r", "ObjectRadius")]);
+    let asked = 0;
+    const sized = createGraphBaker({ sourceDir, maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", radius]]) })!;
+    const large = await sized({ materialName: "s", lookupName: "MI_Rock", assets, readProps, objectRadius: () => (asked++, 500) });
+    const small = await sized({ materialName: "s", lookupName: "MI_Rock", assets, readProps, objectRadius: () => (asked++, 250) });
+    if (large.status !== "baked" || small.status !== "baked") throw new Error(`expected bakes, got ${large.status} and ${small.status}`);
+    expect(await firstPixel(large.png)).toEqual([encode(0.5), encode(0.5), encode(0.5)]);
+    expect(await firstPixel(small.png)).toEqual([encode(0.25), encode(0.25), encode(0.25)]);
+    expect(asked).toBe(2);
+    const plain = createGraphBaker({ sourceDir, maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", masterGraph()]]) })!;
+    expect((await plain({ materialName: "s", lookupName: "MI_Rock", assets, readProps, objectRadius: () => { throw new Error("radius asked for a graph that does not read it"); } })).status).toBe("baked");
+  });
+
   it("is unavailable without a source package and does not touch the converter", async () => {
     const { sourceDir, assets, readProps } = await fixture();
     let dumps = 0;
