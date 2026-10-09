@@ -972,10 +972,10 @@ describe("graphPathClasses and supportedNodeClasses", () => {
 
   it("exposes the closed node set", () => {
     const supported = supportedNodeClasses();
-    for (const name of ["TextureSample", "TextureSampleParameter2D", "LinearInterpolate", "FunctionCall", "StaticSwitch", "FeatureLevelSwitch", "Fresnel", "DepthFade", "TwoSidedSign"]) {
+    for (const name of ["TextureSample", "TextureSampleParameter2D", "LinearInterpolate", "FunctionCall", "StaticSwitch", "FeatureLevelSwitch", "Fresnel", "DepthFade", "TwoSidedSign", "WorldPosition"]) {
       expect(supported).toContain(name);
     }
-    for (const name of ["VertexColor", "Panner", "Time", "WorldPosition", "ReflectionVectorWS"]) expect(supported).not.toContain(name);
+    for (const name of ["VertexColor", "Panner", "Time", "ReflectionVectorWS", "TextureSampleParameterCube"]) expect(supported).not.toContain(name);
   });
 });
 
@@ -1819,5 +1819,30 @@ describe("view-dependent nodes of sky and effect materials", () => {
     expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.3), encode(0.6), encode(0.2)]);
     expect(result.status === "baked" && result.confidence).toBe("heuristic");
     expect(notes(result).some((note) => note.startsWith("TwoSidedSign evaluated as +1"))).toBe(true);
+  });
+
+  it("a texture sampled at a WorldPosition-derived coordinate reads its average colour, not one UV-space texel, and says so", async () => {
+    // A grass pack's WorldCoords-XY function: ComponentMask(WorldPosition).xy / Scale, feeding a macro variation mask.
+    // The 2x2 mask holds 0, 0, 0, 255 in R: its average is 0.25 (linear). Sampled at one texel it would be 0 or 1.
+    const mask = await pngOf(2, 2, (x, y) => (x === 1 && y === 1 ? [255, 255, 255] : [0, 0, 0]));
+    const graph = makeGraph(
+      [
+        node("mix", "LinearInterpolate", { inputs: { A: pin("dead"), B: pin("live"), Alpha: pin("mask", 0, [1, 0, 0, 0]) } }),
+        constant3("dead", [0, 0, 0]),
+        constant3("live", [1, 1, 1]),
+        node("mask", "TextureSample", { inputs: { Coordinates: pin("coords") }, texture: "/Game/Test/T_Mask.T_Mask", samplerType: "LinearColor" }),
+        node("coords", "Divide", { inputs: { A: pin("xy"), B: pin("scale") } }),
+        node("xy", "ComponentMask", { inputs: { Input: pin("world") }, channelMask: [1, 1, 0, 0] }),
+        node("world", "WorldPosition"),
+        node("scale", "Constant", { constants: { R: 600 } }),
+      ],
+      pin("mix", 0, RGB_MASK),
+    );
+    const result = await bake(graph, { T_Mask: { png: mask, srgb: false } });
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(0.25), encode(0.25), encode(0.25)]);
+    expect(pixel(3, 3)).toEqual(pixel(0, 0));
+    expect(result.status === "baked" && result.confidence).toBe("heuristic");
+    expect(notes(result).some((note) => note.startsWith("WorldPosition evaluated as the origin"))).toBe(true);
   });
 });
