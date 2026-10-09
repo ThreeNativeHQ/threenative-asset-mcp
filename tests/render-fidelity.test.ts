@@ -206,3 +206,68 @@ describe("referenceObjectMask (the solid-card check's thumbnail fill)", () => {
     expect(fill(thumbnailWithShadow(true))).toBeCloseTo(fill(thumbnailWithShadow(false)), 1);
   });
 });
+
+/**
+ * Mass, not only bounding-box fill: a spray of 1px needles and a half-solid blob can fill the same share of their boxes,
+ * yet one reads as speckle. `closedSolidity` is object pixels over the closed silhouette's pixels at the scale of a needle
+ * cluster. Calibrated on the conifer pack: render/reference mass 0.82 at 1x (hard alpha-tested edges), 0.95 supersampled.
+ */
+function stripes(period: number, boxWidth = 40): RgbaImage {
+  const data = new Uint8Array(SIZE * SIZE * 4);
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    const x = i % SIZE;
+    const y = Math.floor(i / SIZE);
+    const inside = x >= 12 && x < 12 + boxWidth && y >= 12 && y < 52 && (period === 1 || x % period === 0);
+    data.set(inside ? [60, 150, 50, 255] : [128, 128, 128, 255], i * 4);
+  }
+  return { width: SIZE, height: SIZE, data };
+}
+
+describe("closedSolidity and the mass ratio", () => {
+  it("is 1 for a solid block and about the fill for thin stripes the closing bridges", async () => {
+    const { objectMask } = await import("../src/unreal/image-diff.js");
+    const { closedSolidity } = await import("../src/unreal/render-fidelity.js");
+    const solidity = (image: RgbaImage) => closedSolidity(objectMask(image, 26), image.width, image.height, 0.03);
+    expect(solidity(stripes(1))).toBeCloseTo(1, 2);
+    expect(solidity(stripes(2))).toBeGreaterThan(0.45);
+    expect(solidity(stripes(2))).toBeLessThan(0.6);
+  });
+
+  it("sees thin speckle that bounding-box fill cannot: equal fill, half the mass", () => {
+    // Reference: a solid block over the left half of the box plus one stray pixel that stretches its box to full width.
+    // Render: stripes across the whole box at half density. Both fill half of their (equal) boxes.
+    const reference = stripes(1, 20);
+    reference.data.set([60, 150, 50, 255], (12 * SIZE + 51) * 4);
+    const render = stripes(2, 40);
+    const metrics = measureFidelity(reference, render);
+    expect(metrics.comparable).toBe(true);
+    expect(metrics.densityRatio).toBeGreaterThan(0.85);
+    expect(metrics.densityRatio).toBeLessThan(1.2);
+    expect(metrics.massRatio).toBeLessThan(0.65);
+    expect(explainFidelity(metrics)).toMatch(/thinner than Unreal/);
+  });
+
+  it("fails a spray of thin needles against a dense reference", () => {
+    const metrics = measureFidelity(stripes(1, 40), stripes(3, 40));
+    expect(metrics.massRatio).toBeLessThan(0.4);
+    expect(fidelityVerdict(metrics).verdict).toBe("fail");
+    expect(fidelityVerdict(metrics).reasons.join(" ")).toMatch(/thinner than Unreal/);
+  });
+
+  it("reads the mass from the supersampled render when one is given, leaving colour and density on the 1x render", () => {
+    const reference = stripes(1, 40);
+    const thin = stripes(3, 40);
+    const dense = stripes(1, 40);
+    const plain = measureFidelity(reference, thin);
+    const supersampled = measureFidelity(reference, thin, dense);
+    expect(supersampled.massRatio).toBeGreaterThan(plain.massRatio * 2);
+    expect(supersampled.densityRatio).toBeCloseTo(plain.densityRatio, 6);
+    expect(supersampled.saturationRatio).toBeCloseTo(plain.saturationRatio, 6);
+  });
+
+  it("does not flag an identical render", () => {
+    const metrics = measureFidelity(stripes(2, 40), stripes(2, 40));
+    expect(metrics.massRatio).toBeCloseTo(1, 2);
+    expect(fidelityVerdict(metrics).verdict).toBe("ok");
+  });
+});

@@ -43,6 +43,16 @@ export const HUE_SUSPECT_DEGREES = 25;
 export const HUE_FAIL_DEGREES = 45;
 export const DENSITY_SUSPECT: readonly [number, number] = [0.65, 1.6];
 export const DENSITY_FAIL: readonly [number, number] = [0.4, 2.5];
+/** Closing radius of the mass measure, as a share of the object's longer side (about a needle cluster). */
+export const MASS_RADIUS_FRACTION = 0.015;
+/**
+ * Mass ratio gates. Bounding-box fill does not see sparse speckle (a spray of thin needles and a thick one can share a box),
+ * so mass is the object's pixels over its closed silhouette's, render over reference. Measured on the supersampled render
+ * (`measureFidelity`'s third argument): the 1x alpha-tested tile reads 0.82 on pieces that are as dense as Unreal's, because
+ * its hard cut-out edges lose the anti-aliased fringe the thumbnail has; supersampled it reads 0.95 (0.83-1.25).
+ */
+export const MASS_SUSPECT: readonly [number, number] = [0.65, 1.5];
+export const MASS_FAIL: readonly [number, number] = [0.4, 2.5];
 
 export interface Described {
   pixels: number;
@@ -56,6 +66,8 @@ export interface Described {
   /** Median linear luminance of the object, 0..1. */
   medianLuminance: number;
   fillRatio: number;
+  /** `closedSolidity` of the object mask at `MASS_RADIUS_FRACTION`. */
+  solidity: number;
 }
 
 /** Below this mean linear saturation an object counts as neutral. */
@@ -129,7 +141,7 @@ export function describeObject(image: RgbaImage): Described {
   const hueHistogram = new Float64Array(HUE_BINS);
   const fill = maskFillRatio(mask, image.width, image.height);
   if (pixelsRgb.length === 0) {
-    return { pixels: 0, coverage: 0, medianSaturation: 0, meanSaturation: 0, hueHistogram, medianLuminance: 0, fillRatio: fill.fillRatio };
+    return { pixels: 0, coverage: 0, medianSaturation: 0, meanSaturation: 0, hueHistogram, medianLuminance: 0, fillRatio: fill.fillRatio, solidity: 0 };
   }
   const luminances = pixelsRgb.map((pixel) => pixel[3]).sort((x, y) => x - y);
   const at = (q: number): number => luminances[Math.min(luminances.length - 1, Math.floor(q * luminances.length))]!;
@@ -161,7 +173,64 @@ export function describeObject(image: RgbaImage): Described {
     hueHistogram,
     medianLuminance: luminances[Math.floor(luminances.length / 2)]!,
     fillRatio: fill.fillRatio,
+    solidity: closedSolidity(mask, image.width, image.height, MASS_RADIUS_FRACTION),
   };
+}
+
+/** Running max (or min) of one row/column with a window of `2 * radius + 1`, naive but bounded by the tile size. */
+function slide(values: Uint8Array, length: number, stride: number, offset: number, radius: number, max: boolean): Uint8Array {
+  const out = new Uint8Array(length);
+  for (let i = 0; i < length; i++) {
+    let hit = max ? 0 : 1;
+    for (let k = Math.max(0, i - radius); k <= Math.min(length - 1, i + radius); k++) {
+      const v = values[offset + k * stride]!;
+      if (max ? v : !v) { hit = max ? 1 : 0; break; }
+    }
+    out[i] = hit;
+  }
+  return out;
+}
+
+function morph(mask: Uint8Array, width: number, height: number, radius: number, max: boolean): Uint8Array {
+  const rows = new Uint8Array(mask.length);
+  for (let y = 0; y < height; y++) rows.set(slide(mask, width, 1, y * width, radius, max), y * width);
+  const out = new Uint8Array(mask.length);
+  for (let x = 0; x < width; x++) {
+    const column = slide(rows, height, width, x, radius, max);
+    for (let y = 0; y < height; y++) out[y * width + x] = column[y]!;
+  }
+  return out;
+}
+
+/**
+ * Mass of the silhouette at the scale of a needle cluster: object pixels over the pixels of the object's morphologically
+ * closed silhouette (dilate then erode by `radiusFraction` of the bounding box's longer side). A solid sheet is 1; a spray of
+ * thin needles whose gaps are narrower than the closing radius is its true density; isolated speckle that does not fuse stays
+ * low. Unlike the bounding-box fill it does not move with the piece's overall shape, only with how filled its parts are, and
+ * it is scale-invariant because the radius follows the object's own size.
+ */
+export function closedSolidity(mask: Uint8Array, width: number, height: number, radiusFraction: number): number {
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  let pixels = 0;
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    pixels++;
+    const x = i % width;
+    const y = (i - x) / width;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  if (pixels === 0) return 0;
+  const radius = Math.max(1, Math.round(radiusFraction * Math.max(maxX - minX + 1, maxY - minY + 1)));
+  const closed = morph(morph(mask, width, height, radius, true), width, height, radius, false);
+  let closedPixels = 0;
+  for (let i = 0; i < closed.length; i++) if (closed[i]) closedPixels++;
+  return pixels / Math.max(pixels, closedPixels);
 }
 
 /** Circular earth mover's distance between two normalised hue histograms, in degrees. */
@@ -189,6 +258,8 @@ export interface FidelityMetrics {
   readonly saturationRatio: number;
   /** Silhouette fill of the render over the reference's. Below 1: sparser; above 1: more solid. */
   readonly densityRatio: number;
+  /** Closed-silhouette mass of the render over the reference's (see `MASS_SUSPECT`). Below 1: sparser or speckled. */
+  readonly massRatio: number;
   /** Median linear luminance of the render over the reference's (lighting moves it; weighted low and tolerant). */
   readonly lightnessRatio: number;
   readonly parts: { readonly hue: number; readonly saturation: number; readonly density: number; readonly lightness: number };
@@ -201,6 +272,7 @@ const NOT_COMPARABLE: FidelityMetrics = Object.freeze({
   hueEmdDegrees: Number.NaN,
   saturationRatio: Number.NaN,
   densityRatio: Number.NaN,
+  massRatio: Number.NaN,
   lightnessRatio: Number.NaN,
   parts: Object.freeze({ hue: 0, saturation: 0, density: 0, lightness: 0 }),
   score: 0,
@@ -212,15 +284,18 @@ export function ratioPart(ratio: number, zeroAt: number): number {
 }
 
 /** Compares a render with the Unreal thumbnail of the same piece. Pure over pixels. */
-export function measureFidelity(reference: RgbaImage, render: RgbaImage): FidelityMetrics {
+export function measureFidelity(reference: RgbaImage, render: RgbaImage, shapeRender?: RgbaImage): FidelityMetrics {
   const ref = describeObject(reference);
   const out = describeObject(render);
+  // Mass reads the supersampled render when given one: an alpha-tested cut-out has no anti-aliased fringe at 1x.
+  const shape = shapeRender ? describeObject(shapeRender) : out;
   if (ref.coverage < MIN_COVERAGE || out.coverage < MIN_COVERAGE) return NOT_COMPARABLE;
   const bothNeutral = ref.meanSaturation < NEUTRAL_SATURATION && out.meanSaturation < NEUTRAL_SATURATION;
   const hueEmdDegrees = bothNeutral ? 0 : circularHueEmd(ref.hueHistogram, out.hueHistogram);
   // A noise floor keeps two near-neutral objects (a grey mannequin) from scoring on a 0 / 0.02 ratio.
   const saturationRatio = (out.medianSaturation + SATURATION_NOISE_FLOOR) / (ref.medianSaturation + SATURATION_NOISE_FLOOR);
   const densityRatio = ref.fillRatio > 0 ? out.fillRatio / ref.fillRatio : Number.NaN;
+  const massRatio = ref.solidity > 0 && shape.solidity > 0 ? shape.solidity / ref.solidity : Number.NaN;
   const lightnessRatio = ref.medianLuminance > 0 ? out.medianLuminance / ref.medianLuminance : Number.NaN;
   const parts = {
     hue: bothNeutral ? 1 : Math.max(0, 1 - hueEmdDegrees / HUE_ZERO_DEGREES),
@@ -234,8 +309,10 @@ export function measureFidelity(reference: RgbaImage, render: RgbaImage): Fideli
       FIDELITY_WEIGHTS.saturation * parts.saturation +
       FIDELITY_WEIGHTS.density * parts.density +
       FIDELITY_WEIGHTS.lightness * parts.lightness);
-  return { comparable: true, hueEmdDegrees, saturationRatio, densityRatio, lightnessRatio, parts, score };
+  return { comparable: true, hueEmdDegrees, saturationRatio, densityRatio, massRatio, lightnessRatio, parts, score };
 }
+
+const outside = (value: number, [low, high]: readonly [number, number]): boolean => value < low || value > high;
 
 /** One-line explanation of what drags a low score down, for the sheet. */
 export function explainFidelity(metrics: FidelityMetrics): string {
@@ -248,6 +325,9 @@ export function explainFidelity(metrics: FidelityMetrics): string {
   if (metrics.parts.density < 0.7) {
     reasons.push(metrics.densityRatio < 1 ? `sparser than Unreal (${metrics.densityRatio.toFixed(2)}x fill)` : `more solid than Unreal (${metrics.densityRatio.toFixed(2)}x fill)`);
   }
+  if (Number.isFinite(metrics.massRatio) && outside(metrics.massRatio, MASS_SUSPECT)) {
+    reasons.push(metrics.massRatio < 1 ? `thinner than Unreal (${metrics.massRatio.toFixed(2)}x mass)` : `heavier than Unreal (${metrics.massRatio.toFixed(2)}x mass)`);
+  }
   if (metrics.parts.lightness < 0.5) reasons.push(`${metrics.lightnessRatio < 1 ? "darker" : "brighter"} (${metrics.lightnessRatio.toFixed(2)}x lightness)`);
   return reasons.join("; ");
 }
@@ -256,8 +336,6 @@ export interface FidelityVerdict {
   readonly verdict: "ok" | "suspect" | "fail";
   readonly reasons: readonly string[];
 }
-
-const outside = (value: number, [low, high]: readonly [number, number]): boolean => value < low || value > high;
 
 /** Per-axis verdict for one comparable pair. */
 export function fidelityVerdict(metrics: FidelityMetrics): FidelityVerdict {
@@ -273,6 +351,11 @@ export function fidelityVerdict(metrics: FidelityMetrics): FidelityVerdict {
   if (Number.isFinite(metrics.densityRatio)) {
     if (outside(metrics.densityRatio, DENSITY_FAIL)) failing.push(density);
     else if (outside(metrics.densityRatio, DENSITY_SUSPECT)) suspect.push(density);
+  }
+  if (Number.isFinite(metrics.massRatio)) {
+    const mass = metrics.massRatio < 1 ? `thinner than Unreal (${metrics.massRatio.toFixed(2)}x mass)` : `heavier than Unreal (${metrics.massRatio.toFixed(2)}x mass)`;
+    if (outside(metrics.massRatio, MASS_FAIL)) failing.push(mass);
+    else if (outside(metrics.massRatio, MASS_SUSPECT)) suspect.push(mass);
   }
   if (failing.length > 0) return { verdict: "fail", reasons: [...failing, ...suspect] };
   return { verdict: suspect.length > 0 ? "suspect" : "ok", reasons: suspect };

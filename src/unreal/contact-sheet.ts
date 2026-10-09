@@ -166,8 +166,8 @@ function serve(response: ServerResponse, bytes: Uint8Array, type: string): void 
   response.end(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
 }
 
-function pageHtml(tileSize: number, count: number, columns: number, rows: number): string {
-  const payload = JSON.stringify({ tile: tileSize, count, columns, rows });
+function pageHtml(tileSize: number, count: number, columns: number, rows: number, supersample: number): string {
+  const payload = JSON.stringify({ tile: tileSize, count, columns, rows, ss: supersample });
   return `<!doctype html><html><body>
 <script type="importmap">{"imports":{"three":"/three.module.js","three/addons/":"/jsm/"}}</script>
 <script type="module">
@@ -178,7 +178,7 @@ const options = ${payload};
 const size = options.tile;
 try {
   const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
-  renderer.setPixelRatio(1);
+  renderer.setPixelRatio(options.ss);
   renderer.setSize(size, size);
   renderer.setClearColor(0x808080, 1);
   const scene = new THREE.Scene();
@@ -219,7 +219,7 @@ try {
       camera.near = distance / 100; camera.far = distance * 10; camera.updateProjectionMatrix();
       camera.lookAt(center);
       renderer.render(scene, camera);
-      context.drawImage(renderer.domElement, (i % options.columns) * size, Math.floor(i / options.columns) * size);
+      context.drawImage(renderer.domElement, (i % options.columns) * size, Math.floor(i / options.columns) * size, size, size);
       scene.remove(model); dispose(model);
       tiles.push({ ok: true });
     } catch (error) {
@@ -252,8 +252,10 @@ async function renderGrid(
   columns: number,
   rows: number,
   timeoutMs: number,
+  /** Render at this multiple of the tile size and box-filter down (1 = the plain alpha-tested render). */
+  supersample = 1,
 ): Promise<RenderedGrid> {
-  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows), "utf8");
+  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample), "utf8");
   const server = createServer((request, response) => {
     const url = (request.url ?? "/").split("?")[0]!;
     const glb = /^\/glb\/(\d+)\.glb$/.exec(url);
@@ -344,6 +346,8 @@ export async function renderTiles(options: {
   /** Tile edge in pixels. Default 160. */
   readonly tile?: number;
   readonly timeoutMs?: number;
+  /** Render at this multiple of the tile and box-filter down; default 1. */
+  readonly supersample?: number;
 }): Promise<RenderedTiles> {
   const tile = Math.max(16, Math.round(options.tile ?? 160));
   const paths = options.glbPaths;
@@ -355,7 +359,7 @@ export async function renderTiles(options: {
     score: 0,
     failed: false,
   }));
-  const grid = await renderGrid(candidates, tile, columns, rows, options.timeoutMs ?? 180_000);
+  const grid = await renderGrid(candidates, tile, columns, rows, options.timeoutMs ?? 180_000, options.supersample ?? 1);
   const decoded = await decodeRgba(grid.png);
   return {
     png: grid.png,
@@ -374,6 +378,8 @@ function cutTile(grid: RgbaImage, tile: number, column: number, row: number): Rg
   return { width: tile, height: tile, data };
 }
 
+/** Supersampling of the tile used for silhouette mass and the sheet picture (2x is an exact box filter). */
+const SHAPE_SUPERSAMPLE = 2;
 const PAIR_CAPTION = 46;
 const REFERENCE_BAND = 132;
 const VERDICT_COLOUR: Record<Verdict, string> = { ok: "#3ddc84", suspect: "#ffc233", fail: "#ff4d4d" };
@@ -430,11 +436,19 @@ export async function renderContactSheet(
 
   let rendered: boolean[] = [];
   let gridPng: Buffer | undefined;
+  let shapeGridPng: Buffer | undefined;
   const loadable = selected.filter((c) => !c.failed);
   if (loadable.length > 0) {
     // Failed candidates are not sent to the browser; keep their cells blank in place.
-    const grid = await renderGrid(selected.map((c) => (c.failed ? { ...c, path: "" } : c)), tile, columns, rows, timeoutMs);
+    const cells = selected.map((c) => (c.failed ? { ...c, path: "" } : c));
+    const grid = await renderGrid(cells, tile, columns, rows, timeoutMs);
     gridPng = grid.png;
+    // An alpha-tested cut-out has hard edges at 1x while Unreal's thumbnail is anti-aliased, so thin needles read sparser
+    // than they are. The silhouette-mass measure and the sheet picture use a 2x supersampled render; colour stays at 1x.
+    if (withThumbnails) {
+      const shape = await renderGrid(cells, tile, columns, rows, timeoutMs, SHAPE_SUPERSAMPLE);
+      shapeGridPng = shape.png;
+    }
     rendered = grid.rendered.map((ok, index) => ok && !selected[index]!.failed);
   }
   const meshesRendered = rendered.filter(Boolean).length;
@@ -447,6 +461,12 @@ export async function renderContactSheet(
     gridPng === undefined
       ? undefined
       : await sharp(gridPng).ensureAlpha().raw().toBuffer({ resolveWithObject: true }).then(
+          ({ data, info }) => ({ width: info.width, height: info.height, data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength) }),
+        );
+  const decodedShape: RgbaImage | undefined =
+    shapeGridPng === undefined
+      ? undefined
+      : await sharp(shapeGridPng).ensureAlpha().raw().toBuffer({ resolveWithObject: true }).then(
           ({ data, info }) => ({ width: info.width, height: info.height, data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength) }),
         );
   for (const [index, candidate] of selected.entries()) {
@@ -465,7 +485,8 @@ export async function renderContactSheet(
       try {
         const reference = await decodeRgba(candidate.thumbnail);
         const comparison = colourSimilarity(reference, pixels);
-        const measured = measureFidelity(reference, pixels);
+        const shapePixels = decodedShape === undefined ? undefined : cutTile(decodedShape, tile, index % columns, Math.floor(index / columns));
+        const measured = measureFidelity(reference, pixels, shapePixels);
         if (measured.comparable) fidelity = measured;
         if (options.dumpTilesDir !== undefined) {
           await mkdir(options.dumpTilesDir, { recursive: true });
@@ -641,19 +662,21 @@ export async function renderContactSheet(
         : { input: galleryPanel, left: 0, top: header + Math.floor((bodyHeight - galleryHeight) / 2) },
     );
   }
-  if (gridPng !== undefined) {
+  // The picture shows the supersampled tiles when there are any (the thumbnail beside it is anti-aliased).
+  const pictureGridPng = shapeGridPng ?? gridPng;
+  if (pictureGridPng !== undefined) {
     if (withThumbnails) {
       // The browser grid is `columns` tiles wide; move each render beside its thumbnail.
       for (let index = 0; index < count; index++) {
         if (!rendered[index]) continue;
-        const input = await sharp(gridPng)
+        const input = await sharp(pictureGridPng)
           .extract({ left: (index % columns) * tile, top: Math.floor(index / columns) * tile, width: tile, height: tile })
           .png()
           .toBuffer();
         layers.push({ input, left: gridLeft + (index % columns) * cellWidth + tile, top: header + Math.floor(index / columns) * tile });
       }
     } else {
-      layers.push({ input: gridPng, left: gridLeft, top: header });
+      layers.push({ input: pictureGridPng, left: gridLeft, top: header });
     }
   } else if (count > 0 && !withThumbnails) {
     layers.push({

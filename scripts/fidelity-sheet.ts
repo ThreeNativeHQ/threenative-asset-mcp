@@ -49,6 +49,7 @@ const rows = result.judge.map((j) => ({
   hueEmd: j.fidelity ? Math.round(j.fidelity.hueEmdDegrees) : "-",
   sat: j.fidelity ? Number(j.fidelity.saturationRatio.toFixed(2)) : "-",
   density: j.fidelity ? Number(j.fidelity.densityRatio.toFixed(2)) : "-",
+  mass: j.fidelity ? Number(j.fidelity.massRatio.toFixed(2)) : "-",
   light: j.fidelity ? Number(j.fidelity.lightnessRatio.toFixed(2)) : "-",
   oldSim: j.similarity !== undefined ? Number(j.similarity.toFixed(2)) : "-",
 }));

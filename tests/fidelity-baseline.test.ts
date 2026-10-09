@@ -8,6 +8,7 @@ const metrics = (score: number): FidelityMetrics => ({
   hueEmdDegrees: 0,
   saturationRatio: 1,
   densityRatio: 1,
+  massRatio: 1,
   lightnessRatio: 1,
   parts: { hue: 1, saturation: 1, density: 1, lightness: 1 },
   score,

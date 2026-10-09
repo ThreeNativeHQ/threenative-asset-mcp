@@ -572,11 +572,13 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
   let dir: string;
   let names: string[] = [];
   let byName = new Map<string, RgbaImage>();
+  let paths = new Map<string, string>();
 
   beforeAll(async () => {
     dir = await mkdtemp(join(tmpdir(), "tn-visual-regression-"));
     const fixtures = await buildFixtures(dir);
     names = fixtures.map((fixture) => fixture.name);
+    paths = new Map(fixtures.map((fixture) => [fixture.name, fixture.path]));
     const result = await renderTiles({ glbPaths: fixtures.map((fixture) => fixture.path), tile: TILE });
     expect(result.rendered.every(Boolean)).toBe(true);
     byName = new Map(names.map((name, index) => [name, result.tiles[index]!]));
@@ -616,6 +618,15 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     for (let i = 3; i < data.length; i += 4) if (data[i]! >= 128) opaque++;
     expect(opaque / (data.length / 4)).toBeGreaterThan(0.25);
     expect(opaque / (data.length / 4)).toBeLessThan(0.5);
+  });
+
+  it("a supersampled render keeps the cut-out's anti-aliased fringe: a hard 1x alpha test reads sparser than Unreal's AA'd thumbnail", async () => {
+    const { tiles } = await renderTiles({ glbPaths: [paths.get("needle-card-unmipped")!], tile: TILE, supersample: 2 });
+    const plain = judgeRender(byName.get("needle-card-unmipped")!);
+    const smooth = judgeRender(tiles[0]!);
+    // Same needles, same camera: only the edge treatment differs, and the fringe adds object pixels.
+    expect(smooth.stats.objectPixels).toBeGreaterThan(plain.stats.objectPixels * 1.15);
+    expect(smooth.stats.coverage).toBeLessThan(plain.stats.coverage * 3);
   });
 
   it("the zero-alpha-tint card is not blank", () => {
