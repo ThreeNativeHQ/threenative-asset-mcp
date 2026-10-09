@@ -1749,7 +1749,7 @@ describe("view-dependent nodes of sky and effect materials", () => {
   });
 
   it("DepthFade is its InOpacity (fully faded in) or OpacityDefault, and its fade distance is not walked", async () => {
-    // M_Cave_Water_JM: Lerp(DepthFade(InOpacity = ColorOpacity) x Color, Color.rgb x Color.a, DepthContribution).
+    // A cave pack's water master: Lerp(DepthFade(InOpacity = ColorOpacity) x Color, Color.rgb x Color.a, DepthContribution).
     const water = (opacity: number | null) =>
       makeGraph(
         [
@@ -1773,7 +1773,7 @@ describe("view-dependent nodes of sky and effect materials", () => {
   });
 
   it("MatLayerBlend_Tint multiplies BaseColor by lerp(1, Tint, Alpha): white tint is the identity, an alpha mask picks where the tint applies", async () => {
-    // M_Soul_Statue2: Tint = Edge Highlight Colour (2, 2, 2), Alpha = Mask.G; M_Slums_2: Tint = Overall_Material_Brightness, no alpha.
+    // A cave pack's statue master: Tint = Edge Highlight Colour (2, 2, 2), Alpha = Mask.G; its slum master: Tint = an overall brightness vector, no alpha.
     const layer = (tint: number[], withAlpha: boolean) =>
       makeGraph(
         [
@@ -1803,7 +1803,7 @@ describe("view-dependent nodes of sky and effect materials", () => {
   });
 
   it("TwoSidedSign is +1 (front face): a leaf card's top colour wins over its bottom colour, and the bake says so", async () => {
-    // M_DeadLeaves / BogMyrtle: Lerp(bottom texture, top texture, Clamp(TwoSidedSign)) where the sign is -1 on the back face.
+    // Kite foliage: Lerp(bottom texture, top texture, Clamp(TwoSidedSign)) where the sign is -1 on the back face.
     const graph = makeGraph(
       [
         node("mix", "LinearInterpolate", { inputs: { A: pin("bottom"), B: pin("top"), Alpha: pin("clamp") } }),
