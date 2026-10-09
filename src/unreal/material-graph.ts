@@ -198,6 +198,7 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "ObjectScale",
   "WorldAlignedBlend",
   "WorldAlignedTexture",
+  "FlowMaps_Simple",
   "MatLayerBlend_Emissive",
   "MatLayerBlend_ModulateRoughness",
   "MatLayerBlend_ModulateSpecular",
@@ -492,6 +493,9 @@ const OBJECT_RADIUS_NOTE =
 
 const WORLD_ALIGNED_TEXTURE_NOTE =
   "WorldAlignedTexture evaluated as its texture's average colour: the projection follows world position, which a baked texture shared by every instance does not have, and every planar projection of a tiling texture averages to the same value; engine body unavailable";
+
+const FLOW_MAP_NOTE =
+  "FlowMaps_Simple: Diffuse evaluated as its texture's average colour: the texture is cross-faded between two flow-displaced phases over time, which a single baked texture cannot hold, and over the surface the flow keeps its mean; engine body unavailable";
 
 const TIME_NOTE =
   "Time evaluated as 0 (the first frame): a baked texture is one snapshot; a snapshot keeps a panning texture's detail, which a time average would blur, and a sine of time is at its mean there";
@@ -1614,7 +1618,7 @@ class Compiler {
     }
     if (lower === "hueshift") return this.hueShift(node, name!);
     if (!node.fn?.outputs.some(Boolean)) {
-      const layered = this.layerFunction(node, lower, name!);
+      const layered = this.layerFunction(node, lower, name!, output);
       if (layered) return layered;
     }
     if (lower === "objectscale" && !node.fn?.outputs.some(Boolean)) {
@@ -1742,7 +1746,7 @@ class Compiler {
    * body. Each is inferred from its pins (the bodies are engine content), so each records an approximation. Returns
    * undefined for a function this does not handle.
    */
-  private layerFunction(node: GraphNode, lower: string, name: string): Compiled | undefined {
+  private layerFunction(node: GraphNode, lower: string, name: string, output: number): Compiled | undefined {
     switch (lower) {
       // Attribute -> attribute functions that write something other than BaseColor: Input0 is the incoming attributes.
       case "matlayerblend_emissive":
@@ -1812,7 +1816,19 @@ class Compiler {
         this.approximations.add(`${name}: view-dependent shading ignored, Input0 colour passed through; engine body unavailable`);
         return this.passThrough(node, "Input0", name);
       case "worldalignedtexture":
-        return this.worldAlignedTexture(node, name);
+        this.approximations.add(WORLD_ALIGNED_TEXTURE_NOTE);
+        return this.textureMean(node, "Input0", name);
+      case "flowmaps_simple": {
+        // Outputs Diffuse, Diffuse Alpha, Normal, Distortion; Input0 is the diffuse texture object, Input1 the normal one.
+        if (output === 2) {
+          this.approximations.add(`${name}: Normal stands in as flat (0, 0, 1); engine body unavailable`);
+          return this.constant([0, 0, 1], 3);
+        }
+        if (output > 2) return this.markUnsupported(`${name}.${node.outputNames?.[output] ?? `output${output}`}`);
+        this.approximations.add(FLOW_MAP_NOTE);
+        const mean = this.textureMean(node, "Input0", name);
+        return mean.kind === "vec" && output === 1 ? this.gather(mean, [3]) : mean;
+      }
       default:
         return undefined;
     }
@@ -1837,16 +1853,15 @@ class Compiler {
     return result;
   }
 
-  /** WorldAlignedTexture(Input0 = texture object, Input1 = size, ...): every output is the texture's average (see the note). */
-  private worldAlignedTexture(node: GraphNode, name: string): Compiled {
-    const object = this.texture(node.inputs.Input0, `${name}.Input0`);
+  /** The average colour (RGBA, the coarsest mip) of the texture object on `pinName`, for engine functions whose sampling follows world position or time. */
+  private textureMean(node: GraphNode, pinName: string, name: string): Compiled {
+    const object = this.texture(node.inputs[pinName], `${name}.${pinName}`);
     if (!object) return this.markUnavailable(`${name} ${node.id} has no texture object`);
     if (!object.reference) {
       this.unboundTextures.add(node.id);
       return this.markUnavailable(`${name} ${node.id} samples a texture object nothing binds`);
     }
-    this.approximations.add(WORLD_ALIGNED_TEXTURE_NOTE);
-    const key = `${node.id}#wat`;
+    const key = `${node.id}#mean`;
     const cached = this.textureRegisters.get(key);
     if (cached) return cached;
     const slot: TextureSlot = { name: textureObjectName(object.reference), colorSampler: object.samplerType.toLowerCase() === "color", lodFor: () => 40 };

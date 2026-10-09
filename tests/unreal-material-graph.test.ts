@@ -2042,6 +2042,28 @@ describe("layered architecture masters: texture objects, render-path switches, s
     expect((await pixelsOf(overridden))(3, 3)).toEqual([encode(0.25), encode(0.25), encode(0.25)]);
   });
 
+  it("FlowMaps_Simple's Diffuse is its diffuse texture's average, Diffuse Alpha that average's alpha, Normal flat; Distortion stays unsupported", async () => {
+    // The water masters: FlowMaps_Simple(Input0 = water texture object, Input1 = normal texture object, ..., Input5 = Panner).
+    const half = await pngOf(4, 4, (x) => (x < 2 ? [0, 0, 0] : [255, 255, 255]));
+    const flow = (output: number, mask: number[] | null) =>
+      makeGraph(
+        [
+          engineFn("flow", "Engine_MaterialFunctions02/Texturing/FlowMaps_Simple", { Input0: pin("water"), Input1: pin("normal"), Input5: pin("pan") }, ["Diffuse", "Diffuse Alpha", "Normal", "Distortion"]),
+          node("water", "TextureObject", { texture: "/Game/Test/T_Half.T_Half", samplerType: "LinearColor" }),
+          node("normal", "TextureObject", { texture: "/Game/Test/T_Normal.T_Normal", samplerType: "Normal" }),
+          node("pan", "Panner", { constants: { SpeedY: 0.1, bFractionalPart: true } }),
+        ],
+        pin("flow", output, mask),
+      );
+    const textures = { T_Half: { png: half, srgb: false } };
+    const diffuse = await bake(flow(0, RGB_MASK), textures);
+    expect((await pixelsOf(diffuse))(1, 2)).toEqual([encode(0.5), encode(0.5), encode(0.5)]);
+    expect(notes(diffuse).some((note) => note.startsWith("FlowMaps_Simple: Diffuse evaluated as its texture's average"))).toBe(true);
+    expect((await pixelsOf(await bake(flow(1, null), textures)))(0, 0)).toEqual([255, 255, 255]);
+    expect((await pixelsOf(await bake(flow(2, null), textures)))(0, 0)).toEqual([0, 0, 255]);
+    expect(await bake(flow(3, null), textures)).toMatchObject({ status: "unsupported", unsupported: ["FlowMaps_Simple.Distortion"] });
+  });
+
   it("MatLayerBlend_TenLayerBlend lerps the layers over Input20 from Input18 (next to the base) up to Input0 (top), ignoring Input21", async () => {
     // A turret master: dirt (Input0) over lights (Input6) over gold (Input18) over marble (Input20); Input21 is a baked normal map.
     const tenLayers = (alphas: { dirt: number; gold: number }) =>
