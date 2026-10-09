@@ -229,41 +229,49 @@ interface GltfJson {
 }
 
 /**
- * Points each primitive of a UE Viewer glTF at the material its section really uses. The exported primitives are the
- * LOD0 sections in order, each named for its raw slot; section `i` belongs to slot `lod0.get(i)`. Returns the number of
- * primitives whose material changed. A glTF that does not look like that (a different primitive count, a material
- * that is not the one a raw slot would give, raw slots out of order) is left alone and reports 0.
+ * Points each primitive of a UE Viewer glTF at the material its section really uses. UE Viewer names a primitive's material
+ * for its raw slot; the editor sorts the distinct raw slots into sections 0, 1, 2... and `lod0` says which slot each section
+ * ends up with. So a primitive whose material is raw slot `r` belongs to section `rank(r)` among the distinct raw slots and
+ * takes slot `lod0.get(rank(r))`. A group mesh with many primitives of one material works the same way. Raw slots are read
+ * back from the material names in order of first appearance, each the lowest slot of that name above the previous one
+ * (duplicate names are common); a glTF that does not fit (a name no slot has, raw slots out of order, a different number of
+ * distinct slots than sections) is left alone. Returns the number of primitives whose material changed.
  */
 export function remapGltfSectionMaterials(gltf: GltfJson, sections: StaticMeshSections): number {
   const primitives = (gltf.meshes ?? []).flatMap((mesh) => mesh.primitives ?? []);
   const materials = gltf.materials ?? [];
-  if (primitives.length === 0 || primitives.length !== sections.lod0.size) return 0;
-  const used = new Set<number>();
-  let previousRaw = -1;
-  const targets: string[] = [];
-  for (const [section, primitive] of primitives.entries()) {
-    const current = primitive.material === undefined ? undefined : materials[primitive.material]?.name;
-    const raw = sections.slots.findIndex((slot, index) => slot !== undefined && slot === current && !used.has(index));
-    const slot = sections.lod0.get(section);
-    const target = slot === undefined ? undefined : sections.slots[slot];
-    if (raw < 0 || raw <= previousRaw || target === undefined) return 0;
-    used.add(raw);
-    previousRaw = raw;
-    targets.push(target);
+  if (primitives.length === 0) return 0;
+  const names = primitives.map((primitive) => (primitive.material === undefined ? undefined : materials[primitive.material]?.name));
+  if (names.some((name) => name === undefined)) return 0;
+  const rawOf = new Map<string, number>();
+  let previous = -1;
+  for (const name of names as string[]) {
+    if (rawOf.has(name)) continue;
+    const raw = sections.slots.findIndex((slot, index) => index > previous && slot === name);
+    if (raw < 0) return 0;
+    rawOf.set(name, raw);
+    previous = raw;
   }
-  if (targets.every((target, section) => target === materials[primitives[section]!.material!]?.name)) return 0;
+  const rawSlots = [...rawOf.values()].sort((a, b) => a - b);
+  if (rawSlots.length !== sections.lod0.size) return 0;
+  const targets = (names as string[]).map((name) => {
+    const slot = sections.lod0.get(rawSlots.indexOf(rawOf.get(name)!));
+    return slot === undefined ? undefined : sections.slots[slot];
+  });
+  if (targets.some((target) => target === undefined)) return 0;
+  if (targets.every((target, index) => target === names[index])) return 0;
   const rebuilt: { name?: string }[] = [];
   let changed = 0;
-  for (const [section, primitive] of primitives.entries()) {
-    const target = targets[section]!;
+  for (const [index, primitive] of primitives.entries()) {
+    const target = targets[index]!;
     const original = materials[primitive.material!]!;
-    let index = rebuilt.findIndex((material) => material.name === target);
-    if (index < 0) {
-      index = rebuilt.length;
+    let at = rebuilt.findIndex((material) => material.name === target);
+    if (at < 0) {
+      at = rebuilt.length;
       rebuilt.push({ ...original, name: target });
     }
     if (original.name !== target) changed += 1;
-    primitive.material = index;
+    primitive.material = at;
   }
   gltf.materials = rebuilt;
   return changed;

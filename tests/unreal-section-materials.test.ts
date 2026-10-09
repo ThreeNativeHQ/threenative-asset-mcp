@@ -67,6 +67,18 @@ describe("remapGltfSectionMaterials", () => {
     expect(remapGltfSectionMaterials(foreign, sections)).toBe(0);
   });
 
+  it("remaps a group mesh with many primitives per material by raw slot, not by primitive order (BoughGroup02: sections swap bark and leafs)", () => {
+    const group: StaticMeshSections = { slots: ["MI_Bark", "MI_Leafs"], lod0: new Map([[0, 1], [1, 0]]) };
+    const gltf = {
+      materials: [{ name: "MI_Bark" }, { name: "MI_Leafs" }],
+      meshes: [{ primitives: [{ material: 0 }, { material: 1 }, { material: 0 }, { material: 1 }, { material: 0 }] }],
+    };
+    expect(remapGltfSectionMaterials(gltf, group)).toBe(5);
+    expect(gltf.meshes[0]!.primitives.map((primitive) => gltf.materials[primitive.material]!.name)).toEqual(["MI_Leafs", "MI_Bark", "MI_Leafs", "MI_Bark", "MI_Leafs"]);
+    // Run again over its own output: the raw slots no longer read in order, so it is left alone.
+    expect(remapGltfSectionMaterials(gltf, group)).toBe(0);
+  });
+
   it("handles a swap and a duplicate slot name (pine05: slots lod3, bark, leafs, bark; sections -> 3, 2)", () => {
     const pine: StaticMeshSections = { slots: ["MI_Lod3", "MI_Bark", "MI_Leafs", "MI_Bark"], lod0: new Map([[0, 3], [1, 2]]) };
     const gltf = exported();
