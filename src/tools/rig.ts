@@ -705,7 +705,7 @@ export const AssetRetargetAnimationsOutputSchema = z.object({
         frames: z.number().int().positive(),
         jointTracks: z.number().int().positive(),
         rootDisplacement: z.number().nonnegative(),
-        omittedRoles: z.array(z.string().max(120)).max(64),
+        omittedRoles: z.array(z.string().max(120)).max(1_024),
       }),
     )
     .max(24),

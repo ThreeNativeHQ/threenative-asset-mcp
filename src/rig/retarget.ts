@@ -28,9 +28,9 @@ const ROLE_PREFERENCES: readonly RolePreference[] = [
   { role: "forearm", sided: true, prefer: ["lowerarm", "forearm"] },
   { role: "hand", sided: true, prefer: ["hand", "wrist"] },
   { role: "thigh", sided: true, prefer: ["thigh", "upperleg", "upleg"] },
-  { role: "shin", sided: true, prefer: ["calf", "shin", "lowerleg"] },
+  { role: "shin", sided: true, prefer: ["calf", "shin", "lowerleg", "leg"] },
   { role: "foot", sided: true, prefer: ["foot", "ankle"] },
-  { role: "toe", sided: true, prefer: ["ball", "toe", "toes"] },
+  { role: "toe", sided: true, prefer: ["ball", "toe", "toes", "toebase"] },
 ];
 
 export function splitJointSide(name: string): { base: string; side: JointSide } {
