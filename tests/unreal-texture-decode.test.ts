@@ -66,7 +66,7 @@ describe("editor texture payload decode (converter program)", () => {
   });
 
   it("bumps the converter version so a stale binary is rebuilt", () => {
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.59");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.60");
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
   });
 });

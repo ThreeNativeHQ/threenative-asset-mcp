@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.59",
+  version: "b4e95441+threenative.60",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -419,6 +419,7 @@ var GraphIgnoredProperties = new HashSet<string>(StringComparer.Ordinal)
     "FunctionExpressions",
 };
 var graphLegacyCache = new Dictionary<string, Dictionary<string, GraphLegacyInput>>(StringComparer.Ordinal);
+var graphLegacyFunctionCache = new Dictionary<string, List<GraphLegacyInput>?>(StringComparer.Ordinal);
 Dictionary<string, string>? graphFunctionKeys = null;
 var graphPackageKeys = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var graphPackageArchives = new Dictionary<string, FAssetArchive?>(StringComparer.OrdinalIgnoreCase);
@@ -520,18 +521,17 @@ static bool GraphTaggedInputs(IPackage? package) =>
     package is Package legacy && (legacy.Summary.CustomVersionContainer?.Versions.All(version => version.Key != FCoreObjectVersion.GUID) ?? true);
 // Packages saved by UE 4.5 store each FExpressionInput as tagged properties that CUE4Parse mis-reads as the native layout and drops.
 // Re-read those struct payloads from the raw package bytes.
-Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
+FAssetArchive? GraphRawArchive(Package legacy)
 {
-    var inputs = new Dictionary<string, GraphLegacyInput>(StringComparer.Ordinal);
-    if (expr.Owner is not Package legacy) return inputs;
-    var cacheKey = legacy.Name + "#" + expr.Name;
-    if (graphLegacyCache.TryGetValue(cacheKey, out var cached)) return cached;
-    graphLegacyCache[cacheKey] = inputs;
     if (!graphPackageArchives.TryGetValue(legacy.Name, out var archive))
     {
         archive = null;
         try
         {
+            // A package reached through a function call was never mounted by the dump loop: find its file by name.
+            if (!graphPackageKeys.ContainsKey(legacy.Name) &&
+                provider.Files.Keys.FirstOrDefault(candidate => string.Equals(Path.ChangeExtension(candidate, null), legacy.Name, StringComparison.OrdinalIgnoreCase)) is { } located)
+                graphPackageKeys[legacy.Name] = located;
             if (graphPackageKeys.TryGetValue(legacy.Name, out var key))
             {
                 var bytes = provider.SaveAsset(key);
@@ -542,6 +542,75 @@ Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
         catch { archive = null; }
         graphPackageArchives[legacy.Name] = archive;
     }
+    return archive;
+}
+// The same recovery for a function call's FunctionInputs: every element nests an FExpressionInput (Input) that CUE4Parse reads in
+// the native layout, so an unwired or wired pin of an old package arrives as junk (a pin on the call itself, masks like 67108864)
+// and the call, with the engine function behind it, looks like a cycle. Null when the array cannot be re-read.
+List<GraphLegacyInput>? GraphLegacyFunctionInputs(UObject call)
+{
+    if (call.Owner is not Package legacy) return null;
+    var cacheKey = legacy.Name + "#" + call.Name;
+    if (graphLegacyFunctionCache.TryGetValue(cacheKey, out var cached)) return cached;
+    graphLegacyFunctionCache[cacheKey] = null;
+    var archive = GraphRawArchive(legacy);
+    var export = legacy.ExportMap.FirstOrDefault(item => item.ObjectName.Text == call.Name);
+    if (archive is null || export is null) return null;
+    archive.Position = export.SerialOffset;
+    List<GraphLegacyInput>? result = null;
+    while (true)
+    {
+        FPropertyTag tag;
+        try { tag = new FPropertyTag(archive, false); } catch { break; }
+        if (tag.Name.IsNone) break;
+        var end = archive.Position + tag.Size;
+        try
+        {
+            if (tag.Name.Text == "FunctionInputs" && tag.PropertyType.Text == "ArrayProperty" && tag.TagData?.InnerType == "StructProperty")
+            {
+                var count = archive.Read<int>();
+                if (count > 0 && archive.Ver >= EUnrealEngineObjectUE4Version.INNER_ARRAY_TAG_INFO) _ = new FPropertyTag(archive, false);
+                var elements = new List<GraphLegacyInput>();
+                for (var element = 0; element < count; element++)
+                {
+                    var input = new GraphLegacyInput(null, 0, null, null, false);
+                    while (true)
+                    {
+                        var item = new FPropertyTag(archive, false);
+                        if (item.Name.IsNone) break;
+                        var itemEnd = archive.Position + item.Size;
+                        if (item.Name.Text == "Input") input = GraphReadLegacyInput(archive, itemEnd);
+                        archive.Position = itemEnd;
+                    }
+                    elements.Add(input);
+                }
+                result = elements;
+            }
+        }
+        catch { result = null; }
+        archive.Position = end;
+    }
+    graphLegacyFunctionCache[cacheKey] = result;
+    return result;
+}
+// The value of an expression's input property, recovered from the raw package when it is stored as tagged properties.
+object? GraphInputValue(UObject expr, string name)
+{
+    var property = GraphProperty(expr, name);
+    var value = property?.Tag?.GenericValue;
+    if (property is not null && property.PropertyType.Text == "StructProperty" &&
+        (property.Tag is null || (GraphTaggedInputs(expr.Owner) && value is FScriptStruct { StructType: FExpressionInput })))
+        return GraphLegacyInputs(expr).TryGetValue(name, out var recovered) ? recovered : null;
+    return value;
+}
+Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
+{
+    var inputs = new Dictionary<string, GraphLegacyInput>(StringComparer.Ordinal);
+    if (expr.Owner is not Package legacy) return inputs;
+    var cacheKey = legacy.Name + "#" + expr.Name;
+    if (graphLegacyCache.TryGetValue(cacheKey, out var cached)) return cached;
+    graphLegacyCache[cacheKey] = inputs;
+    var archive = GraphRawArchive(legacy);
     if (archive is null) return inputs;
     var export = legacy.ExportMap.FirstOrDefault(item => item.ObjectName.Text == expr.Name);
     if (export is null) return inputs;
@@ -904,12 +973,15 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         var pins = new Dictionary<string, Dictionary<string, object?>?>(StringComparer.Ordinal);
         if (GraphProperty(call, "FunctionInputs")?.Tag?.GenericValue is UScriptArray callInputs)
         {
+            // A package that records no FCoreObjectVersion stores each nested input as tagged properties; read them from the raw bytes.
+            var legacyInputs = GraphTaggedInputs(owner) ? GraphLegacyFunctionInputs(call) : null;
+            if (legacyInputs is not null && legacyInputs.Count != callInputs.Properties.Count) legacyInputs = null;
             var position = 0;
             foreach (var element in callInputs.Properties)
             {
                 var slot = position++;
                 if (element.GenericValue is not FScriptStruct { StructType: FStructFallback item }) continue;
-                var actual = Pin(GraphProperty(item, "Input")?.Tag?.GenericValue, prefix, outerInputs, depth);
+                var actual = Pin(legacyInputs is not null ? legacyInputs[slot] : GraphProperty(item, "Input")?.Tag?.GenericValue, prefix, outerInputs, depth);
                 var guid = GraphGuid(GraphProperty(item, "ExpressionInputId"));
                 var inputName = $"Input{slot}";
                 if (guid is not null && inputExpressions.TryGetValue(guid, out var inputExpression))
@@ -936,7 +1008,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                     GraphGuid(GraphProperty(item, "ExpressionOutputId")) is { } guid &&
                     outputExpressions.TryGetValue(guid, out var outputExpression))
                 {
-                    innerId = Pin(GraphProperty(outputExpression, "A")?.Tag?.GenericValue, inner, pins, depth + 1)?["node"] as string;
+                    innerId = Pin(GraphInputValue(outputExpression, "A"), inner, pins, depth + 1)?["node"] as string;
                     outputName = GraphText(GraphProperty(outputExpression, "OutputName")?.Tag?.GenericValue);
                 }
                 outputIds.Add(innerId);

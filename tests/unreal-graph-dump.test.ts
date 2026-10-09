@@ -128,7 +128,7 @@ describe("--dump-graphs converter mode", () => {
   it("is wired into the embedded program and the converter version is bumped", () => {
     expect(CUE4PARSE_PROGRAM).toContain("--dump-graphs");
     expect(CUE4PARSE_PROGRAM).toContain(".graph.json");
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.59");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.60");
     // The embedded program prints the same string `canRun` waits for, so a stale binary is rebuilt.
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
   });
@@ -147,6 +147,18 @@ describe("--dump-graphs converter mode", () => {
     expect(CUE4PARSE_PROGRAM).toContain("GraphLoadFunction(functionIndex");
     expect(CUE4PARSE_PROGRAM).toContain("graphFunctionKeys");
     expect(CUE4PARSE_PROGRAM).toContain('StartsWith("/Engine/"');
+  });
+
+  it("re-reads the tagged inputs nested in a function call and in a function output of a pre-4.12 package", () => {
+    // Open World Demo Collection (Kite, saved by UE 4.7): CUE4Parse read the nested FExpressionInput of every
+    // FunctionInputs element in the native layout, so an engine function call got a pin on itself with a junk mask
+    // (the baker saw a "Cycle" and a PivotPainter node), and a pack function's output pin came back Unresolved.
+    expect(CUE4PARSE_PROGRAM).toContain("GraphLegacyFunctionInputs(call)");
+    expect(CUE4PARSE_PROGRAM).toContain('tag.Name.Text == "FunctionInputs"');
+    expect(CUE4PARSE_PROGRAM).toContain("GraphInputValue(outputExpression, \"A\")");
+    expect(CUE4PARSE_PROGRAM).toContain("GraphRawArchive(legacy)");
+    // A function package is mounted by the call, not by the dump loop, so its file is found by name.
+    expect(CUE4PARSE_PROGRAM).toContain("graphPackageKeys[legacy.Name] = located");
   });
 
   it("emits and accepts the attribute GUIDs of Set/GetMaterialAttributes", () => {
