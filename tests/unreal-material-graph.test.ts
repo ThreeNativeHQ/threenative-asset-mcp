@@ -1729,7 +1729,8 @@ describe("view-dependent nodes of sky and effect materials", () => {
     expect(await colour([node("fresnel", "Fresnel")])).toBe(encode(value(0.04, 5)));
     expect(await colour([node("fresnel", "Fresnel", { inputs: { BaseReflectFractionIn: pin("reflect"), ExponentIn: pin("power") } }), node("reflect", "Constant", { constants: { R: 0.25 } }), node("power", "Constant", { constants: { R: 1 } })])).toBe(encode(value(0.25, 1)));
     // A stiffer exponent keeps the face-on colour on more of the surface: the mean shrinks as the exponent grows.
-    expect(await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0, Exponent: 8 } })])).toBeLessThan(await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0, Exponent: 0.5 } })]));
+    const stiff = (await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0, Exponent: 8 } })]))!;
+    expect(stiff).toBeLessThan((await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0, Exponent: 0.5 } })]))!);
   });
 
   it("Fresnel with a wired Normal does not walk the normal's own nodes", async () => {

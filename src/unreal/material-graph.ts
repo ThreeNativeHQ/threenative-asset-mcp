@@ -153,6 +153,7 @@ const SUPPORTED_NODE_CLASSES = [
   "Fresnel",
   "DepthFade",
   "TwoSidedSign",
+  "WorldPosition",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -352,6 +353,8 @@ interface Val {
   konst: boolean;
   /** The value is `uv * uvScale`: lets a sample choose a mip level. Dropped by any other operation. */
   uvScale?: [number, number];
+  /** The value derives from `WorldPosition`: a texture sampled at it has no UV-space meaning, so its average stands in. */
+  world?: true;
 }
 /** A MaterialAttributes value. Only BaseColor is carried (null = the attribute is not wired = black). */
 interface Attrs {
@@ -424,6 +427,9 @@ const TWO_SIDED_SIGN_NOTE =
 const MAT_LAYER_TINT_NOTE =
   "MatLayerBlend_Tint: BaseColor multiplied by lerp(1, Tint, Alpha) (unwired Alpha is 1); engine body unavailable, inferred from the pins (a white Tint is the identity)";
 
+const WORLD_POSITION_NOTE =
+  "WorldPosition evaluated as the origin, and a texture sampled at a coordinate derived from it as that texture's average colour: a baked texture is shared by every placed instance, so a world-space tiling mask stands in as its mean";
+
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
 
@@ -476,12 +482,13 @@ class Compiler {
   private emit(inputs: readonly Val[], n: number, build: (out: number) => Instruction, texelDependent = false): Val {
     const reg = this.allocate();
     const instruction = build(reg);
+    const world = inputs.some((input) => input.world) ? ({ world: true } as const) : {};
     if (!texelDependent && inputs.every((input) => input.konst)) {
       instruction(this.registers, { u: 0, v: 0 });
-      return { kind: "vec", reg, n, konst: true };
+      return { kind: "vec", reg, n, konst: true, ...world };
     }
     this.program.push(instruction);
-    return { kind: "vec", reg, n, konst: false };
+    return { kind: "vec", reg, n, konst: false, ...world };
   }
 
   private binary(a: Val, b: Val, op: (x: number, y: number) => number): Val {
@@ -722,6 +729,12 @@ class Compiler {
         // Per-instance data: the placement of the instance in the level. One representative instance (the origin).
         this.approximations.add(OBJECT_POSITION_NOTE);
         return this.constant([0, 0, 0], 3);
+      case "WorldPosition": {
+        // The position of the pixel in the level. A world-space macro mask (grass variation noise tiled by world X/Y) has no UV
+        // equivalent, so the origin stands in and a texture sampled through it reads its average (see `textureSample`).
+        this.approximations.add(WORLD_POSITION_NOTE);
+        return { ...this.constant([0, 0, 0], 3), world: true };
+      }
       case "PerInstanceRandom":
         this.approximations.add(PER_INSTANCE_RANDOM_NOTE);
         return this.constant([0.5], 1);
@@ -1051,10 +1064,13 @@ class Compiler {
     const coordinates = node.inputs.Coordinates ? this.vec(node.inputs.Coordinates, "TextureSample.Coordinates") : undefined;
     const uvScale = coordinates ? coordinates.uvScale : ([1, 1] as [number, number]);
     const sampler = (node.samplerType ?? "Color").toLowerCase();
+    const worldCoordinates = coordinates?.world === true;
     const slot: TextureSlot = {
       name: textureObjectName(reference),
       colorSampler: sampler === "color",
       lodFor: (outputSize, raster) => {
+        // A world-space coordinate reads the coarsest mip, the texture's average colour.
+        if (worldCoordinates) return 40;
         if (!uvScale) return 0;
         const ratio = Math.max(raster.width * uvScale[0], raster.height * uvScale[1]) / outputSize;
         return ratio > 1 ? Math.round(Math.log2(ratio)) : 0;
