@@ -416,8 +416,11 @@ package is read with CUE4Parse, a closed node set is evaluated per texel, and th
 base-colour PNG with `source: "graph"` in the section's bindings. The bake is `exact` only when
 every node is understood; engine layer functions that are not in the pack, a mesh without vertex
 colours standing in white, and a UV set the importer drops make it `heuristic`, and the section's
-`graph` field names each approximation. Nodes it cannot evaluate (for example `DepthFade`,
-`MatLayerBlend_Tint`) leave the neutral fallback and are listed under `graph.unsupportedNodes`.
+`graph` field names each approximation. View-dependent nodes (`Fresnel`, `DepthFade`, `TwoSidedSign`)
+stand in as a recorded approximation: a bake has no camera, so `Fresnel` is its mean over a sphere's visible
+surface, `DepthFade` is fully faded in and `TwoSidedSign` is the front face. Nodes it cannot evaluate (for
+example `ReflectionVectorWS` feeding a cubemap lookup, or `Time`) leave the neutral fallback and are listed
+under `graph.unsupportedNodes`.
 The first bake installs the CUE4Parse converter and its private .NET SDK (hundreds of MB, once);
 pass `graphBake: false` to the importer, or set `THREENATIVE_TOOLCHAIN_AUTOINSTALL=0`, to skip it.
 `fab_import_asset` also skips it when its environment has `THREENATIVE_GRAPH_BAKE=0` (the parity

@@ -86,9 +86,16 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   mask channels and tinted, sampled inside material functions). `.mat`/props texture binding cannot
   reproduce it, so a section with no base colour asks the graph baker (`src/unreal/graph-baker.ts`,
   PRD-538): CUE4Parse dumps the graph, `material-graph.ts` evaluates a closed node set and bakes a
-  base-colour PNG (`source: "graph"`). Anything it cannot evaluate (e.g. `DepthFade`,
-  `MatLayerBlend_Tint`) stays on the neutral fallback and is named under the section's `graph`.
-  Engine content functions are not in the pack, so a bake that relies on them is `heuristic`.
+  base-colour PNG (`source: "graph"`). Anything it cannot evaluate (e.g. `ReflectionVectorWS` feeding a
+  cubemap lookup, `Time`) stays on the neutral fallback and is named under the section's `graph`.
+  Engine content functions are not in the pack, so a bake that relies on them is `heuristic`. View-dependent
+  nodes stand in as recorded approximations: `Fresnel` as its mean over a sphere's visible surface,
+  `DepthFade` as fully faded in, `TwoSidedSign` as +1 (front face).
+- **A "Cycle" or a PivotPainter node on a UE4 pack's colour path is the dump adapter, not the material.**
+  A package saved before UE 4.12 records no `FCoreObjectVersion`, so every `FExpressionInput` is tagged
+  properties, and CUE4Parse reads them in the native layout. The adapter re-reads the top-level inputs from the
+  raw bytes, and since converter 60 also the `Input` nested in each `FunctionInputs` element and a function
+  output's `A` pin. A call whose pins point at itself with masks like `67108864` is that bug.
 - Fab downloads land in `~/.cache/threenative-asset-mcp/fab-downloads/<listing>/<artifact>`. They
   are licensed, not redistributable: never commit pack contents. Delete what you downloaded when
   you are done; FabCLI fetched Soul Cave (1.2 GB) in 17 s, so re-downloading is cheap.
