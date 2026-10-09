@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.60",
+  version: "b4e95441+threenative.61",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -1133,6 +1133,15 @@ static List<Dictionary<string, object?>> DumpSlots(UObject mesh, IPackage packag
             slots.Add(DumpSlot("", DumpPath(package, material)));
     return slots;
 }
+// A MaterialInstanceConstant's TextureParameterValues. CUE4Parse fills the typed array only after
+// UMaterialInstance.Deserialize returns; on a UE4 package inside a UE5 artifact (UE 4.25 materials
+// beside UE 5.1 meshes) it throws on the UE5-only cached-data flag first, so the typed array stays
+// empty although the tagged properties were already read. Those are the same values.
+static FTextureParameterValue[] InstanceTextureParameters(UMaterialInstanceConstant instance)
+    => instance.TextureParameterValues.Length > 0
+        ? instance.TextureParameterValues
+        : (instance.GetOrDefault<FStructFallback[]>("TextureParameterValues") ?? Array.Empty<FStructFallback>())
+            .Select(fallback => new FTextureParameterValue(fallback)).ToArray();
 static List<Dictionary<string, object?>> DumpTextureParameters(UObject instance, IPackage package)
 {
     var parameters = new List<Dictionary<string, object?>>();
@@ -1310,9 +1319,10 @@ async Task<bool> ExportPaperSpriteAsync(UPaperSprite sprite)
         var textureFile = Directory.EnumerateFiles(root, textureName + ".uasset", SearchOption.AllDirectories).FirstOrDefault();
         if (textureFile is null || new FileInfo(textureFile).Length > 1_073_741_824) return false;
         var packageBytes = await File.ReadAllBytesAsync(textureFile);
-        var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
+        var spriteTexture = LoadAssetByName<UTexture>(textureName);
+        var sourcePng = ExtractSourcePng(packageBytes, spriteTexture);
         if (sourcePng is null) return false;
-        await File.WriteAllBytesAsync(textureTarget, NormalizeSourcePng(sourcePng, LoadAssetByName<UTexture>(textureName)));
+        await File.WriteAllBytesAsync(textureTarget, NormalizeSourcePng(sourcePng, spriteTexture));
     }
     var descriptor = new {
         Name = sprite.Name,
@@ -1388,7 +1398,7 @@ async Task ExportMaterialAsync(string initialName)
         var references = new List<(string Parameter, string Texture)>();
         if (material is UMaterialInstanceConstant instance)
         {
-            foreach (var parameter in instance.TextureParameterValues)
+            foreach (var parameter in InstanceTextureParameters(instance))
                 if (!parameter.ParameterValue.IsNull && parameter.ParameterValue.Name != "None")
                     references.Add((parameter.Name, parameter.ParameterValue.Name));
         }
@@ -1451,8 +1461,9 @@ async Task ExportMaterialAsync(string initialName)
             // UE5.1+ keeps large source art inside an FCompressedBuffer payload, like every other
             // editor texture site; without this fallback a level's materials lost their textures.
             var textureBytes = await File.ReadAllBytesAsync(textureFile);
-            var sourcePng = ExtractLargestPng(textureBytes) ?? ExtractCompressedPayloadPng(textureBytes);
-            if (sourcePng is not null) await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, LoadAssetByName<UTexture>(textureName)));
+            var sourceTexture = LoadAssetByName<UTexture>(textureName);
+            var sourcePng = ExtractSourcePng(textureBytes, sourceTexture);
+            if (sourcePng is not null) await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, sourceTexture));
         }
     }
 }
@@ -1515,10 +1526,10 @@ bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials,
         assetLookupDiagnostics[mesh.Name] = "uncooked mesh package was not mounted";
         return false;
     }
-    var editorMesh = ReadLargestMeshDescription(file.Read());
+    var editorMesh = ReadLargestMeshDescription(file.Read(), out var refusal);
     if (editorMesh is null)
     {
-        assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model";
+        assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model" + (refusal is null ? "" : $" ({refusal})");
         return false;
     }
     // Same material naming as the cooked glTF writer (MeshMaterialDto.SlotName): the material
@@ -2121,7 +2132,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     if (packageFile is not null && new FileInfo(packageFile).Length <= 1_073_741_824)
                         packageBytes = await File.ReadAllBytesAsync(packageFile);
                 }
-                var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
+                var sourcePng = ExtractSourcePng(packageBytes, texture);
                 if (sourcePng is not null) await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, texture));
             }
             if (File.Exists(target)) pageFiles.Add(targetName);
@@ -2187,7 +2198,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
             }
             var packageBytes = await File.ReadAllBytesAsync(textureFile);
             var payloadFailures = new List<string>();
-            var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes, payloadFailures);
+            var sourcePng = ExtractSourcePng(packageBytes, texture, payloadFailures);
             if (sourcePng is null)
             {
                 textureFailures.Add(ReportTextureFailure(texture, results, "no decodable pixel data", payloadFailures));
@@ -2297,7 +2308,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 var sourceFile = Directory.EnumerateFiles(root, sheet.Name + ".uasset", SearchOption.AllDirectories).FirstOrDefault();
                 if (sourceFile is not null && new FileInfo(sourceFile).Length <= 1_073_741_824)
                 {
-                    var sourcePng = ExtractLargestPng(await File.ReadAllBytesAsync(sourceFile)) ?? ExtractCompressedPayloadPng(await File.ReadAllBytesAsync(sourceFile));
+                    var sourcePng = ExtractSourcePng(await File.ReadAllBytesAsync(sourceFile), sheet);
                     if (sourcePng is not null) await File.WriteAllBytesAsync(textureTarget, NormalizeSourcePng(sourcePng, sheet));
                 }
             }
@@ -2514,12 +2525,212 @@ static byte[]? ExtractCompressedPayloadPng(byte[] bytes, List<string>? failures 
     return null;
 }
 
+// Editor source art in the order every exporter should try it: a TSCF_UEDELTA payload (raw pixels,
+// row-delta filtered, UE 5.6+), then an inline PNG, then a PNG or JPEG inside a compressed payload.
+static byte[]? ExtractSourcePng(byte[] bytes, UTexture? texture, List<string>? failures = null)
+    => ExtractUeDeltaSourcePng(bytes, texture, failures) ?? ExtractLargestPng(bytes) ?? ExtractCompressedPayloadPng(bytes, failures);
+
+// TSCF_UEDELTA (UE 5.6+ editor default for 8- and 16-bit sources): the payload is the raw source
+// pixels with each tile's rows replaced by their difference from the row above. Decoding it needs
+// the source's size and format from the Source struct, so it cannot be found by scanning for an
+// image signature; without this a UE 5.6+ pack exported no colour textures at all.
+static byte[]? ExtractUeDeltaSourcePng(byte[] bytes, UTexture? texture, List<string>? failures)
+{
+    var source = texture?.GetOrDefault<FStructFallback?>("Source", null);
+    if (source is null) return null;
+    var compression = source.GetOrDefault<FName>("CompressionFormat").Text ?? "";
+    if (!compression.EndsWith("TSCF_UEDELTA", StringComparison.Ordinal)) return null;
+    var format = source.GetOrDefault<FName>("Format").Text ?? "";
+    format = format[(format.LastIndexOf(':') + 1)..];
+    var width = source.GetOrDefault<int>("SizeX");
+    var height = source.GetOrDefault<int>("SizeY");
+    var slices = Math.Max(1, source.GetOrDefault<int>("NumSlices"));
+    var mips = Math.Max(1, source.GetOrDefault<int>("NumMips"));
+    var layers = Math.Max(1, source.GetOrDefault<int>("NumLayers"));
+    var blocks = source.GetOrDefault<FStructFallback[]>("Blocks") ?? Array.Empty<FStructFallback>();
+    if (layers > 1 || blocks.Length > 0)
+    {
+        failures?.Add($"TSCF_UEDELTA source with {layers} layers and {blocks.Length} extra blocks is not supported");
+        return null;
+    }
+    var (bytesPerPixel, sampleBytes) = UeDeltaPixelLayout(format);
+    if (bytesPerPixel == 0 || width <= 0 || height <= 0)
+    {
+        failures?.Add($"TSCF_UEDELTA source format {format} ({width}x{height}) is not supported");
+        return null;
+    }
+    long total = 0;
+    for (var mip = 0; mip < mips; mip++) total += (long) Math.Max(1, width >> mip) * Math.Max(1, height >> mip) * slices * bytesPerPixel;
+    foreach (var (at, rawSize) in ScanEditorPayloads(bytes))
+    {
+        if ((long) rawSize != total) continue;
+        try
+        {
+            using var archive = new FByteArchive("editor-payload", bytes);
+            archive.Position = at;
+            var pixels = DecompressEditorPayload(new FCompressedBuffer(archive));
+            // Mip 0, slice 0 is all the importer keeps; it is the first image in the payload.
+            UndoUeDelta(pixels, 0, width, height, bytesPerPixel, sampleBytes);
+            var png = EncodeSourcePixels(pixels, width, height, format, texture!.SRGB);
+            RawDerived.Table.Add(png, new object());
+            return png;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            failures?.Add($"TSCF_UEDELTA payload at {at}: {error.GetType().Name}: {error.Message}");
+        }
+    }
+    failures?.Add($"no TSCF_UEDELTA payload of {total} bytes ({format} {width}x{height}, {mips} mips, {slices} slices)");
+    return null;
+}
+
+// Bytes per pixel and per delta sample of each source format the delta filter covers (0 = not
+// covered). Float formats are never delta coded.
+static (int BytesPerPixel, int SampleBytes) UeDeltaPixelLayout(string format) => format switch
+{
+    "TSF_G8" => (1, 1),
+    "TSF_BGRA8" or "TSF_BGRE8" => (4, 1),
+    "TSF_G16" => (2, 2),
+    "TSF_RGBA16" => (8, 2),
+    _ => (0, 0),
+};
+
+// The inverse of Unreal's row delta (ImageCoreDelta). The image is cut into tiles that are each
+// coded on their own: rows wider than 4096 bytes are split into columns of a cache-line multiple,
+// and each column into runs of rows of about 32768 pixels (at most 512 runs). A tile's first row is
+// stored as is; every later sample is the difference from the sample above it, plus 0x8080 for
+// 16-bit samples. The cut rules are part of the file format, so they are reproduced exactly.
+static void UndoUeDelta(byte[] data, long offset, int width, int height, int bytesPerPixel, int sampleBytes)
+{
+    const long minPixelsPerCut = 32768, minPixelsForAnyCut = 136 * 136, cutStrideBytes = 4096, maxNumCuts = 512;
+    long strideBytes = (long) width * bytesPerPixel;
+    static long RowsPerCut(long sizeX, long sizeY)
+    {
+        var pixels = sizeX * sizeY;
+        long cuts = 1;
+        if (pixels > minPixelsPerCut)
+        {
+            cuts = pixels / minPixelsPerCut;
+            while (cuts > maxNumCuts) cuts >>= 1;
+        }
+        return (sizeY + cuts - 1) / cuts;
+    }
+    void Tile(long startX, long tileWidth, long startY, long tileHeight)
+    {
+        var rowBytes = tileWidth * bytesPerPixel;
+        for (var y = startY + 1; y < startY + tileHeight; y++)
+        {
+            var row = offset + y * strideBytes + startX * bytesPerPixel;
+            var above = row - strideBytes;
+            if (sampleBytes == 1)
+            {
+                for (long x = 0; x < rowBytes; x++) data[row + x] = (byte) (data[row + x] + data[above + x]);
+            }
+            else
+            {
+                for (long x = 0; x < rowBytes; x += 2)
+                {
+                    var delta = data[row + x] | (data[row + x + 1] << 8);
+                    var up = data[above + x] | (data[above + x + 1] << 8);
+                    var value = (delta + up - 0x8080) & 0xFFFF;
+                    data[row + x] = (byte) value;
+                    data[row + x + 1] = (byte) (value >> 8);
+                }
+            }
+        }
+    }
+    if ((long) width * height <= minPixelsForAnyCut)
+    {
+        Tile(0, width, 0, height);
+        return;
+    }
+    long partPixels = width;
+    if (strideBytes > cutStrideBytes)
+    {
+        var parts = (strideBytes + cutStrideBytes - 1) / cutStrideBytes;
+        var partBytes = (strideBytes + parts / 2) / parts;
+        partBytes = (partBytes + 63) & ~63L;
+        partPixels = partBytes / bytesPerPixel;
+    }
+    for (long startX = 0; startX < width; startX += partPixels)
+    {
+        var tileWidth = Math.Min(partPixels, width - startX);
+        var rows = RowsPerCut(tileWidth, height);
+        for (long startY = 0; startY < height; startY += rows) Tile(startX, tileWidth, startY, Math.Min(rows, height - startY));
+    }
+}
+
+// Raw source pixels (mip 0, slice 0) as an RGBA PNG in true colour. A 16-bit sRGB source is linear
+// light, so it is encoded to sRGB like the 16-bit PNG source path does.
+static byte[] EncodeSourcePixels(byte[] pixels, int width, int height, string format, bool srgb)
+{
+    var rgba = new byte[(long) width * height * 4];
+    var count = (long) width * height;
+    switch (format)
+    {
+        case "TSF_G8":
+            for (long i = 0; i < count; i++) { var g = pixels[i]; rgba[i * 4] = g; rgba[i * 4 + 1] = g; rgba[i * 4 + 2] = g; rgba[i * 4 + 3] = 255; }
+            break;
+        case "TSF_BGRA8":
+        case "TSF_BGRE8":
+            for (long i = 0; i < count; i++)
+            {
+                rgba[i * 4] = pixels[i * 4 + 2];
+                rgba[i * 4 + 1] = pixels[i * 4 + 1];
+                rgba[i * 4 + 2] = pixels[i * 4];
+                rgba[i * 4 + 3] = pixels[i * 4 + 3];
+            }
+            break;
+        case "TSF_G16":
+        case "TSF_RGBA16":
+        {
+            var lut = new byte[65536];
+            for (var value = 0; value < lut.Length; value++)
+            {
+                var linear = value / 65535.0;
+                var encoded = srgb ? (linear <= 0.0031308 ? linear * 12.92 : 1.055 * Math.Pow(linear, 1 / 2.4) - 0.055) : linear;
+                lut[value] = (byte) Math.Clamp(Math.Round(encoded * 255), 0, 255);
+            }
+            int Sample(long index) => pixels[index] | (pixels[index + 1] << 8);
+            for (long i = 0; i < count; i++)
+            {
+                if (format == "TSF_G16")
+                {
+                    var g = lut[Sample(i * 2)];
+                    rgba[i * 4] = g; rgba[i * 4 + 1] = g; rgba[i * 4 + 2] = g; rgba[i * 4 + 3] = 255;
+                    continue;
+                }
+                rgba[i * 4] = lut[Sample(i * 8)];
+                rgba[i * 4 + 1] = lut[Sample(i * 8 + 2)];
+                rgba[i * 4 + 2] = lut[Sample(i * 8 + 4)];
+                rgba[i * 4 + 3] = (byte) Math.Clamp(Math.Round(Sample(i * 8 + 6) / 257.0), 0, 255); // alpha is coverage, not light
+            }
+            break;
+        }
+        default:
+            throw new InvalidDataException($"Unsupported source format {format}.");
+    }
+    var info = new SkiaSharp.SKImageInfo(width, height, SkiaSharp.SKColorType.Rgba8888, SkiaSharp.SKAlphaType.Unpremul);
+    var handle = GCHandle.Alloc(rgba, GCHandleType.Pinned);
+    try
+    {
+        using var pixmap = new SkiaSharp.SKPixmap(info, handle.AddrOfPinnedObject());
+        using var png = pixmap.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100) ?? throw new InvalidDataException("PNG encode failed.");
+        return png.ToArray();
+    }
+    finally
+    {
+        handle.Free();
+    }
+}
+
 // The LOD0 source model of an uncooked UE5 StaticMesh. Its package trailer holds one
 // FMeshDescription payload per source-model LOD, so the largest raw payload that parses is LOD0.
 // Every other payload in a StaticMesh package is also a mesh description, so ranking by the
 // header's raw size decompresses only what is kept.
-static EditorMesh? ReadLargestMeshDescription(byte[] bytes)
+static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal)
 {
+    refusal = null;
     foreach (var (at, _) in ScanEditorPayloads(bytes))
     {
         try
@@ -2527,6 +2738,11 @@ static EditorMesh? ReadLargestMeshDescription(byte[] bytes)
             using var archive = new FByteArchive("editor-payload", bytes);
             archive.Position = at;
             return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)));
+        }
+        catch (NotSupportedException error)
+        {
+            // A mesh description in a layout this reader knows it cannot map; say so.
+            refusal ??= error.Message;
         }
         catch
         {
@@ -2596,6 +2812,19 @@ int ExportGroomPayloads(byte[] bytes, string name)
 // whole payload is consumed, so a layout drift is a refusal rather than garbage geometry.
 static EditorMesh ReadMeshDescription(byte[] raw)
 {
+    // Both FName array layouts are tried; only one consumes the whole payload.
+    try
+    {
+        return ReadMeshDescriptionLayout(raw, compactNames: false);
+    }
+    catch (Exception error) when (error is not OutOfMemoryException)
+    {
+        return ReadMeshDescriptionLayout(raw, compactNames: true);
+    }
+}
+
+static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames)
+{
     using var stream = new MemoryStream(raw, false);
     using var reader = new BinaryReader(stream);
     string ReadName()
@@ -2640,6 +2869,19 @@ static EditorMesh ReadMeshDescription(byte[] raw)
                     if (kind == 6)
                     {
                         var count = reader.ReadInt32();
+                        if (compactNames)
+                        {
+                            // UE 5.8 re-saves (Paladin weapons, LookAtPOI props): the element count is
+                            // followed by a distinct-name count and the distinct names. Every package
+                            // seen so far holds one distinct name, which then names every element;
+                            // with more, the element-to-name mapping is unknown, so refuse.
+                            var distinct = reader.ReadInt32();
+                            if (distinct != (count == 0 ? 0 : 1))
+                                throw new NotSupportedException($"FName attribute {attribute} has {distinct} distinct names for {count} elements in the UE 5.8 compact layout");
+                            var only = distinct == 1 ? ReadName() : "";
+                            names[key] = Enumerable.Repeat(only, count).ToArray();
+                            continue;
+                        }
                         names[key] = Enumerable.Range(0, count).Select(_ => ReadName()).ToArray();
                         continue;
                     }
@@ -2732,6 +2974,8 @@ static byte[] NormalizeSourcePng(byte[] png, UTexture? texture)
     if (texture is null) return png;
     // A JPEG source (TSCF_JPEG) is decoded to true colour by Skia, so it needs no channel fix-up.
     if (JpegDerived.Table.TryGetValue(png, out _)) return png;
+    // Neither does one encoded from raw TSCF_UEDELTA pixels: it was written as RGBA in true colour.
+    if (RawDerived.Table.TryGetValue(png, out _)) return png;
     var format = texture.GetOrDefault<FStructFallback?>("Source", null)?.GetOrDefault<FName>("Format").Text ?? "";
     try
     {
@@ -3026,6 +3270,11 @@ public sealed class USkeletalMeshEditorData : UObject
 
 // PNGs that were re-encoded from a JPEG source payload, by reference, so NormalizeSourcePng can tell them apart.
 static class JpegDerived
+{
+    public static readonly System.Runtime.CompilerServices.ConditionalWeakTable<byte[], object> Table = new();
+}
+// PNGs encoded here from raw source pixels (TSCF_UEDELTA), already in true RGBA colour.
+static class RawDerived
 {
     public static readonly System.Runtime.CompilerServices.ConditionalWeakTable<byte[], object> Table = new();
 }

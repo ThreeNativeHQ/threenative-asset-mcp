@@ -96,6 +96,20 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   properties, and CUE4Parse reads them in the native layout. The adapter re-reads the top-level inputs from the
   raw bytes, and since converter 60 also the `Input` nested in each `FunctionInputs` element and a function
   output's `A` pin. A call whose pins point at itself with masks like `67108864` is that bug.
+- **UE 5.6+ texture sources are `TSCF_UEDELTA`, not PNG.** The editor payload is the raw source pixels
+  (BGRA8, G8, RGBA16, ...) with each tile's rows stored as differences from the row above (16-bit samples
+  biased by 0x8080). The tile cut (columns of at most 4096 bytes, runs of about 32768 pixels) is part of the
+  format; `UndoUeDelta` in the converter reproduces it, and `tests/unreal-converter-ue5-sources.test.ts` pins
+  it. Before converter 61 every colour texture of a 5.6+ pack was dropped and its sections went neutral.
+- **A UE5 artifact can hold UE4-saved packages.** A Megascans UE 5.1 listing kept its 4.25 materials and
+  textures beside 5.1 meshes. CUE4Parse throws on such a MaterialInstance before it fills the typed
+  `TextureParameterValues`; the converter reads the tagged property instead (`InstanceTextureParameters`).
+- **UE 5.8 re-saves store an FName mesh attribute compactly** (element count, distinct-name count, names).
+  The reader accepts one distinct name, the only case seen, and refuses more with the reason in the mesh
+  failure.
+- **`BuildScale3D` applies on every UE4 route.** Neither UE Viewer nor the uncooked MeshDescription converter
+  multiplies the source model by it; the importer does (`meshGeometryScale`). UE5 editor meshes are not yet
+  covered: `readBuildScale3D` reads legacy -7 headers only.
 - Fab downloads land in `~/.cache/threenative-asset-mcp/fab-downloads/<listing>/<artifact>`. They
   are licensed, not redistributable: never commit pack contents. Delete what you downloaded when
   you are done; FabCLI fetched Soul Cave (1.2 GB) in 17 s, so re-downloading is cheap.

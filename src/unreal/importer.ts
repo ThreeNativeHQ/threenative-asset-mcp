@@ -56,7 +56,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 68;
+export const IMPORTER_VERSION = 69;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -2136,6 +2136,21 @@ function describeModernFailure(
  * report. Provider-independent: a pack downloaded by FabCLI and one unzipped by hand take the
  * same path, which is what makes an already-downloaded pack re-runnable.
  */
+/**
+ * The per-glTF-axis factor a mesh GLB is multiplied by. The uncooked MeshDescription converter writes centimetres with
+ * glTF x, y, z = Unreal y, z, x; UE Viewer writes metres with glTF x, y, z = Unreal x, z, y. Either way the source
+ * model's BuildScale3D (Unreal axes) is what Unreal multiplies the render data by.
+ */
+export function meshGeometryScale(
+  fromMeshDescription: boolean,
+  buildScale: readonly [number, number, number] | undefined,
+): number | readonly [number, number, number] {
+  if (fromMeshDescription) {
+    return buildScale ? ([buildScale[1] * 0.01, buildScale[2] * 0.01, buildScale[0] * 0.01] as const) : 0.01;
+  }
+  return buildScale ? ([buildScale[0], buildScale[2], buildScale[1]] as const) : 1;
+}
+
 export async function importUnrealDirectory(
   request: ImportUnrealRequest,
 ): Promise<ImportReport> {
@@ -3659,10 +3674,12 @@ export async function importUnrealDirectory(
         continue;
       }
       const dnaSource = fromModernConverter ? assets.dna.get(name) : undefined;
-      // UE Viewer's raw mesh is not multiplied by the source model's BuildScale3D; Unreal's render data is.
-      const buildScale = !fromMeshDescription && !fromModernConverter && entry.meshKind !== "skeletal" ? await readPackageBuildScale3D(entry.file) : undefined;
+      // Neither UE Viewer's raw mesh nor the uncooked converter's FMeshDescription is multiplied by the source model's
+      // BuildScale3D; Unreal's render data is. A UE 4.26 pack built street lights at 1.4 and a tree at 3, so they came out
+      // that much too small.
+      const buildScale = !fromModernConverter && entry.meshKind !== "skeletal" ? await readPackageBuildScale3D(entry.file) : undefined;
       if (buildScale && buildScale.some((factor) => factor !== 1)) {
-        warnings.push(`${name}: the source mesh carries BuildScale3D (${buildScale.join(", ")}); UE Viewer's geometry was scaled by it${new Set(buildScale).size > 1 ? " (non-uniform: normals are not adjusted)" : ""}.`);
+        warnings.push(`${name}: the source mesh carries BuildScale3D (${buildScale.join(", ")}); ${fromMeshDescription ? "the source model's" : "UE Viewer's"} geometry was scaled by it${new Set(buildScale).size > 1 ? " (non-uniform: normals are not adjusted)" : ""}.`);
       }
       for (const { lod, path: gltfPath } of lodPaths) {
         const relativeGlb = fromMeshDescription || fromModernConverter
@@ -3679,7 +3696,7 @@ export async function importUnrealDirectory(
             imageCache,
             copyright,
             sidecars,
-            geometryScale: fromMeshDescription ? 0.01 : buildScale ? ([buildScale[0], buildScale[2], buildScale[1]] as const) : 1,
+            geometryScale: meshGeometryScale(fromMeshDescription, buildScale),
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
