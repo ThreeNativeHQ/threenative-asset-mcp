@@ -726,7 +726,7 @@ export const AssetRetargetAnimationsOutputSchema = z.object({
         source: z.string().max(64),
       }),
     )
-    .max(128),
+    .max(256),
 });
 
 export interface AssetRetargetOptions {

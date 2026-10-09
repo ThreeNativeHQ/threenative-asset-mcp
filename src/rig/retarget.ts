@@ -1,4 +1,4 @@
-import { Document, type Node } from "@gltf-transform/core";
+import { type Accessor, Document, type Node } from "@gltf-transform/core";
 import { Quaternion, Vector3 } from "three";
 
 import { RigAssetError } from "./inspect.js";
@@ -30,13 +30,14 @@ const ROLE_PREFERENCES: readonly RolePreference[] = [
   { role: "thigh", sided: true, prefer: ["thigh", "upperleg", "upleg"] },
   { role: "shin", sided: true, prefer: ["calf", "shin", "lowerleg", "leg"] },
   { role: "foot", sided: true, prefer: ["foot", "ankle"] },
-  { role: "toe", sided: true, prefer: ["ball", "toe", "toes", "toebase"] },
+  { role: "toe", sided: true, prefer: ["ball", "toe", "toes", "toebase", "toe0"] },
 ];
 
 export function splitJointSide(name: string): { base: string; side: JointSide } {
   // Namespaces are not anatomy. A single-letter suffix needs a separator or
   // camel-case boundary: the final r in "shoulder" is not a right-side marker.
-  const bare = name.replace(/^.*[:|]/, "");
+  // 3ds Max Biped names carry the side in the middle: "Bip01 L Finger0".
+  const bare = name.replace(/^.*[:|]/, "").replace(/^bip\d*[\s_.-]+(?=.)/i, "");
   const suffix = /[._\-\s](left|right|[lr])$/i.exec(bare)
     ?? /(left|right)$/i.exec(bare)
     ?? /(?<=[a-z0-9])([LR])$/.exec(bare);
@@ -63,6 +64,35 @@ export function normalizeJointName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+const FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"] as const;
+
+export interface FingerJoint {
+  finger: (typeof FINGER_NAMES)[number];
+  /** 0 = metacarpal, 1..3 = phalanges, 4 = end/leaf joint. */
+  segment: number;
+  leaf: boolean;
+}
+
+/**
+ * Recognise a finger joint from its normalized, side-free name: Mixamo `handindex1`, Unreal
+ * `index01` / `index04leaf` / `indexmetacarpal`, Blender `thumb01` / `findex01`, and 3ds Max
+ * Biped `finger0` (thumb), `finger01` (second thumb joint), `finger2` (middle) ...
+ */
+export function parseFingerJoint(base: string): FingerJoint | null {
+  const biped = /^finger(\d)(\d?)$/.exec(base);
+  if (biped) {
+    const finger = FINGER_NAMES[Number(biped[1])];
+    if (!finger) return null;
+    return { finger, segment: biped[2] ? Number(biped[2]) + 1 : 1, leaf: false };
+  }
+  const named = /^(?:hand|f|finger|fingers)?(thumb|index|middle|ring|pinky|pinkie|little)(?:finger)?(meta(?:carpal)?|\d{1,2})?(leaf|end|tip)?$/.exec(base);
+  if (!named) return null;
+  const finger = named[1] === "pinkie" || named[1] === "little" ? "pinky" : (named[1] as FingerJoint["finger"]);
+  const leaf = named[3] !== undefined;
+  const segment = named[2] === undefined ? (leaf ? 4 : 1) : named[2].startsWith("meta") ? 0 : Number(named[2]);
+  return { finger, segment, leaf };
+}
+
 export interface SkeletonMapping {
   /** target joint name -> source joint name */
   map: Map<string, string>;
@@ -82,6 +112,10 @@ function matchRole(
       }
     }
   }
+  const finger = parseFingerJoint(base);
+  // A finger transfers only to the same finger and segment on the same side; an end/leaf
+  // joint ranks below a real joint with the same number.
+  if (finger) return { role: `finger.${finger.finger}.${finger.segment}`, side, rank: finger.leaf ? 1 : 0 };
   return null;
 }
 
@@ -147,7 +181,50 @@ export function mapSkeleton(
     roles.push({ role: match.role, side: match.side, target, source });
   }
 
+  mapSpineChains(sourceJointNames, targetJointNames, map, roles, requiredMissing, omittedTargets, overrides);
   return { map, roles, requiredMissing, omittedTargets };
+}
+
+const SPINE_JOINT = /^spine(\d*)$/;
+
+function spineChain(names: readonly string[]): string[] {
+  return names
+    .map((name) => ({ name, split: splitJointSide(name) }))
+    .filter(({ split }) => split.side === null && SPINE_JOINT.test(split.base))
+    .map(({ name, split }) => ({ name, order: Number(SPINE_JOINT.exec(split.base)![1] || 0) }))
+    .sort((a, b) => a.order - b.order)
+    .map(({ name }) => name);
+}
+
+/**
+ * Mixamo `Spine/Spine1/Spine2` and Unreal `spine_01/02/03` are the same three segments. The
+ * role table alone sends two target segments to one donor bone and never uses the third, so
+ * when both skeletons have the same number (two or more) of numbered spine joints they map in order.
+ */
+function mapSpineChains(
+  sourceNames: readonly string[],
+  targetNames: readonly string[],
+  map: Map<string, string>,
+  roles: SkeletonMapping["roles"],
+  requiredMissing: string[],
+  omittedTargets: string[],
+  overrides: Record<string, string>,
+): void {
+  const source = spineChain(sourceNames);
+  const target = spineChain(targetNames);
+  if (source.length < 2 || source.length !== target.length) return;
+  target.forEach((name, index) => {
+    if (Object.hasOwn(overrides, name)) return;
+    const donor = source[index]!;
+    map.set(name, donor);
+    const existing = roles.find((entry) => entry.target === name);
+    if (existing) existing.source = donor;
+    else roles.push({ role: "spine", side: null, target: name, source: donor });
+    for (const list of [requiredMissing, omittedTargets]) {
+      const at = list.findIndex((entry) => entry === name || entry.startsWith(`${name} (`));
+      if (at >= 0) list.splice(at, 1);
+    }
+  });
 }
 
 interface LocalTransform {
@@ -260,6 +337,17 @@ export interface RetargetResult {
   omittedRoles: string[];
   mapping: SkeletonMapping["roles"];
   rootDisplacement: number;
+}
+
+/** True when every frame of a packed quaternion track equals the first within 1e-6 radians. */
+function isConstantRotation(values: Float32Array): boolean {
+  const first = new Quaternion(values[0], values[1], values[2], values[3]);
+  const current = new Quaternion();
+  for (let offset = 4; offset < values.length; offset += 4) {
+    current.set(values[offset]!, values[offset + 1]!, values[offset + 2]!, values[offset + 3]!);
+    if (first.angleTo(current) > 1e-6) return false;
+  }
+  return true;
 }
 
 function worldExtent(positions: Float32Array): number {
@@ -393,14 +481,31 @@ export async function retargetClip(
     .setArray(times)
     .setBuffer(buffer);
   const animation = targetDocument.createAnimation(options.clipName);
+  // A joint that never leaves one rotation (most fingers, helpers and un-animated segments)
+  // is written as two keys instead of one per frame. Linear interpolation between two equal
+  // keys reproduces every frame exactly, so playback is unchanged and the file stays small.
+  let constantInput: Accessor | undefined;
   for (const node of targetJoints) {
-    const values = targetRotations.get(node)!;
+    const full = targetRotations.get(node)!;
+    const constant = isConstantRotation(full);
+    const values = constant ? Float32Array.from([...full.subarray(0, 4), ...full.subarray(0, 4)]) : full;
+    if (constant) {
+      constantInput ??= targetDocument
+        .createAccessor(`${options.clipName}-constant-time`)
+        .setType("SCALAR")
+        .setArray(new Float32Array([0, duration]))
+        .setBuffer(buffer);
+    }
     const output = targetDocument
       .createAccessor(`${options.clipName}-${node.getName()}-rotation`)
       .setType("VEC4")
       .setArray(values)
       .setBuffer(buffer);
-    const sampler = targetDocument.createAnimationSampler().setInput(inputAccessor).setOutput(output).setInterpolation("LINEAR");
+    const sampler = targetDocument
+      .createAnimationSampler()
+      .setInput(constant ? constantInput! : inputAccessor)
+      .setOutput(output)
+      .setInterpolation("LINEAR");
     animation
       .addSampler(sampler)
       .addChannel(

@@ -113,7 +113,7 @@ describe("namespaced Mixamo-style fingered rigs", () => {
     for (const side of ["Left", "Right"]) {
       expect(mapping.map.get(`${NAMESPACE}${side}Leg`)).toBe(`${NAMESPACE}${side}Leg`);
       expect(mapping.map.get(`${NAMESPACE}${side}ToeBase`)).toBe(`${NAMESPACE}${side}ToeBase`);
-      expect(mapping.map.get(`${NAMESPACE}${side}HandIndex1`)).toBeUndefined();
+      expect(mapping.map.get(`${NAMESPACE}${side}HandIndex1`)).toBe(`${NAMESPACE}${side}HandIndex1`);
     }
   });
 
