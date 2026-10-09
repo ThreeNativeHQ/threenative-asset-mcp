@@ -48,12 +48,13 @@ import {
   type ImportedScene,
   parseUnrealSceneSource,
 } from "./scenes.js";
+import { remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
 
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 64;
+export const IMPORTER_VERSION = 65;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -2744,7 +2745,14 @@ export async function importUnrealDirectory(
       // a transient process failure from silently removing a mesh from an otherwise valid pack.
       let outcome = await run();
       if (outcome.code !== 0) outcome = await run();
-      return outcome.code === 0 ? undefined : `UE Viewer export exited ${outcome.code}.`;
+      if (outcome.code !== 0) return `UE Viewer export exited ${outcome.code}.`;
+      // UE Viewer names each section's material by raw index; the mesh's SectionInfoMap says which slot the editor used.
+      if (entry.meshKind === "static") {
+        const exported = join(out, `${entry.selector.replace(/^Content\//i, "")}.gltf`);
+        const remapped = await remapMeshFileSectionMaterials(exported, entry.file);
+        if (remapped > 0) log(`${basename(entry.selector)}: ${remapped} section material(s) taken from SectionInfoMap instead of UE Viewer's raw index.`);
+      }
+      return undefined;
     } catch (error) {
       return error instanceof ToolchainError ? error.message : "UE Viewer export failed.";
     }
