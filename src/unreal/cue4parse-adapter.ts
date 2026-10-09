@@ -408,7 +408,8 @@ if (dumpAt >= 0)
     return;
 }
 
-const int GraphNodeLimit = 2000;
+// Inlined function bodies count: a layered master (Paragon's Master_SidesMarble) needs more than 2000.
+const int GraphNodeLimit = 10000;
 const int GraphFunctionDepthLimit = 8;
 // Properties that describe editor placement or bookkeeping, not the computation.
 var GraphIgnoredProperties = new HashSet<string>(StringComparer.Ordinal)
