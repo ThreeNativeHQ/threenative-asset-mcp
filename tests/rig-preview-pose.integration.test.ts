@@ -90,3 +90,13 @@ it("treats HTML-sensitive clip names as data in the preview page", async () => {
   expect(result.animations).toContain(clipName);
   expect(result.images.every(image => image.nonBlank)).toBe(true);
 }, 15_000);
+
+it("applies a requested pose to an untracked bone once per tile instead of accumulating it", async () => {
+  // No clip drives hand.L, so only the per-tile rest restore stops a 35 degree request from
+  // becoming 70 degrees on the second tile.
+  const bytes = await handTriangle(true);
+  const sheet = await renderPreview(bytes, { ...options, times: [0, 0.5], angles: 1, pose: { bone: "hand.L", axis: "z", degrees: 35 } });
+  const unposed = await renderPreview(bytes, { ...options, times: [0], angles: 1 });
+  expect(await pixelDifference(sheet.images[0]!.png, sheet.images[1]!.png)).toBeLessThan(0.5);
+  expect(await pixelDifference(sheet.images[0]!.png, unposed.images[0]!.png)).toBeGreaterThan(2);
+}, 30_000);
