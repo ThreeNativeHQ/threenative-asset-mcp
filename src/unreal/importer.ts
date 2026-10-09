@@ -15,6 +15,7 @@ import {
   type ResolvedMaterial,
   type ResolveMaterialRequest,
   type TextureTransform,
+  parsePropsFile,
   resolveMaterial,
 } from "./materials.js";
 import { readPackageCooking, readPackageObjectNames } from "./cooking.js";
@@ -711,6 +712,64 @@ export function scopeMaterialFiles(assets: ExportedAssets, meshDirectory: string
   return scoped;
 }
 
+/** How many trailing directory names of `file` equal those of the package a `Parent =` reference names. */
+function packageDirectoryOverlap(file: string, packagePath: string): number {
+  const wanted = packagePath.replace(/\\/g, "/").toLowerCase().split("/").slice(0, -1);
+  const held = dirname(file).replace(/\\/g, "/").toLowerCase().split("/");
+  let overlap = 0;
+  while (overlap < wanted.length && overlap < held.length && wanted[wanted.length - 1 - overlap] === held[held.length - 1 - overlap]) overlap += 1;
+  return overlap;
+}
+
+/** The one copy that shares the most trailing directories with the named package; undefined on no overlap or a tie. */
+function copyInPackage(copies: readonly string[], packagePath: string): string | undefined {
+  const scored = copies.map((copy) => ({ copy, overlap: packageDirectoryOverlap(copy, packagePath) })).sort((a, b) => b.overlap - a.overlap);
+  const [best, next] = scored;
+  return best !== undefined && best.overlap > 0 && best.overlap > (next?.overlap ?? 0) ? best.copy : undefined;
+}
+
+const parentScoped = new WeakMap<ExportedAssets, Map<string, ExportedAssets>>();
+
+/**
+ * A parent material is named by basename in the sidecar maps, so two packages that share one (`MI_Leafs_Inst` under
+ * `DeadTrees/` and `GreenTrees/`) collapse onto whichever was indexed last. The instance's `Parent =` line names the
+ * package it really inherits from; this follows the chain from `startName` and points each ambiguous ancestor at the
+ * `.mat` / `.props.txt` that sits in that package's directory. Anything it cannot place keeps the existing pick.
+ */
+export function scopeParentChain(assets: ExportedAssets, startName: string): ExportedAssets {
+  if (assets.propsAll === undefined) return assets;
+  const known = parentScoped.get(assets) ?? new Map<string, ExportedAssets>();
+  parentScoped.set(assets, known);
+  const cached = known.get(startName);
+  if (cached) return cached;
+  let mat: Map<string, string> | undefined;
+  let props: Map<string, string> | undefined;
+  const visited = new Set<string>();
+  let path = assets.props.get(startName);
+  for (let depth = 0; path !== undefined && depth < 8; depth += 1) {
+    const text = readMaterialSidecar(path);
+    if (!text) break;
+    const { parent, parentPackage } = parsePropsFile(text);
+    if (parent === undefined || visited.has(parent)) break;
+    visited.add(parent);
+    const copies = assets.propsAll.get(parent) ?? [];
+    const matching = parentPackage !== undefined && copies.length > 1 ? copyInPackage(copies, parentPackage) : undefined;
+    if (matching !== undefined && matching !== (props ?? assets.props).get(parent)) {
+      props ??= new Map(assets.props);
+      props.set(parent, matching);
+      const sibling = (assets.matAll?.get(parent) ?? []).find((copy) => dirname(copy) === dirname(matching));
+      if (sibling !== undefined) {
+        mat ??= new Map(assets.mat);
+        mat.set(parent, sibling);
+      }
+    }
+    path = (props ?? assets.props).get(parent);
+  }
+  const scoped = mat === undefined && props === undefined ? assets : { ...assets, mat: mat ?? assets.mat, props: props ?? assets.props };
+  known.set(startName, scoped);
+  return scoped;
+}
+
 function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAssets {
   const merge = (first: Map<string, string>, second: Map<string, string>): Map<string, string> =>
     new Map([...first, ...second]);
@@ -1319,11 +1378,12 @@ export async function packageGlb(options: {
   for (const [index, material] of root.listMaterials().entries()) {
     const name = material.getName();
     const lookupName = options.materialLookupNames?.get(name) ?? name;
-    const materialAssets = options.materialAssets?.get(name) ?? meshAssets;
+    const unscopedAssets = options.materialAssets?.get(name) ?? meshAssets;
+    const materialAssets = scopeParentChain(unscopedAssets, lookupName);
     const availableTextures = new Set(materialAssets.png.keys());
     const graphPath = materialAssets.mat.get(lookupName);
     const graphText = graphPath ? readMaterialSidecar(graphPath) : undefined;
-    const graphNames = graphText ? sharedGraphs.get(materialAssets)?.get(graphText) : undefined;
+    const graphNames = graphText ? sharedGraphs.get(unscopedAssets)?.get(graphText) : undefined;
     // UE Viewer names a section it could not resolve `dummy_material_<n>` and paints it a debug
     // colour. Shipping that name would put a placeholder into a game asset and let a reader
     // mistake it for a real material, so it is renamed to something that says what it is.
