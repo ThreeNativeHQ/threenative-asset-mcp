@@ -61,6 +61,8 @@ export interface PackScore {
     readonly missingTotal: number;
     /** World Partition external actor/object packages with mesh-class exports that were left out of `expected` (level data, not meshes). */
     readonly externalActorPackages: number;
+    /** Mesh packages that are a level's generated HLOD proxies (an `HLODProxy` export): not expected as models. */
+    readonly hlodProxyPackages: number;
   };
   readonly shape: {
     readonly ok: boolean;
@@ -335,10 +337,17 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   const meshes = new Map<string, SourceMesh>();
   const failedPackages = new Set<string>();
   const externalActorKeys = new Set<string>();
+  const hlodProxyKeys = new Set<string>();
   for (const pkg of dump.packages) {
     const key = packageKey(pkg.path);
     if (isWorldPartitionExternalPackage(pkg.path)) {
       if ((pkg.exports ?? []).some((exp) => isMeshClass(exp.class))) externalActorKeys.add(key);
+      continue;
+    }
+    // An HLODProxy package holds the editor's generated LOD stand-ins for a level, build output the importer skips
+    // by name (HLOD_PROXY_REASON). Counted, so a pack of nothing but proxies cannot look covered.
+    if ((pkg.exports ?? []).some((exp) => exp.class === "HLODProxy")) {
+      if ((pkg.exports ?? []).some((exp) => isMeshClass(exp.class))) hlodProxyKeys.add(key);
       continue;
     }
     if (pkg.error) failedPackages.add(key);
@@ -548,6 +557,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       missing: capped(missing),
       missingTotal: missing.length,
       externalActorPackages: externalActorKeys.size,
+      hlodProxyPackages: hlodProxyKeys.size,
     },
     shape: {
       ok: shapeOk,

@@ -444,6 +444,8 @@ export interface ImportUnrealRequest {
 
 const UNSUPPORTED_EXTENSIONS = new Map<string, string>();
 
+export const HLOD_PROXY_REASON =
+  "HLOD proxy package: the editor's generated hierarchical-LOD stand-ins for a level (merged, reduced copies of the level's own meshes with a baked material), build output rather than an asset; the level's meshes are imported themselves";
 export const WORLD_PARTITION_EXTERNAL_REASON = "World Partition external actor/object package (level data, not an asset)";
 
 /** True when a package path has a `__ExternalActors__` or `__ExternalObjects__` segment. */
@@ -2495,7 +2497,13 @@ export async function importUnrealDirectory(
     classified.filter((entry) => entry.noMipmaps === true).map((entry) => basename(entry.package, extname(entry.package))),
   );
 
-  const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error);
+  // HLOD proxies are level build output (see HLOD_PROXY_REASON): reported as skipped, never routed to a mesh decoder.
+  const hlodProxyFiles = new Set(
+    (await mapWithConcurrency(classified.filter((entry) => entry.meshKind !== undefined && !entry.error), concurrency, async (entry) =>
+      (await readPackageCooking(entry.file)).hlodProxyHint ? entry.file : undefined,
+    )).filter((file): file is string => file !== undefined),
+  );
+  const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error && !hlodProxyFiles.has(entry.file));
   const animationPackages = classified.filter((entry) => entry.hasAnimation && !entry.error);
   // A Texture2D export nested in an offline UFont is its glyph atlas, not a standalone texture
   // asset. It is promoted with metrics below so it cannot produce a duplicate false failure.
@@ -2764,6 +2772,7 @@ export async function importUnrealDirectory(
   for (const entry of externalActorEntries) {
     skipped.push({ package: entry.package, reason: WORLD_PARTITION_EXTERNAL_REASON });
   }
+  for (const entry of classified) if (hlodProxyFiles.has(entry.file)) skipped.push({ package: entry.package, reason: HLOD_PROXY_REASON });
   for (const entry of classified) {
     if (
       (entry.meshKind !== undefined && !entry.error) ||

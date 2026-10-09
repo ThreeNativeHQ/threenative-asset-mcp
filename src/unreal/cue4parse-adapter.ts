@@ -1227,6 +1227,8 @@ Dictionary<string, object?> DumpPackage(string key)
         var isMesh = className is "StaticMesh" or "SkeletalMesh";
         var isMaterialExpression = className.StartsWith("MaterialExpression", StringComparison.Ordinal);
         var isMaterial = className.StartsWith("Material", StringComparison.Ordinal) && !isMaterialExpression;
+        // An HLODProxy marks the package as a level's generated LOD stand-ins: recorded by class only.
+        if (className == "HLODProxy") { exportsJson.Add(new Dictionary<string, object?> { ["name"] = exportName, ["class"] = className }); continue; }
         if (!isMesh && !isMaterialExpression && !isMaterial) continue;
         var item = new Dictionary<string, object?> { ["name"] = exportName, ["class"] = className };
         try

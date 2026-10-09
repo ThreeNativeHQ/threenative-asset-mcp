@@ -69,6 +69,11 @@ export interface PackageCooking {
   readonly blueprintPrefabHint: boolean;
   /** An editor-only class with nothing to import, named when UE Viewer cannot list the package. */
   readonly nonImportableClassHint: string | undefined;
+  /**
+   * The package holds an `HLODProxy`: the editor's generated hierarchical-LOD stand-ins for a level (merged, reduced
+   * copies of the level's own meshes with a flattened material), built output rather than an authored asset.
+   */
+  readonly hlodProxyHint: boolean;
 }
 
 /** Editor-only asset classes a UE5 pack ships beside its meshes. UE Viewer cannot list them, so
@@ -96,6 +101,7 @@ const UNKNOWN: PackageCooking = Object.freeze({
   groomHint: false,
   blueprintPrefabHint: false,
   nonImportableClassHint: undefined,
+  hlodProxyHint: false,
 });
 
 /** Reads the bounded prefix of one package, or undefined when it cannot be read. */
@@ -206,5 +212,6 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     groomHint,
     blueprintPrefabHint,
     nonImportableClassHint,
+    hlodProxyHint: head.includes("\0HLODProxy\0", 0, "latin1"),
   };
 }
