@@ -517,6 +517,63 @@ async function worldAlignedMossBake(dir: string): Promise<Buffer> {
   return Buffer.from(outcome.png);
 }
 
+/**
+ * Bakes a one-graph material through the real graph baker into a PNG. `view` fixtures are the view-dependent nodes of sky
+ * and foliage materials that used to leave their whole section on the neutral grey fallback.
+ */
+async function viewNodeBake(dir: string, name: string, nodes: Record<string, unknown>[], outputPin: string): Promise<Buffer> {
+  const graph = materialGraphSchema.parse({
+    format: 1,
+    material: "M_View",
+    package: `/Game/Pack/${name}`,
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: { node: outputPin, output: 0, mask: null }, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+    nodes,
+  });
+  const sourceDir = join(dir, `${name}-source`);
+  await mkdir(join(sourceDir, "Content", "Pack"), { recursive: true });
+  await writeFile(join(sourceDir, "Content", "Pack", "MI_View.uasset"), Buffer.alloc(16));
+  const baker = createGraphBaker({ sourceDir, maxTextureSize: 16, dumpGraphs: async () => new Map([["M_View", graph]]) })!;
+  const outcome = await baker({
+    materialName: "MI_View",
+    lookupName: "MI_View",
+    assets: { png: new Map() },
+    readProps: (material) => (material === "MI_View" ? "Parent = Material3'Content/Pack/M_View.M_View'\n" : undefined),
+  });
+  if (outcome.status !== "baked") throw new Error(`${name} bake failed: ${JSON.stringify(outcome)}`);
+  return Buffer.from(outcome.png);
+}
+
+/** KUBIKOS Cube World's clouds: Lerp(blue, white, Fresnel(exponent 1.2, base reflect 0)). The bake is the blue paled by the rim average. */
+const skyFresnelBake = (dir: string): Promise<Buffer> =>
+  viewNodeBake(
+    dir,
+    "sky-fresnel-cloud",
+    [
+      { id: "mix", class: "LinearInterpolate", inputs: { A: { node: "face", output: 0, mask: null }, B: { node: "rim", output: 0, mask: null }, Alpha: { node: "fresnel", output: 0, mask: null } }, constants: {} },
+      { id: "face", class: "Constant3Vector", inputs: {}, constants: { Constant: [0.23, 0.27, 0.71, 1] } },
+      { id: "rim", class: "Constant3Vector", inputs: {}, constants: { Constant: [1, 1, 1, 1] } },
+      { id: "fresnel", class: "Fresnel", inputs: {}, constants: { Exponent: 1.2, BaseReflectFraction: 0 } },
+    ],
+    "mix",
+  );
+
+/** Kite Demo's leaves: Lerp(brown bottom colour, green top colour, Clamp(TwoSidedSign)). The front face shows the green top. */
+const twoSidedLeafBake = (dir: string): Promise<Buffer> =>
+  viewNodeBake(
+    dir,
+    "two-sided-leaf",
+    [
+      { id: "mix", class: "LinearInterpolate", inputs: { A: { node: "bottom", output: 0, mask: null }, B: { node: "top", output: 0, mask: null }, Alpha: { node: "clamp", output: 0, mask: null } }, constants: {} },
+      { id: "bottom", class: "Constant3Vector", inputs: {}, constants: { Constant: [0.4, 0.25, 0.1, 1] } },
+      { id: "top", class: "Constant3Vector", inputs: {}, constants: { Constant: [0.1, 0.5, 0.08, 1] } },
+      { id: "clamp", class: "Clamp", inputs: { Input: { node: "sign", output: 0, mask: null } }, constants: {} },
+      { id: "sign", class: "TwoSidedSign", inputs: {}, constants: {} },
+    ],
+    "mix",
+  );
+
 /** Mean RGB of the object pixels left and right of the object's horizontal centre. */
 function halfMeans(image: RgbaImage): { left: [number, number, number]; right: [number, number, number] } {
   const isObject = (o: number): boolean => !(Math.abs(image.data[o]! - 128) <= 6 && Math.abs(image.data[o + 1]! - 128) <= 6 && Math.abs(image.data[o + 2]! - 128) <= 6);
@@ -645,6 +702,8 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
   });
   await write("dead-tree-leaf", { geometry: "quad", baseColorFactor: [1, 1, 1, 1], texture: await leafTexture((await deadLeafTextureName(dir)) === "T_Green_Leaf" ? [60, 170, 50] : [150, 120, 80]) });
   await write("moss-by-normal", { geometry: "quad", baseColorFactor: [1, 1, 1, 1], texture: await worldAlignedMossBake(dir) });
+  await write("sky-fresnel-cloud", { geometry: "quad", baseColorFactor: [1, 1, 1, 1], texture: await skyFresnelBake(dir) });
+  await write("two-sided-leaf", { geometry: "quad", baseColorFactor: [1, 1, 1, 1], texture: await twoSidedLeafBake(dir) });
   await write("mossy-rock", { geometry: "cube", baseColorFactor: [1, 1, 1, 1], texture: await mossyRockBake(dir) });
   fixtures.push({ name: "vivid-atlas-card", path: await importedNeedleCard(dir, "vivid-atlas-card", { noMipmaps: true, vivid: true, solidMask: true }) });
   fixtures.push({ name: "matte-leaf-specular", path: await importedNeedleCard(dir, "matte-leaf-specular", { specular: 0.1, solidMask: true }) });
@@ -814,6 +873,18 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(left[1]).toBeGreaterThan(left[0]);
     expect(right[0]).toBeGreaterThan(right[1]);
     expect(left[0]).toBeLessThan(right[0] * 0.6);
+  });
+
+  it("a Fresnel sky material keeps its blue hue (paler by its rim average), not the grey fallback (KUBIKOS clouds)", () => {
+    const [r, g, b] = objectMeanRgb(byName.get("sky-fresnel-cloud")!);
+    expect(b).toBeGreaterThan(r * 1.15);
+    expect(b).toBeGreaterThan(g * 1.05);
+  });
+
+  it("a two-sided leaf card shows its green top colour on the front face, not the brown bottom (Kite Demo)", () => {
+    const [r, g, b] = objectMeanRgb(byName.get("two-sided-leaf")!);
+    expect(g).toBeGreaterThan(r * 1.5);
+    expect(g).toBeGreaterThan(b * 2);
   });
 
   it("a tree's trunk is bark brown and its leaf cards are leaf green, not swapped (Landscape Pro SectionInfoMap)", () => {

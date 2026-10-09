@@ -152,6 +152,7 @@ const SUPPORTED_NODE_CLASSES = [
   "BumpOffset",
   "Fresnel",
   "DepthFade",
+  "TwoSidedSign",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -403,10 +404,22 @@ const WORLD_ALIGNED_BLEND_SURFACE_NOTE =
   "WorldAlignedBlend evaluated as saturate(up component of the mesh's own vertex normal x sharpness + bias), rasterised into UV space; the engine body is not in the pack, so the formula is inferred, and the mesh is taken unrotated";
 
 const FRESNEL_NOTE =
-  "Fresnel evaluated at normal incidence (a surface facing the camera): BaseReflectFraction + (1 - BaseReflectFraction) * 0^Exponent = BaseReflectFraction; the rim falloff follows the view angle, which a baked texture does not have";
+  "Fresnel evaluated as its mean over the visible surface of a sphere seen from afar, BaseReflectFraction + (1 - BaseReflectFraction) * 2 / ((Exponent + 1) * (Exponent + 2)); the rim falloff follows the view angle, which a baked texture does not have";
+
+/**
+ * Mean of (1 - cos)^exponent over a sphere's visible disc, where the cosine between the normal and the view vector has
+ * density 2 cos on 0..1 (a pixel disc is uniform in radius, cos = sqrt(1 - r^2)): 2 B(2, e + 1) = 2 / ((e + 1)(e + 2)).
+ */
+function fresnelSphereMean(exponent: number): number {
+  const power = Math.max(exponent, 1e-4);
+  return 2 / ((power + 1) * (power + 2));
+}
 
 const DEPTH_FADE_NOTE =
   "DepthFade evaluated as fully faded in: InOpacity x saturate((scene depth - pixel depth) / FadeDistance) with nothing close behind the surface is InOpacity; a baked texture has no scene depth";
+
+const TWO_SIDED_SIGN_NOTE =
+  "TwoSidedSign evaluated as +1 (the front face): a baked texture shows one side, and the back face of a two-sided card is not baked";
 
 const MAT_LAYER_TINT_NOTE =
   "MatLayerBlend_Tint: BaseColor multiplied by lerp(1, Tint, Alpha) (unwired Alpha is 1); engine body unavailable, inferred from the pins (a white Tint is the identity)";
@@ -719,14 +732,21 @@ class Compiler {
         return coordinate ?? this.markUnavailable(`BumpOffset ${node.id} has no coordinate`);
       }
       case "Fresnel": {
-        // BaseReflectFraction + (1 - BaseReflectFraction) * (1 - saturate(dot(Normal, CameraVector)))^Exponent. A bake has
-        // no camera: the surface faces it (dot = 1), where the power term is zero for any positive exponent and the
-        // value is BaseReflectFraction (Unreal's default 0.04). The Normal pin only changes the angle, so it is not walked.
+        // BaseReflectFraction + (1 - BaseReflectFraction) * (1 - saturate(dot(Normal, CameraVector)))^Exponent. A bake has no
+        // camera, and the texture is seen from every angle, so the node stands in as its mean over a sphere's visible surface
+        // (an object lit by a Fresnel rim is paler on average than face-on: the cloud, sun and moon meshes of one sky pack score 64
+        // with the mean against 55 with the face-on value). Unreal's defaults are Exponent 5 and BaseReflectFraction 0.04. The Normal
+        // pin only changes the angle, so it is not walked.
         this.approximations.add(FRESNEL_NOTE);
         const base = this.operand(node, "BaseReflectFractionIn", "BaseReflectFraction", 0.04);
         const exponent = this.operand(node, "ExponentIn", "Exponent", 5);
-        return this.binary(base, exponent, (reflect, power) => reflect + (1 - reflect) * 0 ** Math.max(power, 1e-4));
+        return this.binary(base, exponent, (reflect, power) => reflect + (1 - reflect) * fresnelSphereMean(power));
       }
+      case "TwoSidedSign":
+        // +1 on a front face, -1 on the back face of a two-sided mesh. Foliage cards lerp a "top" colour (sign > 0) over a
+        // "bottom" colour through saturate(sign); the glTF material carries the front face.
+        this.approximations.add(TWO_SIDED_SIGN_NOTE);
+        return this.constant([1], 1);
       case "DepthFade":
         // InOpacity x saturate((SceneDepth - PixelDepth) / FadeDistance): the soft-edge fade where a surface meets what is
         // behind it. A surface with open space behind it is fully faded in (the factor is 1), so the value is InOpacity,

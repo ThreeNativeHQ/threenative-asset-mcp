@@ -972,7 +972,7 @@ describe("graphPathClasses and supportedNodeClasses", () => {
 
   it("exposes the closed node set", () => {
     const supported = supportedNodeClasses();
-    for (const name of ["TextureSample", "TextureSampleParameter2D", "LinearInterpolate", "FunctionCall", "StaticSwitch", "FeatureLevelSwitch", "Fresnel", "DepthFade"]) {
+    for (const name of ["TextureSample", "TextureSampleParameter2D", "LinearInterpolate", "FunctionCall", "StaticSwitch", "FeatureLevelSwitch", "Fresnel", "DepthFade", "TwoSidedSign"]) {
       expect(supported).toContain(name);
     }
     for (const name of ["VertexColor", "Panner", "Time", "WorldPosition", "ReflectionVectorWS"]) expect(supported).not.toContain(name);
@@ -1695,8 +1695,9 @@ describe("view-dependent nodes of sky and effect materials", () => {
     bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 4 });
   const notes = (result: BakeResult): string[] => (result.status === "baked" ? result.approximations : []);
 
-  it("Fresnel is its BaseReflectFraction at normal incidence, so lerp(A, B, Fresnel) is the face-on colour A (sky dome shape)", async () => {
-    // M_Clouds / M_SunAndMoon: Lerp(A = dark blue, B = white, Alpha = Fresnel(Exponent 1.2, BaseReflectFraction 0)).
+  it("Fresnel is its mean over a sphere's visible surface, so lerp(A, B, Fresnel) is a face-on-to-rim average of A and B (sky dome shape)", async () => {
+    // A sky pack's cloud material: Lerp(A = blue, B = white, Alpha = Fresnel(Exponent 1.2, BaseReflectFraction 0)).
+    // The mean of (1 - cos)^1.2 over a sphere's disc is 2 / ((1.2 + 1)(1.2 + 2)) = 0.28409.
     const graph = makeGraph(
       [
         node("mix", "LinearInterpolate", { inputs: { A: pin("face"), B: pin("rim"), Alpha: pin("fresnel") }, constants: { ConstB: 0, ConstAlpha: 0 } }),
@@ -1707,12 +1708,14 @@ describe("view-dependent nodes of sky and effect materials", () => {
       pin("mix", 0, RGB_MASK),
     );
     const result = await bake(graph);
-    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.2297), encode(0.269), encode(0.7112)]);
+    const mean = 2 / (2.2 * 3.2);
+    const lerp = (a: number) => a + (1 - a) * mean;
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(lerp(0.2297)), encode(lerp(0.269)), encode(lerp(0.7112))]);
     expect(result.status === "baked" && result.confidence).toBe("heuristic");
-    expect(notes(result).some((note) => note.startsWith("Fresnel evaluated at normal incidence"))).toBe(true);
+    expect(notes(result).some((note) => note.startsWith("Fresnel evaluated as its mean over the visible surface of a sphere"))).toBe(true);
   });
 
-  it("Fresnel keeps a non-zero BaseReflectFraction (constant, wired pin or Unreal's 0.04 default) and ignores the exponent", async () => {
+  it("Fresnel adds its BaseReflectFraction (constant, wired pin or Unreal's 0.04 default) to the exponent's mean", async () => {
     const colour = async (nodes: Raw[]) => {
       const graph = makeGraph(
         [node("mix", "LinearInterpolate", { inputs: { A: pin("face"), B: pin("rim"), Alpha: pin("fresnel") } }), constant3("face", [0, 0, 0]), constant3("rim", [1, 1, 1]), ...nodes],
@@ -1720,10 +1723,13 @@ describe("view-dependent nodes of sky and effect materials", () => {
       );
       return (await pixelsOf(await bake(graph)))(0, 0)[0];
     };
-    expect(await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0.5, Exponent: 3 } })])).toBe(encode(0.5));
+    const value = (reflect: number, exponent: number) => reflect + (1 - reflect) * (2 / ((exponent + 1) * (exponent + 2)));
+    expect(await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0.5, Exponent: 3 } })])).toBe(encode(value(0.5, 3)));
     // Both defaults omitted by the dumper: Exponent 5, BaseReflectFraction 0.04.
-    expect(await colour([node("fresnel", "Fresnel")])).toBe(encode(0.04));
-    expect(await colour([node("fresnel", "Fresnel", { inputs: { BaseReflectFractionIn: pin("reflect") } }), node("reflect", "Constant", { constants: { R: 0.25 } })])).toBe(encode(0.25));
+    expect(await colour([node("fresnel", "Fresnel")])).toBe(encode(value(0.04, 5)));
+    expect(await colour([node("fresnel", "Fresnel", { inputs: { BaseReflectFractionIn: pin("reflect"), ExponentIn: pin("power") } }), node("reflect", "Constant", { constants: { R: 0.25 } }), node("power", "Constant", { constants: { R: 1 } })])).toBe(encode(value(0.25, 1)));
+    // A stiffer exponent keeps the face-on colour on more of the surface: the mean shrinks as the exponent grows.
+    expect(await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0, Exponent: 8 } })])).toBeLessThan(await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0, Exponent: 0.5 } })]));
   });
 
   it("Fresnel with a wired Normal does not walk the normal's own nodes", async () => {
@@ -1794,5 +1800,23 @@ describe("view-dependent nodes of sky and effect materials", () => {
     // No alpha wired, grey tint: the whole surface is tinted.
     const dimmed = await bake(layer([0.5, 0.5, 0.5], false));
     expect((await pixelsOf(dimmed))(0, 0)).toEqual([encode(0.1), encode(0.15), encode(0.05)]);
+  });
+
+  it("TwoSidedSign is +1 (front face): a leaf card's top colour wins over its bottom colour, and the bake says so", async () => {
+    // M_DeadLeaves / BogMyrtle: Lerp(bottom texture, top texture, Clamp(TwoSidedSign)) where the sign is -1 on the back face.
+    const graph = makeGraph(
+      [
+        node("mix", "LinearInterpolate", { inputs: { A: pin("bottom"), B: pin("top"), Alpha: pin("clamp") } }),
+        constant3("bottom", [0.1, 0.1, 0.1]),
+        constant3("top", [0.3, 0.6, 0.2]),
+        node("clamp", "Clamp", { inputs: { Input: pin("sign") } }),
+        node("sign", "TwoSidedSign"),
+      ],
+      pin("mix", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.3), encode(0.6), encode(0.2)]);
+    expect(result.status === "baked" && result.confidence).toBe("heuristic");
+    expect(notes(result).some((note) => note.startsWith("TwoSidedSign evaluated as +1"))).toBe(true);
   });
 });
