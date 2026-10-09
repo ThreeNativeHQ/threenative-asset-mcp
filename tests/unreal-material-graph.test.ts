@@ -1823,8 +1823,10 @@ describe("view-dependent nodes of sky and effect materials", () => {
 
   it("a texture sampled at a WorldPosition-derived coordinate reads its average colour, not one UV-space texel, and says so", async () => {
     // A grass pack's WorldCoords-XY function: ComponentMask(WorldPosition).xy / Scale, feeding a macro variation mask.
-    // The 2x2 mask holds 0, 0, 0, 255 in R: its average is 0.25 (linear). Sampled at one texel it would be 0 or 1.
-    const mask = await pngOf(2, 2, (x, y) => (x === 1 && y === 1 ? [255, 255, 255] : [0, 0, 0]));
+    // The 4x4 mask is 255 on its four corner texels and 0 elsewhere: its average is 0.25. The origin (uv 0, 0) wraps onto those
+    // four corners, so a sample taken there reads 1; the average reads 0.25.
+    const corner = (n: number): boolean => n === 0 || n === 3;
+    const mask = await pngOf(4, 4, (x, y) => (corner(x) && corner(y) ? [255, 255, 255] : [0, 0, 0]));
     const graph = makeGraph(
       [
         node("mix", "LinearInterpolate", { inputs: { A: pin("dead"), B: pin("live"), Alpha: pin("mask", 0, [1, 0, 0, 0]) } }),
