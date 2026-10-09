@@ -152,3 +152,46 @@ describe("judgeRender with fidelity", () => {
     expect(judgeRender(image, { fidelity: solid }).verdict).toBe("fail");
   });
 });
+
+/**
+ * An editor thumbnail stands the piece on a blue-grey checkered floor and the piece casts a dark, bluer copy of that floor.
+ * The border-palette object mask counts the shadow as object: it drags hue toward blue (the conifer pack read 30-60 degrees
+ * "off" on Larch/Spruce that were not), lowers saturation and inflates the bounding box. Synthetic stand-in below.
+ */
+function thumbnailWithShadow(withShadow: boolean): RgbaImage {
+  const size = 96;
+  const data = new Uint8Array(size * size * 4);
+  for (let i = 0; i < size * size; i++) {
+    const x = i % size;
+    const y = Math.floor(i / size);
+    const checker = (Math.floor(x / 12) + Math.floor(y / 12)) % 2 === 0;
+    let rgb: [number, number, number] = checker ? [125, 132, 137] : [112, 120, 126];
+    // Shadow blob on the floor, left of and below the plant: darker and bluer than the floor.
+    if (withShadow && x >= 6 && x < 46 && y >= 60 && y < 84) rgb = [48, 66, 78];
+    // The plant: leaf greens of varied lightness, ragged like needles.
+    if (x >= 40 && x < 80 && y >= 14 && y < 62 && (x * 7 + y * 3) % 5 !== 0) {
+      const shade = 0.55 + 0.45 * (((x * 13 + y * 29) % 17) / 16);
+      rgb = [110 * shade, 160 * shade, 45 * shade];
+    }
+    data.set([...rgb.map((v) => Math.round(v)), 255], i * 4);
+  }
+  return { width: size, height: size, data };
+}
+
+describe("measureFidelity ignores the floor's cast shadow", () => {
+  const render = foliage((r, g, b) => [r, g, b]);
+
+  it("scores a correct render the same with and without a shadow in the reference", () => {
+    const clean = measureFidelity(thumbnailWithShadow(false), render);
+    const shadowed = measureFidelity(thumbnailWithShadow(true), render);
+    expect(shadowed.hueEmdDegrees).toBeLessThan(15);
+    expect(shadowed.hueEmdDegrees).toBeCloseTo(clean.hueEmdDegrees, 0);
+    expect(shadowed.densityRatio).toBeCloseTo(clean.densityRatio, 1);
+    expect(fidelityVerdict(shadowed).verdict).toBe("ok");
+  });
+
+  it("still flags a genuinely wrong hue when a shadow is present", () => {
+    const wrong = foliage((r, g, b) => [g, r, b]);
+    expect(fidelityVerdict(measureFidelity(thumbnailWithShadow(true), wrong)).verdict).not.toBe("ok");
+  });
+});

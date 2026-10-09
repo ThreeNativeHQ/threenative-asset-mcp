@@ -273,8 +273,9 @@ describeWithTools(["chromium"], "unreal contact sheet", () => {
     expect(byName.SM_Red!.similarity).toBeGreaterThan(0.6);
     expect(byName.SM_Red!.verdict).toBe("ok");
     expect(byName.SM_Blue!.similarity).toBeLessThan(0.35);
-    expect(byName.SM_Blue!.verdict).toBe("suspect");
-    expect(byName.SM_Blue!.reasons[0]).toContain("colour similarity");
+    // A blue render against a red thumbnail is a hue mismatch beyond the fidelity fail gate (was `suspect` before the per-axis gates).
+    expect(byName.SM_Blue!.verdict).not.toBe("ok");
+    expect(byName.SM_Blue!.reasons.join("\n")).toContain("colour similarity");
 
     // Tile 0 (the larger blue cube is volume 0.73, red is 1: red first). Thumbnail left, render right.
     const top = 132;
