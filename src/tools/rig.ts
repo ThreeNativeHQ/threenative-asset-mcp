@@ -538,6 +538,13 @@ export const AssetPreviewAnimationInputSchema = z.object({
       degrees: z.number().min(-360).max(360),
     })
     .optional(),
+  focus: z
+    .object({
+      bone: z.string().max(64),
+      distance: z.number().positive().max(1_000).optional(),
+    })
+    .optional()
+    .describe("Frame the camera on this bone and its descendant bones, e.g. a hand with its fingers."),
   angles: z.number().int().min(2).max(6).default(3),
   width: z.number().int().min(64).max(1024).default(384),
   height: z.number().int().min(64).max(1024).default(384),
@@ -596,6 +603,7 @@ export function createAssetPreviewAnimationHandler(options: { limits?: RigLimits
           ...(input.clip ? { clipName: input.clip } : {}),
           times,
           ...(input.pose ? { pose: input.pose } : {}),
+          ...(input.focus ? { focus: input.focus } : {}),
           angles: input.angles,
           width: input.width,
           height: input.height,
@@ -705,7 +713,7 @@ export const AssetRetargetAnimationsOutputSchema = z.object({
         frames: z.number().int().positive(),
         jointTracks: z.number().int().positive(),
         rootDisplacement: z.number().nonnegative(),
-        omittedRoles: z.array(z.string().max(120)).max(64),
+        omittedRoles: z.array(z.string().max(120)).max(1_024),
       }),
     )
     .max(24),
@@ -718,7 +726,7 @@ export const AssetRetargetAnimationsOutputSchema = z.object({
         source: z.string().max(64),
       }),
     )
-    .max(128),
+    .max(256),
 });
 
 export interface AssetRetargetOptions {
