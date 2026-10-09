@@ -138,6 +138,7 @@ const SUPPORTED_NODE_CLASSES = [
   "SphereMask",
   "ObjectPositionWS",
   "PerInstanceRandom",
+  "BumpOffset",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -162,6 +163,7 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "BreakOutFloat4Components",
   "SplitComponents",
   "ObjectScale",
+  "WorldAlignedBlend",
 ] as const;
 
 /**
@@ -371,6 +373,12 @@ const PER_INSTANCE_RANDOM_NOTE =
 
 const OBJECT_SCALE_NOTE =
   "ObjectScale evaluated as 1 (an unscaled instance): a placed instance's scale would change texture tiling; engine body unavailable";
+
+const BUMP_OFFSET_NOTE =
+  "BumpOffset evaluated as its Coordinate: the parallax offset follows the view vector, which a baked texture does not have (a straight-on view is no offset)";
+
+const WORLD_ALIGNED_BLEND_NOTE =
+  "WorldAlignedBlend evaluated as 0.5: its blend follows the surface normal in world space (moss on up-facing faces), which a UV-space bake cannot hold, so half the surface stands in";
 
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
@@ -673,6 +681,12 @@ class Compiler {
       case "PerInstanceRandom":
         this.approximations.add(PER_INSTANCE_RANDOM_NOTE);
         return this.constant([0.5], 1);
+      case "BumpOffset": {
+        // Coordinate + (Height - Reference) * HeightRatio * CameraVector.xy: no view vector in a bake, so the coordinate itself.
+        this.approximations.add(BUMP_OFFSET_NOTE);
+        const coordinate = node.inputs.Coordinate ? this.vec(node.inputs.Coordinate, "BumpOffset.Coordinate") : this.defaultUv();
+        return coordinate ?? this.markUnavailable(`BumpOffset ${node.id} has no coordinate`);
+      }
       case "StaticBool":
         return this.constant([node.constants.Value === true ? 1 : 0], 1);
       case "StaticBoolParameter": {
@@ -1292,6 +1306,12 @@ class Compiler {
       // Outputs: Scale XYZ (vector), Scale X, Scale Y, Scale Z. The scale of the placed instance is not known to a bake.
       this.approximations.add(OBJECT_SCALE_NOTE);
       return output === 0 ? this.constant([1, 1, 1], 3) : this.constant([1], 1);
+    }
+    if (lower === "worldalignedblend" && !node.fn?.outputs.some(Boolean)) {
+      // Every output (Alpha, w/ Vertex Normals, w/ Explicit Normal) is a 0..1 mask driven by a world-space normal.
+      this.approximations.add(WORLD_ALIGNED_BLEND_NOTE);
+      for (const input of Object.values(node.inputs)) this.pin(input);
+      return this.constant([0.5], 1);
     }
     if (lower === "splitcomponents" && !node.fn?.outputs.some(Boolean)) return this.splitComponents(node, output, name!);
     // A pack that carries its own body (a Datasmith project holds UVEdit) is evaluated from that body instead.

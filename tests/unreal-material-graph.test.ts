@@ -1569,6 +1569,47 @@ describe("per-instance and engine utility nodes of layered cliff materials", () 
     expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("ObjectScale evaluated as 1"))).toBe(true);
   });
 
+  it("WorldAlignedBlend (the cliff-rock moss overlay) stands in as half the surface and says so, not an unsupported node", async () => {
+    // MF_moss-overlay-function: BaseColor = lerp(rock, moss, WorldAlignedBlend."w/ Vertex Normals"). The mask follows the
+    // world normal, which a UV-space bake cannot hold; before this the whole section fell back to neutral grey.
+    const graph = makeGraph(
+      [
+        node("blend", "LinearInterpolate", { inputs: { A: pin("rock"), B: pin("moss"), Alpha: pin("aligned", 1) } }),
+        constant3("rock", [0.6, 0.6, 0.6]),
+        constant3("moss", [0.2, 0.4, 0.0]),
+        engineOutputs("aligned", "WorldAlignedBlend", "Engine_MaterialFunctions01/AlphaBlend", ["Alpha", "w/Vertex Normals", "w/ Explicit Normal"], { Input2: pin("sharpness"), Input3: pin("bias") }),
+        node("sharpness", "ScalarParameter", { parameter: { name: "Blend Sharpness Moss", group: "" }, default: 10 }),
+        node("bias", "ScalarParameter", { parameter: { name: "Blend Bias Moss", group: "" }, default: -2 }),
+      ],
+      pin("blend", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.4), encode(0.5), encode(0.3)]);
+    expect(result.status === "baked" && result.confidence).toBe("heuristic");
+    expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("WorldAlignedBlend evaluated as 0.5"))).toBe(true);
+  });
+
+  it("BumpOffset keeps its Coordinate (no view vector in a bake) instead of failing the section", async () => {
+    // Sample at BumpOffset(UV x 2): the 2-texel stripes tile twice over 4 pixels. A BumpOffset that returned 0 would read texel 0 everywhere.
+    const stripes = await pngOf(2, 2, (x) => (x === 0 ? [0, 0, 0] : [255, 255, 255]));
+    const graph = makeGraph(
+      [
+        textureSample("t", "T_Stripes", "Color", "bumped"),
+        node("bumped", "BumpOffset", { inputs: { Coordinate: pin("scaled"), Height: pin("height"), HeightRatioInput: pin("ratio") } }),
+        multiply("scaled", pin("uv"), pin("two")),
+        textureCoordinate("uv"),
+        node("two", "Constant", { constants: { R: 2 } }),
+        node("height", "Constant", { constants: { R: 0.7 } }),
+        node("ratio", "Constant", { constants: { R: 0.004 } }),
+      ],
+      pin("t", 0, RGB_MASK),
+    );
+    const result = await bake(graph, { T_Stripes: { png: stripes, srgb: true } });
+    const pixel = await pixelsOf(result);
+    expect([0, 1, 2, 3].map((x) => pixel(x, 0)[0])).toEqual([0, 255, 0, 255]);
+    expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("BumpOffset evaluated as its Coordinate"))).toBe(true);
+  });
+
   it("PerInstanceRandom and ObjectPositionWS evaluate to one representative instance and are named, not left unsupported", async () => {
     // BaseColor = Random x (0.4, 0.8, 0.2) + ObjectPosition x 0.01: 0.5 and the origin give (0.2, 0.4, 0.1).
     const graph = makeGraph(
