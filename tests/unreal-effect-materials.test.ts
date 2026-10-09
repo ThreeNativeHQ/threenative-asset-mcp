@@ -9,7 +9,7 @@ import { describe, expect, it, onTestFinished } from "vitest";
 import { createGraphBaker } from "../src/unreal/graph-baker.js";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
 import { importUnrealDirectory, type ImportedMaterialSection, type ImportedModel, type ImportReport } from "../src/unreal/importer.js";
-import { bakeGraph, emissiveOnlyEffect, type GraphParameters, type TextureRaster } from "../src/unreal/material-graph.js";
+import { bakeGraph, emissiveOnlyEffect, particleDrivenBaseColor, type GraphParameters, type TextureRaster } from "../src/unreal/material-graph.js";
 import { scorePack } from "../src/unreal/parity.js";
 import type { PropertyDump } from "../src/unreal/property-dump.js";
 import { writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fixture.js";
@@ -93,6 +93,28 @@ function emissiveOnlyGraph(): MaterialGraph {
   );
 }
 
+/**
+ * A particle splash master: BaseColor = ParticleColor x a mask sampled at UV + a panner whose offset and speed come from
+ * the emitter's DynamicParameter (x per-particle offset, w timing), driven by Time.
+ */
+function dynamicParameterGraph(): MaterialGraph {
+  return graphOf(
+    "M_FluidSplash",
+    [
+      node("mul", "Multiply", { inputs: { A: pin("particle", 0, [1, 1, 1, 0]), B: pin("mask", 0, [1, 1, 1, 0]) } }),
+      node("particle", "ParticleColor"),
+      node("mask", "TextureSample", { inputs: { Coordinates: pin("pan") }, coordinates: pin("pan"), texture: "/Game/Test/T_SplashMask.T_SplashMask", samplerType: "Color" }),
+      node("pan", "Panner", { inputs: { Coordinate: pin("offset"), Time: pin("timing") }, constants: { SpeedX: 0.25, SpeedY: 0.68 } }),
+      node("offset", "Add", { inputs: { A: pin("uv"), B: pin("dynamic", 0, [1, 0, 0, 0]) } }),
+      node("uv", "TextureCoordinate"),
+      node("timing", "Multiply", { inputs: { A: pin("dynamic", 3, [0, 0, 0, 1]), B: pin("time") } }),
+      node("dynamic", "DynamicParameter", { parameter: { name: "", group: "" } }),
+      node("time", "Time"),
+    ],
+    { baseColor: pin("mul") },
+  );
+}
+
 async function texturePng(rgb: [number, number, number]): Promise<Buffer> {
   return sharp({ create: { width: 2, height: 2, channels: 4, background: { r: rgb[0], g: rgb[1], b: rgb[2], alpha: 1 } } }).png().toBuffer();
 }
@@ -140,6 +162,17 @@ describe("emissiveOnlyEffect", () => {
   });
 });
 
+describe("particleDrivenBaseColor", () => {
+  it("names a BaseColor path that reads DynamicParameter, which only an emitter sets", () => {
+    expect(particleDrivenBaseColor(dynamicParameterGraph())).toContain("reads DynamicParameter on its BaseColor path");
+  });
+
+  it("does not claim a ParticleColor-only tint (white off an emitter, baked as such) or an emissive-only graph", () => {
+    expect(particleDrivenBaseColor(particleTintedMaster())).toBeUndefined();
+    expect(particleDrivenBaseColor(emissiveOnlyGraph())).toBeUndefined();
+  });
+});
+
 describe("createGraphBaker on an emissive-only effect", () => {
   async function bakerFor(graph: MaterialGraph) {
     const root = await scratch("effect-baker-");
@@ -165,6 +198,14 @@ describe("createGraphBaker on an emissive-only effect", () => {
       expect(outcome.status).toBe("unavailable");
       expect(outcome.effect?.textures).toEqual(["T_FoamMask"]);
     }
+  });
+
+  it("reports a DynamicParameter-driven graph that cannot be baked as a particle material", async () => {
+    const { baker, request } = await bakerFor(dynamicParameterGraph());
+    const outcome = await baker(request);
+    expect(outcome.status).toBe("unsupported");
+    expect(outcome.particle).toContain("reads DynamicParameter on its BaseColor path");
+    expect(outcome.effect).toBeUndefined();
   });
 
   it("a probe of a material with a BaseColor output reports no effect and never bakes", async () => {
@@ -402,6 +443,22 @@ describe("importer: an emissive-only effect (SM_Splash_Sea)", () => {
     expect(report.materialCoverage.effect).toBe(1);
     expect(onDisk.models[0]!.materials[0]!.effect).toEqual(section.effect);
     expect(report.warnings.join("\n")).toContain("no albedo by design");
+  });
+});
+
+describe("importer: a particle material whose BaseColor reads DynamicParameter", () => {
+  it("records the section as a particle effect with its reason (an effect section is not a parity colour miss)", async () => {
+    const { section, report } = await importFixture({
+      graph: dynamicParameterGraph(),
+      materialName: "MI_FluidSplash",
+      props: translucentProps("M_FluidSplash"),
+      textures: [["T_SplashMask", [200, 220, 240]]],
+    });
+    expect(section.graph).toMatchObject({ status: "unsupported" });
+    expect(section.effect).toMatchObject({ kind: "particle" });
+    expect(section.textured).toBe(false);
+    expect(report.materialCoverage.effect).toBe(1);
+    expect(report.warnings.join("\n")).toContain("1 particle material");
   });
 });
 

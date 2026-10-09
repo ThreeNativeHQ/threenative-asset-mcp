@@ -7,6 +7,7 @@ import type { MaterialGraph } from "./graph-dump.js";
 import {
   bakeGraph,
   emissiveOnlyEffect,
+  particleDrivenBaseColor,
   graphPathClasses,
   type EmissiveEffect,
   type BakeResult,
@@ -67,6 +68,11 @@ export interface GraphBakeRequest {
 export type GraphBakeOutcome = BakeResult & {
   /** Present when the material wires only Emissive: no albedo exists in the package (see `emissiveOnlyEffect`). */
   readonly effect?: EmissiveEffect;
+  /**
+   * Present when a bake did not succeed and the BaseColor path reads a per-particle value (see `particleDrivenBaseColor`):
+   * the emitter, not the package, sets this section's colour.
+   */
+  readonly particle?: string;
   /** The dumped graph that was evaluated (the root `Material` of the instance chain). */
   readonly graphMaterial?: string;
   /** The parameters the evaluator saw, after nearest-wins merging over the instance chain. */
@@ -165,7 +171,11 @@ function unavailable(reason: string): GraphBakeOutcome {
 
 /** True when the graph has a node whose value follows the surface normal (see `surface-normals.ts`). */
 export function graphReadsSurface(graph: MaterialGraph): boolean {
-  return graph.nodes.some((node) => node.class === "FunctionCall" && /(?:^|\/)WorldAlignedBlend\./i.test(node.function ?? "") && !node.fn?.outputs.some(Boolean));
+  return graph.nodes.some(
+    (node) =>
+      node.class === "VertexNormalWS" ||
+      (node.class === "FunctionCall" && /(?:^|\/)WorldAlignedBlend\./i.test(node.function ?? "") && !node.fn?.outputs.some(Boolean)),
+  );
 }
 
 /** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
@@ -326,7 +336,10 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
           return decode(path, textureIsSrgb(request.readProps(name)));
         },
       });
-      if (result.status !== "baked") return { ...result, graphMaterial: graph!.material, parameters };
+      if (result.status !== "baked") {
+        const particle = particleDrivenBaseColor(graph!);
+        return { ...result, graphMaterial: graph!.material, parameters, ...(particle ? { particle } : {}) };
+      }
       const approximations = new Set(result.approximations);
       for (const name of ambiguous) approximations.add(`texture ${name}: ambiguous exported PNG basename; exact source pixels cannot be selected`);
       const classes = graphPathClasses(graph!, "baseColor", parameters);

@@ -56,7 +56,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 69;
+export const IMPORTER_VERSION = 70;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -108,8 +108,10 @@ export interface ImportedMaterialEffect {
    * `emissive`: the material wires only Emissive (an unlit or additive effect), so its colour is emitted light.
    * `engine-default-material`: the slot holds Unreal's default material (WorldGridMaterial, an engine asset outside the
    * pack); a particle emitter or placing actor supplies the real material at runtime.
+   * `particle`: the BaseColor path reads a per-particle value (DynamicParameter) and could not be baked; the emitter sets
+   * the colour at runtime.
    */
-  readonly kind: "emissive" | "engine-default-material";
+  readonly kind: "emissive" | "engine-default-material" | "particle";
   readonly reason: string;
 }
 
@@ -1658,6 +1660,7 @@ export async function packageGlb(options: {
     if (material.getBaseColorTexture() === null && options.graphBaker && !hasNamedFallback(material.getName())) {
       const outcome = await options.graphBaker(graphRequest(false));
       if (outcome.effect && !effect) effect = { kind: "emissive", reason: outcome.effect.reason };
+      if (outcome.particle && !effect && outcome.status !== "baked") effect = { kind: "particle", reason: outcome.particle };
       if (outcome.status === "baked") {
         const binding: MaterialTextureBinding = {
           slot: "baseColor",
@@ -4670,7 +4673,7 @@ export async function importUnrealDirectory(
     if (effectSections.length > 0) {
       const byKind = (kind: string): number => effectSections.filter((section) => section.effect?.kind === kind).length;
       warnings.push(
-        `${effectSections.length} material sections have no albedo by design and are not failures (${byKind("emissive")} emissive-only effect, ${byKind("engine-default-material")} engine default material); each carries "effect" with the reason.`,
+        `${effectSections.length} material sections have no albedo by design and are not failures (${byKind("emissive")} emissive-only effect, ${byKind("engine-default-material")} engine default material, ${byKind("particle")} particle material); each carries "effect" with the reason.`,
       );
     }
     if (coverage.textured < coverage.sections) {

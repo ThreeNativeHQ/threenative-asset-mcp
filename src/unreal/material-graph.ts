@@ -154,6 +154,7 @@ const SUPPORTED_NODE_CLASSES = [
   "DepthFade",
   "TwoSidedSign",
   "WorldPosition",
+  "VertexNormalWS",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -405,6 +406,9 @@ const WORLD_ALIGNED_BLEND_NOTE =
 
 const WORLD_ALIGNED_BLEND_SURFACE_NOTE =
   "WorldAlignedBlend evaluated as saturate(up component of the mesh's own vertex normal x sharpness + bias), rasterised into UV space; the engine body is not in the pack, so the formula is inferred, and the mesh is taken unrotated";
+
+const VERTEX_NORMAL_WS_NOTE =
+  "VertexNormalWS evaluated from the mesh's own vertex normals rasterised into UV space, the mesh taken unrotated: Unreal's up (Z) is glTF +Y on every route; the horizontal axes are taken as Unreal X, Y = glTF X, Z";
 
 const FRESNEL_NOTE =
   "Fresnel evaluated as its mean over the visible surface of a sphere seen from afar, BaseReflectFraction + (1 - BaseReflectFraction) * 2 / ((Exponent + 1) * (Exponent + 2)); the rim falloff follows the view angle, which a baked texture does not have";
@@ -730,6 +734,18 @@ class Compiler {
         if (!color) return this.unsupportedNode(node);
         this.approximations.add(color.every((channel) => channel === 1) ? PARTICLE_COLOR_NOTE : `ParticleColor evaluated as constant (${color.join(", ")})`);
         return this.constant([...color], 4);
+      }
+      case "VertexNormalWS": {
+        // The vertex normal in world space. A bake knows the mesh's own normals per texel (as for WorldAlignedBlend), and a
+        // mesh is baked unrotated, so its local normal is the world one: a grid that tints up-facing faces (a level-prototyping
+        // master) gets its top colour on the top faces. Without the surface map the node stays unsupported.
+        if (!this.options.surface) return this.unsupportedNode(node);
+        this.approximations.add(VERTEX_NORMAL_WS_NOTE);
+        return this.emit([], 3, (o) => (r, texel) => {
+          r[o] = texel.nx ?? 0;
+          r[o + 1] = texel.nz ?? 0;
+          r[o + 2] = texel.ny ?? 1;
+        }, true);
       }
       case "ObjectPositionWS":
         // Per-instance data: the placement of the instance in the level. One representative instance (the origin).
@@ -1601,6 +1617,34 @@ export function graphPathClasses(graph: MaterialGraph, output: "baseColor", para
   if (output !== "baseColor") return [];
   const { compiler } = compile(graph, parameters, { allowUvSetFallback: true });
   return [...compiler.classes].sort();
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Particle materials
+
+/**
+ * The reason a graph's BaseColor is set per particle, or undefined. `DynamicParameter` only carries a value inside a
+ * particle emitter (Cascade's or Niagara's dynamic-parameter module), so a BaseColor path that reads it belongs to a
+ * particle material: the emitter supplies the coordinates, timing and tint, and the package alone does not fix an albedo.
+ * Only that node qualifies: `ParticleColor` alone has a well-defined value off an emitter (white) and is baked as such.
+ */
+export function particleDrivenBaseColor(graph: MaterialGraph): string | undefined {
+  if (graph.truncated || graph.error || !graph.outputs.baseColor) return undefined;
+  const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
+  const seen = new Set<string>();
+  const stack = [graph.outputs.baseColor.node];
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const node = nodes.get(id);
+    if (!node) continue;
+    if (node.class === "DynamicParameter") {
+      return `${graph.material} reads DynamicParameter on its BaseColor path: a particle material whose coordinates and colour are set per particle by its emitter, so the package has no fixed albedo`;
+    }
+    for (const input of [...Object.values(node.inputs), node.coordinates]) if (input) stack.push(input.node);
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
+import { graphReadsSurface } from "../src/unreal/graph-baker.js";
 import {
   MATERIAL_ATTRIBUTE_GUIDS,
   bakeGraph,
@@ -1610,6 +1611,33 @@ describe("per-instance and engine utility nodes of layered cliff materials", () 
     expect(pixel(0, 0)).toEqual([encode(0.2), encode(0.4), encode(0)]);
     expect(pixel(3, 2)).toEqual([encode(0.6), encode(0.6), encode(0.6)]);
     expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("WorldAlignedBlend evaluated as saturate(up component"))).toBe(true);
+  });
+
+  it("VertexNormalWS reads the mesh's own normals (Unreal Z = glTF +Y), and stays unsupported without them", async () => {
+    // A level-prototyping grid tints up-facing faces: BaseColor = lerp(side, top, saturate(VertexNormalWS.z)). Before, the node
+    // was unsupported and the whole section fell back to neutral.
+    const graph = makeGraph(
+      [
+        node("blend", "LinearInterpolate", { inputs: { A: pin("side"), B: pin("top"), Alpha: pin("normal", 0, [0, 0, 1, 0]) } }),
+        constant3("side", [0.3, 0.3, 0.3]),
+        constant3("top", [0.8, 0.5, 0.1]),
+        node("normal", "VertexNormalWS"),
+      ],
+      pin("blend", 0, RGB_MASK),
+    );
+    expect(graphReadsSurface(graph)).toBe(true);
+    const size = 4;
+    const normals = new Float32Array(size * size * 3);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) normals.set(x < size / 2 ? [0, 1, 0] : [0, 0, 1], (y * size + x) * 3);
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size, surface: { width: size, height: size, normals, covered: size * size } });
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(0.8), encode(0.5), encode(0.1)]);
+    expect(pixel(3, 1)).toEqual([encode(0.3), encode(0.3), encode(0.3)]);
+    expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("VertexNormalWS evaluated from the mesh's own vertex normals"))).toBe(true);
+
+    const blind = await bake(graph);
+    expect(blind.status).toBe("unsupported");
+    expect(blind.status === "unsupported" && blind.unsupported).toContain("VertexNormalWS");
   });
 
   it("BumpOffset keeps its Coordinate (no view vector in a bake) instead of failing the section", async () => {
