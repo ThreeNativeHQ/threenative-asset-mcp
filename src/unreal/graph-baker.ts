@@ -51,6 +51,11 @@ export interface GraphBakeRequest {
    * translucent section that already has a base-colour texture, which a plain request would not look at.
    */
   readonly probe?: boolean | undefined;
+  /**
+   * The graph output that carries the section's cut-out, from its glTF alpha mode: `opacity` for BLEND, `opacityMask`
+   * for MASK, absent for OPAQUE. The bake writes it into the colour PNG's alpha channel.
+   */
+  readonly alpha?: "opacity" | "opacityMask" | undefined;
 }
 
 export type GraphBakeOutcome = BakeResult & {
@@ -253,7 +258,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     if (request.probe) return unavailable(`${graph.material} has a BaseColor output`);
 
     const parameters = chainParameters(chain);
-    const key = `${graph.material}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}`;
+    const key = `${graph.material}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}`;
     let perAssets = bakes.get(request.assets);
     if (!perAssets) {
       perAssets = new Map();
@@ -273,6 +278,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         allowUvSetFallback: true,
         // Unreal feeds white to ParticleColor outside a particle emitter.
         particleColor: [1, 1, 1, 1],
+        ...(request.alpha ? { alpha: request.alpha } : {}),
         ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
         loadTexture: async (reference) => {
           const name = textureBasename(reference);

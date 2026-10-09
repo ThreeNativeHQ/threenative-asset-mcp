@@ -13,11 +13,11 @@
  */
 import { maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 
-const HUE_BINS = 36;
+export const HUE_BINS = 36;
 /** Object masks tolerate the floor's shading; the border palette is wider than the default. */
 const MASK_TOLERANCE = 26;
 /** An object smaller than this share of the image cannot be described. */
-const MIN_COVERAGE = 0.002;
+export const MIN_COVERAGE = 0.002;
 
 export const FIDELITY_WEIGHTS = Object.freeze({ hue: 0.25, saturation: 0.35, density: 0.25, lightness: 0.15 });
 /** Hue distance (degrees) at which the hue part reaches 0. */
@@ -44,7 +44,7 @@ export const HUE_FAIL_DEGREES = 45;
 export const DENSITY_SUSPECT: readonly [number, number] = [0.65, 1.6];
 export const DENSITY_FAIL: readonly [number, number] = [0.4, 2.5];
 
-interface Described {
+export interface Described {
   pixels: number;
   coverage: number;
   /** Median linear-light saturation, (max - min) / max, of the mid-lightness pixels . */
@@ -59,18 +59,19 @@ interface Described {
 }
 
 /** Below this mean linear saturation an object counts as neutral. */
-const NEUTRAL_SATURATION = 0.06;
-const SATURATION_NOISE_FLOOR = 0.05;
+export const NEUTRAL_SATURATION = 0.06;
+export const SATURATION_NOISE_FLOOR = 0.05;
 /** The object's own luminance percentiles that are kept: below drops deep shadow, above drops specular highlights. */
-const BAND_LOW = 0.35;
-const BAND_HIGH = 0.95;
+export const BAND_LOW = 0.35;
+export const BAND_HIGH = 0.95;
 
-function srgbToLinear(value: number): number {
+export function srgbToLinear(value: number): number {
   const v = value / 255;
   return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
 }
 
-function describe(image: RgbaImage): Described {
+/** The statistics of a render's (or thumbnail's) object pixels. */
+export function describeObject(image: RgbaImage): Described {
   const mask = objectMask(image, MASK_TOLERANCE);
     const pixelsRgb: [number, number, number, number][] = [];
   for (let i = 0; i < mask.length; i++) {
@@ -161,15 +162,15 @@ const NOT_COMPARABLE: FidelityMetrics = Object.freeze({
   score: 0,
 });
 
-function ratioPart(ratio: number, zeroAt: number): number {
+export function ratioPart(ratio: number, zeroAt: number): number {
   if (!Number.isFinite(ratio) || ratio <= 0) return 0;
   return Math.max(0, 1 - Math.abs(Math.log(ratio)) / Math.log(zeroAt));
 }
 
 /** Compares a render with the Unreal thumbnail of the same piece. Pure over pixels. */
 export function measureFidelity(reference: RgbaImage, render: RgbaImage): FidelityMetrics {
-  const ref = describe(reference);
-  const out = describe(render);
+  const ref = describeObject(reference);
+  const out = describeObject(render);
   if (ref.coverage < MIN_COVERAGE || out.coverage < MIN_COVERAGE) return NOT_COMPARABLE;
   const bothNeutral = ref.meanSaturation < NEUTRAL_SATURATION && out.meanSaturation < NEUTRAL_SATURATION;
   const hueEmdDegrees = bothNeutral ? 0 : circularHueEmd(ref.hueHistogram, out.hueHistogram);

@@ -52,7 +52,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 61;
+export const IMPORTER_VERSION = 62;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1370,6 +1370,8 @@ export async function packageGlb(options: {
       lookupName,
       assets: materialAssets,
       probe,
+      // A translucent or masked section keeps its cut-out in the graph's Opacity or OpacityMask pin.
+      ...(resolved.alphaMode === "BLEND" ? { alpha: "opacity" as const } : resolved.alphaMode === "MASK" ? { alpha: "opacityMask" as const } : {}),
       // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
       // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
       ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
@@ -1566,6 +1568,15 @@ export async function packageGlb(options: {
         attachTexture(material, binding, texture);
         graphBindings.push(binding);
         packagingLimitations.push(...outcome.approximations);
+        if (outcome.alpha?.binary && material.getAlphaMode() === "BLEND") {
+          // A translucent material whose Opacity is a leaf-shaped mask is a cut-out. Sorted blending smears overlapping
+          // cards over each other and the backdrop (grey, washed-out foliage), so it is exported as a masked card.
+          material.setAlphaMode("MASK");
+          material.setAlphaCutoff(0.5);
+          packagingLimitations.push(
+            `Opacity is a binary cut-out (${(outcome.alpha.opaqueShare * 100).toFixed(0)}% of texels opaque): exported as alphaMode MASK instead of BLEND, because blended overlapping cards render grey and unsorted.`,
+          );
+        }
         graphReport = { status: "baked", confidence: outcome.confidence, unsupportedNodes: [], approximations: [...outcome.approximations] };
       } else if (outcome.status === "unsupported") {
         graphReport = { status: "unsupported", unsupportedNodes: [...outcome.unsupported], approximations: [], reason: outcome.reason };

@@ -8,7 +8,9 @@ import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { renderTiles } from "../src/unreal/contact-sheet.js";
+import { materialGraphSchema } from "../src/unreal/graph-dump.js";
 import { compareImages, decodeRgba, type RgbaImage } from "../src/unreal/image-diff.js";
+import { bakeGraph, type TextureRaster } from "../src/unreal/material-graph.js";
 import { resolveMaterial, type ResolveMaterialRequest } from "../src/unreal/materials.js";
 import { WASHED_OUT_LUMA, judgeRender } from "../src/unreal/visual-judge.js";
 import { describeWithTools } from "./helpers/require-tool.js";
@@ -136,6 +138,52 @@ async function raggedAlphaTexture(): Promise<Buffer> {
   return sharp(data, { raw: { width: size, height: size, channels: 4 } }).png().toBuffer();
 }
 
+/**
+ * A leaf card the way the graph baker produces it: BaseColor = leaf texture, Opacity = Desaturation(mask texture), the
+ * silhouette living only in the mask (the Rusty Cars ivy). Baked for real with `alpha: "opacity"`; if the baker stopped
+ * writing the cut-out, this card would be a solid green square.
+ */
+async function graphBakedLeafTexture(): Promise<Buffer> {
+  const size = 64;
+  const raster = (texel: (x: number, y: number) => [number, number, number]): TextureRaster => {
+    const rgba = new Uint8Array(size * size * 4);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) rgba.set([...texel(x, y), 255], (y * size + x) * 4);
+    return { width: size, height: size, rgba, srgb: true };
+  };
+  const leaf = raster(() => [50, 130, 55]);
+  // A leaf-shaped (pointed ellipse) white mask on black: roughly a third of the card.
+  const mask = raster((x, y) => {
+    const dx = (x - 32) / 30;
+    const dy = (y - 32) / 18;
+    return dx * dx + dy * dy <= 1 && Math.abs(dy) <= 1 - Math.abs(dx) * 0.5 ? [255, 255, 255] : [0, 0, 0];
+  });
+  const pin = (node: string, mask: number[] | null = null) => ({ node, output: 0, mask });
+  const nodes = [
+    { id: "leaf", class: "TextureSample", inputs: {}, constants: {}, texture: "/Game/Test/T_Leaf.T_Leaf", samplerType: "Color" },
+    { id: "mask", class: "TextureSample", inputs: {}, constants: {}, texture: "/Game/Test/T_Mask.T_Mask", samplerType: "Color" },
+    { id: "gray", class: "Desaturation", inputs: { Input: pin("mask", [1, 1, 1, 0]) }, constants: {} },
+  ];
+  const graph = materialGraphSchema.parse({
+    format: 1,
+    material: "M_Leaf",
+    package: "/Game/Test/M_Leaf",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: pin("leaf", [1, 1, 1, 0]), roughness: null, metallic: null, emissive: null, opacity: pin("gray"), opacityMask: null, normal: null, materialAttributes: null },
+    nodes,
+  });
+  const result = await bakeGraph({
+    graph,
+    output: "baseColor",
+    parameters: { textures: new Map(), vectors: new Map(), scalars: new Map(), switches: new Map() },
+    loadTexture: async (name) => (name.includes("T_Leaf") ? leaf : name.includes("T_Mask") ? mask : undefined),
+    size,
+    alpha: "opacity",
+  });
+  if (result.status !== "baked") throw new Error(`leaf bake failed: ${JSON.stringify(result)}`);
+  return result.png;
+}
+
 const resolve = (request: Omit<ResolveMaterialRequest, "readMat" | "readProps"> & {
   readonly files: Record<string, { mat?: string; props?: string }>;
 }) =>
@@ -257,6 +305,7 @@ interface Fixture {
 async function buildFixtures(dir: string): Promise<Fixture[]> {
   const wood = await woodTexture();
   const ragged = await raggedAlphaTexture();
+  const graphLeaf = await graphBakedLeafTexture();
   const fixtures: Fixture[] = [];
   const write = async (name: string, options: Omit<GlbOptions, "name">): Promise<void> => {
     const path = join(dir, `${name}.glb`);
@@ -289,6 +338,15 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
     geometry: "quad",
     baseColorFactor: zeroAlphaTintFactor(),
     texture: ragged,
+    alphaMode: "MASK",
+    alphaCutoff: 0.5,
+    doubleSided: true,
+  });
+  await write("graph-baked-leaf-card", {
+    geometry: "quad",
+    baseColorFactor: [1, 1, 1, 1],
+    texture: graphLeaf,
+    // What the importer exports for a binary Opacity cut-out.
     alphaMode: "MASK",
     alphaCutoff: 0.5,
     doubleSided: true,
@@ -364,6 +422,23 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(cutout.stats.objectPixels).toBeGreaterThan(200);
     expect(solid.stats.fillRatio).toBeGreaterThan(0.5);
     expect(cutout.stats.fillRatio).toBeLessThan(solid.stats.fillRatio * 0.75);
+  });
+
+  it("a graph-baked leaf card keeps its silhouette: far sparser than a solid card, still green (Rusty Cars ivy)", async () => {
+    const leaf = judgeRender(byName.get("graph-baked-leaf-card")!);
+    const solid = judgeRender(byName.get("solid-quad")!);
+    expect(leaf.stats.objectPixels).toBeGreaterThan(200);
+    // A solid card would draw as many pixels as the solid quad; the leaf is about a third of it.
+    expect(leaf.stats.objectPixels).toBeLessThan(solid.stats.objectPixels * 0.6);
+    const [r, g, b] = objectMeanRgb(byName.get("graph-baked-leaf-card")!);
+    expect(g).toBeGreaterThan(r * 1.3);
+    expect(g).toBeGreaterThan(b * 1.3);
+    // The numeric lock on the baked texture itself: about a third of the texels are opaque, matching the mask.
+    const { data } = await sharp(await graphBakedLeafTexture()).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    let opaque = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i]! >= 128) opaque++;
+    expect(opaque / (data.length / 4)).toBeGreaterThan(0.25);
+    expect(opaque / (data.length / 4)).toBeLessThan(0.5);
   });
 
   it("the zero-alpha-tint card is not blank", () => {

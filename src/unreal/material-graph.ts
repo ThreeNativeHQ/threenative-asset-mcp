@@ -69,6 +69,12 @@ export interface BakeRequest {
    * importer passes white; the emitter's own colour modules are not read. Absent, ParticleColor is unsupported.
    */
   particleColor?: readonly [number, number, number, number];
+  /**
+   * Which graph output carries the cut-out: `opacity` for a translucent material, `opacityMask` for a masked one (the
+   * importer picks it from the section's glTF alpha mode). The bake writes it into the PNG's alpha channel, so a leaf card
+   * whose silhouette lives in a mask texture is not an opaque rectangle. Absent, or the pin is unwired: alpha stays 255.
+   */
+  alpha?: "opacity" | "opacityMask";
 }
 
 export type BakeResult =
@@ -81,6 +87,8 @@ export type BakeResult =
       confidence: "exact" | "heuristic";
       approximations: string[];
       texturesUsed: string[];
+      /** Present when a cut-out was written into the alpha channel. */
+      alpha?: { pin: "opacity" | "opacityMask"; opaqueShare: number; binary: boolean };
     }
   | { status: "unsupported"; unsupported: string[]; reason: string }
   | { status: "unavailable"; reason: string };
@@ -1426,6 +1434,14 @@ class Compiler {
     if (compiled.kind === "vec") return compiled;
     return compiled.baseColor ?? this.constant([0, 0, 0], 3);
   }
+
+  /** Compiles the Opacity or OpacityMask pin; undefined when it is unwired or carries a material-attributes struct. */
+  compileAlpha(graph: MaterialGraph, pin: "opacity" | "opacityMask"): Val | undefined {
+    const wired = graph.outputs[pin];
+    if (!wired) return undefined;
+    const compiled = this.pin(wired);
+    return compiled?.kind === "vec" ? compiled : undefined;
+  }
 }
 
 function compile(graph: MaterialGraph, parameters: GraphParameters, options: CompileOptions) {
@@ -1493,32 +1509,24 @@ export function emissiveOnlyEffect(graph: MaterialGraph): EmissiveEffect | undef
 // ---------------------------------------------------------------------------------------------------------
 // Bake
 
-export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
-  const size = Math.max(1, Math.floor(request.size ?? DEFAULT_SIZE));
-  const { graph } = request;
-  if (graph.truncated) return { status: "unavailable", reason: `graph ${graph.material} was truncated at ${graph.nodeCount} nodes` };
-  if (graph.error) return { status: "unavailable", reason: `graph ${graph.material} could not be dumped: ${graph.error}` };
-  if (!graph.outputs.baseColor && !graph.outputs.materialAttributes) {
-    return { status: "unavailable", reason: `graph ${graph.material} has no BaseColor output` };
-  }
-
-  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor });
-  if (compiler.unsupported.size > 0) {
-    const unsupported = [...compiler.unsupported].sort();
-    return { status: "unsupported", unsupported, reason: `BaseColor of ${graph.material} depends on unsupported nodes: ${unsupported.join(", ")}` };
-  }
-  if (compiler.unavailable.length > 0 || !value) {
-    return { status: "unavailable", reason: compiler.unavailable.length > 0 ? compiler.unavailable.join("; ") : `graph ${graph.material} has no readable BaseColor path` };
-  }
-
+/**
+ * Loads the textures a compiled program samples, then runs it once per texel of a size x size grid and hands each
+ * texel's registers to `onTexel`. Returns a reason when a texture is missing or unusable, otherwise undefined.
+ */
+async function evaluate(
+  compiler: Compiler,
+  request: BakeRequest,
+  size: number,
+  onTexel: (x: number, y: number, registers: Float64Array) => void,
+): Promise<string | undefined> {
   // Load each texture once, then give every sample node its mip level.
   const rasters = new Map<string, TextureRaster>();
   for (const slot of compiler.slots) {
     if (rasters.has(slot.name)) continue;
     const raster = await request.loadTexture(slot.name);
-    if (!raster) return { status: "unavailable", reason: `texture ${slot.name} could not be loaded` };
+    if (!raster) return `texture ${slot.name} could not be loaded`;
     if (raster.width < 1 || raster.height < 1 || raster.rgba.length < raster.width * raster.height * 4) {
-      return { status: "unavailable", reason: `texture ${slot.name} has an unusable raster (${raster.width}x${raster.height}, ${raster.rgba.length} bytes)` };
+      return `texture ${slot.name} has an unusable raster (${raster.width}x${raster.height}, ${raster.rgba.length} bytes)`;
     }
     rasters.set(slot.name, raster);
   }
@@ -1545,35 +1553,99 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
 
   const registers = compiler.registers.slice(0, Math.max(4, compiler.registerCount * 4));
   const program = compiler.program;
-  const out = Buffer.alloc(size * size * 4);
   const texel: TexelContext = { u: 0, v: 0 };
-  const channelStep = value.n === 1 ? 0 : 1;
-  const sums = [0, 0, 0];
   for (let y = 0; y < size; y++) {
     texel.v = (y + 0.5) / size;
     for (let x = 0; x < size; x++) {
       texel.u = (x + 0.5) / size;
       for (let index = 0; index < program.length; index++) program[index]!(registers, texel);
-      const at = (y * size + x) * 4;
-      for (let channel = 0; channel < 3; channel++) {
-        const byte = Math.round(linearToSrgb(registers[value.reg + channel * channelStep]!) * 255);
-        out[at + channel] = byte;
-        sums[channel]! += byte;
+      onTexel(x, y, registers);
+    }
+  }
+  return undefined;
+}
+
+/** Alpha bytes at or above / at or below these count as fully opaque / fully clear. */
+const ALPHA_OPAQUE = 242;
+const ALPHA_CLEAR = 13;
+/** A baked opacity with at least this share of fully opaque or fully clear texels is a cut-out, not a gradient. */
+const BINARY_CUTOUT_SHARE = 0.9;
+
+export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
+  const size = Math.max(1, Math.floor(request.size ?? DEFAULT_SIZE));
+  const { graph } = request;
+  if (graph.truncated) return { status: "unavailable", reason: `graph ${graph.material} was truncated at ${graph.nodeCount} nodes` };
+  if (graph.error) return { status: "unavailable", reason: `graph ${graph.material} could not be dumped: ${graph.error}` };
+  if (!graph.outputs.baseColor && !graph.outputs.materialAttributes) {
+    return { status: "unavailable", reason: `graph ${graph.material} has no BaseColor output` };
+  }
+
+  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor });
+  if (compiler.unsupported.size > 0) {
+    const unsupported = [...compiler.unsupported].sort();
+    return { status: "unsupported", unsupported, reason: `BaseColor of ${graph.material} depends on unsupported nodes: ${unsupported.join(", ")}` };
+  }
+  if (compiler.unavailable.length > 0 || !value) {
+    return { status: "unavailable", reason: compiler.unavailable.length > 0 ? compiler.unavailable.join("; ") : `graph ${graph.material} has no readable BaseColor path` };
+  }
+
+  const out = Buffer.alloc(size * size * 4);
+  const sums = [0, 0, 0];
+  const failure = await evaluate(compiler, request, size, (x, y, registers) => {
+    const at = (y * size + x) * 4;
+    const channelStep = value.n === 1 ? 0 : 1;
+    for (let channel = 0; channel < 3; channel++) {
+      const byte = Math.round(linearToSrgb(registers[value.reg + channel * channelStep]!) * 255);
+      out[at + channel] = byte;
+      sums[channel]! += byte;
+    }
+    out[at + 3] = 255;
+  });
+  if (failure) return { status: "unavailable", reason: failure };
+
+  const approximations = new Set(compiler.approximations);
+  const alphaPin = request.alpha && graph.outputs[request.alpha] ? request.alpha : undefined;
+  let alphaSummary: { pin: "opacity" | "opacityMask"; opaqueShare: number; binary: boolean } | undefined;
+  if (alphaPin) {
+    // The cut-out is its own compile, so an alpha path the evaluator cannot read costs only the cut-out: the colour stays.
+    const alphaCompiler = new Compiler(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor });
+    const alphaValue = alphaCompiler.compileAlpha(graph, alphaPin);
+    if (alphaCompiler.unsupported.size > 0 || alphaCompiler.unavailable.length > 0 || !alphaValue) {
+      const why = alphaCompiler.unsupported.size > 0 ? `unsupported nodes ${[...alphaCompiler.unsupported].sort().join(", ")}` : alphaCompiler.unavailable.join("; ") || "no readable path";
+      approximations.add(`${alphaPin} could not be evaluated (${why}); the base colour stays fully opaque`);
+    } else if (alphaValue.konst) {
+      // A uniform opacity (a scalar parameter, a constant) is not a cut-out: the section's colour factor carries it.
+    } else {
+      const alphaFailure = await evaluate(alphaCompiler, request, size, (x, y, registers) => {
+        out[(y * size + x) * 4 + 3] = Math.round(Math.min(1, Math.max(0, registers[alphaValue.reg]!)) * 255);
+      });
+      if (alphaFailure) {
+        for (let at = 3; at < out.length; at += 4) out[at] = 255;
+        approximations.add(`${alphaPin} could not be evaluated (${alphaFailure}); the base colour stays fully opaque`);
+      } else {
+        for (const note of alphaCompiler.approximations) approximations.add(note);
+        let opaque = 0;
+        let extreme = 0;
+        for (let at = 3; at < out.length; at += 4) {
+          if (out[at]! >= ALPHA_OPAQUE) opaque++;
+          if (out[at]! >= ALPHA_OPAQUE || out[at]! <= ALPHA_CLEAR) extreme++;
+        }
+        const texels = out.length / 4;
+        alphaSummary = { pin: alphaPin, opaqueShare: opaque / texels, binary: extreme / texels >= BINARY_CUTOUT_SHARE };
       }
-      out[at + 3] = 255;
     }
   }
   const png = await sharp(out, { raw: { width: size, height: size, channels: 4 } }).png().toBuffer();
   const pixels = size * size * 255;
-  const approximations = [...compiler.approximations].sort();
   return {
     status: "baked",
     png,
     width: size,
     height: size,
     meanRgb: [sums[0]! / pixels, sums[1]! / pixels, sums[2]! / pixels],
-    confidence: approximations.length === 0 ? "exact" : "heuristic",
-    approximations,
+    confidence: approximations.size === 0 ? "exact" : "heuristic",
+    approximations: [...approximations].sort(),
     texturesUsed: [...new Set(compiler.slots.map((slot) => slot.name))].sort(),
+    ...(alphaSummary ? { alpha: alphaSummary } : {}),
   };
 }
