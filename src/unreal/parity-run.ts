@@ -27,8 +27,12 @@ import { textureIdentityReason, type CrossDecodeProof, type TextureProof } from 
 export type ParityRoute = "umodel" | "mesh-description" | "cue4parse" | "unknown";
 export type ParityStatus = "pass" | "fail" | "unverified" | "error" | "skipped";
 
-/** Listing id prefixes (8 characters) of the two packs too large for a routine sweep. */
-export const SIZE_EXCLUDED_PREFIXES: readonly string[] = ["4898e707", "0281d63e"];
+/**
+ * Listing id prefixes (8 characters) of the packs too large for a routine sweep: City Sample, MetaHumans, and
+ * Common Hazel (a 4.7 GB Megascans pack whose hundreds of material packages each take ~3 minutes to decode, so one
+ * pack alone ran over an hour and still had most of its materials left on 2026-10-08).
+ */
+export const SIZE_EXCLUDED_PREFIXES: readonly string[] = ["4898e707", "0281d63e", "81bc7ba6"];
 export const SIZE_SKIP_REASON = "skipped: size";
 export const LISTING_PREFIX_LENGTH = 8;
 
@@ -1003,7 +1007,7 @@ Options:
   --resume               Skip entries already settled in <out>/scorecard.json
   --keep                 Keep downloads and import output (default: delete after each pack)
   --out <dir>            Output directory (default: artifacts/parity)
-  --exclude-size         Skip City Sample and MetaHumans (default on)
+  --exclude-size         Skip City Sample, MetaHumans and Common Hazel (default on)
   --no-exclude-size      Include them
   --baseline <file>      Compare this sweep's S4 miss count with that scorecard.json and print
                          "S4 misses: <baseline> → <now> (<pct>% change)" (PRD-538 AC-4)
