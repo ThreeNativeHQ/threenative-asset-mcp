@@ -81,3 +81,20 @@ describe("colourSimilarity", () => {
     expect(small.similarity).toBeGreaterThan(0.85);
   });
 });
+
+describe("colourSimilarity with a thumbnail's cast shadow", () => {
+  it("scores a correct render higher when the shadow is taken out of the reference's object mask", async () => {
+    const { withoutFloorShadow } = await import("../src/unreal/render-fidelity.js");
+    const size = 96;
+    const checker = (x: number, y: number): Rgb => ((Math.floor(x / 12) + Math.floor(y / 12)) % 2 === 0 ? [125, 132, 137] : [112, 120, 126]);
+    const leaf = (x: number): Rgb => [40 + (x % 5) * 6, 150 + (x % 7) * 4, 50];
+    const reference = scene(size, 30, checker, (x) => leaf(x));
+    // The piece's cast shadow: a big dark, bluer copy of the floor beside it.
+    for (let y = 60; y < 90; y++) for (let x = 4; x < 80; x++) reference.data.set([48, 66, 78, 255], (y * size + x) * 4);
+    const render = scene(size, 30, flatGrey, (x) => leaf(x));
+    const polluted = colourSimilarity(reference, render);
+    const clean = colourSimilarity(reference, render, withoutFloorShadow(reference, objectMask(reference)));
+    expect(clean.similarity).toBeGreaterThan(polluted.similarity + 0.15);
+    expect(clean.similarity).toBeGreaterThan(0.6);
+  });
+});

@@ -441,7 +441,7 @@ function nameTokens(texture: string): string[] {
 
 /** A colour word anywhere (`_c_grey`), or a trailing `_A` albedo beside `_N`/`_AORO` — never a
  * texture that ends as a normal map, whatever variant letter precedes that. */
-function isColourTexture(texture: string): boolean {
+export function isColourTexture(texture: string): boolean {
   const tokens = nameTokens(texture);
   if (NORMAL_TOKENS.has(tokens.at(-1) ?? "")) return false;
   return tokens.some((token) => COLOUR_TOKENS.has(token)) || tokens.at(-1) === "a";

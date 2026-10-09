@@ -158,16 +158,16 @@ describe("judgeRender with fidelity", () => {
  * The border-palette object mask counts the shadow as object: it drags hue toward blue (the conifer pack read 30-60 degrees
  * "off" on Larch/Spruce that were not), lowers saturation and inflates the bounding box. Synthetic stand-in below.
  */
-function thumbnailWithShadow(withShadow: boolean): RgbaImage {
+function thumbnailWithShadow(withShadow: boolean, floor: { light: [number, number, number]; dark: [number, number, number]; shadow: [number, number, number] } = { light: [125, 132, 137], dark: [112, 120, 126], shadow: [48, 66, 78] }): RgbaImage {
   const size = 96;
   const data = new Uint8Array(size * size * 4);
   for (let i = 0; i < size * size; i++) {
     const x = i % size;
     const y = Math.floor(i / size);
     const checker = (Math.floor(x / 12) + Math.floor(y / 12)) % 2 === 0;
-    let rgb: [number, number, number] = checker ? [125, 132, 137] : [112, 120, 126];
+    let rgb: [number, number, number] = checker ? floor.light : floor.dark;
     // Shadow blob on the floor, left of and below the plant: darker and bluer than the floor.
-    if (withShadow && x >= 6 && x < 46 && y >= 60 && y < 84) rgb = [48, 66, 78];
+    if (withShadow && x >= 2 && x < 60 && y >= 58 && y < 94) rgb = floor.shadow;
     // The plant: leaf greens of varied lightness, ragged like needles.
     if (x >= 40 && x < 80 && y >= 14 && y < 62 && (x * 7 + y * 3) % 5 !== 0) {
       const shade = 0.55 + 0.45 * (((x * 13 + y * 29) % 17) / 16);
@@ -190,6 +190,17 @@ describe("measureFidelity ignores the floor's cast shadow", () => {
     expect(fidelityVerdict(shadowed).verdict).toBe("ok");
   });
 
+  it("also removes it from a near-neutral light floor (the Fern Collection thumbnails, floor saturation 0.035)", () => {
+    // The grey shadow has a lower saturation than the leaves: left in the mask it halved the reference's median saturation,
+    // so a correct fern read 2.4x "over-saturated" and failed.
+    const neutral = { light: [167, 171, 173] as [number, number, number], dark: [150, 154, 157] as [number, number, number], shadow: [109, 116, 122] as [number, number, number] };
+    const clean = measureFidelity(thumbnailWithShadow(false, neutral), render);
+    const shadowed = measureFidelity(thumbnailWithShadow(true, neutral), render);
+    expect(shadowed.saturationRatio).toBeCloseTo(clean.saturationRatio, 1);
+    expect(shadowed.saturationRatio).toBeLessThan(1.4);
+    expect(fidelityVerdict(shadowed).verdict).toBe("ok");
+  });
+
   it("still flags a genuinely wrong hue when a shadow is present", () => {
     const wrong = foliage((r, g, b) => [g, r, b]);
     expect(fidelityVerdict(measureFidelity(thumbnailWithShadow(true), wrong)).verdict).not.toBe("ok");
@@ -204,5 +215,103 @@ describe("referenceObjectMask (the solid-card check's thumbnail fill)", () => {
     // With the shadow counted, the plant's bounding box spans the shadow blob too and its fill drops by about half, which
     // made a correct cut-out render read as "solid card" (fill 0.2 vs 0.08 on the conifer ground twigs).
     expect(fill(thumbnailWithShadow(true))).toBeCloseTo(fill(thumbnailWithShadow(false)), 1);
+  });
+});
+
+/**
+ * Mass, not only bounding-box fill: a spray of 1px needles and a half-solid blob can fill the same share of their boxes,
+ * yet one reads as speckle. `closedSolidity` is object pixels over the closed silhouette's pixels at the scale of a needle
+ * cluster. Calibrated on the conifer pack: render/reference mass 0.82 at 1x (hard alpha-tested edges), 0.95 supersampled.
+ */
+function stripes(period: number, boxWidth = 40): RgbaImage {
+  const data = new Uint8Array(SIZE * SIZE * 4);
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    const x = i % SIZE;
+    const y = Math.floor(i / SIZE);
+    const inside = x >= 12 && x < 12 + boxWidth && y >= 12 && y < 52 && (period === 1 || x % period === 0);
+    data.set(inside ? [60, 150, 50, 255] : [128, 128, 128, 255], i * 4);
+  }
+  return { width: SIZE, height: SIZE, data };
+}
+
+describe("closedSolidity and the mass ratio", () => {
+  it("is 1 for a solid block and about the fill for thin stripes the closing bridges", async () => {
+    const { objectMask } = await import("../src/unreal/image-diff.js");
+    const { closedSolidity } = await import("../src/unreal/render-fidelity.js");
+    const solidity = (image: RgbaImage) => closedSolidity(objectMask(image, 26), image.width, image.height, 0.03);
+    expect(solidity(stripes(1))).toBeCloseTo(1, 2);
+    expect(solidity(stripes(2))).toBeGreaterThan(0.45);
+    expect(solidity(stripes(2))).toBeLessThan(0.6);
+  });
+
+  it("sees thin speckle that bounding-box fill cannot: equal fill, half the mass", () => {
+    // Reference: a solid block over the left half of the box plus one stray pixel that stretches its box to full width.
+    // Render: stripes across the whole box at half density. Both fill half of their (equal) boxes.
+    const reference = stripes(1, 20);
+    reference.data.set([60, 150, 50, 255], (12 * SIZE + 51) * 4);
+    const render = stripes(2, 40);
+    const metrics = measureFidelity(reference, render);
+    expect(metrics.comparable).toBe(true);
+    expect(metrics.densityRatio).toBeGreaterThan(0.85);
+    expect(metrics.densityRatio).toBeLessThan(1.2);
+    expect(metrics.massRatio).toBeLessThan(0.65);
+    expect(explainFidelity(metrics)).toMatch(/thinner than Unreal/);
+  });
+
+  it("fails a spray of thin needles against a dense reference", () => {
+    const metrics = measureFidelity(stripes(1, 40), stripes(3, 40));
+    expect(metrics.massRatio).toBeLessThan(0.4);
+    expect(fidelityVerdict(metrics).verdict).toBe("fail");
+    expect(fidelityVerdict(metrics).reasons.join(" ")).toMatch(/thinner than Unreal/);
+  });
+
+  it("reads the mass from the supersampled render when one is given, leaving colour and density on the 1x render", () => {
+    const reference = stripes(1, 40);
+    const thin = stripes(3, 40);
+    const dense = stripes(1, 40);
+    const plain = measureFidelity(reference, thin);
+    const supersampled = measureFidelity(reference, thin, dense);
+    expect(supersampled.massRatio).toBeGreaterThan(plain.massRatio * 2);
+    expect(supersampled.densityRatio).toBeCloseTo(plain.densityRatio, 6);
+    expect(supersampled.saturationRatio).toBeCloseTo(plain.saturationRatio, 6);
+  });
+
+  it("does not flag an identical render", () => {
+    const metrics = measureFidelity(stripes(2, 40), stripes(2, 40));
+    expect(metrics.massRatio).toBeCloseTo(1, 2);
+    expect(fidelityVerdict(metrics).verdict).toBe("ok");
+  });
+});
+
+describe("bounding-box fill is only a solid card when the mass agrees (camera and stems move the box)", () => {
+  /** A solid 20x20 blob, optionally with a 1px stem rising 40px above it (the thumbnail's view of a sprig). */
+  function blob(withStem: boolean): RgbaImage {
+    const data = new Uint8Array(SIZE * SIZE * 4);
+    for (let i = 0; i < SIZE * SIZE; i++) {
+      const x = i % SIZE;
+      const y = Math.floor(i / SIZE);
+      const inBlob = x >= 22 && x < 42 && y >= 38 && y < 58;
+      const inStem = withStem && x === 32 && y >= 0 && y < 38;
+      data.set(inBlob || inStem ? [60, 150, 50, 255] : [128, 128, 128, 255], i * 4);
+    }
+    return { width: SIZE, height: SIZE, data };
+  }
+
+  it("does not call a compact render a solid card because the reference's box is stretched by a stem", () => {
+    const metrics = measureFidelity(blob(true), blob(false));
+    expect(metrics.densityRatio).toBeGreaterThan(1.6);
+    expect(metrics.massRatio).toBeGreaterThan(0.8);
+    expect(metrics.massRatio).toBeLessThan(1.25);
+    expect(fidelityVerdict(metrics).verdict).toBe("ok");
+    const judged = judgeRender(blob(false), { fidelity: metrics, thumbnailFillRatio: 0.35, thumbnailObjectPixels: 440 });
+    expect(judged.reasons.join(" ")).not.toContain("solid card");
+  });
+
+  it("still flags a solid render of a hollow cut-out reference: the mass says so", () => {
+    const metrics = measureFidelity(stripes(3, 40), stripes(1, 40));
+    expect(metrics.massRatio).toBeGreaterThan(1.5);
+    expect(fidelityVerdict(metrics).verdict).not.toBe("ok");
+    const judged = judgeRender(stripes(1, 40), { fidelity: metrics, thumbnailFillRatio: 0.33, thumbnailObjectPixels: 500 });
+    expect(judged.reasons.join(" ")).toContain("solid card");
   });
 });

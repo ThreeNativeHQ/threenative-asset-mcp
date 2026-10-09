@@ -307,15 +307,16 @@ function unwiredEmissiveGrey(): readonly [number, number, number] {
  * leaf-green colour map. Mipmapped, the mask averages to its 25% mean at distance, falls under the 0.333 cut and the card
  * vanishes; unmipped (what the pack authors for the map) the needles stay.
  */
-async function writeNeedleCardPngs(dir: string): Promise<void> {
+async function writeNeedleCardPngs(dir: string, options: { vivid?: boolean; solidMask?: boolean } = {}): Promise<void> {
   const size = 512;
   const colour = Buffer.alloc(size * size * 3);
   const mask = Buffer.alloc(size * size * 3);
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const o = (y * size + x) * 3;
-      colour.set([40, 170, 60], o);
-      mask.set([255, 160, (x + 2 * y) % 4 === 0 ? 255 : 0], o);
+      // Vivid: saturated green blades beside red-brown tips (uncorrelated channels), like the Fern Collection's fern_02_A.
+      colour.set(options.vivid ? (((x >> 5) + (y >> 5)) % 3 === 0 ? [200, 30, 20] : [20, 190, 30]) : [40, 170, 60], o);
+      mask.set([255, 160, options.solidMask || (x + 2 * y) % 4 === 0 ? 255 : 0], o);
     }
   }
   await sharp(colour, { raw: { width: size, height: size, channels: 3 } }).png().toFile(join(dir, "Leaf_A.png"));
@@ -323,7 +324,7 @@ async function writeNeedleCardPngs(dir: string): Promise<void> {
 }
 
 /** A masked foliage card exactly as the importer packages it: `Opacity=` names the colour map, the cut-out is the AORO blue. */
-async function importedNeedleCard(dir: string, name: string, options: { noMipmaps?: boolean; specular?: number }): Promise<string> {
+async function importedNeedleCard(dir: string, name: string, options: { noMipmaps?: boolean; specular?: number; vivid?: boolean; solidMask?: boolean }): Promise<string> {
   const source = join(dir, name);
   await writeMeshFixture(source, {
     name: "Mesh",
@@ -332,7 +333,7 @@ async function importedNeedleCard(dir: string, name: string, options: { noMipmap
     props: "BlendMode = BLEND_Masked (1)\nOpacityMaskClipValue = 0.333\nTwoSided = true\n",
     textures: [],
   });
-  await writeNeedleCardPngs(source);
+  await writeNeedleCardPngs(source, options);
   const authored: SourceMaterial | undefined =
     options.specular === undefined ? undefined : { channels: { Specular: { kind: "scalar", value: options.specular } }, baseColorSamples: [], limitations: [] };
   const glbPath = join(dir, `${name}.glb`);
@@ -521,6 +522,9 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
   });
   await write("dead-tree-leaf", { geometry: "quad", baseColorFactor: [1, 1, 1, 1], texture: await leafTexture((await deadLeafTextureName(dir)) === "T_Green_Leaf" ? [60, 170, 50] : [150, 120, 80]) });
   await write("mossy-rock", { geometry: "cube", baseColorFactor: [1, 1, 1, 1], texture: await mossyRockBake(dir) });
+  fixtures.push({ name: "vivid-atlas-card", path: await importedNeedleCard(dir, "vivid-atlas-card", { noMipmaps: true, vivid: true, solidMask: true }) });
+  fixtures.push({ name: "matte-leaf-specular", path: await importedNeedleCard(dir, "matte-leaf-specular", { specular: 0.1, solidMask: true }) });
+  fixtures.push({ name: "default-leaf-specular", path: await importedNeedleCard(dir, "default-leaf-specular", { solidMask: true }) });
   await write("solid-box", { geometry: "cube", baseColorFactor: [0.15, 0.3, 0.85, 1] });
   await write("neutral-grey", { geometry: "cube", baseColorFactor: [0.5, 0.5, 0.5, 1] });
   await write("solid-quad", { geometry: "quad", baseColorFactor: [0.2, 0.7, 0.3, 1] });
@@ -572,11 +576,13 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
   let dir: string;
   let names: string[] = [];
   let byName = new Map<string, RgbaImage>();
+  let paths = new Map<string, string>();
 
   beforeAll(async () => {
     dir = await mkdtemp(join(tmpdir(), "tn-visual-regression-"));
     const fixtures = await buildFixtures(dir);
     names = fixtures.map((fixture) => fixture.name);
+    paths = new Map(fixtures.map((fixture) => [fixture.name, fixture.path]));
     const result = await renderTiles({ glbPaths: fixtures.map((fixture) => fixture.path), tile: TILE });
     expect(result.rendered.every(Boolean)).toBe(true);
     byName = new Map(names.map((name, index) => [name, result.tiles[index]!]));
@@ -616,6 +622,29 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     for (let i = 3; i < data.length; i += 4) if (data[i]! >= 128) opaque++;
     expect(opaque / (data.length / 4)).toBeGreaterThan(0.25);
     expect(opaque / (data.length / 4)).toBeLessThan(0.5);
+  });
+
+  it("a supersampled render keeps the cut-out's anti-aliased fringe: a hard 1x alpha test reads sparser than Unreal's AA'd thumbnail", async () => {
+    const { tiles } = await renderTiles({ glbPaths: [paths.get("needle-card-unmipped")!], tile: TILE, supersample: 2 });
+    const plain = judgeRender(byName.get("needle-card-unmipped")!);
+    const smooth = judgeRender(tiles[0]!);
+    // Same needles, same camera: only the edge treatment differs, and the fringe adds object pixels.
+    expect(smooth.stats.objectPixels).toBeGreaterThan(plain.stats.objectPixels * 1.15);
+    expect(smooth.stats.coverage).toBeLessThan(plain.stats.coverage * 3);
+  });
+
+  it("a vivid leaf atlas cut out by a packed opacity map keeps its colour instead of the neutral grey fallback (Fern Collection)", () => {
+    const vivid = judgeRender(byName.get("vivid-atlas-card")!);
+    expect(vivid.stats.objectPixels).toBeGreaterThan(200);
+    expect(vivid.stats.meanSaturation).toBeGreaterThan(0.5);
+    expect(vivid.stats.neutralFraction).toBeLessThan(0.2);
+  });
+
+  it("an authored Specular of 0.1 is greener than glTF's default F0 on the same leaf", () => {
+    const matte = judgeRender(byName.get("matte-leaf-specular")!);
+    const plain = judgeRender(byName.get("default-leaf-specular")!);
+    expect(matte.stats.objectPixels).toBeGreaterThan(200);
+    expect(matte.stats.meanSaturation).toBeGreaterThan(plain.stats.meanSaturation + 0.015);
   });
 
   it("the zero-alpha-tint card is not blank", () => {

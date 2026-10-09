@@ -552,8 +552,12 @@ export interface ColourSimilarity {
  * border-colour background is masked out). The score is 0.4 mean-colour + 0.3 colour histogram +
  * 0.3 hue histogram. It ignores shape, shading, camera and lighting, so it is a sanity signal, not a match.
  */
-export function colourSimilarity(a: RgbaImage, b: RgbaImage): ColourSimilarity {
-  const left = describeObject(a, objectMask(a));
+/**
+ * `maskA` replaces the first image's border-palette object mask: an editor thumbnail's cast shadow is not the piece, and left in it
+ * the shadow's blue-grey drags the mean colour and hue histogram (the Fern Collection read 0.28-0.33 "similarity" at fidelity 93).
+ */
+export function colourSimilarity(a: RgbaImage, b: RgbaImage, maskA?: Uint8Array): ColourSimilarity {
+  const left = describeObject(a, maskA ?? objectMask(a));
   const right = describeObject(b, objectMask(b));
   const comparable = left.coverage >= MIN_OBJECT_COVERAGE && right.coverage >= MIN_OBJECT_COVERAGE;
   const delta = comparable

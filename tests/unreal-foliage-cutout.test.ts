@@ -23,17 +23,23 @@ afterEach(async () => {
 
 const MASKED = "BlendMode = BLEND_Masked (1)\nOpacityMaskClipValue = 0.333\n";
 
-async function pack(options: { props?: string; noMipmaps?: readonly string[]; specular?: number }) {
+async function pack(options: { props?: string; noMipmaps?: readonly string[]; specular?: number; vivid?: boolean; mat?: string }) {
   const directory = await mkdtemp(join(tmpdir(), "foliage-cutout-"));
   directories.push(directory);
   await writeMeshFixture(directory, {
     name: "Mesh",
     materialName: "Leaf",
-    mat: "Diffuse=Leaf_A\nOpacity=Leaf_A\nOther[0]=Leaf_AORO\n",
+    mat: options.mat ?? "Diffuse=Leaf_A\nOpacity=Leaf_A\nOther[0]=Leaf_AORO\n",
     props: options.props ?? MASKED,
     textures: ["Leaf_A", "Leaf_AORO"],
   });
-  await writePng(join(directory, "Leaf_A.png"), [110, 120, 50, 255]);
+  if (options.vivid) {
+    // A vivid, uncorrelated atlas: saturated green blades beside red-brown tips, like the Fern Collection's `fern_02_A`.
+    const size = 32;
+    const pixels = Buffer.alloc(size * size * 3);
+    for (let i = 0; i < size * size; i++) pixels.set(i % 3 === 0 ? [200, 30, 20] : [20, 190, 30], i * 3);
+    await (await import("sharp")).default(pixels, { raw: { width: size, height: size, channels: 3 } }).png().toFile(join(directory, "Leaf_A.png"));
+  } else await writePng(join(directory, "Leaf_A.png"), [110, 120, 50, 255]);
   await writePng(join(directory, "Leaf_AORO.png"), [200, 150, 255, 255]);
   const authored: SourceMaterial | undefined =
     options.specular === undefined
@@ -71,6 +77,20 @@ describe("a masked card whose opacity map has no mip chain in Unreal", () => {
   it("leaves an opaque material alone even when its texture has no mip chain", async () => {
     const { material } = await pack({ props: "BlendMode = BLEND_Opaque (0)\n", noMipmaps: ["Leaf_AORO", "Leaf_A"] });
     expect(material.getBaseColorTextureInfo()!.getMinFilter()).toBeNull();
+  });
+});
+
+describe("a vivid leaf atlas wired to Diffuse and cut out by a packed opacity map", () => {
+  it("is the base colour, not rejected as a packed mask (Fern Collection fern_02_A)", async () => {
+    const { material, result } = await pack({ vivid: true });
+    expect(material.getBaseColorTexture()).not.toBeNull();
+    expect(result.sections[0]!.unsupported.map((u) => u.reason).join()).not.toContain("packed mask");
+  });
+
+  it("is still rejected when nothing cuts it out (an opaque rock mask resolved into Diffuse)", async () => {
+    const { material, result } = await pack({ vivid: true, props: "BlendMode = BLEND_Opaque (0)\n", mat: "Diffuse=Leaf_A\n" });
+    expect(material.getBaseColorTexture()).toBeNull();
+    expect(result.sections[0]!.unsupported.map((u) => u.reason).join()).toContain("packed mask");
   });
 });
 
