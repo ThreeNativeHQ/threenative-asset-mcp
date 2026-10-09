@@ -67,6 +67,32 @@ function masterGraph(
   });
 }
 
+// BaseColor = lerp(tan, moss, WorldAlignedBlend."w/Vertex Normals"), the cliff-rock master's moss overlay in miniature.
+function moss(): MaterialGraph {
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: 5,
+    outputs: { baseColor: pin("mix"), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+    nodes: [
+      node("mix", "LinearInterpolate", { inputs: { A: pin("tan"), B: pin("moss"), Alpha: { node: "wab", output: 1, mask: null } } }),
+      node("tan", "Constant3Vector", { constants: { Constant: [0.6, 0.5, 0.3, 1] } }),
+      node("moss", "Constant3Vector", { constants: { Constant: [0.1, 0.3, 0.05, 1] } }),
+      node("wab", "FunctionCall", {
+        inputs: { Input2: pin("sharp"), Input3: pin("bias") },
+        function: "/Engine/Functions/Engine_MaterialFunctions01/AlphaBlend/WorldAlignedBlend.WorldAlignedBlend",
+        outputNames: ["Alpha", "w/Vertex Normals", "w/ Explicit Normal"],
+        fn: { inputs: { Input2: "sharp", Input3: "bias" }, outputs: [], output: null },
+        error: "material function could not be loaded (engine content is not in the pack)",
+      }),
+      node("sharp", "Constant", { constants: { R: 10 } }),
+      node("bias", "Constant", { constants: { R: -2 } }),
+    ],
+  });
+}
+
 const instanceProps = (parent: string, overrides: [string, string][]): string =>
   [
     `Parent = Material3'Content/Test/${parent}.${parent}'`,
@@ -214,6 +240,32 @@ describe("createGraphBaker", () => {
     const bare = await baker({ materialName: "s", lookupName: "MI_Bare", assets, readProps: (name) => (name === "MI_Bare" ? props.MI_Bare!.replace(/Content\/Test\//, "") : undefined) });
     if (bare.status !== "baked") throw new Error(`expected a bake, got ${JSON.stringify(bare)}`);
     expect(await firstPixel(bare.png)).toEqual([encode(200 / 255), encode(100 / 255), encode(50 / 255)]);
+  });
+
+  it("builds the surface map only for a graph that reads it, and bakes a separate texture per surface", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const aligned = moss();
+    const surfaceOf = (normal: number[]) => ({ width: 2, height: 2, normals: new Float32Array(12).map((_, index) => normal[index % 3]!), covered: 4 });
+    let builds = 0;
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", aligned]]) })!;
+    const up = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, surface: () => (builds++, surfaceOf([0, 1, 0])) });
+    const side = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, surface: () => (builds++, surfaceOf([1, 0, 0])) });
+    const upAgain = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, surface: () => (builds++, surfaceOf([0, 1, 0])) });
+    if (up.status !== "baked" || side.status !== "baked") throw new Error("expected bakes");
+    expect(await firstPixel(up.png)).toEqual([encode(0.1), encode(0.3), encode(0.05)]);
+    expect(await firstPixel(side.png)).toEqual([encode(0.6), encode(0.5), encode(0.3)]);
+    expect(upAgain).toBe(up);
+    expect(builds).toBe(3);
+
+    // A graph that does not read the surface never asks for it and keeps one shared bake.
+    const plain = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", masterGraph()]]) })!;
+    const never = () => {
+      throw new Error("the surface map was built for a graph that does not read it");
+    };
+    const first = await plain({ materialName: "s", lookupName: "MI_Rock", assets, readProps, surface: never });
+    const second = await plain({ materialName: "s2", lookupName: "MI_Rock", assets, readProps, surface: never });
+    expect(first.status).toBe("baked");
+    expect(second).toBe(first);
   });
 
   it("is unavailable without a source package and does not touch the converter", async () => {
@@ -370,7 +422,7 @@ process.exit(run.status === null ? 1 : run.status);
   await chmod(path, 0o755);
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean }) {
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number] }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -388,6 +440,13 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     props: instanceProps("M_Master", options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]]),
     textures: [],
   });
+  if (options.normal) {
+    const io = new NodeIO();
+    const document = await io.read(join(exported, "Mesh.gltf"));
+    const primitive = document.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    primitive.getAttribute("NORMAL")!.setArray(new Float32Array([...options.normal, ...options.normal, ...options.normal]));
+    await io.write(join(exported, "Mesh.gltf"), document);
+  }
   if (options.vertexColors) {
     // UE Viewer's glTF writer emits COLOR_0 for a mesh that has a vertex colour buffer.
     const io = new NodeIO();
@@ -436,6 +495,17 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   const textureExports = (await readFile(textureLog, "utf8").catch(() => "")).split("\n").filter(Boolean);
   return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, dumped, leftovers, textureExports };
 }
+
+describe("importUnrealDirectory surface-driven graph bake", () => {
+  it("bakes a world-aligned blend from the mesh's own normals: moss on an up-facing surface, rock on a side-facing one", async () => {
+    const up = await importWithGraph({ graph: moss(), normal: [0, 1, 0] });
+    const side = await importWithGraph({ graph: moss(), normal: [1, 0, 0] });
+    expect(await firstPixel(up.material.getBaseColorTexture()!.getImage()!)).toEqual([encode(0.1), encode(0.3), encode(0.05)]);
+    expect(await firstPixel(side.material.getBaseColorTexture()!.getImage()!)).toEqual([encode(0.6), encode(0.5), encode(0.3)]);
+    const graph = up.report.models[0]!.materials[0]!.graph;
+    expect(graph?.approximations.some((note) => note.startsWith("WorldAlignedBlend evaluated as saturate(up component"))).toBe(true);
+  });
+});
 
 describe("importUnrealDirectory graph bake", () => {
   it("bakes a graph-only base colour and reports it as a graph binding", async () => {

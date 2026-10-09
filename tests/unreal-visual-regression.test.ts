@@ -12,8 +12,10 @@ import { packageGlb } from "../src/unreal/importer.js";
 import type { SourceMaterial } from "../src/unreal/source-material.js";
 import { writeMeshFixture } from "./helpers/unreal-fixture.js";
 import { createGraphBaker } from "../src/unreal/graph-baker.js";
+import type { SurfaceNormals } from "../src/unreal/surface-normals.js";
 import { materialGraphSchema } from "../src/unreal/graph-dump.js";
 import { scopeParentChain } from "../src/unreal/importer.js";
+import { remapGltfSectionMaterials } from "../src/unreal/static-mesh-sections.js";
 import { compareImages, decodeRgba, type RgbaImage } from "../src/unreal/image-diff.js";
 import { bakeGraph, type TextureRaster } from "../src/unreal/material-graph.js";
 import { resolveMaterial, type ResolveMaterialRequest } from "../src/unreal/materials.js";
@@ -464,6 +466,124 @@ async function mossyRockBake(dir: string): Promise<Buffer> {
   return Buffer.from(outcome.png);
 }
 
+/**
+ * Landscape Pro's rock master blends moss over stone by the surface's world-space normal (`WorldAlignedBlend`, sharpness 10,
+ * bias -2). Baked with a surface map whose left half faces up and right half faces sideways, the left half must be moss and
+ * the right half stone; a bake that ignores the surface paints both halves the same mid blend.
+ */
+async function worldAlignedMossBake(dir: string): Promise<Buffer> {
+  const pin = (node: string, output = 0) => ({ node, output, mask: null });
+  const graph = materialGraphSchema.parse({
+    format: 1,
+    material: "M_Rock",
+    package: "/Game/Pack/M_Rock",
+    truncated: false,
+    nodeCount: 6,
+    outputs: { baseColor: pin("mix"), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+    nodes: [
+      { id: "mix", class: "LinearInterpolate", inputs: { A: pin("stone"), B: pin("moss"), Alpha: pin("aligned", 1) }, constants: {} },
+      { id: "stone", class: "Constant3Vector", inputs: {}, constants: { Constant: [0.55, 0.45, 0.3, 1] } },
+      { id: "moss", class: "Constant3Vector", inputs: {}, constants: { Constant: [0.05, 0.3, 0.03, 1] } },
+      {
+        id: "aligned",
+        class: "FunctionCall",
+        inputs: { Input2: pin("sharpness"), Input3: pin("bias") },
+        constants: {},
+        function: "/Engine/Functions/Engine_MaterialFunctions01/AlphaBlend/WorldAlignedBlend.WorldAlignedBlend",
+        outputNames: ["Alpha", "w/Vertex Normals", "w/ Explicit Normal"],
+        fn: { inputs: { Input2: "sharpness", Input3: "bias" }, outputs: [], output: null },
+        error: "material function could not be loaded (engine content is not in the pack)",
+      },
+      { id: "sharpness", class: "Constant", inputs: {}, constants: { R: 10 } },
+      { id: "bias", class: "Constant", inputs: {}, constants: { R: -2 } },
+    ],
+  });
+  const size = 16;
+  const normals = new Float32Array(size * size * 3);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) normals.set(x < size / 2 ? [0, 1, 0] : [1, 0, 0], (y * size + x) * 3);
+  const surface: SurfaceNormals = { width: size, height: size, normals, covered: size * size };
+  const sourceDir = join(dir, "moss-source");
+  await mkdir(join(sourceDir, "Content", "Pack"), { recursive: true });
+  await writeFile(join(sourceDir, "Content", "Pack", "MI_Rock.uasset"), Buffer.alloc(16));
+  const baker = createGraphBaker({ sourceDir, maxTextureSize: 16, dumpGraphs: async () => new Map([["M_Rock", graph]]) })!;
+  const outcome = await baker({
+    materialName: "MI_Rock",
+    lookupName: "MI_Rock",
+    assets: { png: new Map() },
+    surface: () => surface,
+    readProps: (name) => (name === "MI_Rock" ? "Parent = Material3'Content/Pack/M_Rock.M_Rock'\n" : undefined),
+  });
+  if (outcome.status !== "baked") throw new Error(`moss bake failed: ${JSON.stringify(outcome)}`);
+  return Buffer.from(outcome.png);
+}
+
+/** Mean RGB of the object pixels left and right of the object's horizontal centre. */
+function halfMeans(image: RgbaImage): { left: [number, number, number]; right: [number, number, number] } {
+  const isObject = (o: number): boolean => !(Math.abs(image.data[o]! - 128) <= 6 && Math.abs(image.data[o + 1]! - 128) <= 6 && Math.abs(image.data[o + 2]! - 128) <= 6);
+  let minX = image.width;
+  let maxX = -1;
+  for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) if (isObject((y * image.width + x) * 4)) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); }
+  const middle = (minX + maxX) / 2;
+  const sums = { left: [0, 0, 0, 0], right: [0, 0, 0, 0] };
+  for (let y = 0; y < image.height; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const o = (y * image.width + x) * 4;
+      if (!isObject(o)) continue;
+      const half = x < middle ? sums.left : sums.right;
+      half[0]! += image.data[o]!;
+      half[1]! += image.data[o + 1]!;
+      half[2]! += image.data[o + 2]!;
+      half[3]! += 1;
+    }
+  }
+  const mean = (half: number[]): [number, number, number] => [half[0]! / Math.max(1, half[3]!), half[1]! / Math.max(1, half[3]!), half[2]! / Math.max(1, half[3]!)];
+  return { left: mean(sums.left), right: mean(sums.right) };
+}
+
+/**
+ * Landscape Pro's pines and trees: the mesh's slots are [lod3 card, bark, leafs] and its SectionInfoMap sends section 0 (the
+ * trunk) to bark and section 1 (the leaf cards) to leafs, but UE Viewer named the sections by raw index (lod3, bark). The
+ * importer re-points them. Two side-by-side quads stand for trunk (left) and leaf cards (right), each painted with the texture
+ * of the material its section ends up with: trunk brown, leaves green. Unmapped, the trunk gets the lod3 atlas and the
+ * leaves get bark.
+ */
+async function trunkAndLeavesGlb(path: string): Promise<void> {
+  const gltf = {
+    materials: [{ name: "MI_Lod3" }, { name: "MI_Bark" }],
+    meshes: [{ primitives: [{ material: 0 }, { material: 1 }] }],
+  };
+  remapGltfSectionMaterials(gltf, { slots: ["MI_Lod3", "MI_Bark", "MI_Leafs"], lod0: new Map([[0, 1], [1, 2]]) });
+  const colour: Record<string, [number, number, number]> = { MI_Lod3: [190, 175, 150], MI_Bark: [110, 75, 45], MI_Leafs: [50, 150, 50] };
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const mesh = document.createMesh("Tree");
+  for (const [section, primitive] of gltf.meshes[0]!.primitives.entries()) {
+    const name = gltf.materials[primitive.material]!.name;
+    const [r, g, b] = colour[name]!;
+    const flat = await sharp(Buffer.from([r, g, b, 255]), { raw: { width: 1, height: 1, channels: 4 } }).png().toBuffer();
+    const left = section === 0 ? -1.1 : 0.1;
+    const accessor = (type: "VEC3" | "VEC2" | "SCALAR", values: number[], kind: "f" | "u" = "f") =>
+      document.createAccessor().setType(type).setArray(kind === "f" ? new Float32Array(values) : new Uint16Array(values)).setBuffer(buffer);
+    mesh.addPrimitive(
+      document
+        .createPrimitive()
+        .setAttribute("POSITION", accessor("VEC3", [left, -1, 0, left + 1, -1, 0, left + 1, 1, 0, left, 1, 0]))
+        .setAttribute("NORMAL", accessor("VEC3", [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]))
+        .setAttribute("TEXCOORD_0", accessor("VEC2", [0, 1, 1, 1, 1, 0, 0, 0]))
+        .setIndices(accessor("SCALAR", [0, 1, 2, 0, 2, 3], "u"))
+        .setMaterial(
+          document
+            .createMaterial(name)
+            .setBaseColorTexture(document.createTexture(name).setImage(new Uint8Array(flat)).setMimeType("image/png"))
+            .setMetallicFactor(0)
+            .setRoughnessFactor(1),
+        ),
+    );
+  }
+  document.createScene().addChild(document.createNode("Tree").setMesh(mesh));
+  await new NodeIO().write(path, document);
+}
+
 interface Fixture {
   readonly name: string;
   readonly path: string;
@@ -474,6 +594,9 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
   const ragged = await raggedAlphaTexture();
   const graphLeaf = await graphBakedLeafTexture();
   const fixtures: Fixture[] = [];
+  const trunkPath = join(dir, "trunk-and-leaves.glb");
+  await trunkAndLeavesGlb(trunkPath);
+  fixtures.push({ name: "trunk-and-leaves", path: trunkPath });
   const write = async (name: string, options: Omit<GlbOptions, "name">): Promise<void> => {
     const path = join(dir, `${name}.glb`);
     await writeGlb(path, { name, ...options });
@@ -521,6 +644,7 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
     doubleSided: true,
   });
   await write("dead-tree-leaf", { geometry: "quad", baseColorFactor: [1, 1, 1, 1], texture: await leafTexture((await deadLeafTextureName(dir)) === "T_Green_Leaf" ? [60, 170, 50] : [150, 120, 80]) });
+  await write("moss-by-normal", { geometry: "quad", baseColorFactor: [1, 1, 1, 1], texture: await worldAlignedMossBake(dir) });
   await write("mossy-rock", { geometry: "cube", baseColorFactor: [1, 1, 1, 1], texture: await mossyRockBake(dir) });
   fixtures.push({ name: "vivid-atlas-card", path: await importedNeedleCard(dir, "vivid-atlas-card", { noMipmaps: true, vivid: true, solidMask: true }) });
   fixtures.push({ name: "matte-leaf-specular", path: await importedNeedleCard(dir, "matte-leaf-specular", { specular: 0.1, solidMask: true }) });
@@ -683,6 +807,20 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(result.stats.meanLuma).toBeLessThan(115);
     expect(g).toBeGreaterThan(b);
     expect(r).toBeLessThan(120);
+  });
+
+  it("moss follows the surface normal: the up-facing half is green moss, the side-facing half is stone (Landscape Pro)", () => {
+    const { left, right } = halfMeans(byName.get("moss-by-normal")!);
+    expect(left[1]).toBeGreaterThan(left[0]);
+    expect(right[0]).toBeGreaterThan(right[1]);
+    expect(left[0]).toBeLessThan(right[0] * 0.6);
+  });
+
+  it("a tree's trunk is bark brown and its leaf cards are leaf green, not swapped (Landscape Pro SectionInfoMap)", () => {
+    const { left, right } = halfMeans(byName.get("trunk-and-leaves")!);
+    expect(left[0]).toBeGreaterThan(left[1]);
+    expect(right[1]).toBeGreaterThan(right[0]);
+    expect(right[1]).toBeGreaterThan(left[1] * 1.3);
   });
 
   it("the solid box hue matches its base-colour factor", () => {

@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Texture } from "@gltf-transform/core";
+import { Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Root, type Texture } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsSpecular, KHRMaterialsUnlit } from "@gltf-transform/extensions";
 import { attachPsaAnimations, parsePsa, type PsaFile } from "./psa.js";
 
@@ -49,12 +49,14 @@ import {
   type ImportedScene,
   parseUnrealSceneSource,
 } from "./scenes.js";
+import { rasteriseSurfaceNormals, type SurfaceNormals, type SurfaceTriangles } from "./surface-normals.js";
+import { remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
 
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 66;
+export const IMPORTER_VERSION = 67;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1085,6 +1087,29 @@ export class TransformedImageCache {
   }
 }
 
+/** Resolution of the UV-space normal map a surface-reading graph bake is given. */
+const SURFACE_MAP_SIZE = 1024;
+const surfaceMaps = new WeakMap<Material, SurfaceNormals | null>();
+
+/** The vertex normals of every primitive that uses `material`, laid out in UV space; undefined when there are none to use. */
+function surfaceOf(root: Root, material: Material): SurfaceNormals | undefined {
+  const known = surfaceMaps.get(material);
+  if (known !== undefined) return known ?? undefined;
+  const triangles: SurfaceTriangles[] = [];
+  for (const mesh of root.listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      if (primitive.getMaterial() !== material) continue;
+      const uv = primitive.getAttribute("TEXCOORD_0")?.getArray();
+      const normal = primitive.getAttribute("NORMAL")?.getArray();
+      if (!uv || !normal) continue;
+      triangles.push({ uv, normal, indices: primitive.getIndices()?.getArray() ?? undefined });
+    }
+  }
+  const surface = triangles.length > 0 ? rasteriseSurfaceNormals(triangles, SURFACE_MAP_SIZE) : undefined;
+  surfaceMaps.set(material, surface ?? null);
+  return surface;
+}
+
 function attachTexture(
   material: Material,
   binding: MaterialTextureBinding,
@@ -1440,6 +1465,7 @@ export async function packageGlb(options: {
       // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
       // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
       ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
+      surface: () => surfaceOf(root, material),
       readProps: (propsName) => {
         const propsPath = materialAssets.props.get(propsName);
         return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
@@ -2782,7 +2808,14 @@ export async function importUnrealDirectory(
       // a transient process failure from silently removing a mesh from an otherwise valid pack.
       let outcome = await run();
       if (outcome.code !== 0) outcome = await run();
-      return outcome.code === 0 ? undefined : `UE Viewer export exited ${outcome.code}.`;
+      if (outcome.code !== 0) return `UE Viewer export exited ${outcome.code}.`;
+      // UE Viewer names each section's material by raw index; the mesh's SectionInfoMap says which slot the editor used.
+      if (entry.meshKind === "static") {
+        const exported = join(out, `${entry.selector.replace(/^Content\//i, "")}.gltf`);
+        const remapped = await remapMeshFileSectionMaterials(exported, entry.file);
+        if (remapped > 0) log(`${basename(entry.selector)}: ${remapped} section material(s) taken from SectionInfoMap instead of UE Viewer's raw index.`);
+      }
+      return undefined;
     } catch (error) {
       return error instanceof ToolchainError ? error.message : "UE Viewer export failed.";
     }
