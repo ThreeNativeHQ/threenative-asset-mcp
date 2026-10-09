@@ -120,6 +120,11 @@ export interface PropsFile {
   readonly vectors: readonly VectorParameter[];
   readonly vectorOverrides: readonly VectorParameter[];
   readonly parent: string | undefined;
+  /**
+   * The parent's package path as the `Parent =` line spells it (`Content/Pack/Dir/MI_Name`, no object suffix), or undefined
+   * when the line carries only a name. Two packages can share a parent's basename; this is what tells them apart.
+   */
+  readonly parentPackage: string | undefined;
   /** Instance-local streaming references identify a surface family, never its UV transform. */
   readonly streamingTextures: readonly string[];
   /** Legacy decoder sidecars can omit the flags that distinguish instance defaults from overrides. */
@@ -166,6 +171,13 @@ function objectName(reference: string): string | undefined {
   return name === "" || name === "None" ? undefined : name;
 }
 
+/** `Class'Content/A/B/Name.Name'` -> `Content/A/B/Name`; undefined when the reference holds no directory. */
+function packagePath(reference: string): string | undefined {
+  const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference.trim();
+  const beforeDot = quoted.includes(".") ? quoted.slice(0, quoted.lastIndexOf(".")) : quoted;
+  return beforeDot.includes("/") ? beforeDot : undefined;
+}
+
 /**
  * Parses umodel's `<Material>.props.txt`. The file is a brace-nested dump, so the block containing
  * `CollectedTextureParameters` is walked by depth rather than matched with one regex: the same
@@ -178,6 +190,7 @@ export function parsePropsFile(text: string): PropsFile {
   let blendMode: string | undefined;
   let opacityMaskClipValue: number | undefined;
   let parent: string | undefined;
+  let parentPackage: string | undefined;
   const collected: CollectedTextureParameter[] = [];
 
   const overrides: CollectedTextureParameter[] = [];
@@ -275,7 +288,9 @@ export function parsePropsFile(text: string): PropsFile {
       if (clip?.[1]) opacityMaskClipValue = Number(clip[1]);
     }
     if (parent === undefined && /^Parent\s*=/.test(line)) {
-      parent = objectName(line.slice(line.indexOf("=") + 1));
+      const reference = line.slice(line.indexOf("=") + 1);
+      parent = objectName(reference);
+      parentPackage = packagePath(reference);
     }
     if (!inCollected && /^CollectedTextureParameters\[\d+\]/.test(line)) {
       inCollected = true;
@@ -326,6 +341,7 @@ export function parsePropsFile(text: string): PropsFile {
     vectors,
     vectorOverrides,
     parent,
+    parentPackage,
     streamingTextures,
     overrideFlagsMissing: parent !== undefined && [
       ["TwoSided", twoSided], ["BlendMode", blendMode], ["OpacityMaskClipValue", opacityMaskClipValue],
