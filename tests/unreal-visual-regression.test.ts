@@ -315,7 +315,7 @@ async function writeNeedleCardPngs(dir: string, options: { vivid?: boolean; soli
     for (let x = 0; x < size; x++) {
       const o = (y * size + x) * 3;
       // Vivid: saturated green blades beside red-brown tips (uncorrelated channels), like the Fern Collection's fern_02_A.
-      colour.set(options.vivid ? ((x + y) % 3 === 0 ? [200, 30, 20] : [20, 190, 30]) : [40, 170, 60], o);
+      colour.set(options.vivid ? (((x >> 5) + (y >> 5)) % 3 === 0 ? [200, 30, 20] : [20, 190, 30]) : [40, 170, 60], o);
       mask.set([255, 160, options.solidMask || (x + 2 * y) % 4 === 0 ? 255 : 0], o);
     }
   }
