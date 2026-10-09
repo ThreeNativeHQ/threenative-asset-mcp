@@ -142,7 +142,7 @@ const SUPPORTED_NODE_CLASSES = [
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
 const SUPPORTED_ENGINE_FUNCTIONS = [
-  "MatLayerBlend_Standard", "MatLayerBlend_AO", "MatLayerBlend_BakedNormal", "FuzzyShading",
+  "MatLayerBlend_Standard", "MatLayerBlend_Simple", "MatLayerBlend_NormalBlend", "MatLayerBlend_AO", "MatLayerBlend_BakedNormal", "FuzzyShading",
   "SpeedTreeColorVariation",
   "PivotPainter2FoliageShader",
   "Blend_Overlay",
@@ -1245,6 +1245,17 @@ class Compiler {
     const lower = (name ?? "").toLowerCase();
     // Engine functions are matched by name before inlining. Each is trusted only as far as its comment says.
     if (lower === "matlayerblend_standard") return this.layerBlendStandard(node, name!);
+    if (lower === "matlayerblend_simple") {
+      // Same pin shape as Standard (base, layer, alpha); the engine body is not in the pack, so the per-attribute lerp is inferred.
+      this.approximations.add(`${name}: attributes lerped by alpha like MatLayerBlend_Standard; engine body unavailable`);
+      return this.layerBlendStandard(node, name!);
+    }
+    if (lower === "matlayerblend_normalblend") {
+      // Only blends a normal into the attributes it receives (Input2 is the normal), so BaseColor is the attributes input's.
+      // The UE4 mannequin wires the attributes to Input1 and leaves Input0 empty; accept either, preferring Input1.
+      this.approximations.add(`${name}: BaseColor passed through; engine body unavailable`);
+      return this.passThrough(node, node.inputs.Input1 ? "Input1" : "Input0", name!);
+    }
     if (lower === "matlayerblend_ao" || lower === "matlayerblend_bakednormal") {
       // These only write ambient occlusion / normal into the blended attributes, so BaseColor of the first
       // layer is the output's BaseColor. The bodies are engine content that the pack does not carry, hence heuristic.

@@ -381,6 +381,51 @@ describe("bakeGraph", () => {
     expect(result).toMatchObject({ status: "unsupported", unsupported: ["MatLayerBlend_Tint"] });
   });
 
+  it("lerps the layers of MatLayerBlend_Simple and passes MatLayerBlend_NormalBlend's attributes through (UE4 mannequin shape)", async () => {
+    // M_UE4Man_Body: NormalBlend(Input0 unwired, Input1 = attributes, Input2 = normal map) feeds the material attributes,
+    // and MatLayerBlend_Simple(Input0 = base, Input1 = top, Input2 = alpha) chains are blended by a mask texture's channels.
+    const graph = makeGraph(
+      [
+        node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("normalBlend") }, outputNames: ["BaseColor"] }),
+        engineCall("normalBlend", "MatLayerBlend_NormalBlend", { Input0: null, Input1: pin("simple"), Input2: pin("normal", 0, RGB_MASK) }),
+        engineCall("simple", "MatLayerBlend_Simple", { Input0: pin("base"), Input1: pin("top"), Input2: pin("alpha") }),
+        node("base", "MakeMaterialAttributes", { inputs: { BaseColor: pin("red") } }),
+        node("top", "MakeMaterialAttributes", { inputs: { BaseColor: pin("blue") } }),
+        constant3("red", [1, 0, 0]),
+        constant3("blue", [0, 0, 1]),
+        constant3("normal", [0.5, 0.5, 1]),
+        node("alpha", "Constant", { constants: { R: 0.5 } }),
+      ],
+      pin("break", 0, RGB_MASK),
+    );
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+    expect(result.status).toBe("baked");
+    expect((result as { unsupported?: string[] }).unsupported ?? []).toEqual([]);
+    const pixel = await pixelsOf(result);
+    // lerp(red, blue, 0.5) in linear light, encoded to sRGB.
+    const [r = 0, g = 0, b = 0] = pixel(0, 0);
+    expect(r).toBeGreaterThan(150);
+    expect(r).toBeLessThan(210);
+    expect(g).toBe(0);
+    expect(Math.abs(r - b)).toBeLessThanOrEqual(1);
+  });
+
+  it("falls back to NormalBlend's Input0 when Input1 is unwired", async () => {
+    const graph = makeGraph(
+      [
+        node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("normalBlend") }, outputNames: ["BaseColor"] }),
+        engineCall("normalBlend", "MatLayerBlend_NormalBlend", { Input0: pin("base"), Input1: null, Input2: pin("normal", 0, RGB_MASK) }),
+        node("base", "MakeMaterialAttributes", { inputs: { BaseColor: pin("red") } }),
+        constant3("red", [1, 0, 0]),
+        constant3("normal", [0.5, 0.5, 1]),
+      ],
+      pin("break", 0, RGB_MASK),
+    );
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+    expect(result.status).toBe("baked");
+    expect((await pixelsOf(result))(0, 0)).toEqual([255, 0, 0]);
+  });
+
   it("refuses a graph whose BaseColor needs another attribute of a Break node", async () => {
     const graph = makeGraph(
       [
