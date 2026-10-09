@@ -15,6 +15,7 @@ import {
   type ResolvedMaterial,
   type ResolveMaterialRequest,
   type TextureTransform,
+  isColourTexture,
   parsePropsFile,
   resolveMaterial,
 } from "./materials.js";
@@ -53,7 +54,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 65;
+export const IMPORTER_VERSION = 66;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1547,7 +1548,12 @@ export async function packageGlb(options: {
     for (const binding of ordered) {
       const source = materialAssets.png.get(binding.texture);
       if (!source) continue;
-      if (binding.slot === "baseColor" && binding.source !== "effect") {
+      // A vivid, uncorrelated leaf atlas (a fern frond with green blades and red-brown tips) fails the albedo statistics, but
+      // a texture UE Viewer wired to Diffuse, named as a colour map and cut out through a packed opacity map is the leaf
+      // colour: the packed masks this check exists for are never masked foliage cards.
+      const namedColourCutout =
+        binding.source === "mat" && binding.secondaryTexture !== undefined && resolved.alphaMode !== "OPAQUE" && isColourTexture(binding.texture);
+      if (binding.slot === "baseColor" && binding.source !== "effect" && !namedColourCutout) {
         const verdict = await classifyAlbedo(await readFile(source));
         if (!verdict.isAlbedo) {
           // Not a photograph of a surface. Leave the slot on its neutral fallback and hand the

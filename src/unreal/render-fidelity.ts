@@ -85,7 +85,7 @@ export function srgbToLinear(value: number): number {
 /** Chromaticity distance (r, g of r+g+b) from the floor's within which a bluish dark pixel is the floor's shadow. */
 const SHADOW_CHROMA_RADIUS = 0.12;
 /** A floor whose own chroma (max - min over max) is below this is neutral grey; shadows there are grey and not separable by colour. */
-const TINTED_FLOOR_SATURATION = 0.04;
+const TINTED_FLOOR_SATURATION = 0.02;
 
 /**
  * Removes a cast shadow from the object mask. An editor thumbnail's floor is blue-grey and the piece casts a dark,
