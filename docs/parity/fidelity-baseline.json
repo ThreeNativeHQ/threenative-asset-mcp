@@ -6,6 +6,34 @@
   "suspect": 4,
   "fail": 6
  },
+ "3262ab8f-KiteDemo421": {
+  "compared": 11,
+  "meanScore": 40.9,
+  "minScore": 0,
+  "suspect": 2,
+  "fail": 8
+ },
+ "3262ab8f-KiteDemo47315": {
+  "compared": 11,
+  "meanScore": 40.9,
+  "minScore": 0,
+  "suspect": 2,
+  "fail": 8
+ },
+ "75f42402-SoulCave418": {
+  "compared": 9,
+  "meanScore": 50.5,
+  "minScore": 10.7,
+  "suspect": 3,
+  "fail": 5
+ },
+ "7bbf72cf-KUBIKOSCaba2596bf440V1": {
+  "compared": 11,
+  "meanScore": 81,
+  "minScore": 32.6,
+  "suspect": 2,
+  "fail": 1
+ },
  "b2b5e215-Temperatd04bb180da4fV1": {
   "compared": 12,
   "meanScore": 81.7,
