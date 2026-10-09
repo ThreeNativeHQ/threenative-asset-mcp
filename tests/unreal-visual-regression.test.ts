@@ -8,6 +8,9 @@ import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { renderTiles } from "../src/unreal/contact-sheet.js";
+import { packageGlb } from "../src/unreal/importer.js";
+import type { SourceMaterial } from "../src/unreal/source-material.js";
+import { writeMeshFixture } from "./helpers/unreal-fixture.js";
 import { compareImages, decodeRgba, type RgbaImage } from "../src/unreal/image-diff.js";
 import { resolveMaterial, type ResolveMaterialRequest } from "../src/unreal/materials.js";
 import { WASHED_OUT_LUMA, judgeRender } from "../src/unreal/visual-judge.js";
@@ -249,6 +252,60 @@ function unwiredEmissiveGrey(): readonly [number, number, number] {
   return resolved.bindings.some((binding) => binding.slot === "emissive") ? [0.72, 0.72, 0.72] : [0, 0, 0];
 }
 
+/**
+ * A finely hatched mask (one opaque pixel in four, like needles on a card) as the blue channel of a packed `_AORO` map, and a
+ * leaf-green colour map. Mipmapped, the mask averages to its 25% mean at distance, falls under the 0.333 cut and the card
+ * vanishes; unmipped (what the pack authors for the map) the needles stay.
+ */
+async function writeNeedleCardPngs(dir: string): Promise<void> {
+  const size = 512;
+  const colour = Buffer.alloc(size * size * 3);
+  const mask = Buffer.alloc(size * size * 3);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const o = (y * size + x) * 3;
+      colour.set([40, 170, 60], o);
+      mask.set([255, 160, (x + 2 * y) % 4 === 0 ? 255 : 0], o);
+    }
+  }
+  await sharp(colour, { raw: { width: size, height: size, channels: 3 } }).png().toFile(join(dir, "Leaf_A.png"));
+  await sharp(mask, { raw: { width: size, height: size, channels: 3 } }).png().toFile(join(dir, "Leaf_AORO.png"));
+}
+
+/** A masked foliage card exactly as the importer packages it: `Opacity=` names the colour map, the cut-out is the AORO blue. */
+async function importedNeedleCard(dir: string, name: string, options: { noMipmaps?: boolean; specular?: number }): Promise<string> {
+  const source = join(dir, name);
+  await writeMeshFixture(source, {
+    name: "Mesh",
+    materialName: "Leaf",
+    mat: "Diffuse=Leaf_A\nOpacity=Leaf_A\nOther[0]=Leaf_AORO\n",
+    props: "BlendMode = BLEND_Masked (1)\nOpacityMaskClipValue = 0.333\nTwoSided = true\n",
+    textures: [],
+  });
+  await writeNeedleCardPngs(source);
+  const authored: SourceMaterial | undefined =
+    options.specular === undefined ? undefined : { channels: { Specular: { kind: "scalar", value: options.specular } }, baseColorSamples: [], limitations: [] };
+  const glbPath = join(dir, `${name}.glb`);
+  await packageGlb({
+    gltfPath: join(source, "Mesh.gltf"),
+    glbPath,
+    keepAllUvSets: false,
+    maxTextureSize: undefined,
+    assets: {
+      gltf: new Map(),
+      mat: new Map([["Leaf", join(source, "Leaf.mat")]]),
+      props: new Map([["Leaf", join(source, "Leaf.props.txt")]]),
+      png: new Map([["Leaf_A", join(source, "Leaf_A.png")], ["Leaf_AORO", join(source, "Leaf_AORO.png")]]),
+      psa: new Map(),
+      audio: new Map(),
+      dna: new Map(),
+    },
+    ...(options.noMipmaps ? { noMipmapTextures: new Set(["Leaf_AORO"]) } : {}),
+    ...(authored ? { sourceMaterial: () => authored } : {}),
+  });
+  return glbPath;
+}
+
 interface Fixture {
   readonly name: string;
   readonly path: string;
@@ -293,6 +350,8 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
     alphaCutoff: 0.5,
     doubleSided: true,
   });
+  fixtures.push({ name: "needle-card-mipped", path: await importedNeedleCard(dir, "needle-card-mipped", {}) });
+  fixtures.push({ name: "needle-card-unmipped", path: await importedNeedleCard(dir, "needle-card-unmipped", { noMipmaps: true }) });
   await write("solid-box", { geometry: "cube", baseColorFactor: [0.15, 0.3, 0.85, 1] });
   await write("neutral-grey", { geometry: "cube", baseColorFactor: [0.5, 0.5, 0.5, 1] });
   await write("solid-quad", { geometry: "quad", baseColorFactor: [0.2, 0.7, 0.3, 1] });
@@ -364,6 +423,13 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(cutout.stats.objectPixels).toBeGreaterThan(200);
     expect(solid.stats.fillRatio).toBeGreaterThan(0.5);
     expect(cutout.stats.fillRatio).toBeLessThan(solid.stats.fillRatio * 0.75);
+  });
+
+  it("a needle card whose mask has no mip chain keeps its coverage; mipmapped it thins out", () => {
+    const mipped = judgeRender(byName.get("needle-card-mipped")!);
+    const unmipped = judgeRender(byName.get("needle-card-unmipped")!);
+    expect(unmipped.stats.objectPixels).toBeGreaterThan(200);
+    expect(unmipped.stats.objectPixels).toBeGreaterThan(mipped.stats.objectPixels * 2);
   });
 
   it("the zero-alpha-tint card is not blank", () => {
