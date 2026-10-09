@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.61",
+  version: "b4e95441+threenative.62",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */

@@ -59,8 +59,8 @@ function resolveInstance(parameters: readonly (readonly [string, string])[]) {
 }
 
 describe("converter: a material instance's texture overrides", () => {
-  it("reads the tagged TextureParameterValues too, not only CUE4Parse's typed array (converter 61)", () => {
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.61");
+  it("reads the tagged TextureParameterValues too, not only CUE4Parse's typed array (converter 62)", () => {
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.62");
     const exporter = CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("async Task ExportMaterialAsync"));
     expect(exporter).toContain('instance.GetOrDefault<FStructFallback[]>("TextureParameterValues")');
   });

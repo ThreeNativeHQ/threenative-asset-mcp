@@ -1896,7 +1896,7 @@ describe("CollectionParameter", () => {
     if (result.status === "unsupported") expect(result.unsupported).toEqual(["CollectionParameter"]);
   });
 
-  it("is wired into the converter's graph dump (converter 61)", async () => {
+  it("is wired into the converter's graph dump (converter 62)", async () => {
     const { CUE4PARSE_PROGRAM } = await import("../src/unreal/cue4parse-adapter.js");
     expect(CUE4PARSE_PROGRAM).toContain('className == "CollectionParameter"');
     expect(CUE4PARSE_PROGRAM).toContain('"ScalarParameters"');
