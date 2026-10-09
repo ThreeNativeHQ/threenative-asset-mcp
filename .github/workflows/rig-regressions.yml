@@ -15,24 +15,52 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rig-regressions:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      FAB_BROWSER_HEADLESS: "true"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: '22'
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.x
           cache: npm
-      - run: npm ci --no-audit --no-fund
-      - run: npm run typecheck
-      - name: Install preview backends
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Python for local creature fixtures
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      # The hand fix ships in the published GLB, so this leg runs the whole suite and
+      # needs the same prerequisites CI does. npm, pip, apt and Playwright downloads
+      # can stall; fail in 15 min instead of at the 45-min job limit.
+      - name: Install deterministic test prerequisites
+        timeout-minutes: 15
         run: |
+          npm ci --no-audit --no-fund
+          python -m pip install --disable-pip-version-check --only-binary=:all: numpy==2.3.5 pillow==12.0.0
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
           npx --no-install playwright install --with-deps chromium
-          python3 -m venv "$RUNNER_TEMP/rig-python"
-          "$RUNNER_TEMP/rig-python/bin/python" -m pip install numpy==2.2.6 Pillow==11.3.0
-          echo "$RUNNER_TEMP/rig-python/bin" >> "$GITHUB_PATH"
+
+      - run: npm run typecheck
+
       # Each integration file can launch Chromium, Python and installed MCP
       # processes. Bound concurrency instead of weakening existing deadlines.
+      # npm test builds first, so the cancellation test finds dist/index.js.
       - run: npm test -- --maxWorkers=1
