@@ -339,6 +339,67 @@ export interface RetargetResult {
   rootDisplacement: number;
 }
 
+interface HipsTranslation {
+  source: Node;
+  target: Node;
+  sourceRest: Vector3;
+  targetRest: Vector3;
+  scale: number;
+  sample: (time: number) => Vector3;
+}
+
+function restWorldPosition(node: Node, parents: Map<Node, Node | null>, restWorld: Map<Node, Quaternion>): Vector3 {
+  const chain: Node[] = [];
+  for (let current: Node | null | undefined = node; current; current = parents.get(current)) chain.unshift(current);
+  const position = new Vector3();
+  chain.forEach((link, index) => {
+    const parentRotation = index === 0 ? new Quaternion() : restWorld.get(chain[index - 1]!)!;
+    position.add(readLocal(link).position.applyQuaternion(parentRotation));
+  });
+  return position;
+}
+
+/** Returns a hips translation plan only when the donor hips actually leave their rest position. */
+function planHipsTranslation(
+  mapping: SkeletonMapping,
+  sourceJoints: readonly Node[],
+  targetJoints: readonly Node[],
+  sourceDocument: Document,
+  sourceParents: Map<Node, Node | null>,
+  targetParents: Map<Node, Node | null>,
+  sourceRestWorld: Map<Node, Quaternion>,
+  targetRestWorld: Map<Node, Quaternion>,
+): HipsTranslation | undefined {
+  const role = mapping.roles.find((entry) => entry.role === "hips");
+  const target = role ? targetJoints.find((joint) => joint.getName() === role.target) : undefined;
+  const source = role ? sourceJoints.find((joint) => joint.getName() === role.source) : undefined;
+  if (!target || !source) return undefined;
+  const sampler = sourceDocument.getRoot().listAnimations()
+    .flatMap((entry) => entry.listChannels())
+    .find((channel) => channel.getTargetNode() === source && channel.getTargetPath() === "translation")?.getSampler();
+  const input = sampler?.getInput()?.getArray();
+  const output = sampler?.getOutput()?.getArray();
+  if (!input || !output || input.length === 0 || output.length < input.length * 3) return undefined;
+  const sourceRest = readLocal(source).position;
+  const at = (index: number) => new Vector3(Number(output[index * 3]), Number(output[index * 3 + 1]), Number(output[index * 3 + 2]));
+  let moves = false;
+  for (let index = 0; index < input.length && !moves; index += 1) moves = at(index).distanceTo(sourceRest) > 1e-6;
+  if (!moves) return undefined;
+  const sourceHeight = restWorldPosition(source, sourceParents, sourceRestWorld).y;
+  const targetHeight = restWorldPosition(target, targetParents, targetRestWorld).y;
+  const scale = sourceHeight > 1e-6 && targetHeight > 1e-6 ? targetHeight / sourceHeight : 1;
+  const sample = (time: number): Vector3 => {
+    const last = input.length - 1;
+    const clamped = Math.min(Math.max(time, Number(input[0])), Number(input[last]));
+    let index = 0;
+    while (index < last && Number(input[index + 1]) < clamped) index += 1;
+    const next = Math.min(index + 1, last);
+    const span = Number(input[next]) - Number(input[index]);
+    return at(index).lerp(at(next), span > 0 ? (clamped - Number(input[index])) / span : 0);
+  };
+  return { source, target, sourceRest, targetRest: readLocal(target).position, scale, sample };
+}
+
 /** True when every frame of a packed quaternion track equals the first within 1e-6 radians. */
 function isConstantRotation(values: Float32Array): boolean {
   const first = new Quaternion(values[0], values[1], values[2], values[3]);
@@ -441,6 +502,12 @@ export async function retargetClip(
   const targetRotations = new Map<Node, Float32Array<ArrayBuffer>>();
   for (const joint of targetJoints) targetRotations.set(joint, new Float32Array(frameCount * 4));
 
+  // The hips carry the body's bob, sway and crouch (a sitting clip lowers the pelvis for the
+  // whole clip), so their translation is retargeted too: the donor's offset from its rest,
+  // scaled by the ratio of hip heights and re-expressed in the target's animated parent frame.
+  const hips = planHipsTranslation(mapping, sourceJoints, targetJoints, sourceDocument, sourceParents, targetParents, sourceRestWorld, targetRestWorld);
+  const hipsTranslation = hips ? new Float32Array(frameCount * 3) : undefined;
+
   for (let frame = 0; frame < frameCount; frame += 1) {
     const time = times[frame]!;
     const sourceAnimated = new Map<Node, Quaternion>();
@@ -469,6 +536,13 @@ export async function retargetClip(
       }
       const local = parentWorld.clone().invert().multiply(world).normalize();
       targetAnimated.set(node, world);
+      if (hips && hipsTranslation && node === hips.target) {
+        const offset = hips.sample(time).sub(hips.sourceRest).multiplyScalar(hips.scale);
+        const sourceParent = sourceParents.get(hips.source);
+        const inWorld = offset.applyQuaternion(sourceParent ? sourceAnimated.get(sourceParent)! : new Quaternion());
+        const position = hips.targetRest.clone().add(inWorld.applyQuaternion(parentWorld.clone().invert()));
+        hipsTranslation.set([position.x, position.y, position.z], frame * 3);
+      }
       const output = targetRotations.get(node);
       if (output) output.set([local.x, local.y, local.z, local.w], frame * 4);
     }
@@ -515,6 +589,20 @@ export async function retargetClip(
           .setTargetNode(node)
           .setTargetPath("rotation"),
       );
+  }
+
+  // When the hips are the root bone, the root-motion channel below already owns their translation.
+  const hipsAtRoot = options.rootMotion === true && hips?.target === targetJoints[0];
+  if (hips && hipsTranslation && !hipsAtRoot) {
+    const output = targetDocument
+      .createAccessor(`${options.clipName}-${hips.target.getName()}-translation`)
+      .setType("VEC3")
+      .setArray(hipsTranslation)
+      .setBuffer(buffer);
+    const sampler = targetDocument.createAnimationSampler().setInput(inputAccessor).setOutput(output).setInterpolation("LINEAR");
+    animation
+      .addSampler(sampler)
+      .addChannel(targetDocument.createAnimationChannel().setSampler(sampler).setTargetNode(hips.target).setTargetPath("translation"));
   }
 
   let rootDisplacement = 0;

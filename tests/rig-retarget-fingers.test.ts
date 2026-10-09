@@ -20,10 +20,11 @@ interface Joint {
   position: [number, number, number];
 }
 
-function skeleton(options: { fingers: boolean; segments?: Partial<Record<(typeof FINGERS)[number], number>> }): Joint[] {
+function skeleton(options: { fingers: boolean; segments?: Partial<Record<(typeof FINGERS)[number], number>>; pelvisHeight?: number }): Joint[] {
   const joints: Joint[] = [
     { key: "root", parent: null, position: [0, 0, 0] },
-    { key: "pelvis", parent: "root", position: [0, 1, 0] },
+    // Unreal style: the pelvis sits up the root's local z, which the rotated root turns into world up.
+    { key: "pelvis", parent: "root", position: [0, 0, options.pelvisHeight ?? 1] },
     { key: "spine1", parent: "pelvis", position: [0, 0.1, 0] },
     { key: "spine2", parent: "spine1", position: [0, 0.15, 0] },
     { key: "spine3", parent: "spine2", position: [0, 0.15, 0] },
@@ -104,7 +105,7 @@ interface Rig {
   rest: Map<string, Quaternion>;
 }
 
-function buildRig(naming: Naming, options: { fingers: boolean; segments?: Partial<Record<(typeof FINGERS)[number], number>>; animateFingers?: boolean }): Rig {
+function buildRig(naming: Naming, options: { fingers: boolean; segments?: Partial<Record<(typeof FINGERS)[number], number>>; animateFingers?: boolean; pelvisHeight?: number; hips?: "moving" | "constant" }): Rig {
   const document = new Document();
   const buffer = document.createBuffer();
   const armature = document.createNode("Armature");
@@ -130,7 +131,41 @@ function buildRig(naming: Naming, options: { fingers: boolean; segments?: Partia
       .setOutput(document.createAccessor().setType("VEC4").setBuffer(buffer).setArray(new Float32Array(values)));
     animation.addSampler(sampler).addChannel(document.createAnimationChannel().setSampler(sampler).setTargetNode(nodes.get(joint.key)!).setTargetPath("rotation"));
   }
+  if (options.hips) {
+    const pelvis = nodes.get("pelvis")!;
+    const restPosition = new Vector3(...pelvis.getTranslation());
+    const values = KEY_TIMES.flatMap((_, keyframe) => {
+      const offset = options.hips === "moving" ? HIPS_OFFSETS[keyframe]! : new Vector3();
+      return restPosition.clone().add(offset).toArray();
+    });
+    const sampler = document.createAnimationSampler().setInterpolation("LINEAR").setInput(input)
+      .setOutput(document.createAccessor().setType("VEC3").setBuffer(buffer).setArray(new Float32Array(values)));
+    animation.addSampler(sampler).addChannel(document.createAnimationChannel().setSampler(sampler).setTargetNode(pelvis).setTargetPath("translation"));
+  }
   return { document, nodes, rest };
+}
+
+/** The first frame already sits below the rest pose, like a real clip's first pelvis sample. */
+const HIPS_OFFSETS = [new Vector3(0, 0, -0.046), new Vector3(0.01, 0.02, 0.03), new Vector3(-0.02, 0.01, -0.04)];
+
+function hipsOffset(time: number): Vector3 {
+  const segment = time <= 0.5 ? 0 : 1;
+  const alpha = time <= 0.5 ? time / 0.5 : (time - 0.5) / 0.5;
+  return HIPS_OFFSETS[segment]!.clone().lerp(HIPS_OFFSETS[segment + 1]!, alpha);
+}
+
+function retargetedPosition(document: Document, node: Node, time: number): Vector3 | undefined {
+  const channel = document.getRoot().listAnimations().at(-1)!.listChannels()
+    .find(entry => entry.getTargetNode() === node && entry.getTargetPath() === "translation");
+  if (!channel) return undefined;
+  const times = channel.getSampler()!.getInput()!.getArray()!;
+  const values = channel.getSampler()!.getOutput()!.getArray()!;
+  let index = 0;
+  while (index < times.length - 2 && times[index + 1]! < time) index += 1;
+  const span = times[index + 1]! - times[index]!;
+  const alpha = Math.min(1, Math.max(0, span > 0 ? (time - times[index]!) / span : 0));
+  const at = (offset: number) => new Vector3(values[offset * 3]!, values[offset * 3 + 1]!, values[offset * 3 + 2]!);
+  return at(index).lerp(at(index + 1), alpha);
 }
 
 /** The authored local rotation of a joint at time t, interpolated like a glTF viewer does. */
@@ -354,5 +389,41 @@ describe("constant tracks are stored compactly", () => {
     const reloaded = await new NodeIO().readBinary(await new NodeIO().writeBinary(target.document));
     const finger = reloaded.getRoot().listNodes().find(node => node.getName() === "index_02_l")!;
     for (const time of FRAME_TIMES) expect(degrees(retargeted(reloaded, finger, time), target.rest.get("index2.L")!), "reloaded finger").toBeLessThan(1e-3);
+  });
+});
+
+describe("hips translation", () => {
+  it.each([["unreal"], ["mixamo"]] as const)("a self-retarget of a %s rig reproduces the pelvis motion", async naming => {
+    const donor = buildRig(naming, { fingers: false, hips: "moving" });
+    const target = buildRig(naming, { fingers: false });
+    await retargetClip(donor.document, target.document, { clipName: "Bob" });
+    const pelvis = target.nodes.get("pelvis")!;
+    const rest = new Vector3(...pelvis.getTranslation());
+    for (const time of FRAME_TIMES) {
+      const position = retargetedPosition(target.document, pelvis, time);
+      expect(position, "pelvis translation channel").toBeDefined();
+      expect(position!.distanceTo(rest.clone().add(hipsOffset(time)))).toBeLessThan(1e-4);
+    }
+  });
+
+  it("scales the donor's offset by the ratio of hip heights", async () => {
+    const donor = buildRig("unreal", { fingers: false, hips: "moving", pelvisHeight: 1 });
+    const target = buildRig("mixamo", { fingers: false, pelvisHeight: 2 });
+    await retargetClip(donor.document, target.document, { clipName: "Bob" });
+    const pelvis = target.nodes.get("pelvis")!;
+    const rest = new Vector3(...pelvis.getTranslation());
+    for (const time of FRAME_TIMES) {
+      const expected = rest.clone().add(hipsOffset(time).multiplyScalar(2));
+      expect(retargetedPosition(target.document, pelvis, time)!.distanceTo(expected), `t=${time}`).toBeLessThan(2e-3);
+    }
+  });
+
+  it("writes no translation channel when the donor hips never leave their rest position", async () => {
+    for (const hips of [undefined, "constant"] as const) {
+      const donor = buildRig("unreal", { fingers: false, ...(hips ? { hips } : {}) });
+      const target = buildRig("unreal", { fingers: false });
+      await retargetClip(donor.document, target.document, { clipName: "Still" });
+      expect(retargetedPosition(target.document, target.nodes.get("pelvis")!, 0.3)).toBeUndefined();
+    }
   });
 });
