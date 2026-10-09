@@ -370,7 +370,7 @@ describe("bakeGraph", () => {
     const graph = makeGraph(
       [
         node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("contrast") }, outputNames: ["BaseColor", "Metallic"] }),
-        engineCall("contrast", "MatLayerBlend_Tint", { Input0: pin("make"), Input1: pin("amount") }),
+        engineCall("contrast", "MatLayerBlend_Imaginary", { Input0: pin("make"), Input1: pin("amount") }),
         node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("c") } }),
         constant3("c", [0.5, 0.5, 0.5]),
         node("amount", "Constant", { constants: { R: 0.2 } }),
@@ -378,7 +378,7 @@ describe("bakeGraph", () => {
       pin("break", 0, RGB_MASK),
     );
     const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
-    expect(result).toMatchObject({ status: "unsupported", unsupported: ["MatLayerBlend_Tint"] });
+    expect(result).toMatchObject({ status: "unsupported", unsupported: ["MatLayerBlend_Imaginary"] });
   });
 
   it("lerps the layers of MatLayerBlend_Simple and passes MatLayerBlend_NormalBlend's attributes through (UE4 mannequin shape)", async () => {
@@ -961,21 +961,21 @@ describe("graphPathClasses and supportedNodeClasses", () => {
     const graph = makeGraph(
       [
         node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("contrast") }, outputNames: ["BaseColor"] }),
-        engineCall("contrast", "MatLayerBlend_Tint", { Input0: pin("make") }),
+        engineCall("contrast", "MatLayerBlend_Imaginary", { Input0: pin("make") }),
         node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("v") } }),
         node("v", "VertexColor"),
       ],
       pin("break", 0, RGB_MASK),
     );
-    expect(graphPathClasses(graph, "baseColor")).toEqual(["BreakMaterialAttributes", "FunctionCall", "MakeMaterialAttributes", "MatLayerBlend_Tint", "VertexColor"]);
+    expect(graphPathClasses(graph, "baseColor")).toEqual(["BreakMaterialAttributes", "FunctionCall", "MakeMaterialAttributes", "MatLayerBlend_Imaginary", "VertexColor"]);
   });
 
   it("exposes the closed node set", () => {
     const supported = supportedNodeClasses();
-    for (const name of ["TextureSample", "TextureSampleParameter2D", "LinearInterpolate", "FunctionCall", "StaticSwitch", "FeatureLevelSwitch"]) {
+    for (const name of ["TextureSample", "TextureSampleParameter2D", "LinearInterpolate", "FunctionCall", "StaticSwitch", "FeatureLevelSwitch", "Fresnel", "DepthFade"]) {
       expect(supported).toContain(name);
     }
-    for (const name of ["VertexColor", "Panner", "Time", "WorldPosition", "Fresnel"]) expect(supported).not.toContain(name);
+    for (const name of ["VertexColor", "Panner", "Time", "WorldPosition", "ReflectionVectorWS"]) expect(supported).not.toContain(name);
   });
 });
 
@@ -1125,7 +1125,7 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
         constant3("c", [0.25, 0.5, 0.75]),
         node("wpo", "RotateAboutAxis"),
         node("normal", "VertexNormalWS"),
-        node("shading", "Fresnel"),
+        node("shading", "Panner"),
       ],
       pin("break", 0, RGB_MASK),
     );
@@ -1136,15 +1136,15 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
 
   it("an unsupported node on the BaseColor pin or the incoming attributes still blocks", async () => {
     const onColour = makeGraph(
-      [breakBaseColor("set"), set({ "Inputs[0]": pin("make"), "Inputs[1]": pin("bad") }, [G.BaseColor]), makeColour("make", "c"), constant3("c", [1, 1, 1]), node("bad", "Fresnel")],
+      [breakBaseColor("set"), set({ "Inputs[0]": pin("make"), "Inputs[1]": pin("bad") }, [G.BaseColor]), makeColour("make", "c"), constant3("c", [1, 1, 1]), node("bad", "Panner")],
       pin("break", 0, RGB_MASK),
     );
-    expect(await bake(onColour)).toMatchObject({ status: "unsupported", unsupported: ["Fresnel"] });
+    expect(await bake(onColour)).toMatchObject({ status: "unsupported", unsupported: ["Panner"] });
     const onIncoming = makeGraph(
-      [breakBaseColor("set"), set({ "Inputs[0]": pin("bad"), "Inputs[1]": pin("c") }, [G.Roughness]), constant3("c", [1, 1, 1]), node("bad", "Fresnel")],
+      [breakBaseColor("set"), set({ "Inputs[0]": pin("bad"), "Inputs[1]": pin("c") }, [G.Roughness]), constant3("c", [1, 1, 1]), node("bad", "Panner")],
       pin("break", 0, RGB_MASK),
     );
-    expect(await bake(onIncoming)).toMatchObject({ status: "unsupported", unsupported: ["Fresnel"] });
+    expect(await bake(onIncoming)).toMatchObject({ status: "unsupported", unsupported: ["Panner"] });
   });
 
   it("falls back to by-name matching when the dump carries no attributeTypes", async () => {
@@ -1170,7 +1170,7 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
 
   it("BreakMaterialAttributes does not walk its input for an attribute that is not BaseColor", async () => {
     const graph = makeGraph(
-      [node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("bad") }, outputNames: ["BaseColor", "Metallic"] }), node("bad", "Fresnel")],
+      [node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("bad") }, outputNames: ["BaseColor", "Metallic"] }), node("bad", "Panner")],
       pin("break", 1, RGB_MASK),
     );
     expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Metallic"] });
@@ -1189,7 +1189,7 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
         node("q", "QualitySwitch", { inputs: { Default: pin("hi", 0, RGB_MASK), "Inputs[0]": pin("bad"), "Inputs[1]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }),
         constant3("hi", [0.25, 0.5, 0.75]),
         constant3("lo", [1, 0, 0]),
-        node("bad", "Fresnel"),
+        node("bad", "Panner"),
       ],
       pin("q", 0, RGB_MASK),
     );
@@ -1212,7 +1212,7 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
     ];
     for (const [name, note] of cases) {
       const graph = makeGraph(
-        [engineCall("f", name, { Input0: pin("c", 0, RGB_MASK), Input1: pin("bad") }), constant3("c", [0.25, 0.5, 0.75]), node("bad", "Fresnel")],
+        [engineCall("f", name, { Input0: pin("c", 0, RGB_MASK), Input1: pin("bad") }), constant3("c", [0.25, 0.5, 0.75]), node("bad", "Panner")],
         pin("f", 0, RGB_MASK),
       );
       const result = await bake(graph);
@@ -1417,7 +1417,7 @@ describe("standard math nodes and engine utility functions seen on real BaseColo
     const nodes = [
       node("q", "PathTracingQualitySwitch", { inputs: { Normal: pin("hi", 0, RGB_MASK), PathTraced: pin("bad") } }),
       constant3("hi", [0.25, 0.5, 0.75]),
-      node("bad", "Fresnel"),
+      node("bad", "Panner"),
     ];
     expect(await exact(nodes, "q")).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
     expect(await bake(makeGraph([node("q", "PathTracingQualitySwitch")], pin("q", 0, RGB_MASK)))).toMatchObject({ status: "unavailable" });
@@ -1426,10 +1426,10 @@ describe("standard math nodes and engine utility functions seen on real BaseColo
   it("ShadingPathSwitch takes Default, else the deferred slot Inputs[0]", async () => {
     const withDefault = [
       node("s", "ShadingPathSwitch", { inputs: { Default: pin("hi", 0, RGB_MASK), "Inputs[0]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }),
-      constant3("hi", [0.25, 0.5, 0.75]), constant3("lo", [1, 0, 0]), node("bad", "Fresnel"),
+      constant3("hi", [0.25, 0.5, 0.75]), constant3("lo", [1, 0, 0]), node("bad", "Panner"),
     ];
     expect(await exact(withDefault, "s")).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
-    const slotOnly = [node("s", "ShadingPathSwitch", { inputs: { "Inputs[0]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }), constant3("lo", [1, 0, 0]), node("bad", "Fresnel")];
+    const slotOnly = [node("s", "ShadingPathSwitch", { inputs: { "Inputs[0]": pin("lo", 0, RGB_MASK), "Inputs[2]": pin("bad") } }), constant3("lo", [1, 0, 0]), node("bad", "Panner")];
     expect(await exact(slotOnly, "s")).toEqual([255, 0, 0]);
     expect(await bake(makeGraph([node("s", "ShadingPathSwitch")], pin("s", 0, RGB_MASK)))).toMatchObject({ status: "unavailable" });
   });
@@ -1687,5 +1687,112 @@ describe("per-instance and engine utility nodes of layered cliff materials", () 
     const [r, g, b] = (await pixelsOf(result))(0, 0);
     for (const channel of [r, g, b]) expect(Math.abs(channel! - texel)).toBeLessThanOrEqual(1);
     expect(result.status === "baked" && result.confidence).toBe("heuristic");
+  });
+});
+
+describe("view-dependent nodes of sky and effect materials", () => {
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 4 });
+  const notes = (result: BakeResult): string[] => (result.status === "baked" ? result.approximations : []);
+
+  it("Fresnel is its BaseReflectFraction at normal incidence, so lerp(A, B, Fresnel) is the face-on colour A (sky dome shape)", async () => {
+    // M_Clouds / M_SunAndMoon: Lerp(A = dark blue, B = white, Alpha = Fresnel(Exponent 1.2, BaseReflectFraction 0)).
+    const graph = makeGraph(
+      [
+        node("mix", "LinearInterpolate", { inputs: { A: pin("face"), B: pin("rim"), Alpha: pin("fresnel") }, constants: { ConstB: 0, ConstAlpha: 0 } }),
+        constant3("face", [0.2297, 0.269, 0.7112]),
+        constant3("rim", [1, 1, 1]),
+        node("fresnel", "Fresnel", { constants: { Exponent: 1.2000000476837158, BaseReflectFraction: 0 } }),
+      ],
+      pin("mix", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.2297), encode(0.269), encode(0.7112)]);
+    expect(result.status === "baked" && result.confidence).toBe("heuristic");
+    expect(notes(result).some((note) => note.startsWith("Fresnel evaluated at normal incidence"))).toBe(true);
+  });
+
+  it("Fresnel keeps a non-zero BaseReflectFraction (constant, wired pin or Unreal's 0.04 default) and ignores the exponent", async () => {
+    const colour = async (nodes: Raw[]) => {
+      const graph = makeGraph(
+        [node("mix", "LinearInterpolate", { inputs: { A: pin("face"), B: pin("rim"), Alpha: pin("fresnel") } }), constant3("face", [0, 0, 0]), constant3("rim", [1, 1, 1]), ...nodes],
+        pin("mix", 0, RGB_MASK),
+      );
+      return (await pixelsOf(await bake(graph)))(0, 0)[0];
+    };
+    expect(await colour([node("fresnel", "Fresnel", { constants: { BaseReflectFraction: 0.5, Exponent: 3 } })])).toBe(encode(0.5));
+    // Both defaults omitted by the dumper: Exponent 5, BaseReflectFraction 0.04.
+    expect(await colour([node("fresnel", "Fresnel")])).toBe(encode(0.04));
+    expect(await colour([node("fresnel", "Fresnel", { inputs: { BaseReflectFractionIn: pin("reflect") } }), node("reflect", "Constant", { constants: { R: 0.25 } })])).toBe(encode(0.25));
+  });
+
+  it("Fresnel with a wired Normal does not walk the normal's own nodes", async () => {
+    // A TwoSidedSign (or any view node) feeding only the Normal pin must not make the colour path unsupported.
+    const graph = makeGraph(
+      [
+        node("mix", "LinearInterpolate", { inputs: { A: pin("face"), B: pin("rim"), Alpha: pin("fresnel") } }),
+        constant3("face", [0.1, 0.2, 0.3]),
+        constant3("rim", [1, 1, 1]),
+        node("fresnel", "Fresnel", { inputs: { Normal: pin("view") }, constants: { BaseReflectFraction: 0 } }),
+        node("view", "SomeViewOnlyNode"),
+      ],
+      pin("mix", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect(result.status).toBe("baked");
+  });
+
+  it("DepthFade is its InOpacity (fully faded in) or OpacityDefault, and its fade distance is not walked", async () => {
+    // M_Cave_Water_JM: Lerp(DepthFade(InOpacity = ColorOpacity) x Color, Color.rgb x Color.a, DepthContribution).
+    const water = (opacity: number | null) =>
+      makeGraph(
+        [
+          node("mix", "LinearInterpolate", { inputs: { A: pin("fade"), B: pin("deep"), Alpha: pin("half") } }),
+          node("fade", "DepthFade", { inputs: { ...(opacity === null ? {} : { InOpacity: pin("opacity") }), FadeDistance: pin("distance") } }),
+          scalarParameter("opacity", "ColorOpacity", opacity ?? 0),
+          scalarParameter("distance", "FadeDistanceColor", 0),
+          constant3("deep", [0.1, 0.2, 0.4]),
+          scalarParameter("half", "DepthContribution", 0.5),
+        ],
+        pin("mix", 0, RGB_MASK),
+      );
+    const wired = await bake(water(0.8));
+    // A = 0.8 (all channels), B = (0.1, 0.2, 0.4): lerp at 0.5.
+    expect((await pixelsOf(wired))(0, 0)).toEqual([encode(0.45), encode(0.5), encode(0.6)]);
+    expect(wired.status === "baked" && wired.confidence).toBe("heuristic");
+    expect(notes(wired).some((note) => note.startsWith("DepthFade evaluated as fully faded in"))).toBe(true);
+    // Unwired InOpacity: OpacityDefault, 1 unless the node stores another value.
+    const unwired = await bake(water(null));
+    expect((await pixelsOf(unwired))(0, 0)).toEqual([encode(0.55), encode(0.6), encode(0.7)]);
+  });
+
+  it("MatLayerBlend_Tint multiplies BaseColor by lerp(1, Tint, Alpha): white tint is the identity, an alpha mask picks where the tint applies", async () => {
+    // M_Soul_Statue2: Tint = Edge Highlight Colour (2, 2, 2), Alpha = Mask.G; M_Slums_2: Tint = Overall_Material_Brightness, no alpha.
+    const layer = (tint: number[], withAlpha: boolean) =>
+      makeGraph(
+        [
+          node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("tinted") }, outputNames: ["BaseColor"] }),
+          engineCall("tinted", "MatLayerBlend_Tint", { Input0: pin("make"), Input1: pin("tint", 0, RGB_MASK), Input2: withAlpha ? pin("mask", 0, [0, 1, 0, 0]) : null }),
+          node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("base") } }),
+          constant3("base", [0.2, 0.3, 0.1]),
+          vectorParameter("tint", "Edge Highlight Colour", [...tint, tint[0] ?? 1]),
+          textureSample("mask", "T_Mask"),
+        ],
+        pin("break", 0, RGB_MASK),
+      );
+    // Mask texels: left half G = 0 (no tint), right half G = 255 (full tint). The sampler is Color/sRGB, so 0 and 255 survive decoding.
+    const mask = await pngOf(4, 4, (x) => (x < 2 ? [0, 0, 0] : [0, 255, 0]));
+    const bright = await bake(layer([2, 2, 2], true), { T_Mask: { png: mask, srgb: true } });
+    const pixel = await pixelsOf(bright);
+    expect(pixel(0, 0)).toEqual([encode(0.2), encode(0.3), encode(0.1)]);
+    expect(pixel(3, 0)).toEqual([encode(0.4), encode(0.6), encode(0.2)]);
+    expect(bright.status === "baked" && bright.confidence).toBe("heuristic");
+    expect(notes(bright).some((note) => note.startsWith("MatLayerBlend_Tint"))).toBe(true);
+    // No alpha wired, white tint: the base colour unchanged.
+    const identity = await bake(layer([1, 1, 1], false));
+    expect((await pixelsOf(identity))(0, 0)).toEqual([encode(0.2), encode(0.3), encode(0.1)]);
+    // No alpha wired, grey tint: the whole surface is tinted.
+    const dimmed = await bake(layer([0.5, 0.5, 0.5], false));
+    expect((await pixelsOf(dimmed))(0, 0)).toEqual([encode(0.1), encode(0.15), encode(0.05)]);
   });
 });

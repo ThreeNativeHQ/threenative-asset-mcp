@@ -150,11 +150,13 @@ const SUPPORTED_NODE_CLASSES = [
   "ObjectPositionWS",
   "PerInstanceRandom",
   "BumpOffset",
+  "Fresnel",
+  "DepthFade",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
 const SUPPORTED_ENGINE_FUNCTIONS = [
-  "MatLayerBlend_Standard", "MatLayerBlend_Simple", "MatLayerBlend_NormalBlend", "MatLayerBlend_AO", "MatLayerBlend_BakedNormal", "FuzzyShading",
+  "MatLayerBlend_Standard", "MatLayerBlend_Simple", "MatLayerBlend_NormalBlend", "MatLayerBlend_Tint", "MatLayerBlend_AO", "MatLayerBlend_BakedNormal", "FuzzyShading",
   "SpeedTreeColorVariation",
   "PivotPainter2FoliageShader",
   "Blend_Overlay",
@@ -399,6 +401,15 @@ const WORLD_ALIGNED_BLEND_NOTE =
 
 const WORLD_ALIGNED_BLEND_SURFACE_NOTE =
   "WorldAlignedBlend evaluated as saturate(up component of the mesh's own vertex normal x sharpness + bias), rasterised into UV space; the engine body is not in the pack, so the formula is inferred, and the mesh is taken unrotated";
+
+const FRESNEL_NOTE =
+  "Fresnel evaluated at normal incidence (a surface facing the camera): BaseReflectFraction + (1 - BaseReflectFraction) * 0^Exponent = BaseReflectFraction; the rim falloff follows the view angle, which a baked texture does not have";
+
+const DEPTH_FADE_NOTE =
+  "DepthFade evaluated as fully faded in: InOpacity x saturate((scene depth - pixel depth) / FadeDistance) with nothing close behind the surface is InOpacity; a baked texture has no scene depth";
+
+const MAT_LAYER_TINT_NOTE =
+  "MatLayerBlend_Tint: BaseColor multiplied by lerp(1, Tint, Alpha) (unwired Alpha is 1); engine body unavailable, inferred from the pins (a white Tint is the identity)";
 
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
@@ -707,6 +718,21 @@ class Compiler {
         const coordinate = node.inputs.Coordinate ? this.vec(node.inputs.Coordinate, "BumpOffset.Coordinate") : this.defaultUv();
         return coordinate ?? this.markUnavailable(`BumpOffset ${node.id} has no coordinate`);
       }
+      case "Fresnel": {
+        // BaseReflectFraction + (1 - BaseReflectFraction) * (1 - saturate(dot(Normal, CameraVector)))^Exponent. A bake has
+        // no camera: the surface faces it (dot = 1), where the power term is zero for any positive exponent and the
+        // value is BaseReflectFraction (Unreal's default 0.04). The Normal pin only changes the angle, so it is not walked.
+        this.approximations.add(FRESNEL_NOTE);
+        const base = this.operand(node, "BaseReflectFractionIn", "BaseReflectFraction", 0.04);
+        const exponent = this.operand(node, "ExponentIn", "Exponent", 5);
+        return this.binary(base, exponent, (reflect, power) => reflect + (1 - reflect) * 0 ** Math.max(power, 1e-4));
+      }
+      case "DepthFade":
+        // InOpacity x saturate((SceneDepth - PixelDepth) / FadeDistance): the soft-edge fade where a surface meets what is
+        // behind it. A surface with open space behind it is fully faded in (the factor is 1), so the value is InOpacity,
+        // which is OpacityDefault (1) when unwired. FadeDistance only scales the factor and is not walked.
+        this.approximations.add(DEPTH_FADE_NOTE);
+        return this.operand(node, "InOpacity", "OpacityDefault", 1);
       case "StaticBool":
         return this.constant([node.constants.Value === true ? 1 : 0], 1);
       case "StaticBoolParameter": {
@@ -1290,6 +1316,7 @@ class Compiler {
       this.approximations.add(`${name}: BaseColor passed through; engine body unavailable`);
       return this.passThrough(node, node.inputs.Input1 ? "Input1" : "Input0", name!);
     }
+    if (lower === "matlayerblend_tint") return this.layerBlendTint(node, name!);
     if (lower === "matlayerblend_ao" || lower === "matlayerblend_bakednormal") {
       // These only write ambient occlusion / normal into the blended attributes, so BaseColor of the first
       // layer is the output's BaseColor. The bodies are engine content that the pack does not carry, hence heuristic.
@@ -1465,6 +1492,23 @@ class Compiler {
       result = this.blendAttrs(result, top, alpha);
     }
     return result;
+  }
+
+  /**
+   * MatLayerBlend_Tint(Input0 = attributes, Input1 = Tint colour, Input2 = Alpha): the real graphs wire an "Overall Material
+   * Brightness" parameter (default white) to the tint and an edge mask texture to the alpha, so the tint multiplies BaseColor,
+   * weighted by the alpha: BaseColor x lerp(1, Tint, Alpha). An unwired alpha is 1, an unwired tint the identity. Heuristic:
+   * the engine body is not in the pack.
+   */
+  private layerBlendTint(node: GraphNode, name: string): Compiled {
+    const base = this.attrs(node.inputs.Input0, `${name}.Input0`);
+    if (!base) return this.markUnavailable(`${name} ${node.id} has no Input0`);
+    this.approximations.add(MAT_LAYER_TINT_NOTE);
+    const tint = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
+    if (!tint || !base.baseColor) return base;
+    const alpha = node.inputs.Input2 ? this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1) : this.constant([1], 1);
+    const weight = this.lerp(this.constant([1], 1), tint, alpha);
+    return { kind: "attr", baseColor: this.binary(base.baseColor, weight, (x, y) => x * y) };
   }
 
   // -- entry ----------------------------------------------------------------------------------------------
