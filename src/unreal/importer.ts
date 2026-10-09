@@ -1549,10 +1549,10 @@ export async function packageGlb(options: {
       const source = materialAssets.png.get(binding.texture);
       if (!source) continue;
       // A vivid, uncorrelated leaf atlas (a fern frond with green blades and red-brown tips) fails the albedo statistics, but
-      // a texture UE Viewer wired to Diffuse, named as a colour map and cut out through a packed opacity map is the leaf
-      // colour: the packed masks this check exists for are never masked foliage cards.
+      // a texture named as a colour map and cut out through a packed opacity map of its own set is the leaf colour (UE Viewer
+      // wired it, or the filename rule paired it): the packed masks this check exists for are never masked foliage cards.
       const namedColourCutout =
-        binding.source === "mat" && binding.secondaryTexture !== undefined && resolved.alphaMode !== "OPAQUE" && isColourTexture(binding.texture);
+        binding.source !== "effect" && binding.secondaryTexture !== undefined && resolved.alphaMode !== "OPAQUE" && isColourTexture(binding.texture);
       if (binding.slot === "baseColor" && binding.source !== "effect" && !namedColourCutout) {
         const verdict = await classifyAlbedo(await readFile(source));
         if (!verdict.isAlbedo) {

@@ -158,16 +158,16 @@ describe("judgeRender with fidelity", () => {
  * The border-palette object mask counts the shadow as object: it drags hue toward blue (the conifer pack read 30-60 degrees
  * "off" on Larch/Spruce that were not), lowers saturation and inflates the bounding box. Synthetic stand-in below.
  */
-function thumbnailWithShadow(withShadow: boolean): RgbaImage {
+function thumbnailWithShadow(withShadow: boolean, floor: { light: [number, number, number]; dark: [number, number, number]; shadow: [number, number, number] } = { light: [125, 132, 137], dark: [112, 120, 126], shadow: [48, 66, 78] }): RgbaImage {
   const size = 96;
   const data = new Uint8Array(size * size * 4);
   for (let i = 0; i < size * size; i++) {
     const x = i % size;
     const y = Math.floor(i / size);
     const checker = (Math.floor(x / 12) + Math.floor(y / 12)) % 2 === 0;
-    let rgb: [number, number, number] = checker ? [125, 132, 137] : [112, 120, 126];
+    let rgb: [number, number, number] = checker ? floor.light : floor.dark;
     // Shadow blob on the floor, left of and below the plant: darker and bluer than the floor.
-    if (withShadow && x >= 6 && x < 46 && y >= 60 && y < 84) rgb = [48, 66, 78];
+    if (withShadow && x >= 2 && x < 60 && y >= 58 && y < 94) rgb = floor.shadow;
     // The plant: leaf greens of varied lightness, ragged like needles.
     if (x >= 40 && x < 80 && y >= 14 && y < 62 && (x * 7 + y * 3) % 5 !== 0) {
       const shade = 0.55 + 0.45 * (((x * 13 + y * 29) % 17) / 16);
@@ -187,6 +187,17 @@ describe("measureFidelity ignores the floor's cast shadow", () => {
     expect(shadowed.hueEmdDegrees).toBeLessThan(15);
     expect(shadowed.hueEmdDegrees).toBeCloseTo(clean.hueEmdDegrees, 0);
     expect(shadowed.densityRatio).toBeCloseTo(clean.densityRatio, 1);
+    expect(fidelityVerdict(shadowed).verdict).toBe("ok");
+  });
+
+  it("also removes it from a near-neutral light floor (the Fern Collection thumbnails, floor saturation 0.035)", () => {
+    // The grey shadow has a lower saturation than the leaves: left in the mask it halved the reference's median saturation,
+    // so a correct fern read 2.4x "over-saturated" and failed.
+    const neutral = { light: [167, 171, 173] as [number, number, number], dark: [150, 154, 157] as [number, number, number], shadow: [109, 116, 122] as [number, number, number] };
+    const clean = measureFidelity(thumbnailWithShadow(false, neutral), render);
+    const shadowed = measureFidelity(thumbnailWithShadow(true, neutral), render);
+    expect(shadowed.saturationRatio).toBeCloseTo(clean.saturationRatio, 1);
+    expect(shadowed.saturationRatio).toBeLessThan(1.4);
     expect(fidelityVerdict(shadowed).verdict).toBe("ok");
   });
 
