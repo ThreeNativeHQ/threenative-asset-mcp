@@ -18,11 +18,22 @@ export interface PreviewPose {
   degrees: number;
 }
 
+export interface PreviewFocus {
+  bone: string;
+  distance?: number | undefined;
+}
+
 export interface PreviewOptions {
   clipName?: string;
   times: number[];
   /** An additive local-axis rotation applied after sampling, for limb-isolation sheets. */
   pose?: PreviewPose;
+  /**
+   * Frame the camera on one bone and its descendant bones (a hand with its
+   * fingers) instead of the whole model, following it through the animation.
+   * `distance` overrides the automatic fit, in model units.
+   */
+  focus?: PreviewFocus;
   angles?: number;
   width?: number;
   height?: number;
@@ -60,6 +71,7 @@ function pageHtml(options: PreviewOptions): string {
     clipName: options.clipName ?? null,
     times: options.times,
     pose: options.pose ?? null,
+    focus: options.focus ?? null,
     angles: options.angles ?? 3,
     width: options.width ?? 384,
     height: options.height ?? 384,
@@ -81,6 +93,9 @@ try {
   new GLTFLoader().load('/model.glb', (gltf) => {
     try {
       const model = gltf.scene; scene.add(model);
+      // A skinned mesh keeps the bounding sphere of its first pose, so a limb that swings away
+      // (or a camera framed on one hand) would otherwise be culled and the frame render empty.
+      model.traverse(node => { if (node.isMesh) node.frustumCulled = false; });
       model.updateMatrixWorld(true);
       const box = new THREE.Box3().setFromObject(model);
       const size = box.getSize(new THREE.Vector3()); const center = box.getCenter(new THREE.Vector3());
@@ -109,13 +124,14 @@ try {
         const index = gltf.parser.associations.get(node)?.nodes;
         if (index !== undefined) addBoneAlias(gltf.parser.json.nodes[index]?.name, node);
       });
+      const resolveBone = name => {
+        const matches = bones.get(name);
+        if (!matches || matches.size !== 1) throw new Error('Unknown or ambiguous preview bone: ' + name);
+        return matches.values().next().value;
+      };
       const pose = options.pose;
-      let poseBone;
-      if (pose) {
-        const matches = bones.get(pose.bone);
-        if (!matches || matches.size !== 1) throw new Error('Unknown or ambiguous preview bone: ' + pose.bone);
-        poseBone = matches.values().next().value;
-      }
+      const poseBone = pose ? resolveBone(pose.bone) : undefined;
+      const focusBone = options.focus ? resolveBone(options.focus.bone) : undefined;
       let tracks = 0, boundTracks = 0;
       let action;
       if (clip) {
@@ -151,9 +167,21 @@ try {
             poseBone.rotateOnAxis(axis, (pose.degrees * Math.PI) / 180);
           }
           model.updateMatrixWorld(true);
-          const distance = radius * 1.7;
-          camera.position.set(center.x + Math.sin(azimuth)*distance, center.y + size.y*0.12, center.z + Math.cos(azimuth)*distance);
-          camera.lookAt(center);
+          if (focusBone) {
+            // Track the bone and its descendant bones; fit the camera to their extent.
+            const points = [];
+            focusBone.traverse(node => { if (node.isBone) points.push(node.getWorldPosition(new THREE.Vector3())); });
+            const focusBox = new THREE.Box3().setFromPoints(points);
+            const focusCenter = focusBox.getCenter(new THREE.Vector3());
+            const extent = Math.max(focusBox.getSize(new THREE.Vector3()).length(), radius * 0.04);
+            const focusDistance = options.focus.distance ?? extent * 2.4;
+            camera.position.set(focusCenter.x + Math.sin(azimuth)*focusDistance, focusCenter.y + focusDistance*0.2, focusCenter.z + Math.cos(azimuth)*focusDistance);
+            camera.lookAt(focusCenter);
+          } else {
+            const distance = radius * 1.7;
+            camera.position.set(center.x + Math.sin(azimuth)*distance, center.y + size.y*0.12, center.z + Math.cos(azimuth)*distance);
+            camera.lookAt(center);
+          }
           renderer.render(scene, camera);
           const pixels = new Uint8Array(width*height*4);
           gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
@@ -307,7 +335,10 @@ export async function renderPreview(
     if (images.length === 0) {
       throw new RigAssetError("RIG_PREVIEW_FAILED", "The preview produced no images.");
     }
-    if (images.some((image) => !image.nonBlank)) {
+    // A close-up can legitimately look through a solid body at one azimuth; only an entirely
+    // empty set of close-ups means the renderer failed to draw the model.
+    const blank = options.focus ? images.every((image) => !image.nonBlank) : images.some((image) => !image.nonBlank);
+    if (blank) {
       throw new RigAssetError(
         "RIG_PREVIEW_FAILED",
         "The preview produced a blank frame; the renderer did not draw the model.",
