@@ -1847,4 +1847,20 @@ describe("view-dependent nodes of sky and effect materials", () => {
     expect(result.status === "baked" && result.confidence).toBe("heuristic");
     expect(notes(result).some((note) => note.startsWith("WorldPosition evaluated as the origin"))).toBe(true);
   });
+
+  it("an engine function without a body is named alone: its other outputs' inputs are not reported as a Cycle", async () => {
+    // ImposterUVs(UVs, ..., Normal in) -> output 0 feeds a normal texture, whose sample is wired back to the same call's input 8
+    // (for its TransformedNormals output). BaseColor reads output 0 only, so there is no loop, only an engine function with no body.
+    const graph = makeGraph(
+      [
+        node("tex", "TextureSample", { inputs: { Coordinates: pin("uvs", 0) }, texture: "/Game/Test/T_Albedo.T_Albedo", samplerType: "Color" }),
+        engineCall("uvs", "ImposterUVs", { Input0: pin("scale"), Input8: pin("normalTex", 0, RGB_MASK) }),
+        node("normalTex", "TextureSample", { inputs: { Coordinates: pin("uvs", 0) }, texture: "/Game/Test/T_Normal.T_Normal", samplerType: "Normal" }),
+        node("scale", "Constant", { constants: { R: 4 } }),
+      ],
+      pin("tex", 0, RGB_MASK),
+    );
+    const result = await bake(graph);
+    expect(result).toMatchObject({ status: "unsupported", unsupported: ["ImposterUVs"] });
+  });
 });

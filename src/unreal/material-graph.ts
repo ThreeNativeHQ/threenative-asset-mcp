@@ -443,6 +443,8 @@ class Compiler {
   readonly classes = new Set<string>();
   readonly slots: TextureSlot[] = [];
   private readonly memo = new Map<string, Compiled>();
+  /** Above zero while the inputs of an already-unsupported node are being visited for the report. */
+  private walkingInputs = 0;
   private readonly active = new Set<string>();
   private readonly textureRegisters = new Map<string, Val>();
   private readonly nodes = new Map<string, GraphNode>();
@@ -603,6 +605,10 @@ class Compiler {
     const cached = this.memo.get(key);
     if (cached) return cached;
     if (this.active.has(key) || this.active.size > MAX_DEPTH) {
+      // The walk below an unsupported node follows every input, though a function call hands each output only the inputs
+      // that feed it, so an engine function whose normal output feeds a texture that feeds the same call's UV output
+      // looks like a loop. It is a reporting walk: the node is already named, and a "Cycle" would be an invented cause.
+      if (this.walkingInputs > 0 && this.active.has(key)) return this.constant([0], 1);
       this.markUnsupported(this.active.has(key) ? "Cycle" : "DepthLimit");
       return this.constant([0], 1);
     }
@@ -972,8 +978,18 @@ class Compiler {
   /** Records an unsupported class and still walks its inputs, so the report names everything beneath it. */
   private unsupportedNode(node: GraphNode): Val {
     this.unsupported.add(node.class);
-    for (const input of Object.values(node.inputs)) this.pin(input);
+    this.walkInputs(node);
     return this.constant([0], 1);
+  }
+
+  /** Visits every input of an unsupported node so the report is complete; a loop met on the way is not an error. */
+  private walkInputs(node: GraphNode): void {
+    this.walkingInputs++;
+    try {
+      for (const input of Object.values(node.inputs)) this.pin(input);
+    } finally {
+      this.walkingInputs--;
+    }
   }
 
   /**
@@ -1462,7 +1478,7 @@ class Compiler {
     // No body: an engine function the evaluator does not know. Walk its inputs so the report is complete.
     this.unsupported.add(name ?? "FunctionCall");
     if (name) this.classes.add(name);
-    for (const input of Object.values(node.inputs)) this.pin(input);
+    this.walkInputs(node);
     return this.constant([0], 1);
   }
 
