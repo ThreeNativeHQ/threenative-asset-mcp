@@ -247,6 +247,17 @@ export const MATERIAL_ATTRIBUTE_GUIDS = {
   ShadingModel: "D9423FFFD77E4D828FF9CF5E055D1255",
 } as const;
 
+/** Approximation notes whose node follows the view or the clock, by the node name each note starts with. */
+const VIEW_DEPENDENT_PREFIXES = ["Fresnel", "DepthFade", "TwoSidedSign", "BumpOffset", "Time", "Panner", "FlowMaps_Simple", "MetallicShading", "view-dependent fuzzy shading"] as const;
+
+/**
+ * The view- or time-dependent nodes a bake stood in for, from its approximation notes. Unreal has no flat-colour bake of
+ * these (it shades them per view and per frame), so the importer reports them as approximated rather than at parity.
+ */
+export function viewDependentNodes(approximations: readonly string[]): string[] {
+  return VIEW_DEPENDENT_PREFIXES.filter((prefix) => approximations.some((note) => note === prefix || note.startsWith(`${prefix} `) || note.startsWith(`${prefix}:`)));
+}
+
 export function supportedNodeClasses(): readonly string[] {
   return SUPPORTED_NODE_CLASSES;
 }
@@ -872,12 +883,15 @@ class Compiler {
         return { kind: "tex", reference: override ?? node.texture ?? null, samplerType: node.samplerType ?? "Color" };
       }
       case "LightmassReplace":
-        // Realtime is what the renderer evaluates; Lightmass only feeds the static-lighting bake.
+        // Realtime is what the renderer evaluates; Lightmass only feeds the static-lighting bake (inferred: the expression's
+        // Compile is engine code, not in the pack).
         return this.pin(node.inputs.Realtime) ?? this.markUnavailable(`LightmassReplace ${node.id} has no Realtime input`);
       case "MaterialProxyReplace":
-        // Realtime is the material itself; MaterialProxy only feeds merged-actor (HLOD) proxy baking.
+        // Realtime is the material itself; MaterialProxy only feeds merged-actor (HLOD) proxy baking (inferred, as above).
         return this.pin(node.inputs.Realtime) ?? this.markUnavailable(`MaterialProxyReplace ${node.id} has no Realtime input`);
       case "PrecomputedAOMask":
+        // Inferred: the value without a built AO material mask is not verifiable here (engine code); 0 was chosen and checked
+        // against the editor thumbnails of the pieces that read it (see the PR's fidelity table).
         this.approximations.add(PRECOMPUTED_AO_MASK_NOTE);
         return this.constant([0], 1);
       case "VertexNormalWS":

@@ -483,3 +483,60 @@ describe("parity scorer: legitimately neutral effect sections", () => {
     expect(effect.colour).toMatchObject({ expectsColour: 0, coloured: 0, missesTotal: 0, effectNeutral: 1 });
   });
 });
+
+describe("importer: an Additive or Modulate material is classified by its BlendMode, not waved through", () => {
+  /** A particle master whose BaseColor needs a per-particle DynamicParameter the bake cannot read. */
+  const particleMaster = (): MaterialGraph =>
+    graphOf(
+      "M_Spark",
+      [
+        node("mul", "Multiply", { inputs: { A: pin("tint", 0, [1, 1, 1, 0]), B: pin("dynamic") } }),
+        node("tint", "VectorParameter", { parameter: { name: "Colour", group: "" }, default: [1, 0.5, 0.2, 1] }),
+        node("dynamic", "DynamicParameter", { outputNames: ["Param1", "Param2", "Param3", "Param4"], parameter: { name: "", group: "" }, default: null }),
+      ],
+      { baseColor: pin("mul") },
+    );
+  const spark = (blend: string) =>
+    importFixture({ graph: particleMaster(), materialName: "M_Spark", props: `BlendMode = ${blend}\nTwoSided = true\n`, textures: [] });
+
+  it("Additive and Modulate: the section is an effect with the blend mode as its reason", async () => {
+    for (const [blend, verb] of [["BLEND_Additive (3)", "added to"], ["BLEND_Modulate (4)", "multiplied with"]] as const) {
+      const { section, report } = await spark(blend);
+      expect(section.effect, blend).toMatchObject({ kind: "additive-blend" });
+      expect(section.effect?.reason).toContain(verb);
+      expect(report.materialCoverage.effect).toBe(1);
+      // The graph is still asked and its unsupported node still named: the classification does not hide it.
+      expect(section.graph).toMatchObject({ status: "unsupported", unsupportedNodes: ["DynamicParameter"] });
+    }
+  });
+
+  it("Translucent with the same graph is not an effect: the unsupported node stays a miss", async () => {
+    const { section, report } = await spark("BLEND_Translucent (2)");
+    expect(section.effect).toBeUndefined();
+    expect(report.materialCoverage.effect).toBe(0);
+    expect(section.graph).toMatchObject({ status: "unsupported", unsupportedNodes: ["DynamicParameter"] });
+  });
+});
+
+describe("importer: a bake that stands in for a view- or time-dependent node says so", () => {
+  it("adds a 'view-dependent: approximated' limitation naming the nodes, and none for a static graph", async () => {
+    const rim = graphOf(
+      "M_Rim",
+      [
+        node("mix", "LinearInterpolate", { inputs: { A: pin("face"), B: pin("edge"), Alpha: pin("fresnel") } }),
+        node("face", "Constant3Vector", { constants: { Constant: [0.2, 0.3, 0.7, 1] } }),
+        node("edge", "Constant3Vector", { constants: { Constant: [1, 1, 1, 1] } }),
+        node("fresnel", "Fresnel", { inputs: { ExponentIn: pin("time") } }),
+        node("time", "Time"),
+      ],
+      { baseColor: pin("mix") },
+    );
+    const { section } = await importFixture({ graph: rim, materialName: "M_Rim", props: "TwoSided = false\n", textures: [] });
+    expect(section.graph).toMatchObject({ status: "baked" });
+    expect(section.limitations).toContainEqual(expect.stringMatching(/^view-dependent: approximated \(Fresnel, Time\)/));
+    const flat = graphOf("M_Flat", [node("c", "Constant3Vector", { constants: { Constant: [0.2, 0.3, 0.7, 1] } })], { baseColor: pin("c") });
+    const plain = await importFixture({ graph: flat, materialName: "M_Flat", props: "TwoSided = false\n", textures: [] });
+    expect(plain.section.graph).toMatchObject({ status: "baked" });
+    expect(plain.section.limitations.some((line) => line.startsWith("view-dependent"))).toBe(false);
+  });
+});

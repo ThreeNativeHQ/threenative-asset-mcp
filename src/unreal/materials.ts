@@ -69,6 +69,8 @@ export interface ResolvedMaterial {
   readonly bindings: readonly MaterialTextureBinding[];
   readonly unsupported: readonly UnsupportedTexture[];
   readonly alphaMode: "OPAQUE" | "MASK" | "BLEND";
+  /** The effective Unreal `BlendMode` of the instance chain (`BLEND_Additive`, ...), when a props file names one. */
+  readonly sourceBlendMode?: string | undefined;
   readonly alphaCutoff: number | undefined;
   readonly doubleSided: boolean;
   readonly baseColorFactor: readonly [number, number, number, number] | undefined;
@@ -964,6 +966,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     bindings: [...bindings.values()],
     unsupported,
     alphaMode,
+    ...(inheritedBlend !== undefined ? { sourceBlendMode: inheritedBlend } : {}),
     alphaCutoff,
     doubleSided,
     // A colour parameter's alpha is not opacity in Unreal, and a `Tint` of A=0 is common on a surface that draws fully

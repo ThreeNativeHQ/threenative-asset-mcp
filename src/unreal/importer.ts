@@ -49,6 +49,7 @@ import {
   type ImportedScene,
   parseUnrealSceneSource,
 } from "./scenes.js";
+import { viewDependentNodes } from "./material-graph.js";
 import { rasteriseSurfaceNormals, type SurfaceNormals, type SurfaceTriangles } from "./surface-normals.js";
 import { remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
@@ -108,8 +109,10 @@ export interface ImportedMaterialEffect {
    * `emissive`: the material wires only Emissive (an unlit or additive effect), so its colour is emitted light.
    * `engine-default-material`: the slot holds Unreal's default material (WorldGridMaterial, an engine asset outside the
    * pack); a particle emitter or placing actor supplies the real material at runtime.
+   * `additive-blend`: the material's BlendMode is Additive or Modulate, so the renderer draws its Emissive only (added to,
+   * or multiplied with, the scene) and BaseColor is never read.
    */
-  readonly kind: "emissive" | "engine-default-material";
+  readonly kind: "emissive" | "engine-default-material" | "additive-blend";
   readonly reason: string;
 }
 
@@ -1492,6 +1495,13 @@ export async function packageGlb(options: {
         kind: "engine-default-material",
         reason: "the mesh package names Unreal's default material (/Engine/EngineMaterials/WorldGridMaterial) and no pack material for this slot; the engine's default is not part of the pack, and a particle emitter or placing actor supplies the real material at runtime",
       };
+    } else if (resolved.sourceBlendMode === "BLEND_Additive" || resolved.sourceBlendMode === "BLEND_Modulate") {
+      // Evidence from the material itself, not its name or its nodes: an Additive or Modulate material is drawn from its
+      // Emissive alone (inferred from the engine's shading model; the shader source is not in the pack), so no albedo exists.
+      effect = {
+        kind: "additive-blend",
+        reason: `${lookupName} has BlendMode ${resolved.sourceBlendMode.slice("BLEND_".length)}: the renderer draws its Emissive only (${resolved.sourceBlendMode === "BLEND_Additive" ? "added to" : "multiplied with"} the scene), so BaseColor is never read and the package has no albedo for it`,
+      };
     }
     const graphRequest = (probe: boolean): GraphBakeRequest => ({
       materialName: material.getName(),
@@ -1718,6 +1728,12 @@ export async function packageGlb(options: {
         attachTexture(material, binding, texture);
         graphBindings.push(binding);
         packagingLimitations.push(...outcome.approximations);
+        const viewDependent = viewDependentNodes(outcome.approximations);
+        if (viewDependent.length > 0) {
+          packagingLimitations.push(
+            `view-dependent: approximated (${viewDependent.join(", ")}): Unreal shades these per view or per frame and has no flat-colour bake of its own, so this base colour is a recorded stand-in, not engine parity`,
+          );
+        }
         if (outcome.alpha?.binary && material.getAlphaMode() === "BLEND") {
           // A translucent material whose Opacity is a leaf-shaped mask is a cut-out. Sorted blending smears overlapping
           // cards over each other and the backdrop (grey, washed-out foliage), so it is exported as a masked card.
@@ -4695,7 +4711,7 @@ export async function importUnrealDirectory(
     if (effectSections.length > 0) {
       const byKind = (kind: string): number => effectSections.filter((section) => section.effect?.kind === kind).length;
       warnings.push(
-        `${effectSections.length} material sections have no albedo by design and are not failures (${byKind("emissive")} emissive-only effect, ${byKind("engine-default-material")} engine default material); each carries "effect" with the reason.`,
+        `${effectSections.length} material sections have no albedo by design and are not failures (${byKind("emissive")} emissive-only effect, ${byKind("engine-default-material")} engine default material, ${byKind("additive-blend")} additive or modulate blend); each carries "effect" with the reason.`,
       );
     }
     if (coverage.textured < coverage.sections) {
