@@ -1,4 +1,11 @@
 {
+ "1ac647da-Landscap030ebaff99f6V1": {
+  "compared": 10,
+  "meanScore": 45.5,
+  "minScore": 22.6,
+  "suspect": 4,
+  "fail": 6
+ },
  "b2b5e215-Temperatd04bb180da4fV1": {
   "compared": 12,
   "meanScore": 81.7,

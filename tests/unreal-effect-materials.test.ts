@@ -285,6 +285,93 @@ describe("importer: a ParticleColor-tinted translucent instance (SM_SplashMesh_0
   });
 });
 
+/** An ivy leaf card: BaseColor = leaf texture, and the cut-out lives only in the Opacity (or OpacityMask) pin. */
+function leafCardGraph(pinName: "opacity" | "opacityMask"): MaterialGraph {
+  const nodes = [
+    node("leaf", "TextureSample", { texture: "/Game/Test/T_Leaf.T_Leaf", samplerType: "Color" }),
+    node("mask", "TextureSample", { texture: "/Game/Test/T_LeafMask.T_LeafMask", samplerType: "Color" }),
+    node("gray", "Desaturation", { inputs: { Input: pin("mask", 0, [1, 1, 1, 0]) } }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Leaf",
+    package: "/Game/Test/M_Leaf",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: pin("leaf", 0, [1, 1, 1, 0]), roughness: null, metallic: null, emissive: null, opacity: pinName === "opacity" ? pin("gray") : null, opacityMask: pinName === "opacityMask" ? pin("gray") : null, normal: null, materialAttributes: null },
+    nodes,
+  });
+}
+
+async function embeddedAlpha(material: { getBaseColorTexture(): { getImage(): Uint8Array | null } | null }): Promise<number[]> {
+  const image = material.getBaseColorTexture()!.getImage()!;
+  const { data } = await sharp(image).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  return [data[3]!, data[data.length - 1]!];
+}
+
+describe("importer: a leaf card whose silhouette lives in an opacity mask (SM_ivy)", () => {
+  it("bakes a translucent material's Opacity into the base colour's alpha instead of a solid rectangle", async () => {
+    const { material, section } = await importFixture({
+      graph: leafCardGraph("opacity"),
+      materialName: "MI_Leaf",
+      props: translucentProps("M_Leaf"),
+      // A black mask is the card's clear background: nothing of the card may be drawn.
+      textures: [["T_Leaf", [40, 120, 50]], ["T_LeafMask", [0, 0, 0]]],
+    });
+    expect(section.graph).toMatchObject({ status: "baked" });
+    expect(await embeddedAlpha(material)).toEqual([0, 0]);
+  });
+
+  it("exports a binary leaf cut-out as MASK, because blended overlapping cards render grey", async () => {
+    const { material, section } = await importFixture({
+      graph: leafCardGraph("opacity"),
+      materialName: "MI_Leaf",
+      props: translucentProps("M_Leaf"),
+      textures: [["T_Leaf", [40, 120, 50]], ["T_LeafMask", [255, 255, 255]]],
+    });
+    expect(material.getAlphaMode()).toBe("MASK");
+    expect(material.getAlphaCutoff()).toBe(0.5);
+    expect(section.alphaMode).toBe("MASK");
+    expect(section.limitations.join("\n")).toContain("binary cut-out");
+  });
+
+  it("keeps a genuinely graded translucency (a soft mask) as BLEND", async () => {
+    const { material, section } = await importFixture({
+      graph: leafCardGraph("opacity"),
+      materialName: "MI_Leaf",
+      props: translucentProps("M_Leaf"),
+      // sRGB 128 decodes to linear 0.216: a uniform soft veil, not a cut-out.
+      textures: [["T_Leaf", [40, 120, 50]], ["T_LeafMask", [128, 128, 128]]],
+    });
+    expect(material.getAlphaMode()).toBe("BLEND");
+    expect(section.limitations.join("\n")).not.toContain("binary cut-out");
+    const [alpha] = await embeddedAlpha(material);
+    expect(alpha).toBeGreaterThan(40);
+    expect(alpha).toBeLessThan(70);
+  });
+
+  it("keeps the leaf opaque where the mask is white", async () => {
+    const { material } = await importFixture({
+      graph: leafCardGraph("opacity"),
+      materialName: "MI_Leaf",
+      props: translucentProps("M_Leaf"),
+      textures: [["T_Leaf", [40, 120, 50]], ["T_LeafMask", [255, 255, 255]]],
+    });
+    expect(await embeddedAlpha(material)).toEqual([255, 255]);
+  });
+
+  it("bakes a masked material's OpacityMask and keeps MASK mode", async () => {
+    const { material } = await importFixture({
+      graph: leafCardGraph("opacityMask"),
+      materialName: "MI_Leaf",
+      props: ["Parent = Material3'Content/Test/M_Leaf.M_Leaf'", "BlendMode = BLEND_Masked (1)", "OpacityMaskClipValue = 0.333"].join("\n"),
+      textures: [["T_Leaf", [40, 120, 50]], ["T_LeafMask", [0, 0, 0]]],
+    });
+    expect(material.getAlphaMode()).toBe("MASK");
+    expect(await embeddedAlpha(material)).toEqual([0, 0]);
+  });
+});
+
 describe("importer: an emissive-only effect (SM_Splash_Sea)", () => {
   async function foam() {
     return importFixture({

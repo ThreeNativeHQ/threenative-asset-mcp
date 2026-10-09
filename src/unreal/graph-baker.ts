@@ -51,6 +51,11 @@ export interface GraphBakeRequest {
    * translucent section that already has a base-colour texture, which a plain request would not look at.
    */
   readonly probe?: boolean | undefined;
+  /**
+   * The graph output that carries the section's cut-out, from its glTF alpha mode: `opacity` for BLEND, `opacityMask`
+   * for MASK, absent for OPAQUE. The bake writes it into the colour PNG's alpha channel.
+   */
+  readonly alpha?: "opacity" | "opacityMask" | undefined;
 }
 
 export type GraphBakeOutcome = BakeResult & {
@@ -152,6 +157,27 @@ function unavailable(reason: string): GraphBakeOutcome {
   return { status: "unavailable", reason };
 }
 
+/** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
+function normalisedPackage(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^(?:Game|Content)\//i, "").toLowerCase();
+}
+
+/**
+ * The graph of material `name`. The dump keys the first graph of a name by that name and any later one of the same
+ * name by its package path, so a plain lookup by name always lands on one arbitrary namesake. With the package the
+ * instance's `Parent =` line named, the matching graph is taken wherever it is keyed.
+ */
+export function graphNamed(graphs: ReadonlyMap<string, MaterialGraph>, name: string, packagePath: string | undefined): MaterialGraph | undefined {
+  const byName = graphs.get(name);
+  if (packagePath === undefined) return byName;
+  const wanted = normalisedPackage(packagePath);
+  if (byName !== undefined && normalisedPackage(byName.package) === wanted) return byName;
+  for (const candidate of graphs.values()) {
+    if (candidate.material === name && normalisedPackage(candidate.package) === wanted) return candidate;
+  }
+  return byName;
+}
+
 /** Returns undefined when graph baking is switched off by the caller (the importer decides that). */
 export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undefined {
   const dump = options.dumpGraphs ?? dumpMaterialGraphs;
@@ -236,15 +262,18 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     const chain: PropsFile[] = [];
     let graph: MaterialGraph | undefined;
     const visited = new Set<string>();
+    // The package the previous link's `Parent =` line named: when two packages hold a material of one name, it picks the graph.
+    let currentPackage: string | undefined;
     for (let current: string | undefined = request.lookupName; current && chain.length < MAX_PARENT_DEPTH && !visited.has(current); ) {
       visited.add(current);
       const text = request.readProps(current);
       if (text) chain.push(parsePropsFile(text));
-      graph = byName.get(current);
+      graph = graphNamed(byName, current, currentPackage);
       if (graph) break;
       const unreadable = dumped.invalid.get(current);
       if (unreadable !== undefined) return unavailable(`graph for ${current} unreadable (${unreadable})`);
       current = text ? chain[chain.length - 1]!.parent : undefined;
+      currentPackage = text ? chain[chain.length - 1]!.parentPackage : undefined;
     }
     if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);
 
@@ -253,7 +282,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     if (request.probe) return unavailable(`${graph.material} has a BaseColor output`);
 
     const parameters = chainParameters(chain);
-    const key = `${graph.material}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}`;
+    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}`;
     let perAssets = bakes.get(request.assets);
     if (!perAssets) {
       perAssets = new Map();
@@ -273,6 +302,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         allowUvSetFallback: true,
         // Unreal feeds white to ParticleColor outside a particle emitter.
         particleColor: [1, 1, 1, 1],
+        ...(request.alpha ? { alpha: request.alpha } : {}),
         ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
         loadTexture: async (reference) => {
           const name = textureBasename(reference);

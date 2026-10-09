@@ -11,7 +11,11 @@ import { renderTiles } from "../src/unreal/contact-sheet.js";
 import { packageGlb } from "../src/unreal/importer.js";
 import type { SourceMaterial } from "../src/unreal/source-material.js";
 import { writeMeshFixture } from "./helpers/unreal-fixture.js";
+import { createGraphBaker } from "../src/unreal/graph-baker.js";
+import { materialGraphSchema } from "../src/unreal/graph-dump.js";
+import { scopeParentChain } from "../src/unreal/importer.js";
 import { compareImages, decodeRgba, type RgbaImage } from "../src/unreal/image-diff.js";
+import { bakeGraph, type TextureRaster } from "../src/unreal/material-graph.js";
 import { resolveMaterial, type ResolveMaterialRequest } from "../src/unreal/materials.js";
 import { WASHED_OUT_LUMA, judgeRender } from "../src/unreal/visual-judge.js";
 import { describeWithTools } from "./helpers/require-tool.js";
@@ -137,6 +141,52 @@ async function raggedAlphaTexture(): Promise<Buffer> {
     }
   }
   return sharp(data, { raw: { width: size, height: size, channels: 4 } }).png().toBuffer();
+}
+
+/**
+ * A leaf card the way the graph baker produces it: BaseColor = leaf texture, Opacity = Desaturation(mask texture), the
+ * silhouette living only in the mask (the Rusty Cars ivy). Baked for real with `alpha: "opacity"`; if the baker stopped
+ * writing the cut-out, this card would be a solid green square.
+ */
+async function graphBakedLeafTexture(): Promise<Buffer> {
+  const size = 64;
+  const raster = (texel: (x: number, y: number) => [number, number, number]): TextureRaster => {
+    const rgba = new Uint8Array(size * size * 4);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) rgba.set([...texel(x, y), 255], (y * size + x) * 4);
+    return { width: size, height: size, rgba, srgb: true };
+  };
+  const leaf = raster(() => [50, 130, 55]);
+  // A leaf-shaped (pointed ellipse) white mask on black: roughly a third of the card.
+  const mask = raster((x, y) => {
+    const dx = (x - 32) / 30;
+    const dy = (y - 32) / 18;
+    return dx * dx + dy * dy <= 1 && Math.abs(dy) <= 1 - Math.abs(dx) * 0.5 ? [255, 255, 255] : [0, 0, 0];
+  });
+  const pin = (node: string, mask: number[] | null = null) => ({ node, output: 0, mask });
+  const nodes = [
+    { id: "leaf", class: "TextureSample", inputs: {}, constants: {}, texture: "/Game/Test/T_Leaf.T_Leaf", samplerType: "Color" },
+    { id: "mask", class: "TextureSample", inputs: {}, constants: {}, texture: "/Game/Test/T_Mask.T_Mask", samplerType: "Color" },
+    { id: "gray", class: "Desaturation", inputs: { Input: pin("mask", [1, 1, 1, 0]) }, constants: {} },
+  ];
+  const graph = materialGraphSchema.parse({
+    format: 1,
+    material: "M_Leaf",
+    package: "/Game/Test/M_Leaf",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: pin("leaf", [1, 1, 1, 0]), roughness: null, metallic: null, emissive: null, opacity: pin("gray"), opacityMask: null, normal: null, materialAttributes: null },
+    nodes,
+  });
+  const result = await bakeGraph({
+    graph,
+    output: "baseColor",
+    parameters: { textures: new Map(), vectors: new Map(), scalars: new Map(), switches: new Map() },
+    loadTexture: async (name) => (name.includes("T_Leaf") ? leaf : name.includes("T_Mask") ? mask : undefined),
+    size,
+    alpha: "opacity",
+  });
+  if (result.status !== "baked") throw new Error(`leaf bake failed: ${JSON.stringify(result)}`);
+  return result.png;
 }
 
 const resolve = (request: Omit<ResolveMaterialRequest, "readMat" | "readProps"> & {
@@ -306,6 +356,113 @@ async function importedNeedleCard(dir: string, name: string, options: { noMipmap
   return glbPath;
 }
 
+/** A leaf albedo of one flat hue with mild noise (the importer binds only plausible albedos; this is a render fixture). */
+async function leafTexture(rgb: readonly [number, number, number]): Promise<Buffer> {
+  const size = 32;
+  const data = Buffer.alloc(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const n = ((x * 5 + y * 3) % 7) - 3;
+      data.set([rgb[0] + n, rgb[1] + n, rgb[2] + n, 255], (y * size + x) * 4);
+    }
+  }
+  return sharp(data, { raw: { width: size, height: size, channels: 4 } }).png().toBuffer();
+}
+
+/**
+ * Landscape Pro's dead trees: `DeadTrees/MI_Leafs_Parent` overrides Diffuse with the dry leaf and `GreenTrees/MI_Leafs_Parent`
+ * (same basename) with the green one. The instance's `Parent =` line names DeadTrees; the sidecar index is keyed by
+ * basename, so the importer must follow the package or the dead tree renders green. Resolved for real through the
+ * importer's parent scoping.
+ */
+async function deadLeafTextureName(dir: string): Promise<"T_Dry_Leaf" | "T_Green_Leaf"> {
+  const reference = (folder: string, name: string, cls = "Texture2D"): string => `${cls}'Content/Pack/${folder}/${name}.${name}'`;
+  const instance = (parentFolder: string): string => `Parent = MaterialInstanceConstant'Content/Pack/${parentFolder}/MI_Leafs_Parent.MI_Leafs_Parent'\n`;
+  const overrideOf = (texture: string): string =>
+    [
+      "Parent = Material3'Content/Pack/Master/M_Leafs.M_Leafs'",
+      "TextureParameterValues[1] =",
+      "{",
+      "    TextureParameterValues[0] =",
+      "    {",
+      "        ParameterInfo = { Name=None }",
+      `        ParameterValue = ${reference("Textures", texture)}`,
+      "        ParameterName = Diffuse",
+      "    }",
+      "}",
+    ].join("\n");
+  const master = ["CollectedTextureParameters[1] =", "{", "    CollectedTextureParameters[0] =", "    {", `        Texture = ${reference("Textures", "T_Dry_Leaf")}`, "        Name = Diffuse", "        Group = Base", "    }", "}"].join("\n");
+  const root = join(dir, "leaf-index");
+  const folders = { dead: join(root, "DeadTrees"), green: join(root, "GreenTrees"), tree: join(root, "DeadTrees", "tree02") };
+  for (const folder of Object.values(folders)) await mkdir(folder, { recursive: true });
+  await writeFile(join(folders.tree, "MI_Leafs_lod00.props.txt"), instance("DeadTrees"));
+  await writeFile(join(folders.tree, "MI_Leafs_lod00.mat"), "Diffuse=T_Dry_Leaf\n");
+  await writeFile(join(folders.dead, "MI_Leafs_Parent.props.txt"), overrideOf("T_Dry_Leaf"));
+  await writeFile(join(folders.green, "MI_Leafs_Parent.props.txt"), overrideOf("T_Green_Leaf"));
+  await writeFile(join(root, "M_Leafs.props.txt"), master);
+  const props = new Map([
+    ["MI_Leafs_lod00", join(folders.tree, "MI_Leafs_lod00.props.txt")],
+    // Indexed last, as in the real pack: the green namesake.
+    ["MI_Leafs_Parent", join(folders.green, "MI_Leafs_Parent.props.txt")],
+    ["M_Leafs", join(root, "M_Leafs.props.txt")],
+  ]);
+  const propsAll = new Map([...props].map(([name, path]) => [name, name === "MI_Leafs_Parent" ? [join(folders.dead, "MI_Leafs_Parent.props.txt"), path] : [path]]));
+  const scoped = scopeParentChain(
+    { gltf: new Map(), psa: new Map(), mat: new Map(), props, matAll: new Map(), propsAll, png: new Map(), audio: new Map(), dna: new Map() },
+    "MI_Leafs_lod00",
+  );
+  const read = async (path: string | undefined): Promise<string | undefined> => (path === undefined ? undefined : readFile(path, "utf8").catch(() => undefined));
+  const texts = new Map<string, string>();
+  for (const name of ["MI_Leafs_lod00", "MI_Leafs_Parent", "M_Leafs"]) {
+    const text = await read(scoped.props.get(name));
+    if (text !== undefined) texts.set(name, text);
+  }
+  const resolved = resolveMaterial({
+    name: "MI_Leafs_lod00",
+    readMat: (name) => (name === "MI_Leafs_lod00" ? "Diffuse=T_Dry_Leaf\n" : undefined),
+    readProps: (name) => texts.get(name),
+    availableTextures: new Set(["T_Dry_Leaf", "T_Green_Leaf"]),
+  });
+  const base = resolved.bindings.find((binding) => binding.slot === "baseColor")?.texture;
+  return base === "T_Green_Leaf" ? "T_Green_Leaf" : "T_Dry_Leaf";
+}
+
+/**
+ * Landscape Pro's rocks: two packages hold `M_Rock` (a tan cliff master and a dark mossy medium-rock master). The
+ * instance's `Parent =` line names Medium. The baker must bake that graph, not the one the dump keys by plain name.
+ * Returns the PNG the real graph baker produces.
+ */
+async function mossyRockBake(dir: string): Promise<Buffer> {
+  const graph = (pkg: string, rgb: readonly [number, number, number]) =>
+    materialGraphSchema.parse({
+      format: 1,
+      material: "M_Rock",
+      package: pkg,
+      truncated: false,
+      nodeCount: 1,
+      outputs: { baseColor: { node: "c", output: 0, mask: null }, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+      nodes: [{ id: "c", class: "Constant3Vector", inputs: {}, constants: { Constant: [rgb[0], rgb[1], rgb[2], 1] } }],
+    });
+  const cliff = graph("/Game/Pack/Cliff/M_Rock", [0.5, 0.42, 0.3]);
+  const medium = graph("/Game/Pack/Medium/M_Rock", [0.08, 0.13, 0.04]);
+  const sourceDir = join(dir, "rock-source");
+  await mkdir(join(sourceDir, "Content", "Pack"), { recursive: true });
+  await writeFile(join(sourceDir, "Content", "Pack", "MI_Rock_Inst.uasset"), Buffer.alloc(16));
+  const baker = createGraphBaker({
+    sourceDir,
+    maxTextureSize: 16,
+    dumpGraphs: async () => new Map([["M_Rock", cliff], ["/Game/Pack/Medium/M_Rock", medium]]),
+  })!;
+  const outcome = await baker({
+    materialName: "MI_Rock_Inst",
+    lookupName: "MI_Rock_Inst",
+    assets: { png: new Map() },
+    readProps: (name) => (name === "MI_Rock_Inst" ? "Parent = Material3'Content/Pack/Medium/M_Rock.M_Rock'\n" : undefined),
+  });
+  if (outcome.status !== "baked") throw new Error(`rock bake failed: ${JSON.stringify(outcome)}`);
+  return Buffer.from(outcome.png);
+}
+
 interface Fixture {
   readonly name: string;
   readonly path: string;
@@ -314,6 +471,7 @@ interface Fixture {
 async function buildFixtures(dir: string): Promise<Fixture[]> {
   const wood = await woodTexture();
   const ragged = await raggedAlphaTexture();
+  const graphLeaf = await graphBakedLeafTexture();
   const fixtures: Fixture[] = [];
   const write = async (name: string, options: Omit<GlbOptions, "name">): Promise<void> => {
     const path = join(dir, `${name}.glb`);
@@ -352,6 +510,17 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
   });
   fixtures.push({ name: "needle-card-mipped", path: await importedNeedleCard(dir, "needle-card-mipped", {}) });
   fixtures.push({ name: "needle-card-unmipped", path: await importedNeedleCard(dir, "needle-card-unmipped", { noMipmaps: true }) });
+  await write("graph-baked-leaf-card", {
+    geometry: "quad",
+    baseColorFactor: [1, 1, 1, 1],
+    texture: graphLeaf,
+    // What the importer exports for a binary Opacity cut-out.
+    alphaMode: "MASK",
+    alphaCutoff: 0.5,
+    doubleSided: true,
+  });
+  await write("dead-tree-leaf", { geometry: "quad", baseColorFactor: [1, 1, 1, 1], texture: await leafTexture((await deadLeafTextureName(dir)) === "T_Green_Leaf" ? [60, 170, 50] : [150, 120, 80]) });
+  await write("mossy-rock", { geometry: "cube", baseColorFactor: [1, 1, 1, 1], texture: await mossyRockBake(dir) });
   await write("solid-box", { geometry: "cube", baseColorFactor: [0.15, 0.3, 0.85, 1] });
   await write("neutral-grey", { geometry: "cube", baseColorFactor: [0.5, 0.5, 0.5, 1] });
   await write("solid-quad", { geometry: "quad", baseColorFactor: [0.2, 0.7, 0.3, 1] });
@@ -432,6 +601,23 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(unmipped.stats.objectPixels).toBeGreaterThan(mipped.stats.objectPixels * 2);
   });
 
+  it("a graph-baked leaf card keeps its silhouette: far sparser than a solid card, still green (Rusty Cars ivy)", async () => {
+    const leaf = judgeRender(byName.get("graph-baked-leaf-card")!);
+    const solid = judgeRender(byName.get("solid-quad")!);
+    expect(leaf.stats.objectPixels).toBeGreaterThan(200);
+    // A solid card would draw as many pixels as the solid quad; the leaf is about a third of it.
+    expect(leaf.stats.objectPixels).toBeLessThan(solid.stats.objectPixels * 0.6);
+    const [r, g, b] = objectMeanRgb(byName.get("graph-baked-leaf-card")!);
+    expect(g).toBeGreaterThan(r * 1.3);
+    expect(g).toBeGreaterThan(b * 1.3);
+    // The numeric lock on the baked texture itself: about a third of the texels are opaque, matching the mask.
+    const { data } = await sharp(await graphBakedLeafTexture()).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    let opaque = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i]! >= 128) opaque++;
+    expect(opaque / (data.length / 4)).toBeGreaterThan(0.25);
+    expect(opaque / (data.length / 4)).toBeLessThan(0.5);
+  });
+
   it("the zero-alpha-tint card is not blank", () => {
     const result = judgeRender(byName.get("zero-alpha-tint")!);
     expect(result.stats.objectPixels).toBeGreaterThan(200);
@@ -455,6 +641,19 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(washed.stats.meanLuma).toBeLessThan(180);
     expect(washed.stats.meanLuma).toBeLessThan(wood.stats.meanLuma + 25);
     expect(washed.reasons.join()).not.toMatch(/washed out|white/);
+  });
+
+  it("a dead tree's leaf is dry brown, not the namesake package's green (Landscape Pro)", () => {
+    const [r, g] = objectMeanRgb(byName.get("dead-tree-leaf")!);
+    expect(r).toBeGreaterThan(g);
+  });
+
+  it("a medium rock bakes its own dark mossy master, not the tan cliff one (Landscape Pro)", () => {
+    const result = judgeRender(byName.get("mossy-rock")!);
+    const [r, g, b] = objectMeanRgb(byName.get("mossy-rock")!);
+    expect(result.stats.meanLuma).toBeLessThan(115);
+    expect(g).toBeGreaterThan(b);
+    expect(r).toBeLessThan(120);
   });
 
   it("the solid box hue matches its base-colour factor", () => {

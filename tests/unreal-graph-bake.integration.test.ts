@@ -25,7 +25,11 @@ type Raw = Record<string, unknown>;
 const pin = (node: string, mask: number[] | null = null) => ({ node, output: 0, mask });
 const node = (id: string, cls: string, extra: Raw = {}): Raw => ({ id, class: cls, inputs: {}, constants: {}, ...extra });
 
-function masterGraph(kind: "mask-tint" | "vertex-color" = "mask-tint", defaultTexture = "T_MasterMask"): MaterialGraph {
+function masterGraph(
+  kind: "mask-tint" | "vertex-color" = "mask-tint",
+  defaultTexture = "T_MasterMask",
+  where: { readonly package?: string; readonly tint?: number[] } = {},
+): MaterialGraph {
   const nodes: Raw[] =
     kind === "mask-tint"
       ? [
@@ -35,18 +39,18 @@ function masterGraph(kind: "mask-tint" | "vertex-color" = "mask-tint", defaultTe
             texture: `/Game/Test/${defaultTexture}.${defaultTexture}`,
             samplerType: "Masks",
           }),
-          node("tint", "Constant3Vector", { constants: { Constant: [0.5, 0.25, 1, 1] } }),
+          node("tint", "Constant3Vector", { constants: { Constant: where.tint ?? [0.5, 0.25, 1, 1] } }),
           node("mul", "Multiply", { inputs: { A: pin("mask", [1, 1, 1, 0]), B: pin("tint") } }),
         ]
       : [
           node("vertex", "VertexColor"),
-          node("tint", "Constant3Vector", { constants: { Constant: [0.5, 0.25, 1, 1] } }),
+          node("tint", "Constant3Vector", { constants: { Constant: where.tint ?? [0.5, 0.25, 1, 1] } }),
           node("mul", "Multiply", { inputs: { A: pin("vertex", [1, 1, 1, 0]), B: pin("tint") } }),
         ];
   return materialGraphSchema.parse({
     format: 1,
     material: "M_Master",
-    package: "/Game/Test/M_Master",
+    package: where.package ?? "/Game/Test/M_Master",
     truncated: false,
     nodeCount: nodes.length,
     outputs: {
@@ -182,6 +186,34 @@ describe("createGraphBaker", () => {
     if (plain.status !== "baked") throw new Error("expected a bake of the master");
     expect(await firstPixel(plain.png)).toEqual([encode((10 / 255) * 0.5), encode((10 / 255) * 0.25), encode(10 / 255)]);
     expect(dumps).toBe(1);
+  });
+
+  it("takes the master the Parent line names when two packages hold a master of the same name", async () => {
+    // Landscape Pro: RocksCliff/ and RocksMedium/ both hold M_cliffrock01_material, and they are different graphs
+    // (the Medium one blends moss). The dump keys the first by name and the second by package, so a lookup by name
+    // always returned the Cliff graph for a Medium rock.
+    const { sourceDir, assets } = await fixture();
+    const cliff = masterGraph("mask-tint", "T_MasterMask", { package: "/Game/Test/Cliff/M_Master", tint: [1, 1, 1, 1] });
+    const medium = masterGraph("mask-tint", "T_MasterMask", { package: "/Game/Test/Medium/M_Master", tint: [0.5, 0.25, 1, 1] });
+    const dump = async () => new Map([["M_Master", cliff], ["/Game/Test/Medium/M_Master", medium]]);
+    const props: Record<string, string> = {
+      MI_Rock: instanceProps("M_Master", [["Mask", "T_InstanceMask"]]).replace("Content/Test/M_Master.M_Master", "Content/Test/Medium/M_Master.M_Master"),
+      MI_Cliff: instanceProps("M_Master", [["Mask", "T_InstanceMask"]]).replace("Content/Test/M_Master.M_Master", "Content/Test/Cliff/M_Master.M_Master"),
+      MI_Bare: instanceProps("M_Master", [["Mask", "T_InstanceMask"]]),
+    };
+    for (const name of ["MI_Cliff", "MI_Bare"]) await writeFile(join(sourceDir, "Content", "Test", `${name}.uasset`), Buffer.alloc(16));
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: dump })!;
+    const readProps = (name: string): string | undefined => props[name];
+    const rock = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps });
+    if (rock.status !== "baked") throw new Error(`expected a bake, got ${JSON.stringify(rock)}`);
+    expect(await firstPixel(rock.png)).toEqual([encode((200 / 255) * 0.5), encode((100 / 255) * 0.25), encode(50 / 255)]);
+    const cliffBake = await baker({ materialName: "s", lookupName: "MI_Cliff", assets, readProps });
+    if (cliffBake.status !== "baked") throw new Error(`expected a bake, got ${JSON.stringify(cliffBake)}`);
+    expect(await firstPixel(cliffBake.png)).toEqual([encode(200 / 255), encode(100 / 255), encode(50 / 255)]);
+    // A reference that names no directory keeps the by-name pick (the first graph).
+    const bare = await baker({ materialName: "s", lookupName: "MI_Bare", assets, readProps: (name) => (name === "MI_Bare" ? props.MI_Bare!.replace(/Content\/Test\//, "") : undefined) });
+    if (bare.status !== "baked") throw new Error(`expected a bake, got ${JSON.stringify(bare)}`);
+    expect(await firstPixel(bare.png)).toEqual([encode(200 / 255), encode(100 / 255), encode(50 / 255)]);
   });
 
   it("is unavailable without a source package and does not touch the converter", async () => {

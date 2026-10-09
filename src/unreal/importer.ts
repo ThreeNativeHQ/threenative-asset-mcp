@@ -15,6 +15,7 @@ import {
   type ResolvedMaterial,
   type ResolveMaterialRequest,
   type TextureTransform,
+  parsePropsFile,
   resolveMaterial,
 } from "./materials.js";
 import { readPackageCooking, readPackageObjectNames } from "./cooking.js";
@@ -52,7 +53,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 62;
+export const IMPORTER_VERSION = 65;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -713,6 +714,64 @@ export function scopeMaterialFiles(assets: ExportedAssets, meshDirectory: string
   return scoped;
 }
 
+/** How many trailing directory names of `file` equal those of the package a `Parent =` reference names. */
+function packageDirectoryOverlap(file: string, packagePath: string): number {
+  const wanted = packagePath.replace(/\\/g, "/").toLowerCase().split("/").slice(0, -1);
+  const held = dirname(file).replace(/\\/g, "/").toLowerCase().split("/");
+  let overlap = 0;
+  while (overlap < wanted.length && overlap < held.length && wanted[wanted.length - 1 - overlap] === held[held.length - 1 - overlap]) overlap += 1;
+  return overlap;
+}
+
+/** The one copy that shares the most trailing directories with the named package; undefined on no overlap or a tie. */
+function copyInPackage(copies: readonly string[], packagePath: string): string | undefined {
+  const scored = copies.map((copy) => ({ copy, overlap: packageDirectoryOverlap(copy, packagePath) })).sort((a, b) => b.overlap - a.overlap);
+  const [best, next] = scored;
+  return best !== undefined && best.overlap > 0 && best.overlap > (next?.overlap ?? 0) ? best.copy : undefined;
+}
+
+const parentScoped = new WeakMap<ExportedAssets, Map<string, ExportedAssets>>();
+
+/**
+ * A parent material is named by basename in the sidecar maps, so two packages that share one (`MI_Leafs_Inst` under
+ * `DeadTrees/` and `GreenTrees/`) collapse onto whichever was indexed last. The instance's `Parent =` line names the
+ * package it really inherits from; this follows the chain from `startName` and points each ambiguous ancestor at the
+ * `.mat` / `.props.txt` that sits in that package's directory. Anything it cannot place keeps the existing pick.
+ */
+export function scopeParentChain(assets: ExportedAssets, startName: string): ExportedAssets {
+  if (assets.propsAll === undefined) return assets;
+  const known = parentScoped.get(assets) ?? new Map<string, ExportedAssets>();
+  parentScoped.set(assets, known);
+  const cached = known.get(startName);
+  if (cached) return cached;
+  let mat: Map<string, string> | undefined;
+  let props: Map<string, string> | undefined;
+  const visited = new Set<string>();
+  let path = assets.props.get(startName);
+  for (let depth = 0; path !== undefined && depth < 8; depth += 1) {
+    const text = readMaterialSidecar(path);
+    if (!text) break;
+    const { parent, parentPackage } = parsePropsFile(text);
+    if (parent === undefined || visited.has(parent)) break;
+    visited.add(parent);
+    const copies = assets.propsAll.get(parent) ?? [];
+    const matching = parentPackage !== undefined && copies.length > 1 ? copyInPackage(copies, parentPackage) : undefined;
+    if (matching !== undefined && matching !== (props ?? assets.props).get(parent)) {
+      props ??= new Map(assets.props);
+      props.set(parent, matching);
+      const sibling = (assets.matAll?.get(parent) ?? []).find((copy) => dirname(copy) === dirname(matching));
+      if (sibling !== undefined) {
+        mat ??= new Map(assets.mat);
+        mat.set(parent, sibling);
+      }
+    }
+    path = (props ?? assets.props).get(parent);
+  }
+  const scoped = mat === undefined && props === undefined ? assets : { ...assets, mat: mat ?? assets.mat, props: props ?? assets.props };
+  known.set(startName, scoped);
+  return scoped;
+}
+
 function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAssets {
   const merge = (first: Map<string, string>, second: Map<string, string>): Map<string, string> =>
     new Map([...first, ...second]);
@@ -1323,11 +1382,12 @@ export async function packageGlb(options: {
   for (const [index, material] of root.listMaterials().entries()) {
     const name = material.getName();
     const lookupName = options.materialLookupNames?.get(name) ?? name;
-    const materialAssets = options.materialAssets?.get(name) ?? meshAssets;
+    const unscopedAssets = options.materialAssets?.get(name) ?? meshAssets;
+    const materialAssets = scopeParentChain(unscopedAssets, lookupName);
     const availableTextures = new Set(materialAssets.png.keys());
     const graphPath = materialAssets.mat.get(lookupName);
     const graphText = graphPath ? readMaterialSidecar(graphPath) : undefined;
-    const graphNames = graphText ? sharedGraphs.get(materialAssets)?.get(graphText) : undefined;
+    const graphNames = graphText ? sharedGraphs.get(unscopedAssets)?.get(graphText) : undefined;
     // UE Viewer names a section it could not resolve `dummy_material_<n>` and paints it a debug
     // colour. Shipping that name would put a placeholder into a game asset and let a reader
     // mistake it for a real material, so it is renamed to something that says what it is.
@@ -1374,6 +1434,8 @@ export async function packageGlb(options: {
       lookupName,
       assets: materialAssets,
       probe,
+      // A translucent or masked section keeps its cut-out in the graph's Opacity or OpacityMask pin.
+      ...(resolved.alphaMode === "BLEND" ? { alpha: "opacity" as const } : resolved.alphaMode === "MASK" ? { alpha: "opacityMask" as const } : {}),
       // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
       // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
       ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
@@ -1582,6 +1644,15 @@ export async function packageGlb(options: {
         attachTexture(material, binding, texture);
         graphBindings.push(binding);
         packagingLimitations.push(...outcome.approximations);
+        if (outcome.alpha?.binary && material.getAlphaMode() === "BLEND") {
+          // A translucent material whose Opacity is a leaf-shaped mask is a cut-out. Sorted blending smears overlapping
+          // cards over each other and the backdrop (grey, washed-out foliage), so it is exported as a masked card.
+          material.setAlphaMode("MASK");
+          material.setAlphaCutoff(0.5);
+          packagingLimitations.push(
+            `Opacity is a binary cut-out (${(outcome.alpha.opaqueShare * 100).toFixed(0)}% of texels opaque): exported as alphaMode MASK instead of BLEND, because blended overlapping cards render grey and unsorted.`,
+          );
+        }
         graphReport = { status: "baked", confidence: outcome.confidence, unsupportedNodes: [], approximations: [...outcome.approximations] };
       } else if (outcome.status === "unsupported") {
         graphReport = { status: "unsupported", unsupportedNodes: [...outcome.unsupported], approximations: [], reason: outcome.reason };
