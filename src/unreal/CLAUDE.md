@@ -10,9 +10,9 @@ Loaded when you work in this directory. The long form (and why) is in the root `
    `npx tsx scripts/fidelity-sheet.ts --source <pack dir> --import <import output dir> --out <dir>`.
    It prints a per-piece table (score 0..100, hue EMD, saturation ratio, density ratio, lightness ratio) and writes
    `sheet.jpg` plus the reference/render tile PNGs. Then **look at the sheet** (Read the jpg): numbers and eyes must agree.
-   - saturation ratio below ~0.85: greyer than Unreal (dropped tint, wrong channel, missing graph colour).
-   - density ratio below ~0.8: sparser (opacity cut-out too harsh); above ~1.4: solid card (cut-out missing).
-   - hue EMD above ~20 degrees: wrong colour (swapped channels, wrong texture, wrong tint).
+   - saturation ratio below ~0.7 (provisional; a correct import sits a little under 1 because the editor tonemaps): greyer than Unreal (dropped tint, wrong channel, missing graph colour).
+   - density ratio below ~0.65: sparser (opacity cut-out too harsh); above ~1.6: solid card (cut-out missing).
+   - hue EMD above ~25 degrees: wrong colour (swapped channels, wrong texture, wrong tint).
    - no thumbnail (most UE5 packs): the metric cannot compare; compare the render with the albedo the material binds.
 2. **Find the cause in the package**, not in the render: material graph (`dump.mts`-style `dumpMaterialGraphs`),
    instance parameters, texture source format. Check `tests/fixtures`/`AGENTS.md` first: thumbnails are red/blue

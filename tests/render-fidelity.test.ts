@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { RgbaImage } from "../src/unreal/image-diff.js";
-import { circularHueEmd, explainFidelity, FIDELITY_OK_SCORE, FIDELITY_SUSPECT_SCORE, measureFidelity } from "../src/unreal/render-fidelity.js";
+import { circularHueEmd, explainFidelity, FIDELITY_OK_SCORE, fidelityVerdict, measureFidelity } from "../src/unreal/render-fidelity.js";
 import { judgeRender } from "../src/unreal/visual-judge.js";
 
 const SIZE = 64;
@@ -42,14 +42,14 @@ describe("measureFidelity", () => {
     // Same yellow-green hue, a third of the saturation. The old mean-colour similarity waved this kind of drift through.
     const metrics = measureFidelity(reference, tile([128, 140, 100]));
     expect(metrics.saturationRatio).toBeLessThan(0.6);
-    expect(metrics.score).toBeLessThan(FIDELITY_OK_SCORE);
+    expect(fidelityVerdict(metrics).verdict).not.toBe("ok");
     expect(explainFidelity(metrics)).toMatch(/greyer than Unreal/);
   });
 
   it("flags a hue shift at the same saturation", () => {
     const metrics = measureFidelity(reference, tile([160, 80, 40]));
     expect(metrics.hueEmdDegrees).toBeGreaterThan(30);
-    expect(metrics.score).toBeLessThan(FIDELITY_OK_SCORE);
+    expect(fidelityVerdict(metrics).verdict).not.toBe("ok");
     expect(explainFidelity(metrics)).toMatch(/hue off/);
   });
 
@@ -83,13 +83,72 @@ describe("measureFidelity", () => {
   });
 });
 
-describe("judgeRender with a fidelity score", () => {
+/** A textured, foliage-like object: leaf greens of varied lightness, on flat grey. */
+function foliage(transform: (r: number, g: number, b: number, x: number, y: number) => [number, number, number]): RgbaImage {
+  const data = new Uint8Array(SIZE * SIZE * 4);
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    const x = i % SIZE;
+    const y = Math.floor(i / SIZE);
+    const inside = x >= 10 && x < 54 && y >= 8 && y < 56 && (x * 7 + y * 3) % 5 !== 0;
+    let rgb: [number, number, number] = [128, 128, 128];
+    if (inside) {
+      const shade = 0.55 + 0.45 * (((x * 13 + y * 29) % 17) / 16);
+      rgb = transform(110 * shade, 160 * shade, 45 * shade, x, y);
+    }
+    data.set([...rgb.map((v) => Math.max(0, Math.min(255, Math.round(v)))), 255], i * 4);
+  }
+  return { width: SIZE, height: SIZE, data };
+}
+
+describe("measureFidelity under Unreal-like lighting (apples to apples)", () => {
+  const neutral = foliage((r, g, b) => [r, g, b]);
+
+  it("is unmoved by sun and shade, a cast-shadow patch and a cool sky tint on the reference", () => {
+    // Unreal's thumbnail: brighter sun side, darker shade side, a deep shadow patch, a bluish ambient lift in shade.
+    const lit = foliage((r, g, b, x, y) => {
+      const sun = 0.5 + 0.9 * (x / SIZE);
+      const inShadow = x < 22 && y > 36;
+      const k = inShadow ? 0.25 : sun;
+      const ambient = inShadow ? 12 : 0;
+      return [r * k + ambient * 0.6, g * k + ambient * 0.8, b * k + ambient * 1.3];
+    });
+    const metrics = measureFidelity(lit, neutral);
+    expect(metrics.score).toBeGreaterThanOrEqual(FIDELITY_OK_SCORE + 10);
+    expect(metrics.saturationRatio).toBeGreaterThan(0.8);
+    expect(metrics.saturationRatio).toBeLessThan(1.25);
+    expect(fidelityVerdict(metrics).verdict).toBe("ok");
+  });
+
+  it("still catches a desaturated render under that same lighting difference", () => {
+    const lit = foliage((r, g, b, x) => {
+      const k = 0.5 + 0.9 * (x / SIZE);
+      return [r * k, g * k, b * k];
+    });
+    // Same luminance, half the colour: the washed-out conifer look.
+    const washed = foliage((r, g, b) => {
+      const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      return [y + (r - y) * 0.45, y + (g - y) * 0.45, y + (b - y) * 0.45];
+    });
+    const metrics = measureFidelity(lit, washed);
+    expect(metrics.saturationRatio).toBeLessThan(0.75);
+    expect(fidelityVerdict(metrics).verdict).not.toBe("ok");
+  });
+});
+
+describe("judgeRender with fidelity", () => {
   const image = tile([120, 160, 40]);
-  it("passes a high score, marks a middling one suspect and a low one fail, with the explanation", () => {
-    expect(judgeRender(image, { fidelityScore: 90 }).verdict).toBe("ok");
-    const suspect = judgeRender(image, { fidelityScore: FIDELITY_OK_SCORE - 1, fidelityExplanation: "greyer than Unreal (0.60x saturation)" });
-    expect(suspect.verdict).toBe("suspect");
+  const reference = tile([120, 160, 40]);
+
+  it("passes a faithful render", () => {
+    expect(judgeRender(image, { fidelity: measureFidelity(reference, image) }).verdict).toBe("ok");
+  });
+
+  it("marks one bad axis suspect, and a very bad one fail, with the reason", () => {
+    const washed = measureFidelity(reference, tile([128, 140, 100]));
+    const suspect = judgeRender(image, { fidelity: washed });
+    expect(["suspect", "fail"]).toContain(suspect.verdict);
     expect(suspect.reasons.join(" ")).toContain("greyer than Unreal");
-    expect(judgeRender(image, { fidelityScore: FIDELITY_SUSPECT_SCORE - 1 }).verdict).toBe("fail");
+    const solid = measureFidelity(tile([120, 160, 40], { sparse: true }), tile([120, 160, 40]));
+    expect(judgeRender(image, { fidelity: solid }).verdict).toBe("fail");
   });
 });

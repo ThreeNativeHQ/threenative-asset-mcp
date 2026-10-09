@@ -1,5 +1,5 @@
 import type { RgbaImage } from "./image-diff.js";
-import { FIDELITY_OK_SCORE, FIDELITY_SUSPECT_SCORE } from "./render-fidelity.js";
+import { fidelityVerdict, type FidelityMetrics } from "./render-fidelity.js";
 
 /** A thumbnail present and colour similarity below this makes the verdict `suspect`. */
 export const SUSPECT_COLOUR_SIMILARITY = 0.35;
@@ -37,9 +37,6 @@ export const WASHED_OUT_LUMA = 200;
 export const SOLID_CARD_FILL_FACTOR = 1.6;
 /** Object pixels below this make a fill ratio meaningless: a handful of pixels trivially fills its box. */
 export const MIN_FILL_MASK_PIXELS = 200;
-/** Fidelity (0..100, `render-fidelity.ts`) below which a tile is flagged suspect / failed. */
-export const FIDELITY_SUSPECT_BELOW = FIDELITY_OK_SCORE;
-export const FIDELITY_FAIL_BELOW = FIDELITY_SUSPECT_SCORE;
 const NEAR_WHITE = 235;
 const NEUTRAL_SPREAD = 12;
 /** Colour distance from the tile background above which a pixel is object. */
@@ -82,10 +79,8 @@ export interface JudgeOptions {
   thumbnailFillRatio?: number;
   /** Object pixels of the Unreal thumbnail's mask; the silhouette check needs enough of both. */
   thumbnailObjectPixels?: number;
-  /** 0..100 fidelity to the Unreal thumbnail (`measureFidelity`), when the pair is comparable. */
-  fidelityScore?: number;
-  /** What drags the fidelity score down (`explainFidelity`). */
-  fidelityExplanation?: string;
+  /** Lighting-robust fidelity to the Unreal thumbnail (`measureFidelity`), when the pair is comparable. */
+  fidelity?: FidelityMetrics;
 }
 
 const RANK: Record<Verdict, number> = { ok: 0, suspect: 1, fail: 2 };
@@ -202,12 +197,11 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
   if (options.colourSimilarity !== undefined && options.colourSimilarity < SUSPECT_COLOUR_SIMILARITY) {
     raise("suspect", `colour similarity ${options.colourSimilarity.toFixed(2)} below ${SUSPECT_COLOUR_SIMILARITY}`);
   }
-  // Lighting-robust fidelity to the thumbnail (hue, saturation per lightness, silhouette density): the older mean-colour
-  // similarity passed washed-out, hue-shifted or sparse foliage, this does not.
-  if (options.fidelityScore !== undefined && options.fidelityScore < FIDELITY_FAIL_BELOW) {
-    raise("fail", `fidelity ${options.fidelityScore.toFixed(0)}/100: ${options.fidelityExplanation ?? "far from the Unreal thumbnail"}`);
-  } else if (options.fidelityScore !== undefined && options.fidelityScore < FIDELITY_SUSPECT_BELOW) {
-    raise("suspect", `fidelity ${options.fidelityScore.toFixed(0)}/100: ${options.fidelityExplanation ?? "differs from the Unreal thumbnail"}`);
+  // Lighting-robust fidelity to the thumbnail, gated per axis (hue, saturation, silhouette density): the older
+  // mean-colour similarity passed washed-out, hue-shifted or sparse foliage, this does not.
+  if (options.fidelity?.comparable) {
+    const fidelity = fidelityVerdict(options.fidelity);
+    for (const reason of fidelity.reasons) raise(fidelity.verdict, `fidelity ${options.fidelity.score.toFixed(0)}/100: ${reason}`);
   }
   return { verdict, reasons, stats };
 }

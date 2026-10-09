@@ -7,7 +7,7 @@ import { chromium } from "playwright";
 import sharp, { type OverlayOptions } from "sharp";
 
 import { createBrowserTempDir } from "../browser-temp.js";
-import { measureFidelity, explainFidelity, type FidelityMetrics } from "./render-fidelity.js";
+import { measureFidelity, type FidelityMetrics } from "./render-fidelity.js";
 import { colourSimilarity, decodeRgba, maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 import { judgeRender, type JudgeStats, type Verdict } from "./visual-judge.js";
 
@@ -484,7 +484,7 @@ export async function renderContactSheet(
     const result = judgeRender(pixels, {
       ...(candidate.expectColoured ? { expectColoured: true } : {}),
       ...(similarity !== undefined ? { colourSimilarity: similarity } : {}),
-      ...(fidelity !== undefined ? { fidelityScore: fidelity.score, fidelityExplanation: explainFidelity(fidelity) } : {}),
+      ...(fidelity !== undefined ? { fidelity } : {}),
       ...(thumbnailFill !== undefined
         ? { thumbnailFillRatio: thumbnailFill.fillRatio, thumbnailObjectPixels: thumbnailFill.objectPixels }
         : {}),
