@@ -301,3 +301,29 @@ describeWithTools(["chromium"], "unreal contact sheet", () => {
     expect([...keys]).toEqual(["a.glb"]);
   });
 });
+
+describeWithTools(["chromium"], "contact sheet reference shadow", () => {
+  it("does not let the thumbnail's cast shadow lower a correct render's colour similarity", async () => {
+    const dir = await scratch();
+    const green = join(dir, "Meshes", "SM_Green.glb");
+    await mkdir(join(dir, "Meshes"), { recursive: true });
+    await writeCube(green, [0.1, 0.8, 0.15]);
+    // An editor-like thumbnail: blue-grey checkered floor, a green piece, and a larger dark blue cast shadow beside it.
+    const floor = Buffer.alloc(64 * 64 * 3);
+    for (let y = 0; y < 64; y++) for (let x = 0; x < 64; x++) floor.set(((x >> 3) + (y >> 3)) % 2 === 0 ? [125, 132, 137] : [112, 120, 126], (y * 64 + x) * 3);
+    const base = sharp(floor, { raw: { width: 64, height: 64, channels: 3 } }).resize(256, 256, { kernel: "nearest" });
+    const piece = await sharp({ create: { width: 70, height: 70, channels: 3, background: { r: 38, g: 200, b: 40 } } }).png().toBuffer();
+    const shadow = await sharp({ create: { width: 190, height: 70, channels: 3, background: { r: 48, g: 66, b: 78 } } }).png().toBuffer();
+    const thumbnail = await base.composite([{ input: shadow, left: 20, top: 150 }, { input: piece, left: 90, top: 70 }]).png().toBuffer();
+    const result = await renderContactSheet({
+      glbPaths: [green],
+      outPath: join(dir, "sheet.jpg"),
+      title: "Shadow",
+      tile: 200,
+      thumbnails: new Map([["Meshes/SM_Green.glb", thumbnail]]),
+    });
+    const tile = result.judge[0]!;
+    expect(tile.similarity).toBeGreaterThan(0.5);
+    expect(tile.reasons.join(" ")).not.toContain("colour similarity");
+  });
+});

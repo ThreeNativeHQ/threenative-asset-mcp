@@ -484,7 +484,7 @@ export async function renderContactSheet(
     if (candidate.thumbnail !== undefined) {
       try {
         const reference = await decodeRgba(candidate.thumbnail);
-        const comparison = colourSimilarity(reference, pixels);
+        const comparison = colourSimilarity(reference, pixels, referenceObjectMask(reference));
         const shapePixels = decodedShape === undefined ? undefined : cutTile(decodedShape, tile, index % columns, Math.floor(index / columns));
         const measured = measureFidelity(reference, pixels, shapePixels);
         if (measured.comparable) fidelity = measured;
