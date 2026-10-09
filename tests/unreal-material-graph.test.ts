@@ -1589,6 +1589,29 @@ describe("per-instance and engine utility nodes of layered cliff materials", () 
     expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("WorldAlignedBlend evaluated as 0.5"))).toBe(true);
   });
 
+  it("WorldAlignedBlend follows the mesh's own surface normals when the bake is given them", async () => {
+    // Left half of UV space faces up (+Y), right half faces sideways. saturate(up x 10 - 2): moss (alpha 1) on the left, rock (0) on the right.
+    const graph = makeGraph(
+      [
+        node("blend", "LinearInterpolate", { inputs: { A: pin("rock"), B: pin("moss"), Alpha: pin("aligned", 1) } }),
+        constant3("rock", [0.6, 0.6, 0.6]),
+        constant3("moss", [0.2, 0.4, 0.0]),
+        engineOutputs("aligned", "WorldAlignedBlend", "Engine_MaterialFunctions01/AlphaBlend", ["Alpha", "w/Vertex Normals", "w/ Explicit Normal"], { Input2: pin("sharpness"), Input3: pin("bias") }),
+        node("sharpness", "ScalarParameter", { parameter: { name: "Blend Sharpness Moss", group: "" }, default: 10 }),
+        node("bias", "ScalarParameter", { parameter: { name: "Blend Bias Moss", group: "" }, default: -2 }),
+      ],
+      pin("blend", 0, RGB_MASK),
+    );
+    const size = 4;
+    const normals = new Float32Array(size * size * 3);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) normals.set(x < size / 2 ? [0, 1, 0] : [1, 0, 0], (y * size + x) * 3);
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size, surface: { width: size, height: size, normals, covered: size * size } });
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(0.2), encode(0.4), encode(0)]);
+    expect(pixel(3, 2)).toEqual([encode(0.6), encode(0.6), encode(0.6)]);
+    expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("WorldAlignedBlend evaluated as saturate(up component"))).toBe(true);
+  });
+
   it("BumpOffset keeps its Coordinate (no view vector in a bake) instead of failing the section", async () => {
     // Sample at BumpOffset(UV x 2): the 2-texel stripes tile twice over 4 pixels. A BumpOffset that returned 0 would read texel 0 everywhere.
     const stripes = await pngOf(2, 2, (x) => (x === 0 ? [0, 0, 0] : [255, 255, 255]));

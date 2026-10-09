@@ -14,6 +14,7 @@ import {
   type TextureRaster,
 } from "./material-graph.js";
 import { parsePropsFile, type PropsFile } from "./materials.js";
+import { surfaceKey, type SurfaceNormals } from "./surface-normals.js";
 import type { ExternalTool } from "./toolchain.js";
 
 /**
@@ -56,6 +57,11 @@ export interface GraphBakeRequest {
    * for MASK, absent for OPAQUE. The bake writes it into the colour PNG's alpha channel.
    */
   readonly alpha?: "opacity" | "opacityMask" | undefined;
+  /**
+   * The mesh's vertex normals in UV space, built on demand: the importer lays them out only for a graph that reads the
+   * surface (a world-normal blend), so a graph that does not never pays for the raster or loses its shared bake.
+   */
+  readonly surface?: (() => SurfaceNormals | undefined) | undefined;
 }
 
 export type GraphBakeOutcome = BakeResult & {
@@ -155,6 +161,11 @@ function parametersKey(parameters: GraphParameters): string {
 
 function unavailable(reason: string): GraphBakeOutcome {
   return { status: "unavailable", reason };
+}
+
+/** True when the graph has a node whose value follows the surface normal (see `surface-normals.ts`). */
+export function graphReadsSurface(graph: MaterialGraph): boolean {
+  return graph.nodes.some((node) => node.class === "FunctionCall" && /(?:^|\/)WorldAlignedBlend\./i.test(node.function ?? "") && !node.fn?.outputs.some(Boolean));
 }
 
 /** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
@@ -282,7 +293,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     if (request.probe) return unavailable(`${graph.material} has a BaseColor output`);
 
     const parameters = chainParameters(chain);
-    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}`;
+    const surface = request.surface && graphReadsSurface(graph) ? request.surface() : undefined;
+    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}`;
     let perAssets = bakes.get(request.assets);
     if (!perAssets) {
       perAssets = new Map();
@@ -304,6 +316,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         particleColor: [1, 1, 1, 1],
         ...(request.alpha ? { alpha: request.alpha } : {}),
         ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
+        ...(surface ? { surface } : {}),
         loadTexture: async (reference) => {
           const name = textureBasename(reference);
           const path = request.assets.png.get(name) ?? (await options.exportTexture?.(name));

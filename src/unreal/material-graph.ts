@@ -1,5 +1,6 @@
 import sharp from "sharp";
 import type { GraphInput, GraphNode, MaterialGraph } from "./graph-dump.js";
+import type { SurfaceNormals } from "./surface-normals.js";
 
 /**
  * PRD-538 Phase 2a: evaluates the BaseColor output of a dumped Unreal material graph (see `graph-dump.ts`)
@@ -75,6 +76,8 @@ export interface BakeRequest {
    * whose silhouette lives in a mask texture is not an opaque rectangle. Absent, or the pin is unwired: alpha stays 255.
    */
   alpha?: "opacity" | "opacityMask";
+  /** The mesh's vertex normals in UV space. With it a `WorldAlignedBlend` follows the surface; without, it is 0.5. */
+  surface?: SurfaceNormals | undefined;
 }
 
 export type BakeResult =
@@ -357,6 +360,10 @@ type Compiled = Val | Attrs;
 interface TexelContext {
   u: number;
   v: number;
+  /** Unit vertex normal at the texel (glTF axes, +Y up), when the bake was given a surface map. */
+  nx?: number;
+  ny?: number;
+  nz?: number;
 }
 type Instruction = (registers: Float64Array, texel: TexelContext) => void;
 
@@ -366,6 +373,8 @@ const BREAK_ATTRIBUTES = ["BaseColor", "Metallic", "Specular", "Roughness", "Emi
 
 interface CompileOptions {
   allowUvSetFallback: boolean;
+  /** The bake carries the mesh's UV-space normals, so a world-normal driven node can be evaluated per texel. */
+  surface?: boolean | undefined;
   vertexColor?: readonly [number, number, number, number] | undefined;
   particleColor?: readonly [number, number, number, number] | undefined;
 }
@@ -387,6 +396,9 @@ const BUMP_OFFSET_NOTE =
 
 const WORLD_ALIGNED_BLEND_NOTE =
   "WorldAlignedBlend evaluated as 0.5: its blend follows the surface normal in world space (moss on up-facing faces), which a UV-space bake cannot hold, so half the surface stands in";
+
+const WORLD_ALIGNED_BLEND_SURFACE_NOTE =
+  "WorldAlignedBlend evaluated as saturate(up component of the mesh's own vertex normal x sharpness + bias), rasterised into UV space; the engine body is not in the pack, so the formula is inferred, and the mesh is taken unrotated";
 
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
@@ -437,10 +449,10 @@ class Compiler {
   }
 
   /** Emits `instruction`, or runs it now when every input is constant (the result is then a constant). */
-  private emit(inputs: readonly Val[], n: number, build: (out: number) => Instruction): Val {
+  private emit(inputs: readonly Val[], n: number, build: (out: number) => Instruction, texelDependent = false): Val {
     const reg = this.allocate();
     const instruction = build(reg);
-    if (inputs.every((input) => input.konst)) {
+    if (!texelDependent && inputs.every((input) => input.konst)) {
       instruction(this.registers, { u: 0, v: 0 });
       return { kind: "vec", reg, n, konst: true };
     }
@@ -1317,9 +1329,21 @@ class Compiler {
     }
     if (lower === "worldalignedblend" && !node.fn?.outputs.some(Boolean)) {
       // Every output (Alpha, w/ Vertex Normals, w/ Explicit Normal) is a 0..1 mask driven by a world-space normal.
-      this.approximations.add(WORLD_ALIGNED_BLEND_NOTE);
       for (const input of Object.values(node.inputs)) this.pin(input);
-      return this.constant([0.5], 1);
+      if (!this.options.surface) {
+        this.approximations.add(WORLD_ALIGNED_BLEND_NOTE);
+        return this.constant([0.5], 1);
+      }
+      // The mesh's own vertex normals are known per texel: up-facing surface gets the blend. The engine body is not in the
+      // pack, so the formula is inferred from the pins (Input2 sharpness, Input3 bias; an artist's -2 bias with sharpness 10
+      // puts the transition at a normal's up component of 0.2 to 0.3).
+      this.approximations.add(WORLD_ALIGNED_BLEND_SURFACE_NOTE);
+      const sharpness = node.inputs.Input2 ? this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1) : this.constant([1], 1);
+      const bias = node.inputs.Input3 ? this.vec(node.inputs.Input3, `${name}.Input3`) ?? this.constant([0], 1) : this.constant([0], 1);
+      return this.emit([sharpness, bias], 1, (o) => (r, texel) => {
+        const alpha = (texel.ny ?? 0) * r[sharpness.reg]! + r[bias.reg]!;
+        r[o] = r[o + 1] = r[o + 2] = r[o + 3] = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
+      }, true);
     }
     if (lower === "splitcomponents" && !node.fn?.outputs.some(Boolean)) return this.splitComponents(node, output, name!);
     // A pack that carries its own body (a Datasmith project holds UVEdit) is evaluated from that body instead.
@@ -1574,10 +1598,19 @@ async function evaluate(
   const registers = compiler.registers.slice(0, Math.max(4, compiler.registerCount * 4));
   const program = compiler.program;
   const texel: TexelContext = { u: 0, v: 0 };
+  const surface = request.surface;
   for (let y = 0; y < size; y++) {
     texel.v = (y + 0.5) / size;
     for (let x = 0; x < size; x++) {
       texel.u = (x + 0.5) / size;
+      if (surface) {
+        const sx = Math.min(surface.width - 1, Math.floor(((x + 0.5) / size) * surface.width));
+        const sy = Math.min(surface.height - 1, Math.floor(((y + 0.5) / size) * surface.height));
+        const at = (sy * surface.width + sx) * 3;
+        texel.nx = surface.normals[at]!;
+        texel.ny = surface.normals[at + 1]!;
+        texel.nz = surface.normals[at + 2]!;
+      }
       for (let index = 0; index < program.length; index++) program[index]!(registers, texel);
       onTexel(x, y, registers);
     }
@@ -1600,7 +1633,7 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
     return { status: "unavailable", reason: `graph ${graph.material} has no BaseColor output` };
   }
 
-  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor });
+  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined });
   if (compiler.unsupported.size > 0) {
     const unsupported = [...compiler.unsupported].sort();
     return { status: "unsupported", unsupported, reason: `BaseColor of ${graph.material} depends on unsupported nodes: ${unsupported.join(", ")}` };
@@ -1628,7 +1661,7 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
   let alphaSummary: { pin: "opacity" | "opacityMask"; opaqueShare: number; binary: boolean } | undefined;
   if (alphaPin) {
     // The cut-out is its own compile, so an alpha path the evaluator cannot read costs only the cut-out: the colour stays.
-    const alphaCompiler = new Compiler(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor });
+    const alphaCompiler = new Compiler(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined });
     const alphaValue = alphaCompiler.compileAlpha(graph, alphaPin);
     if (alphaCompiler.unsupported.size > 0 || alphaCompiler.unavailable.length > 0 || !alphaValue) {
       const why = alphaCompiler.unsupported.size > 0 ? `unsupported nodes ${[...alphaCompiler.unsupported].sort().join(", ")}` : alphaCompiler.unavailable.join("; ") || "no readable path";
