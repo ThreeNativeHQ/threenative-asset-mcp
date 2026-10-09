@@ -15,10 +15,12 @@ async function figure(occluder = false): Promise<Uint8Array> {
   const buffer = document.createBuffer();
   const root = document.createNode("root");
   const wrist = document.createNode("wrist.L").setTranslation([0.9, 1.4, 0]);
-  const tip = document.createNode("tip.L").setTranslation([0.2, 0, 0]);
+  const knuckle = document.createNode("knuckle.L").setTranslation([0.1, 0, 0]);
+  const tip = document.createNode("tip.L").setTranslation([0.1, 0, 0]);
   root.addChild(wrist);
-  wrist.addChild(tip);
-  const joints = [root, wrist, tip];
+  wrist.addChild(knuckle);
+  knuckle.addChild(tip);
+  const joints = [root, wrist, knuckle, tip];
   const skin = document.createSkin("Skin");
   for (const joint of joints) skin.addJoint(joint);
   skin.setInverseBindMatrices(document.createAccessor().setType("MAT4").setBuffer(buffer)
@@ -109,3 +111,18 @@ it("accepts a close-up that looks through a solid body at one angle, but not a s
   expect(result.images.some(image => !image.nonBlank)).toBe(true);
   expect(result.images.some(image => image.nonBlank)).toBe(true);
 }, 30_000);
+
+it("keeps the camera still when the fingers move if an explicit distance is given", async () => {
+  const bytes = await figure();
+  const base = { ...options, times: [0], focus: { bone: "wrist.L", distance: 0.6 } };
+  const rest = await renderPreview(bytes, base);
+  const bent = await renderPreview(bytes, { ...base, pose: { bone: "knuckle.L", axis: "z", degrees: 90 } });
+  const before = await redHand(rest.images[0]!.png);
+  const after = await redHand(bent.images[0]!.png);
+  // The red hand is skinned to the wrist, so only a camera that follows the fingertip would move it.
+  expect(Math.hypot(before.x - after.x, before.y - after.y)).toBeLessThan(0.01);
+  const fitted = await renderPreview(bytes, { ...options, times: [0], focus: { bone: "wrist.L" } });
+  const fittedBent = await renderPreview(bytes, { ...options, times: [0], focus: { bone: "wrist.L" }, pose: { bone: "knuckle.L", axis: "z", degrees: 90 } });
+  const a = await redHand(fitted.images[0]!.png), b = await redHand(fittedBent.images[0]!.png);
+  expect(Math.hypot(a.x - b.x, a.y - b.y)).toBeGreaterThan(0.01);
+}, 60_000);

@@ -31,7 +31,8 @@ export interface PreviewOptions {
   /**
    * Frame the camera on one bone and its descendant bones (a hand with its
    * fingers) instead of the whole model, following it through the animation.
-   * `distance` overrides the automatic fit, in model units.
+   * `distance` overrides the automatic fit, in model units, and centres the camera on the
+   * bone itself rather than on its subtree, so the view is independent of the finger pose.
    */
   focus?: PreviewFocus;
   angles?: number;
@@ -172,7 +173,11 @@ try {
             const points = [];
             focusBone.traverse(node => { if (node.isBone) points.push(node.getWorldPosition(new THREE.Vector3())); });
             const focusBox = new THREE.Box3().setFromPoints(points);
-            const focusCenter = focusBox.getCenter(new THREE.Vector3());
+            // An explicit distance frames the bone itself, so the camera does not move when the
+            // fingers do and two builds of the same clip can be compared with an identical view.
+            const focusCenter = options.focus.distance !== undefined && options.focus.distance !== null
+              ? focusBone.getWorldPosition(new THREE.Vector3())
+              : focusBox.getCenter(new THREE.Vector3());
             const extent = Math.max(focusBox.getSize(new THREE.Vector3()).length(), radius * 0.04);
             const focusDistance = options.focus.distance ?? extent * 2.4;
             camera.position.set(focusCenter.x + Math.sin(azimuth)*focusDistance, focusCenter.y + focusDistance*0.2, focusCenter.z + Math.cos(azimuth)*focusDistance);
