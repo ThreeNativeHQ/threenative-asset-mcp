@@ -113,3 +113,17 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   zero-alpha-tint and emissive fixtures take their factors from the real material resolver, so reverting
   those importer fixes turns the suite red. Regenerate goldens with `npm run goldens:update`; a failing diff
   writes actual and difference PNGs under `artifacts/ci/visual-diff/`, which CI uploads.
+- **Measure fidelity, do not eyeball it, and lock every win.** `scripts/fidelity-sheet.ts` compares an import
+  with Unreal's own thumbnails without re-importing (`--source <pack dir> --import <import output dir> --out <dir>`;
+  the import output is what `parity:fab --keep` leaves, with its `import-report.json`). `src/unreal/render-fidelity.ts`
+  scores each piece 0..100 on what survives a change of lighting and camera: chroma-weighted hue (circular EMD),
+  saturation as chroma per lightness (render over thumbnail; below 1 is greyer than Unreal), silhouette density
+  (fill ratio; below 1 is sparser, above 1 a solid card), and lightness (weighted low). `judgeRender` marks a tile
+  suspect below 70 and fail below 50, with the reason. The older mean-colour "similarity" is dominated by
+  lightness and waved washed-out conifers through at 0.5-0.7; do not use it as the gate.
+- **A piece that reaches parity is locked, twice.** (1) Per defect, a synthetic red-to-green test, and for anything
+  you can see, a fixture in `tests/unreal-visual-regression.test.ts`. (2) Per pack, `docs/parity/fidelity-baseline.json`
+  holds numbers only (no names, no images): `npx tsx scripts/fidelity-baseline.ts check <sweep out dir>` fails when a
+  pack's mean fidelity falls more than 2 points, its worst piece more than 6, its failing tiles rise, or compared
+  pieces drop; `update` only ever ratchets numbers up. Run `check` after every sweep before merging a fix, so a fix
+  for one pack cannot silently undo another.

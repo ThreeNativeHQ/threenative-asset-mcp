@@ -7,6 +7,7 @@ import { chromium } from "playwright";
 import sharp, { type OverlayOptions } from "sharp";
 
 import { createBrowserTempDir } from "../browser-temp.js";
+import { measureFidelity, explainFidelity, type FidelityMetrics } from "./render-fidelity.js";
 import { colourSimilarity, decodeRgba, maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 import { judgeRender, type JudgeStats, type Verdict } from "./visual-judge.js";
 
@@ -42,6 +43,11 @@ export interface ContactSheetOptions {
   thumbnails?: ReadonlyMap<string, Buffer>;
   /** GLB keys (same form as `thumbnails`) whose report says they have coloured or textured sections. */
   expectColoured?: ReadonlySet<string>;
+  /**
+   * Writes `<n>-<name>.reference.png` and `<n>-<name>.render.png` per compared tile here, for calibrating the
+   * fidelity metric. Derived from licensed packs: local-only, never commit.
+   */
+  dumpTilesDir?: string;
 }
 
 export interface TileJudgement {
@@ -57,6 +63,8 @@ export interface TileJudgement {
   similarity?: number;
   /** Distance between the mean Lab colours of the thumbnail's and the render's object pixels. */
   meanColourDelta?: number;
+  /** Lighting-robust fidelity to the thumbnail (`render-fidelity.ts`); absent without a comparable thumbnail. */
+  fidelity?: FidelityMetrics;
 }
 
 export interface ContactSheetResult {
@@ -444,10 +452,20 @@ export async function renderContactSheet(
     let similarity: number | undefined;
     let meanColourDelta: number | undefined;
     let thumbnailFill: { fillRatio: number; objectPixels: number } | undefined;
+    let fidelity: FidelityMetrics | undefined;
     if (candidate.thumbnail !== undefined) {
       try {
         const reference = await decodeRgba(candidate.thumbnail);
         const comparison = colourSimilarity(reference, pixels);
+        const measured = measureFidelity(reference, pixels);
+        if (measured.comparable) fidelity = measured;
+        if (options.dumpTilesDir !== undefined) {
+          await mkdir(options.dumpTilesDir, { recursive: true });
+          const stem = `${String(index).padStart(2, "0")}-${candidate.name.replace(/[^\w.-]/g, "_")}`;
+          const raw = (image: RgbaImage) => ({ raw: { width: image.width, height: image.height, channels: 4 as const } });
+          await sharp(Buffer.from(reference.data.buffer, reference.data.byteOffset, reference.data.byteLength), raw(reference)).png().toFile(join(options.dumpTilesDir, `${stem}.reference.png`));
+          await sharp(Buffer.from(pixels.data.buffer, pixels.data.byteOffset, pixels.data.byteLength), raw(pixels)).png().toFile(join(options.dumpTilesDir, `${stem}.render.png`));
+        }
         if (comparison.comparable) {
           similarity = comparison.similarity;
           meanColourDelta = comparison.meanColourDelta;
@@ -466,6 +484,7 @@ export async function renderContactSheet(
     const result = judgeRender(pixels, {
       ...(candidate.expectColoured ? { expectColoured: true } : {}),
       ...(similarity !== undefined ? { colourSimilarity: similarity } : {}),
+      ...(fidelity !== undefined ? { fidelityScore: fidelity.score, fidelityExplanation: explainFidelity(fidelity) } : {}),
       ...(thumbnailFill !== undefined
         ? { thumbnailFillRatio: thumbnailFill.fillRatio, thumbnailObjectPixels: thumbnailFill.objectPixels }
         : {}),
@@ -478,6 +497,7 @@ export async function renderContactSheet(
       reasons: result.reasons,
       stats: result.stats,
       ...(similarity !== undefined && meanColourDelta !== undefined ? { similarity, meanColourDelta } : {}),
+      ...(fidelity !== undefined ? { fidelity } : {}),
     });
   }
   const judgeSummary = {
