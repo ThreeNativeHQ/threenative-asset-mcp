@@ -22,6 +22,10 @@ export interface StaticMeshSections {
 
 const UE4_IMPORT_STRIDE = 28;
 const UE4_NON_OUTER_PACKAGE_IMPORT = 520;
+/** The last UE4 object version (4.27); UE5 packages have another summary layout. */
+const UE4_LAST_VERSION = 522;
+const UE4_PACKAGE_SUMMARY_LOCALIZATION_ID = 516;
+const PKG_FILTER_EDITOR_ONLY = 0x80000000;
 
 class Reader {
   private readonly view: DataView;
@@ -59,28 +63,48 @@ class Reader {
   }
 }
 
+interface ImportEntry {
+  readonly className: string;
+  /** FPackageIndex of the outer: negative is an import, 0 is none. */
+  readonly outer: number;
+  readonly name: string;
+}
+
 interface Header {
   readonly names: readonly string[];
   readonly importNames: readonly string[];
+  readonly imports: readonly ImportEntry[];
   readonly bodyStart: number;
 }
 
-function readHeader(bytes: Buffer): Header | undefined {
+/**
+ * The summary, name table and import table of a UE4 editor package. `maxVersion` bounds the object versions a caller has
+ * checked its own reading against: the tagged-property readers here serve UE Viewer's range (below 520), the import
+ * table alone is read through 4.27, where each import gains a `PackageName`.
+ */
+function readHeader(bytes: Buffer, maxVersion = UE4_NON_OUTER_PACKAGE_IMPORT - 1): Header | undefined {
   const reader = new Reader(bytes);
   reader.i32(); // magic
-  reader.i32(); // legacy file version
+  const legacy = reader.i32();
+  if (legacy > -5 || legacy < -7) return undefined; // -8 is UE5, with another summary layout
   reader.i32(); // legacy UE3 version
   const ue4 = reader.i32();
   reader.i32(); // licensee version
-  if (ue4 < 504 || ue4 >= UE4_NON_OUTER_PACKAGE_IMPORT) return undefined;
+  if (ue4 < 504 || ue4 > Math.min(maxVersion, UE4_LAST_VERSION)) return undefined;
   const customVersions = reader.i32();
   reader.offset += customVersions * 20;
   const totalHeaderSize = reader.i32();
   const folderLength = reader.i32();
   reader.offset += folderLength;
-  reader.i32(); // package flags
+  const packageFlags = reader.i32();
   const nameCount = reader.i32();
   const nameOffset = reader.i32();
+  if (ue4 >= UE4_PACKAGE_SUMMARY_LOCALIZATION_ID && (packageFlags & PKG_FILTER_EDITOR_ONLY) === 0) {
+    // 4.19+ editor packages carry a LocalizationId FString here.
+    const length = reader.i32();
+    if (length < 0 || length > 1024) return undefined; // a UTF-16 id is not expected in an editor save
+    reader.offset += length;
+  }
   reader.i32(); // gatherable text count
   reader.i32(); // gatherable text offset
   reader.i32(); // export count
@@ -96,12 +120,16 @@ function readHeader(bytes: Buffer): Header | undefined {
     names.push(bytes.toString("latin1", table.offset, table.offset + length - 1));
     table.offset += length + 4;
   }
-  const importNames: string[] = [];
+  const imports: ImportEntry[] = [];
+  // FObjectImport: ClassPackage, ClassName, OuterIndex, ObjectName; an editor save from 4.22 on adds PackageName.
+  const stride = UE4_IMPORT_STRIDE + (ue4 >= UE4_NON_OUTER_PACKAGE_IMPORT && (packageFlags & PKG_FILTER_EDITOR_ONLY) === 0 ? 8 : 0);
   for (let index = 0; index < importCount; index += 1) {
-    const entry = reader.at(importOffset + index * UE4_IMPORT_STRIDE + 20);
-    importNames.push(entry.withNames(names).name());
+    const entry = reader.at(importOffset + index * stride + 8).withNames(names);
+    const className = entry.name();
+    const outer = entry.i32();
+    imports.push({ className, outer, name: entry.name() });
   }
-  return { names, importNames, bodyStart: totalHeaderSize };
+  return { names, importNames: imports.map((entry) => entry.name), imports, bodyStart: totalHeaderSize };
 }
 
 /** Skips the rest of a tagged property after its common header (name, type, size, array index). */
@@ -215,6 +243,43 @@ export function parseStaticMeshSections(bytes: Buffer): StaticMeshSections | und
     const lod0 = readSectionInfoMap(bytes, header);
     if (!slots || !lod0 || lod0.size === 0) return undefined;
     return { slots, lod0 };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The package each material a mesh imports lives in, by lower-cased object name: `spruce_trunk` ->
+ * `/Game/Pack/Winter/Materials/spruce_trunk`. UE Viewer names a section's material by object name only, and a pack can hold
+ * several packages of that name (a Summer and a Winter copy of every instance); the mesh's import table says which one it
+ * uses. A name imported from two packages is left out (no evidence), as is a package this reader does not support.
+ */
+export function parseMeshMaterialPackages(bytes: Buffer): ReadonlyMap<string, string> | undefined {
+  try {
+    const header = readHeader(bytes, UE4_LAST_VERSION);
+    if (!header) return undefined;
+    const packages = new Map<string, string>();
+    const ambiguous = new Set<string>();
+    for (const entry of header.imports) {
+      if (!entry.className.startsWith("Material") || entry.className.startsWith("MaterialFunction") || entry.outer >= 0) continue;
+      const outer = header.imports[-entry.outer - 1];
+      if (outer?.className !== "Package" || !outer.name.startsWith("/")) continue;
+      const key = entry.name.toLowerCase();
+      const known = packages.get(key);
+      if (known !== undefined && known !== outer.name) ambiguous.add(key);
+      packages.set(key, outer.name);
+    }
+    for (const key of ambiguous) packages.delete(key);
+    return packages;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `parseMeshMaterialPackages` for a `.uasset` on disk; undefined when it cannot be read. */
+export async function readMeshMaterialPackages(uassetPath: string): Promise<ReadonlyMap<string, string> | undefined> {
+  try {
+    return parseMeshMaterialPackages(await readFile(uassetPath));
   } catch {
     return undefined;
   }

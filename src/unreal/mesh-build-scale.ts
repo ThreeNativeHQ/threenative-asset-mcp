@@ -7,17 +7,21 @@ import { readFile, stat } from "node:fs/promises";
  * UE Viewer's GLB eight times too small. UE Viewer does not read the `FMeshBuildSettings` struct, so the scale is
  * read here from the package's own tagged property.
  *
- * Only the UE4 header profile with a legacy file version of -7 is read (the packages UE Viewer handles); anything
- * else, or a package without the property, returns undefined and the mesh is left as exported.
+ * The UE4 (legacy file version -7) and UE5 (-8) header profiles are read: the MeshDescription and CUE4Parse converters
+ * decode the same raw source model from editor packages, so their geometry needs the scale too. Anything else, or a
+ * package without the property, returns undefined and the mesh is left as exported.
  */
 
 const PACKAGE_TAG = 0x9e2a83c1;
 const MAX_PACKAGE_BYTES = 512 * 1024 * 1024;
 
-/** The name table of a legacy -7 UE4 package, or undefined when the header is not that profile. */
+/** The name table of a legacy -7 (UE4) or -8 (UE5) package, or undefined when the header is neither profile. */
 function readNames(bytes: Buffer): string[] | undefined {
-  if (bytes.length < 28 || bytes.readUInt32LE(0) !== PACKAGE_TAG || bytes.readInt32LE(4) !== -7) return undefined;
-  let at = 20;
+  if (bytes.length < 32 || bytes.readUInt32LE(0) !== PACKAGE_TAG) return undefined;
+  const legacy = bytes.readInt32LE(4);
+  if (legacy !== -7 && legacy !== -8) return undefined;
+  // Tag, legacy version, UE3 version, UE4 version, (UE5 version,) licensee version.
+  let at = legacy === -8 ? 24 : 20;
   const customVersions = bytes.readInt32LE(at);
   if (customVersions < 0 || customVersions > 1000) return undefined;
   at += 4 + customVersions * 20;
@@ -68,7 +72,9 @@ export function readBuildScale3D(bytes: Buffer, body: Buffer = bytes): readonly 
     from = found + 1;
     let at = found + head.length;
     if (at + 8 + 8 + 16 + 1 > body.length) continue;
-    if (body.readInt32LE(at) !== 12 || body.readInt32LE(at + 4) !== 0) continue;
+    // 12 bytes of floats in UE4; UE5's large-world-coordinate FVector is 24 bytes of doubles.
+    const size = body.readInt32LE(at);
+    if ((size !== 12 && size !== 24) || body.readInt32LE(at + 4) !== 0) continue;
     at += 8;
     if (!body.subarray(at, at + 8).equals(nameBytes(vector))) continue;
     at += 8 + 16;
@@ -76,8 +82,11 @@ export function readBuildScale3D(bytes: Buffer, body: Buffer = bytes): readonly 
     at += 1;
     if (hasGuid === 1) at += 16;
     else if (hasGuid !== 0) continue;
-    if (at + 12 > body.length) continue;
-    const value: [number, number, number] = [body.readFloatLE(at), body.readFloatLE(at + 4), body.readFloatLE(at + 8)];
+    if (at + size > body.length) continue;
+    const value: [number, number, number] =
+      size === 24
+        ? [body.readDoubleLE(at), body.readDoubleLE(at + 8), body.readDoubleLE(at + 16)]
+        : [body.readFloatLE(at), body.readFloatLE(at + 4), body.readFloatLE(at + 8)];
     if (value.every((component) => Number.isFinite(component) && component > 0 && component < 1e6)) return value;
   }
 }

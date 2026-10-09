@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.60",
+  version: "b4e95441+threenative.61",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -834,6 +834,14 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                 node["default"] = GraphValue(defaultTag) ?? (className.Contains("Vector", StringComparison.Ordinal) ? new[] { 0d, 0d, 0d, 0d }
                     : className.Contains("Scalar", StringComparison.Ordinal) ? 0d
                     : className.Contains("Static", StringComparison.Ordinal) ? false : null);
+                // A CollectionParameter reads a MaterialParameterCollection: its default is the collection entry's
+                // DefaultValue (a scalar, or a linear colour), which is what the editor renders until gameplay sets it.
+                if (className == "CollectionParameter")
+                {
+                    node["default"] = GraphCollectionDefault(GraphProperty(expr, "Collection")?.Tag?.GenericValue as FPackageIndex, parameterName);
+                    if (GraphProperty(expr, "Collection")?.Tag?.GenericValue is FPackageIndex collectionIndex && owner is not null)
+                        node["collection"] = DumpPath(owner, collectionIndex);
+                }
             }
             if (className.StartsWith("TextureSample", StringComparison.Ordinal) || className.StartsWith("TextureObject", StringComparison.Ordinal))
             {
@@ -900,6 +908,21 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
 
     // A pack may mount its content under any folder (Polyphoria/Polyphoria/...), so a reference that does not load
     // as given is found again by its file name among the pack's own packages. Engine content is never in the pack.
+    object? GraphCollectionDefault(FPackageIndex? collectionIndex, string parameterName)
+    {
+        if (collectionIndex is null || collectionIndex.IsNull || string.IsNullOrEmpty(parameterName)) return null;
+        UObject? collection = null;
+        try { collection = collectionIndex.Load<UObject>(); } catch { }
+        collection ??= GraphLoadFunction(null, collectionIndex.ResolvedObject?.GetPathName());
+        if (collection is null) return null;
+        foreach (var entry in collection.GetOrDefault<FStructFallback[]>("ScalarParameters") ?? Array.Empty<FStructFallback>())
+            if (GraphText(GraphProperty(entry, "ParameterName")?.Tag?.GenericValue).Equals(parameterName, StringComparison.OrdinalIgnoreCase))
+                return GraphValue(GraphProperty(entry, "DefaultValue")?.Tag?.GenericValue) ?? 0d;
+        foreach (var entry in collection.GetOrDefault<FStructFallback[]>("VectorParameters") ?? Array.Empty<FStructFallback>())
+            if (GraphText(GraphProperty(entry, "ParameterName")?.Tag?.GenericValue).Equals(parameterName, StringComparison.OrdinalIgnoreCase))
+                return GraphValue(GraphProperty(entry, "DefaultValue")?.Tag?.GenericValue) ?? new[] { 0d, 0d, 0d, 0d };
+        return null;
+    }
     UObject? GraphLoadFunction(FPackageIndex? functionIndex, string? path)
     {
         try { if (functionIndex?.Load<UObject>() is { } direct) return direct; } catch { }
@@ -1370,14 +1393,64 @@ FPackageIndex ResolveSkeletalMesh(USceneComponent component) =>
         ? skinnedComponent.GetSkeletalMesh()
         : component.GetOrDefault("SkeletalMesh", component.GetOrDefault("SkinnedAsset", new FPackageIndex()));
 
-async Task ExportMaterialAsync(string initialName)
+// /Game/A/MI_X.MI_X (or a provider key Pack/Content/A/MI_X.uasset) -> /Game/A/MI_X.
+static string GamePackagePath(string path)
 {
-    var pending = new Queue<string>();
-    pending.Enqueue(initialName);
-    while (pending.TryDequeue(out var materialName))
+    var game = DumpGamePath(path);
+    foreach (var suffix in new[] { ".uasset", ".umap" })
+        if (game.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return game[..^suffix.Length];
+    var slash = game.LastIndexOf('/');
+    var dot = game.IndexOf('.', slash + 1);
+    return dot >= 0 ? game[..dot] : game;
+}
+// Two packages can share a material's object name (MI_Wanted2 beside two posters). The package path, when the
+// referrer names it, picks the right one; the first by name is only the fallback.
+string? MaterialKey(string materialName, string? packagePath)
+{
+    var byName = provider.Files.Keys.Where(candidate => Path.GetFileNameWithoutExtension(candidate).Equals(materialName, StringComparison.OrdinalIgnoreCase)).ToList();
+    if (packagePath is not null)
     {
-        if (!exportedMaterials.Add(materialName)) continue;
-        var materialKey = provider.Files.Keys.FirstOrDefault(candidate => Path.GetFileNameWithoutExtension(candidate).Equals(materialName, StringComparison.OrdinalIgnoreCase));
+        var exact = byName.FirstOrDefault(candidate => GamePackagePath(candidate).Equals(packagePath, StringComparison.OrdinalIgnoreCase));
+        if (exact is not null) return exact;
+    }
+    return byName.FirstOrDefault();
+}
+static string? ResolvedPackagePath(ResolvedObject? resolved)
+{
+    try { var path = resolved?.GetPathName(); return string.IsNullOrEmpty(path) ? null : GamePackagePath(path); }
+    catch { return null; }
+}
+static string? IndexPackagePath(FPackageIndex? index)
+{
+    if (index is null || index.IsNull) return null;
+    try { return ResolvedPackagePath(index.ResolvedObject); } catch { return null; }
+}
+// Meshes/<mesh>.materials.json: slot material object name -> package path, so the importer can tell same-named
+// materials apart. A name two slots take from different packages is left out.
+async Task WriteMeshMaterialPackagesAsync(string meshName, IEnumerable<FPackageIndex?> materials)
+{
+    var packages = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+    foreach (var material in materials)
+    {
+        if (material is null || material.IsNull || string.IsNullOrWhiteSpace(material.Name)) continue;
+        var path = IndexPackagePath(material);
+        if (path is null) continue;
+        packages[material.Name] = packages.TryGetValue(material.Name, out var known) && (known is null || !known.Equals(path, StringComparison.OrdinalIgnoreCase)) ? null : path;
+    }
+    var known2 = packages.Where(entry => entry.Value is not null).ToDictionary(entry => entry.Key, entry => entry.Value!);
+    if (known2.Count == 0) return;
+    await File.WriteAllTextAsync(Path.Combine(output, "Meshes", meshName + ".materials.json"), JsonConvert.SerializeObject(known2));
+}
+
+async Task ExportMaterialAsync(string initialName, string? initialPath = null)
+{
+    var pending = new Queue<(string Name, string? Path)>();
+    pending.Enqueue((initialName, initialPath));
+    while (pending.TryDequeue(out var next))
+    {
+        var materialName = next.Name;
+        if (!exportedMaterials.Add(next.Path ?? materialName)) continue;
+        var materialKey = MaterialKey(materialName, next.Path);
         if (materialKey is null) continue;
         IPackage package;
         try { package = provider.LoadPackage(materialKey); } catch { continue; }
@@ -1391,6 +1464,17 @@ async Task ExportMaterialAsync(string initialName)
             foreach (var parameter in instance.TextureParameterValues)
                 if (!parameter.ParameterValue.IsNull && parameter.ParameterValue.Name != "None")
                     references.Add((parameter.Name, parameter.ParameterValue.Name));
+            // An editor-saved UE5.3 instance leaves the typed array empty while its tagged TextureParameterValues
+            // hold every override (the property dump reads them this way), so the instance bound its parent's
+            // defaults (T_Default_N) instead of its own textures. Read the tagged structs as well.
+            foreach (var parameter in instance.GetOrDefault<FStructFallback[]>("TextureParameterValues") ?? Array.Empty<FStructFallback>())
+            {
+                var info = parameter.GetOrDefault<FStructFallback>("ParameterInfo");
+                var parameterName = info is not null ? info.GetOrDefault<FName>("Name").Text : parameter.GetOrDefault<FName>("ParameterName").Text;
+                var value = parameter.GetOrDefault<FPackageIndex>("ParameterValue");
+                if (string.IsNullOrEmpty(parameterName) || parameterName == "None" || value is null || value.IsNull || value.Name == "None") continue;
+                references.Add((parameterName, value.Name));
+            }
         }
         foreach (var expression in exports.OfType<UMaterialExpressionTextureBase>())
         {
@@ -1402,10 +1486,12 @@ async Task ExportMaterialAsync(string initialName)
         }
 
         var parentName = "";
+        string? parentPath = null;
         if (material.TryGetValue<FPackageIndex>(out var parent, "Parent") && !parent.IsNull && parent.Name != "None")
         {
             parentName = parent.Name;
-            pending.Enqueue(parentName);
+            try { parentPath = ResolvedPackagePath(package.ResolvePackageIndex(parent)); } catch { parentPath = null; }
+            pending.Enqueue((parentName, parentPath));
         }
 
         references = references.Distinct().ToList();
@@ -1414,7 +1500,8 @@ async Task ExportMaterialAsync(string initialName)
         var mat = string.Join("\n", references.Select((entry, index) => $"Other[{index}]={entry.Texture}")) + "\n";
         await File.WriteAllTextAsync(Path.Combine(materialDirectory, materialName + ".mat"), mat);
         var props = new StringBuilder();
-        if (parentName.Length > 0) props.AppendLine($"Parent = Material'{parentName}.{parentName}'");
+        // The parent's package path lets the importer pick between same-named parents.
+        if (parentName.Length > 0) props.AppendLine($"Parent = Material'{(parentPath is null ? parentName : parentPath)}.{parentName}'");
         if (material is UMaterial baseMaterial)
         {
             props.AppendLine($"BlendMode = {baseMaterial.BlendMode}");
@@ -1494,8 +1581,9 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
         if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
     }
     meshFailures.Remove(mesh.Name);
-    foreach (var materialName in staticMaterials.Select(slot => slot.MaterialInterface?.Name).Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase))
-        await ExportMaterialAsync(materialName!);
+    await WriteMeshMaterialPackagesAsync(mesh.Name, staticMaterials.Select(slot => slot.MaterialInterface));
+    foreach (var slot in staticMaterials.Where(slot => !string.IsNullOrWhiteSpace(slot.MaterialInterface?.Name)))
+        await ExportMaterialAsync(slot.MaterialInterface!.Name, IndexPackagePath(slot.MaterialInterface));
     return true;
 }
 
@@ -1649,8 +1737,9 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
         var dnaTarget = Path.Combine(output, "Meshes", mesh.Name + ".dna");
         if (!Path.GetFullPath(dna).Equals(Path.GetFullPath(dnaTarget), StringComparison.OrdinalIgnoreCase)) File.Move(dna, dnaTarget, true);
     }
-    foreach (var materialName in mesh.SkeletalMaterials.Select(slot => slot.Material?.Name).Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase))
-        await ExportMaterialAsync(materialName!);
+    await WriteMeshMaterialPackagesAsync(mesh.Name, mesh.SkeletalMaterials.Select(slot => slot.Material));
+    foreach (var slot in mesh.SkeletalMaterials.Where(slot => !string.IsNullOrWhiteSpace(slot.Material?.Name)))
+        await ExportMaterialAsync(slot.Material!.Name, IndexPackagePath(slot.Material));
     return true;
 }
 
@@ -1682,7 +1771,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
             ExportGroomPayloads(groomFile.Read(), asset.Name) > 0) exported++;
     foreach (var material in package.GetExports().OfType<UMaterialInterface>())
     {
-        await ExportMaterialAsync(material.Name);
+        await ExportMaterialAsync(material.Name, GamePackagePath(key));
         exported++;
     }
     foreach (var world in package.GetExports().OfType<UWorld>())

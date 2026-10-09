@@ -44,6 +44,18 @@ describe("scopeMaterialFiles", () => {
     expect(scopeMaterialFiles(ambiguousNoneBeside, cliff)).toBe(scoped);
   });
 
+  it("follows the mesh's import table over the copy beside it, and caches per import set", () => {
+    const assets = assetsOf(inst, props);
+    const fromLarge = new Map([["mi_rock_inst", "/Game/Rocks/Large/MI_Rock_Inst"]]);
+    const scoped = scopeMaterialFiles(assets, cliff, fromLarge);
+    expect(scoped.mat.get("MI_Rock_Inst")).toBe(`${large}/MI_Rock_Inst.mat`);
+    expect(scoped.props.get("MI_Rock_Inst")).toBe(`${large}/MI_Rock_Inst.props.txt`);
+    // Same directory, other evidence: not served from the cache of the first call.
+    expect(scopeMaterialFiles(assets, cliff, new Map([["mi_rock_inst", "/Game/Rocks/Cliff/MI_Rock_Inst"]])).mat.get("MI_Rock_Inst")).toBe(`${cliff}/MI_Rock_Inst.mat`);
+    // An import naming a package neither copy is in falls back to the copy beside the mesh.
+    expect(scopeMaterialFiles(assets, cliff, new Map([["mi_rock_inst", "/Game/Other/MI_Rock_Inst"]])).mat.get("MI_Rock_Inst")).toBe(`${cliff}/MI_Rock_Inst.mat`);
+  });
+
   it("copes with an index that carries no candidate lists", () => {
     const { matAll: _matAll, propsAll: _propsAll, ...legacy } = assetsOf({});
     expect(scopeMaterialFiles(legacy, cliff)).toBe(legacy);

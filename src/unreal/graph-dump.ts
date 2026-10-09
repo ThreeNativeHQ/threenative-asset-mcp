@@ -45,6 +45,8 @@ export const graphNodeSchema = z
     // GraphValue() also yields a string for a name-valued DefaultValue.
     default: z.union([z.number(), z.boolean(), z.string(), z.array(z.number())]).nullable().optional(),
     texture: z.string().nullable().optional(),
+    /** `CollectionParameter`: the MaterialParameterCollection it reads (its default is in `default`). */
+    collection: z.string().nullable().optional(),
     samplerType: z.string().optional(),
     coordinates: graphInputSchema.nullable().optional(),
     tiling: z.tuple([z.number(), z.number()]).optional(),

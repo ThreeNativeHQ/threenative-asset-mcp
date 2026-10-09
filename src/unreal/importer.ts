@@ -50,13 +50,13 @@ import {
   parseUnrealSceneSource,
 } from "./scenes.js";
 import { rasteriseSurfaceNormals, type SurfaceNormals, type SurfaceTriangles } from "./surface-normals.js";
-import { remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
+import { readMeshMaterialPackages, remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
 
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 68;
+export const IMPORTER_VERSION = 69;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -690,30 +690,39 @@ const scopedMaterialFiles = new WeakMap<ExportedAssets, Map<string, ExportedAsse
 
 /**
  * UE Viewer keeps the package folders, but the importer indexes `.mat` / `.props.txt` by basename, so `MI_X_Inst` in two
- * folders collapses to whichever was indexed last and a mesh gets another package's textures. A mesh's own folder is the
- * best evidence of which copy it uses (the Landscape Pro rocks each have a same-named instance beside them), so for a
- * name with several exports the copy beside the mesh wins. Returns `assets` itself when nothing needs choosing.
+ * folders collapses to whichever was indexed last and a mesh gets another package's textures. The mesh's own import table
+ * (`materialPackages`, object name -> package path) is exact evidence of which copy it uses: a Winter tree imports the
+ * Winter instances that share every name with the Summer ones. Without it, the copy beside the mesh wins (the Landscape
+ * Pro rocks each have a same-named instance beside them). Returns `assets` itself when nothing needs choosing.
  */
-export function scopeMaterialFiles(assets: ExportedAssets, meshDirectory: string): ExportedAssets {
+export function scopeMaterialFiles(
+  assets: ExportedAssets,
+  meshDirectory: string,
+  materialPackages?: ReadonlyMap<string, string>,
+): ExportedAssets {
   const byDirectory = scopedMaterialFiles.get(assets) ?? new Map<string, ExportedAssets>();
   scopedMaterialFiles.set(assets, byDirectory);
-  const known = byDirectory.get(meshDirectory);
+  const cacheKey = materialPackages && materialPackages.size > 0
+    ? `${meshDirectory}\0${[...materialPackages].map(([name, path]) => `${name}=${path}`).sort().join("\0")}`
+    : meshDirectory;
+  const known = byDirectory.get(cacheKey);
   if (known) return known;
   const choose = (all: ReadonlyMap<string, readonly string[]> | undefined, current: Map<string, string>): Map<string, string> => {
     let chosen: Map<string, string> | undefined;
     for (const [name, paths] of all ?? []) {
       if (paths.length < 2) continue;
-      const beside = paths.find((path) => dirname(path) === meshDirectory);
-      if (beside === undefined || current.get(name) === beside) continue;
+      const imported = materialPackages?.get(name.toLowerCase());
+      const pick = (imported !== undefined ? copyInPackage(paths, imported) : undefined) ?? paths.find((path) => dirname(path) === meshDirectory);
+      if (pick === undefined || current.get(name) === pick) continue;
       chosen ??= new Map(current);
-      chosen.set(name, beside);
+      chosen.set(name, pick);
     }
     return chosen ?? current;
   };
   const mat = choose(assets.matAll, assets.mat);
   const props = choose(assets.propsAll, assets.props);
   const scoped = mat === assets.mat && props === assets.props ? assets : { ...assets, mat, props };
-  byDirectory.set(meshDirectory, scoped);
+  byDirectory.set(cacheKey, scoped);
   return scoped;
 }
 
@@ -849,6 +858,51 @@ export function modernConverterFailureCause(output: { readonly stdout: string; r
  * cannot select the serializer. Each attempt writes to a private sibling and only a complete exit
  * zero is renamed into the caller's staging path; failed partial exports never leak forward.
  */
+/**
+ * Per-axis glTF scale for a mesh: `unit` (centimetres to metres for the MeshDescription converter) times the source
+ * model's BuildScale3D, moved from Unreal axes (X, Y, Z) to the exporter's glTF axes. UE Viewer writes (X, Z, Y); the
+ * CUE4Parse and MeshDescription converters write (Y, Z, X), both with Unreal's up axis on glTF Y.
+ */
+export function geometryScaleFor(
+  exporter: "umodel" | "converter",
+  unit: number,
+  buildScale: readonly [number, number, number] | undefined,
+): number | readonly [number, number, number] {
+  if (!buildScale || buildScale.every((factor) => factor === 1)) return unit;
+  const [x, y, z] = buildScale;
+  const axes = exporter === "umodel" ? [x, z, y] : [y, z, x];
+  return [unit * axes[0]!, unit * axes[1]!, unit * axes[2]!] as const;
+}
+
+/** The entries whose package basename another entry shares (case-insensitive), in input order. */
+export function sharedBasenames<T extends { readonly package: string }>(entries: readonly T[]): T[] {
+  const counts = new Map<string, number>();
+  const key = (entry: T): string => basename(entry.package, extname(entry.package)).toLowerCase();
+  for (const entry of entries) counts.set(key(entry), (counts.get(key(entry)) ?? 0) + 1);
+  return entries.filter((entry) => (counts.get(key(entry)) ?? 0) > 1);
+}
+
+/** `/Game/A/MI_X`, `Content/A/MI_X.uasset` and `Pack/Content/A/MI_X.uasset` all become `a/mi_x`. */
+export function gamePackageKey(path: string): string {
+  const segments = path.replace(/\\/g, "/").replace(/\.(uasset|umap)$/i, "").split("/").filter((segment) => segment.length > 0);
+  const content = segments.map((segment) => segment.toLowerCase()).lastIndexOf("content");
+  // After the last `Content` folder; a `/Game/...` (or other mount) path drops its mount name.
+  return segments.slice(content >= 0 ? content + 1 : 1).join("/").toLowerCase();
+}
+
+/** The modern converter's `<mesh>.materials.json` (slot material name -> package path), lower-cased; undefined without one. */
+async function readConverterMaterialPackages(path: string): Promise<ReadonlyMap<string, string> | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const packages = new Map<string, string>();
+    for (const [name, value] of Object.entries(parsed)) if (typeof value === "string" && value.startsWith("/")) packages.set(name.toLowerCase(), value);
+    return packages;
+  } catch {
+    return undefined;
+  }
+}
+
 async function runModernConverter(
   executable: string,
   sourceDir: string,
@@ -1339,6 +1393,13 @@ function hasNamedFallback(materialName: string): boolean {
 
 export async function packageGlb(options: {
   readonly gltfPath: string;
+  /** The mesh package's material imports, object name (lower case) -> package path; see `scopeMaterialFiles`. */
+  readonly materialPackages?: ReadonlyMap<string, string> | undefined;
+  /**
+   * Sidecars of the exact material package a section imports, by lower-cased object name, for names several packages
+   * share. Merged over the mesh's own index, so the material's parents still resolve.
+   */
+  readonly importedMaterialAssets?: ReadonlyMap<string, ExportedAssets> | undefined;
   readonly glbPath: string;
   readonly assets: ExportedAssets;
   readonly maxTextureSize: number | undefined;
@@ -1389,11 +1450,23 @@ export async function packageGlb(options: {
   let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
   const sharedGraphs = new Map<ExportedAssets, Map<string, Set<string>>>();
-  const meshAssets = scopeMaterialFiles(options.assets, dirname(options.gltfPath));
+  const meshAssets = scopeMaterialFiles(options.assets, dirname(options.gltfPath), options.materialPackages);
+  const importedAssets = new Map<string, ExportedAssets>();
+  const assetsFor = (name: string, lookup: string): ExportedAssets => {
+    const own = options.materialAssets?.get(name);
+    if (own) return own;
+    const isolated = options.importedMaterialAssets?.get(lookup.toLowerCase());
+    if (!isolated) return meshAssets;
+    const known = importedAssets.get(lookup.toLowerCase());
+    if (known) return known;
+    const merged = mergeExported(meshAssets, isolated);
+    importedAssets.set(lookup.toLowerCase(), merged);
+    return merged;
+  };
   for (const material of root.listMaterials()) {
     const name = material.getName();
     const lookup = options.materialLookupNames?.get(name) ?? name;
-    const assets = options.materialAssets?.get(name) ?? meshAssets;
+    const assets = assetsFor(name, lookup);
     const path = assets.mat.get(lookup);
     if (!path) continue;
     const text = readMaterialSidecar(path);
@@ -1408,7 +1481,7 @@ export async function packageGlb(options: {
   for (const [index, material] of root.listMaterials().entries()) {
     const name = material.getName();
     const lookupName = options.materialLookupNames?.get(name) ?? name;
-    const unscopedAssets = options.materialAssets?.get(name) ?? meshAssets;
+    const unscopedAssets = assetsFor(name, lookupName);
     const materialAssets = scopeParentChain(unscopedAssets, lookupName);
     const availableTextures = new Set(materialAssets.png.keys());
     const graphPath = materialAssets.mat.get(lookupName);
@@ -1440,7 +1513,11 @@ export async function packageGlb(options: {
       // Same-named exports in several folders and none beside the mesh: the pick is the last indexed, not evidence.
       const copies = materialAssets.matAll?.get(lookupName) ?? [];
       const chosen = materialAssets.mat.get(lookupName);
-      if (!options.materialAssets?.has(name) && copies.length > 1 && chosen !== undefined && dirname(chosen) !== dirname(options.gltfPath)) {
+      const imported = options.materialPackages?.get(lookupName.toLowerCase());
+      const byImport =
+        options.importedMaterialAssets?.has(lookupName.toLowerCase()) === true ||
+        (imported !== undefined && copies.length > 1 && copyInPackage(copies, imported) === chosen);
+      if (!options.materialAssets?.has(name) && copies.length > 1 && chosen !== undefined && !byImport && dirname(chosen) !== dirname(options.gltfPath)) {
         const folders = [...new Set(copies.map((path) => basename(dirname(path))))].join(", ");
         resolved = {
           ...resolved,
@@ -3060,6 +3137,8 @@ export async function importUnrealDirectory(
   let modernConverter: ExternalTool | undefined;
   let modernGlbs = new Map<string, string>();
   let modernGroomPayloads = new Map<string, string[]>();
+  /** Mesh packages whose basename another routed package shares, decoded on their own: entry file -> GLB (undefined: failed). */
+  const isolatedMeshGlbs = new Map<string, string | undefined>();
   /** Meshes UE Viewer exported after the modern converter failed on them. */
   const recoveredByUmodel = new Set<string>();
   /** Why a mesh the modern converter ran on still has no GLB, by package basename. */
@@ -3097,6 +3176,24 @@ export async function importUnrealDirectory(
         );
       }
       uncookedGlbs = await indexGlbs(uncookedRaw);
+      // The converter writes Meshes/<name>.glb, so two packages that share a name leave one GLB for both. Each
+      // such package is decoded again on its own, from an input tree that holds only it.
+      const duplicates = sharedBasenames(uncookedMeshDescription.map(({ entry }) => entry));
+      await mapWithConcurrency(duplicates, 1, async (entry, index) => {
+        const isolated = join(staging, "uncooked-duplicates", String(index).padStart(5, "0"));
+        const input = join(isolated, "input");
+        const linked = join(input, entry.package);
+        await mkdir(dirname(linked), { recursive: true });
+        await symlink(entry.file, linked);
+        const out = join(isolated, "out");
+        const run = await runBounded(uncookedConverter!.path, [input, "--export-dir", out, "--skip-textures"], {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 64 * 1024 * 1024,
+        });
+        const glb = run.code === 0 ? (await indexGlbs(out)).get(basename(entry.package, extname(entry.package))) : undefined;
+        if (glb) isolatedMeshGlbs.set(entry.file, glb);
+        else isolatedMeshGlbs.set(entry.file, undefined);
+      });
       warnings.push(
         `Decoded ${uncookedMeshDescription.length} requested uncooked UE4 MeshDescription GLB${uncookedMeshDescription.length === 1 ? "" : "s"} without Unreal Engine; UE Viewer supplied their source textures and material metadata.`,
       );
@@ -3173,6 +3270,19 @@ export async function importUnrealDirectory(
       modernGlbs = await indexGlbs(modernRaw);
       modernGroomPayloads = await indexGroomPayloads(modernRaw);
       assets = mergeExported(assets, await indexExported(modernRaw));
+      // Same-named mesh packages share Meshes/<name>.glb in one run; each is decoded again on its own, filtered by
+      // its relative path.
+      const duplicates = sharedBasenames(modernPackages.filter(({ entry }) => entry.meshKind !== undefined).map(({ entry }) => entry));
+      await mapWithConcurrency(duplicates, 1, async (entry, index) => {
+        const isolated = join(staging, "modern-duplicates", String(index).padStart(5, "0"));
+        await mkdir(dirname(isolated), { recursive: true });
+        const run = await runModernConverter(modernConverter!.path, sourceDir, isolated, ["--filter", entry.selector], {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 64 * 1024 * 1024,
+        });
+        const glb = run.code === 0 ? (await indexGlbs(isolated)).get(basename(entry.package, extname(entry.package))) : undefined;
+        isolatedMeshGlbs.set(entry.file, glb);
+      });
       warnings.push(
         `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
       );
@@ -3623,16 +3733,34 @@ export async function importUnrealDirectory(
   const existingPsa = new Set<string>();
   const incompatiblePsa = new Set<string>();
 
+  // Material packages by `/Game/...` path, for names several packages share: their isolated exports are the only
+  // copy of each that no other package overwrote.
+  const materialFileByGamePath = new Map<string, string>();
+  for (const entry of materialPackages) materialFileByGamePath.set(gamePackageKey(entry.package), entry.file);
+  const isolatedMaterialsFor = (imports: ReadonlyMap<string, string> | undefined): Map<string, ExportedAssets> | undefined => {
+    let found: Map<string, ExportedAssets> | undefined;
+    for (const [name, path] of imports ?? []) {
+      const file = materialFileByGamePath.get(gamePackageKey(path));
+      if (file === undefined || (materialNameCounts.get(basename(file, extname(file))) ?? 0) < 2) continue;
+      const isolated = materialAssetsByFile.get(file);
+      if (!isolated) continue;
+      (found ??= new Map()).set(name, isolated);
+    }
+    return found;
+  };
+
   try {
     for (const entry of assetMeshPackages) {
       const name = basename(entry.package, extname(entry.package));
       const fromMeshDescription = uncookedNames.has(name);
       const fromModernConverter = modernNames.has(name);
-      const defaultPath = fromMeshDescription
-        ? uncookedGlbs.get(name)
-        : fromModernConverter
-          ? modernGlbs.get(name)
-          : assets.gltf.get(name);
+      const defaultPath = isolatedMeshGlbs.has(entry.file)
+        ? isolatedMeshGlbs.get(entry.file)
+        : fromMeshDescription
+          ? uncookedGlbs.get(name)
+          : fromModernConverter
+            ? modernGlbs.get(name)
+            : assets.gltf.get(name);
       // Only the modern converter emits more than LOD0, and only when asked. Every other route
       // keeps its single existing GLB. Extra LODs come out of the same run under the writer's own
       // `_LOD<n>` suffix, so the base mesh name plus that suffix finds them.
@@ -3648,7 +3776,9 @@ export async function importUnrealDirectory(
       if (lodPaths.length === 0) {
         failed.push({
           package: entry.package,
-          reason: fromMeshDescription
+          reason: isolatedMeshGlbs.has(entry.file)
+            ? "Another mesh package shares this name, so it was decoded on its own, and that run produced no GLB (the shared one belongs to either package)."
+            : fromMeshDescription
             ? "The uncooked MeshDescription converter produced no GLB for this package."
             : fromModernConverter
               ? `The modern UE5 mesh converter produced no GLB for this package${
@@ -3660,18 +3790,32 @@ export async function importUnrealDirectory(
       }
       const dnaSource = fromModernConverter ? assets.dna.get(name) : undefined;
       // UE Viewer's raw mesh is not multiplied by the source model's BuildScale3D; Unreal's render data is.
-      const buildScale = !fromMeshDescription && !fromModernConverter && entry.meshKind !== "skeletal" ? await readPackageBuildScale3D(entry.file) : undefined;
+      // Every static route decodes the raw source model (UE Viewer's raw mesh, the MeshDescription and CUE4Parse editor
+      // decoders), which Unreal multiplies by BuildScale3D when it builds the render data.
+      const buildScale = entry.meshKind !== "skeletal" ? await readPackageBuildScale3D(entry.file) : undefined;
       if (buildScale && buildScale.some((factor) => factor !== 1)) {
-        warnings.push(`${name}: the source mesh carries BuildScale3D (${buildScale.join(", ")}); UE Viewer's geometry was scaled by it${new Set(buildScale).size > 1 ? " (non-uniform: normals are not adjusted)" : ""}.`);
+        warnings.push(`${name}: the source mesh carries BuildScale3D (${buildScale.join(", ")}); the decoded source geometry was scaled by it${new Set(buildScale).size > 1 ? " (non-uniform: normals are not adjusted)" : ""}.`);
       }
+      // Material sidecars are found by object name; the mesh names the package of each: its import table (UE4
+      // packages), or the converter's `<mesh>.materials.json` (UE5).
+      const materialPackages = fromModernConverter && defaultPath
+        ? await readConverterMaterialPackages(join(dirname(defaultPath), `${name}.materials.json`))
+        : await readMeshMaterialPackages(entry.file);
+      const importedMaterialAssets = isolatedMaterialsFor(materialPackages);
       for (const { lod, path: gltfPath } of lodPaths) {
+        // A name another package shares keeps its package folders, or the two would overwrite one Models/<name>.glb.
+        const modelStem = isolatedMeshGlbs.has(entry.file)
+          ? `Models/${entry.package.replace(/\\/g, "/").replace(/^Content\//i, "").slice(0, -extname(entry.package).length)}`
+          : `Models/${name}`;
         const relativeGlb = fromMeshDescription || fromModernConverter
-          ? lod === 0 ? `Models/${name}.glb` : `Models/${name}_LOD${lod}.glb`
+          ? lod === 0 ? `${modelStem}.glb` : `${modelStem}_LOD${lod}.glb`
           : `${relative(raw, gltfPath).split(sep).join("/").slice(0, -".gltf".length)}.glb`;
         const glbPath = assertContained(promotion, relativeGlb);
         try {
           const packaged = await packageGlb({
             gltfPath,
+            materialPackages,
+            importedMaterialAssets,
             glbPath,
             assets,
             maxTextureSize: request.maxTextureSize,
@@ -3679,7 +3823,7 @@ export async function importUnrealDirectory(
             imageCache,
             copyright,
             sidecars,
-            geometryScale: fromMeshDescription ? 0.01 : buildScale ? ([buildScale[0], buildScale[2], buildScale[1]] as const) : 1,
+            geometryScale: geometryScaleFor(fromMeshDescription || fromModernConverter ? "converter" : "umodel", fromMeshDescription ? 0.01 : 1, buildScale),
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
