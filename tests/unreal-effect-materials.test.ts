@@ -248,6 +248,7 @@ async function importFixture(options: {
   textures: [string, [number, number, number]][];
   /** Bytes appended to the mesh package, which the importer scans for the engine default material. */
   meshPackageText?: string;
+  vertexColor?: readonly [number, number, number, number];
 }) {
   const root = await scratch("effect-import-");
   const sourceDir = join(root, "source");
@@ -257,7 +258,14 @@ async function importFixture(options: {
   await writeFile(join(content, "Mesh.uasset"), Buffer.concat([Buffer.alloc(16), Buffer.from(options.meshPackageText ?? "")]));
   await writeFile(join(content, `${options.graph.material}.uasset`), Buffer.alloc(16));
   await writeFile(join(content, `${options.materialName}.uasset`), Buffer.alloc(16));
-  await writeMeshFixture(exported, { name: "Mesh", materialName: options.materialName, mat: options.mat ?? "", props: options.props, textures: [] });
+  await writeMeshFixture(exported, {
+    name: "Mesh",
+    materialName: options.materialName,
+    mat: options.mat ?? "",
+    props: options.props,
+    textures: [],
+    ...(options.vertexColor ? { vertexColor: options.vertexColor } : {}),
+  });
   for (const [name, rgb] of options.textures) await writePng(join(exported, `${name}.png`), [...rgb, 255], 4);
   const umodel = join(root, "umodel");
   await writeFakeUmodel(umodel, { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
@@ -276,7 +284,8 @@ async function importFixture(options: {
   });
   const glb = await new NodeIO().read(join(outputDir, report.models[0]!.glb));
   const onDisk = JSON.parse(await readFile(join(outputDir, "import-report.json"), "utf8")) as ImportReport;
-  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, section: report.models[0]!.materials[0]! };
+  const primitive = glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, section: report.models[0]!.materials[0]!, primitive };
 }
 
 describe("importer: a ParticleColor-tinted translucent instance (SM_SplashMesh_02)", () => {
@@ -459,6 +468,51 @@ describe("importer: a particle material whose BaseColor reads DynamicParameter",
     expect(section.textured).toBe(false);
     expect(report.materialCoverage.effect).toBe(1);
     expect(report.warnings.join("\n")).toContain("1 particle material");
+  });
+});
+
+describe("importer: vertex colours the material never reads", () => {
+  /** BaseColor = texture, optionally x VertexColor.rgb. */
+  function textured(readsVertexColor: boolean): MaterialGraph {
+    return graphOf(
+      "M_Cloth",
+      [
+        node("albedo", "TextureSample", { texture: "/Game/Test/T_Cloth_D.T_Cloth_D", samplerType: "Color" }),
+        ...(readsVertexColor
+          ? [node("mul", "Multiply", { inputs: { A: pin("albedo", 0, [1, 1, 1, 0]), B: pin("paint", 0, [1, 1, 1, 0]) } }), node("paint", "VertexColor")]
+          : []),
+      ],
+      { baseColor: readsVertexColor ? pin("mul") : pin("albedo", 0, [1, 1, 1, 0]) },
+    );
+  }
+  const opaqueProps = ["Parent = Material3'Content/Test/M_Cloth.M_Cloth'", "BlendMode = BLEND_Opaque (0)"].join("\n");
+
+  it("drops a black COLOR_0 that glTF would multiply into the base colour, and says so", async () => {
+    // A skeletal character whose vertex colours are all black rendered black in a glTF viewer, although Unreal ignores
+    // vertex colours its material does not read.
+    const { primitive, section } = await importFixture({
+      graph: textured(false),
+      materialName: "MI_Cloth",
+      props: opaqueProps,
+      mat: "Diffuse=T_Cloth_D\n",
+      textures: [["T_Cloth_D", [120, 90, 60]]],
+      vertexColor: [0, 0, 0, 1],
+    });
+    expect(primitive.getAttribute("COLOR_0")).toBeNull();
+    expect(section.limitations.join("\n")).toContain("Vertex colours (COLOR_0) dropped from 1 primitive(s)");
+  });
+
+  it("keeps COLOR_0 when the BaseColor path reads VertexColor", async () => {
+    const { primitive, section } = await importFixture({
+      graph: textured(true),
+      materialName: "MI_Cloth",
+      props: opaqueProps,
+      mat: "Diffuse=T_Cloth_D\n",
+      textures: [["T_Cloth_D", [120, 90, 60]]],
+      vertexColor: [0.5, 0.25, 1, 1],
+    });
+    expect(primitive.getAttribute("COLOR_0")).not.toBeNull();
+    expect(section.limitations.join("\n")).not.toContain("COLOR_0) dropped");
   });
 });
 

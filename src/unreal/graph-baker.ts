@@ -73,6 +73,11 @@ export type GraphBakeOutcome = BakeResult & {
    * the emitter, not the package, sets this section's colour.
    */
   readonly particle?: string;
+  /**
+   * Probe only: whether the BaseColor path reads VertexColor (after static switches). Absent when the graph is unknown,
+   * truncated or unreadable.
+   */
+  readonly vertexColorOnBaseColor?: boolean;
   /** The dumped graph that was evaluated (the root `Material` of the instance chain). */
   readonly graphMaterial?: string;
   /** The parameters the evaluator saw, after nearest-wins merging over the instance chain. */
@@ -300,9 +305,17 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
 
     const effect = emissiveOnlyEffect(graph);
     if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material };
-    if (request.probe) return unavailable(`${graph.material} has a BaseColor output`);
-
     const parameters = chainParameters(chain);
+    if (request.probe) {
+      // Unreal applies a mesh's vertex colours only where the graph reads VertexColor; glTF multiplies COLOR_0 into
+      // every base colour. The importer drops COLOR_0 when the BaseColor path does not read it.
+      const readable = !graph.truncated && !graph.error;
+      return {
+        ...unavailable(`${graph.material} has a BaseColor output`),
+        ...(readable ? { vertexColorOnBaseColor: graphPathClasses(graph, "baseColor", parameters).includes("VertexColor") } : {}),
+      };
+    }
+
     const surface = request.surface && graphReadsSurface(graph) ? request.surface() : undefined;
     const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}`;
     let perAssets = bakes.get(request.assets);

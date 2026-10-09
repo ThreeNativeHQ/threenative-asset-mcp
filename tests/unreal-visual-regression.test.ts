@@ -8,7 +8,7 @@ import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { renderTiles } from "../src/unreal/contact-sheet.js";
-import { packageGlb } from "../src/unreal/importer.js";
+import { dropUnreadVertexColours, packageGlb } from "../src/unreal/importer.js";
 import type { SourceMaterial } from "../src/unreal/source-material.js";
 import { writeMeshFixture } from "./helpers/unreal-fixture.js";
 import { createGraphBaker } from "../src/unreal/graph-baker.js";
@@ -646,6 +646,34 @@ interface Fixture {
   readonly path: string;
 }
 
+/**
+ * A character piece whose mesh carries black vertex colours its material never reads (a 5.8 pack's armour and
+ * mannequins rendered black). Built as the importer leaves it: a black COLOR_0 on a brown box, passed through the real
+ * `dropUnreadVertexColours` with a graph whose BaseColor does not read VertexColor.
+ */
+async function unreadVertexColourBox(dir: string, name: string): Promise<string> {
+  const path = join(dir, `${name}.glb`);
+  await writeGlb(path, { name, geometry: "cube", baseColorFactor: [0.55, 0.3, 0.12, 1] });
+  const io = new NodeIO();
+  const document = await io.read(path);
+  const root = document.getRoot();
+  const primitive = root.listMeshes()[0]!.listPrimitives()[0]!;
+  const count = primitive.getAttribute("POSITION")!.getCount();
+  primitive.setAttribute(
+    "COLOR_0",
+    document.createAccessor("COLOR_0").setType("VEC4").setArray(new Float32Array(count * 4).map((_, i) => (i % 4 === 3 ? 1 : 0))).setBuffer(root.listBuffers()[0]!),
+  );
+  await dropUnreadVertexColours(root, root.listMaterials()[0]!, async () => ({ status: "unavailable", reason: "probe", vertexColorOnBaseColor: false }), () => ({
+    materialName: name,
+    lookupName: name,
+    assets: { png: new Map() },
+    readProps: () => undefined,
+    probe: true,
+  }));
+  await io.write(path, document);
+  return path;
+}
+
 async function buildFixtures(dir: string): Promise<Fixture[]> {
   const wood = await woodTexture();
   const ragged = await raggedAlphaTexture();
@@ -708,6 +736,7 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
   fixtures.push({ name: "vivid-atlas-card", path: await importedNeedleCard(dir, "vivid-atlas-card", { noMipmaps: true, vivid: true, solidMask: true }) });
   fixtures.push({ name: "matte-leaf-specular", path: await importedNeedleCard(dir, "matte-leaf-specular", { specular: 0.1, solidMask: true }) });
   fixtures.push({ name: "default-leaf-specular", path: await importedNeedleCard(dir, "default-leaf-specular", { solidMask: true }) });
+  fixtures.push({ name: "unread-black-vertex-colours", path: await unreadVertexColourBox(dir, "unread-black-vertex-colours") });
   await write("solid-box", { geometry: "cube", baseColorFactor: [0.15, 0.3, 0.85, 1] });
   await write("neutral-grey", { geometry: "cube", baseColorFactor: [0.5, 0.5, 0.5, 1] });
   await write("solid-quad", { geometry: "quad", baseColorFactor: [0.2, 0.7, 0.3, 1] });
@@ -892,6 +921,13 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(left[0]).toBeGreaterThan(left[1]);
     expect(right[1]).toBeGreaterThan(right[0]);
     expect(right[1]).toBeGreaterThan(left[1] * 1.3);
+  });
+
+  it("a box with black vertex colours its material never reads renders its brown base colour, not black", () => {
+    const [r, g, b] = objectMeanRgb(byName.get("unread-black-vertex-colours")!);
+    expect(r).toBeGreaterThan(70);
+    expect(r).toBeGreaterThan(g * 1.3);
+    expect(g).toBeGreaterThan(b * 1.3);
   });
 
   it("the solid box hue matches its base-colour factor", () => {

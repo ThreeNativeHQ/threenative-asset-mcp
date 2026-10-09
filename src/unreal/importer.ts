@@ -56,7 +56,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 70;
+export const IMPORTER_VERSION = 71;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1326,6 +1326,36 @@ async function writeMaterialLibrarySource(
   await separateLayoutIO().write(path, document);
 }
 
+/**
+ * Drops COLOR_0 from the primitives that render with `material` when the material's dumped graph shows its BaseColor
+ * path does not read VertexColor; returns the limitation to record, or undefined when nothing was dropped (no colour
+ * buffer, no graph baker, or a graph that is unknown or reads VertexColor).
+ */
+export async function dropUnreadVertexColours(
+  root: ReturnType<Document["getRoot"]>,
+  material: Material,
+  graphBaker: GraphBaker | undefined,
+  probe: () => GraphBakeRequest,
+): Promise<string | undefined> {
+  if (!graphBaker || !usesVertexColors(root, material)) return undefined;
+  const outcome = await graphBaker(probe());
+  if (outcome.vertexColorOnBaseColor !== false) return undefined;
+  let dropped = 0;
+  for (const mesh of root.listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      if (primitive.getMaterial() !== material) continue;
+      const colour = primitive.getAttribute("COLOR_0");
+      if (!colour) continue;
+      primitive.setAttribute("COLOR_0", null);
+      dropped += 1;
+      if (colour.listParents().every((parent) => parent.propertyType === "Root")) colour.dispose();
+    }
+  }
+  return dropped === 0
+    ? undefined
+    : `Vertex colours (COLOR_0) dropped from ${dropped} primitive(s): ${outcome.graphMaterial ?? "the material"}'s BaseColor does not read VertexColor, so Unreal ignores them, while a glTF client would multiply them into the base colour.`;
+}
+
 /** True when any primitive that renders with `material` carries a COLOR_0 attribute. */
 function usesVertexColors(root: ReturnType<Document["getRoot"]>, material: Material): boolean {
   return root
@@ -1473,6 +1503,11 @@ export async function packageGlb(options: {
         return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
       },
     });
+    // Unreal applies vertex colours only where the material reads VertexColor, but a glTF client multiplies COLOR_0 into
+    // the base colour of every primitive that has it. Skeletal meshes often carry black or mask vertex colours a
+    // material never reads, which rendered whole characters black. When the material's graph is known and its BaseColor
+    // path does not read VertexColor, the attribute is dropped.
+    const vertexColourLimitation = await dropUnreadVertexColours(root, material, options.graphBaker, () => graphRequest(true));
     // A translucent section with a base-colour texture is not otherwise looked at by the graph baker, yet an unlit or
     // additive effect names its emissive mask `Diffuse`. Ask the graph whether Emissive is its only colour output.
     if (
@@ -1563,7 +1598,7 @@ export async function packageGlb(options: {
     const ordered = [...resolved.bindings].sort(
       (left, right) => SLOT_ORDER.indexOf(left.slot) - SLOT_ORDER.indexOf(right.slot),
     );
-    const packagingLimitations = [...resolved.limitations];
+    const packagingLimitations = [...resolved.limitations, ...(vertexColourLimitation ? [vertexColourLimitation] : [])];
     let authoredAoApplied = false;
     let authoredAoBaseAttached = false;
     const sidecarTextures: string[] = [];

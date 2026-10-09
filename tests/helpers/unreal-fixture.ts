@@ -20,6 +20,8 @@ export interface MeshFixtureOptions {
   readonly textures: readonly string[];
   /** Emits a tangent accessor whose every element is zero, as UE Viewer does for UE4 meshes. */
   readonly degenerateTangents?: boolean;
+  /** Emits a COLOR_0 accessor with this linear RGBA on every vertex. */
+  readonly vertexColor?: readonly [number, number, number, number];
 }
 
 export async function writePng(
@@ -159,6 +161,16 @@ export async function writeMeshFixture(
         .createAccessor("TANGENT")
         .setType("VEC4")
         .setArray(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]))
+        .setBuffer(buffer),
+    );
+  }
+  if (options.vertexColor) {
+    primitive.setAttribute(
+      "COLOR_0",
+      document
+        .createAccessor("COLOR_0")
+        .setType("VEC4")
+        .setArray(new Float32Array([...options.vertexColor, ...options.vertexColor, ...options.vertexColor]))
         .setBuffer(buffer),
     );
   }
