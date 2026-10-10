@@ -47,7 +47,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      # npm, pip, apt and Playwright downloads can stall; fail in 15 min instead of at the 45-min job limit.
       - name: Install deterministic test prerequisites
+        timeout-minutes: 15
         id: install
         run: |
           npm ci --no-audit --no-fund
@@ -146,6 +148,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install deterministic test prerequisites
+        timeout-minutes: 15
         run: |
           npm ci --no-audit --no-fund
           python -m pip install --disable-pip-version-check --only-binary=:all: numpy==2.3.5 pillow==12.0.0

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { basename, dirname, join, normalize } from "node:path";
@@ -17,11 +18,23 @@ export interface PreviewPose {
   degrees: number;
 }
 
+export interface PreviewFocus {
+  bone: string;
+  distance?: number | undefined;
+}
+
 export interface PreviewOptions {
   clipName?: string;
   times: number[];
-  /** One explicit bone rotation applied to every frame, for limb-isolation sheets. */
+  /** An additive local-axis rotation applied after sampling, for limb-isolation sheets. */
   pose?: PreviewPose;
+  /**
+   * Frame the camera on one bone and its descendant bones (a hand with its
+   * fingers) instead of the whole model, following it through the animation.
+   * `distance` overrides the automatic fit, in model units, and centres the camera on the
+   * bone itself rather than on its subtree, so the view is independent of the finger pose.
+   */
+  focus?: PreviewFocus;
   angles?: number;
   width?: number;
   height?: number;
@@ -54,14 +67,16 @@ function threeFile(relative: string): string {
 }
 
 function pageHtml(options: PreviewOptions): string {
+  // Asset names are data, including names containing an HTML script terminator.
   const payload = JSON.stringify({
     clipName: options.clipName ?? null,
     times: options.times,
     pose: options.pose ?? null,
+    focus: options.focus ?? null,
     angles: options.angles ?? 3,
     width: options.width ?? 384,
     height: options.height ?? 384,
-  });
+  }).replace(/</g, "\\u003c");
   return `<!doctype html><html><body>
 <script type="importmap">{"imports":{"three":"/three.module.js","three/addons/":"/jsm/"}}</script>
 <script type="module">
@@ -77,71 +92,125 @@ try {
   const light = new THREE.DirectionalLight(0xffffff,3); light.position.set(2,5,3); scene.add(light);
   const camera = new THREE.PerspectiveCamera(45,width/height,0.01,1000);
   new GLTFLoader().load('/model.glb', (gltf) => {
-    const model = gltf.scene; scene.add(model);
-    const box = new THREE.Box3().setFromObject(model);
-    const size = box.getSize(new THREE.Vector3()); const center = box.getCenter(new THREE.Vector3());
-    const radius = Math.max(size.x,size.y,size.z) || 1;
-    const mixer = new THREE.AnimationMixer(model);
-    const clips = gltf.animations ?? [];
-    const clip = options.clipName ? clips.find(c => c.name === options.clipName) : clips[0];
-    let tracks = 0, boundTracks = 0;
-    const boneNames = new Set();
-    model.traverse(o => { if (o.isBone) boneNames.add(o.name); });
-    if (clip) {
-      tracks = clip.tracks.length;
-      for (const track of clip.tracks) {
-        const head = track.name.replace(/\.(quaternion|position|scale|morphTargetInfluences.*)$/, '');
-        if (boneNames.has(head) || THREE.PropertyBinding.findNode(model, track.name)) boundTracks += 1;
+    try {
+      const model = gltf.scene; scene.add(model);
+      // A skinned mesh keeps the bounding sphere of its first pose, so a limb that swings away
+      // (or a camera framed on one hand) would otherwise be culled and the frame render empty.
+      model.traverse(node => { if (node.isMesh) node.frustumCulled = false; });
+      model.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(model);
+      const size = box.getSize(new THREE.Vector3()); const center = box.getCenter(new THREE.Vector3());
+      const radius = Math.max(size.x,size.y,size.z) || 1;
+      const mixer = new THREE.AnimationMixer(model);
+      const clips = gltf.animations ?? [];
+      const clip = options.clipName !== null ? clips.find(c => c.name === options.clipName) : clips[0];
+      if (options.clipName !== null && !clip) throw new Error('Unknown preview clip: ' + options.clipName);
+
+      // Restore authored local transforms, never Euler zero. Untracked fingers
+      // and helper nodes must retain their bind/rest orientation.
+      const rest = [];
+      const bones = new Map();
+      const addBoneAlias = (name, bone) => {
+        if (typeof name !== 'string' || !name) return;
+        const matches = bones.get(name) ?? new Set();
+        matches.add(bone);
+        bones.set(name, matches);
+      };
+      model.traverse(node => {
+        rest.push({node, position:node.position.clone(), quaternion:node.quaternion.clone(), scale:node.scale.clone()});
+        if (!node.isBone) return;
+        addBoneAlias(node.name, node);
+        // GLTFLoader sanitizes names for PropertyBinding (hand.L -> handL).
+        // The public preview API also accepts the original glTF joint name.
+        const index = gltf.parser.associations.get(node)?.nodes;
+        if (index !== undefined) addBoneAlias(gltf.parser.json.nodes[index]?.name, node);
+      });
+      const resolveBone = name => {
+        const matches = bones.get(name);
+        if (!matches || matches.size !== 1) throw new Error('Unknown or ambiguous preview bone: ' + name);
+        return matches.values().next().value;
+      };
+      const pose = options.pose;
+      const poseBone = pose ? resolveBone(pose.bone) : undefined;
+      const focusBone = options.focus ? resolveBone(options.focus.bone) : undefined;
+      let tracks = 0, boundTracks = 0;
+      let action;
+      if (clip) {
+        tracks = clip.tracks.length;
+        for (const track of clip.tracks) {
+          const binding = THREE.PropertyBinding.parseTrackName(track.name);
+          if (THREE.PropertyBinding.findNode(model, binding.nodeName)) boundTracks += 1;
+        }
+        action = mixer.clipAction(clip);
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;
       }
-      mixer.clipAction(clip).play();
-    }
-    const bones = {};
-    // GLTFLoader sanitizes node names, so 'upper_arm.L' in the file is 'upper_armL' in the scene.
-    model.traverse(o => { if (o.isBone) bones[o.name] = o; });
-    const pose = options.pose;
-    const poseBone = pose ? (bones[pose.bone] ?? bones[THREE.PropertyBinding.sanitizeNodeName(pose.bone)]) : null;
-    if (pose && !poseBone) {
-      window.__result = { ok:false, error: 'pose bone ' + pose.bone + ' is not in the model' };
-      return;
-    }
-    const poseAxis = pose ? new THREE.Vector3(pose.axis === 'x' ? 1 : 0, pose.axis === 'y' ? 1 : 0, pose.axis === 'z' ? 1 : 0) : null;
-    const poseRotation = pose ? new THREE.Quaternion().setFromAxisAngle(poseAxis, (pose.degrees * Math.PI) / 180) : null;
-    const poseUndo = poseRotation ? poseRotation.clone().invert() : null;
-    const gl = renderer.getContext();
-    const images = [];
-    for (const time of options.times) {
-      for (let angle = 0; angle < options.angles; angle++) {
-        const azimuth = (angle / options.angles) * Math.PI * 2;
-        // Never write the driven bones by hand: AnimationMixer applies a track only when its value
-        // differs from the one it last wrote, so an external reset makes it skip every later tile
-        // and the whole sheet past the first frame renders the same pose.
-        if (clip) { mixer.setTime(time); }
-        // On top of the mixer, never before it, or a clip driving this bone overwrites the override.
-        if (poseRotation) poseBone.quaternion.multiply(poseRotation);
-        model.updateMatrixWorld(true);
-        const distance = radius * 1.7;
-        camera.position.set(center.x + Math.sin(azimuth)*distance, center.y + size.y*0.12, center.z + Math.cos(azimuth)*distance);
-        camera.lookAt(center);
-        renderer.render(scene, camera);
-        const pixels = new Uint8Array(width*height*4);
-        gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
-        let sum=0, sum2=0; const n = width*height;
-        for (let i=0;i<pixels.length;i+=4){ const v=pixels[i]; sum+=v; sum2+=v*v; }
-        const mean = sum/n; const std = Math.sqrt(Math.max(0, sum2/n - mean*mean));
-        images.push({ time, angle, dataUrl: renderer.domElement.toDataURL('image/png'), mean, std });
-        // Undo the override so the mixer's change detection keeps seeing its own last value.
-        if (poseUndo) poseBone.quaternion.multiply(poseUndo);
+      const gl = renderer.getContext();
+      const images = [];
+      for (const time of options.times) {
+        for (let angle = 0; angle < options.angles; angle++) {
+          const azimuth = (angle / options.angles) * Math.PI * 2;
+          mixer.stopAllAction();
+          for (const entry of rest) {
+            entry.node.position.copy(entry.position);
+            entry.node.quaternion.copy(entry.quaternion);
+            entry.node.scale.copy(entry.scale);
+          }
+          if (action) {
+            action.reset().play();
+            mixer.setTime(Math.min(Math.max(time, 0), clip.duration));
+          }
+          // Apply after sampling so animation cannot erase the requested proof.
+          // A local delta preserves the authored orientation and avoids any
+          // assumption that a finger's curl axis matches a world-space axis.
+          if (poseBone) {
+            const axis = new THREE.Vector3(); axis[pose.axis] = 1;
+            poseBone.rotateOnAxis(axis, (pose.degrees * Math.PI) / 180);
+          }
+          model.updateMatrixWorld(true);
+          if (focusBone) {
+            // Track the bone and its descendant bones; fit the camera to their extent.
+            const points = [];
+            focusBone.traverse(node => { if (node.isBone) points.push(node.getWorldPosition(new THREE.Vector3())); });
+            const focusBox = new THREE.Box3().setFromPoints(points);
+            // An explicit distance frames the bone itself, so the camera does not move when the
+            // fingers do and two builds of the same clip can be compared with an identical view.
+            const focusCenter = options.focus.distance !== undefined && options.focus.distance !== null
+              ? focusBone.getWorldPosition(new THREE.Vector3())
+              : focusBox.getCenter(new THREE.Vector3());
+            const extent = Math.max(focusBox.getSize(new THREE.Vector3()).length(), radius * 0.04);
+            const focusDistance = options.focus.distance ?? extent * 2.4;
+            camera.position.set(focusCenter.x + Math.sin(azimuth)*focusDistance, focusCenter.y + focusDistance*0.2, focusCenter.z + Math.cos(azimuth)*focusDistance);
+            camera.lookAt(focusCenter);
+          } else {
+            const distance = radius * 1.7;
+            camera.position.set(center.x + Math.sin(azimuth)*distance, center.y + size.y*0.12, center.z + Math.cos(azimuth)*distance);
+            camera.lookAt(center);
+          }
+          renderer.render(scene, camera);
+          const pixels = new Uint8Array(width*height*4);
+          gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
+          let sum=0, sum2=0; const n = width*height;
+          for (let i=0;i<pixels.length;i+=4){ const v=pixels[i]; sum+=v; sum2+=v*v; }
+          const mean = sum/n; const std = Math.sqrt(Math.max(0, sum2/n - mean*mean));
+          images.push({ time, angle, dataUrl: renderer.domElement.toDataURL('image/png'), mean, std });
+        }
       }
+      window.__result = {
+        ok: true,
+        backend: 'playwright-chromium ' + gl.getParameter(gl.VERSION),
+        images,
+        animations: clips.map(c => c.name),
+        tracks,
+        boundTracks,
+        bounds: { min: box.min.toArray(), max: box.max.toArray() },
+      };
+      mixer.stopAllAction();
+      mixer.uncacheRoot(model);
+      renderer.dispose();
+    } catch (error) {
+      window.__result = { ok:false, error: 'render ' + String(error) };
     }
-    window.__result = {
-      ok: true,
-      backend: 'playwright-chromium ' + gl.getParameter(gl.VERSION),
-      images,
-      animations: clips.map(c => c.name),
-      tracks,
-      boundTracks,
-      bounds: { min: box.min.toArray(), max: box.max.toArray() },
-    };
   }, undefined, (error) => { window.__result = { ok:false, error: 'load ' + String(error) }; });
 } catch (error) {
   window.__result = { ok:false, error: 'setup ' + String(error) };
@@ -160,7 +229,7 @@ function serveBuffer(
 
 export function previewAvailable(): boolean {
   try {
-    return chromium.executablePath().length > 0;
+    return existsSync(chromium.executablePath());
   } catch {
     return false;
   }
@@ -271,7 +340,10 @@ export async function renderPreview(
     if (images.length === 0) {
       throw new RigAssetError("RIG_PREVIEW_FAILED", "The preview produced no images.");
     }
-    if (images.some((image) => !image.nonBlank)) {
+    // A close-up can legitimately look through a solid body at one azimuth; only an entirely
+    // empty set of close-ups means the renderer failed to draw the model.
+    const blank = options.focus ? images.every((image) => !image.nonBlank) : images.some((image) => !image.nonBlank);
+    if (blank) {
       throw new RigAssetError(
         "RIG_PREVIEW_FAILED",
         "The preview produced a blank frame; the renderer did not draw the model.",
