@@ -3,6 +3,7 @@
  * CUE4Parse (`PropertyDump`), with what the importer reported (`ImportReport`). No I/O.
  */
 import type { ImportedMaterialSection, ImportedModel, ImportReport } from "./importer.js";
+import { isWorldPartitionExternalPackage } from "./importer.js";
 import type { PropertyDump } from "./property-dump.js";
 
 /** Every list in a score is capped at this many entries; a `…Total` count sits beside it. */
@@ -58,6 +59,10 @@ export interface PackScore {
     readonly exported: number;
     readonly missing: readonly MissingMesh[];
     readonly missingTotal: number;
+    /** World Partition external actor/object packages with mesh-class exports that were left out of `expected` (level data, not meshes). */
+    readonly externalActorPackages: number;
+    /** Mesh packages that are a level's generated HLOD proxies (an `HLODProxy` export): not expected as models. */
+    readonly hlodProxyPackages: number;
   };
   readonly shape: {
     readonly ok: boolean;
@@ -70,6 +75,8 @@ export interface PackScore {
     readonly unverifiedModels: number;
     readonly unusedSlots: number;
     readonly boundsUnverified: number;
+    /** Meshes whose size is within the tolerance but more than 1 % off the authored bounds. */
+    readonly boundsDrift: number;
     readonly violations: readonly ShapeViolation[];
     readonly violationsTotal: number;
     /** Uncapped violation count per kind; `violations` is capped, this is not. */
@@ -80,6 +87,8 @@ export interface PackScore {
     readonly sections: number;
     readonly verified: number;
     readonly unverified: number;
+    /** Bindings accepted because the source's own Winter/Autumn texture, not the bound Summer sibling, is in the effective set. */
+    readonly substituted: number;
     readonly violations: readonly IdentityViolation[];
     readonly violationsTotal: number;
     /** Uncapped violation count per kind; `violations` is capped, this is not. */
@@ -92,6 +101,11 @@ export interface PackScore {
     readonly share: number;
     readonly misses: readonly ColourMiss[];
     readonly missesTotal: number;
+    /**
+     * Sections the source gives no albedo by design (the importer recorded an `effect`: emissive-only effect or
+     * engine default material) and that stayed neutral. They are neither coloured nor missed, so they leave `expectsColour`.
+     */
+    readonly effectNeutral: number;
     /** Sections (all models) by graph outcome; sections with no `graph` count in none of these. */
     readonly graphBaked: number;
     readonly graphUnsupported: number;
@@ -228,6 +242,28 @@ function resolve(index: Map<string, Located[]>, path: string): Located | undefin
   return candidates.length === 1 && key === undefined ? candidates[0] : undefined;
 }
 
+const MAX_FUNCTION_DEPTH = 16;
+
+/** Textures reachable from `roots` through MaterialFunction calls (cycle-safe, depth-limited). */
+function functionTextures(index: Map<string, Located[]>, roots: readonly string[]): Set<string> {
+  const found = new Set<string>();
+  const seen = new Set<DumpExport>();
+  let frontier = roots;
+  for (let depth = 0; depth < MAX_FUNCTION_DEPTH && frontier.length > 0; depth++) {
+    const next: string[] = [];
+    for (const path of frontier) {
+      const located = resolve(index, path);
+      if (!located || !located.exp.class.startsWith("MaterialFunction") || seen.has(located.exp)) continue;
+      seen.add(located.exp);
+      for (const t of located.exp.textures ?? []) found.add(objectName(t));
+      for (const p of located.exp.textureParameters ?? []) if (p.texture) found.add(objectName(p.texture));
+      next.push(...(located.exp.functions ?? []));
+    }
+    frontier = next;
+  }
+  return found;
+}
+
 /** The effective texture/colour set for a material, or undefined when the chain leaves the dump. */
 function effectiveSet(index: Map<string, Located[]>, start: Located): Effective | undefined {
   const chain: Located[] = [start];
@@ -268,6 +304,9 @@ function effectiveSet(index: Map<string, Located[]>, start: Located): Effective 
     const name = objectName(t);
     if (!rootDefaults.has(name)) textures.add(name);
   }
+  // Textures a MaterialFunction samples are bound through the calling Material's graph, but the dump lists
+  // them on the function's own export. Functions missing from the dump are unverified, never a violation.
+  for (const name of functionTextures(index, root.functions ?? [])) if (!rootDefaults.has(name)) textures.add(name);
   for (const name of textures) replaced.delete(name);
   const normalTextures = new Set<string>();
   for (const name of textures) if (isNormalName(name)) normalTextures.add(name);
@@ -280,6 +319,8 @@ function effectiveSet(index: Map<string, Located[]>, start: Located): Effective 
     constantColors: (root.constantColors ?? 0) > 0,
   };
 }
+
+const BOUNDS_TOLERANCE = 0.1;
 
 function near(a: number, b: number, tolerance: number): boolean {
   return Math.abs(a - b) <= tolerance;
@@ -295,8 +336,20 @@ function isNeutral(factor: readonly number[]): boolean {
 export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   const meshes = new Map<string, SourceMesh>();
   const failedPackages = new Set<string>();
+  const externalActorKeys = new Set<string>();
+  const hlodProxyKeys = new Set<string>();
   for (const pkg of dump.packages) {
     const key = packageKey(pkg.path);
+    if (isWorldPartitionExternalPackage(pkg.path)) {
+      if ((pkg.exports ?? []).some((exp) => isMeshClass(exp.class))) externalActorKeys.add(key);
+      continue;
+    }
+    // An HLODProxy package holds the editor's generated LOD stand-ins for a level, build output the importer skips
+    // by name (HLOD_PROXY_REASON). Counted, so a pack of nothing but proxies cannot look covered.
+    if ((pkg.exports ?? []).some((exp) => exp.class === "HLODProxy")) {
+      if ((pkg.exports ?? []).some((exp) => isMeshClass(exp.class))) hlodProxyKeys.add(key);
+      continue;
+    }
     if (pkg.error) failedPackages.add(key);
     for (const exp of pkg.exports ?? []) {
       if (!isMeshClass(exp.class) || meshes.has(key)) continue;
@@ -325,15 +378,18 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   let unverifiedModels = 0;
   let unusedSlots = 0;
   let boundsUnverified = 0;
+  let boundsDrift = 0;
   const identity: IdentityViolation[] = [];
   let sections = 0;
   let unverified = 0;
+  let substituted = 0;
   // Sections of readable meshes only: the "material data outside the dump" rule must not count
   // sections that are unverified because their mesh was unreadable.
   let readableSections = 0;
   let outsideDump = 0;
   let expectsColour = 0;
   let coloured = 0;
+  let effectNeutral = 0;
   const misses: ColourMiss[] = [];
   let graphBaked = 0;
   let graphUnsupported = 0;
@@ -364,22 +420,42 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
     else if (mesh) {
       checked++;
       const expectedSlots = mesh.slots?.length ?? 0;
-      const actualSlots = new Set(model.materials.map((m) => m.name)).size;
+      // UE Viewer gives every section it cannot resolve its own `dummy_material_<section>`, so the importer's
+      // `<mesh>_unresolved_section_<n>` names count sections, not slots. They stand for the slots with no material
+      // (SternInhibitor2: 29 of them for one null slot), which no name can tell apart: count them as one.
+      const resolvedSlots = new Set(model.materials.filter((m) => m.resolved !== false).map((m) => m.name)).size;
+      const actualSlots = resolvedSlots + (model.materials.some((m) => m.resolved === false) ? 1 : 0);
       if (actualSlots > expectedSlots || actualSlots === 0) {
         shape.push({ kind: "slot-count", model: model.name, expected: expectedSlots, actual: actualSlots });
       } else unusedSlots += expectedSlots - actualSlots;
       const extent = mesh.bounds?.boxExtent;
       if (!extent) boundsUnverified++;
       else {
-        const size = extent.map((e) => (e * 2) / 100);
-        const expected = [size[0]!, size[2]!, size[1]!];
+        // `ExtendedBounds` is the geometry grown by the mesh's authored Positive/NegativeBoundsExtension
+        // (culling padding, large on foliage), so judge the geometry against the box minus that padding.
+        const padded = mesh.bounds?.property === "ExtendedBounds";
+        const positive = padded ? mesh.bounds?.positiveExtension : undefined;
+        const negative = padded ? mesh.bounds?.negativeExtension : undefined;
+        const size = extent.map((e, i) => Math.max(e * 2 - (positive?.[i] ?? 0) - (negative?.[i] ?? 0), 0) / 100);
+        // Two glTF axis conventions are valid and both keep UE's up axis (Z) on glTF Y: UE Viewer writes
+        // (X, Z, Y); the CUE4Parse and MeshDescription converters write (Y, Z, X) (UE right -> glTF x,
+        // UE forward -> glTF z). A mesh is axis-correct when it matches either order.
+        const viewerOrder = [size[0]!, size[2]!, size[1]!];
+        const converterOrder = [size[1]!, size[2]!, size[0]!];
         const actual = model.boundsMetres;
-        const tolerance = Math.max(0.01 * Math.max(...expected), 0.001);
-        if (!triplesMatch(expected, actual, tolerance)) {
+        // `ExtendedBounds` is an authored, cached value and can lag the geometry (Soul Cave: 4 of 173
+        // meshes sit 2-8 % off). Scale, unit and up-axis errors are factors, so 10 % still catches
+        // them; the 1-10 % band is counted as drift, not failed.
+        const tolFor = (e: readonly number[], fraction: number): number => Math.max(fraction * Math.max(...e), 0.001);
+        const matched = [viewerOrder, converterOrder].find((order) => triplesMatch(order, actual, tolFor(order, BOUNDS_TOLERANCE)));
+        if (matched) {
+          if (!triplesMatch(matched, actual, tolFor(matched, 0.01))) boundsDrift++;
+        } else {
+          const expected = viewerOrder;
           const sortedE = [...expected].sort((a, b) => a - b);
           const sortedA = [...actual].sort((a, b) => a - b);
           shape.push({
-            kind: triplesMatch(sortedE, sortedA, tolerance) ? "bounds-axis" : "bounds-size",
+            kind: triplesMatch(sortedE, sortedA, tolFor(expected, BOUNDS_TOLERANCE)) ? "bounds-axis" : "bounds-size",
             model: model.name,
             expected,
             actual,
@@ -404,11 +480,16 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
         outsideDump++;
         continue;
       }
-      scoreIdentity(model.name, section, effective, identity);
+      substituted += scoreIdentity(model.name, section, effective, identity);
       const hasColourTexture = [...effective.textures].some((t) => !effective.normalTextures.has(t));
       if (hasColourTexture || effective.hasVectors || effective.constantColors) {
-        expectsColour++;
         const isColoured = section.textured === true || (section.factors?.baseColor !== undefined && !isNeutral(section.factors.baseColor));
+        if (section.effect && !isColoured) {
+          // The importer named why this section has no albedo; the reason is in the report, so it is not a miss.
+          effectNeutral++;
+          continue;
+        }
+        expectsColour++;
         const graphStatus: GraphOutcome = section.graph?.status ?? "none";
         if (isColoured) {
           coloured++;
@@ -434,7 +515,10 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
   const coverageOk = missing.length === 0;
   const shapeOk = shape.length === 0;
   const identityOk = identity.length === 0;
-  const colourOk = share >= COLOUR_PASS_SHARE;
+  // A section the importer knows has source colour (its graph names nodes it cannot evaluate, or a bake came out neutral)
+  // and left neutral is a real miss. The share must not average it away: 12 white rocks among 132 sections is 91%.
+  const knownColourMisses = missAttribution.unsupportedNode + missAttribution.bakedStillGrey;
+  const colourOk = share >= COLOUR_PASS_SHARE && knownColourMisses === 0;
 
   const reasons: string[] = [];
   let status: PackScore["status"];
@@ -448,7 +532,13 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
     if (!coverageOk) reasons.push(`S1 coverage: ${missing.length} mesh package(s) not exported`);
     if (!shapeOk) reasons.push(`S2 shape: ${shape.length} violation(s)`);
     if (!identityOk) reasons.push(`S3 identity: ${identity.length} violation(s)`);
-    if (!colourOk) reasons.push(`S4 colour: ${coloured}/${expectsColour} sections coloured (below 90%)`);
+    if (share < COLOUR_PASS_SHARE) reasons.push(`S4 colour: ${coloured}/${expectsColour} sections coloured (below 90%)`);
+    else if (!colourOk) {
+      const nodes = Object.keys(cappedRecord(unsupportedNodes)).slice(0, 4).join(", ");
+      reasons.push(
+        `S4 colour: ${knownColourMisses} section(s) have source colour the importer left neutral (${missAttribution.unsupportedNode} on unsupported graph nodes${nodes ? `: ${nodes}` : ""}, ${missAttribution.bakedStillGrey} baked but still neutral); ${coloured}/${expectsColour} coloured hides them`,
+      );
+    }
     status = reasons.length === 0 ? "pass" : "fail";
   }
   if (unverifiedModels > 0) {
@@ -466,6 +556,8 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       exported: models.size,
       missing: capped(missing),
       missingTotal: missing.length,
+      externalActorPackages: externalActorKeys.size,
+      hlodProxyPackages: hlodProxyKeys.size,
     },
     shape: {
       ok: shapeOk,
@@ -474,6 +566,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       unverifiedModels,
       unusedSlots,
       boundsUnverified,
+      boundsDrift,
       violations: capped(shape),
       violationsTotal: shape.length,
       byKind: countByKind(shape),
@@ -483,6 +576,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       sections,
       verified: sections - unverified,
       unverified,
+      substituted,
       violations: capped(identity),
       violationsTotal: identity.length,
       byKind: countByKind(identity),
@@ -494,6 +588,7 @@ export function scorePack(dump: PropertyDump, report: ImportReport): PackScore {
       share,
       misses: capped(misses),
       missesTotal: misses.length,
+      effectNeutral,
       graphBaked,
       graphUnsupported,
       graphUnavailable,
@@ -525,11 +620,19 @@ function scoreIdentity(
   section: ImportedMaterialSection,
   effective: Effective,
   out: IdentityViolation[],
-): void {
+): number {
   const actual = new Set<string>();
+  let substituted = 0;
   for (const b of section.bindings) {
     // A baked graph texture is derived from several pack textures, so it is not itself one of them.
     if (b.source === "graph") continue;
+    // A Summer sibling bound in place of the source's own Winter/Autumn texture is the importer's
+    // declared choice: honest when the texture the source named is one of the section's own.
+    if (b.substitutedFrom && effective.textures.has(objectName(b.substitutedFrom))) {
+      substituted++;
+      if (b.secondaryTexture) actual.add(objectName(b.secondaryTexture));
+      continue;
+    }
     actual.add(objectName(b.texture));
     if (b.secondaryTexture) actual.add(objectName(b.secondaryTexture));
   }
@@ -542,4 +645,5 @@ function scoreIdentity(
       kind: effective.replaced.has(texture) ? "overridden-parent-default" : "foreign",
     });
   }
+  return substituted;
 }

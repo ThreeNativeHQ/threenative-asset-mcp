@@ -39,9 +39,12 @@ export type TextureTransform =
   /** Already packed glTF image: force G to one so an authored scalar supplies all roughness. */
   | "roughnessToOne"
   /** Preserve diffuse RGB, with a separate opacity map's red channel as alpha. */
-  | "redToBaseColorAlpha";
+  | "redToBaseColorAlpha"
+  /** Preserve diffuse RGB, with a packed data map's blue channel as alpha (`*_AORO`). */
+  | "blueToBaseColorAlpha";
 
-export type BindingSource = "mat" | "props" | "filename" | "texture-set" | "authored-source" | "graph";
+/** `effect`: an emissive-only effect material's mask, bound as emissive and alpha because the package has no albedo. */
+export type BindingSource = "mat" | "props" | "filename" | "texture-set" | "authored-source" | "graph" | "effect";
 export type BindingConfidence = "exact" | "heuristic";
 
 export interface MaterialTextureBinding {
@@ -52,6 +55,8 @@ export interface MaterialTextureBinding {
   readonly source: BindingSource;
   readonly confidence: BindingConfidence;
   readonly transform: TextureTransform;
+  /** The texture the source actually named, when a Winter/Autumn texture yielded to its Summer sibling. */
+  readonly substitutedFrom?: string;
 }
 
 export interface UnsupportedTexture {
@@ -64,6 +69,8 @@ export interface ResolvedMaterial {
   readonly bindings: readonly MaterialTextureBinding[];
   readonly unsupported: readonly UnsupportedTexture[];
   readonly alphaMode: "OPAQUE" | "MASK" | "BLEND";
+  /** The effective Unreal `BlendMode` of the instance chain (`BLEND_Additive`, ...), when a props file names one. */
+  readonly sourceBlendMode?: string | undefined;
   readonly alphaCutoff: number | undefined;
   readonly doubleSided: boolean;
   readonly baseColorFactor: readonly [number, number, number, number] | undefined;
@@ -104,11 +111,27 @@ export interface PropsFile {
   /** `TextureParameterValues` — a MaterialInstanceConstant's own overrides of its parent's inputs.
    * The only place an instance's textures appear when umodel resolved the parent's instead. */
   readonly overrides: readonly CollectedTextureParameter[];
+  /**
+   * Names of `TextureParameterValues` entries whose value is `None`: UE Viewer cannot name an engine texture
+   * (`BaseFlattenNormalMap`, `WhiteSquareTexture`), so an override that points outside the pack prints as `None`.
+   * It still replaces whatever an ancestor bound to that parameter.
+   */
+  readonly unresolvedOverrides: readonly string[];
   readonly scalars: readonly ScalarParameter[];
   readonly scalarOverrides: readonly ScalarParameter[];
   readonly vectors: readonly VectorParameter[];
   readonly vectorOverrides: readonly VectorParameter[];
+  /**
+   * `StaticParameters.StaticSwitchParameters` the instance overrides (`bOverride = true`): the branch it takes at a
+   * `StaticSwitchParameter` node, whatever the parent's default is.
+   */
+  readonly switchOverrides: readonly { readonly name: string; readonly value: boolean }[];
   readonly parent: string | undefined;
+  /**
+   * The parent's package path as the `Parent =` line spells it (`Content/Pack/Dir/MI_Name`, no object suffix), or undefined
+   * when the line carries only a name. Two packages can share a parent's basename; this is what tells them apart.
+   */
+  readonly parentPackage: string | undefined;
   /** Instance-local streaming references identify a surface family, never its UV transform. */
   readonly streamingTextures: readonly string[];
   /** Legacy decoder sidecars can omit the flags that distinguish instance defaults from overrides. */
@@ -155,6 +178,13 @@ function objectName(reference: string): string | undefined {
   return name === "" || name === "None" ? undefined : name;
 }
 
+/** `Class'Content/A/B/Name.Name'` -> `Content/A/B/Name`; undefined when the reference holds no directory. */
+function packagePath(reference: string): string | undefined {
+  const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference.trim();
+  const beforeDot = quoted.includes(".") ? quoted.slice(0, quoted.lastIndexOf(".")) : quoted;
+  return beforeDot.includes("/") ? beforeDot : undefined;
+}
+
 /**
  * Parses umodel's `<Material>.props.txt`. The file is a brace-nested dump, so the block containing
  * `CollectedTextureParameters` is walked by depth rather than matched with one regex: the same
@@ -167,13 +197,16 @@ export function parsePropsFile(text: string): PropsFile {
   let blendMode: string | undefined;
   let opacityMaskClipValue: number | undefined;
   let parent: string | undefined;
+  let parentPackage: string | undefined;
   const collected: CollectedTextureParameter[] = [];
 
   const overrides: CollectedTextureParameter[] = [];
+  const unresolvedOverrides: string[] = [];
   const scalars: ScalarParameter[] = [];
   const scalarOverrides: ScalarParameter[] = [];
   const vectors: VectorParameter[] = [];
   const vectorOverrides: VectorParameter[] = [];
+  const switchOverrides: { name: string; value: boolean }[] = [];
   let inCollected = false;
   let collectedDepth = 0;
   let depth = 0;
@@ -183,7 +216,8 @@ export function parsePropsFile(text: string): PropsFile {
   const number = "[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[Ee][-+]?\\d+)?";
   const readName = (line: string): string | undefined => {
     const legacy = /ParameterName\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
-    const modern = /ParameterInfo\s*=\s*\{\s*Name\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
+    // A parameter name may hold a comma ("true = leaf, false = trunk"), so the name runs to the closing brace.
+    const modern = /ParameterInfo\s*=\s*\{\s*Name\s*=\s*([^}\r\n]+)/.exec(line)?.[1]?.trim();
     const collected = /\bName\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
     return [legacy, modern, collected].find((name) => name && name !== "None");
   };
@@ -239,11 +273,19 @@ export function parsePropsFile(text: string): PropsFile {
   collectScalars("ScalarParameterValues", scalarOverrides);
   collectVectors("CollectedVectorParameters", vectors);
   collectVectors("VectorParameterValues", vectorOverrides);
+  for (const block of indexedBlocks("StaticSwitchParameters")) {
+    if (/StaticSwitchParameters\[\d+\]/.test(block)) continue;
+    const name = readName(block);
+    const value = /\bValue\s*=\s*(true|false)\b/.exec(block)?.[1];
+    const overridden = /\bbOverride\s*=\s*(true|false)\b/.exec(block)?.[1];
+    if (name && value !== undefined && overridden !== "false") switchOverrides.push({ name, value: value === "true" });
+  }
   for (const block of indexedBlocks("TextureParameterValues")) {
     if (/TextureParameterValues\[\d+\]/.test(block)) continue;
     const name = readName(block);
     const texture = objectName(/ParameterValue\s*=\s*([^\r\n}]+)/.exec(block)?.[1] ?? "");
     if (name && texture) overrides.push({ name, texture });
+    else if (name && /ParameterValue\s*=\s*None\b/.test(block)) unresolvedOverrides.push(name);
   }
   const streamingTextures = indexedBlocks("TextureStreamingData")
     .filter((block) => !/TextureStreamingData\[\d+\]/.test(block))
@@ -262,7 +304,9 @@ export function parsePropsFile(text: string): PropsFile {
       if (clip?.[1]) opacityMaskClipValue = Number(clip[1]);
     }
     if (parent === undefined && /^Parent\s*=/.test(line)) {
-      parent = objectName(line.slice(line.indexOf("=") + 1));
+      const reference = line.slice(line.indexOf("=") + 1);
+      parent = objectName(reference);
+      parentPackage = packagePath(reference);
     }
     if (!inCollected && /^CollectedTextureParameters\[\d+\]/.test(line)) {
       inCollected = true;
@@ -303,12 +347,18 @@ export function parsePropsFile(text: string): PropsFile {
     blendMode: effective("BlendMode", blendMode, "BLEND_Opaque"),
     opacityMaskClipValue: effective("OpacityMaskClipValue", opacityMaskClipValue, 0),
     collected,
-    overrides,
+    // The modern converter writes an instance's own overrides as `CollectedTextureParameters`
+    // (a MaterialInstance has no expression nodes, so the collected block IS its overrides; on a
+    // root Material it is the defaults). A real `TextureParameterValues` block wins; never both.
+    overrides: parent !== undefined && overrides.length === 0 ? [...collected] : overrides,
+    unresolvedOverrides,
     scalars,
     scalarOverrides,
     vectors,
     vectorOverrides,
+    switchOverrides,
     parent,
+    parentPackage,
     streamingTextures,
     overrideFlagsMissing: parent !== undefined && [
       ["TwoSided", twoSided], ["BlendMode", blendMode], ["OpacityMaskClipValue", opacityMaskClipValue],
@@ -358,6 +408,20 @@ function normalizedParameterName(name: string): string {
   return name.toLowerCase().replace(/[^a-z]/g, "");
 }
 
+/** Parameter names that are unambiguously a base-colour tint, with no extra qualifier. */
+const BASE_COLOUR_KEYS = new Set(["basecolor", "basecolour", "albedo", "color", "colour", "tint"]);
+const BASE_COLOUR_TOKENS = ["basecolor", "basecolour", "albedo", "color", "colour", "diffuse", "diff"];
+
+/**
+ * An instance's own base-colour tint, including names qualified with extra words that the exact
+ * keys miss ("Albedo Color Tint (Base)", "Diffuse Tint"). Requiring a colour token beside `tint`
+ * keeps a parameter that merely ends in `Tint` but names another channel (a `RockTint` on a graph
+ * material) out of the base-colour factor.
+ */
+function isBaseColourTintOverride(key: string): boolean {
+  return BASE_COLOUR_KEYS.has(key) || (key.includes("tint") && BASE_COLOUR_TOKENS.some((token) => key.includes(token)));
+}
+
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
@@ -394,7 +458,7 @@ function nameTokens(texture: string): string[] {
 
 /** A colour word anywhere (`_c_grey`), or a trailing `_A` albedo beside `_N`/`_AORO` — never a
  * texture that ends as a normal map, whatever variant letter precedes that. */
-function isColourTexture(texture: string): boolean {
+export function isColourTexture(texture: string): boolean {
   const tokens = nameTokens(texture);
   if (NORMAL_TOKENS.has(tokens.at(-1) ?? "")) return false;
   return tokens.some((token) => COLOUR_TOKENS.has(token)) || tokens.at(-1) === "a";
@@ -407,9 +471,30 @@ function isDataTexture(texture: string): boolean {
   return tokens.some((token) => DATA_TOKENS.has(token)) || tokens.at(-1) === "g";
 }
 
+/** The texture's name gives it a slot other than base colour, or marks it as a data map. */
+function namesAnotherChannel(texture: string): boolean {
+  const plan = planForFileName(texture);
+  return (plan !== undefined && plan.slot !== "baseColor") || isDataTexture(texture);
+}
+
 /** `*_D_R` textures carry roughness in alpha; the same image serves both slots. */
 export function packsRoughnessInAlpha(texture: string): boolean {
   return /_d(?:\d+)?(?:_[a-z0-9]+)*_r$/i.test(texture);
+}
+
+/**
+ * A packed data map that carries opacity in a named channel: `*_AORO` packs AO, roughness and opacity
+ * into R, G and B. The channel is a naming convention, not a pack identity; the map is only consulted
+ * for a masked section whose own opacity source turned out to be the base colour.
+ */
+function packedOpacityTransform(texture: string): TextureTransform | undefined {
+  return /_aoro$/i.test(texture) ? "blueToBaseColorAlpha" : undefined;
+}
+
+/** Whether `candidate` belongs to `base`'s texture set (`LarchLeafs_AORO` beside `LarchLeafs_A`). */
+function sharesTextureStem(base: string, candidate: string): boolean {
+  const stem = base.replace(/_[^_]+$/, "").toLowerCase();
+  return stem !== "" && candidate.toLowerCase().startsWith(`${stem}_`);
 }
 
 export interface ResolveMaterialRequest {
@@ -451,7 +536,8 @@ function referencedTextures(
 /** A parent's default texture that an instance below it replaces with its own. */
 interface SupersededDefault {
   readonly parameter: string;
-  readonly override: string;
+  /** The replacing texture; undefined when the override points outside the pack (an engine default). */
+  readonly override: string | undefined;
 }
 
 /**
@@ -461,7 +547,7 @@ interface SupersededDefault {
  * Returns each parent default (by texture) that some instance in the chain overrides with a
  * different texture, keyed by the parent's texture.
  */
-function supersededDefaults(request: ResolveMaterialRequest): Map<string, SupersededDefault> {
+function supersededDefaults(request: ResolveMaterialRequest): { readonly superseded: Map<string, SupersededDefault>; readonly albedoPlaceholders: Set<string> } {
   const chain: PropsFile[] = [];
   const visited = new Set<string>();
   for (let current: string | undefined = request.name; current && chain.length < MAX_PARENT_DEPTH; ) {
@@ -474,11 +560,21 @@ function supersededDefaults(request: ResolveMaterialRequest): Map<string, Supers
   }
   const result = new Map<string, SupersededDefault>();
   const key = (name: string): string => name.trim().toLowerCase();
-  // An override at level i replaces defaults declared at levels above it (i + 1 and up).
+  // An override at level i replaces defaults declared at levels above it (i + 1 and up). An override whose
+  // value is `None` points at an engine texture UE Viewer cannot name (Paragon: MI_Generic_Metal sets Baked_Normal
+  // to the engine's flat normal map over its parent's T_EvilGate_Piece1_N); it supersedes the same way.
   for (let level = 0; level < chain.length; level += 1) {
-    for (const override of chain[level]!.overrides) {
+    const replacing: { name: string; texture: string | undefined }[] = [
+      ...chain[level]!.overrides,
+      ...chain[level]!.unresolvedOverrides.map((name) => ({ name, texture: undefined })),
+    ];
+    for (const override of replacing) {
       for (let ancestor = level + 1; ancestor < chain.length; ancestor += 1) {
-        const parentDefault = chain[ancestor]!.collected.find((candidate) => key(candidate.name) === key(override.name));
+        // The value a descendant replaces is the nearest ancestor's: an ancestor INSTANCE's own override
+        // (Paragon: MM_Marble_Walls_Inst sets Plain_Wall_M, the leaf sets another) as much as a master's default.
+        const parentDefault =
+          chain[ancestor]!.overrides.find((candidate) => key(candidate.name) === key(override.name)) ??
+          chain[ancestor]!.collected.find((candidate) => key(candidate.name) === key(override.name));
         if (parentDefault && parentDefault.texture !== override.texture && !result.has(parentDefault.texture)) {
           result.set(parentDefault.texture, { parameter: override.name, override: override.texture });
           break;
@@ -486,15 +582,22 @@ function supersededDefaults(request: ResolveMaterialRequest): Map<string, Supers
       }
     }
   }
+  // A master that fills every parameter with one placeholder per map type (Old West: TX_Fill_01_ALB is the default of
+  // both Albedo and Emissive) has its Albedo replaced by each instance. The same texture left as the Emissive default
+  // is that placeholder, not light the instance emits: binding it washes the whole surface out.
+  const albedoPlaceholders = new Set<string>();
+  for (const [texture, replacement] of result) {
+    if (planForParameterName(replacement.parameter)?.slot === "baseColor") albedoPlaceholders.add(texture);
+  }
   // A texture that is also the effective value of a parameter nobody overrides is still in use;
   // suppressing it would drop a real binding.
-  const overridden = new Set(chain.flatMap((props) => props.overrides.map((override) => key(override.name))));
+  const overridden = new Set(chain.flatMap((props) => [...props.overrides.map((override) => override.name), ...props.unresolvedOverrides].map(key)));
   for (const props of chain) {
     for (const parameter of props.collected) {
       if (!overridden.has(key(parameter.name))) result.delete(parameter.texture);
     }
   }
-  return result;
+  return { superseded: result, albedoPlaceholders };
 }
 
 /**
@@ -507,7 +610,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   const seenMaterials = new Set<string>();
   const parents: string[] = [];
   const limitations = new Set<string>();
-  const superseded = supersededDefaults(request);
+  const { superseded, albedoPlaceholders } = supersededDefaults(request);
 
   let alphaMode: ResolvedMaterial["alphaMode"] = "OPAQUE";
   let alphaCutoff: number | undefined;
@@ -516,10 +619,14 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   let inheritedBlend: string | undefined;
   let sawAlphaSource = false;
   let baseColorFactorValue: [number, number, number, number] | undefined;
+  /** Base-colour tint parameters in chain order; a mask-qualified tint is the surface colour (below). */
+  const baseColourTints: { readonly key: string; readonly value: readonly [number, number, number, number]; readonly mask: boolean; readonly override: boolean }[] = [];
   let emissive: [number, number, number] | undefined;
   let metallic: number | undefined;
   let roughness: number | undefined;
   let opacity: number | undefined;
+  /** Textures UE Viewer names as the material's opacity (`Opacity=` slot, or an `Other` named `*_Opacity*`), nearest material first. */
+  const opacityTextures: string[] = [];
 
   const bind = (
     plan: SlotPlan,
@@ -533,7 +640,9 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
       // The instance replaces this parent default. A replacement for the same slot is bound
       // exactly; one for a different slot or a packed data map is never painted in its place.
       const replacementPlan = planForParameterName(replacement.parameter);
-      if (replacementPlan?.slot === plan.slot && !isDataTexture(replacement.override)) {
+      if (replacement.override === undefined) {
+        limitations.add(`${texture} is the parent default of "${replacement.parameter}", overridden by an engine texture outside the pack; it is not bound for ${plan.slot}.`);
+      } else if (replacementPlan?.slot === plan.slot && !isDataTexture(replacement.override)) {
         claimed.add(replacement.override);
         if (!bindings.has(plan.slot) && request.availableTextures.has(replacement.override)) {
           bindings.set(plan.slot, { slot: plan.slot, texture: replacement.override, source: "props", confidence: "exact", transform: replacementPlan.transform });
@@ -573,6 +682,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
         if (key === "Opacity" || key === "Mask") {
           claimed.add(texture);
           sawAlphaSource = true;
+          if (key === "Opacity" && !opacityTextures.includes(texture)) opacityTextures.push(texture);
           continue;
         }
         if (key === "Cube") {
@@ -589,9 +699,24 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
       inheritedSidedness ??= props.twoSided;
       inheritedBlend ??= props.blendMode;
       alphaCutoff ??= props.opacityMaskClipValue;
+      // `props.collected` are the material's declared texture-parameter defaults. A parameter can exist
+      // without being wired to any output (or wired only behind a static switch that evaluates off), so its
+      // default texture is not evidence of a live slot. When UE Viewer resolved the graph and named slots in
+      // the `.mat`, a default whose texture is already one of those named outputs is a shared placeholder, not
+      // a second live slot: bind only defaults whose texture the `.mat` left unattributed (in `Other[]`), which
+      // is exactly how a parameter name recovers a diffuse umodel could not place. `props.overrides` still fills
+      // slots below, and `supersededDefaults` applies those over any default bound here.
+      const matNamedTextures = mat ? new Set(mat.slots.values()) : undefined;
       for (const parameter of props.collected) {
         const plan = planForParameterName(parameter.name);
-        if (plan) bind(plan, parameter.texture, "props", "heuristic");
+        if (!plan) continue;
+        if (matNamedTextures?.has(parameter.texture)) continue;
+        if (plan.slot === "emissive" && albedoPlaceholders.has(parameter.texture)) {
+          claimed.add(parameter.texture);
+          limitations.add(`${parameter.texture} is the master's placeholder for Albedo and Emissive; the instance replaces Albedo, so it is not bound as emissive.`);
+          continue;
+        }
+        bind(plan, parameter.texture, "props", "heuristic");
       }
       // An instance's own overrides fill slots umodel did not resolve. They never displace a
       // `.mat` slot: umodel walked the real graph to produce that one, and a parameter name is
@@ -612,12 +737,37 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
           opacity = clamp01(parameter.value);
         }
       }
+      // A `Tint`/`Color` parameter is a multiplicative base-colour factor. An instance's own
+      // overrides may carry extra words the exact keys miss ("Albedo Color Tint (Base)"). A master
+      // that tints "by mask" overrides both a global base multiplier and a mask colour; the mask
+      // tint is the surface colour that shows through. A lone mask tint (Old West's MI_Curtain_03a,
+      // whose editor mesh thumbnail is the untinted albedo) is not a live tint on its own. Only
+      // overrides are matched broadly: a master's oddly named default (its red `Base Color Tint
+      // (Mask)` placeholder) is not a live colour and must not paint every un-tinted instance.
+      // A master that offers "Split Albedo Controls" reads `Albedo Tint Leaves` / `Albedo Tint Branches` when the
+      // instance turns the split on, and the plain `Albedo Tint` only when it is off. With the split on, the plain
+      // tint is not live whenever a split variant of it exists (Hornbeam keeps a magenta default there).
+      const splitOn = props.switchOverrides.some((entry) => entry.value && /\bsplit\b/i.test(entry.name));
+      const allVectorKeys = [...props.vectorOverrides, ...props.vectors].map((entry) => normalizedParameterName(entry.name));
+      const hasSplitVariant = (key: string): boolean =>
+        splitOn && allVectorKeys.some((other) => other.length > key.length && other.startsWith(key));
+      for (const parameter of props.vectorOverrides) {
+        const key = normalizedParameterName(parameter.name);
+        if (hasSplitVariant(key)) continue;
+        if (isBaseColourTintOverride(key) && !baseColourTints.some((tint) => tint.key === key)) {
+          baseColourTints.push({ key, value: parameter.value, mask: key.includes("mask"), override: true });
+        }
+      }
+      for (const parameter of props.vectors) {
+        const key = normalizedParameterName(parameter.name);
+        if (BASE_COLOUR_KEYS.has(key) && !baseColourTints.some((tint) => tint.key === key)) {
+          baseColourTints.push({ key, value: parameter.value, mask: false, override: false });
+        }
+      }
       for (const parameter of [...props.vectorOverrides, ...props.vectors]) {
         const key = normalizedParameterName(parameter.name);
         const value = parameter.value;
-        if (["basecolor", "basecolour", "albedo", "color", "colour", "tint"].includes(key) && !baseColorFactorValue) {
-          baseColorFactorValue = [clamp01(value[0]), clamp01(value[1]), clamp01(value[2]), clamp01(value[3])];
-        } else if (["emissive", "emission", "emissivecolor"].includes(key) && !emissive) {
+        if (["emissive", "emission", "emissivecolor"].includes(key) && !emissive) {
           emissive = [clamp01(value[0]), clamp01(value[1]), clamp01(value[2])];
         }
       }
@@ -628,10 +778,22 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
         if (claimed.has(texture)) continue;
         const plan = planForFileName(texture);
         if (plan) bind(plan, texture, "filename", "heuristic");
+        else if (/(?:^|_)opacity(?:_|\d|$)/i.test(texture) && !opacityTextures.includes(texture)) opacityTextures.push(texture);
       }
     }
 
     current = props?.parent;
+  }
+
+  // The mask tint is the surface colour only when the instance ITSELF overrides both a global base
+  // multiplier and a mask colour. A master's default global tint does not count: an instance that
+  // overrides only a mask tint (Old West's MI_Curtain_03a) keeps the nearest global tint, if any.
+  const maskOverride = baseColourTints.find((tint) => tint.mask && tint.override);
+  const globalOverride = baseColourTints.find((tint) => !tint.mask && tint.override);
+  const chosenTint = globalOverride && maskOverride ? maskOverride : baseColourTints.find((tint) => !tint.mask);
+  if (chosenTint) {
+    const value = chosenTint.value;
+    baseColorFactorValue = [clamp01(value[0]), clamp01(value[1]), clamp01(value[2]), clamp01(value[3])];
   }
 
   doubleSided = inheritedSidedness ?? false;
@@ -663,7 +825,9 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     for (const [, members] of stems) {
       if (members.length < 2) continue;
       const normal = members.find((texture) => /_n(?:_tex)?$/i.test(texture));
-      const colour = members.find((texture) => texture !== normal);
+      // A sibling whose own name says it is another channel (`_S` specular, `_R` roughness, `_AO`, a mask) is not
+      // the colour map: binding a skin's pore specular as albedo painted a character's head in black spots.
+      const colour = members.find((texture) => texture !== normal && !namesAnotherChannel(texture));
       if (!normal || !colour) continue;
       bind({ slot: "baseColor", transform: "none" }, colour, "texture-set", "heuristic");
       // The set's own normal is more specific than whatever the parent resolved.
@@ -768,7 +932,9 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     const sibling = [...referenced].find(
       (texture) => texture.toLowerCase() === summer && request.availableTextures.has(texture),
     );
-    if (sibling) bindings.set(slot, { ...binding, texture: sibling, confidence: "heuristic" });
+    if (!sibling) continue;
+    bindings.set(slot, { ...binding, texture: sibling, confidence: "heuristic", substitutedFrom: binding.texture });
+    limitations.add(`Winter/Autumn texture ${binding.texture} replaced by its Summer sibling ${sibling} (heuristic default look)`);
   }
 
   const metallicRoughness = bindings.get("metallicRoughness");
@@ -785,6 +951,34 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
         secondaryTexture: metalness,
         transform: "redRoughnessRedMetalness",
       });
+    }
+  }
+
+  // A masked or translucent section whose cut-out lives in a separate opacity map (a grass card's blades) keeps the
+  // base colour's RGB and takes the map's red channel as alpha. Without it the card is a solid rectangle, and an
+  // instance colour with a zero alpha would clip all of it.
+  const colourForAlpha = bindings.get("baseColor");
+  const opacityMap = opacityTextures.find((texture) => request.availableTextures.has(texture) && texture !== colourForAlpha?.texture);
+  if (
+    opacityMap && colourForAlpha && alphaMode !== "OPAQUE" && colourForAlpha.secondaryTexture === undefined &&
+    colourForAlpha.transform === "none" && request.availableTextures.has(colourForAlpha.texture)
+  ) {
+    bindings.set("baseColor", { ...colourForAlpha, secondaryTexture: opacityMap, confidence: "heuristic", transform: "redToBaseColorAlpha" });
+    limitations.add(`${opacityMap} is the material's opacity map: its red channel is the base colour's alpha; same UV layout is assumed (heuristic).`);
+  } else if (
+    colourForAlpha && alphaMode !== "OPAQUE" && opacityTextures.length > 0 && colourForAlpha.secondaryTexture === undefined &&
+    colourForAlpha.transform === "none" && request.availableTextures.has(colourForAlpha.texture)
+  ) {
+    // UE Viewer resolves a masked foliage master's `Opacity=` to the base colour itself even though that
+    // albedo has no alpha; the cut-out is the blue channel of a packed `<stem>_AORO` (AO / Roughness /
+    // Opacity) sibling in `Other[]`. Without it the masked card draws as a solid rectangle.
+    const packed = [...referenced].find(
+      (texture) => request.availableTextures.has(texture) && packedOpacityTransform(texture) !== undefined &&
+        sharesTextureStem(colourForAlpha.texture, texture),
+    );
+    if (packed) {
+      bindings.set("baseColor", { ...colourForAlpha, secondaryTexture: packed, confidence: "heuristic", transform: packedOpacityTransform(packed)! });
+      limitations.add(`${packed} is the material's packed opacity map: its blue channel is the base colour's alpha; same UV layout is assumed (heuristic).`);
     }
   }
 
@@ -815,10 +1009,13 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     bindings: [...bindings.values()],
     unsupported,
     alphaMode,
+    ...(inheritedBlend !== undefined ? { sourceBlendMode: inheritedBlend } : {}),
     alphaCutoff,
     doubleSided,
+    // A colour parameter's alpha is not opacity in Unreal, and a `Tint` of A=0 is common on a surface that draws fully
+    // (a zero alpha here would clip every pixel of a masked section). Only a partial alpha is kept, as before.
     baseColorFactor: baseColorFactorValue
-      ? [baseColorFactorValue[0], baseColorFactorValue[1], baseColorFactorValue[2], opacity ?? baseColorFactorValue[3]]
+      ? [baseColorFactorValue[0], baseColorFactorValue[1], baseColorFactorValue[2], opacity ?? (baseColorFactorValue[3] > 0 ? baseColorFactorValue[3] : 1)]
       : opacity === undefined
         ? undefined
         : [1, 1, 1, opacity],

@@ -103,6 +103,25 @@ describe("parity key normalisation", () => {
 });
 
 describe("scorePack", () => {
+  it("does not expect meshes inside World Partition external actor packages, and counts them", () => {
+    const dump = dumpOf(
+      pkg("/Game/C/SM_Pillar", mesh("SM_Pillar", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar")),
+      pkg("/Game/C/MI_Cave_Rock_Pillar", pillarInstance),
+      pkg("/Game/C/M_Cave_Rock_MASTER", master),
+      pkg("/Game/__ExternalActors__/Pack/0/23/abc123", mesh("SM_Actor", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar")),
+      pkg("/Game/__ExternalObjects__/Pack/1/45/def456", mesh("SM_Object", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar")),
+    );
+    const score = scorePack(
+      dump,
+      reportOf([model(MESH_PKG, [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])])]),
+    );
+    expect(score.coverage.expected).toBe(1);
+    expect(score.coverage.missingTotal).toBe(0);
+    expect(score.coverage.externalActorPackages).toBe(2);
+    expect(score.reasons).toEqual([]);
+    expect(score.status).toBe("pass");
+  });
+
   it("passes a perfect pack", () => {
     const score = scorePack(
       caveDump(),
@@ -149,6 +168,63 @@ describe("scorePack", () => {
     expect(bad.identity.violations.map((v) => v.texture)).toEqual(["t_other_d"]);
   });
 
+  describe("textures reached through material functions", () => {
+    const T = (n: string): string => `/Game/F/${n}.${n}`;
+    const fn = (name: string, textures: string[], functions?: string[], params: string[] = []): Exp => ({
+      name,
+      class: "MaterialFunction",
+      textures: textures.map(T),
+      textureParameters: params.map((p) => ({ name: `P_${p}`, texture: T(p) })),
+      ...(functions ? { functions: functions.map((f) => `/Game/F/${f}.${f}`) } : {}),
+    });
+    const withFunctions = (functions: string[] | undefined, ...extra: Exp[]): PropertyDump =>
+      dumpOf(
+        pkg("/Game/C/SM_Pillar", mesh("SM_Pillar", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar")),
+        pkg("/Game/C/MI_Cave_Rock_Pillar", pillarInstance),
+        pkg("/Game/C/M_Cave_Rock_MASTER", { ...master, ...(functions ? { functions: functions.map((f) => `/Game/F/${f}.${f}`) } : {}) }),
+        ...extra.map((e) => pkg(`/Game/F/${e.name}`, e)),
+      );
+    const bound = (...extraTextures: string[]) =>
+      reportOf([model(MESH_PKG, [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", ...extraTextures])])]);
+
+    it("does not flag a texture only a function supplies (Spruce Forest moss_a)", () => {
+      const dump = withFunctions(["MF_Moss"], fn("MF_Moss", ["moss_a"]));
+      expect(scorePack(dump, bound("moss_a")).identity.violationsTotal).toBe(0);
+      // The same texture without the function link is foreign.
+      const unlinked = withFunctions(undefined, fn("MF_Moss", ["moss_a"]));
+      expect(scorePack(unlinked, bound("moss_a")).identity.violations.map((v) => v.kind)).toEqual(["foreign"]);
+    });
+
+    it("still flags an unrelated texture next to a function texture", () => {
+      const dump = withFunctions(["MF_Moss"], fn("MF_Moss", ["moss_a"]));
+      expect(scorePack(dump, bound("moss_a", "T_Other_D")).identity.violations.map((v) => v.texture)).toEqual(["t_other_d"]);
+    });
+
+    it("follows nested functions, function texture parameters, and survives cycles", () => {
+      const dump = withFunctions(
+        ["MF_Outer"],
+        fn("MF_Outer", [], ["MF_Inner"]),
+        fn("MF_Inner", ["deep_a"], ["MF_Outer"], ["deep_param"]),
+      );
+      expect(scorePack(dump, bound("deep_a", "deep_param")).identity.violationsTotal).toBe(0);
+    });
+
+    it("stops at depth 16 and ignores functions missing from the dump", () => {
+      const chain = Array.from({ length: 20 }, (_, i) => fn(`MF_${i}`, [`tex_${i}`], i < 19 ? [`MF_${i + 1}`] : undefined));
+      const dump = withFunctions(["MF_0"], ...chain);
+      expect(scorePack(dump, bound("tex_3")).identity.violationsTotal).toBe(0);
+      expect(scorePack(dump, bound("tex_19")).identity.violations.map((v) => v.kind)).toEqual(["foreign"]);
+      const missing = withFunctions(["MF_Gone"]);
+      expect(scorePack(missing, bound()).identity.violationsTotal).toBe(0);
+    });
+
+    it("keeps overridden-parent-default for a parent texture the instance replaced", () => {
+      const dump = withFunctions(["MF_Moss"], fn("MF_Moss", ["moss_a"]));
+      const leaky = scorePack(dump, reportOf([model(MESH_PKG, [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Stalactite_M", "T_Cave_Rock_Pillar_N"])])]));
+      expect(leaky.identity.violations.map((v) => v.kind)).toEqual(["overridden-parent-default"]);
+    });
+  });
+
   it("fails coverage with the report's reason when a mesh is missing", () => {
     const score = scorePack(
       caveDump(),
@@ -166,6 +242,66 @@ describe("scorePack", () => {
     expect(swapped.shape.violations[0]?.kind).toBe("bounds-axis");
     const wrong = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [20, 1, 4])]));
     expect(wrong.shape.violations[0]?.kind).toBe("bounds-size");
+  });
+
+  it("tolerates authored bounds that lag the geometry by up to 10 % and counts the drift", () => {
+    const secs = [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])];
+    // expected (2, 1, 4); the geometry is 5 % bigger on the long axis, a Soul Cave-style stale bound
+    const drifted = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4.2])]));
+    expect(drifted.shape.violations).toEqual([]);
+    expect(drifted.shape.boundsDrift).toBe(1);
+    const exact = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4])]));
+    expect(exact.shape.boundsDrift).toBe(0);
+    // a 2.54x unit error is still a violation
+    const unit = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4 * 2.54])]));
+    expect(unit.shape.violations[0]?.kind).toBe("bounds-size");
+  });
+
+  it("subtracts the authored bounds extension so padded foliage and sphere meshes are not size violations", () => {
+    const secs = [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])];
+    const padded = (extent: [number, number, number], positive: [number, number, number], negative: [number, number, number], property = "ExtendedBounds"): PropertyDump => {
+      const m = mesh("SM_Pillar", "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar", extent);
+      m.bounds = { ...m.bounds!, property, positiveExtension: positive, negativeExtension: negative };
+      return dumpOf(
+        pkg("/Game/C/SM_Pillar", m),
+        pkg("/Game/C/MI_Cave_Rock_Pillar", pillarInstance),
+        pkg("/Game/C/M_Cave_Rock_MASTER", master),
+      );
+    };
+    // SM_Sphere_Scale_Unit_100: extended 22 m, geometry 2 m. 2*1100 - 1000 - 1000 = 200 cm per axis.
+    const sphere = padded([1100, 1100, 1100], [1000, 1000, 1000], [1000, 1000, 1000]);
+    const ok = scorePack(sphere, reportOf([model(MESH_PKG, secs, [2, 2, 2])]));
+    expect(ok.shape.violations).toEqual([]);
+    expect(ok.shape.boundsDrift).toBe(0);
+    // The padded 22 m is no longer what the geometry is judged against.
+    const stale = scorePack(sphere, reportOf([model(MESH_PKG, secs, [22, 22, 22])]));
+    expect(stale.shape.violations[0]?.kind).toBe("bounds-size");
+    // Asymmetric, per axis: 2*300 - 100 - 100 = 400 cm (x), 2*100 - 0 - 0 = 200 (y), 2*50 - 40 - 0 = 60 (z) -> (4, 2, 0.6) m;
+    // viewer order (x, z, y) = (4, 0.6, 2).
+    const mixed = padded([300, 100, 50], [100, 0, 40], [100, 0, 0]);
+    expect(scorePack(mixed, reportOf([model(MESH_PKG, secs, [4, 0.6, 2])])).shape.violations).toEqual([]);
+    expect(scorePack(mixed, reportOf([model(MESH_PKG, secs, [6, 1, 2])])).shape.violations[0]?.kind).toBe("bounds-size");
+    // An extension larger than the box clamps to zero instead of going negative.
+    const clamped = padded([100, 100, 100], [500, 0, 0], [0, 0, 0]);
+    expect(scorePack(clamped, reportOf([model(MESH_PKG, secs, [0, 2, 2])])).shape.violations).toEqual([]);
+    // RenderData.Bounds and ImportedBounds are geometric already: nothing is subtracted.
+    const geometric = padded([100, 200, 50], [50, 50, 50], [50, 50, 50], "ImportedBounds");
+    expect(scorePack(geometric, reportOf([model(MESH_PKG, secs, [2, 1, 4])])).shape.violations).toEqual([]);
+    // No extension fields: today's behaviour.
+    const legacy = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4])]));
+    expect(legacy.shape.violations).toEqual([]);
+  });
+
+  it("accepts both valid glTF axis conventions but still flags a swapped up axis", () => {
+    // extent [100,200,50] cm -> UE size (2,4,1) m. UE Viewer: (x,z,y) = (2,1,4); converters: (y,z,x) = (4,1,2).
+    const secs = [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])];
+    const viewer = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 1, 4])]));
+    const converter = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [4, 1, 2])]));
+    expect(viewer.shape.violations).toEqual([]);
+    expect(converter.shape.violations).toEqual([]);
+    // UE Z on glTF Z instead of Y (a Z-up export) is a real error under both conventions
+    const zUp = scorePack(caveDump(), reportOf([model(MESH_PKG, secs, [2, 4, 1])]));
+    expect(zUp.shape.violations[0]?.kind).toBe("bounds-axis");
   });
 
   it("flags more sections than slots and tolerates unverified bounds", () => {
@@ -262,6 +398,41 @@ describe("scorePack", () => {
         noGraph: 1,
       });
       expect(score.colour.missesTotal).toBe(4);
+    });
+
+    describe("a share above 90 % cannot hide a miss the importer knows is real", () => {
+      // Ten meshes on the same pillar instance; nine coloured sections and one grey one with the given graph outcome.
+      const packOf = (lastGraph: ImportedMaterialSection["graph"] | undefined) => {
+        const meshes = Array.from({ length: 10 }, (_, i) => `SM_Pillar${i}`);
+        const dump = dumpOf(
+          ...meshes.map((name) => pkg(`/Game/C/${name}`, mesh(name, "/Game/C/MI_Cave_Rock_Pillar.MI_Cave_Rock_Pillar"))),
+          pkg("/Game/C/MI_Cave_Rock_Pillar", pillarInstance),
+          pkg("/Game/C/M_Cave_Rock_MASTER", master),
+        );
+        const models = meshes.map((name, i) =>
+          model(`Content/C/${name}.uasset`, [i < 9 ? section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"]) : grey("MI_Cave_Rock_Pillar", lastGraph)]),
+        );
+        return scorePack(dump, reportOf(models));
+      };
+
+      it("fails a pack whose miss names graph nodes the evaluator cannot run (12 white rocks of 132 sections)", () => {
+        const score = packOf(unsupported("ObjectScale", "SplitComponents"));
+        expect(score.colour.share).toBe(0.9);
+        expect(score.colour.ok).toBe(false);
+        expect(score.status).toBe("fail");
+        expect(score.reasons).toEqual([expect.stringMatching(/^S4 colour: 1 section\(s\) have source colour the importer left neutral \(1 on unsupported graph nodes: ObjectScale, SplitComponents, 0 baked/)]);
+      });
+
+      it("fails a pack whose bake came out neutral", () => {
+        const score = packOf({ status: "baked", unsupportedNodes: [], approximations: [] });
+        expect(score.status).toBe("fail");
+        expect(score.colour.missAttribution.bakedStillGrey).toBe(1);
+      });
+
+      it("still passes when the miss is one the importer could not look into (no graph, unavailable)", () => {
+        expect(packOf(undefined).status).toBe("pass");
+        expect(packOf({ status: "unavailable", unsupportedNodes: [], approximations: [], reason: "no dumped graph for X or its parents" }).status).toBe("pass");
+      });
     });
 
     it("scores an older report with no graph field without crashing", () => {
@@ -384,5 +555,64 @@ describe("unreadable meshes", () => {
     const broken: Exp = { name: "SM_Pillar", class: "StaticMesh", error: "x" };
     const score = scorePack(dumpWith(pkg("/Game/C/SM_Pillar", broken)), reportOf([model(MESH_PKG, goodSections)]));
     expect(failureClasses(score)).toEqual(["unverified:unreadable-mesh"]);
+  });
+});
+
+describe("S3 Summer-sibling substitution", () => {
+  const withSubstitution = (texture: string, substitutedFrom: string): ImportedMaterialSection => {
+    const s = section("MI_Cave_Rock_Pillar", [texture, "T_Cave_Rock_Pillar_N"]);
+    return { ...s, bindings: s.bindings.map((b, i) => (i === 0 ? { ...b, substitutedFrom } : b)) };
+  };
+  const score = (s: ImportedMaterialSection) => scorePack(caveDump(), reportOf([model(MESH_PKG, [s])])).identity;
+
+  it("accepts a swapped binding whose original texture is in the effective set, and counts it", () => {
+    const identity = score(withSubstitution("moss_a", "T_Cave_Rock_Pillar_M"));
+    expect(identity.violationsTotal).toBe(0);
+    expect(identity.substituted).toBe(1);
+  });
+
+  it("still flags a swap whose original is not the section's own texture", () => {
+    const identity = score(withSubstitution("moss_a", "T_Other_D"));
+    expect(identity.violations.map((v) => [v.texture, v.kind])).toEqual([["moss_a", "foreign"]]);
+    expect(identity.substituted).toBe(0);
+  });
+
+  it("still flags a plain foreign texture and other bindings next to a substituted one", () => {
+    const s = withSubstitution("moss_a", "T_Cave_Rock_Pillar_M");
+    const mixed = { ...s, bindings: [...s.bindings, { ...s.bindings[1]!, slot: "occlusion", texture: "T_Other_D" }] };
+    const identity = score(mixed);
+    expect(identity.violations.map((v) => v.texture)).toEqual(["t_other_d"]);
+    expect(identity.substituted).toBe(1);
+    expect(score(section("MI_Cave_Rock_Pillar", ["moss_a"])).substituted).toBe(0);
+  });
+});
+
+describe("S1 and HLOD proxy packages", () => {
+  // A level's HLOD package: an HLODProxy plus the generated cluster mesh, named after the level, not the package.
+  const withProxy = (proxy: boolean): PropertyDump => {
+    const cave = caveDump();
+    return dumpOf(
+      ...cave.packages,
+      pkg(
+        "/Game/Maps/HLOD/Level_0_HLOD",
+        ...(proxy ? [{ name: "Level_0_HLOD", class: "HLODProxy" } as Exp] : []),
+        mesh("Level_0_HLOD_0_SingleCluster", "/Game/Maps/HLOD/M_Level_0_HLOD_0.M_Level_0_HLOD_0"),
+      ),
+    );
+  };
+  const report = () =>
+    reportOf([model(MESH_PKG, [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])])]);
+
+  it("counts a package the dump shows is an HLODProxy apart, not as a missing mesh", () => {
+    const score = scorePack(withProxy(true), report());
+    expect(score.coverage.missingTotal).toBe(0);
+    expect(score.coverage.hlodProxyPackages).toBe(1);
+    expect(score.coverage.expected).toBe(1);
+  });
+
+  it("still calls the same mesh missing without the HLODProxy export as evidence", () => {
+    const score = scorePack(withProxy(false), report());
+    expect(score.coverage.missing.map((entry) => entry.package)).toEqual(["maps/hlod/level_0_hlod"]);
+    expect(score.coverage.hlodProxyPackages).toBe(0);
   });
 });

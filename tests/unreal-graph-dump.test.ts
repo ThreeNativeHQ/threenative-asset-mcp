@@ -128,9 +128,60 @@ describe("--dump-graphs converter mode", () => {
   it("is wired into the embedded program and the converter version is bumped", () => {
     expect(CUE4PARSE_PROGRAM).toContain("--dump-graphs");
     expect(CUE4PARSE_PROGRAM).toContain(".graph.json");
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.52");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.67");
     // The embedded program prints the same string `canRun` waits for, so a stale binary is rebuilt.
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
+  });
+
+  it("finds a function's inputs and outputs in UE5 EditorOnlyData or the package exports, not only FunctionExpressions", () => {
+    // Paladin RPG Set (UE 5.8): MF_RGBA_PatternBlend loaded fine but inlined to nothing because UE5.1+ keeps
+    // the expression list in EditorOnlyData.ExpressionCollection and the loader only read FunctionExpressions.
+    expect(CUE4PARSE_PROGRAM).toContain("GraphFunctionExpressions(function)");
+    expect(CUE4PARSE_PROGRAM).toContain('"ExpressionCollection"');
+    expect(CUE4PARSE_PROGRAM).toContain('"Expressions"');
+    expect(CUE4PARSE_PROGRAM).toContain("function.Owner");
+    expect(CUE4PARSE_PROGRAM).not.toContain('GraphProperty(function, "FunctionExpressions")?.Tag?.GenericValue is UScriptArray expressions');
+  });
+
+  it("resolves a pack-local function under any content mount by its file name", () => {
+    expect(CUE4PARSE_PROGRAM).toContain("GraphLoadFunction(functionIndex");
+    expect(CUE4PARSE_PROGRAM).toContain("graphFunctionKeys");
+    expect(CUE4PARSE_PROGRAM).toContain('StartsWith("/Engine/"');
+  });
+
+  it("re-reads the tagged inputs nested in a function call and in a function output of a pre-4.12 package", () => {
+    // Open World Demo Collection (Kite, saved by UE 4.7): CUE4Parse read the nested FExpressionInput of every
+    // FunctionInputs element in the native layout, so an engine function call got a pin on itself with a junk mask
+    // (the baker saw a "Cycle" and a PivotPainter node), and a pack function's output pin came back Unresolved.
+    expect(CUE4PARSE_PROGRAM).toContain("GraphLegacyFunctionInputs(call)");
+    expect(CUE4PARSE_PROGRAM).toContain('tag.Name.Text == "FunctionInputs"');
+    expect(CUE4PARSE_PROGRAM).toContain("GraphInputValue(outputExpression, \"A\")");
+    expect(CUE4PARSE_PROGRAM).toContain("GraphRawArchive(legacy)");
+    // A function package is mounted by the call, not by the dump loop, so its file is found by name.
+    expect(CUE4PARSE_PROGRAM).toContain("graphPackageKeys[legacy.Name] = located");
+  });
+
+  it("reads a native input whose pin name is an FString because the package records no FFrameworkObjectVersion", () => {
+    // Open World Demo Collection, UE 4.21 re-saves: CUE4Parse guesses an FName from --engine, reads every mask four bytes off and
+    // drops a connected Color/Scalar input, so five foliage materials came back with no BaseColor output at all.
+    expect(CUE4PARSE_PROGRAM).toContain("GraphPinsAsString(");
+    expect(CUE4PARSE_PROGRAM).toContain("FFrameworkObjectVersion.Type.PinsStoreFName) archive.ReadFName();");
+    expect(CUE4PARSE_PROGRAM).toContain("else archive.ReadFString();");
+    expect(CUE4PARSE_PROGRAM).toContain("GraphReadNativeInput(archive, legacy)");
+    expect(CUE4PARSE_PROGRAM).toContain("GraphRawInputs(material.Owner)");
+  });
+
+  it("emits and accepts the attribute GUIDs of Set/GetMaterialAttributes", () => {
+    expect(CUE4PARSE_PROGRAM).toContain('"AttributeSetTypes" or "AttributeGetTypes"');
+    expect(CUE4PARSE_PROGRAM).toContain('node["attributeTypes"]');
+    const graph = materialGraphSchema.parse({
+      ...functionCallGraph(),
+      nodes: [
+        { id: "n0", class: "SetMaterialAttributes", inputs: { "Inputs[0]": null, "Inputs[1]": null }, constants: {}, attributeTypes: ["69B8D33616ED4D499AA497292F050F7A"] },
+        { id: "n1", class: "GetMaterialAttributes", inputs: {}, constants: {}, outputNames: ["MaterialAttributes", "Normal"], attributeTypes: ["0FA2821A200F4A4AB719B789C1259C64"] },
+      ],
+    });
+    expect(graph.nodes.map((node) => node.attributeTypes)).toEqual([["69B8D33616ED4D499AA497292F050F7A"], ["0FA2821A200F4A4AB719B789C1259C64"]]);
   });
 
   it("accepts a graph shaped like the Cave Rock master and keeps all four tint parameters reachable", () => {
@@ -147,6 +198,33 @@ describe("--dump-graphs converter mode", () => {
     expect(parameters).toEqual(expect.arrayContaining(["Mask", "Tint", "Tint1", "RockTint", "DetailRockTint"]));
     expect(byId.get("n1")?.channelMask).toEqual([1, 0, 0, 0]);
     expect(graph.outputConstants).toEqual({});
+  });
+
+  it("accepts a named reroute pair and keeps the declaration reachable through the usage", () => {
+    const graph = materialGraphSchema.parse({
+      format: 1,
+      material: "M_Reroute",
+      package: "/Game/Test/M_Reroute",
+      truncated: false,
+      nodeCount: 3,
+      outputs: { ...NO_OUTPUTS, baseColor: pin("n0") },
+      nodes: [
+        { id: "n0", class: "NamedRerouteUsage", inputs: { Input: pin("n1") }, constants: { DeclarationGuid: "0b0a0e0f-0000-0000-0000-000000000001" } },
+        { id: "n1", class: "NamedRerouteDeclaration", inputs: { Input: pin("n2") }, constants: { Name: "Albedo" } },
+        { id: "n2", class: "Constant3Vector", inputs: {}, constants: { Constant: [1, 0, 0, 1] } },
+        { id: "n3", class: "NamedRerouteUsage", inputs: {}, constants: {}, error: "named reroute declaration could not be found" },
+      ],
+    });
+    expect(graph.nodes[0]?.inputs.Input).toEqual({ node: "n1", output: 0, mask: null });
+    expect(graph.nodes[3]?.error).toMatch(/declaration/);
+  });
+
+  it("pins the C# named reroute handling in the embedded program", () => {
+    expect(CUE4PARSE_PROGRAM).toContain('"NamedRerouteUsage"');
+    expect(CUE4PARSE_PROGRAM).toContain('"NamedRerouteDeclaration"');
+    expect(CUE4PARSE_PROGRAM).toContain('"Declaration"');
+    expect(CUE4PARSE_PROGRAM).toContain('"DeclarationGuid"');
+    expect(CUE4PARSE_PROGRAM).toContain("named reroute declaration could not be found");
   });
 
   it("accepts function calls with inlined nodes and legacy defaults", () => {
@@ -224,5 +302,81 @@ writeFileSync(${JSON.stringify(outLog)}, argv[argv.indexOf("--dump-graphs") + 1]
     await expect(readMaterialGraph(bad)).rejects.toThrow(/M_Bad\.graph\.json is not valid JSON/);
     await writeFile(bad, JSON.stringify({ format: 1 }));
     await expect(readMaterialGraph(bad)).rejects.toThrow(/unexpected shape/);
+  });
+
+  it("accepts every shape the converter can emit, including an unresolved node and string parameter defaults", () => {
+    const graph = materialGraphSchema.parse({
+      ...maskTintGraph("M_Emitted"),
+      nodes: [
+        // BuildMaterialGraph's Pin(): an expression that failed to load carries only id, class and error.
+        { id: "n0", class: "Unresolved", error: "expression could not be loaded" },
+        // GraphValue() can return a string (FName / string DefaultValue), and an input index is whatever the package stores.
+        { id: "n1", class: "FontSampleParameter", inputs: { A: { node: "n0", output: -1, mask: null } }, constants: { Name: "x" }, parameter: { name: "F", group: "" }, default: "Roboto" },
+        { id: "n2", class: "TextureCoordinate", inputs: {}, constants: {}, tiling: [2, 0.5] },
+        { id: "n3", class: "StaticSwitchParameter", inputs: { A: null, B: null }, constants: {}, parameter: { name: "S", group: "" }, default: false, switchValue: true },
+        { id: "n4", class: "FunctionCall", inputs: { In: null }, constants: {}, function: null, fn: { inputs: { In: null }, outputs: [null], output: null }, error: "material function could not be loaded" },
+      ],
+    });
+    expect(graph.nodes[0]).toMatchObject({ inputs: {}, constants: {} });
+    expect(graph.nodes[1]?.default).toBe("Roboto");
+  });
+
+  describe("one bad graph must not lose the others", () => {
+    const converterWriting = async (dir: string, files: Record<string, string>): Promise<string> =>
+      fakeConverter(
+        dir,
+        `import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const out = process.argv[process.argv.indexOf("--dump-graphs") + 1];
+for (const [name, text] of Object.entries(${JSON.stringify(files)})) writeFileSync(join(out, name), text);`,
+      );
+    const withNullOutput = () => {
+      const graph = maskTintGraph("M_Null") as unknown as { nodes: Array<{ inputs: Record<string, unknown> }> };
+      // The reported Agora shape: a null where the schema wants a number, deep inside the node list.
+      graph.nodes[12]!.inputs.A = { node: "n1", output: null, mask: null };
+      return graph;
+    };
+
+    it("skips an invalid graph, keeps the good ones, and records a short readable reason", async () => {
+      const dir = await scratch();
+      const converter = await converterWriting(dir, {
+        "M_Good.graph.json": JSON.stringify(maskTintGraph("M_Good")),
+        "M_Null.graph.json": JSON.stringify(withNullOutput()),
+        "M_Torn.graph.json": "{ not json",
+        "M_AlsoGood.graph.json": JSON.stringify(maskTintGraph("M_AlsoGood")),
+      });
+      const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+      expect([...graphs.keys()]).toEqual(["M_AlsoGood", "M_Good"]);
+      expect([...(graphs.invalid ?? new Map()).keys()].sort()).toEqual(["M_Null", "M_Torn"]);
+      const reason = graphs.invalid?.get("M_Null") ?? "";
+      expect(reason).toMatch(/^nodes\[12\]\.inputs\.A\.output: /);
+      expect(reason).toMatch(/number/);
+      expect(reason.length).toBeLessThanOrEqual(200);
+      expect(graphs.invalid?.get("M_Torn")).toMatch(/not valid JSON/);
+      expect((graphs.invalid?.get("M_Torn") ?? "").length).toBeLessThanOrEqual(200);
+    });
+
+    it("returns an empty graph map plus every reason when all graphs are invalid", async () => {
+      const dir = await scratch();
+      const converter = await converterWriting(dir, {
+        "M_One.graph.json": JSON.stringify({ format: 1, material: "M_One" }),
+        "M_Two.graph.json": JSON.stringify(withNullOutput()),
+      });
+      const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+      expect(graphs.size).toBe(0);
+      expect(graphs.invalid?.size).toBe(2);
+    });
+
+    it("readMaterialGraph reports a short reason, not a zod dump", async () => {
+      const dir = await scratch();
+      const bad = join(dir, "M_Null.graph.json");
+      await writeFile(bad, JSON.stringify(withNullOutput()));
+      const message = await readMaterialGraph(bad).then(
+        () => "",
+        (error: Error) => error.message,
+      );
+      expect(message).toMatch(/unexpected shape: nodes\[12\]\.inputs\.A\.output: /);
+      expect(message.length).toBeLessThan(300);
+    });
   });
 });

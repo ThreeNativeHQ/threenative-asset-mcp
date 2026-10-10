@@ -43,6 +43,12 @@ export interface PackageCooking {
   readonly meshKindHint: "static" | "skeletal" | undefined;
   /** High-confidence Texture2D hint used only when UE Viewer cannot parse a newer header. */
   readonly textureHint: boolean;
+  /**
+   * The texture's `MipGenSettings` is `TMGS_NoMipmaps`: the editor builds no mip chain for it. A tagged enum value is a name
+   * in the name table (a default is never written), so the whole entry is positive evidence. Foliage packs set it on the
+   * packed `_AORO` opacity map so thin cut-outs keep their coverage at a distance.
+   */
+  readonly noMipmapsHint: boolean;
   /** High-confidence TextureCube hint used only when UE Viewer cannot parse a newer header. */
   readonly cubemapHint: boolean;
   /** High-confidence SoundWave hint used only when UE Viewer cannot parse a newer header. */
@@ -63,6 +69,11 @@ export interface PackageCooking {
   readonly blueprintPrefabHint: boolean;
   /** An editor-only class with nothing to import, named when UE Viewer cannot list the package. */
   readonly nonImportableClassHint: string | undefined;
+  /**
+   * The package holds an `HLODProxy`: the editor's generated hierarchical-LOD stand-ins for a level (merged, reduced
+   * copies of the level's own meshes with a flattened material), built output rather than an authored asset.
+   */
+  readonly hlodProxyHint: boolean;
 }
 
 /** Editor-only asset classes a UE5 pack ships beside its meshes. UE Viewer cannot list them, so
@@ -79,6 +90,7 @@ const UNKNOWN: PackageCooking = Object.freeze({
   naniteHint: false,
   meshKindHint: undefined,
   textureHint: false,
+  noMipmapsHint: false,
   cubemapHint: false,
   soundHint: false,
   dataClassHint: undefined,
@@ -89,6 +101,7 @@ const UNKNOWN: PackageCooking = Object.freeze({
   groomHint: false,
   blueprintPrefabHint: false,
   nonImportableClassHint: undefined,
+  hlodProxyHint: false,
 });
 
 /** Reads the bounded prefix of one package, or undefined when it cannot be read. */
@@ -188,6 +201,7 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     textureHint:
       hasTextureClass &&
       (markers.includes("AssetImportData") || head.includes("\0TextureSource\0", 0, "latin1")),
+    noMipmapsHint: hasTextureClass && head.includes("\0TMGS_NoMipmaps\0", 0, "latin1"),
     cubemapHint: hasCubemapClass && markers.includes("AssetImportData"),
     soundHint: hasSoundClass && markers.includes("AssetImportData"),
     dataClassHint,
@@ -198,5 +212,6 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     groomHint,
     blueprintPrefabHint,
     nonImportableClassHint,
+    hlodProxyHint: head.includes("\0HLODProxy\0", 0, "latin1"),
   };
 }

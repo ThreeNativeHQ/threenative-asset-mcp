@@ -51,6 +51,7 @@
     "probe:fab": "tsx scripts/probe-fab.ts",
     "parity:fab": "tsx scripts/fab-parity.ts",
     "test": "vitest run",
+    "goldens:update": "UPDATE_GOLDENS=1 vitest run tests/unreal-visual-regression.test.ts",
     "test:ci": "vitest run --maxWorkers=1 --exclude tests/mcp-smoke.test.ts --reporter=default --reporter=junit --outputFile=artifacts/ci/tests.xml",
     "test:smoke": "vitest run tests/mcp-smoke.test.ts --maxWorkers=1 --reporter=default --reporter=junit --outputFile=artifacts/ci/mcp-smoke.xml",
     "test:leaks": "tsx scripts/leak-gate.ts -- vitest run",

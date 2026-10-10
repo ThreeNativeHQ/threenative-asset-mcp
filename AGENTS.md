@@ -86,9 +86,33 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   mask channels and tinted, sampled inside material functions). `.mat`/props texture binding cannot
   reproduce it, so a section with no base colour asks the graph baker (`src/unreal/graph-baker.ts`,
   PRD-538): CUE4Parse dumps the graph, `material-graph.ts` evaluates a closed node set and bakes a
-  base-colour PNG (`source: "graph"`). Anything it cannot evaluate (e.g. `DepthFade`,
-  `MatLayerBlend_Tint`) stays on the neutral fallback and is named under the section's `graph`.
-  Engine content functions are not in the pack, so a bake that relies on them is `heuristic`.
+  base-colour PNG (`source: "graph"`). Anything it cannot evaluate (e.g. `ReflectionVectorWS` feeding a
+  cubemap lookup, `CameraVectorWS`, a `CollectionParameter`) stays on the neutral fallback and is named under the section's `graph`.
+  Engine content functions are not in the pack, so a bake that relies on them is `heuristic`. View-dependent
+  nodes stand in as recorded approximations: `Fresnel` as its mean over a sphere's visible surface,
+  `DepthFade` as fully faded in, `TwoSidedSign` as +1 (front face), `Time` as 0 and `Panner` unpanned (one
+  snapshot keeps a panning texture's detail), `PrecomputedAOMask` as 0 (no built static lighting, as in the
+  thumbnail), `WorldAlignedTexture` as its texture's average. `VertexNormalWS`, `ObjectRadius` and a Tangent-to-World
+  `Transform` read the mesh itself (its UV-space normals, its bounding radius), so their bakes are per mesh.
+- **A "Cycle" or a PivotPainter node on a UE4 pack's colour path is the dump adapter, not the material.**
+  A package saved before UE 4.12 records no `FCoreObjectVersion`, so every `FExpressionInput` is tagged
+  properties, and CUE4Parse reads them in the native layout. The adapter re-reads the top-level inputs from the
+  raw bytes, and since converter 60 also the `Input` nested in each `FunctionInputs` element and a function
+  output's `A` pin. A call whose pins point at itself with masks like `67108864` is that bug.
+- **UE 5.6+ texture sources are `TSCF_UEDELTA`, not PNG.** The editor payload is the raw source pixels
+  (BGRA8, G8, RGBA16, ...) with each tile's rows stored as differences from the row above (16-bit samples
+  biased by 0x8080). The tile cut (columns of at most 4096 bytes, runs of about 32768 pixels) is part of the
+  format; `UndoUeDelta` in the converter reproduces it, and `tests/unreal-converter-ue5-sources.test.ts` pins
+  it. Before converter 61 every colour texture of a 5.6+ pack was dropped and its sections went neutral.
+- **A UE5 artifact can hold UE4-saved packages.** A Megascans UE 5.1 listing kept its 4.25 materials and
+  textures beside 5.1 meshes. CUE4Parse throws on such a MaterialInstance before it fills the typed
+  `TextureParameterValues`; the converter reads the tagged property instead (`InstanceTextureParameters`).
+- **UE 5.8 re-saves store an FName mesh attribute compactly** (element count, distinct-name count, names).
+  The reader accepts one distinct name, the only case seen, and refuses more with the reason in the mesh
+  failure.
+- **`BuildScale3D` applies on every UE4 route.** Neither UE Viewer nor the uncooked MeshDescription converter
+  multiplies the source model by it; the importer does (`meshGeometryScale`). UE5 editor meshes are not yet
+  covered: `readBuildScale3D` reads legacy -7 headers only.
 - Fab downloads land in `~/.cache/threenative-asset-mcp/fab-downloads/<listing>/<artifact>`. They
   are licensed, not redistributable: never commit pack contents. Delete what you downloaded when
   you are done; FabCLI fetched Soul Cave (1.2 GB) in 17 s, so re-downloading is cheap.
@@ -97,3 +121,33 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   replay it. The dumps carry licensed pack names: keep them out of the repo.
 - Judge an import against its source package, not a screenshot. PRD-537 defines the structural
   parity checks (coverage, shape, texture identity, colour presence).
+- **Editor thumbnails in UE4 packages have red and blue swapped** (`src/unreal/package-thumbnail.ts`
+  corrects it for legacy version -7 .. -1). A brown rock showed up as blue-grey, with a tan "floor" that is
+  really Unreal's blue-grey checker. Before blaming the import for a colour mismatch against a thumbnail,
+  compare the thumbnail of a *texture* package with UE Viewer's export of that texture: the swap shows up
+  there with no material graph involved. UE5 packages are returned as stored (order unverified).
+- **Visual regressions have their own guards.** `judgeRender` (`src/unreal/visual-judge.ts`) now measures a
+  camera-robust *fill ratio* (object pixels over their tight bounding box); when a piece has an Unreal
+  thumbnail it flags "solid card: render fill X vs thumbnail fill Y" if the render fills its box
+  `SOLID_CARD_FILL_FACTOR` (1.6x) more than the thumbnail's mask does, and both masks have enough pixels —
+  the solid-polygon conifer bug the colour and coverage rules missed. `tests/unreal-visual-regression.test.ts`
+  builds synthetic GLBs, renders them through the production tile renderer (`renderTiles`) with its fixed
+  camera, and asserts per-fixture judge invariants plus SSIM against small committed PNGs in
+  `tests/fixtures/visual-golden/` (threshold 0.90, to survive SwiftShader differences between hosts). The
+  zero-alpha-tint and emissive fixtures take their factors from the real material resolver, so reverting
+  those importer fixes turns the suite red. Regenerate goldens with `npm run goldens:update`; a failing diff
+  writes actual and difference PNGs under `artifacts/ci/visual-diff/`, which CI uploads.
+- **Measure fidelity, do not eyeball it, and lock every win.** `scripts/fidelity-sheet.ts` compares an import
+  with Unreal's own thumbnails without re-importing (`--source <pack dir> --import <import output dir> --out <dir>`;
+  the import output is what `parity:fab --keep` leaves, with its `import-report.json`). `src/unreal/render-fidelity.ts`
+  scores each piece 0..100 on what survives a change of lighting and camera: chroma-weighted hue (circular EMD),
+  saturation as chroma per lightness (render over thumbnail; below 1 is greyer than Unreal), silhouette density
+  (fill ratio; below 1 is sparser, above 1 a solid card), and lightness (weighted low). `judgeRender` marks a tile
+  suspect below 70 and fail below 50, with the reason. The older mean-colour "similarity" is dominated by
+  lightness and waved washed-out conifers through at 0.5-0.7; do not use it as the gate.
+- **A piece that reaches parity is locked, twice.** (1) Per defect, a synthetic red-to-green test, and for anything
+  you can see, a fixture in `tests/unreal-visual-regression.test.ts`. (2) Per pack, `docs/parity/fidelity-baseline.json`
+  holds numbers only (no names, no images): `npx tsx scripts/fidelity-baseline.ts check <sweep out dir>` fails when a
+  pack's mean fidelity falls more than 2 points, its worst piece more than 6, its failing tiles rise, or compared
+  pieces drop; `update` only ever ratchets numbers up. Run `check` after every sweep before merging a fix, so a fix
+  for one pack cannot silently undo another.

@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { NodeIO } from "@gltf-transform/core";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { FabCli, FabCliError, preferredPlatform } from "../src/fab/fabcli.js";
+import { FabCli, FabCliError, featuredImageUrl, preferredPlatform } from "../src/fab/fabcli.js";
 import { classifyLicenses } from "../src/fab/license.js";
+import { importUnrealDirectory } from "../src/unreal/importer.js";
+import { isFatalHandlerError, licencesReader } from "../src/unreal/parity-run.js";
 import {
   createFabImportAssetHandler,
   createFabListOwnedHandler,
@@ -853,5 +855,113 @@ describe("listing what the account already owns", () => {
     const result = await handler({ unrealOnly: true });
     if ("isError" in result) throw new Error(JSON.stringify(errorOf(result)));
     expect(result.structuredContent.total).toBe(120);
+  });
+});
+
+describe("gallery images in the library payload", () => {
+  const gallery = (images: unknown) => ({
+    results: [
+      {
+        title: "Pack",
+        description: "",
+        url: "",
+        distributionMethod: "ASSET_PACK",
+        customAttributes: [{ ListingIdentifier: LISTING }],
+        categories: [],
+        images,
+        projectVersions: [
+          { artifactId: "A", engineVersions: ["UE_5.4"], targetPlatforms: ["Windows"] },
+        ],
+      },
+    ],
+  });
+  const owned = async (library: unknown) => {
+    const test = await harness({ library });
+    const cli = new FabCli({
+      tool: { name: "fabcli", path: test.environment.THREENATIVE_FABCLI_PATH!, version: "0.1.0" },
+    });
+    return (await cli.ownedListings())[0]!;
+  };
+
+  it("parses images (string sizes as FabCLI sends them) and picks the Featured one", async () => {
+    const listing = await owned(
+      gallery([
+        { type: "Screenshot", url: "https://media.fab.com/a.jpg", width: "100", height: "50" },
+        { type: "Featured", url: "https://media.fab.com/f.jpg", width: "640", height: "349" },
+      ]),
+    );
+    expect(listing.images?.[1]).toEqual({
+      type: "Featured",
+      url: "https://media.fab.com/f.jpg",
+      width: 640,
+      height: 349,
+    });
+    expect(featuredImageUrl(listing)).toBe("https://media.fab.com/f.jpg");
+  });
+
+  it("falls back to the first image, and to undefined when there are none or they are malformed", async () => {
+    const first = await owned(gallery([{ type: "Screenshot", url: "https://media.fab.com/a.jpg" }]));
+    expect(featuredImageUrl(first)).toBe("https://media.fab.com/a.jpg");
+    expect(featuredImageUrl(await owned(gallery(null)))).toBeUndefined();
+    const malformed = await owned(gallery([{ type: "Featured" }, 7, { url: "https://x/y.png" }]));
+    expect(malformed.images).toHaveLength(1);
+    expect(featuredImageUrl(await owned({ results: [{ title: "No images" }] }))).toBeUndefined();
+  });
+});
+
+describe("parity sweep licences file and graph-bake switch", () => {
+  const run = async (
+    test: Harness,
+    licences: Record<string, readonly string[]>,
+    extraEnvironment: NodeJS.ProcessEnv = {},
+  ) => {
+    const seen: { graphBake?: boolean | undefined }[] = [];
+    const handler = createFabImportAssetHandler({
+      environment: { ...test.environment, ...extraEnvironment },
+      readLicenses: licencesReader(licences),
+      importDirectory: async (request) => {
+        seen.push({ graphBake: request.graphBake });
+        return importUnrealDirectory(request);
+      },
+    });
+    const result = await handler({
+      listingIdOrUrl: LISTING,
+      outputDir: test.outputDir,
+      acceptFabEula: true,
+    });
+    return { result, seen };
+  };
+
+  it("answers UNVERIFIED for a listing absent from the file, without touching FabCLI", async () => {
+    const test = await harness();
+    const { result, seen } = await run(test, { "other-listing": ["personal"] });
+    const error = errorOf(result);
+    expect(error.code).toBe("FABCLI_LICENSE_UNVERIFIED");
+    expect(isFatalHandlerError({ ...error, retryable: true })).toBe(false);
+    expect(await test.invocations()).toEqual([]);
+    expect(seen).toEqual([]);
+  });
+
+  it("lets the gate refuse a listing whose slugs are not permitted", async () => {
+    const test = await harness();
+    const { result } = await run(test, { [LISTING]: ["uefn-reference-only"] });
+    const error = errorOf(result);
+    expect(error.code).toBe("FABCLI_LICENSE_NOT_PERMITTED");
+    expect(isFatalHandlerError(error)).toBe(false);
+    expect(await test.invocations()).toEqual([]);
+  });
+
+  it("imports a listing whose slugs are permitted, with graph baking on by default", async () => {
+    const test = await harness();
+    const { result, seen } = await run(test, { [LISTING]: ["personal", "professional"] });
+    expect("isError" in result).toBe(false);
+    expect(seen).toEqual([{ graphBake: undefined }]);
+  });
+
+  it("passes graphBake:false to the importer when THREENATIVE_GRAPH_BAKE=0", async () => {
+    const test = await harness();
+    const { result, seen } = await run(test, { [LISTING]: ["personal"] }, { THREENATIVE_GRAPH_BAKE: "0" });
+    expect("isError" in result).toBe(false);
+    expect(seen).toEqual([{ graphBake: false }]);
   });
 });

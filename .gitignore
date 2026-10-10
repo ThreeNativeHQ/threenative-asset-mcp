@@ -33,3 +33,4 @@ __pycache__/
 
 # AFK run logs
 .afk/
+node_modules

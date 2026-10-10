@@ -5,8 +5,8 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { Document, NodeIO, VertexLayout, type Material, type Primitive, type Texture } from "@gltf-transform/core";
-import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsUnlit } from "@gltf-transform/extensions";
+import { Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Root, type Texture } from "@gltf-transform/core";
+import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsSpecular, KHRMaterialsUnlit } from "@gltf-transform/extensions";
 import { attachPsaAnimations, parsePsa, type PsaFile } from "./psa.js";
 
 import {
@@ -15,6 +15,8 @@ import {
   type ResolvedMaterial,
   type ResolveMaterialRequest,
   type TextureTransform,
+  isColourTexture,
+  parsePropsFile,
   resolveMaterial,
 } from "./materials.js";
 import { readPackageCooking, readPackageObjectNames } from "./cooking.js";
@@ -39,19 +41,23 @@ import {
   type PaperTileMapDescriptor,
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
-import { createGraphBaker, type GraphBaker } from "./graph-baker.js";
+import { createGraphBaker, type GraphBakeRequest, type GraphBaker } from "./graph-baker.js";
+import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
 import {
   assembleSceneGlb,
   type ImportedScene,
   parseUnrealSceneSource,
 } from "./scenes.js";
+import { viewDependentNodes } from "./material-graph.js";
+import { rasteriseSurfaceNormals, type SurfaceNormals, type SurfaceTriangles } from "./surface-normals.js";
+import { readMeshMaterialPackages, remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
 
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 53;
+export const IMPORTER_VERSION = 89;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -70,7 +76,49 @@ export function uncookedMeshRoute(
   return fileVersionUE4 !== undefined && fileVersionUE4 <= MESH_DESCRIPTION_LAST_VERSION ? "mesh-description" : undefined;
 }
 
+/** One line per mesh the modern converter could not write: `threenative-mesh-failure<TAB>name<TAB>cause`. */
+const MODERN_MESH_FAILURE = /^threenative-mesh-failure\t([^\t]+)\t(.+)$/;
+
+/** Why the modern converter wrote no GLB for each mesh it named, keyed by package basename. */
+export function parseModernMeshFailures(stderr: string): Map<string, string> {
+  const failures = new Map<string, string>();
+  for (const line of stderr.split(/\r?\n/)) {
+    const match = MODERN_MESH_FAILURE.exec(line.trim());
+    if (match?.[1] && match[2] && !failures.has(match[1])) failures.set(match[1], match[2].trim());
+  }
+  return failures;
+}
+
+/**
+ * Whether UE Viewer is worth trying on a mesh the modern converter could not write. A UE5 package
+ * is beyond UE Viewer, and a UE4 static mesh already has its own route; the case this admits is a
+ * UE4 skeletal mesh, which UE Viewer reads for the object versions it decodes.
+ */
+function umodelCanRetry(meshKind: "static" | "skeletal" | undefined, legacyFileVersion: number | undefined): boolean {
+  return meshKind !== undefined && legacyFileVersion !== undefined && legacyFileVersion >= -7;
+}
+
 export { ImportError, type ImportErrorCode } from "./errors.js";
+
+/**
+ * Why a section is legitimately without albedo. A visual judge or the parity scorer reads this to tell "the source has
+ * no base colour here" from "the importer failed to find it".
+ */
+export interface ImportedMaterialEffect {
+  /**
+   * `emissive`: the material wires only Emissive (an unlit or additive effect), so its colour is emitted light.
+   * `engine-default-material`: the slot holds Unreal's default material (WorldGridMaterial, an engine asset outside the
+   * pack); a particle emitter or placing actor supplies the real material at runtime.
+   * `particle`: the BaseColor path reads a per-particle value (DynamicParameter) and could not be baked; the emitter sets
+   * the colour at runtime.
+   * `additive-blend`: the material's BlendMode is Additive or Modulate, so the renderer draws its Emissive only (added to,
+   * or multiplied with, the scene) and BaseColor is never read.
+   * `no-base-colour`: the material's graph wires no BaseColor, MaterialAttributes or Emissive (a normal or roughness
+   * overlay), so Unreal shades it with the default BaseColor, black.
+   */
+  readonly kind: "emissive" | "engine-default-material" | "particle" | "additive-blend" | "no-base-colour";
+  readonly reason: string;
+}
 
 export interface ImportedMaterialSection {
   readonly name: string;
@@ -83,6 +131,8 @@ export interface ImportedMaterialSection {
     readonly source: string;
     readonly confidence: string;
     readonly transform: TextureTransform;
+    /** The texture the source named when this binding is its Summer sibling instead. */
+    readonly substitutedFrom?: string;
   }[];
   readonly unsupported: readonly { readonly texture: string; readonly reason: string }[];
   readonly alphaMode: string;
@@ -96,6 +146,8 @@ export interface ImportedMaterialSection {
     readonly roughness: number;
   };
   readonly textured: boolean;
+  /** Present when the source has no albedo for this section by design (see `ImportedMaterialEffect`). */
+  readonly effect?: ImportedMaterialEffect;
   /** Textures written beside the GLB because no glTF slot honestly fits them. */
   readonly sidecarTextures: readonly string[];
   /** Present only when a material-graph bake was attempted for the section (PRD-538). */
@@ -339,6 +391,8 @@ export interface ImportReport {
     readonly unresolved: number;
     /** Sections whose base colour was baked from the Unreal material graph (PRD-538). */
     readonly graphBaked?: number;
+    /** Sections with no albedo by design (emissive-only effects, engine default material); they carry `effect` with the reason. */
+    readonly effect?: number;
   };
   readonly transforms: Readonly<Record<string, number>>;
   /** Relative paths of textures written beside the models because no glTF slot fits them. */
@@ -381,9 +435,33 @@ export interface ImportUnrealRequest {
   readonly graphBake?: boolean;
   /** Receives each material's resolver request, for metadata capture. Production leaves it unset. */
   readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
+  /**
+   * Called once after the output is promoted and before the staging directory is deleted, with the
+   * exporter's source PNG of every texture embedded without a pixel transform: GLB path (relative
+   * to the output directory) -> texture name -> source path(s). More than one path for a name means
+   * the name is ambiguous inside that GLB. The paths are valid only until the callback returns.
+   * It also receives the report. Not called when the import is served from the cache. Used by the
+   * texture-identity proof.
+   */
+  readonly proofSources?: (
+    sources: ReadonlyMap<string, ReadonlyMap<string, readonly string[]>>,
+    report: ImportReport,
+  ) => void | Promise<void>;
 }
 
 const UNSUPPORTED_EXTENSIONS = new Map<string, string>();
+
+export const HLOD_PROXY_REASON =
+  "HLOD proxy package: the editor's generated hierarchical-LOD stand-ins for a level (merged, reduced copies of the level's own meshes with a baked material), build output rather than an asset; the level's meshes are imported themselves";
+export const WORLD_PARTITION_EXTERNAL_REASON = "World Partition external actor/object package (level data, not an asset)";
+
+/** True when a package path has a `__ExternalActors__` or `__ExternalObjects__` segment. */
+export function isWorldPartitionExternalPackage(path: string): boolean {
+  return path
+    .replace(/\\/g, "/")
+    .split("/")
+    .some((segment) => /^__external(actors|objects)__$/i.test(segment));
+}
 
 const UNSUPPORTED_CLASSES = new Map<string, string>([
   ["Blueprint", "Blueprint graph"],
@@ -514,6 +592,8 @@ interface PackageClassification {
   readonly paperClass: "PaperSprite" | "PaperFlipbook" | "PaperTileMap" | "PaperTileSet" | undefined;
   readonly hasGroom: boolean;
   readonly needsModernConverter: boolean;
+  /** A texture package whose mip generation setting is `TMGS_NoMipmaps` (see `PackageCooking.noMipmapsHint`). */
+  readonly noMipmaps?: boolean;
   readonly error: string | undefined;
 }
 
@@ -556,6 +636,13 @@ interface ExportedAssets {
   readonly psa: Map<string, string>;
   readonly mat: Map<string, string>;
   readonly props: Map<string, string>;
+  /**
+   * Every `.mat` / `.props.txt` written for a basename, in index order. `mat` and `props` keep only the last one, so two
+   * packages that share an object name (`MI_Rock_Inst` in two folders) would silently share one file; `scopeMaterialFiles`
+   * uses these to pick the copy that sits beside the mesh being packaged.
+   */
+  readonly matAll?: ReadonlyMap<string, readonly string[]>;
+  readonly propsAll?: ReadonlyMap<string, readonly string[]>;
   readonly png: Map<string, string>;
   /** Basenames with multiple physical PNG producers cannot establish an exact source binding. */
   readonly ambiguousPng?: ReadonlySet<string>;
@@ -569,21 +656,141 @@ async function indexExported(root: string): Promise<ExportedAssets> {
   const psa = new Map<string, string>();
   const mat = new Map<string, string>();
   const props = new Map<string, string>();
+  const matAll = new Map<string, string[]>();
+  const propsAll = new Map<string, string[]>();
   const png = new Map<string, string>();
   const ambiguousPng = new Set<string>();
   const audio = new Map<string, string>();
   const dna = new Map<string, string>();
+  const collect = (all: Map<string, string[]>, key: string, path: string): void => {
+    const list = all.get(key) ?? [];
+    list.push(path);
+    all.set(key, list);
+  };
   for (const file of await listFiles(root).catch(() => [])) {
     const name = basename(file.path);
-    if (name.endsWith(".props.txt")) props.set(name.slice(0, -".props.txt".length), file.path);
-    else if (name.endsWith(".mat")) mat.set(name.slice(0, -".mat".length), file.path);
+    if (name.endsWith(".props.txt")) { const key = name.slice(0, -".props.txt".length); props.set(key, file.path); collect(propsAll, key, file.path); }
+    else if (name.endsWith(".mat")) { const key = name.slice(0, -".mat".length); mat.set(key, file.path); collect(matAll, key, file.path); }
     else if (name.endsWith(".gltf")) gltf.set(name.slice(0, -".gltf".length), file.path);
     else if (name.endsWith(".psa")) psa.set(name.slice(0, -".psa".length), file.path);
     else if (name.endsWith(".png")) { const stem = name.slice(0, -".png".length); if (png.has(stem)) ambiguousPng.add(stem); png.set(stem, file.path); }
     else if (name.endsWith(".dna")) dna.set(name.slice(0, -".dna".length), file.path);
     else if (/\.(?:wav|ogg|mp3|flac)$/i.test(name)) audio.set(name.slice(0, name.lastIndexOf(".")), file.path);
   }
-  return { gltf, psa, mat, props, png, ambiguousPng, audio, dna };
+  return { gltf, psa, mat, props, matAll, propsAll, png, ambiguousPng, audio, dna };
+}
+
+function mergeCandidates(
+  left: ReadonlyMap<string, readonly string[]> | undefined,
+  right: ReadonlyMap<string, readonly string[]> | undefined,
+): Map<string, string[]> {
+  const merged = new Map<string, string[]>();
+  for (const source of [left, right]) {
+    for (const [name, paths] of source ?? []) {
+      const list = merged.get(name) ?? [];
+      for (const path of paths) if (!list.includes(path)) list.push(path);
+      merged.set(name, list);
+    }
+  }
+  return merged;
+}
+
+const scopedMaterialFiles = new WeakMap<ExportedAssets, Map<string, ExportedAssets>>();
+
+/**
+ * UE Viewer keeps the package folders, but the importer indexes `.mat` / `.props.txt` by basename, so `MI_X_Inst` in two
+ * folders collapses to whichever was indexed last and a mesh gets another package's textures. The mesh's own import table
+ * (`materialPackages`, object name -> package path) is exact evidence of which copy it uses: a Winter tree imports the
+ * Winter instances that share every name with the Summer ones. Without it, the copy beside the mesh wins (the Landscape
+ * Pro rocks each have a same-named instance beside them). Returns `assets` itself when nothing needs choosing.
+ */
+export function scopeMaterialFiles(
+  assets: ExportedAssets,
+  meshDirectory: string,
+  materialPackages?: ReadonlyMap<string, string>,
+): ExportedAssets {
+  const byDirectory = scopedMaterialFiles.get(assets) ?? new Map<string, ExportedAssets>();
+  scopedMaterialFiles.set(assets, byDirectory);
+  const cacheKey = materialPackages && materialPackages.size > 0
+    ? `${meshDirectory}\0${[...materialPackages].map(([name, path]) => `${name}=${path}`).sort().join("\0")}`
+    : meshDirectory;
+  const known = byDirectory.get(cacheKey);
+  if (known) return known;
+  const choose = (all: ReadonlyMap<string, readonly string[]> | undefined, current: Map<string, string>): Map<string, string> => {
+    let chosen: Map<string, string> | undefined;
+    for (const [name, paths] of all ?? []) {
+      if (paths.length < 2) continue;
+      const imported = materialPackages?.get(name.toLowerCase());
+      const pick = (imported !== undefined ? copyInPackage(paths, imported) : undefined) ?? paths.find((path) => dirname(path) === meshDirectory);
+      if (pick === undefined || current.get(name) === pick) continue;
+      chosen ??= new Map(current);
+      chosen.set(name, pick);
+    }
+    return chosen ?? current;
+  };
+  const mat = choose(assets.matAll, assets.mat);
+  const props = choose(assets.propsAll, assets.props);
+  const scoped = mat === assets.mat && props === assets.props ? assets : { ...assets, mat, props };
+  byDirectory.set(cacheKey, scoped);
+  return scoped;
+}
+
+/** How many trailing directory names of `file` equal those of the package a `Parent =` reference names. */
+function packageDirectoryOverlap(file: string, packagePath: string): number {
+  const wanted = packagePath.replace(/\\/g, "/").toLowerCase().split("/").slice(0, -1);
+  const held = dirname(file).replace(/\\/g, "/").toLowerCase().split("/");
+  let overlap = 0;
+  while (overlap < wanted.length && overlap < held.length && wanted[wanted.length - 1 - overlap] === held[held.length - 1 - overlap]) overlap += 1;
+  return overlap;
+}
+
+/** The one copy that shares the most trailing directories with the named package; undefined on no overlap or a tie. */
+function copyInPackage(copies: readonly string[], packagePath: string): string | undefined {
+  const scored = copies.map((copy) => ({ copy, overlap: packageDirectoryOverlap(copy, packagePath) })).sort((a, b) => b.overlap - a.overlap);
+  const [best, next] = scored;
+  return best !== undefined && best.overlap > 0 && best.overlap > (next?.overlap ?? 0) ? best.copy : undefined;
+}
+
+const parentScoped = new WeakMap<ExportedAssets, Map<string, ExportedAssets>>();
+
+/**
+ * A parent material is named by basename in the sidecar maps, so two packages that share one (`MI_Leafs_Inst` under
+ * `DeadTrees/` and `GreenTrees/`) collapse onto whichever was indexed last. The instance's `Parent =` line names the
+ * package it really inherits from; this follows the chain from `startName` and points each ambiguous ancestor at the
+ * `.mat` / `.props.txt` that sits in that package's directory. Anything it cannot place keeps the existing pick.
+ */
+export function scopeParentChain(assets: ExportedAssets, startName: string): ExportedAssets {
+  if (assets.propsAll === undefined) return assets;
+  const known = parentScoped.get(assets) ?? new Map<string, ExportedAssets>();
+  parentScoped.set(assets, known);
+  const cached = known.get(startName);
+  if (cached) return cached;
+  let mat: Map<string, string> | undefined;
+  let props: Map<string, string> | undefined;
+  const visited = new Set<string>();
+  let path = assets.props.get(startName);
+  for (let depth = 0; path !== undefined && depth < 8; depth += 1) {
+    const text = readMaterialSidecar(path);
+    if (!text) break;
+    const { parent, parentPackage } = parsePropsFile(text);
+    if (parent === undefined || visited.has(parent)) break;
+    visited.add(parent);
+    const copies = assets.propsAll.get(parent) ?? [];
+    const matching = parentPackage !== undefined && copies.length > 1 ? copyInPackage(copies, parentPackage) : undefined;
+    if (matching !== undefined && matching !== (props ?? assets.props).get(parent)) {
+      props ??= new Map(assets.props);
+      props.set(parent, matching);
+      const sibling = (assets.matAll?.get(parent) ?? []).find((copy) => dirname(copy) === dirname(matching));
+      if (sibling !== undefined) {
+        mat ??= new Map(assets.mat);
+        mat.set(parent, sibling);
+      }
+    }
+    path = (props ?? assets.props).get(parent);
+  }
+  const scoped = mat === undefined && props === undefined ? assets : { ...assets, mat: mat ?? assets.mat, props: props ?? assets.props };
+  known.set(startName, scoped);
+  return scoped;
 }
 
 function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAssets {
@@ -596,6 +803,8 @@ function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAss
     psa: merge(left.psa, right.psa),
     mat: merge(left.mat, right.mat),
     props: merge(left.props, right.props),
+    matAll: mergeCandidates(left.matAll, right.matAll),
+    propsAll: mergeCandidates(left.propsAll, right.propsAll),
     png: merge(left.png, right.png),
     ambiguousPng,
     audio: merge(left.audio, right.audio),
@@ -639,10 +848,70 @@ function isEngineProfileMismatch(output: string): boolean {
 }
 
 /**
+ * The converter explains a texture it could not write on stderr (`threenative-texture-failure
+ * <name>: <reason>; <evidence>`), ahead of the generic "no output" exception. Surfacing that line
+ * turns a bare exit code into a stated pack limitation, such as pixel data that is not in the pack.
+ */
+export function modernConverterFailureCause(output: { readonly stdout: string; readonly stderr: string }): string | undefined {
+  const lines = `${output.stderr}\n${output.stdout}`.split(/\r?\n/);
+  const explained = lines.find((line) => line.startsWith("threenative-texture-failure "));
+  const cause = explained?.slice("threenative-texture-failure ".length)
+    ?? lines.find((line) => /^Unhandled exception\. /.test(line))?.replace(/^Unhandled exception\. [\w.]+: /, "");
+  const trimmed = cause?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > 800 ? `${trimmed.slice(0, 800)}…` : trimmed;
+}
+
+/**
  * Unversioned UE5.6 and UE5.7 packages both use LegacyFileVersion -9, so the package header alone
  * cannot select the serializer. Each attempt writes to a private sibling and only a complete exit
  * zero is renamed into the caller's staging path; failed partial exports never leak forward.
  */
+/**
+ * Per-axis glTF scale for a mesh: `unit` (centimetres to metres for the MeshDescription converter) times the source
+ * model's BuildScale3D, moved from Unreal axes (X, Y, Z) to the exporter's glTF axes. UE Viewer writes (X, Z, Y); the
+ * CUE4Parse and MeshDescription converters write (Y, Z, X), both with Unreal's up axis on glTF Y.
+ */
+export function geometryScaleFor(
+  exporter: "umodel" | "converter",
+  unit: number,
+  buildScale: readonly [number, number, number] | undefined,
+): number | readonly [number, number, number] {
+  if (!buildScale || buildScale.every((factor) => factor === 1)) return unit;
+  const [x, y, z] = buildScale;
+  const axes = exporter === "umodel" ? [x, z, y] : [y, z, x];
+  return [unit * axes[0]!, unit * axes[1]!, unit * axes[2]!] as const;
+}
+
+/** The entries whose package basename another entry shares (case-insensitive), in input order. */
+export function sharedBasenames<T extends { readonly package: string }>(entries: readonly T[]): T[] {
+  const counts = new Map<string, number>();
+  const key = (entry: T): string => basename(entry.package, extname(entry.package)).toLowerCase();
+  for (const entry of entries) counts.set(key(entry), (counts.get(key(entry)) ?? 0) + 1);
+  return entries.filter((entry) => (counts.get(key(entry)) ?? 0) > 1);
+}
+
+/** `/Game/A/MI_X`, `Content/A/MI_X.uasset` and `Pack/Content/A/MI_X.uasset` all become `a/mi_x`. */
+export function gamePackageKey(path: string): string {
+  const segments = path.replace(/\\/g, "/").replace(/\.(uasset|umap)$/i, "").split("/").filter((segment) => segment.length > 0);
+  const content = segments.map((segment) => segment.toLowerCase()).lastIndexOf("content");
+  // After the last `Content` folder; a `/Game/...` (or other mount) path drops its mount name.
+  return segments.slice(content >= 0 ? content + 1 : 1).join("/").toLowerCase();
+}
+
+/** The modern converter's `<mesh>.materials.json` (slot material name -> package path), lower-cased; undefined without one. */
+async function readConverterMaterialPackages(path: string): Promise<ReadonlyMap<string, string> | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const packages = new Map<string, string>();
+    for (const [name, value] of Object.entries(parsed)) if (typeof value === "string" && value.startsWith("/")) packages.set(name.toLowerCase(), value);
+    return packages;
+  } catch {
+    return undefined;
+  }
+}
+
 async function runModernConverter(
   executable: string,
   sourceDir: string,
@@ -711,17 +980,21 @@ export async function applyTextureTransform(
     for (let index = 0; index < pixels; index += 1) data[index * 4 + 1] = 255;
     return { data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6 }).toBuffer(), mimeType: "image/png" };
   }
-  if (transform === "redToBaseColorAlpha") {
+  if (transform === "redToBaseColorAlpha" || transform === "blueToBaseColorAlpha") {
     if (!secondaryInput) throw new Error("Opacity source is missing for base-colour alpha composition.");
     const colourMetadata = await sharp(input).metadata();
     const opacityMetadata = await sharp(secondaryInput).metadata();
-    if (colourMetadata.width !== opacityMetadata.width || colourMetadata.height !== opacityMetadata.height) {
+    // The same UV layout at another resolution is fine (the mask is resized to the colour); another aspect is not.
+    const colourAspect = (colourMetadata.width ?? 1) / (colourMetadata.height ?? 1);
+    const opacityAspect = (opacityMetadata.width ?? 1) / (opacityMetadata.height ?? 1);
+    if (Math.abs(colourAspect / opacityAspect - 1) > 0.01) {
       throw new Error("Opacity and base-colour source dimensions do not match.");
     }
     const mask = await sharp(secondaryInput, { limitInputPixels: 268_435_456, unlimited: true })
       .resize(info.width, info.height, { fit: "fill" })
       .ensureAlpha().raw().toBuffer();
-    for (let index = 0; index < pixels; index += 1) data[index * 4 + 3] = mask[index * 4] ?? 0;
+    const channel = transform === "blueToBaseColorAlpha" ? 2 : 0;
+    for (let index = 0; index < pixels; index += 1) data[index * 4 + 3] = mask[index * 4 + channel] ?? 0;
     return {
       data: await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer(),
       mimeType: "image/png",
@@ -877,6 +1150,65 @@ export class TransformedImageCache {
   }
 }
 
+/** Resolution of the UV-space normal map a surface-reading graph bake is given. */
+const SURFACE_MAP_SIZE = 1024;
+const surfaceMaps = new WeakMap<Material, SurfaceNormals | null>();
+
+/** The vertex normals of every primitive that uses `material`, laid out in UV space; undefined when there are none to use. */
+function surfaceOf(root: Root, material: Material): SurfaceNormals | undefined {
+  const known = surfaceMaps.get(material);
+  if (known !== undefined) return known ?? undefined;
+  const triangles: SurfaceTriangles[] = [];
+  for (const mesh of root.listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      if (primitive.getMaterial() !== material) continue;
+      const uv = primitive.getAttribute("TEXCOORD_0")?.getArray();
+      const normal = primitive.getAttribute("NORMAL")?.getArray();
+      if (!uv || !normal) continue;
+      triangles.push({ uv, normal, indices: primitive.getIndices()?.getArray() ?? undefined });
+    }
+  }
+  const surface = triangles.length > 0 ? rasteriseSurfaceNormals(triangles, SURFACE_MAP_SIZE) : undefined;
+  surfaceMaps.set(material, surface ?? null);
+  return surface;
+}
+
+/**
+ * The mesh's bounding-sphere radius in Unreal units (centimetres), what `ObjectRadius` reads for an unscaled instance: the
+ * largest distance of a vertex from the centre of the bounding box. `geometryScale` is the factor still to be applied to the
+ * glTF positions (they are metres once it is applied).
+ */
+function objectRadiusOf(root: Root, geometryScale: number | readonly [number, number, number] | undefined): number | undefined {
+  const factors = typeof geometryScale === "number" ? [geometryScale, geometryScale, geometryScale] : geometryScale ?? [1, 1, 1];
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  const positions: ArrayLike<number>[] = [];
+  for (const mesh of root.listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      const array = primitive.getAttribute("POSITION")?.getArray();
+      if (!array) continue;
+      positions.push(array);
+      for (let at = 0; at + 2 < array.length; at += 3) {
+        for (let axis = 0; axis < 3; axis++) {
+          const value = array[at + axis]! * factors[axis]!;
+          if (value < min[axis]!) min[axis] = value;
+          if (value > max[axis]!) max[axis] = value;
+        }
+      }
+    }
+  }
+  if (positions.length === 0 || !Number.isFinite(min[0]!)) return undefined;
+  const centre = [0, 1, 2].map((axis) => (min[axis]! + max[axis]!) / 2);
+  let radius = 0;
+  for (const array of positions) {
+    for (let at = 0; at + 2 < array.length; at += 3) {
+      const distance = Math.hypot(array[at]! * factors[0]! - centre[0]!, array[at + 1]! * factors[1]! - centre[1]!, array[at + 2]! * factors[2]! - centre[2]!);
+      if (distance > radius) radius = distance;
+    }
+  }
+  return radius * 100;
+}
+
 function attachTexture(
   material: Material,
   binding: MaterialTextureBinding,
@@ -919,6 +1251,8 @@ export interface PackagedModel {
   readonly sections: ImportedMaterialSection[];
   readonly prunedUvSets: number;
   readonly droppedTangents: number;
+  /** UV components stored as the half-float saturation value (|x| >= 65504), reset to 0 so none reaches glTF. */
+  readonly saturatedUvs: number;
   /** Seam-duplicated render vertices given the morph delta their twin already carried. */
   readonly repairedMorphDeltas: number;
   /** Co-located vertices whose morph deltas disagreed in a way no single value could repair. */
@@ -1037,7 +1371,7 @@ function repairSeamMorphDeltas(primitive: Primitive): { readonly repaired: numbe
  */
 function separateLayoutIO(): NodeIO {
   return new NodeIO()
-    .registerExtensions([KHRLightsPunctual, EXTMeshGPUInstancing, KHRMaterialsUnlit])
+    .registerExtensions([KHRLightsPunctual, EXTMeshGPUInstancing, KHRMaterialsUnlit, KHRMaterialsSpecular])
     .setVertexLayout(VertexLayout.SEPARATE);
 }
 
@@ -1091,6 +1425,42 @@ async function writeMaterialLibrarySource(
   await separateLayoutIO().write(path, document);
 }
 
+/**
+ * Drops COLOR_0 from the primitives that render with `material` when the material's dumped graph shows its BaseColor
+ * path does not read VertexColor; returns the limitation to record, or undefined when nothing was dropped (no colour
+ * buffer, no graph baker, or a graph that is unknown or reads VertexColor).
+ */
+export async function dropUnreadVertexColours(
+  root: ReturnType<Document["getRoot"]>,
+  material: Material,
+  graphBaker: GraphBaker | undefined,
+  probe: () => GraphBakeRequest,
+): Promise<string | undefined> {
+  if (!graphBaker || !usesVertexColors(root, material)) return undefined;
+  const outcome = await graphBaker(probe());
+  if (outcome.vertexColorOnBaseColor !== false) return undefined;
+  const dropped = dropVertexColours(root, material);
+  return dropped === 0
+    ? undefined
+    : `Vertex colours (COLOR_0) dropped from ${dropped} primitive(s): ${outcome.graphMaterial ?? "the material"}'s BaseColor does not read VertexColor, so Unreal ignores them, while a glTF client would multiply them into the base colour.`;
+}
+
+/** Removes COLOR_0 from every primitive that renders with `material`; returns how many primitives lost it. */
+function dropVertexColours(root: ReturnType<Document["getRoot"]>, material: Material): number {
+  let dropped = 0;
+  for (const mesh of root.listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      if (primitive.getMaterial() !== material) continue;
+      const colour = primitive.getAttribute("COLOR_0");
+      if (!colour) continue;
+      primitive.setAttribute("COLOR_0", null);
+      dropped += 1;
+      if (colour.listParents().every((parent) => parent.propertyType === "Root")) colour.dispose();
+    }
+  }
+  return dropped;
+}
+
 /** True when any primitive that renders with `material` carries a COLOR_0 attribute. */
 function usesVertexColors(root: ReturnType<Document["getRoot"]>, material: Material): boolean {
   return root
@@ -1099,6 +1469,20 @@ function usesVertexColors(root: ReturnType<Document["getRoot"]>, material: Mater
 }
 
 /** Glass, mirror and light sections keep their named PBR fallbacks; no graph bake is attempted for them. */
+/** True when any link of the instance chain starting at `name` overrides a static switch. */
+function chainOverridesSwitch(name: string, readProps: (name: string) => string | undefined): boolean {
+  const visited = new Set<string>();
+  for (let current: string | undefined = name; current && visited.size < 16 && !visited.has(current); ) {
+    visited.add(current);
+    const text = readProps(current);
+    if (!text) return false;
+    const props = parsePropsFile(text);
+    if (props.switchOverrides.length > 0) return true;
+    current = props.parent;
+  }
+  return false;
+}
+
 function hasNamedFallback(materialName: string): boolean {
   const lower = materialName.toLowerCase();
   return lower.includes("glass") || lower.includes("mirror") || /(?:^|_)light(?:_|$)/.test(lower);
@@ -1106,6 +1490,13 @@ function hasNamedFallback(materialName: string): boolean {
 
 export async function packageGlb(options: {
   readonly gltfPath: string;
+  /** The mesh package's material imports, object name (lower case) -> package path; see `scopeMaterialFiles`. */
+  readonly materialPackages?: ReadonlyMap<string, string> | undefined;
+  /**
+   * Sidecars of the exact material package a section imports, by lower-cased object name, for names several packages
+   * share. Merged over the mesh's own index, so the material's parents still resolve.
+   */
+  readonly importedMaterialAssets?: ReadonlyMap<string, ExportedAssets> | undefined;
   readonly glbPath: string;
   readonly assets: ExportedAssets;
   readonly maxTextureSize: number | undefined;
@@ -1115,8 +1506,11 @@ export async function packageGlb(options: {
   readonly copyright?: string | undefined;
   /** Collects textures no glTF slot fits, to be written beside the GLBs. */
   readonly sidecars?: Map<string, string>;
-  /** Multiplies positions before writing; uncooked MeshDescription coordinates are centimetres. */
-  readonly geometryScale?: number;
+  /**
+   * Multiplies positions before writing; uncooked MeshDescription coordinates are centimetres. A triple scales the
+   * glTF x, y and z axes separately (UE Viewer's `BuildScale3D`, see `mesh-build-scale.ts`).
+   */
+  readonly geometryScale?: number | readonly [number, number, number];
   /** Standalone ActorX animations exported by UE Viewer and matched to this model's joints. */
   readonly psaFiles?: readonly PsaFile[];
   /** Unique library material name -> Unreal object basename used for sidecar lookup. */
@@ -1127,7 +1521,13 @@ export async function packageGlb(options: {
   readonly sourceMaterial?: (name: string, lookupName: string) => SourceMaterial | undefined | Promise<SourceMaterial | undefined>;
   /** Bakes the Unreal material graph for a section no texture binding gave a base colour (PRD-538). */
   readonly graphBaker?: GraphBaker | undefined;
+  /** Lazily answers whether the mesh package names the engine default material; asked only for an unresolved section. */
+  readonly namesEngineDefaultMaterial?: (() => Promise<boolean>) | undefined;
   readonly onMaterialResolved?: ((request: ResolveMaterialRequest) => void) | undefined;
+  /** Collects texture name -> source PNG path for every texture embedded without a pixel transform. */
+  readonly proofSources?: Map<string, string[]> | undefined;
+  /** Source textures with no mip chain in Unreal; a cut-out card sampling one keeps an unmipped sampler. */
+  readonly noMipmapTextures?: ReadonlySet<string> | undefined;
 }): Promise<PackagedModel> {
   const io = separateLayoutIO();
   const document = await io.read(options.gltfPath);
@@ -1143,14 +1543,30 @@ export async function packageGlb(options: {
   const scalarRoughnessTextures = new Map<Texture, Texture>();
   let prunedUvSets = 0;
   let droppedTangents = 0;
+  let saturatedUvs = 0;
   let repairedMorphDeltas = 0;
   let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
   const sharedGraphs = new Map<ExportedAssets, Map<string, Set<string>>>();
+  const meshAssets = scopeMaterialFiles(options.assets, dirname(options.gltfPath), options.materialPackages);
+  const importedAssets = new Map<string, ExportedAssets>();
+  const assetsFor = (name: string, lookup: string): ExportedAssets => {
+    const own = options.materialAssets?.get(name);
+    if (own) return own;
+    const isolated = options.importedMaterialAssets?.get(lookup.toLowerCase());
+    if (!isolated) return meshAssets;
+    const known = importedAssets.get(lookup.toLowerCase());
+    if (known) return known;
+    const merged = mergeExported(meshAssets, isolated);
+    importedAssets.set(lookup.toLowerCase(), merged);
+    return merged;
+  };
+  // Computed on the first bake that reads ObjectRadius; null when the mesh has no positions.
+  let meshRadius: number | null | undefined;
   for (const material of root.listMaterials()) {
     const name = material.getName();
     const lookup = options.materialLookupNames?.get(name) ?? name;
-    const assets = options.materialAssets?.get(name) ?? options.assets;
+    const assets = assetsFor(name, lookup);
     const path = assets.mat.get(lookup);
     if (!path) continue;
     const text = readMaterialSidecar(path);
@@ -1165,16 +1581,20 @@ export async function packageGlb(options: {
   for (const [index, material] of root.listMaterials().entries()) {
     const name = material.getName();
     const lookupName = options.materialLookupNames?.get(name) ?? name;
-    const materialAssets = options.materialAssets?.get(name) ?? options.assets;
+    const unscopedAssets = assetsFor(name, lookupName);
+    const materialAssets = scopeParentChain(unscopedAssets, lookupName);
     const availableTextures = new Set(materialAssets.png.keys());
     const graphPath = materialAssets.mat.get(lookupName);
     const graphText = graphPath ? readMaterialSidecar(graphPath) : undefined;
-    const graphNames = graphText ? sharedGraphs.get(materialAssets)?.get(graphText) : undefined;
+    const graphNames = graphText ? sharedGraphs.get(unscopedAssets)?.get(graphText) : undefined;
     // UE Viewer names a section it could not resolve `dummy_material_<n>` and paints it a debug
     // colour. Shipping that name would put a placeholder into a game asset and let a reader
     // mistake it for a real material, so it is renamed to something that says what it is.
-    const unresolvedSection = /^dummy_material(_\d+)?$/i.test(name);
-    if (unresolvedSection) {
+    // CUE4Parse names a section whose slot holds no material `None` (a null package index); Unreal draws it with the
+    // engine default material.
+    const emptySlot = name === "None";
+    const unresolvedSection = emptySlot || /^dummy_material(_\d+)?$/i.test(name);
+    if (unresolvedSection && !emptySlot) {
       material.setName(`${basename(options.glbPath, ".glb")}_unresolved_section_${index}`);
     }
     const materialRequest: ResolveMaterialRequest = {
@@ -1192,6 +1612,126 @@ export async function packageGlb(options: {
     };
     let resolved: ResolvedMaterial = resolveMaterial(materialRequest);
     options.onMaterialResolved?.(materialRequest);
+    {
+      // Same-named exports in several folders and none beside the mesh: the pick is the last indexed, not evidence.
+      const copies = materialAssets.matAll?.get(lookupName) ?? [];
+      const chosen = materialAssets.mat.get(lookupName);
+      const imported = options.materialPackages?.get(lookupName.toLowerCase());
+      const byImport =
+        options.importedMaterialAssets?.has(lookupName.toLowerCase()) === true ||
+        (imported !== undefined && copies.length > 1 && copyInPackage(copies, imported) === chosen);
+      if (!options.materialAssets?.has(name) && copies.length > 1 && chosen !== undefined && !byImport && dirname(chosen) !== dirname(options.gltfPath)) {
+        const folders = [...new Set(copies.map((path) => basename(dirname(path))))].join(", ");
+        resolved = {
+          ...resolved,
+          limitations: [...resolved.limitations, `Material ${lookupName} was exported from ${copies.length} folders (${folders}) and none beside this mesh; the one in ${basename(dirname(chosen))} was used, which may not be the package the mesh references.`],
+        };
+      }
+    }
+    let effect: ImportedMaterialEffect | undefined;
+    if (emptySlot) {
+      effect = {
+        kind: "engine-default-material",
+        reason: "the mesh assigns no material to this slot (None), so Unreal draws it with its default material (/Engine/EngineMaterials/WorldGridMaterial), an engine asset outside the pack; a Blueprint or component override that supplies the real material at runtime is not part of the mesh",
+      };
+    } else if (unresolvedSection && (await options.namesEngineDefaultMaterial?.())) {
+      effect = {
+        kind: "engine-default-material",
+        reason: "the mesh package names Unreal's default material (/Engine/EngineMaterials/WorldGridMaterial) and no pack material for this slot; the engine's default is not part of the pack, and a particle emitter or placing actor supplies the real material at runtime",
+      };
+    } else if (resolved.sourceBlendMode === "BLEND_Additive" || resolved.sourceBlendMode === "BLEND_Modulate") {
+      // Evidence from the material itself, not its name or its nodes: an Additive or Modulate material is drawn from its
+      // Emissive alone (inferred from the engine's shading model; the shader source is not in the pack), so no albedo exists.
+      effect = {
+        kind: "additive-blend",
+        reason: `${lookupName} has BlendMode ${resolved.sourceBlendMode.slice("BLEND_".length)}: the renderer draws its Emissive only (${resolved.sourceBlendMode === "BLEND_Additive" ? "added to" : "multiplied with"} the scene), so BaseColor is never read and the package has no albedo for it`,
+      };
+    }
+    const graphRequest = (probe: boolean): GraphBakeRequest => ({
+      materialName: material.getName(),
+      lookupName,
+      assets: materialAssets,
+      probe,
+      // A translucent or masked section keeps its cut-out in the graph's Opacity or OpacityMask pin.
+      ...(resolved.alphaMode === "BLEND" ? { alpha: "opacity" as const } : resolved.alphaMode === "MASK" ? { alpha: "opacityMask" as const } : {}),
+      // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
+      // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
+      ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
+      surface: () => surfaceOf(root, material),
+      objectRadius: () => {
+        if (meshRadius === undefined) meshRadius = objectRadiusOf(root, options.geometryScale) ?? null;
+        return meshRadius ?? undefined;
+      },
+      readProps: (propsName) => {
+        const propsPath = materialAssets.props.get(propsName);
+        return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
+      },
+    });
+    // Unreal applies vertex colours only where the material reads VertexColor, but a glTF client multiplies COLOR_0 into
+    // the base colour of every primitive that has it. Skeletal meshes often carry black or mask vertex colours a
+    // material never reads, which rendered whole characters black. When the material's graph is known and its BaseColor
+    // path does not read VertexColor, the attribute is dropped.
+    // WorldGridMaterial does not read VertexColor either: a MetaHuman face's RGB region-mask vertex colours turned its
+    // empty slots saturated green and cyan in a glTF viewer.
+    const defaultMaterialDropped = effect?.kind === "engine-default-material" ? dropVertexColours(root, material) : 0;
+    const vertexColourLimitation =
+      defaultMaterialDropped > 0
+        ? `Vertex colours (COLOR_0) dropped from ${defaultMaterialDropped} primitive(s): Unreal's default material (WorldGridMaterial) does not read VertexColor, so Unreal ignores them, while a glTF client would multiply them into the base colour.`
+        : await dropUnreadVertexColours(root, material, options.graphBaker, () => graphRequest(true));
+    // A translucent section with a base-colour texture is not otherwise looked at by the graph baker, yet an unlit or
+    // additive effect names its emissive mask `Diffuse`. Ask the graph whether Emissive is its only colour output.
+    if (
+      options.graphBaker &&
+      resolved.alphaMode === "BLEND" &&
+      resolved.bindings.some((binding) => binding.slot === "baseColor") &&
+      !hasNamedFallback(material.getName())
+    ) {
+      const probed = await options.graphBaker(graphRequest(true));
+      if (probed.effect) {
+        effect = { kind: "emissive", reason: probed.effect.reason };
+        const emissiveMask = resolved.bindings.find((binding) => binding.slot === "baseColor" && probed.effect!.textures.includes(binding.texture));
+        resolved = {
+          ...resolved,
+          bindings: [
+            ...resolved.bindings
+              // An unlit effect has no specular: the `SpecPower` the exporter read from the same mask is not roughness.
+              .filter((binding) => !(emissiveMask && binding.slot === "metallicRoughness" && binding.texture === emissiveMask.texture))
+              .map((binding) => (binding === emissiveMask ? { ...binding, slot: "emissive" as const } : binding)),
+            // glTF has no additive blending, so the mask also drives alpha: bright where the effect emits, clear where it
+            // does not, instead of an opaque sheet. An approximation, named by source "effect" and by the limitation below.
+            ...(emissiveMask
+              ? [{ slot: "baseColor" as const, texture: emissiveMask.texture, secondaryTexture: emissiveMask.texture, source: "effect" as const, confidence: "heuristic" as const, transform: "redToBaseColorAlpha" as const }]
+              : []),
+          ],
+          limitations: [
+            ...resolved.limitations,
+            ...(emissiveMask ? [`${emissiveMask.texture} is an emissive mask: it is bound as emissive, and its red channel also drives alpha because glTF has no additive blending.`] : []),
+          ],
+        };
+      }
+    }
+    // The flattened `.mat` lists the first texture of each class, which is not the branch a static switch picks: a
+    // winter spruce's trunk, branch and leaf instances all flattened to the bark atlas. When the instance chain
+    // overrides a switch and the graph's active BaseColor path never samples the bound texture, the binding is stale;
+    // it is dropped so the graph baker (below) supplies the colour the chosen branch actually reads.
+    if (options.graphBaker && !hasNamedFallback(material.getName()) && chainOverridesSwitch(lookupName, graphRequest(true).readProps)) {
+      const staleBase = resolved.bindings.find((binding) => binding.slot === "baseColor" && binding.source !== "graph");
+      if (staleBase) {
+        const probed = await options.graphBaker(graphRequest(true));
+        const active = probed.baseColourTextures?.map((texture) => texture.toLowerCase());
+        const bound = [staleBase.texture, staleBase.secondaryTexture].filter((texture): texture is string => texture !== undefined);
+        if (probed.switchOverridden && active && active.length > 0 && !bound.some((texture) => active.includes(texture.toLowerCase()))) {
+          resolved = {
+            ...resolved,
+            bindings: resolved.bindings.filter((binding) => binding.slot !== "baseColor"),
+            limitations: [
+              ...resolved.limitations,
+              `${staleBase.texture} dropped as base colour: the instance's static switches select a graph branch that samples ${[...new Set(probed.baseColourTextures)].join(", ")}, so the colour is baked from the graph.`,
+            ],
+          };
+        }
+      }
+    }
     const authored = await options.sourceMaterial?.(name, lookupName);
     let authoredAoCoordinatesMatch = false;
     let authoredAoBaseBinding: ResolvedMaterial["bindings"][number] | undefined;
@@ -1250,7 +1790,7 @@ export async function packageGlb(options: {
     const ordered = [...resolved.bindings].sort(
       (left, right) => SLOT_ORDER.indexOf(left.slot) - SLOT_ORDER.indexOf(right.slot),
     );
-    const packagingLimitations = [...resolved.limitations];
+    const packagingLimitations = [...resolved.limitations, ...(vertexColourLimitation ? [vertexColourLimitation] : [])];
     let authoredAoApplied = false;
     let authoredAoBaseAttached = false;
     const sidecarTextures: string[] = [];
@@ -1263,7 +1803,12 @@ export async function packageGlb(options: {
     for (const binding of ordered) {
       const source = materialAssets.png.get(binding.texture);
       if (!source) continue;
-      if (binding.slot === "baseColor") {
+      // A vivid, uncorrelated leaf atlas (a fern frond with green blades and red-brown tips) fails the albedo statistics, but
+      // a texture named as a colour map and cut out through a packed opacity map of its own set is the leaf colour (UE Viewer
+      // wired it, or the filename rule paired it): the packed masks this check exists for are never masked foliage cards.
+      const namedColourCutout =
+        binding.source !== "effect" && binding.secondaryTexture !== undefined && resolved.alphaMode !== "OPAQUE" && isColourTexture(binding.texture);
+      if (binding.slot === "baseColor" && binding.source !== "effect" && !namedColourCutout) {
         const verdict = await classifyAlbedo(await readFile(source));
         if (!verdict.isAlbedo) {
           // Not a photograph of a surface. Leave the slot on its neutral fallback and hand the
@@ -1283,21 +1828,19 @@ export async function packageGlb(options: {
       const key = `${source}|${secondarySource ?? ""}|${binding.transform}`;
       let texture = cache.get(key);
       if (!texture) {
-        const image = options.imageCache
-          ? await options.imageCache.get(key, async () =>
-              applyTextureTransform(
-                await readFile(source),
-                binding.transform,
-                options.maxTextureSize,
-                secondarySource ? await readFile(secondarySource) : undefined,
-              ),
-            )
-          : await applyTextureTransform(
-              await readFile(source),
-              binding.transform,
-              options.maxTextureSize,
-              secondarySource ? await readFile(secondarySource) : undefined,
-            );
+        const produce = async (transform: TextureTransform, secondary: string | undefined) => {
+          const read = async () => applyTextureTransform(await readFile(source), transform, options.maxTextureSize, secondary ? await readFile(secondary) : undefined);
+          return options.imageCache ? options.imageCache.get(`${source}|${secondary ?? ""}|${transform}`, read) : read();
+        };
+        let image: { data: Buffer; mimeType: string };
+        try {
+          image = await produce(binding.transform, secondarySource);
+        } catch (error) {
+          // An inferred opacity map that cannot be composed (other aspect, unreadable) must not cost the model its colour.
+          if ((binding.transform !== "redToBaseColorAlpha" && binding.transform !== "blueToBaseColorAlpha") || binding.source === "effect") throw error;
+          image = await produce("none", undefined);
+          packagingLimitations.push(`Opacity map ${binding.secondaryTexture ?? "?"} could not be composed into ${binding.texture}'s alpha (${error instanceof Error ? error.message : String(error)}); the base colour is bound without it.`);
+        }
         texture = document
           .createTexture(`${binding.texture}${binding.transform === "none" ? "" : `_${binding.transform}`}`)
           .setImage(new Uint8Array(image.data))
@@ -1305,6 +1848,23 @@ export async function packageGlb(options: {
         cache.set(key, texture);
       }
       attachTexture(material, binding, texture);
+      // Thin cut-outs (needles, grass) lose coverage as mips average the mask toward its mean, and the averaged edge pixels
+      // pull in the off-leaf colour around the cut-out. Unreal does neither for a mask with no mip chain, so neither do we.
+      if (
+        binding.slot === "baseColor" &&
+        resolved.alphaMode !== "OPAQUE" &&
+        (options.noMipmapTextures?.has(binding.secondaryTexture ?? "") === true || (binding.secondaryTexture === undefined && options.noMipmapTextures?.has(binding.texture) === true))
+      ) {
+        const info = material.getBaseColorTextureInfo();
+        info?.setMinFilter(TextureInfo.MinFilter.LINEAR as 9729);
+        info?.setMagFilter(TextureInfo.MagFilter.LINEAR as 9729);
+        packagingLimitations.push(`${binding.secondaryTexture ?? binding.texture} has no mip chain in Unreal (TMGS_NoMipmaps): the base colour sampler is unmipmapped so the cut-out keeps its coverage.`);
+      }
+      if (options.proofSources && binding.transform === "none") {
+        const paths = options.proofSources.get(binding.texture) ?? [];
+        if (!paths.includes(source)) paths.push(source);
+        options.proofSources.set(binding.texture, paths);
+      }
       if (binding === authoredAoBaseBinding) authoredAoBaseAttached = true;
       if (binding.source === "authored-source" && binding.slot === "occlusion") {
         const baseInfo = material.getBaseColorTextureInfo();
@@ -1325,18 +1885,10 @@ export async function packageGlb(options: {
     const graphBindings: MaterialTextureBinding[] = [];
     let graphReport: ImportedMaterialSection["graph"];
     if (material.getBaseColorTexture() === null && options.graphBaker && !hasNamedFallback(material.getName())) {
-      const outcome = await options.graphBaker({
-        materialName: material.getName(),
-        lookupName,
-        assets: materialAssets,
-        // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
-        // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
-        ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
-        readProps: (propsName) => {
-          const propsPath = materialAssets.props.get(propsName);
-          return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
-        },
-      });
+      const outcome = await options.graphBaker(graphRequest(false));
+      if (outcome.effect && !effect) effect = { kind: "emissive", reason: outcome.effect.reason };
+      if (outcome.particle && !effect && outcome.status !== "baked") effect = { kind: "particle", reason: outcome.particle };
+      if (outcome.noAlbedo && !effect) effect = { kind: "no-base-colour", reason: outcome.noAlbedo };
       if (outcome.status === "baked") {
         const binding: MaterialTextureBinding = {
           slot: "baseColor",
@@ -1355,6 +1907,21 @@ export async function packageGlb(options: {
         attachTexture(material, binding, texture);
         graphBindings.push(binding);
         packagingLimitations.push(...outcome.approximations);
+        const viewDependent = viewDependentNodes(outcome.approximations);
+        if (viewDependent.length > 0) {
+          packagingLimitations.push(
+            `view-dependent: approximated (${viewDependent.join(", ")}): Unreal shades these per view or per frame and has no flat-colour bake of its own, so this base colour is a recorded stand-in, not engine parity`,
+          );
+        }
+        if (outcome.alpha?.binary && material.getAlphaMode() === "BLEND") {
+          // A translucent material whose Opacity is a leaf-shaped mask is a cut-out. Sorted blending smears overlapping
+          // cards over each other and the backdrop (grey, washed-out foliage), so it is exported as a masked card.
+          material.setAlphaMode("MASK");
+          material.setAlphaCutoff(0.5);
+          packagingLimitations.push(
+            `Opacity is a binary cut-out (${(outcome.alpha.opaqueShare * 100).toFixed(0)}% of texels opaque): exported as alphaMode MASK instead of BLEND, because blended overlapping cards render grey and unsorted.`,
+          );
+        }
         graphReport = { status: "baked", confidence: outcome.confidence, unsupportedNodes: [], approximations: [...outcome.approximations] };
       } else if (outcome.status === "unsupported") {
         graphReport = { status: "unsupported", unsupportedNodes: [...outcome.unsupported], approximations: [], reason: outcome.reason };
@@ -1364,6 +1931,8 @@ export async function packageGlb(options: {
     }
 
     const boundBaseColour = material.getBaseColorTexture() !== null;
+    // An effect's emissive mask also drives alpha (above); the instance's colour factor has nothing to tint there.
+    const effectBinding = ordered.some((binding) => binding.source === "effect");
     if (!boundBaseColour) {
       const materialName = material.getName().toLowerCase();
       if (materialName.includes("glass")) {
@@ -1384,13 +1953,19 @@ export async function packageGlb(options: {
         material.setBaseColorFactor([0.8, 0.8, 0.8, 1]);
       }
     }
-    // A baked graph already contains its tints; multiplying the instance's colour factor in again would apply them twice.
-    if (resolved.baseColorFactor && graphBindings.length === 0) {
+    if (resolved.baseColorFactor && graphBindings.length === 0 && !effectBinding) {
       material.setBaseColorFactor([...resolved.baseColorFactor]);
       if (resolved.baseColorFactor[3] < 1 && material.getAlphaMode() === "OPAQUE") {
         material.setAlphaMode("BLEND");
       }
+    } else if (resolved.baseColorFactor && resolved.baseColorFactor[3] < 1) {
+      // A baked graph already contains its tints (multiplying the instance's colour in again would apply them twice)
+      // and an emissive effect has no albedo tint to apply, but the instance's opacity still holds. Only alpha carries over.
+      const [r, g, b] = material.getBaseColorFactor();
+      material.setBaseColorFactor([r, g, b, resolved.baseColorFactor[3]]);
+      if (material.getAlphaMode() === "OPAQUE") material.setAlphaMode("BLEND");
     }
+    if (effect) packagingLimitations.push(effect.reason);
     if (resolved.emissiveFactor) material.setEmissiveFactor([...resolved.emissiveFactor]);
     if (resolved.metallicFactor !== undefined) material.setMetallicFactor(resolved.metallicFactor);
     if (authored?.channels.Roughness?.kind === "scalar") {
@@ -1408,6 +1983,17 @@ export async function packageGlb(options: {
       }
     }
     if (resolved.roughnessFactor !== undefined) material.setRoughnessFactor(resolved.roughnessFactor);
+    // Unreal's `Specular` input is a dielectric F0 of 0.08 x Specular (0.5 gives the glTF default 0.04). A matte foliage
+    // master with Specular 0.1 has F0 0.008, a fifth of glTF's default, so leaving the default adds a pale sheen that
+    // washes the green out. Only a constant is applied; 0.5 (the engine default) changes nothing.
+    const specular = authored?.channels.Specular;
+    if (specular?.kind === "scalar" && Number.isFinite(specular.value) && specular.value >= 0) {
+      const factor = Math.min(1, (0.08 * specular.value) / 0.04);
+      if (Math.abs(factor - 1) > 1e-6) {
+        const extension = document.createExtension(KHRMaterialsSpecular);
+        material.setExtension("KHR_materials_specular", extension.createSpecular().setSpecularFactor(factor));
+      }
+    }
 
     sections.push({
       name: material.getName(),
@@ -1420,6 +2006,7 @@ export async function packageGlb(options: {
         source: binding.source,
         confidence: binding.confidence,
         transform: binding.transform,
+        ...(binding.substitutedFrom ? { substitutedFrom: binding.substitutedFrom } : {}),
       })),
       unsupported: [...resolved.unsupported.map((entry) => ({ ...entry })), ...rejectedMasks.splice(0)],
       alphaMode: material.getAlphaMode(),
@@ -1432,7 +2019,8 @@ export async function packageGlb(options: {
         metallic: material.getMetallicFactor(),
         roughness: material.getRoughnessFactor(),
       },
-      textured: boundBaseColour,
+      textured: boundBaseColour && !effectBinding,
+      ...(effect ? { effect } : {}),
       ...(graphReport ? { graph: graphReport } : {}),
     });
   }
@@ -1446,13 +2034,15 @@ export async function packageGlb(options: {
       primitives += 1;
       const position = primitive.getAttribute("POSITION");
       if (!position) continue;
-      if (options.geometryScale !== undefined && options.geometryScale !== 1) {
+      const scale = options.geometryScale;
+      const factors = typeof scale === "number" ? [scale, scale, scale] : scale;
+      if (factors && factors.some((factor) => factor !== 1)) {
         const element = [0, 0, 0];
         for (let index = 0; index < position.getCount(); index += 1) {
           position.getElement(index, element);
-          element[0] = (element[0] ?? 0) * options.geometryScale;
-          element[1] = (element[1] ?? 0) * options.geometryScale;
-          element[2] = (element[2] ?? 0) * options.geometryScale;
+          element[0] = (element[0] ?? 0) * factors[0]!;
+          element[1] = (element[1] ?? 0) * factors[1]!;
+          element[2] = (element[2] ?? 0) * factors[2]!;
           position.setElement(index, element);
         }
       }
@@ -1478,6 +2068,23 @@ export async function packageGlb(options: {
           primitive.setAttribute("TANGENT", null);
           tangent.dispose();
           droppedTangents += degenerate;
+        }
+      }
+
+      // UE stores an unused or clamped half-float UV as -MAX_FLT16 (-65504). It is not a coordinate, and
+      // a renderer that wraps it samples an arbitrary texel, so the component is reset to 0.
+      for (const semantic of primitive.listSemantics().filter((name) => name.startsWith("TEXCOORD_"))) {
+        const attribute = primitive.getAttribute(semantic);
+        if (!attribute) continue;
+        const element = [0, 0];
+        for (let index = 0; index < attribute.getCount(); index += 1) {
+          attribute.getElement(index, element);
+          const u = element[0] ?? 0;
+          const v = element[1] ?? 0;
+          if (Math.abs(u) < 65504 && Math.abs(v) < 65504) continue;
+          if (Math.abs(u) >= 65504) { element[0] = 0; saturatedUvs += 1; }
+          if (Math.abs(v) >= 65504) { element[1] = 0; saturatedUvs += 1; }
+          attribute.setElement(index, element);
         }
       }
 
@@ -1526,6 +2133,7 @@ export async function packageGlb(options: {
     sections,
     prunedUvSets,
     droppedTangents,
+    saturatedUvs,
     repairedMorphDeltas,
     conflictingMorphDeltas,
   };
@@ -1783,6 +2391,18 @@ function describeModernFailure(
  * report. Provider-independent: a pack downloaded by FabCLI and one unzipped by hand take the
  * same path, which is what makes an already-downloaded pack re-runnable.
  */
+/**
+ * The per-glTF-axis factor a mesh GLB is multiplied by. The uncooked MeshDescription converter writes centimetres with
+ * glTF x, y, z = Unreal y, z, x; UE Viewer writes metres with glTF x, y, z = Unreal x, z, y. Either way the source
+ * model's BuildScale3D (Unreal axes) is what Unreal multiplies the render data by.
+ */
+export function meshGeometryScale(
+  fromMeshDescription: boolean,
+  buildScale: readonly [number, number, number] | undefined,
+): number | readonly [number, number, number] {
+  return geometryScaleFor(fromMeshDescription ? "converter" : "umodel", fromMeshDescription ? 0.01 : 1, buildScale);
+}
+
 export async function importUnrealDirectory(
   request: ImportUnrealRequest,
 ): Promise<ImportReport> {
@@ -1924,7 +2544,7 @@ export async function importUnrealDirectory(
 
   log(`Classifying ${candidates.length} Unreal packages…`);
   const concurrency = request.concurrency ?? Math.min(8, Math.max(2, candidates.length));
-  const classified = await mapWithConcurrency<
+  const classifiedAll = await mapWithConcurrency<
     (typeof candidates)[number],
     PackageClassification
   >(candidates, concurrency, async (entry) => {
@@ -2024,6 +2644,7 @@ export async function importUnrealDirectory(
         paperClass,
         hasGroom,
         needsModernConverter,
+        ...(hasTexture && cooking?.noMipmapsHint === true ? { noMipmaps: true } : {}),
         error:
           run.code === 0 || needsModernConverter || nonImportableClass !== undefined || hasFont || paperClass !== undefined || cooking?.levelHint === true
             ? undefined
@@ -2053,7 +2674,24 @@ export async function importUnrealDirectory(
     }
   });
 
-  const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error);
+  // World Partition keeps per-actor level data under __ExternalActors__/__ExternalObjects__. Those
+  // packages can list mesh-class exports but are never standalone assets, so they are skipped
+  // up front instead of being sent to a mesh converter and failing.
+  const externalActorEntries = classifiedAll.filter((entry) => isWorldPartitionExternalPackage(entry.package));
+  const externalActorFiles = new Set(externalActorEntries.map((entry) => entry.file));
+  const classified = classifiedAll.filter((entry) => !externalActorFiles.has(entry.file));
+  /** Texture basenames the editor builds no mip chain for; their sampler must not average them either. */
+  const noMipmapTextures: ReadonlySet<string> = new Set(
+    classified.filter((entry) => entry.noMipmaps === true).map((entry) => basename(entry.package, extname(entry.package))),
+  );
+
+  // HLOD proxies are level build output (see HLOD_PROXY_REASON): reported as skipped, never routed to a mesh decoder.
+  const hlodProxyFiles = new Set(
+    (await mapWithConcurrency(classified.filter((entry) => entry.meshKind !== undefined && !entry.error), concurrency, async (entry) =>
+      (await readPackageCooking(entry.file)).hlodProxyHint ? entry.file : undefined,
+    )).filter((file): file is string => file !== undefined),
+  );
+  const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error && !hlodProxyFiles.has(entry.file));
   const animationPackages = classified.filter((entry) => entry.hasAnimation && !entry.error);
   // A Texture2D export nested in an offline UFont is its glyph atlas, not a standalone texture
   // asset. It is promoted with metrics below so it cannot produce a duplicate false failure.
@@ -2129,7 +2767,7 @@ export async function importUnrealDirectory(
     })();
     sourceMaterialCache.set(key, pending); return pending;
   };
-  const sourceForMesh = (file: string): ((name: string, lookup: string) => Promise<SourceMaterial | undefined>) => async (_name, lookup) => {
+  const sourceForMeshUnguarded = (file: string): ((name: string, lookup: string) => Promise<SourceMaterial | undefined>) => async (_name, lookup) => {
     const location = sourceLocation(file); if (!location) return undefined;
     const mesh = await loadSourcePackage(location.namespace, location.path);
     const references = mesh.status === "decoded" ? [...new Set(mesh.imports.filter((ref) => (ref.className === "Material" || ref.className === "MaterialInstanceConstant") && ref.name === lookup && ref.path?.startsWith("/Game/")).map((ref) => ref.path!))] : [];
@@ -2146,11 +2784,31 @@ export async function importUnrealDirectory(
     const material = await sourceForFile(matches[0]!.file);
     return material ? { ...material, limitations: [...material.limitations, `Authored source material ${lookup}: unique source basename fallback used because an exact mesh material import was not recovered${mesh.status === "unsupported" ? ` (${mesh.reason})` : ""}; canonical mesh routing remains unresolved.`] } : undefined;
   };
+  // The authored-source reader only refines roughness/AO. A malformed, cyclic or oversized source
+  // package must never abort a mesh import: it degrades to "no authored source" plus a limitation
+  // on the section and one warning per import. This is the single boundary for every call site.
+  let unreadableSourceWarned = false;
+  const guardSource = async (read: () => Promise<SourceMaterial | undefined>): Promise<SourceMaterial | undefined> => {
+    try { return await read(); } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 160);
+      if (!unreadableSourceWarned) {
+        unreadableSourceWarned = true;
+        warnings.push(`Source material unreadable (${message}); authored roughness/AO not applied. Affected materials keep their prior reconstruction.`);
+      }
+      return { channels: {}, baseColorSamples: [], limitations: [`Source material unreadable (${message}); authored roughness/AO not applied`] };
+    }
+  };
+  const sourceForMesh = (file: string): ((name: string, lookup: string) => Promise<SourceMaterial | undefined>) => {
+    const read = sourceForMeshUnguarded(file);
+    return (name, lookup) => guardSource(() => read(name, lookup));
+  };
+  const sourceForLibraryFile = (file: string): Promise<SourceMaterial | undefined> => guardSource(() => sourceForFile(file));
   // PRD-538: colour textures that only a material function references were never exported with the mesh.
   // Export exactly one such package on demand, serially, into the import's own staging directory.
   let textureIndex: Map<string, string[]> | undefined;
   let textureExports: Promise<unknown> = Promise.resolve();
   let textureExportCount = 0;
+  let graphTextureConverter: Promise<ExternalTool> | undefined;
   const exportedTextures = new Map<string, Promise<string | undefined>>();
   const exportTexture = (name: string): Promise<string | undefined> => {
     const known = exportedTextures.get(name);
@@ -2171,36 +2829,66 @@ export async function importUnrealDirectory(
         return undefined;
       }
       const selector = relative(sourceDir, matches[0]!).split(sep).join("/").slice(0, -extname(matches[0]!).length);
-      const isolated = join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
-      // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the
-      // package's own folders are appended to it. A deep staging path is reached through a short
-      // symlink (removed below); the files still land inside the staging directory.
-      let link: string | undefined;
-      try {
-        await mkdir(isolated, { recursive: true });
-        let out = isolated;
-        if (isolated.length > 120) {
-          link = join(tmpdir(), `tn-gt-${randomBytes(6).toString("hex")}`);
-          await symlink(isolated, link);
-          out = link;
+      const nextDirectory = (): string => join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
+      const viaUmodel = async (): Promise<string | undefined> => {
+        const isolated = nextDirectory();
+        // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the
+        // package's own folders are appended to it. A deep staging path is reached through a short
+        // symlink (removed below); the files still land inside the staging directory.
+        let link: string | undefined;
+        try {
+          await mkdir(isolated, { recursive: true });
+          let out = isolated;
+          if (isolated.length > 120) {
+            link = join(tmpdir(), `tn-gt-${randomBytes(6).toString("hex")}`);
+            await symlink(isolated, link);
+            out = link;
+          }
+          const exportRun = await runBounded(umodel.path, [`-path=${sourceDir}`, "-export", "-png", `-out=${out}`, selector], {
+            timeoutMs: 300_000,
+            maxOutputBytes: 32 * 1024 * 1024,
+          });
+          if (exportRun.code !== 0) {
+            log(`Graph texture ${name}: UE Viewer exited ${exportRun.code}.`);
+            return undefined;
+          }
+          const png = (await indexExported(isolated)).png.get(name);
+          if (!png) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
+          return png;
+        } catch (error) {
+          log(`Graph texture ${name}: export failed (${error instanceof Error ? error.message : String(error)}).`);
+          return undefined;
+        } finally {
+          if (link) await rm(link, { force: true });
         }
-        const exportRun = await runBounded(umodel.path, [`-path=${sourceDir}`, "-export", "-png", `-out=${out}`, selector], {
-          timeoutMs: 300_000,
-          maxOutputBytes: 32 * 1024 * 1024,
-        });
-        if (exportRun.code !== 0) {
-          log(`Graph texture ${name}: UE Viewer exited ${exportRun.code}.`);
+      };
+      // UE5 packages are unreadable to UE Viewer: the modern converter decodes the one package into
+      // its own staging directory (it names every texture Textures/<name>.png, hence the isolation).
+      const viaConverter = async (): Promise<string | undefined> => {
+        try {
+          graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
+          const converter = await graphTextureConverter;
+          const isolated = nextDirectory();
+          const converted = await runModernConverter(converter.path, sourceDir, isolated, ["--filter", selector], {
+            timeoutMs: 1_800_000,
+            maxOutputBytes: 32 * 1024 * 1024,
+          });
+          if (converted.code !== 0) {
+            const cause = modernConverterFailureCause(converted);
+            log(`Graph texture ${name}: the modern converter exited ${converted.code}${cause ? `: ${cause}` : "."}`);
+            return undefined;
+          }
+          const png = (await indexExported(isolated)).png.get(name);
+          if (!png) log(`Graph texture ${name}: the modern converter wrote no PNG.`);
+          return png;
+        } catch (error) {
+          log(`Graph texture ${name}: modern export failed (${error instanceof Error ? error.message : String(error)}).`);
           return undefined;
         }
-        const png = (await indexExported(isolated)).png.get(name);
-        if (!png) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
-        return png;
-      } catch (error) {
-        log(`Graph texture ${name}: export failed (${error instanceof Error ? error.message : String(error)}).`);
-        return undefined;
-      } finally {
-        if (link) await rm(link, { force: true });
-      }
+      };
+      const modernHeader = (await readPackageCooking(matches[0]!)).legacyFileVersion;
+      if (modernHeader !== undefined && modernHeader <= -8) return viaConverter();
+      return (await viaUmodel()) ?? viaConverter();
     });
     textureExports = run;
     exportedTextures.set(name, run);
@@ -2269,6 +2957,10 @@ export async function importUnrealDirectory(
   const assetMeshPackages = meshPackages.filter((entry) => !mapFiles.has(entry.file));
   const skipped: { package: string; reason: string }[] = [];
   const failed: { package: string; reason: string }[] = [];
+  for (const entry of externalActorEntries) {
+    skipped.push({ package: entry.package, reason: WORLD_PARTITION_EXTERNAL_REASON });
+  }
+  for (const entry of classified) if (hlodProxyFiles.has(entry.file)) skipped.push({ package: entry.package, reason: HLOD_PROXY_REASON });
   for (const entry of classified) {
     if (
       (entry.meshKind !== undefined && !entry.error) ||
@@ -2390,7 +3082,14 @@ export async function importUnrealDirectory(
       // a transient process failure from silently removing a mesh from an otherwise valid pack.
       let outcome = await run();
       if (outcome.code !== 0) outcome = await run();
-      return outcome.code === 0 ? undefined : `UE Viewer export exited ${outcome.code}.`;
+      if (outcome.code !== 0) return `UE Viewer export exited ${outcome.code}.`;
+      // UE Viewer names each section's material by raw index; the mesh's SectionInfoMap says which slot the editor used.
+      if (entry.meshKind === "static") {
+        const exported = join(out, `${entry.selector.replace(/^Content\//i, "")}.gltf`);
+        const remapped = await remapMeshFileSectionMaterials(exported, entry.file);
+        if (remapped > 0) log(`${basename(entry.selector)}: ${remapped} section material(s) taken from SectionInfoMap instead of UE Viewer's raw index.`);
+      }
+      return undefined;
     } catch (error) {
       return error instanceof ToolchainError ? error.message : "UE Viewer export failed.";
     }
@@ -2635,8 +3334,12 @@ export async function importUnrealDirectory(
   let modernConverter: ExternalTool | undefined;
   let modernGlbs = new Map<string, string>();
   let modernGroomPayloads = new Map<string, string[]>();
+  /** Mesh packages whose basename another routed package shares, decoded on their own: entry file -> GLB (undefined: failed). */
+  const isolatedMeshGlbs = new Map<string, string | undefined>();
   /** Meshes UE Viewer exported after the modern converter failed on them. */
   const recoveredByUmodel = new Set<string>();
+  /** Why a mesh the modern converter ran on still has no GLB, by package basename. */
+  const modernMeshFailureReasons = new Map<string, string>();
   const modernSceneModelSources: {
     readonly entry: PackageClassification;
     readonly name: string;
@@ -2650,41 +3353,71 @@ export async function importUnrealDirectory(
   if (uncookedMeshDescription.length > 0 || mapPackages.length > 0) {
     uncookedConverter = request.uncookedConverter ?? (await ensureUncookedConverter(environment, log));
     const uncookedRaw = join(staging, "uncooked");
-    const args =
-      uncookedMeshDescription.length > 0
-        ? [sourceDir, "--export-dir", uncookedRaw, "--skip-textures"]
-        : [sourceDir, "--export-dir", uncookedRaw, "--skip-export"];
-    if (uncookedMeshDescription.length > 0 && request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
-      args.push("--filter", request.onlyPackages[0]);
-    }
-    if (mapPackages.length > 0) args.push("--scene-json-dir", sceneSources);
-    const actions = [
-      ...(uncookedMeshDescription.length > 0
-        ? [`${uncookedMeshDescription.length} uncooked MeshDescription package${uncookedMeshDescription.length === 1 ? "" : "s"}`]
-        : []),
-      ...(mapPackages.length > 0
-        ? [`${mapPackages.length} Unreal level${mapPackages.length === 1 ? "" : "s"}`]
-        : []),
-    ];
-    log(`Decoding ${actions.join(" and ")}…`);
-    const converted = await runBounded(uncookedConverter.path, args, {
-      timeoutMs: 1_800_000,
-      maxOutputBytes: 64 * 1024 * 1024,
-    });
-    if (converted.code !== 0) {
-      throw new ToolchainError(
-        "UNREAL_TOOL_FAILED",
-        `The uncooked MeshDescription converter exited ${converted.code}; no partial output was promoted.`,
-      );
-    }
+    // Meshes and levels run as separate invocations. The Python tool parses every .umap under the
+    // source tree while exporting scenes, so one level it cannot read (a UE5 package the header
+    // check did not catch) must not take the meshes down with it.
     if (uncookedMeshDescription.length > 0) {
+      const args = [sourceDir, "--export-dir", uncookedRaw, "--skip-textures"];
+      if (request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
+        args.push("--filter", request.onlyPackages[0]);
+      }
+      log(`Decoding ${uncookedMeshDescription.length} uncooked MeshDescription package${uncookedMeshDescription.length === 1 ? "" : "s"}…`);
+      const converted = await runBounded(uncookedConverter.path, args, {
+        timeoutMs: 1_800_000,
+        maxOutputBytes: 64 * 1024 * 1024,
+      });
+      if (converted.code !== 0) {
+        throw new ToolchainError(
+          "UNREAL_TOOL_FAILED",
+          `The uncooked MeshDescription converter exited ${converted.code}; no partial output was promoted.`,
+        );
+      }
       uncookedGlbs = await indexGlbs(uncookedRaw);
+      // The converter writes Meshes/<name>.glb, so two packages that share a name leave one GLB for both. Each
+      // such package is decoded again on its own, from an input tree that holds only it.
+      const duplicates = sharedBasenames(uncookedMeshDescription.map(({ entry }) => entry));
+      await mapWithConcurrency(duplicates, 1, async (entry, index) => {
+        const isolated = join(staging, "uncooked-duplicates", String(index).padStart(5, "0"));
+        const input = join(isolated, "input");
+        const linked = join(input, entry.package);
+        await mkdir(dirname(linked), { recursive: true });
+        await symlink(entry.file, linked);
+        const out = join(isolated, "out");
+        const run = await runBounded(uncookedConverter!.path, [input, "--export-dir", out, "--skip-textures"], {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 64 * 1024 * 1024,
+        });
+        const glb = run.code === 0 ? (await indexGlbs(out)).get(basename(entry.package, extname(entry.package))) : undefined;
+        if (glb) isolatedMeshGlbs.set(entry.file, glb);
+        else isolatedMeshGlbs.set(entry.file, undefined);
+      });
       warnings.push(
         `Decoded ${uncookedMeshDescription.length} requested uncooked UE4 MeshDescription GLB${uncookedMeshDescription.length === 1 ? "" : "s"} without Unreal Engine; UE Viewer supplied their source textures and material metadata.`,
       );
     }
-    for (const entry of mapPackages) {
-      sceneSourcePaths.set(entry.file, join(sceneSources, `${basename(entry.package, extname(entry.package))}.scene-source.json`));
+    if (mapPackages.length > 0) {
+      const args = [sourceDir, "--export-dir", uncookedRaw, "--skip-export", "--scene-json-dir", sceneSources];
+      log(`Decoding ${mapPackages.length} Unreal level${mapPackages.length === 1 ? "" : "s"}…`);
+      const converted = await runBounded(uncookedConverter.path, args, {
+        timeoutMs: 1_800_000,
+        maxOutputBytes: 64 * 1024 * 1024,
+      });
+      if (converted.code === 0) {
+        for (const entry of mapPackages) {
+          sceneSourcePaths.set(entry.file, join(sceneSources, `${basename(entry.package, extname(entry.package))}.scene-source.json`));
+        }
+      } else {
+        const detail = `${converted.stderr}\n${converted.stdout}`
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .pop();
+        const reason = `The uncooked scene converter exited ${converted.code}${detail ? `: ${detail.slice(0, 160)}` : ""}`;
+        warnings.push(
+          `Scene reconstruction failed (${reason}); ${mapPackages.length} level${mapPackages.length === 1 ? "" : "s"} skipped.`,
+        );
+        for (const entry of mapPackages) failed.push({ package: entry.package, reason: `Scene reconstruction failed: ${reason}` });
+      }
     }
   }
   const uncookedNames = new Set(uncookedMeshDescription.map((entry) => basename(entry.package, extname(entry.package))));
@@ -2708,8 +3441,9 @@ export async function importUnrealDirectory(
       // honest when it covers everything: recovering part of the request would drop the rest
       // silently, so anything UE Viewer cannot supply reports the converter's own diagnostic.
       const retryable = modernPackages.filter(
-        ({ entry, fileVersionUE4 }) =>
-          entry.meshKind === "static" && uncookedMeshRoute("static", fileVersionUE4) === "umodel",
+        ({ entry, legacyFileVersion, fileVersionUE4 }) =>
+          (entry.meshKind === "static" && uncookedMeshRoute("static", fileVersionUE4) === "umodel") ||
+          (entry.meshKind === "skeletal" && umodelCanRetry(entry.meshKind, legacyFileVersion)),
       );
       const retried = await mapWithConcurrency(retryable, 1, async ({ entry }) => ({
         entry,
@@ -2727,15 +3461,57 @@ export async function importUnrealDirectory(
       }
       assets = mergeExported(assets, await indexExported(raw));
       warnings.push(
-        `The modern UE5 asset converter exited ${converted.code}; UE Viewer decoded ${recoveredByUmodel.size} static mesh package${recoveredByUmodel.size === 1 ? "" : "s"} it could read itself.`,
+        `The modern UE5 asset converter exited ${converted.code}; UE Viewer decoded ${recoveredByUmodel.size} mesh package${recoveredByUmodel.size === 1 ? "" : "s"} it could read itself.`,
       );
     } else {
       modernGlbs = await indexGlbs(modernRaw);
       modernGroomPayloads = await indexGroomPayloads(modernRaw);
       assets = mergeExported(assets, await indexExported(modernRaw));
+      // Same-named mesh packages share Meshes/<name>.glb in one run; each is decoded again on its own, filtered by
+      // its relative path.
+      const duplicates = sharedBasenames(modernPackages.filter(({ entry }) => entry.meshKind !== undefined).map(({ entry }) => entry));
+      await mapWithConcurrency(duplicates, 1, async (entry, index) => {
+        const isolated = join(staging, "modern-duplicates", String(index).padStart(5, "0"));
+        await mkdir(dirname(isolated), { recursive: true });
+        const run = await runModernConverter(modernConverter!.path, sourceDir, isolated, ["--filter", entry.selector], {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 64 * 1024 * 1024,
+        });
+        const glb = run.code === 0 ? (await indexGlbs(isolated)).get(basename(entry.package, extname(entry.package))) : undefined;
+        isolatedMeshGlbs.set(entry.file, glb);
+      });
       warnings.push(
         `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
       );
+      // The converter exits zero when it wrote other packages, so a mesh it could not read is
+      // only visible as a missing GLB. Name its cause, and give UE Viewer the chance to read it.
+      const converterCauses = parseModernMeshFailures(converted.stderr);
+      const missingMeshes = modernPackages.filter(
+        ({ entry }) => entry.meshKind !== undefined && !modernGlbs.has(basename(entry.package, extname(entry.package))),
+      );
+      for (const { entry, legacyFileVersion } of missingMeshes) {
+        const name = basename(entry.package, extname(entry.package));
+        const cause = converterCauses.get(name);
+        if (!umodelCanRetry(entry.meshKind, legacyFileVersion)) {
+          if (cause) modernMeshFailureReasons.set(name, cause);
+          continue;
+        }
+        const retried = await exportMeshWithUmodel(entry, raw);
+        if (retried === undefined && (await indexExported(raw)).gltf.has(name)) {
+          recoveredByUmodel.add(name);
+        } else {
+          modernMeshFailureReasons.set(
+            name,
+            [cause, `UE Viewer retry: ${retried ?? "it wrote no glTF"}`].filter(Boolean).join("; "),
+          );
+        }
+      }
+      if (recoveredByUmodel.size > 0) {
+        assets = mergeExported(assets, await indexExported(raw));
+        warnings.push(
+          `The modern UE5 asset converter wrote no GLB for ${recoveredByUmodel.size} mesh package${recoveredByUmodel.size === 1 ? "" : "s"}; UE Viewer decoded ${recoveredByUmodel.size === 1 ? "it" : "them"} instead.`,
+        );
+      }
     }
   }
   if (modernTexturePackages.length > 0) {
@@ -2757,7 +3533,10 @@ export async function importUnrealDirectory(
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
       );
-      if (converted.code !== 0) return { entry, reason: `The modern UE5 texture converter exited ${converted.code}.` };
+      if (converted.code !== 0) {
+        const cause = modernConverterFailureCause(converted);
+        return { entry, reason: `The modern UE5 texture converter exited ${converted.code}${cause ? `: ${cause}` : "."}` };
+      }
       const exported = await indexExported(isolated);
       const source = exported.png.get(name);
       return source
@@ -3106,6 +3885,15 @@ export async function importUnrealDirectory(
   );
 
   const promotion = await mkdtemp(join(promotionParent, ".threenative-import-"));
+  /** GLB path (relative to the output) -> texture name -> source PNG paths; see `ImportUnrealRequest.proofSources`. */
+  const proofByGlb = new Map<string, Map<string, string[]>>();
+  const proofFor = (glbPath: string): Map<string, string[]> | undefined => {
+    if (!request.proofSources) return undefined;
+    const key = relative(promotion, glbPath).split(sep).join("/");
+    const sources = proofByGlb.get(key) ?? new Map<string, string[]>();
+    proofByGlb.set(key, sources);
+    return sources;
+  };
 
   // Only a verified entitlement earns a copyright line. A local pack whose licence nobody
   // checked stays blank so the game's asset health check keeps saying "unknown".
@@ -3135,6 +3923,7 @@ export async function importUnrealDirectory(
   const transforms: Record<string, number> = {};
   let prunedUvSets = 0;
   let droppedTangents = 0;
+  let saturatedUvs = 0;
   let repairedMorphDeltas = 0;
   let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
@@ -3142,16 +3931,34 @@ export async function importUnrealDirectory(
   const existingPsa = new Set<string>();
   const incompatiblePsa = new Set<string>();
 
+  // Material packages by `/Game/...` path, for names several packages share: their isolated exports are the only
+  // copy of each that no other package overwrote.
+  const materialFileByGamePath = new Map<string, string>();
+  for (const entry of materialPackages) materialFileByGamePath.set(gamePackageKey(entry.package), entry.file);
+  const isolatedMaterialsFor = (imports: ReadonlyMap<string, string> | undefined): Map<string, ExportedAssets> | undefined => {
+    let found: Map<string, ExportedAssets> | undefined;
+    for (const [name, path] of imports ?? []) {
+      const file = materialFileByGamePath.get(gamePackageKey(path));
+      if (file === undefined || (materialNameCounts.get(basename(file, extname(file))) ?? 0) < 2) continue;
+      const isolated = materialAssetsByFile.get(file);
+      if (!isolated) continue;
+      (found ??= new Map()).set(name, isolated);
+    }
+    return found;
+  };
+
   try {
     for (const entry of assetMeshPackages) {
       const name = basename(entry.package, extname(entry.package));
       const fromMeshDescription = uncookedNames.has(name);
       const fromModernConverter = modernNames.has(name);
-      const defaultPath = fromMeshDescription
-        ? uncookedGlbs.get(name)
-        : fromModernConverter
-          ? modernGlbs.get(name)
-          : assets.gltf.get(name);
+      const defaultPath = isolatedMeshGlbs.has(entry.file)
+        ? isolatedMeshGlbs.get(entry.file)
+        : fromMeshDescription
+          ? uncookedGlbs.get(name)
+          : fromModernConverter
+            ? modernGlbs.get(name)
+            : assets.gltf.get(name);
       // Only the modern converter emits more than LOD0, and only when asked. Every other route
       // keeps its single existing GLB. Extra LODs come out of the same run under the writer's own
       // `_LOD<n>` suffix, so the base mesh name plus that suffix finds them.
@@ -3167,23 +3974,46 @@ export async function importUnrealDirectory(
       if (lodPaths.length === 0) {
         failed.push({
           package: entry.package,
-          reason: fromMeshDescription
+          reason: isolatedMeshGlbs.has(entry.file)
+            ? "Another mesh package shares this name, so it was decoded on its own, and that run produced no GLB (the shared one belongs to either package)."
+            : fromMeshDescription
             ? "The uncooked MeshDescription converter produced no GLB for this package."
             : fromModernConverter
-              ? "The modern UE5 mesh converter produced no GLB for this package."
+              ? `The modern UE5 mesh converter produced no GLB for this package${
+                  modernMeshFailureReasons.has(name) ? `: ${modernMeshFailureReasons.get(name)}` : "."
+                }`
             : "UE Viewer produced no glTF for this package.",
         });
         continue;
       }
       const dnaSource = fromModernConverter ? assets.dna.get(name) : undefined;
+      // UE Viewer's raw mesh is not multiplied by the source model's BuildScale3D; Unreal's render data is.
+      // Every static route decodes the raw source model (UE Viewer's raw mesh, the MeshDescription and CUE4Parse editor
+      // decoders), which Unreal multiplies by BuildScale3D when it builds the render data.
+      const buildScale = entry.meshKind !== "skeletal" ? await readPackageBuildScale3D(entry.file) : undefined;
+      if (buildScale && buildScale.some((factor) => factor !== 1)) {
+        warnings.push(`${name}: the source mesh carries BuildScale3D (${buildScale.join(", ")}); the decoded source geometry was scaled by it${new Set(buildScale).size > 1 ? " (non-uniform: normals are not adjusted)" : ""}.`);
+      }
+      // Material sidecars are found by object name; the mesh names the package of each: its import table (UE4
+      // packages), or the converter's `<mesh>.materials.json` (UE5).
+      const materialPackages = fromModernConverter && defaultPath
+        ? await readConverterMaterialPackages(join(dirname(defaultPath), `${name}.materials.json`))
+        : await readMeshMaterialPackages(entry.file);
+      const importedMaterialAssets = isolatedMaterialsFor(materialPackages);
       for (const { lod, path: gltfPath } of lodPaths) {
+        // A name another package shares keeps its package folders, or the two would overwrite one Models/<name>.glb.
+        const modelStem = isolatedMeshGlbs.has(entry.file)
+          ? `Models/${entry.package.replace(/\\/g, "/").replace(/^Content\//i, "").slice(0, -extname(entry.package).length)}`
+          : `Models/${name}`;
         const relativeGlb = fromMeshDescription || fromModernConverter
-          ? lod === 0 ? `Models/${name}.glb` : `Models/${name}_LOD${lod}.glb`
+          ? lod === 0 ? `${modelStem}.glb` : `${modelStem}_LOD${lod}.glb`
           : `${relative(raw, gltfPath).split(sep).join("/").slice(0, -".gltf".length)}.glb`;
         const glbPath = assertContained(promotion, relativeGlb);
         try {
           const packaged = await packageGlb({
             gltfPath,
+            materialPackages,
+            importedMaterialAssets,
             glbPath,
             assets,
             maxTextureSize: request.maxTextureSize,
@@ -3191,14 +4021,18 @@ export async function importUnrealDirectory(
             imageCache,
             copyright,
             sidecars,
-            geometryScale: fromMeshDescription ? 0.01 : 1,
+            geometryScale: geometryScaleFor(fromMeshDescription || fromModernConverter ? "converter" : "umodel", fromMeshDescription ? 0.01 : 1, buildScale),
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
+            noMipmapTextures,
+            namesEngineDefaultMaterial: async () => (await readPackageObjectNames(entry.file)).has("WorldGridMaterial"),
             onMaterialResolved: request.onMaterialResolved,
+            proofSources: proofFor(glbPath),
           });
           prunedUvSets += packaged.prunedUvSets;
           droppedTangents += packaged.droppedTangents;
+          saturatedUvs += packaged.saturatedUvs;
           repairedMorphDeltas += packaged.repairedMorphDeltas;
           conflictingMorphDeltas += packaged.conflictingMorphDeltas;
           for (const name of packaged.attachedPsa) attachedPsa.add(name);
@@ -3320,10 +4154,13 @@ export async function importUnrealDirectory(
           geometryScale: 1,
           sourceMaterial: sourceForMesh(source.entry.file),
           graphBaker,
+          noMipmapTextures,
           onMaterialResolved: request.onMaterialResolved,
+          proofSources: proofFor(glbPath),
         });
         prunedUvSets += packaged.prunedUvSets;
         droppedTangents += packaged.droppedTangents;
+        saturatedUvs += packaged.saturatedUvs;
         repairedMorphDeltas += packaged.repairedMorphDeltas;
         conflictingMorphDeltas += packaged.conflictingMorphDeltas;
         const validated = await validateGlb(glbPath);
@@ -3422,10 +4259,12 @@ export async function importUnrealDirectory(
           materialAssets: isolatedAssets,
           sourceMaterial: (name) => {
             const entry = materialEntries.find((e) => e.libraryName === name)?.entry;
-            return entry ? sourceForFile(entry.file) : undefined;
+            return entry ? sourceForLibraryFile(entry.file) : undefined;
           },
           graphBaker,
+          noMipmapTextures,
           onMaterialResolved: request.onMaterialResolved,
+          proofSources: proofFor(glbPath),
         });
         await validateGlb(glbPath);
         const sections = new Map(packaged.sections.map((section) => [section.name, section]));
@@ -4011,7 +4850,7 @@ export async function importUnrealDirectory(
     // A modern level or prefab whose conversion did not produce a scene source was already reported
     // above; reconstructing it again would only add a second, misleading ENOENT failure.
     const sceneEntries = [
-      ...mapPackages,
+      ...mapPackages.filter((entry) => sceneSourcePaths.has(entry.file)),
       ...[...modernMapPackages, ...modernPrefabPackages].filter((entry) => sceneSourcePaths.has(entry.file)),
     ];
     const sceneBasenameCounts = new Map<string, number>();
@@ -4127,7 +4966,13 @@ export async function importUnrealDirectory(
       unsupported: sections.reduce((sum, section) => sum + section.unsupported.length, 0),
       unresolved: sections.filter((section) => !section.resolved).length,
       graphBaked: sections.filter((section) => section.graph?.status === "baked").length,
+      effect: sections.filter((section) => section.effect !== undefined).length,
     };
+    if (saturatedUvs > 0) {
+      warnings.push(
+        `Reset ${saturatedUvs} UV components stored as the half-float saturation value (-65504) to 0; Unreal writes it for an unused or clamped UV channel.`,
+      );
+    }
     if (droppedTangents > 0) {
       warnings.push(
         `Dropped ${droppedTangents} zero-length TANGENT vectors UE Viewer wrote for these meshes; the runtime derives the tangent frame from UVs instead.`,
@@ -4151,6 +4996,13 @@ export async function importUnrealDirectory(
     if (coverage.unresolved > 0) {
       warnings.push(
         `${coverage.unresolved} mesh sections had no material UE Viewer could resolve; they are named "<mesh>_unresolved_section_<n>" and carry a neutral grey, not a debug colour.`,
+      );
+    }
+    const effectSections = sections.filter((section) => section.effect !== undefined);
+    if (effectSections.length > 0) {
+      const byKind = (kind: string): number => effectSections.filter((section) => section.effect?.kind === kind).length;
+      warnings.push(
+        `${effectSections.length} material sections have no albedo by design and are not failures (${byKind("emissive")} emissive-only effect, ${byKind("engine-default-material")} engine default material, ${byKind("particle")} particle material, ${byKind("additive-blend")} additive or modulate blend, ${byKind("no-base-colour")} with no colour output); each carries "effect" with the reason.`,
       );
     }
     if (coverage.textured < coverage.sections) {
@@ -4229,6 +5081,8 @@ export async function importUnrealDirectory(
 
     await writeFile(join(promotion, "import-report.json"), `${JSON.stringify(report, null, 2)}\n`);
     await rename(promotion, outputDir);
+    // The staging PNGs are still on disk here and are removed in `finally`.
+    if (request.proofSources) await request.proofSources(proofByGlb, report);
     log(
       `Promoted ${models.length} model GLB${models.length === 1 ? "" : "s"}, ${textures.length} texture PNG${textures.length === 1 ? "" : "s"}, ${cubemaps.length} cubemap environment map${cubemaps.length === 1 ? "" : "s"}, ${textureStacks.length} multidimensional texture stack${textureStacks.length === 1 ? "" : "s"}, ${standaloneMaterials.length} material asset${standaloneMaterials.length === 1 ? "" : "s"}, ${audio.length} audio file${audio.length === 1 ? "" : "s"}, ${fonts.length} font face${fonts.length === 1 ? "" : "s"}, ${bitmapFonts.length} bitmap font${bitmapFonts.length === 1 ? "" : "s"}, ${sprites.length} sprite GLB${sprites.length === 1 ? "" : "s"}, ${flipbooks.length} flipbook manifest${flipbooks.length === 1 ? "" : "s"}, ${dataAssets.length} data JSON file${dataAssets.length === 1 ? "" : "s"}, and ${scenes.length} scene GLB${scenes.length === 1 ? "" : "s"} to ${outputDir}.`,
     );

@@ -63,6 +63,22 @@ const VersionSchema = z.object({
   fileType: z.string().optional(),
 });
 
+// FabCLI reports gallery dimensions as strings ("640"); accept numbers too and drop anything else.
+const DimensionSchema = z
+  .union([z.number(), z.string()])
+  .nullish()
+  .transform((value) => {
+    const parsed = typeof value === "string" ? Number(value) : value;
+    return parsed !== undefined && parsed !== null && Number.isFinite(parsed) ? parsed : undefined;
+  });
+
+const GalleryImageSchema = z.object({
+  type: z.string().nullish(),
+  url: z.string(),
+  width: DimensionSchema,
+  height: DimensionSchema,
+});
+
 const LibraryEntrySchema = z.object({
   // Epic catalog coordinates. Older payloads may omit them, and `download` then falls back to the
   // engine filter.
@@ -77,6 +93,16 @@ const LibraryEntrySchema = z.object({
     .default([]),
   projectVersions: z.array(VersionSchema.loose()).default([]),
   categories: z.array(z.object({ name: z.string().optional() }).loose()).default([]),
+  // One malformed gallery entry must not fail the whole library parse.
+  images: z
+    .array(z.unknown())
+    .nullish()
+    .transform((images) =>
+      (images ?? []).flatMap((image) => {
+        const parsed = GalleryImageSchema.loose().safeParse(image);
+        return parsed.success ? [parsed.data] : [];
+      }),
+    ),
 });
 
 const LibrarySchema = z.object({
@@ -101,6 +127,13 @@ export interface FabAuthStatus {
   readonly expiresAt: string | undefined;
 }
 
+export interface FabGalleryImage {
+  readonly type: string | undefined;
+  readonly url: string;
+  readonly width: number | undefined;
+  readonly height: number | undefined;
+}
+
 export interface FabOwnedListing {
   readonly listingId: string | undefined;
   /** Epic catalog asset id; with `assetNamespace` and an artifact id it names one artifact exactly. */
@@ -111,6 +144,17 @@ export interface FabOwnedListing {
   readonly categories: readonly string[];
   readonly distributionMethod: string;
   readonly unrealArtifacts: readonly FabUnrealVersion[];
+  /** The listing's gallery images from the library payload (public media.fab.com URLs). */
+  readonly images?: readonly FabGalleryImage[];
+}
+
+/** The listing's own "Featured" gallery image URL, else its first image, else undefined. */
+export function featuredImageUrl(
+  listing: Pick<FabOwnedListing, "images">,
+): string | undefined {
+  const images = listing.images ?? [];
+  const featured = images.find((image) => image.type?.toLowerCase() === "featured");
+  return (featured ?? images[0])?.url;
 }
 
 export interface FabUnrealVersion {
@@ -343,6 +387,12 @@ export class FabCli {
         category.name === undefined ? [] : [category.name],
       ),
       distributionMethod: entry.distributionMethod,
+      images: entry.images.map((image) => ({
+        type: image.type ?? undefined,
+        url: image.url,
+        width: image.width,
+        height: image.height,
+      })),
       unrealArtifacts: entry.projectVersions.map((version) => ({
         artifactId: version.artifactId,
         engineVersions: version.engineVersions,

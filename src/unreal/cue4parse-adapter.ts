@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.52",
+  version: "b4e95441+threenative.67",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -158,7 +158,7 @@ index 5a23e98..8eacca2 100644
          if (Ar.Ver >= EUnrealEngineObjectUE3Version.DeprecatedOldLodformat)
          {
              if (skelMeshVer < FSkeletalMeshCustomVersion.Type.CombineSectionWithChunk)
-@@ -192,7 +226,23 @@ public FStaticLODModel(FAssetArchive Ar, bool bHasVertexColors) : this()
+@@ -192,7 +226,31 @@ public FStaticLODModel(FAssetArchive Ar, bool bHasVertexColors) : this()
 
          RequiredBones = Ar.ReadArray<short>();
          if (!stripDataFlags.IsEditorDataStripped())
@@ -179,11 +179,19 @@ index 5a23e98..8eacca2 100644
 +                _ = Ar.ReadBoolean();
 +                _ = Ar.ReadBoolean();
 +            }
++            else if (skelMeshVer >= FSkeletalMeshCustomVersion.Type.SplitModelAndRenderData)
++            {
++                // UE4.19-4.24 editor packages keep the imported source model inline as
++                // FRawSkeletalMeshBulkData: a bulk-data header, a GUID and bGuidIsHash.
++                _ = new FByteBulkData(Ar);
++                Ar.Position += 16;
++                _ = Ar.ReadBoolean();
++            }
 +        }
 
          if (Ar.Game != GAME_StateOfDecay2 && Ar.Ver >= EUnrealEngineObjectUE4Version.ADD_SKELMESH_MESHTOIMPORTVERTEXMAP)
          {
-@@ -324,6 +374,24 @@ public FStaticLODModel(FAssetArchive Ar, bool bHasVertexColors) : this()
+@@ -324,6 +382,24 @@ public FStaticLODModel(FAssetArchive Ar, bool bHasVertexColors) : this()
              }
          }
 
@@ -369,6 +377,13 @@ if (dumpAt < 0 && graphAt < 0)
     Directory.CreateDirectory(Path.Combine(output, "Grooms"));
 }
 ObjectTypeRegistry.RegisterClass(typeof(USkeletalMeshEditorData));
+// CUE4Parse swallows an export it cannot deserialize and logs it, which leaves a mesh with no
+// geometry and no explanation. Capturing those events lets a missing mesh name its real cause.
+var packageReadFailures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+CUE4Parse.CUE4ParseLog.UseLogger(new Serilog.LoggerConfiguration().MinimumLevel.Error().WriteTo.Sink(new PackageReadFailureSink(packageReadFailures)).CreateLogger());
+// Mesh name -> why no GLB was written. Reported on stderr as "threenative-mesh-failure" lines.
+var meshFailures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+string? olderEngineAttempts = null;
 
 var engineAt = Array.IndexOf(args, "--engine");
 var game = engineAt >= 0 ? ParseGame(args[engineAt + 1]) : DetectGame(root);
@@ -393,7 +408,8 @@ if (dumpAt >= 0)
     return;
 }
 
-const int GraphNodeLimit = 2000;
+// Inlined function bodies count: a layered master (Paragon's Master_SidesMarble) needs more than 2000.
+const int GraphNodeLimit = 10000;
 const int GraphFunctionDepthLimit = 8;
 // Properties that describe editor placement or bookkeeping, not the computation.
 var GraphIgnoredProperties = new HashSet<string>(StringComparer.Ordinal)
@@ -404,6 +420,8 @@ var GraphIgnoredProperties = new HashSet<string>(StringComparer.Ordinal)
     "FunctionExpressions",
 };
 var graphLegacyCache = new Dictionary<string, Dictionary<string, GraphLegacyInput>>(StringComparer.Ordinal);
+var graphLegacyFunctionCache = new Dictionary<string, List<GraphLegacyInput>?>(StringComparer.Ordinal);
+Dictionary<string, string>? graphFunctionKeys = null;
 var graphPackageKeys = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var graphPackageArchives = new Dictionary<string, FAssetArchive?>(StringComparer.OrdinalIgnoreCase);
 var GraphMaterialOutputs = new (string Output, string Property)[]
@@ -444,6 +462,8 @@ static object? GraphValue(object? value) => value switch
     FColor color => new[] { color.R / 255d, color.G / 255d, color.B / 255d, color.A / 255d },
     FVector vector => DumpVec(vector),
     FVector2D vector => new[] { DumpNum(vector.X), DumpNum(vector.Y) },
+    // A FunctionInput's PreviewValue: the constant an unconnected input compiles to.
+    FVector4 vector => new[] { DumpNum(vector.X), DumpNum(vector.Y), DumpNum(vector.Z), DumpNum(vector.W) },
     FName name => name.Text,
     string text => text,
     FScriptStruct script => GraphValue(script.StructType),
@@ -502,20 +522,25 @@ static (FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bo
 // CUE4Parse guesses from --engine when the package records nothing, and that guess is wrong for packages saved by UE 4.5.
 static bool GraphTaggedInputs(IPackage? package) =>
     package is Package legacy && (legacy.Summary.CustomVersionContainer?.Versions.All(version => version.Key != FCoreObjectVersion.GUID) ?? true);
+// A native package that records no FFrameworkObjectVersion keeps a pin's InputName as an FString (Unreal reads a missing custom version as the
+// oldest), but CUE4Parse guesses an FName from --engine and misreads every input's mask, or drops a connected Color/Scalar input outright.
+static bool GraphPinsAsString(IPackage? package) =>
+    package is Package legacy && (legacy.Summary.CustomVersionContainer?.Versions.All(version => version.Key != FFrameworkObjectVersion.GUID) ?? false);
+// Inputs CUE4Parse cannot be trusted with: re-read from the raw bytes.
+static bool GraphRawInputs(IPackage? package) => GraphTaggedInputs(package) || GraphPinsAsString(package);
 // Packages saved by UE 4.5 store each FExpressionInput as tagged properties that CUE4Parse mis-reads as the native layout and drops.
 // Re-read those struct payloads from the raw package bytes.
-Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
+FAssetArchive? GraphRawArchive(Package legacy)
 {
-    var inputs = new Dictionary<string, GraphLegacyInput>(StringComparer.Ordinal);
-    if (expr.Owner is not Package legacy) return inputs;
-    var cacheKey = legacy.Name + "#" + expr.Name;
-    if (graphLegacyCache.TryGetValue(cacheKey, out var cached)) return cached;
-    graphLegacyCache[cacheKey] = inputs;
     if (!graphPackageArchives.TryGetValue(legacy.Name, out var archive))
     {
         archive = null;
         try
         {
+            // A package reached through a function call was never mounted by the dump loop: find its file by name.
+            if (!graphPackageKeys.ContainsKey(legacy.Name) &&
+                provider.Files.Keys.FirstOrDefault(candidate => string.Equals(Path.ChangeExtension(candidate, null), legacy.Name, StringComparison.OrdinalIgnoreCase)) is { } located)
+                graphPackageKeys[legacy.Name] = located;
             if (graphPackageKeys.TryGetValue(legacy.Name, out var key))
             {
                 var bytes = provider.SaveAsset(key);
@@ -526,9 +551,82 @@ Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
         catch { archive = null; }
         graphPackageArchives[legacy.Name] = archive;
     }
+    return archive;
+}
+// The same recovery for a function call's FunctionInputs: every element nests an FExpressionInput (Input) that CUE4Parse reads in
+// the native layout, so an unwired or wired pin of an old package arrives as junk (a pin on the call itself, masks like 67108864)
+// and the call, with the engine function behind it, looks like a cycle. Null when the array cannot be re-read.
+List<GraphLegacyInput>? GraphLegacyFunctionInputs(UObject call)
+{
+    if (call.Owner is not Package legacy) return null;
+    var cacheKey = legacy.Name + "#" + call.Name;
+    if (graphLegacyFunctionCache.TryGetValue(cacheKey, out var cached)) return cached;
+    graphLegacyFunctionCache[cacheKey] = null;
+    var archive = GraphRawArchive(legacy);
+    var export = legacy.ExportMap.FirstOrDefault(item => item.ObjectName.Text == call.Name);
+    if (archive is null || export is null) return null;
+    var native = !GraphTaggedInputs(legacy);
+    archive.Position = export.SerialOffset;
+    List<GraphLegacyInput>? result = null;
+    while (true)
+    {
+        FPropertyTag tag;
+        try { tag = new FPropertyTag(archive, false); } catch { break; }
+        if (tag.Name.IsNone) break;
+        var end = archive.Position + tag.Size;
+        try
+        {
+            if (tag.Name.Text == "FunctionInputs" && tag.PropertyType.Text == "ArrayProperty" && tag.TagData?.InnerType == "StructProperty")
+            {
+                var count = archive.Read<int>();
+                if (count > 0 && archive.Ver >= EUnrealEngineObjectUE4Version.INNER_ARRAY_TAG_INFO) _ = new FPropertyTag(archive, false);
+                var elements = new List<GraphLegacyInput>();
+                for (var element = 0; element < count; element++)
+                {
+                    var input = new GraphLegacyInput(null, 0, null, null, false);
+                    while (true)
+                    {
+                        var item = new FPropertyTag(archive, false);
+                        if (item.Name.IsNone) break;
+                        var itemEnd = archive.Position + item.Size;
+                        if (item.Name.Text == "Input") input = native ? GraphReadNativeInput(archive, legacy) : GraphReadLegacyInput(archive, itemEnd);
+                        archive.Position = itemEnd;
+                    }
+                    elements.Add(input);
+                }
+                result = elements;
+            }
+        }
+        catch { result = null; }
+        archive.Position = end;
+    }
+    graphLegacyFunctionCache[cacheKey] = result;
+    return result;
+}
+// The value of an expression's input property, recovered from the raw package when it is stored as tagged properties.
+object? GraphInputValue(UObject expr, string name)
+{
+    var property = GraphProperty(expr, name);
+    var value = property?.Tag?.GenericValue;
+    if (property is not null && property.PropertyType.Text == "StructProperty" &&
+        (property.Tag is null || (GraphRawInputs(expr.Owner) && value is FScriptStruct { StructType: FExpressionInput })))
+        return GraphLegacyInputs(expr).TryGetValue(name, out var recovered) ? recovered : null;
+    return value;
+}
+Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
+{
+    var inputs = new Dictionary<string, GraphLegacyInput>(StringComparer.Ordinal);
+    if (expr.Owner is not Package legacy) return inputs;
+    var cacheKey = legacy.Name + "#" + expr.Name;
+    if (graphLegacyCache.TryGetValue(cacheKey, out var cached)) return cached;
+    graphLegacyCache[cacheKey] = inputs;
+    var archive = GraphRawArchive(legacy);
     if (archive is null) return inputs;
     var export = legacy.ExportMap.FirstOrDefault(item => item.ObjectName.Text == expr.Name);
     if (export is null) return inputs;
+    // A package that records FCoreObjectVersion stores an input natively; CUE4Parse's own read of a connected Color/Scalar input
+    // of such a package can still fail and drop the property (a UE 4.21 re-save), so the native payload is re-read here too.
+    var native = !GraphTaggedInputs(legacy);
     archive.Position = export.SerialOffset;
     while (true)
     {
@@ -539,12 +637,24 @@ Dictionary<string, GraphLegacyInput> GraphLegacyInputs(UObject expr)
         try
         {
             if (tag.PropertyType.Text == "StructProperty" && tag.TagData?.StructType is "ExpressionInput" or "ColorMaterialInput" or "ScalarMaterialInput" or "VectorMaterialInput" or "Vector2MaterialInput" or "MaterialAttributesInput")
-                inputs[tag.ArrayIndex > 0 ? $"{tag.Name.Text}[{tag.ArrayIndex}]" : tag.Name.Text] = GraphReadLegacyInput(archive, end);
+                inputs[tag.ArrayIndex > 0 ? $"{tag.Name.Text}[{tag.ArrayIndex}]" : tag.Name.Text] = native ? GraphReadNativeInput(archive, legacy) : GraphReadLegacyInput(archive, end);
         }
         catch { }
         archive.Position = end;
     }
     return inputs;
+}
+// The native layout (Expression, OutputIndex, InputName, Mask, MaskR..A); the UseConstant/Constant tail is not needed for a wired input.
+static GraphLegacyInput GraphReadNativeInput(FAssetArchive archive, Package legacy)
+{
+    var expression = new FPackageIndex(archive);
+    var output = archive.Read<int>();
+    if (legacy.Summary.CustomVersionContainer?.Versions.FirstOrDefault(version => version.Key == FFrameworkObjectVersion.GUID) is { } framework &&
+        framework.Version >= (int) FFrameworkObjectVersion.Type.PinsStoreFName) archive.ReadFName();
+    else archive.ReadFString();
+    var mask = archive.Read<int>();
+    var channels = new[] { archive.Read<int>(), archive.Read<int>(), archive.Read<int>(), archive.Read<int>() };
+    return new GraphLegacyInput(expression, output, mask != 0 ? channels : null, null, false);
 }
 static GraphLegacyInput GraphReadLegacyInput(FAssetArchive archive, long structEnd)
 {
@@ -661,7 +771,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
             var isFunctionInput = className == "FunctionInput";
             if (isFunctionCall) { className = "FunctionCall"; node["class"] = className; }
             Dictionary<string, GraphLegacyInput>? legacyInputs = null;
-            var taggedPackage = GraphTaggedInputs(owner);
+            var taggedPackage = GraphRawInputs(owner);
             foreach (var property in expr.Properties)
             {
                 var name = property.Name.Text;
@@ -693,6 +803,14 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                                 names.Add(element.GenericValue is FScriptStruct { StructType: FStructFallback outputItem } ? GraphText(GraphProperty(outputItem, "OutputName")?.Tag?.GenericValue) : "");
                             node["outputNames"] = names;
                         }
+                        else if (name is "AttributeSetTypes" or "AttributeGetTypes")
+                        {
+                            // SetMaterialAttributes pin Inputs[i] carries attribute AttributeSetTypes[i-1]; GetMaterialAttributes output i is AttributeGetTypes[i].
+                            var guids = new List<string>();
+                            foreach (var element in array.Properties)
+                                guids.Add(element.GenericValue is FScriptStruct { StructType: FGuid attributeGuid } ? attributeGuid.ToString() : "");
+                            node["attributeTypes"] = guids;
+                        }
                         else if (array.Properties.Count > 0 && array.Properties.All(element => GraphIsInput(element.GenericValue)))
                         {
                             for (var element = 0; element < array.Properties.Count; element++)
@@ -719,6 +837,14 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                 node["default"] = GraphValue(defaultTag) ?? (className.Contains("Vector", StringComparison.Ordinal) ? new[] { 0d, 0d, 0d, 0d }
                     : className.Contains("Scalar", StringComparison.Ordinal) ? 0d
                     : className.Contains("Static", StringComparison.Ordinal) ? false : null);
+                // A CollectionParameter reads a MaterialParameterCollection: its default is the collection entry's
+                // DefaultValue (a scalar, or a linear colour), which is what the editor renders until gameplay sets it.
+                if (className == "CollectionParameter")
+                {
+                    node["default"] = GraphCollectionDefault(GraphProperty(expr, "Collection")?.Tag?.GenericValue as FPackageIndex, parameterName);
+                    if (GraphProperty(expr, "Collection")?.Tag?.GenericValue is FPackageIndex collectionIndex && owner is not null)
+                        node["collection"] = DumpPath(owner, collectionIndex);
+                }
             }
             if (className.StartsWith("TextureSample", StringComparison.Ordinal) || className.StartsWith("TextureObject", StringComparison.Ordinal))
             {
@@ -746,10 +872,126 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                 else if (!inputs.ContainsKey("Input")) inputs["Input"] = null;
                 constants["InputName"] = GraphText(GraphProperty(expr, "InputName")?.Tag?.GenericValue);
             }
+            if (className == "NamedRerouteUsage")
+            {
+                // A usage has no input of its own: link it to its declaration so the declaration's Input is followed.
+                var declarationGuid = GraphGuid(GraphProperty(expr, "DeclarationGuid"));
+                if (declarationGuid is not null) constants["DeclarationGuid"] = declarationGuid;
+                UObject? declaration = null;
+                if (GraphProperty(expr, "Declaration")?.Tag?.GenericValue is FPackageIndex declarationIndex && !declarationIndex.IsNull)
+                {
+                    try { declaration = declarationIndex.Load<UObject>(); } catch { }
+                }
+                if (declaration is null && declarationGuid is not null && owner is not null)
+                {
+                    for (var exportIndex = 0; exportIndex < owner.ExportsLazy.Length && declaration is null; exportIndex++)
+                    {
+                        try
+                        {
+                            if (!DumpExportClass(owner, exportIndex).EndsWith("NamedRerouteDeclaration", StringComparison.Ordinal)) continue;
+                            var candidate = owner.ExportsLazy[exportIndex].Value;
+                            if (GraphGuid(GraphProperty(candidate, "VariableGuid")) == declarationGuid) declaration = candidate;
+                        }
+                        catch { }
+                    }
+                }
+                if (declaration is null) node["error"] = "named reroute declaration could not be found";
+                else
+                {
+                    var declarationId = EmitNode(declaration, prefix, callInputs, depth);
+                    if (declarationId is null) node["error"] = "named reroute declaration could not be emitted (graph node limit)";
+                    else inputs["Input"] = new Dictionary<string, object?> { ["node"] = declarationId, ["output"] = 0, ["mask"] = null };
+                }
+            }
             if (isFunctionCall) InlineFunctionCall(expr, id, node, prefix, callInputs, depth);
         }
         catch (Exception error) { node["error"] = error.Message; }
         return id;
+    }
+
+    // A pack may mount its content under any folder (Polyphoria/Polyphoria/...), so a reference that does not load
+    // as given is found again by its file name among the pack's own packages. Engine content is never in the pack.
+    object? GraphCollectionDefault(FPackageIndex? collectionIndex, string parameterName)
+    {
+        if (collectionIndex is null || collectionIndex.IsNull || string.IsNullOrEmpty(parameterName)) return null;
+        UObject? collection = null;
+        try { collection = collectionIndex.Load<UObject>(); } catch { }
+        collection ??= GraphLoadFunction(null, collectionIndex.ResolvedObject?.GetPathName());
+        if (collection is null) return null;
+        foreach (var entry in collection.GetOrDefault<FStructFallback[]>("ScalarParameters") ?? Array.Empty<FStructFallback>())
+            if (GraphText(GraphProperty(entry, "ParameterName")?.Tag?.GenericValue).Equals(parameterName, StringComparison.OrdinalIgnoreCase))
+                return GraphValue(GraphProperty(entry, "DefaultValue")?.Tag?.GenericValue) ?? 0d;
+        foreach (var entry in collection.GetOrDefault<FStructFallback[]>("VectorParameters") ?? Array.Empty<FStructFallback>())
+            if (GraphText(GraphProperty(entry, "ParameterName")?.Tag?.GenericValue).Equals(parameterName, StringComparison.OrdinalIgnoreCase))
+                return GraphValue(GraphProperty(entry, "DefaultValue")?.Tag?.GenericValue) ?? new[] { 0d, 0d, 0d, 0d };
+        return null;
+    }
+    UObject? GraphLoadFunction(FPackageIndex? functionIndex, string? path)
+    {
+        try { if (functionIndex?.Load<UObject>() is { } direct) return direct; } catch { }
+        if (string.IsNullOrEmpty(path) || path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return null;
+        var slash = path.LastIndexOf('/');
+        var functionName = path[(slash + 1)..];
+        var dot = functionName.IndexOf('.');
+        if (dot >= 0) functionName = functionName[..dot];
+        if (functionName.Length == 0) return null;
+        if (graphFunctionKeys is null)
+        {
+            graphFunctionKeys = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var key in provider.Files.Keys.Where(key => key.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)).OrderBy(key => key, StringComparer.Ordinal))
+                graphFunctionKeys.TryAdd(Path.GetFileNameWithoutExtension(key), key);
+        }
+        if (!graphFunctionKeys.TryGetValue(functionName, out var packageKey)) return null;
+        try
+        {
+            var functionPackage = provider.LoadPackage(packageKey);
+            for (var index = 0; index < functionPackage.ExportsLazy.Length; index++)
+            {
+                if (DumpExportName(functionPackage, index) == functionName) return functionPackage.ExportsLazy[index].Value;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // UE4 and 5.0 keep the expression list on the function; 5.1+ moves it to EditorOnlyData.ExpressionCollection.
+    // The package exports are the last resort, because the inputs and outputs are exports whatever the layout.
+    List<UObject> GraphFunctionExpressions(UObject function)
+    {
+        var found = new List<UObject>();
+        void Collect(object? array)
+        {
+            if (array is not UScriptArray list) return;
+            foreach (var element in list.Properties)
+            {
+                try { if ((element.GenericValue as FPackageIndex)?.Load<UObject>() is { } candidate) found.Add(candidate); } catch { }
+            }
+        }
+        Collect(GraphProperty(function, "FunctionExpressions")?.Tag?.GenericValue);
+        if (found.Count == 0)
+        {
+            try
+            {
+                var editorOnly = GraphProperty(function, "EditorOnlyData")?.Tag?.GenericValue is FPackageIndex editorIndex ? editorIndex.Load<UObject>() : null;
+                if (editorOnly is not null &&
+                    GraphProperty(editorOnly, "ExpressionCollection")?.Tag?.GenericValue is FScriptStruct { StructType: FStructFallback collection })
+                    Collect(GraphProperty(collection, "Expressions")?.Tag?.GenericValue);
+            }
+            catch { }
+        }
+        if (found.Count == 0 && function.Owner is { } functionOwner)
+        {
+            for (var index = 0; index < functionOwner.ExportsLazy.Length; index++)
+            {
+                try
+                {
+                    var export = functionOwner.ExportsLazy[index].Value;
+                    if (export.ExportType is "MaterialExpressionFunctionInput" or "MaterialExpressionFunctionOutput") found.Add(export);
+                }
+                catch { }
+            }
+        }
+        return found;
     }
 
     void InlineFunctionCall(UObject call, string callId, Dictionary<string, object?> node, string prefix, Dictionary<string, Dictionary<string, object?>?>? outerInputs, int depth)
@@ -763,17 +1005,13 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         node["fn"] = fn;
         var callPins = (Dictionary<string, object?>) node["inputs"]!;
         // The call stores each wired input and only a guid for the function input it feeds.
-        UObject? function = null;
-        try { function = functionIndex?.Load<UObject>(); } catch { }
+        var function = GraphLoadFunction(functionIndex, node["function"] as string);
         var inputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
         var outputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
-        if (function is not null && GraphProperty(function, "FunctionExpressions")?.Tag?.GenericValue is UScriptArray expressions)
+        if (function is not null)
         {
-            foreach (var element in expressions.Properties)
+            foreach (var candidate in GraphFunctionExpressions(function))
             {
-                UObject? candidate = null;
-                try { candidate = (element.GenericValue as FPackageIndex)?.Load<UObject>(); } catch { }
-                if (candidate is null) continue;
                 var guid = GraphGuid(GraphProperty(candidate, "Id"));
                 if (guid is null) continue;
                 if (candidate.ExportType == "MaterialExpressionFunctionInput") inputExpressions[guid] = candidate;
@@ -783,12 +1021,15 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         var pins = new Dictionary<string, Dictionary<string, object?>?>(StringComparer.Ordinal);
         if (GraphProperty(call, "FunctionInputs")?.Tag?.GenericValue is UScriptArray callInputs)
         {
+            // A package that records no FCoreObjectVersion stores each nested input as tagged properties; read them from the raw bytes.
+            var legacyInputs = GraphRawInputs(owner) ? GraphLegacyFunctionInputs(call) : null;
+            if (legacyInputs is not null && legacyInputs.Count != callInputs.Properties.Count) legacyInputs = null;
             var position = 0;
             foreach (var element in callInputs.Properties)
             {
                 var slot = position++;
                 if (element.GenericValue is not FScriptStruct { StructType: FStructFallback item }) continue;
-                var actual = Pin(GraphProperty(item, "Input")?.Tag?.GenericValue, prefix, outerInputs, depth);
+                var actual = Pin(legacyInputs is not null ? legacyInputs[slot] : GraphProperty(item, "Input")?.Tag?.GenericValue, prefix, outerInputs, depth);
                 var guid = GraphGuid(GraphProperty(item, "ExpressionInputId"));
                 var inputName = $"Input{slot}";
                 if (guid is not null && inputExpressions.TryGetValue(guid, out var inputExpression))
@@ -815,7 +1056,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                     GraphGuid(GraphProperty(item, "ExpressionOutputId")) is { } guid &&
                     outputExpressions.TryGetValue(guid, out var outputExpression))
                 {
-                    innerId = Pin(GraphProperty(outputExpression, "A")?.Tag?.GenericValue, inner, pins, depth + 1)?["node"] as string;
+                    innerId = Pin(GraphInputValue(outputExpression, "A"), inner, pins, depth + 1)?["node"] as string;
                     outputName = GraphText(GraphProperty(outputExpression, "OutputName")?.Tag?.GenericValue);
                 }
                 outputIds.Add(innerId);
@@ -835,7 +1076,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         {
             var outputProperty = GraphProperty(material, propertyName) ?? (editorOnly is null ? null : GraphProperty(editorOnly, propertyName));
             var value = outputProperty?.Tag?.GenericValue;
-            if (outputProperty is not null && outputProperty.PropertyType.Text == "StructProperty" && (outputProperty.Tag is null || GraphTaggedInputs(material.Owner)))
+            if (outputProperty is not null && outputProperty.PropertyType.Text == "StructProperty" && (outputProperty.Tag is null || GraphRawInputs(material.Owner)))
             {
                 var recovered = GraphLegacyInputs(material);
                 if (recovered.TryGetValue(propertyName, out var legacyOutput)) value = legacyOutput;
@@ -893,6 +1134,8 @@ static Dictionary<string, object?>? DumpBounds(UObject mesh, string property)
         ["boxExtent"] = DumpVec(bounds.GetOrDefault<FVector>("BoxExtent")),
         ["sphereRadius"] = DumpNum(bounds.GetOrDefault<float>("SphereRadius")),
         ["property"] = property,
+        ["positiveExtension"] = DumpVec(mesh.GetOrDefault<FVector>("PositiveBoundsExtension")),
+        ["negativeExtension"] = DumpVec(mesh.GetOrDefault<FVector>("NegativeBoundsExtension")),
     };
 }
 static List<Dictionary<string, object?>> DumpSlots(UObject mesh, IPackage package)
@@ -916,6 +1159,42 @@ static List<Dictionary<string, object?>> DumpSlots(UObject mesh, IPackage packag
             slots.Add(DumpSlot("", DumpPath(package, material)));
     return slots;
 }
+// The name a material's Materials/<name>.mat and .props.txt are written under. One run can export two
+// packages with one object name: a MetaHuman instance (Kellan/Face/MI_X) whose parent is a same-named
+// instance in Common/ (Common/Face/MI_X). The first package to claim a name keeps it; a later package of
+// that name, told apart by its package path, gets "<name>__2" (then __3, ...), so it can no longer
+// overwrite the instance's own overrides, and the child's Parent line names the suffixed sidecar. A
+// package without a known path never counts as different.
+static string MaterialSidecarName(Dictionary<string, string> owners, string name, string? packagePath)
+{
+    var identity = packagePath ?? "";
+    var candidate = name;
+    for (var suffix = 2; ; suffix++)
+    {
+        if (!owners.TryGetValue(candidate, out var owner))
+        {
+            owners[candidate] = identity;
+            return candidate;
+        }
+        if (owner.Length == 0 || identity.Length == 0 || owner.Equals(identity, StringComparison.OrdinalIgnoreCase))
+        {
+            // The spelling first claimed, so one package always lands on one file.
+            var claimed = owners.Keys.First(key => key.Equals(candidate, StringComparison.OrdinalIgnoreCase));
+            if (owner.Length == 0 && identity.Length > 0) owners[claimed] = identity;
+            return claimed;
+        }
+        candidate = name + "__" + suffix;
+    }
+}
+// A MaterialInstanceConstant's TextureParameterValues. CUE4Parse fills the typed array only after
+// UMaterialInstance.Deserialize returns; on a UE4 package inside a UE5 artifact (UE 4.25 materials
+// beside UE 5.1 meshes) it throws on the UE5-only cached-data flag first, so the typed array stays
+// empty although the tagged properties were already read. Those are the same values.
+static FTextureParameterValue[] InstanceTextureParameters(UMaterialInstanceConstant instance)
+    => instance.TextureParameterValues.Length > 0
+        ? instance.TextureParameterValues
+        : (instance.GetOrDefault<FStructFallback[]>("TextureParameterValues") ?? Array.Empty<FStructFallback>())
+            .Select(fallback => new FTextureParameterValue(fallback)).ToArray();
 static List<Dictionary<string, object?>> DumpTextureParameters(UObject instance, IPackage package)
 {
     var parameters = new List<Dictionary<string, object?>>();
@@ -976,6 +1255,7 @@ Dictionary<string, object?> DumpPackage(string key)
     var graphTextureParameters = new List<Dictionary<string, object?>>();
     var graphTextures = new List<string>();
     var graphVectorParameters = new List<Dictionary<string, object?>>();
+    var graphFunctions = new List<string>();
     var graphConstants = 0;
     var graphOwners = new List<Dictionary<string, object?>>();
     for (var index = 0; index < package.ExportsLazy.Length; index++)
@@ -986,6 +1266,8 @@ Dictionary<string, object?> DumpPackage(string key)
         var isMesh = className is "StaticMesh" or "SkeletalMesh";
         var isMaterialExpression = className.StartsWith("MaterialExpression", StringComparison.Ordinal);
         var isMaterial = className.StartsWith("Material", StringComparison.Ordinal) && !isMaterialExpression;
+        // An HLODProxy marks the package as a level's generated LOD stand-ins: recorded by class only.
+        if (className == "HLODProxy") { exportsJson.Add(new Dictionary<string, object?> { ["name"] = exportName, ["class"] = className }); continue; }
         if (!isMesh && !isMaterialExpression && !isMaterial) continue;
         var item = new Dictionary<string, object?> { ["name"] = exportName, ["class"] = className };
         try
@@ -1001,6 +1283,8 @@ Dictionary<string, object?> DumpPackage(string key)
                     {
                         ["origin"] = DumpVec(renderBounds.Origin), ["boxExtent"] = DumpVec(renderBounds.BoxExtent),
                         ["sphereRadius"] = DumpNum(renderBounds.SphereRadius), ["property"] = "RenderData.Bounds",
+                        ["positiveExtension"] = DumpVec(export.GetOrDefault<FVector>("PositiveBoundsExtension")),
+                        ["negativeExtension"] = DumpVec(export.GetOrDefault<FVector>("NegativeBoundsExtension")),
                     };
                 item["bounds"] = bounds;
                 if (slots.Count == 0) item["error"] = "no material slots could be read (typed mesh load may have failed)";
@@ -1022,6 +1306,11 @@ Dictionary<string, object?> DumpPackage(string key)
                     var value = export.GetOrDefault<FLinearColor>("DefaultValue");
                     graphVectorParameters.Add(new Dictionary<string, object?> { ["name"] = export.GetOrDefault<FName>("ParameterName").Text ?? "", ["value"] = new[] { DumpNum(value.R), DumpNum(value.G), DumpNum(value.B), DumpNum(value.A) } });
                 }
+                else if (className == "MaterialExpressionMaterialFunctionCall")
+                {
+                    var function = DumpPath(package, export.GetOrDefault<FPackageIndex>("MaterialFunction"));
+                    if (function is not null && !graphFunctions.Contains(function, StringComparer.OrdinalIgnoreCase)) graphFunctions.Add(function);
+                }
                 else if (className is "MaterialExpressionConstant3Vector" or "MaterialExpressionConstant4Vector") graphConstants++;
                 continue;
             }
@@ -1031,6 +1320,7 @@ Dictionary<string, object?> DumpPackage(string key)
                 {
                     item["textureParameters"] = graphTextureParameters;
                     item["textures"] = graphTextures;
+                    item["functions"] = graphFunctions;
                     item["vectorParameters"] = graphVectorParameters;
                     item["constantColors"] = 0;
                     graphOwners.Add(item);
@@ -1053,8 +1343,11 @@ Dictionary<string, object?> DumpPackage(string key)
 var exported = 0;
 var mappingRequired = false;
 Exception? lastLoadError = null;
+var textureFailures = new List<string>();
 var selectedExportTypes = new HashSet<string>(StringComparer.Ordinal);
 var exportedMaterials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+// Materials/<name>.mat and .props.txt per sidecar name -> the package that owns it (see MaterialSidecarName).
+var materialSidecarOwners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var exportedSprites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 var exportedMeshes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 var assetLookupDiagnostics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1083,9 +1376,10 @@ async Task<bool> ExportPaperSpriteAsync(UPaperSprite sprite)
         var textureFile = Directory.EnumerateFiles(root, textureName + ".uasset", SearchOption.AllDirectories).FirstOrDefault();
         if (textureFile is null || new FileInfo(textureFile).Length > 1_073_741_824) return false;
         var packageBytes = await File.ReadAllBytesAsync(textureFile);
-        var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
+        var spriteTexture = LoadAssetByName<UTexture>(textureName);
+        var sourcePng = ExtractSourcePng(packageBytes, spriteTexture);
         if (sourcePng is null) return false;
-        await File.WriteAllBytesAsync(textureTarget, NormalizeSourcePng(sourcePng, LoadAssetByName<UTexture>(textureName)));
+        await File.WriteAllBytesAsync(textureTarget, NormalizeSourcePng(sourcePng, spriteTexture));
     }
     var descriptor = new {
         Name = sprite.Name,
@@ -1143,15 +1437,71 @@ FPackageIndex ResolveSkeletalMesh(USceneComponent component) =>
         ? skinnedComponent.GetSkeletalMesh()
         : component.GetOrDefault("SkeletalMesh", component.GetOrDefault("SkinnedAsset", new FPackageIndex()));
 
-async Task ExportMaterialAsync(string initialName)
+// /Game/A/MI_X.MI_X (or a provider key Pack/Content/A/MI_X.uasset) -> /Game/A/MI_X.
+static string GamePackagePath(string path)
 {
-    var pending = new Queue<string>();
-    pending.Enqueue(initialName);
-    while (pending.TryDequeue(out var materialName))
+    var game = DumpGamePath(path);
+    foreach (var suffix in new[] { ".uasset", ".umap" })
+        if (game.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return game[..^suffix.Length];
+    var slash = game.LastIndexOf('/');
+    var dot = game.IndexOf('.', slash + 1);
+    return dot >= 0 ? game[..dot] : game;
+}
+// Two packages can share a material's object name (MI_Wanted2 beside two posters). The package path, when the
+// referrer names it, picks the right one; the first by name is only the fallback.
+string? MaterialKey(string materialName, string? packagePath)
+{
+    var byName = provider.Files.Keys.Where(candidate => Path.GetFileNameWithoutExtension(candidate).Equals(materialName, StringComparison.OrdinalIgnoreCase)).ToList();
+    if (packagePath is not null)
     {
-        if (!exportedMaterials.Add(materialName)) continue;
-        var materialKey = provider.Files.Keys.FirstOrDefault(candidate => Path.GetFileNameWithoutExtension(candidate).Equals(materialName, StringComparison.OrdinalIgnoreCase));
+        var exact = byName.FirstOrDefault(candidate => GamePackagePath(candidate).Equals(packagePath, StringComparison.OrdinalIgnoreCase));
+        if (exact is not null) return exact;
+    }
+    return byName.FirstOrDefault();
+}
+static string? ResolvedPackagePath(ResolvedObject? resolved)
+{
+    try { var path = resolved?.GetPathName(); return string.IsNullOrEmpty(path) ? null : GamePackagePath(path); }
+    catch { return null; }
+}
+static string? IndexPackagePath(FPackageIndex? index)
+{
+    if (index is null || index.IsNull) return null;
+    try { return ResolvedPackagePath(index.ResolvedObject); } catch { return null; }
+}
+// Meshes/<mesh>.materials.json: slot material object name -> package path, so the importer can tell same-named
+// materials apart. A name two slots take from different packages is left out.
+async Task WriteMeshMaterialPackagesAsync(string meshName, IEnumerable<FPackageIndex?> materials)
+{
+    var packages = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+    foreach (var material in materials)
+    {
+        if (material is null || material.IsNull || string.IsNullOrWhiteSpace(material.Name)) continue;
+        var path = IndexPackagePath(material);
+        if (path is null) continue;
+        packages[material.Name] = packages.TryGetValue(material.Name, out var known) && (known is null || !known.Equals(path, StringComparison.OrdinalIgnoreCase)) ? null : path;
+    }
+    var known2 = packages.Where(entry => entry.Value is not null).ToDictionary(entry => entry.Key, entry => entry.Value!);
+    if (known2.Count == 0) return;
+    await File.WriteAllTextAsync(Path.Combine(output, "Meshes", meshName + ".materials.json"), JsonConvert.SerializeObject(known2));
+}
+
+async Task ExportMaterialAsync(string initialName, string? initialPath = null)
+{
+    var pending = new Queue<(string Name, string? Path)>();
+    pending.Enqueue((initialName, initialPath));
+    while (pending.TryDequeue(out var next))
+    {
+        var materialName = next.Name;
+        if (!exportedMaterials.Add(next.Path ?? materialName)) continue;
+        var sidecarName = MaterialSidecarName(materialSidecarOwners, materialName, next.Path);
+        var materialKey = MaterialKey(materialName, next.Path);
         if (materialKey is null) continue;
+        // A parent whose own package is not in the pack falls back to the first package of its name. When that is one
+        // this run already wrote (the instance itself, for a same-named parent), writing it again under the parent's
+        // sidecar name would only make the instance its own parent: the parent stays absent instead.
+        if (next.Path is not null && !GamePackagePath(materialKey).Equals(next.Path, StringComparison.OrdinalIgnoreCase) &&
+            exportedMaterials.Contains(GamePackagePath(materialKey))) continue;
         IPackage package;
         try { package = provider.LoadPackage(materialKey); } catch { continue; }
         var exports = package.GetExports().ToArray();
@@ -1161,9 +1511,20 @@ async Task ExportMaterialAsync(string initialName)
         var references = new List<(string Parameter, string Texture)>();
         if (material is UMaterialInstanceConstant instance)
         {
-            foreach (var parameter in instance.TextureParameterValues)
+            foreach (var parameter in InstanceTextureParameters(instance))
                 if (!parameter.ParameterValue.IsNull && parameter.ParameterValue.Name != "None")
                     references.Add((parameter.Name, parameter.ParameterValue.Name));
+            // An editor-saved UE5.3 instance leaves the typed array empty while its tagged TextureParameterValues
+            // hold every override (the property dump reads them this way), so the instance bound its parent's
+            // defaults (T_Default_N) instead of its own textures. Read the tagged structs as well.
+            foreach (var parameter in instance.GetOrDefault<FStructFallback[]>("TextureParameterValues") ?? Array.Empty<FStructFallback>())
+            {
+                var info = parameter.GetOrDefault<FStructFallback>("ParameterInfo");
+                var parameterName = info is not null ? info.GetOrDefault<FName>("Name").Text : parameter.GetOrDefault<FName>("ParameterName").Text;
+                var value = parameter.GetOrDefault<FPackageIndex>("ParameterValue");
+                if (string.IsNullOrEmpty(parameterName) || parameterName == "None" || value is null || value.IsNull || value.Name == "None") continue;
+                references.Add((parameterName, value.Name));
+            }
         }
         foreach (var expression in exports.OfType<UMaterialExpressionTextureBase>())
         {
@@ -1175,19 +1536,25 @@ async Task ExportMaterialAsync(string initialName)
         }
 
         var parentName = "";
+        var parentSidecar = "";
+        string? parentPath = null;
         if (material.TryGetValue<FPackageIndex>(out var parent, "Parent") && !parent.IsNull && parent.Name != "None")
         {
             parentName = parent.Name;
-            pending.Enqueue(parentName);
+            try { parentPath = ResolvedPackagePath(package.ResolvePackageIndex(parent)); } catch { parentPath = null; }
+            pending.Enqueue((parentName, parentPath));
+            // Claimed now, so this instance's Parent line names the sidecar the parent is written under.
+            parentSidecar = MaterialSidecarName(materialSidecarOwners, parentName, parentPath);
         }
 
         references = references.Distinct().ToList();
         var materialDirectory = Path.Combine(output, "Materials");
         Directory.CreateDirectory(materialDirectory);
         var mat = string.Join("\n", references.Select((entry, index) => $"Other[{index}]={entry.Texture}")) + "\n";
-        await File.WriteAllTextAsync(Path.Combine(materialDirectory, materialName + ".mat"), mat);
+        await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".mat"), mat);
         var props = new StringBuilder();
-        if (parentName.Length > 0) props.AppendLine($"Parent = Material'{parentName}.{parentName}'");
+        // The parent's package path lets the importer pick between same-named parents.
+        if (parentName.Length > 0) props.AppendLine($"Parent = Material'{(parentPath is null ? parentName : parentPath)}.{parentSidecar}'");
         if (material is UMaterial baseMaterial)
         {
             props.AppendLine($"BlendMode = {baseMaterial.BlendMode}");
@@ -1212,7 +1579,7 @@ async Task ExportMaterialAsync(string initialName)
             props.AppendLine("    }");
         }
         props.AppendLine("}");
-        await File.WriteAllTextAsync(Path.Combine(materialDirectory, materialName + ".props.txt"), props.ToString());
+        await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".props.txt"), props.ToString());
 
         foreach (var textureName in references.Select(entry => entry.Texture).Distinct(StringComparer.OrdinalIgnoreCase))
         {
@@ -1224,8 +1591,9 @@ async Task ExportMaterialAsync(string initialName)
             // UE5.1+ keeps large source art inside an FCompressedBuffer payload, like every other
             // editor texture site; without this fallback a level's materials lost their textures.
             var textureBytes = await File.ReadAllBytesAsync(textureFile);
-            var sourcePng = ExtractLargestPng(textureBytes) ?? ExtractCompressedPayloadPng(textureBytes);
-            if (sourcePng is not null) await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, LoadAssetByName<UTexture>(textureName)));
+            var sourceTexture = LoadAssetByName<UTexture>(textureName);
+            var sourcePng = ExtractSourcePng(textureBytes, sourceTexture);
+            if (sourcePng is not null) await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, sourceTexture));
         }
     }
 }
@@ -1247,6 +1615,7 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
         if (!ExportEditorStaticMesh(mesh, staticMaterials, target))
         {
             exportedMeshes.Remove(identity);
+            meshFailures[mesh.Name] = assetLookupDiagnostics.GetValueOrDefault(mesh.Name, "the uncooked static mesh could not be decoded");
             return false;
         }
     }
@@ -1260,12 +1629,15 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
         if (emitted is null || !File.Exists(emitted))
         {
             exportedMeshes.Remove(identity);
+            RecordMeshFailure(mesh.Name, "static mesh", results);
             return false;
         }
         if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
     }
-    foreach (var materialName in staticMaterials.Select(slot => slot.MaterialInterface?.Name).Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase))
-        await ExportMaterialAsync(materialName!);
+    meshFailures.Remove(mesh.Name);
+    await WriteMeshMaterialPackagesAsync(mesh.Name, staticMaterials.Select(slot => slot.MaterialInterface));
+    foreach (var slot in staticMaterials.Where(slot => !string.IsNullOrWhiteSpace(slot.MaterialInterface?.Name)))
+        await ExportMaterialAsync(slot.MaterialInterface!.Name, IndexPackagePath(slot.MaterialInterface));
     return true;
 }
 
@@ -1285,10 +1657,14 @@ bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials,
         assetLookupDiagnostics[mesh.Name] = "uncooked mesh package was not mounted";
         return false;
     }
-    var editorMesh = ReadLargestMeshDescription(file.Read());
+    // The triangle count LOD0's source model cached when the mesh was saved: the cross-check that lets
+    // a payload with a stale tail through (see ReadMeshDescription).
+    var cachedTriangles = (int)((mesh.GetOrDefault<FStructFallback[]>("SourceModels") ?? Array.Empty<FStructFallback>())
+        .FirstOrDefault()?.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount") ?? 0);
+    var editorMesh = ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles);
     if (editorMesh is null)
     {
-        assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model";
+        assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model" + (refusal is null ? "" : $" ({refusal})");
         return false;
     }
     // Same material naming as the cooked glTF writer (MeshMaterialDto.SlotName): the material
@@ -1331,6 +1707,52 @@ T? LoadAssetByName<T>(string name) where T : UObject
     return null;
 }
 
+void RecordMeshFailure(string name, string kind, IEnumerable<ExportResult> results)
+{
+    var parts = new List<string>();
+    if (packageReadFailures.TryGetValue(name, out var readFailure))
+        parts.Add($"the {kind} package could not be deserialized ({readFailure}{(olderEngineAttempts is null ? "" : "; it also failed under the " + olderEngineAttempts + " profiles")})");
+    var error = results.Select(result => result.Error).FirstOrDefault(candidate => candidate is not null);
+    if (error is not null) parts.Add($"the exporter failed ({error.GetType().Name}: {error.Message})");
+    if (parts.Count == 0) parts.Add($"the exporter wrote no glTF for this {kind}");
+    var flat = string.Join(' ', string.Join("; ", parts).Split(new[] { '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    meshFailures[name] = flat.Length <= 500 ? flat : flat[..500];
+}
+
+// A package that predates the run's engine profile (a UE4 or early UE5 package read as UE5.3) lists
+// fewer custom versions, so CUE4Parse fills the gaps from the profile and reads the file in a later layout (a wider soft-vertex, for
+// one). The package then yields a SkeletalMesh with no LODs. Re-reading it under an older UE4
+// profile is the only decoder that can tell, and costs nothing for a mesh that already loaded.
+var olderEngineProviders = new Dictionary<EGame, DefaultFileProvider>();
+USkeletalMesh? ReloadSkeletalMeshWithOlderEngine(string packageKey, string meshName)
+{
+    if (game < EGame.GAME_UE4_0) return null;
+    foreach (var older in new[] { EGame.GAME_UE4_27, EGame.GAME_UE4_24, EGame.GAME_UE4_22, EGame.GAME_UE4_20 })
+    {
+        if (older >= game) continue;
+        try
+        {
+            if (!olderEngineProviders.TryGetValue(older, out var olderProvider))
+            {
+                olderProvider = new DefaultFileProvider(root, SearchOption.AllDirectories, new VersionContainer(older), StringComparer.OrdinalIgnoreCase);
+                if (mappings.Length == 1) olderProvider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
+                olderProvider.Initialize();
+                olderProvider.PostMount();
+                olderEngineProviders[older] = olderProvider;
+            }
+            var candidate = olderProvider.LoadPackage(packageKey).GetExports().OfType<USkeletalMesh>().FirstOrDefault(item => item.Name == meshName);
+            if (candidate?.LODModels is { Length: > 0 })
+            {
+                packageReadFailures.Remove(meshName);
+                return candidate;
+            }
+        }
+        catch (Exception) { }
+    }
+    olderEngineAttempts = "UE 4.27, 4.24, 4.22 and 4.20";
+    return null;
+}
+
 async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
 {
     var identity = mesh.GetPathName();
@@ -1356,8 +1778,10 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
     if (glbByLod.Count == 0)
     {
         exportedMeshes.Remove(identity);
+        RecordMeshFailure(mesh.Name, "skeletal mesh", results);
         return false;
     }
+    meshFailures.Remove(mesh.Name);
     foreach (var (lod, path) in glbByLod)
     {
         var lodTarget = Path.Combine(output, "Meshes", lod == 0 ? mesh.Name + ".glb" : mesh.Name + "_LOD" + lod + ".glb");
@@ -1371,8 +1795,9 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
         var dnaTarget = Path.Combine(output, "Meshes", mesh.Name + ".dna");
         if (!Path.GetFullPath(dna).Equals(Path.GetFullPath(dnaTarget), StringComparison.OrdinalIgnoreCase)) File.Move(dna, dnaTarget, true);
     }
-    foreach (var materialName in mesh.SkeletalMaterials.Select(slot => slot.Material?.Name).Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase))
-        await ExportMaterialAsync(materialName!);
+    await WriteMeshMaterialPackagesAsync(mesh.Name, mesh.SkeletalMaterials.Select(slot => slot.Material));
+    foreach (var slot in mesh.SkeletalMaterials.Where(slot => !string.IsNullOrWhiteSpace(slot.Material?.Name)))
+        await ExportMaterialAsync(slot.Material!.Name, IndexPackagePath(slot.Material));
     return true;
 }
 
@@ -1390,7 +1815,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
     foreach (var export in package.GetExports()) selectedExportTypes.Add(export.GetType().Name);
     foreach (var mesh in package.GetExports().OfType<USkeletalMesh>())
     {
-        if (await ExportSkeletalMeshAsync(mesh)) exported++;
+        var readable = mesh.LODModels is { Length: > 0 } ? mesh : ReloadSkeletalMeshWithOlderEngine(key, mesh.Name) ?? mesh;
+        if (await ExportSkeletalMeshAsync(readable)) exported++;
     }
     foreach (var mesh in package.GetExports().OfType<UStaticMesh>())
     {
@@ -1403,7 +1829,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
             ExportGroomPayloads(groomFile.Read(), asset.Name) > 0) exported++;
     foreach (var material in package.GetExports().OfType<UMaterialInterface>())
     {
-        await ExportMaterialAsync(material.Name);
+        await ExportMaterialAsync(material.Name, GamePackagePath(key));
         exported++;
     }
     foreach (var world in package.GetExports().OfType<UWorld>())
@@ -1842,7 +2268,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     if (packageFile is not null && new FileInfo(packageFile).Length <= 1_073_741_824)
                         packageBytes = await File.ReadAllBytesAsync(packageFile);
                 }
-                var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
+                var sourcePng = ExtractSourcePng(packageBytes, texture);
                 if (sourcePng is not null) await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, texture));
             }
             if (File.Exists(target)) pageFiles.Add(targetName);
@@ -1897,14 +2323,29 @@ foreach (var key in provider.Files.Keys.Where(key =>
             // on the UE5 version, the complete source PNG is inline or wrapped in FCompressedBuffer
             // blocks. Preserving it is lossless and does not require the derived-data cache.
             var normalizedKey = key.Replace('\\', '/');
+            // An export is named for the object (Texture2D_0 inside a material package), not for
+            // the file, so the package's own key resolves it before the export name does.
+            var packageFiles = Directory.EnumerateFiles(root, Path.GetFileNameWithoutExtension(key) + ".uasset", SearchOption.AllDirectories)
+                .Where(candidate => normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
+                .ToArray();
             var candidates = Directory.EnumerateFiles(root, texture.Name + ".uasset", SearchOption.AllDirectories).ToArray();
-            var textureFile = candidates.FirstOrDefault(candidate =>
-                normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
+            var textureFile = packageFiles.FirstOrDefault()
+                ?? candidates.FirstOrDefault(candidate =>
+                    normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
                 ?? (candidates.Length == 1 ? candidates[0] : null);
-            if (textureFile is null || new FileInfo(textureFile).Length > 1_073_741_824) continue;
+            if (textureFile is null || new FileInfo(textureFile).Length > 1_073_741_824)
+            {
+                textureFailures.Add(ReportTextureFailure(texture, results, textureFile is null ? "texture package file not found on disk" : "texture package exceeds 1 GiB", []));
+                continue;
+            }
             var packageBytes = await File.ReadAllBytesAsync(textureFile);
-            var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
-            if (sourcePng is null) continue;
+            var payloadFailures = new List<string>();
+            var sourcePng = ExtractSourcePng(packageBytes, texture, payloadFailures);
+            if (sourcePng is null)
+            {
+                textureFailures.Add(ReportTextureFailure(texture, results, "no decodable pixel data", payloadFailures));
+                continue;
+            }
             await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, texture));
         }
         exported++;
@@ -2009,7 +2450,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 var sourceFile = Directory.EnumerateFiles(root, sheet.Name + ".uasset", SearchOption.AllDirectories).FirstOrDefault();
                 if (sourceFile is not null && new FileInfo(sourceFile).Length <= 1_073_741_824)
                 {
-                    var sourcePng = ExtractLargestPng(await File.ReadAllBytesAsync(sourceFile)) ?? ExtractCompressedPayloadPng(await File.ReadAllBytesAsync(sourceFile));
+                    var sourcePng = ExtractSourcePng(await File.ReadAllBytesAsync(sourceFile), sheet);
                     if (sourcePng is not null) await File.WriteAllBytesAsync(textureTarget, NormalizeSourcePng(sourcePng, sheet));
                 }
             }
@@ -2105,9 +2546,11 @@ foreach (var key in provider.Files.Keys.Where(key =>
         exported++;
     }
 }
+foreach (var (failedMesh, failureDetail) in meshFailures)
+    Console.Error.WriteLine($"threenative-mesh-failure\t{failedMesh}\t{failureDetail}");
 if (exported == 0 && mappingRequired) throw new InvalidDataException("This cooked UE5 package uses unversioned properties. Place its game-compatible .usmap mapping file in the imported directory.");
 if (exported == 0 && lastLoadError is not null) throw new InvalidDataException("CUE4Parse could not decode the selected Unreal package.", lastLoadError);
-if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}.");
+if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
 
 static byte[] EncodeBgre8AsRadiance(byte[] source, int width, int height)
 {
@@ -2172,14 +2615,36 @@ static byte[]? ExtractCompressedPayloadWave(byte[] bytes)
     return null;
 }
 
-static byte[]? ExtractCompressedPayloadPng(byte[] bytes)
+// A texture the converter cannot write is reported with the evidence that decides the cause, so the
+// importer can say "pixel data not present in the pack" instead of a bare exit code.
+static string ReportTextureFailure(UTexture2D texture, IEnumerable<ExportResult> results, string reason, List<string> payloadFailures)
+{
+    var source = texture.GetOrDefault<FStructFallback?>("Source", null);
+    var mip = texture.GetFirstMip();
+    var exportErrors = string.Join(" | ", results.Where(item => item.Error is not null).Select(item => item.Error!.GetType().Name + ": " + item.Error.Message));
+    var message =
+        $"threenative-texture-failure {texture.Name}: {reason}; " +
+        $"platformFormat={texture.PlatformData?.PixelFormat}, mips={texture.PlatformData?.Mips?.Length ?? 0}, firstMipBulk={(mip?.BulkData is { } bulk ? bulk.Header.ElementCount : -1)}, " +
+        $"compression={texture.CompressionSettings}, srgb={texture.SRGB}, sourceFormat={source?.GetOrDefault<FName>("Format").Text}, " +
+        $"sourceCompression={source?.GetOrDefault<FName>("CompressionFormat").Text}, " +
+        $"editorPayload={(texture.EditorData is { } editor ? $"{editor.Payload.Header.Method}/{editor.Payload.Header.TotalRawSize}B/offset {editor.OffsetInFile}" : "none")}, " +
+        $"exportErrors=[{exportErrors}], payload=[{string.Join(" | ", payloadFailures)}]";
+    Console.Error.WriteLine(message);
+    return message;
+}
+
+static byte[]? ExtractCompressedPayloadPng(byte[] bytes, List<string>? failures = null)
 {
     ReadOnlySpan<byte> magic = [0xb7, 0x75, 0x63, 0x62];
     var searchAt = 0;
     while (searchAt <= bytes.Length - magic.Length)
     {
         var relativeAt = bytes.AsSpan(searchAt).IndexOf(magic);
-        if (relativeAt < 0) return null;
+        if (relativeAt < 0)
+        {
+            if (searchAt == 0) failures?.Add("the package holds no editor source payload and no cooked mip (pixel data is not in the pack)");
+            return null;
+        }
         var payloadAt = searchAt + relativeAt;
         searchAt = payloadAt + magic.Length;
         try
@@ -2189,30 +2654,237 @@ static byte[]? ExtractCompressedPayloadPng(byte[] bytes)
             var payload = new FCompressedBuffer(archive);
             if (payload.Header.TotalRawSize == 0 || payload.Header.TotalRawSize > 1_073_741_824) continue;
             var raw = DecompressEditorPayload(payload);
-            var png = ExtractLargestPng(raw);
+            var png = ExtractLargestPng(raw) ?? ExtractLargestJpegAsPng(raw);
             if (png is not null) return png;
+            failures?.Add($"payload at {payloadAt} ({payload.Header.Method}, {payload.Header.TotalRawSize} bytes) decoded but holds no PNG or JPEG");
         }
-        catch
+        catch (Exception error)
         {
             // The magic may occur in unrelated bulk bytes. Continue to the next bounded candidate.
+            failures?.Add($"payload at {payloadAt}: {error.GetType().Name}: {error.Message}");
         }
     }
     return null;
+}
+
+// Editor source art in the order every exporter should try it: a TSCF_UEDELTA payload (raw pixels,
+// row-delta filtered, UE 5.6+), then an inline PNG, then a PNG or JPEG inside a compressed payload.
+static byte[]? ExtractSourcePng(byte[] bytes, UTexture? texture, List<string>? failures = null)
+    => ExtractUeDeltaSourcePng(bytes, texture, failures) ?? ExtractLargestPng(bytes) ?? ExtractCompressedPayloadPng(bytes, failures);
+
+// TSCF_UEDELTA (UE 5.6+ editor default for 8- and 16-bit sources): the payload is the raw source
+// pixels with each tile's rows replaced by their difference from the row above. Decoding it needs
+// the source's size and format from the Source struct, so it cannot be found by scanning for an
+// image signature; without this a UE 5.6+ pack exported no colour textures at all.
+static byte[]? ExtractUeDeltaSourcePng(byte[] bytes, UTexture? texture, List<string>? failures)
+{
+    var source = texture?.GetOrDefault<FStructFallback?>("Source", null);
+    if (source is null) return null;
+    var compression = source.GetOrDefault<FName>("CompressionFormat").Text ?? "";
+    if (!compression.EndsWith("TSCF_UEDELTA", StringComparison.Ordinal)) return null;
+    var format = source.GetOrDefault<FName>("Format").Text ?? "";
+    format = format[(format.LastIndexOf(':') + 1)..];
+    var width = source.GetOrDefault<int>("SizeX");
+    var height = source.GetOrDefault<int>("SizeY");
+    var slices = Math.Max(1, source.GetOrDefault<int>("NumSlices"));
+    var mips = Math.Max(1, source.GetOrDefault<int>("NumMips"));
+    var layers = Math.Max(1, source.GetOrDefault<int>("NumLayers"));
+    var blocks = source.GetOrDefault<FStructFallback[]>("Blocks") ?? Array.Empty<FStructFallback>();
+    if (layers > 1 || blocks.Length > 0)
+    {
+        failures?.Add($"TSCF_UEDELTA source with {layers} layers and {blocks.Length} extra blocks is not supported");
+        return null;
+    }
+    var (bytesPerPixel, sampleBytes) = UeDeltaPixelLayout(format);
+    if (bytesPerPixel == 0 || width <= 0 || height <= 0)
+    {
+        failures?.Add($"TSCF_UEDELTA source format {format} ({width}x{height}) is not supported");
+        return null;
+    }
+    long total = 0;
+    for (var mip = 0; mip < mips; mip++) total += (long) Math.Max(1, width >> mip) * Math.Max(1, height >> mip) * slices * bytesPerPixel;
+    foreach (var (at, rawSize) in ScanEditorPayloads(bytes))
+    {
+        if ((long) rawSize != total) continue;
+        try
+        {
+            using var archive = new FByteArchive("editor-payload", bytes);
+            archive.Position = at;
+            var pixels = DecompressEditorPayload(new FCompressedBuffer(archive));
+            // Mip 0, slice 0 is all the importer keeps; it is the first image in the payload.
+            UndoUeDelta(pixels, 0, width, height, bytesPerPixel, sampleBytes);
+            var png = EncodeSourcePixels(pixels, width, height, format, texture!.SRGB);
+            RawDerived.Table.Add(png, new object());
+            return png;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            failures?.Add($"TSCF_UEDELTA payload at {at}: {error.GetType().Name}: {error.Message}");
+        }
+    }
+    failures?.Add($"no TSCF_UEDELTA payload of {total} bytes ({format} {width}x{height}, {mips} mips, {slices} slices)");
+    return null;
+}
+
+// Bytes per pixel and per delta sample of each source format the delta filter covers (0 = not
+// covered). Float formats are never delta coded.
+static (int BytesPerPixel, int SampleBytes) UeDeltaPixelLayout(string format) => format switch
+{
+    "TSF_G8" => (1, 1),
+    "TSF_BGRA8" or "TSF_BGRE8" => (4, 1),
+    "TSF_G16" => (2, 2),
+    "TSF_RGBA16" => (8, 2),
+    _ => (0, 0),
+};
+
+// The inverse of Unreal's row delta (ImageCoreDelta). The image is cut into tiles that are each
+// coded on their own: rows wider than 4096 bytes are split into columns of a cache-line multiple,
+// and each column into runs of rows of about 32768 pixels (at most 512 runs). A tile's first row is
+// stored as is; every later sample is the difference from the sample above it, plus 0x8080 for
+// 16-bit samples. The cut rules are part of the file format, so they are reproduced exactly.
+static void UndoUeDelta(byte[] data, long offset, int width, int height, int bytesPerPixel, int sampleBytes)
+{
+    const long minPixelsPerCut = 32768, minPixelsForAnyCut = 136 * 136, cutStrideBytes = 4096, maxNumCuts = 512;
+    long strideBytes = (long) width * bytesPerPixel;
+    static long RowsPerCut(long sizeX, long sizeY)
+    {
+        var pixels = sizeX * sizeY;
+        long cuts = 1;
+        if (pixels > minPixelsPerCut)
+        {
+            cuts = pixels / minPixelsPerCut;
+            while (cuts > maxNumCuts) cuts >>= 1;
+        }
+        return (sizeY + cuts - 1) / cuts;
+    }
+    void Tile(long startX, long tileWidth, long startY, long tileHeight)
+    {
+        var rowBytes = tileWidth * bytesPerPixel;
+        for (var y = startY + 1; y < startY + tileHeight; y++)
+        {
+            var row = offset + y * strideBytes + startX * bytesPerPixel;
+            var above = row - strideBytes;
+            if (sampleBytes == 1)
+            {
+                for (long x = 0; x < rowBytes; x++) data[row + x] = (byte) (data[row + x] + data[above + x]);
+            }
+            else
+            {
+                for (long x = 0; x < rowBytes; x += 2)
+                {
+                    var delta = data[row + x] | (data[row + x + 1] << 8);
+                    var up = data[above + x] | (data[above + x + 1] << 8);
+                    var value = (delta + up - 0x8080) & 0xFFFF;
+                    data[row + x] = (byte) value;
+                    data[row + x + 1] = (byte) (value >> 8);
+                }
+            }
+        }
+    }
+    if ((long) width * height <= minPixelsForAnyCut)
+    {
+        Tile(0, width, 0, height);
+        return;
+    }
+    long partPixels = width;
+    if (strideBytes > cutStrideBytes)
+    {
+        var parts = (strideBytes + cutStrideBytes - 1) / cutStrideBytes;
+        var partBytes = (strideBytes + parts / 2) / parts;
+        partBytes = (partBytes + 63) & ~63L;
+        partPixels = partBytes / bytesPerPixel;
+    }
+    for (long startX = 0; startX < width; startX += partPixels)
+    {
+        var tileWidth = Math.Min(partPixels, width - startX);
+        var rows = RowsPerCut(tileWidth, height);
+        for (long startY = 0; startY < height; startY += rows) Tile(startX, tileWidth, startY, Math.Min(rows, height - startY));
+    }
+}
+
+// Raw source pixels (mip 0, slice 0) as an RGBA PNG in true colour. A 16-bit sRGB source is linear
+// light, so it is encoded to sRGB like the 16-bit PNG source path does.
+static byte[] EncodeSourcePixels(byte[] pixels, int width, int height, string format, bool srgb)
+{
+    var rgba = new byte[(long) width * height * 4];
+    var count = (long) width * height;
+    switch (format)
+    {
+        case "TSF_G8":
+            for (long i = 0; i < count; i++) { var g = pixels[i]; rgba[i * 4] = g; rgba[i * 4 + 1] = g; rgba[i * 4 + 2] = g; rgba[i * 4 + 3] = 255; }
+            break;
+        case "TSF_BGRA8":
+        case "TSF_BGRE8":
+            for (long i = 0; i < count; i++)
+            {
+                rgba[i * 4] = pixels[i * 4 + 2];
+                rgba[i * 4 + 1] = pixels[i * 4 + 1];
+                rgba[i * 4 + 2] = pixels[i * 4];
+                rgba[i * 4 + 3] = pixels[i * 4 + 3];
+            }
+            break;
+        case "TSF_G16":
+        case "TSF_RGBA16":
+        {
+            var lut = new byte[65536];
+            for (var value = 0; value < lut.Length; value++)
+            {
+                var linear = value / 65535.0;
+                var encoded = srgb ? (linear <= 0.0031308 ? linear * 12.92 : 1.055 * Math.Pow(linear, 1 / 2.4) - 0.055) : linear;
+                lut[value] = (byte) Math.Clamp(Math.Round(encoded * 255), 0, 255);
+            }
+            int Sample(long index) => pixels[index] | (pixels[index + 1] << 8);
+            for (long i = 0; i < count; i++)
+            {
+                if (format == "TSF_G16")
+                {
+                    var g = lut[Sample(i * 2)];
+                    rgba[i * 4] = g; rgba[i * 4 + 1] = g; rgba[i * 4 + 2] = g; rgba[i * 4 + 3] = 255;
+                    continue;
+                }
+                rgba[i * 4] = lut[Sample(i * 8)];
+                rgba[i * 4 + 1] = lut[Sample(i * 8 + 2)];
+                rgba[i * 4 + 2] = lut[Sample(i * 8 + 4)];
+                rgba[i * 4 + 3] = (byte) Math.Clamp(Math.Round(Sample(i * 8 + 6) / 257.0), 0, 255); // alpha is coverage, not light
+            }
+            break;
+        }
+        default:
+            throw new InvalidDataException($"Unsupported source format {format}.");
+    }
+    var info = new SkiaSharp.SKImageInfo(width, height, SkiaSharp.SKColorType.Rgba8888, SkiaSharp.SKAlphaType.Unpremul);
+    var handle = GCHandle.Alloc(rgba, GCHandleType.Pinned);
+    try
+    {
+        using var pixmap = new SkiaSharp.SKPixmap(info, handle.AddrOfPinnedObject());
+        using var png = pixmap.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100) ?? throw new InvalidDataException("PNG encode failed.");
+        return png.ToArray();
+    }
+    finally
+    {
+        handle.Free();
+    }
 }
 
 // The LOD0 source model of an uncooked UE5 StaticMesh. Its package trailer holds one
 // FMeshDescription payload per source-model LOD, so the largest raw payload that parses is LOD0.
 // Every other payload in a StaticMesh package is also a mesh description, so ranking by the
 // header's raw size decompresses only what is kept.
-static EditorMesh? ReadLargestMeshDescription(byte[] bytes)
+static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal, int cachedTriangles = 0)
 {
+    refusal = null;
     foreach (var (at, _) in ScanEditorPayloads(bytes))
     {
         try
         {
             using var archive = new FByteArchive("editor-payload", bytes);
             archive.Position = at;
-            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)));
+            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)), cachedTriangles);
+        }
+        catch (NotSupportedException error)
+        {
+            // A mesh description in a layout this reader knows it cannot map; say so.
+            refusal ??= error.Message;
         }
         catch
         {
@@ -2280,7 +2952,40 @@ int ExportGroomPayloads(byte[] bytes, string name)
 // UE5's FMeshDescription serialization, as verified byte-exact on the Common Hazel packs (see
 // docs/PRDs/done/ue5-mesh-description-reference.py for the annotated layout). Throws unless the
 // whole payload is consumed, so a layout drift is a refusal rather than garbage geometry.
-static EditorMesh ReadMeshDescription(byte[] raw)
+//
+// Some UE 5.8 re-saves (the LookAtPOI border props) store a payload longer than the description it
+// holds: every declared element type parses, then the tail repeats the cut-off start of an earlier,
+// different serialization. Such a payload is kept only when cachedTriangles (the source model's
+// CacheMeshDescriptionTrianglesCount, written at save time) equals the decoded live triangle count and
+// exactly one FName layout reads it that way; without that count, or with a mismatch, it stays a refusal.
+static EditorMesh ReadMeshDescription(byte[] raw, int cachedTriangles = 0)
+{
+    // Both FName array layouts are tried; only one consumes the whole payload.
+    try
+    {
+        return ReadMeshDescriptionLayout(raw, compactNames: false, 0);
+    }
+    catch (Exception error) when (error is not OutOfMemoryException)
+    {
+        try
+        {
+            return ReadMeshDescriptionLayout(raw, compactNames: true, 0);
+        }
+        catch (InvalidDataException strict) when (cachedTriangles > 0)
+        {
+            var readings = new List<EditorMesh>();
+            foreach (var compactNames in new[] { false, true })
+            {
+                try { readings.Add(ReadMeshDescriptionLayout(raw, compactNames, cachedTriangles)); }
+                catch (Exception tolerant) when (tolerant is not OutOfMemoryException) { }
+            }
+            if (readings.Count == 1) return readings[0];
+            throw readings.Count == 0 ? strict : new InvalidDataException("Mesh description with a trailing tail reads in both FName layouts.");
+        }
+    }
+}
+
+static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int cachedTriangles)
 {
     using var stream = new MemoryStream(raw, false);
     using var reader = new BinaryReader(stream);
@@ -2326,6 +3031,19 @@ static EditorMesh ReadMeshDescription(byte[] raw)
                     if (kind == 6)
                     {
                         var count = reader.ReadInt32();
+                        if (compactNames)
+                        {
+                            // UE 5.8 re-saves (Paladin weapons, LookAtPOI props): the element count is
+                            // followed by a distinct-name count and the distinct names. Every package
+                            // seen so far holds one distinct name, which then names every element;
+                            // with more, the element-to-name mapping is unknown, so refuse.
+                            var distinct = reader.ReadInt32();
+                            if (distinct != (count == 0 ? 0 : 1))
+                                throw new NotSupportedException($"FName attribute {attribute} has {distinct} distinct names for {count} elements in the UE 5.8 compact layout");
+                            var only = distinct == 1 ? ReadName() : "";
+                            names[key] = Enumerable.Repeat(only, count).ToArray();
+                            continue;
+                        }
                         names[key] = Enumerable.Range(0, count).Select(_ => ReadName()).ToArray();
                         continue;
                     }
@@ -2346,7 +3064,9 @@ static EditorMesh ReadMeshDescription(byte[] raw)
             }
         }
     }
-    if (stream.Position != raw.Length) throw new InvalidDataException("Mesh description was not fully consumed.");
+    var liveTriangles = live.TryGetValue("Triangles", out var liveTriangleFlags) ? liveTriangleFlags.Count(flag => flag) : 0;
+    if (stream.Position != raw.Length && (cachedTriangles <= 0 || liveTriangles != cachedTriangles))
+        throw new InvalidDataException("Mesh description was not fully consumed.");
     float[] Floats(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, float>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
     int[] Ints(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, int>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
     return new EditorMesh(
@@ -2416,6 +3136,10 @@ static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string n
 static byte[] NormalizeSourcePng(byte[] png, UTexture? texture)
 {
     if (texture is null) return png;
+    // A JPEG source (TSCF_JPEG) is decoded to true colour by Skia, so it needs no channel fix-up.
+    if (JpegDerived.Table.TryGetValue(png, out _)) return png;
+    // Neither does one encoded from raw TSCF_UEDELTA pixels: it was written as RGBA in true colour.
+    if (RawDerived.Table.TryGetValue(png, out _)) return png;
     var format = texture.GetOrDefault<FStructFallback?>("Source", null)?.GetOrDefault<FName>("Format").Text ?? "";
     try
     {
@@ -2529,12 +3253,47 @@ static byte[] DecompressEditorPayload(FCompressedBuffer payload)
             throw new InvalidDataException("Truncated editor payload block.");
         var rawSize = Math.Min(1 << header.BlockSizeExponent, output.Length - outputOffset);
         if (rawSize <= 0) throw new InvalidDataException("Editor payload contains excess blocks.");
-        Compression.Decompress(payload.Data, inputOffset, compressedSize, output, outputOffset, rawSize, method);
+        // UE stores a block verbatim when compression did not shrink it (compressed size == raw
+        // size); the block table holds the same size for both, and the decoder returns 0 bytes for
+        // such a block. Incompressible source art (PNG) is mostly verbatim blocks, so a texture
+        // whose payload has one never decoded.
+        if (compressedSize == rawSize) payload.Data.AsSpan(inputOffset, rawSize).CopyTo(output.AsSpan(outputOffset, rawSize));
+        else Compression.Decompress(payload.Data, inputOffset, compressedSize, output, outputOffset, rawSize, method);
         inputOffset += compressedSize;
         outputOffset += rawSize;
     }
     if (outputOffset != output.Length) throw new InvalidDataException("Editor payload is incomplete.");
     return output;
+}
+
+// A texture saved with TSCF_JPEG source compression keeps JPEG bytes (SOI FF D8 FF) in its editor payload. The
+// largest decodable image wins; it is re-encoded as PNG so every later stage sees the format it already reads.
+static byte[]? ExtractLargestJpegAsPng(byte[] bytes)
+{
+    byte[]? best = null;
+    long bestArea = 0;
+    for (var start = 0; start <= bytes.Length - 3; start++)
+    {
+        if (bytes[start] != 0xff || bytes[start + 1] != 0xd8 || bytes[start + 2] != 0xff) continue;
+        try
+        {
+            using var bitmap = SkiaSharp.SKBitmap.Decode(bytes.AsSpan(start));
+            if (bitmap is null) continue;
+            var area = (long) bitmap.Width * bitmap.Height;
+            if (area <= bestArea) continue;
+            using var image = SkiaSharp.SKImage.FromBitmap(bitmap);
+            using var encoded = image.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+            if (encoded is null) continue;
+            best = encoded.ToArray();
+            bestArea = area;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            // A false-positive marker inside compressed bytes; keep scanning.
+        }
+    }
+    if (best is not null) JpegDerived.Table.Add(best, new object());
+    return best;
 }
 
 static byte[]? ExtractLargestPng(byte[] bytes)
@@ -2642,6 +3401,20 @@ static EGame ParseGame(string version) => version switch
     _ => throw new ArgumentException($"unsupported --engine version {version}")
 };
 
+public sealed class PackageReadFailureSink(Dictionary<string, string> failures) : Serilog.Core.ILogEventSink
+{
+    public void Emit(Serilog.Events.LogEvent logEvent)
+    {
+        if (logEvent.Exception is null) return;
+        var match = System.Text.RegularExpressions.Regex.Match(logEvent.RenderMessage(), "^Could not read \"?(?<type>[^\"]+?)\"? named \"?(?<name>[^\"]+?)\"? correctly$");
+        if (!match.Success) return;
+        var root = logEvent.Exception;
+        while (root.InnerException is not null) root = root.InnerException;
+        var first = (root.Message.Split('\n')[0]).Trim();
+        failures.TryAdd(match.Groups["name"].Value, $"{match.Groups["type"].Value} {root.GetType().Name}: {first}");
+    }
+}
+
 public sealed class USkeletalMeshEditorData : UObject
 {
     public override void Deserialize(FAssetArchive ar, long validPos)
@@ -2659,6 +3432,16 @@ public sealed class USkeletalMeshEditorData : UObject
     }
 }
 
+// PNGs that were re-encoded from a JPEG source payload, by reference, so NormalizeSourcePng can tell them apart.
+static class JpegDerived
+{
+    public static readonly System.Runtime.CompilerServices.ConditionalWeakTable<byte[], object> Table = new();
+}
+// PNGs encoded here from raw source pixels (TSCF_UEDELTA), already in true RGBA colour.
+static class RawDerived
+{
+    public static readonly System.Runtime.CompilerServices.ConditionalWeakTable<byte[], object> Table = new();
+}
 sealed record GraphLegacyInput(FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bool UseConstant);
 sealed record EditorMesh(
     float[] Positions,
