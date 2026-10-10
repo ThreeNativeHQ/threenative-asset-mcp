@@ -455,6 +455,8 @@ const PER_INSTANCE_RANDOM_NOTE =
 
 const BOUNDING_BOX_UVW_NOTE =
   "BoundingBoxBased_0-1_UVW evaluated as the mesh UV0 with W = 0.5: the function maps the pixel's position across the object's bounding box to 0..1, and a bake has no object-space position (engine body unavailable, inferred from the name)";
+const DEFAULT_ATTRIBUTES_NOTE =
+  "SetMaterialAttributes has no incoming attributes and no BaseColor pin: BaseColor is Unreal's default attribute value (black)";
 const OBJECT_SCALE_NOTE =
   "ObjectScale evaluated as 1 (an unscaled instance): a placed instance's scale would change texture tiling; engine body unavailable";
 
@@ -1410,6 +1412,12 @@ class Compiler {
       if (override) {
         const colour = this.vec(override, "SetMaterialAttributes.BaseColor");
         return { kind: "attr", baseColor: colour ?? null };
+      }
+      if (!incomingPin) {
+        // Nothing wired into the attributes at all: Unreal starts from the default attributes, whose BaseColor is black (an
+        // eye-occlusion or shadow-card material that only sets Opacity and the shading model).
+        this.approximations.add(DEFAULT_ATTRIBUTES_NOTE);
+        return { kind: "attr", baseColor: null };
       }
       return incoming ?? this.markUnavailable(`SetMaterialAttributes ${node.id} has no incoming attributes and no BaseColor input`);
     }

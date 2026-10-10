@@ -1148,6 +1148,24 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
     expect(await bake(onIncoming)).toMatchObject({ status: "unsupported", unsupported: ["ReflectionVectorWS"] });
   });
 
+  it("a SetMaterialAttributes with no incoming attributes and no BaseColor pin is Unreal's default black, and says so", async () => {
+    // An eye-occlusion shadow card only sets Opacity and the shading model; BaseColor is the attribute default (black).
+    const graph = makeGraph([set({ "Inputs[1]": pin("opacity") }, [G.Roughness]), node("opacity", "Constant", { constants: { R: 0.5 } })], pin("set"));
+    const result = await bake(graph);
+    expect(result.status).toBe("baked");
+    expect((await pixelsOf(result))(0, 0)).toEqual([0, 0, 0]);
+    expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("SetMaterialAttributes has no incoming attributes"))).toBe(true);
+  });
+
+  it("sibling: an incoming attributes pin that cannot be read stays unavailable, never black", async () => {
+    const graph = makeGraph(
+      [set({ "Inputs[0]": pin("broken") }, [G.Roughness]), node("broken", "NamedRerouteUsage", { error: "named reroute declaration could not be found" })],
+      pin("set"),
+    );
+    const result = await bake(graph);
+    expect(result.status).not.toBe("baked");
+  });
+
   it("falls back to by-name matching when the dump carries no attributeTypes", async () => {
     const graph = makeGraph(
       [breakBaseColor("set"), node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Base Color": pin("over", 0, RGB_MASK) } }), makeColour("make", "c"), constant3("c", [0.25, 0.5, 0.75]), constant3("over", [0.5, 0.125, 1])],
