@@ -551,6 +551,10 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     primitive.setAttribute("COLOR_0", document.createAccessor("COLOR_0").setType("VEC4").setArray(new Float32Array([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1])).setBuffer(document.getRoot().listBuffers()[0]!));
     await io.write(join(exported, "Mesh.gltf"), document);
   }
+  // The textures the graph names are packages in the pack; the baker exports the exact one from source, never a same-named PNG
+  // the mesh export happened to carry.
+  await writeFile(join(content, "T_InstanceMask.uasset"), Buffer.alloc(16));
+  await writeFile(join(content, "T_MasterMask.uasset"), Buffer.alloc(16));
   await writePng(join(exported, "T_InstanceMask.png"), [200, 100, 50, 255], 4);
   await writePng(join(exported, "T_MasterMask.png"), [10, 10, 10, 255], 4);
   const umodel = join(root, "umodel");
@@ -662,18 +666,19 @@ describe("importUnrealDirectory graph bake", () => {
 });
 
 describe("graph textures that only a material function references", () => {
-  it("unit: falls back to exportTexture after assets.png and stays unavailable, named, when both fail", async () => {
+  it("unit: the exporter is authoritative before assets.png, and a same-named PNG never stands in for it", async () => {
     const root = await scratch("graph-bake-export-");
     const content = join(root, "source", "Content", "Test");
     await mkdir(content, { recursive: true });
     await writeFile(join(content, "M_Master.uasset"), Buffer.alloc(16));
     await writePng(join(root, "T_Late.png"), [200, 100, 50, 255], 4);
     const requested: string[] = [];
-    const make = (exportTexture: (name: string) => Promise<string | undefined>) =>
+    const make = (exportTexture: (name: string, reference?: string) => Promise<string | undefined>) =>
       createGraphBaker({ sourceDir: join(root, "source"), maxTextureSize: 4, exportTexture, dumpGraphs: async () => new Map([["M_Master", masterGraph("mask-tint", "T_Late")]]) })!;
     const request = { materialName: "M_Master", lookupName: "M_Master", assets: { png: new Map<string, string>() }, readProps: () => undefined };
-    const baked = await make(async (name) => {
+    const baked = await make(async (name, reference) => {
       requested.push(name);
+      expect(reference).toContain("T_Late");
       return join(root, "T_Late.png");
     })(request);
     expect(baked.status).toBe("baked");
@@ -681,14 +686,18 @@ describe("graph textures that only a material function references", () => {
     const failed = await make(async () => undefined)(request);
     expect(failed).toMatchObject({ status: "unavailable" });
     expect(failed.status === "unavailable" && failed.reason).toContain("T_Late");
-    // assets.png wins when the mesh export did carry the texture.
+    // The exporter owns the answer: a same-named PNG the mesh export carried must not stand in when it cannot select the package.
     const asked: string[] = [];
     const present = await make(async (name) => {
       asked.push(name);
       return undefined;
     })({ ...request, assets: { png: new Map([["T_Late", join(root, "T_Late.png")]]) } });
-    expect(present.status).toBe("baked");
-    expect(asked).toEqual([]);
+    expect(present).toMatchObject({ status: "unavailable" });
+    expect(asked).toEqual(["T_Late"]);
+    // Without an exporter the caller's PNG map is the only binding.
+    const plain = createGraphBaker({ sourceDir: join(root, "source"), maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", masterGraph("mask-tint", "T_Late")]]) })!;
+    const bound = await plain({ ...request, assets: { png: new Map([["T_Late", join(root, "T_Late.png")]]) } });
+    expect(bound.status).toBe("baked");
   });
 
   it("importer: exports the one package on demand, bakes it, and leaves nothing behind", async () => {

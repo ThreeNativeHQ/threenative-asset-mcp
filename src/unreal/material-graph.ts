@@ -32,6 +32,12 @@ import type { SurfaceNormals } from "./surface-normals.js";
 export interface GraphParameters {
   /** Parameter name (lower-case) -> texture object name or path. */
   textures: ReadonlyMap<string, string>;
+  /**
+   * Parameter name (lower-case) -> the full reference the chain settles on (`Texture2D'/Game/A/T_X.T_X'`), which keeps the
+   * package a same-named texture comes from. `textures` alone holds only the object name, so two instances could not be
+   * told apart. Optional: a caller that only has object names leaves it out and the evaluator falls back to `textures`.
+   */
+  textureReferences?: ReadonlyMap<string, string> | undefined;
   vectors: ReadonlyMap<string, [number, number, number, number]>;
   scalars: ReadonlyMap<string, number>;
   switches: ReadonlyMap<string, boolean>;
@@ -46,7 +52,13 @@ export interface TextureRaster {
   srgb: boolean;
 }
 
-export type TextureLoader = (objectName: string) => Promise<TextureRaster | undefined>;
+/**
+ * Loads a texture. `objectName` is the object the graph names (`T_X`), which is all a caller with one texture per name
+ * needs. `reference` is the full source reference the graph or instance chain gives (`Texture2D'/Game/A/T_X.T_X'`), so a
+ * caller that can select an exact package can answer for that package and no same-named one. Optional and absent only when
+ * the graph proves no reference.
+ */
+export type TextureLoader = (objectName: string, reference?: string) => Promise<TextureRaster | undefined>;
 
 export interface BakeRequest {
   graph: MaterialGraph;
@@ -371,6 +383,11 @@ function sampleLevel(level: Level, u: number, v: number, out: Float64Array, offs
 /** One TextureSample node's view of a texture: which texture, how it decodes, which mip level it reads. */
 interface TextureSlot {
   name: string;
+  /**
+   * The full reference the sample resolves to (`Texture2D'/Game/A/T_X.T_X'`). Selects the exact package when two textures
+   * share a basename; absent only for a sample whose graph proves no reference.
+   */
+  reference?: string | undefined;
   /** Sampler type allows sRGB decoding (the raster's own flag is checked once it is loaded). */
   colorSampler: boolean;
   /** Mip level wanted (0 = full size). Set at compile time from the coordinate scale. */
@@ -378,10 +395,11 @@ interface TextureSlot {
   level?: Level;
 }
 
-/** `T_Rock_D`, `/Game/Rock/T_Rock_D.T_Rock_D` and `Rock/T_Rock_D.T_Rock_D` all name the object `T_Rock_D`. */
+/** `T_Rock_D`, `/Game/Rock/T_Rock_D.T_Rock_D`, `Rock/T_Rock_D.T_Rock_D` and `Texture2D'Content/Rock/T_Rock_D.T_Rock_D'` all name the object `T_Rock_D`. */
 function textureObjectName(reference: string): string {
-  const afterSlash = reference.slice(reference.lastIndexOf("/") + 1);
-  return afterSlash.slice(afterSlash.lastIndexOf(".") + 1);
+  const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference;
+  const afterSlash = quoted.slice(quoted.lastIndexOf("/") + 1);
+  return afterSlash.includes(".") ? afterSlash.slice(afterSlash.lastIndexOf(".") + 1) : afterSlash.trim();
 }
 
 /** GUIDs compare case-insensitively and ignoring dashes and braces. */
@@ -941,7 +959,10 @@ class Compiler {
       case "TextureObject":
         return { kind: "tex", reference: node.texture ?? null, samplerType: node.samplerType ?? "Color" };
       case "TextureObjectParameter": {
-        const override = node.parameter ? this.parameters.textures.get(node.parameter.name.toLowerCase()) : undefined;
+        const parameter = node.parameter?.name.toLowerCase();
+        // The chain's full reference keeps the package; a plain object name is the fallback when the caller gave none.
+        const override = (parameter ? this.parameters.textureReferences?.get(parameter) : undefined)
+          ?? (parameter ? this.parameters.textures.get(parameter) : undefined);
         return { kind: "tex", reference: override ?? node.texture ?? null, samplerType: node.samplerType ?? "Color" };
       }
       case "LightmassReplace":
@@ -1398,7 +1419,10 @@ class Compiler {
     const cached = this.textureRegisters.get(node.id);
     if (cached) return cached;
     const parameterName = node.class === "TextureSampleParameter2D" && node.parameter ? node.parameter.name.toLowerCase() : undefined;
-    let reference = parameterName ? this.parameters.textures.get(parameterName) : undefined;
+    // The chain's full reference for the parameter keeps the package; the plain object name is the fallback when the
+    // caller gave none. This is what lets an override replace a same-named default instead of reading the default.
+    const qualified = parameterName ? this.parameters.textureReferences?.get(parameterName) : undefined;
+    let reference = qualified ?? (parameterName ? this.parameters.textures.get(parameterName) : undefined);
     // A wired TextureObject pin replaces the node's own Texture property (inside a function that property is only the
     // preview, e.g. DefaultDiffuse), and a TextureObjectParameter there honours the instance's override.
     if (!reference && node.inputs.TextureObject) {
@@ -1414,6 +1438,7 @@ class Compiler {
     const worldCoordinates = coordinates?.world === true;
     const slot: TextureSlot = {
       name: textureObjectName(reference),
+      reference,
       colorSampler: sampler === "color",
       lodFor: (outputSize, raster) => {
         // A world-space coordinate reads the coarsest mip, the texture's average colour.
@@ -2097,7 +2122,7 @@ class Compiler {
     const key = `${node.id}#mean`;
     const cached = this.textureRegisters.get(key);
     if (cached) return cached;
-    const slot: TextureSlot = { name: textureObjectName(object.reference), colorSampler: object.samplerType.toLowerCase() === "color", lodFor: () => 40 };
+    const slot: TextureSlot = { name: textureObjectName(object.reference), reference: object.reference, colorSampler: object.samplerType.toLowerCase() === "color", lodFor: () => 40 };
     this.slots.push(slot);
     const reg = this.allocate();
     this.program.push((r) => sampleLevel(slot.level!, 0.5, 0.5, r, reg));
@@ -2300,16 +2325,19 @@ async function evaluate(
   size: number,
   onTexel: (x: number, y: number, registers: Float64Array) => void,
 ): Promise<string | undefined> {
-  // Load each texture once, then give every sample node its mip level.
+  // Load each texture once, then give every sample node its mip level. The full reference is the key, so two samples that
+  // name one object through different packages load separately and each keeps its own pixels.
+  const slotKey = (slot: TextureSlot): string => slot.reference ?? slot.name;
   const rasters = new Map<string, TextureRaster>();
   for (const slot of compiler.slots) {
-    if (rasters.has(slot.name)) continue;
-    const raster = await request.loadTexture(slot.name);
+    const key = slotKey(slot);
+    if (rasters.has(key)) continue;
+    const raster = await request.loadTexture(slot.name, slot.reference);
     if (!raster) return `texture ${slot.name} could not be loaded`;
     if (raster.width < 1 || raster.height < 1 || raster.rgba.length < raster.width * raster.height * 4) {
       return `texture ${slot.name} has an unusable raster (${raster.width}x${raster.height}, ${raster.rgba.length} bytes)`;
     }
-    rasters.set(slot.name, raster);
+    rasters.set(key, raster);
   }
   const levels = new Map<string, Level>();
   const levelFor = (name: string, decode: boolean, lod: number): Level => {
@@ -2328,8 +2356,9 @@ async function evaluate(
     return level;
   };
   for (const slot of compiler.slots) {
-    const raster = rasters.get(slot.name)!;
-    slot.level = levelFor(slot.name, raster.srgb && slot.colorSampler, slot.lodFor(size, raster));
+    const key = slotKey(slot);
+    const raster = rasters.get(key)!;
+    slot.level = levelFor(key, raster.srgb && slot.colorSampler, slot.lodFor(size, raster));
   }
 
   const registers = compiler.registers.slice(0, Math.max(4, compiler.registerCount * 4));

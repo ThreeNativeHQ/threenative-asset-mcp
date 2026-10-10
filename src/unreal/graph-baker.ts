@@ -31,9 +31,13 @@ import type { ExternalTool } from "./toolchain.js";
 
 /** The part of the importer's exported-asset index the baker reads. */
 export interface GraphBakeAssets {
-  /** Texture object name -> PNG written by UE Viewer. */
+  /**
+   * Texture object name -> PNG written by UE Viewer. The binding for a caller that gives no `exportTexture`: a name it
+   * holds uniquely is that texture. It cannot say which package a same-named PNG came from, so it is never consulted
+   * when an exporter is present.
+   */
   readonly png: ReadonlyMap<string, string>;
-  /** Basenames with several physical PNG producers; a sample of one cannot name its exact pixels. */
+  /** Basenames with several physical PNG producers; without an exporter a sample of one is refused, not guessed. */
   readonly ambiguousPng?: ReadonlySet<string> | undefined;
 }
 
@@ -99,6 +103,16 @@ export type GraphBakeOutcome = BakeResult & {
 
 export type GraphBaker = (request: GraphBakeRequest) => Promise<GraphBakeOutcome>;
 
+/**
+ * One resolvable texture source: the PNG the exporter wrote for the exact package, and the `.props.txt` text of
+ * that same package when the exporter produced one. The props carry the source's own `SRGB` override, so the bake
+ * decodes the pixels of the package the graph names and never a same-named package's metadata.
+ */
+export interface GraphTextureSource {
+  readonly path: string;
+  readonly properties?: string | undefined;
+}
+
 export interface GraphBakerOptions {
   readonly sourceDir: string;
   readonly engine?: string | undefined;
@@ -109,10 +123,15 @@ export interface GraphBakerOptions {
   /** The importer's longest embedded edge; the bake never exceeds 1024 either way. */
   readonly maxTextureSize?: number | undefined;
   /**
-   * Exports one texture package that the mesh export did not carry (colour textures that only a material
-   * function references) and returns the PNG path, or undefined. Tried after `assets.png`.
+   * Resolves one texture the graph samples to its source, or undefined. It is authoritative and consulted before
+   * `assets.png`: when the export returns undefined the bake is refused rather than falling back to a same-named PNG in
+   * the mesh export, which could be another package. The second argument is the full reference the graph or instance
+   * names for that object (`/Game/A/B/T_X.T_X`), absent when the graph proves none, and the exporter must answer only
+   * for that package. A bare string is the PNG path alone (legacy); a `GraphTextureSource` also carries the exact
+   * package's `.props.txt`, so the sRGB decode uses that package's own `SRGB` and never a namesake's. Without an
+   * exporter the caller's `assets.png` map is the binding (see `GraphBakeAssets`).
    */
-  readonly exportTexture?: ((name: string) => Promise<string | undefined>) | undefined;
+  readonly exportTexture?: ((name: string, reference?: string) => Promise<string | GraphTextureSource | undefined>) | undefined;
   /** Test seam; production runs the converter's `--dump-graphs` mode. */
   readonly dumpGraphs?: typeof dumpMaterialGraphs;
 }
@@ -130,7 +149,7 @@ const STATIC_SWITCH_NOTE = "static switch values taken from the parent's default
  * has to say whether the texture's own `SRGB` property was switched off; UE Viewer writes that into
  * a texture's `.props.txt` when it exports one, and absent properties mean Unreal's default (true).
  */
-function textureIsSrgb(propsText: string | undefined): boolean {
+export function textureIsSrgb(propsText: string | undefined): boolean {
   return !(propsText !== undefined && /^\s*SRGB\s*=\s*false\b/im.test(propsText));
 }
 
@@ -139,6 +158,33 @@ function textureBasename(reference: string): string {
   const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference;
   const afterSlash = quoted.slice(quoted.lastIndexOf("/") + 1);
   return (afterSlash.includes(".") ? afterSlash.slice(afterSlash.lastIndexOf(".") + 1) : afterSlash).trim();
+}
+
+/**
+ * The package a texture reference names, lower-cased and without its object: `Texture2D'/Game/A/T_X.T_X'`,
+ * `/Game/A/T_X.T_X` and `/Game/A/T_X` all give `game/a/t_x`, and so does a props-style `Content/A/T_X`, since the
+ * pack's `Content` folder is the `/Game` mount. A bare object name names no package: undefined.
+ */
+export function texturePackageKey(reference: string): string | undefined {
+  const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference;
+  const slash = quoted.lastIndexOf("/");
+  if (slash < 0) return undefined;
+  const dot = quoted.indexOf(".", slash);
+  const path = (dot < 0 ? quoted : quoted.slice(0, dot)).replace(/^\/+/, "").toLowerCase();
+  return path.startsWith("content/") ? `game/${path.slice("content/".length)}` : path;
+}
+
+/**
+ * The full reference (`Texture2D'/Game/A/T_X.T_X'`) that the nearest-wins merge of `chainParameters` settles on for each
+ * texture parameter, by lower-cased name. It uses the same order, so it names the same value the evaluator sees; the
+ * evaluator reads it back per parameter, which is what makes an override replace a same-named default. A value the props
+ * file gives without a package stays as its object name, which names no package.
+ */
+function chainTextureReferences(chain: readonly PropsFile[]): Map<string, string> {
+  const references = new Map<string, string>();
+  for (const props of chain) for (const entry of props.overrides) mergeFirst(references, entry.name, entry.reference ?? entry.texture);
+  for (const props of chain) for (const entry of props.collected) mergeFirst(references, entry.name, entry.reference ?? entry.texture);
+  return references;
 }
 
 async function listUassetBasenames(root: string): Promise<Set<string>> {
@@ -177,12 +223,18 @@ export function chainParameters(chain: readonly PropsFile[]): GraphParameters {
     for (const entry of props.vectors) mergeFirst(vectors, entry.name, [...entry.value]);
     for (const entry of props.scalars) mergeFirst(scalars, entry.name, entry.value);
   }
-  return { textures, vectors, scalars, switches };
+  // The same nearest-wins merge, keeping each value's full reference so a parameter still names its package.
+  return { textures, textureReferences: chainTextureReferences(chain), vectors, scalars, switches };
 }
 
 function parametersKey(parameters: GraphParameters): string {
   const sorted = <T>(map: ReadonlyMap<string, T>): [string, T][] => [...map].sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify([sorted(parameters.textures), sorted(parameters.vectors), sorted(parameters.scalars), sorted(parameters.switches)]);
+  // Two chains can carry the same object names from different packages, and those bake differently, so the key also holds
+  // each reference by its package identity: `/Game/A/T` and `Content/A/T` are the same package.
+  const references = [...parameters.textureReferences ?? []]
+    .map(([name, reference]): [string, string] => [name, texturePackageKey(reference) ?? reference.toLowerCase()])
+    .sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify([sorted(parameters.textures), references, sorted(parameters.vectors), sorted(parameters.scalars), sorted(parameters.switches)]);
 }
 
 function unavailable(reason: string): GraphBakeOutcome {
@@ -365,8 +417,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     if (memo) return memo;
 
     const pending = (async (): Promise<GraphBakeOutcome> => {
-      const ambiguous: string[] = [];
-      const loaded = new Set<string>();
+      const unresolved = new Map<string, string>();
       const result = await bakeGraph({
         graph: graph!,
         output: "baseColor",
@@ -379,21 +430,39 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
         ...(surface ? { surface } : {}),
         ...(objectRadius !== undefined ? { objectRadius } : {}),
-        loadTexture: async (reference) => {
-          const name = textureBasename(reference);
-          const path = request.assets.png.get(name) ?? (await options.exportTexture?.(name));
-          if (!path) return undefined;
-          if (request.assets.ambiguousPng?.has(name) && !loaded.has(name)) ambiguous.push(name);
-          loaded.add(name);
-          return decode(path, textureIsSrgb(request.readProps(name)));
+        loadTexture: async (objectName, reference) => {
+          const name = textureBasename(objectName);
+          let path: string | undefined;
+          let properties: string | undefined;
+          // The exporter is authoritative: with the full reference it owns the answer, so a same-named PNG the mesh export
+          // happens to carry is never substituted for the package the graph names. Its metadata rides with the source it
+          // selected (never `readProps(name)`, which is a namesake's). Without an exporter the caller's PNG map is the only
+          // binding, and a basename several files share proves no source, so it is refused rather than guessed.
+          if (options.exportTexture) {
+            const source = await options.exportTexture(name, reference);
+            if (typeof source === "string") path = source;
+            else if (source) {
+              path = source.path;
+              properties = source.properties;
+            }
+          } else {
+            path = request.assets.ambiguousPng?.has(name) ? undefined : request.assets.png.get(name);
+            properties = request.readProps(name);
+          }
+          if (!path) {
+            unresolved.set(name, `${name} has no exact source`);
+            return undefined;
+          }
+          return decode(path, textureIsSrgb(properties));
         },
       });
       if (result.status !== "baked") {
         const particle = particleDrivenBaseColor(graph!);
-        return { ...result, graphMaterial: graph!.material, parameters, ...(particle ? { particle } : {}) };
+        // A refused texture is the reason even though the evaluator reports it only as missing: no exact source was chosen.
+        const reason = unresolved.size > 0 ? `${[...unresolved.values()].join("; ")}; no source is selected, so the base colour is not baked` : result.reason;
+        return { ...result, reason, graphMaterial: graph!.material, parameters, ...(particle ? { particle } : {}) };
       }
       const approximations = new Set(result.approximations);
-      for (const name of ambiguous) approximations.add(`texture ${name}: ambiguous exported PNG basename; exact source pixels cannot be selected`);
       const classes = graphPathClasses(graph!, "baseColor", parameters);
       if (classes.includes("StaticSwitchParameter") || classes.includes("StaticBoolParameter")) approximations.add(STATIC_SWITCH_NOTE);
       const baked: GraphBakeOutcome = {

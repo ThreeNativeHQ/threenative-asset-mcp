@@ -275,7 +275,11 @@ async function importFixture(options: {
     ...(options.saturatedUv ? { saturatedUv: true } : {}),
   });
   for (const [name, text] of Object.entries(options.extraProps ?? {})) await writeFile(join(exported, `${name}.props.txt`), text);
-  for (const [name, rgb] of options.textures) await writePng(join(exported, `${name}.png`), [...rgb, 255], 4);
+  for (const [name, rgb] of options.textures) {
+    // The texture package exists in the pack; the graph names it, so the baker exports it from the source, not from the mesh export.
+    await writeFile(join(content, `${name}.uasset`), Buffer.alloc(16));
+    await writePng(join(exported, `${name}.png`), [...rgb, 255], 4);
+  }
   const umodel = join(root, "umodel");
   await writeFakeUmodel(umodel, { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
   const converter = join(root, "converter");

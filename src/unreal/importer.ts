@@ -41,7 +41,7 @@ import {
   type PaperTileMapDescriptor,
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
-import { createGraphBaker, type GraphBakeRequest, type GraphBaker } from "./graph-baker.js";
+import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphTextureSource } from "./graph-baker.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
 import {
@@ -644,11 +644,70 @@ interface ExportedAssets {
   readonly matAll?: ReadonlyMap<string, readonly string[]>;
   readonly propsAll?: ReadonlyMap<string, readonly string[]>;
   readonly png: Map<string, string>;
+  /**
+   * Every physical PNG file that carried a basename, in index order. `png` is the chosen representative;
+   * `ambiguousPng` names only the basenames whose files hold different bytes.
+   */
+  readonly pngAll?: ReadonlyMap<string, readonly string[]>;
   /** Basenames with multiple physical PNG producers cannot establish an exact source binding. */
   readonly ambiguousPng?: ReadonlySet<string>;
   readonly audio: Map<string, string>;
   /** Embedded MetaHuman DNA blobs, keyed by the mesh whose export promoted them. */
   readonly dna: Map<string, string>;
+}
+
+/** Content hash of a PNG, or a per-path sentinel when it cannot be read (so unreadable files never look identical). */
+async function pngDigest(path: string): Promise<string> {
+  try {
+    return createHash("sha256").update(await readFile(path)).digest("hex");
+  } catch {
+    return `unreadable:${path}`;
+  }
+}
+
+/**
+ * True when every path exists and holds the same bytes. One unreadable or absent copy means identity cannot be
+ * proven, so the duplicate stays ambiguous; only a proof of identical bytes makes it one source.
+ */
+async function identicalByContent(paths: readonly string[]): Promise<boolean> {
+  let digest: string | undefined;
+  for (const path of paths) {
+    const current = await pngDigest(path);
+    if (current.startsWith("unreadable:")) return false;
+    if (digest === undefined) { digest = current; continue; }
+    if (current !== digest) return false;
+  }
+  return digest !== undefined;
+}
+
+/**
+ * One deterministic path among same-named PNG exports, or undefined unless they hold the same bytes. Identity is proven
+ * on the exported pixels only: source package files can match while their texture data differs.
+ */
+async function representativeWhenIdentical(paths: readonly string[]): Promise<string | undefined> {
+  const sorted = [...new Set(paths)].sort();
+  if (sorted.length === 0) return undefined;
+  if (sorted.length === 1) return sorted[0];
+  return (await identicalByContent(sorted)) ? sorted[0] : undefined;
+}
+
+/**
+ * Chooses one path per PNG basename and reports a basename `ambiguous` only when its candidate files hold
+ * different bytes. Several folders can export one source texture (UE Viewer writes it once per material);
+ * those copies are one source, not a conflict. The representative is the first path in sorted order, so the
+ * pick is deterministic across hosts.
+ */
+async function resolvePngByContent(candidates: ReadonlyMap<string, readonly string[]>): Promise<{ png: Map<string, string>; ambiguousPng: Set<string> }> {
+  const png = new Map<string, string>();
+  const ambiguousPng = new Set<string>();
+  for (const [name, paths] of candidates) {
+    const sorted = [...new Set(paths)].sort();
+    const first = sorted[0];
+    if (first === undefined) continue;
+    png.set(name, first);
+    if (sorted.length > 1 && !(await identicalByContent(sorted))) ambiguousPng.add(name);
+  }
+  return { png, ambiguousPng };
 }
 
 async function indexExported(root: string): Promise<ExportedAssets> {
@@ -658,8 +717,7 @@ async function indexExported(root: string): Promise<ExportedAssets> {
   const props = new Map<string, string>();
   const matAll = new Map<string, string[]>();
   const propsAll = new Map<string, string[]>();
-  const png = new Map<string, string>();
-  const ambiguousPng = new Set<string>();
+  const pngAll = new Map<string, string[]>();
   const audio = new Map<string, string>();
   const dna = new Map<string, string>();
   const collect = (all: Map<string, string[]>, key: string, path: string): void => {
@@ -673,11 +731,12 @@ async function indexExported(root: string): Promise<ExportedAssets> {
     else if (name.endsWith(".mat")) { const key = name.slice(0, -".mat".length); mat.set(key, file.path); collect(matAll, key, file.path); }
     else if (name.endsWith(".gltf")) gltf.set(name.slice(0, -".gltf".length), file.path);
     else if (name.endsWith(".psa")) psa.set(name.slice(0, -".psa".length), file.path);
-    else if (name.endsWith(".png")) { const stem = name.slice(0, -".png".length); if (png.has(stem)) ambiguousPng.add(stem); png.set(stem, file.path); }
+    else if (name.endsWith(".png")) collect(pngAll, name.slice(0, -".png".length), file.path);
     else if (name.endsWith(".dna")) dna.set(name.slice(0, -".dna".length), file.path);
     else if (/\.(?:wav|ogg|mp3|flac)$/i.test(name)) audio.set(name.slice(0, name.lastIndexOf(".")), file.path);
   }
-  return { gltf, psa, mat, props, matAll, propsAll, png, ambiguousPng, audio, dna };
+  const { png, ambiguousPng } = await resolvePngByContent(pngAll);
+  return { gltf, psa, mat, props, matAll, propsAll, png, pngAll, ambiguousPng, audio, dna };
 }
 
 function mergeCandidates(
@@ -744,11 +803,54 @@ function packageDirectoryOverlap(file: string, packagePath: string): number {
   return overlap;
 }
 
-/** The one copy that shares the most trailing directories with the named package; undefined on no overlap or a tie. */
+/**
+ * The one copy that shares the most trailing directories with the named package; undefined on no overlap or a tie. This is
+ * a heuristic that orders material copies, not proof of which package is named: graph textures match whole package paths
+ * (`gamePackageOfSource`).
+ */
 function copyInPackage(copies: readonly string[], packagePath: string): string | undefined {
   const scored = copies.map((copy) => ({ copy, overlap: packageDirectoryOverlap(copy, packagePath) })).sort((a, b) => b.overlap - a.overlap);
   const [best, next] = scored;
   return best !== undefined && best.overlap > 0 && best.overlap > (next?.overlap ?? 0) ? best.copy : undefined;
+}
+
+/**
+ * The `/Game` mount prefixes a source root holds, relative to that root. The pack's `Content` folder mounts as `/Game`,
+ * so `<root>/Content/...` is `Content`, `<root>/X/Content/...` is a single wrapped project's `X/Content`, and a root that
+ * is itself `Content` is the empty prefix. A deeper `Content` (a plugin or nested package) is not a Game mount. A Fab
+ * staging download dir often wraps the project, so this finds `Paragon/Content` rather than requiring `Content` at the
+ * top; several wrapped projects give several prefixes, which a reference cannot tell apart (see `gamePackageOfSource`).
+ */
+function contentMounts(root: string, files: readonly string[]): string[] {
+  if (basename(root).toLowerCase() === "content") return [""];
+  const mounts = new Set<string>();
+  for (const file of files) {
+    const segments = relative(root, file).split(sep);
+    const index = segments.findIndex((segment) => segment.toLowerCase() === "content");
+    if (index === 0) mounts.add("Content");
+    else if (index === 1) mounts.add(`${segments[0]}/Content`);
+  }
+  return [...mounts];
+}
+
+/**
+ * The `/Game` package a source file holds under `mount`, in the form `texturePackageKey` gives: with mount `Content`,
+ * `<root>/Content/A/T_X.uasset` is `game/a/t_x`. A file outside the mount names no package: undefined.
+ */
+function gamePackageOfSource(root: string, file: string, mount: string): string | undefined {
+  const within = relative(root, file).split(sep).join("/");
+  const prefix = mount.toLowerCase();
+  if (prefix === "") {
+    // The root itself is the `Content` folder: only a path that stays inside it names a package.
+    if (within === ".." || within.startsWith("../")) return undefined;
+  } else if (!within.toLowerCase().startsWith(`${prefix}/`)) {
+    // The file must sit under the mount, not merely share its leading characters: `Derived/A/T_X` is not
+    // `Content/A/T_X`, however the old fixed-length slice would fall.
+    return undefined;
+  }
+  const after = prefix === "" ? within : within.slice(mount.length + 1);
+  const stem = after.slice(0, after.length - extname(after).length);
+  return stem.length > 0 ? `game/${stem.toLowerCase()}` : undefined;
 }
 
 const parentScoped = new WeakMap<ExportedAssets, Map<string, ExportedAssets>>();
@@ -806,10 +908,22 @@ function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAss
     matAll: mergeCandidates(left.matAll, right.matAll),
     propsAll: mergeCandidates(left.propsAll, right.propsAll),
     png: merge(left.png, right.png),
+    pngAll: mergeCandidates(left.pngAll, right.pngAll),
     ambiguousPng,
     audio: merge(left.audio, right.audio),
     dna: merge(left.dna, right.dna),
   };
+}
+
+/**
+ * Re-resolves the PNG index from every candidate a merge collected: byte-identical copies of one basename
+ * collapse to a single representative, while copies holding different bytes stay `ambiguous`. Without this a
+ * texture exported into two folders would be a conflict even when both copies are the very same image.
+ */
+async function refreshPngIndex(assets: ExportedAssets): Promise<ExportedAssets> {
+  if (assets.pngAll === undefined) return assets;
+  const { png, ambiguousPng } = await resolvePngByContent(assets.pngAll);
+  return { ...assets, png, ambiguousPng };
 }
 
 async function indexGlbs(root: string): Promise<Map<string, string>> {
@@ -2827,11 +2941,22 @@ export async function importUnrealDirectory(
   let textureExports: Promise<unknown> = Promise.resolve();
   let textureExportCount = 0;
   let graphTextureConverter: Promise<ExternalTool> | undefined;
-  const exportedTextures = new Map<string, Promise<string | undefined>>();
-  const exportTexture = (name: string): Promise<string | undefined> => {
-    const known = exportedTextures.get(name);
+  const exportedTextures = new Map<string, Promise<GraphTextureSource | undefined>>();
+  // Standalone Texture2D exports already on disk (duplicate names exported into isolated folders, and the modern
+  // converter's group), keyed by the source package each came from. The graph baker reuses one instead of
+  // re-exporting it. The key is the source file, never the export folder: UE Viewer's folder layout does not say
+  // which package an output holds. Filled by the standalone texture phases, which run before any graph bake.
+  const standaloneBySource = new Map<string, GraphTextureSource>();
+  // The `/Game` mounts the source root holds; resolved once, since a pack with several of them cannot say which one a
+  // `/Game/...` reference means. A Fab staging dir wraps a single project (`Paragon/Content`), which is one mount.
+  let graphMounts: string[] | undefined;
+  const exportTexture = (name: string, reference?: string): Promise<GraphTextureSource | undefined> => {
+    // Two graphs can name different packages of one object name, so an answer belongs to the name and package together.
+    const wanted = reference === undefined ? undefined : texturePackageKey(reference);
+    const cacheKey = `${name}\0${wanted ?? ""}`;
+    const known = exportedTextures.get(cacheKey);
     if (known) return known;
-    const run = textureExports.then(async (): Promise<string | undefined> => {
+    const run = textureExports.then(async (): Promise<GraphTextureSource | undefined> => {
       if (!textureIndex) {
         textureIndex = new Map();
         for (const file of packages) {
@@ -2840,15 +2965,54 @@ export async function importUnrealDirectory(
           textureIndex.set(stem, [...(textureIndex.get(stem) ?? []), file.path]);
         }
       }
-      const matches = textureIndex.get(name) ?? [];
-      // Two packages of one name cannot say which pixels the material meant.
-      if (matches.length !== 1) {
-        log(`Graph texture ${name}: ${matches.length === 0 ? "no source package" : "ambiguous source packages"}; not exported.`);
+      const sorted = [...new Set(textureIndex.get(name) ?? [])].sort();
+      if (sorted.length === 0) {
+        log(`Graph texture ${name}: no source package; not exported.`);
         return undefined;
       }
-      const selector = relative(sourceDir, matches[0]!).split(sep).join("/").slice(0, -extname(matches[0]!).length);
+      if (wanted === undefined && sorted.length > 1) {
+        // Nothing names a package: several same-named packages are one source only if every one exported the
+        // same bytes AND every one's own sidecar decodes them the same way. Equal PNGs under different sRGB
+        // flags sample differently, so an arbitrary pick is invalid; a duplicate with no sidecar at all leaves
+        // its flag unknown, which cannot prove equality either. `textureIsSrgb` is the baker's own flag parser,
+        // so a sidecar that states no override reads as Unreal's default (true) on both sides.
+        const exports = sorted.map((source) => standaloneBySource.get(source));
+        const paths = exports.map((source) => source?.path);
+        const first = exports[0]?.properties;
+        const sameDecode =
+          first !== undefined && exports.every((source) => source?.properties !== undefined && textureIsSrgb(source.properties) === textureIsSrgb(first));
+        const identical =
+          sameDecode && paths.every((png): png is string => png !== undefined) ? await representativeWhenIdentical(paths) : undefined;
+        if (identical === undefined) log(`Graph texture ${name}: ${sorted.length} source packages and no package reference; not exported.`);
+        return identical === undefined ? undefined : exports[0];
+      }
+      // A package reference names one package, found by its path in the pack, and nothing else answers for it: a namesake or
+      // identical bytes elsewhere may be a different texture, and the reference may name a package this pack does not hold.
+      // A root that wraps several Game mounts cannot say which one a reference means, so `qualified` names none of them.
+      graphMounts ??= contentMounts(sourceDir, packages.map((entry) => entry.path));
+      const qualified = (source: string): string | undefined =>
+        graphMounts!.length === 1 ? gamePackageOfSource(sourceDir, source, graphMounts![0]!) : undefined;
+      const exact = wanted === undefined ? sorted : sorted.filter((source) => qualified(source) === wanted);
+      if (exact.length !== 1) {
+        log(`Graph texture ${name}: ${exact.length === 0 ? `no source package is ${wanted}` : `${exact.length} source packages are ${wanted}`}; not exported.`);
+        return undefined;
+      }
+      const chosen = exact[0]!;
+      const reused = standaloneBySource.get(chosen);
+      if (reused !== undefined) return reused;
+      const selector = relative(sourceDir, chosen).split(sep).join("/").slice(0, -extname(chosen).length);
       const nextDirectory = (): string => join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
-      const viaUmodel = async (): Promise<string | undefined> => {
+      // The isolated export's own `.props.txt` is the exact source's metadata, never a same-named package's: the sRGB
+      // decode then follows the selector this call resolved. `indexExported` reads it if the exporter wrote one.
+      const indexedSource = async (isolated: string): Promise<GraphTextureSource | undefined> => {
+        const exported = await indexExported(isolated);
+        const path = exported.png.get(name);
+        if (!path) return undefined;
+        const propsPath = exported.props.get(name);
+        const properties = propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
+        return properties === undefined ? { path } : { path, properties };
+      };
+      const viaUmodel = async (): Promise<GraphTextureSource | undefined> => {
         const isolated = nextDirectory();
         // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the
         // package's own folders are appended to it. A deep staging path is reached through a short
@@ -2870,9 +3034,9 @@ export async function importUnrealDirectory(
             log(`Graph texture ${name}: UE Viewer exited ${exportRun.code}.`);
             return undefined;
           }
-          const png = (await indexExported(isolated)).png.get(name);
-          if (!png) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
-          return png;
+          const source = await indexedSource(isolated);
+          if (!source) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
+          return source;
         } catch (error) {
           log(`Graph texture ${name}: export failed (${error instanceof Error ? error.message : String(error)}).`);
           return undefined;
@@ -2882,7 +3046,7 @@ export async function importUnrealDirectory(
       };
       // UE5 packages are unreadable to UE Viewer: the modern converter decodes the one package into
       // its own staging directory (it names every texture Textures/<name>.png, hence the isolation).
-      const viaConverter = async (): Promise<string | undefined> => {
+      const viaConverter = async (): Promise<GraphTextureSource | undefined> => {
         try {
           graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
           const converter = await graphTextureConverter;
@@ -2896,20 +3060,20 @@ export async function importUnrealDirectory(
             log(`Graph texture ${name}: the modern converter exited ${converted.code}${cause ? `: ${cause}` : "."}`);
             return undefined;
           }
-          const png = (await indexExported(isolated)).png.get(name);
-          if (!png) log(`Graph texture ${name}: the modern converter wrote no PNG.`);
-          return png;
+          const source = await indexedSource(isolated);
+          if (!source) log(`Graph texture ${name}: the modern converter wrote no PNG.`);
+          return source;
         } catch (error) {
           log(`Graph texture ${name}: modern export failed (${error instanceof Error ? error.message : String(error)}).`);
           return undefined;
         }
       };
-      const modernHeader = (await readPackageCooking(matches[0]!)).legacyFileVersion;
+      const modernHeader = (await readPackageCooking(chosen)).legacyFileVersion;
       if (modernHeader !== undefined && modernHeader <= -8) return viaConverter();
       return (await viaUmodel()) ?? viaConverter();
     });
     textureExports = run;
-    exportedTextures.set(name, run);
+    exportedTextures.set(cacheKey, run);
     return run;
   };
   // PRD-538: lazy, so a run that never meets a colourless section never provisions or spawns the converter.
@@ -3231,12 +3395,15 @@ export async function importUnrealDirectory(
         if (run.code !== 0) {
           return { entry, reason: `UE Viewer texture export exited ${run.code}.` };
         }
-        const emitted = (await listFiles(isolated)).find(
+        const files = await listFiles(isolated);
+        const emitted = files.find(
           (file) => basename(file.path).toLowerCase() === `${name}.png`.toLowerCase(),
         );
-        return emitted
-          ? { entry, source: emitted.path }
-          : { entry, reason: "UE Viewer recognized Texture2D but produced no PNG." };
+        if (!emitted) return { entry, reason: "UE Viewer recognized Texture2D but produced no PNG." };
+        // UE Viewer writes the texture's own `.props.txt` beside the PNG; its `SRGB` is the exact source's metadata.
+        const propsFile = files.find((file) => basename(file.path).toLowerCase() === `${name}.props.txt`.toLowerCase());
+        const properties = propsFile === undefined ? undefined : readMaterialSidecar(propsFile.path);
+        return { entry, source: emitted.path, ...(properties === undefined ? {} : { properties }) };
       } catch (error) {
         return {
           entry,
@@ -3245,8 +3412,10 @@ export async function importUnrealDirectory(
       }
     });
     for (const result of results) {
-      if (result.source) textureSources.set(result.entry.file, result.source);
-      else failed.push({ package: result.entry.package, reason: result.reason ?? "Texture export failed." });
+      if ("source" in result) {
+        textureSources.set(result.entry.file, result.source);
+        standaloneBySource.set(result.entry.file, result.properties === undefined ? { path: result.source } : { path: result.source, properties: result.properties });
+      } else failed.push({ package: result.entry.package, reason: result.reason ?? "Texture export failed." });
     }
   }
 
@@ -3557,16 +3726,18 @@ export async function importUnrealDirectory(
       }
       const exported = await indexExported(isolated);
       const source = exported.png.get(name);
-      return source
-        ? { entry, source, exported }
-        : { entry, reason: "The modern UE5 texture converter produced no PNG for this package." };
+      if (!source) return { entry, reason: "The modern UE5 texture converter produced no PNG for this package." };
+      const propsPath = exported.props.get(name);
+      const properties = propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
+      return { entry, source, exported, ...(properties === undefined ? {} : { properties }) };
     });
     for (const result of results) {
-      if (result.exported) {
+      if ("exported" in result) {
         // Material texture bindings resolve by name, so the isolated exports still feed the
         // shared index exactly as the batched run used to.
         assets = mergeExported(assets, result.exported);
-        textureSources.set(result.entry.file, result.source!);
+        textureSources.set(result.entry.file, result.source);
+        standaloneBySource.set(result.entry.file, result.properties === undefined ? { path: result.source } : { path: result.source, properties: result.properties });
       } else {
         failed.push({ package: result.entry.package, reason: result.reason ?? "Modern texture conversion failed." });
       }
@@ -3948,6 +4119,10 @@ export async function importUnrealDirectory(
   const attachedPsa = new Set<string>();
   const existingPsa = new Set<string>();
   const incompatiblePsa = new Set<string>();
+
+  // Copies of one texture name that separate exports wrote collapse to one source when their bytes match, so a
+  // texture exported into two folders is not a conflict when both copies are the very same image.
+  assets = await refreshPngIndex(assets);
 
   // Material packages by `/Game/...` path, for names several packages share: their isolated exports are the only
   // copy of each that no other package overwrote.
