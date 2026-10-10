@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.65",
+  version: "b4e95441+threenative.66",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -1619,7 +1619,11 @@ bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials,
         assetLookupDiagnostics[mesh.Name] = "uncooked mesh package was not mounted";
         return false;
     }
-    var editorMesh = ReadLargestMeshDescription(file.Read(), out var refusal);
+    // The triangle count LOD0's source model cached when the mesh was saved: the cross-check that lets
+    // a payload with a stale tail through (see ReadMeshDescription).
+    var cachedTriangles = (int)((mesh.GetOrDefault<FStructFallback[]>("SourceModels") ?? Array.Empty<FStructFallback>())
+        .FirstOrDefault()?.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount") ?? 0);
+    var editorMesh = ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles);
     if (editorMesh is null)
     {
         assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model" + (refusal is null ? "" : $" ({refusal})");
@@ -2828,7 +2832,7 @@ static byte[] EncodeSourcePixels(byte[] pixels, int width, int height, string fo
 // FMeshDescription payload per source-model LOD, so the largest raw payload that parses is LOD0.
 // Every other payload in a StaticMesh package is also a mesh description, so ranking by the
 // header's raw size decompresses only what is kept.
-static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal)
+static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal, int cachedTriangles = 0)
 {
     refusal = null;
     foreach (var (at, _) in ScanEditorPayloads(bytes))
@@ -2837,7 +2841,7 @@ static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal)
         {
             using var archive = new FByteArchive("editor-payload", bytes);
             archive.Position = at;
-            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)));
+            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)), cachedTriangles);
         }
         catch (NotSupportedException error)
         {
@@ -2910,20 +2914,40 @@ int ExportGroomPayloads(byte[] bytes, string name)
 // UE5's FMeshDescription serialization, as verified byte-exact on the Common Hazel packs (see
 // docs/PRDs/done/ue5-mesh-description-reference.py for the annotated layout). Throws unless the
 // whole payload is consumed, so a layout drift is a refusal rather than garbage geometry.
-static EditorMesh ReadMeshDescription(byte[] raw)
+//
+// Some UE 5.8 re-saves (the LookAtPOI border props) store a payload longer than the description it
+// holds: every declared element type parses, then the tail repeats the cut-off start of an earlier,
+// different serialization. Such a payload is kept only when cachedTriangles (the source model's
+// CacheMeshDescriptionTrianglesCount, written at save time) equals the decoded live triangle count and
+// exactly one FName layout reads it that way; without that count, or with a mismatch, it stays a refusal.
+static EditorMesh ReadMeshDescription(byte[] raw, int cachedTriangles = 0)
 {
     // Both FName array layouts are tried; only one consumes the whole payload.
     try
     {
-        return ReadMeshDescriptionLayout(raw, compactNames: false);
+        return ReadMeshDescriptionLayout(raw, compactNames: false, 0);
     }
     catch (Exception error) when (error is not OutOfMemoryException)
     {
-        return ReadMeshDescriptionLayout(raw, compactNames: true);
+        try
+        {
+            return ReadMeshDescriptionLayout(raw, compactNames: true, 0);
+        }
+        catch (InvalidDataException strict) when (cachedTriangles > 0)
+        {
+            var readings = new List<EditorMesh>();
+            foreach (var compactNames in new[] { false, true })
+            {
+                try { readings.Add(ReadMeshDescriptionLayout(raw, compactNames, cachedTriangles)); }
+                catch (Exception tolerant) when (tolerant is not OutOfMemoryException) { }
+            }
+            if (readings.Count == 1) return readings[0];
+            throw readings.Count == 0 ? strict : new InvalidDataException("Mesh description with a trailing tail reads in both FName layouts.");
+        }
     }
 }
 
-static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames)
+static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int cachedTriangles)
 {
     using var stream = new MemoryStream(raw, false);
     using var reader = new BinaryReader(stream);
@@ -3002,7 +3026,9 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames)
             }
         }
     }
-    if (stream.Position != raw.Length) throw new InvalidDataException("Mesh description was not fully consumed.");
+    var liveTriangles = live.TryGetValue("Triangles", out var liveTriangleFlags) ? liveTriangleFlags.Count(flag => flag) : 0;
+    if (stream.Position != raw.Length && (cachedTriangles <= 0 || liveTriangles != cachedTriangles))
+        throw new InvalidDataException("Mesh description was not fully consumed.");
     float[] Floats(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, float>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
     int[] Ints(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, int>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
     return new EditorMesh(

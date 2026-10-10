@@ -209,8 +209,8 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
   });
 
   it("names a compact FName layout it refuses instead of a bare 'no readable source model'", () => {
-    expect(CUE4PARSE_PROGRAM).toContain("ReadLargestMeshDescription(file.Read(), out var refusal)");
-    expect(CUE4PARSE_PROGRAM).toContain("ReadMeshDescriptionLayout(raw, compactNames: true)");
+    expect(CUE4PARSE_PROGRAM).toContain("ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles)");
+    expect(CUE4PARSE_PROGRAM).toContain("ReadMeshDescriptionLayout(raw, compactNames: true, 0)");
   });
 });
 
@@ -266,7 +266,12 @@ else
 {
     try
     {
-        var mesh = ReadMeshDescription(File.ReadAllBytes(args[1]));
+        var mesh = ${
+          // Converter 66 takes the source model's cached triangle count; before that the reader has one parameter.
+          CUE4PARSE_PROGRAM.includes("static EditorMesh ReadMeshDescription(byte[] raw, int cachedTriangles")
+            ? "ReadMeshDescription(File.ReadAllBytes(args[1]), args.Length > 2 ? int.Parse(args[2]) : 0)"
+            : "ReadMeshDescription(File.ReadAllBytes(args[1]))"
+        };
         Console.WriteLine("ok " + mesh.Positions.Length / 3 + " " + mesh.TriangleInstances.Length / 3 + " " + string.Join(",", mesh.GroupSlots));
     }
     catch (Exception error)
@@ -326,6 +331,27 @@ ${editorMesh}
     const file = join(root, "mesh-compact.bin");
     await writeFile(file, meshDescription(["SlotA"], true));
     expect(run("mesh", file)).toBe("ok 3 1 SlotA");
+  });
+
+  // A UE 5.8 re-save (the LookAtPOI border props) whose payload runs past the description: the tail is the cut-off start
+  // of an earlier, different serialization (here a 12-triangle Triangles element).
+  const staleTail = (): Buffer => element("Triangles", 12, [{ name: "VertexInstanceIndex", kind: 4, extent: 3, elementSize: 4, data: int32(...Array.from({ length: 36 }, (_, index) => index)) }], true).subarray(0, 104);
+
+  it("decodes a UE 5.8 payload with a stale tail when the source model cached the same triangle count", async () => {
+    const file = join(root, "mesh-compact-tail.bin");
+    await writeFile(file, Buffer.concat([meshDescription(["SlotA"], true), staleTail()]));
+    expect(run("mesh", file, "1")).toBe("ok 3 1 SlotA");
+  });
+
+  it("still refuses a payload with a tail when no cached triangle count vouches for it, or the count differs", async () => {
+    const file = join(root, "mesh-compact-tail-unvouched.bin");
+    await writeFile(file, Buffer.concat([meshDescription(["SlotA"], true), staleTail()]));
+    expect(run("mesh", file)).toBe("error InvalidDataException: Mesh description was not fully consumed.");
+    expect(run("mesh", file, "2")).toBe("error InvalidDataException: Mesh description was not fully consumed.");
+    // The established layout is not loosened either.
+    const classic = join(root, "mesh-classic-tail.bin");
+    await writeFile(classic, Buffer.concat([meshDescription(["SlotA"], false), Buffer.from([0, 1, 2, 3, 4, 5, 6, 7])]));
+    expect(run("mesh", classic)).toMatch(/^error /);
   });
 
   it("refuses a compact FName attribute with several distinct names rather than guess the mapping", async () => {
