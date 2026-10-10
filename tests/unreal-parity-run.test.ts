@@ -92,15 +92,17 @@ describe("buildCorpus", () => {
   ] satisfies FabOwnedListing[];
   const base = { listings: [], artifact: undefined, limit: undefined, excludeSize: true, allArtifacts: true };
 
-  it("makes one entry per listing x artifact, skipping size and non-Unreal listings", () => {
+  it("makes one entry per listing x artifact, skipping size and reporting UID-less artifacts", () => {
     const { entries, skipped } = buildCorpus(owned, base);
     expect(entries.map((e) => [e.artifactId, e.oldestEngine, e.route])).toEqual([
       ["Old", "UE_4.18", "umodel"],
       ["New", "UE_5.0", "cue4parse"],
     ]);
-    expect(skipped.map((s) => [s.title, s.reason])).toEqual([
-      ["City Sample", "skipped: size"],
-      ["MetaHumans", "skipped: size"],
+    // The UID-less listing is no longer dropped silently: its artifact is reported as skipped.
+    expect(skipped.map((s) => [s.title, s.listingId, s.artifactId, s.reason])).toEqual([
+      ["City Sample", "4898e707-7855-404b-af0e-a505ee690e68", undefined, "skipped: size"],
+      ["MetaHumans", "0281d63e-0000-0000-0000-000000000000", undefined, "skipped: size"],
+      ["x", undefined, "N", "no listing UID; explicit catalog route is not wired and licence is unverified"],
     ]);
   });
 
@@ -111,6 +113,46 @@ describe("buildCorpus", () => {
     const named = buildCorpus(owned, { ...base, listings: ["4898E707-7855-404B-AF0E-A505EE690E68"] });
     expect(named.entries.map((e) => e.artifactId)).toEqual(["City"]);
     expect(named.skipped).toEqual([]);
+  });
+});
+
+describe("buildCorpus UID-less listings", () => {
+  const reason = "no listing UID; explicit catalog route is not wired and licence is unverified";
+  const normalId = "99999999-0000-0000-0000-000000000000";
+  const normal = listing(normalId, [["Known", ["UE_5.4"]]], "Known Pack");
+  const uidless = { ...listing("orphan", [["U1", ["UE_4.18"]], ["U2", ["UE_5.4"]]]), listingId: undefined };
+  const empty = listing("88888888-0000-0000-0000-000000000000", [], "Empty Pack");
+  const emptyUidless = { ...listing("orphan-empty", []), listingId: undefined };
+  const all = { listings: [], artifact: undefined, limit: undefined, excludeSize: true, allArtifacts: true };
+
+  it("reports one skipped entry per artifact of a UID-less listing in whole-library coverage", () => {
+    const { entries, skipped } = buildCorpus([normal, uidless, empty], all);
+    expect(entries.map((e) => e.artifactId)).toEqual(["Known"]);
+    expect(skipped).toEqual([
+      { title: "orphan", artifactId: "U1", reason },
+      { title: "orphan", artifactId: "U2", reason },
+    ]);
+    expect(skipped.every((s) => s.listingId === undefined)).toBe(true);
+    // Per-route dedupe does not swallow them either: routing needs a listing UID.
+    expect(buildCorpus([normal, uidless], { ...all, allArtifacts: false }).skipped).toHaveLength(2);
+  });
+
+  it("applies the artifact filter to a UID-less listing's reported artifacts", () => {
+    const { entries, skipped } = buildCorpus([normal, uidless], { ...all, artifact: "U2" });
+    expect(entries).toEqual([]);
+    expect(skipped).toEqual([{ title: "orphan", artifactId: "U2", reason }]);
+  });
+
+  it("leaves UID-less listings out of an explicit --listing shard", () => {
+    const { entries, skipped } = buildCorpus([normal, uidless, empty], { ...all, listings: [normalId] });
+    expect(entries.map((e) => e.artifactId)).toEqual(["Known"]);
+    expect(skipped).toEqual([]);
+  });
+
+  it("still omits a listing with no Unreal artifacts, UID or not", () => {
+    const { entries, skipped } = buildCorpus([empty, emptyUidless], all);
+    expect(entries).toEqual([]);
+    expect(skipped).toEqual([]);
   });
 });
 

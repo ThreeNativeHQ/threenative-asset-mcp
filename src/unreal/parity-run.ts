@@ -36,6 +36,14 @@ export const SIZE_EXCLUDED_PREFIXES: readonly string[] = ["4898e707", "0281d63e"
 export const SIZE_SKIP_REASON = "skipped: size";
 export const LISTING_PREFIX_LENGTH = 8;
 
+/**
+ * A UID-less owned listing cannot be swept: FabCLI is invoked by listing UID, the explicit catalog
+ * route (asset id + namespace) is not wired, and no licence was read for it. Its artifacts are
+ * reported as skipped rather than dropped silently.
+ */
+export const NO_LISTING_UID_REASON =
+  "no listing UID; explicit catalog route is not wired and licence is unverified";
+
 export interface CorpusEntry {
   readonly listingId: string;
   readonly title: string;
@@ -46,9 +54,10 @@ export interface CorpusEntry {
 }
 
 export interface SkippedEntry {
-  readonly listingId: string;
+  /** Absent for a UID-less owned listing (its artifact(s) are reported individually). */
+  readonly listingId?: string;
   readonly title: string;
-  /** Set for an artifact the per-route dedupe dropped; absent for a whole listing skipped by size. */
+  /** Set for an artifact a per-route dedupe or UID-less listing dropped; absent for a size skip. */
   readonly artifactId?: string;
   readonly reason: string;
 }
@@ -305,19 +314,35 @@ export function routeFor(engine: string | undefined): ParityRoute {
  * listed wins a full tie). The rest are returned in `skipped` with the artifact that stands for
  * them. `allArtifacts`, a named `artifact` and a named listing all keep every artifact. A listing
  * the caller named explicitly is never size-excluded: asking for City Sample by id is a decision,
- * not an accident.
+ * not an accident. A UID-less owned listing is never addressed; in whole-library coverage each of
+ * its artifacts the selection matches is reported as skipped (`NO_LISTING_UID_REASON`), while an
+ * explicit `--listing` shard, which names ids, leaves it out entirely.
  */
 export function buildCorpus(
   owned: readonly FabOwnedListing[],
   options: CorpusOptions,
 ): { readonly entries: CorpusEntry[]; readonly skipped: SkippedEntry[] } {
   const wanted = new Set(options.listings.map((id) => id.toLowerCase()));
+  const explicit = wanted.size > 0;
   const entries: CorpusEntry[] = [];
   const skipped: SkippedEntry[] = [];
   for (const listing of owned) {
+    if (listing.unrealArtifacts.length === 0) continue;
     const listingId = listing.listingId;
-    if (listingId === undefined || listing.unrealArtifacts.length === 0) continue;
-    const explicit = wanted.size > 0;
+    if (listingId === undefined) {
+      // Whole-library coverage only: a --listing shard names ids, so this listing is unrelated to it.
+      if (!explicit) {
+        for (const artifact of listing.unrealArtifacts) {
+          if (options.artifact !== undefined && artifact.artifactId !== options.artifact) continue;
+          skipped.push({
+            title: listing.title,
+            artifactId: artifact.artifactId,
+            reason: NO_LISTING_UID_REASON,
+          });
+        }
+      }
+      continue;
+    }
     if (explicit && !wanted.has(listingId.toLowerCase())) continue;
     if (
       !explicit &&
@@ -765,7 +790,11 @@ export function carriedOverEntries(
   skipped: readonly SkippedEntry[],
 ): ScorecardEntry[] {
   const skippedKeys = new Set(
-    skipped.flatMap((entry) => (entry.artifactId === undefined ? [] : [entryKey({ ...entry, artifactId: entry.artifactId })])),
+    skipped.flatMap((entry) =>
+      entry.listingId === undefined || entry.artifactId === undefined
+        ? []
+        : [entryKey({ listingId: entry.listingId, artifactId: entry.artifactId })],
+    ),
   );
   return previous.filter((entry) => isSettled(entry) && skippedKeys.has(entryKey(entry)));
 }
