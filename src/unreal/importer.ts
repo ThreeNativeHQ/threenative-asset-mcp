@@ -49,6 +49,7 @@ import {
   type ImportedScene,
   parseUnrealSceneSource,
 } from "./scenes.js";
+import { viewDependentNodes } from "./material-graph.js";
 import { rasteriseSurfaceNormals, type SurfaceNormals, type SurfaceTriangles } from "./surface-normals.js";
 import { remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
@@ -56,7 +57,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 72;
+export const IMPORTER_VERSION = 73;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -110,8 +111,10 @@ export interface ImportedMaterialEffect {
    * pack); a particle emitter or placing actor supplies the real material at runtime.
    * `particle`: the BaseColor path reads a per-particle value (DynamicParameter) and could not be baked; the emitter sets
    * the colour at runtime.
+   * `additive-blend`: the material's BlendMode is Additive or Modulate, so the renderer draws its Emissive only (added to,
+   * or multiplied with, the scene) and BaseColor is never read.
    */
-  readonly kind: "emissive" | "engine-default-material" | "particle";
+  readonly kind: "emissive" | "engine-default-material" | "particle" | "additive-blend";
   readonly reason: string;
 }
 
@@ -1112,6 +1115,42 @@ function surfaceOf(root: Root, material: Material): SurfaceNormals | undefined {
   return surface;
 }
 
+/**
+ * The mesh's bounding-sphere radius in Unreal units (centimetres), what `ObjectRadius` reads for an unscaled instance: the
+ * largest distance of a vertex from the centre of the bounding box. `geometryScale` is the factor still to be applied to the
+ * glTF positions (they are metres once it is applied).
+ */
+function objectRadiusOf(root: Root, geometryScale: number | readonly [number, number, number] | undefined): number | undefined {
+  const factors = typeof geometryScale === "number" ? [geometryScale, geometryScale, geometryScale] : geometryScale ?? [1, 1, 1];
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  const positions: ArrayLike<number>[] = [];
+  for (const mesh of root.listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      const array = primitive.getAttribute("POSITION")?.getArray();
+      if (!array) continue;
+      positions.push(array);
+      for (let at = 0; at + 2 < array.length; at += 3) {
+        for (let axis = 0; axis < 3; axis++) {
+          const value = array[at + axis]! * factors[axis]!;
+          if (value < min[axis]!) min[axis] = value;
+          if (value > max[axis]!) max[axis] = value;
+        }
+      }
+    }
+  }
+  if (positions.length === 0 || !Number.isFinite(min[0]!)) return undefined;
+  const centre = [0, 1, 2].map((axis) => (min[axis]! + max[axis]!) / 2);
+  let radius = 0;
+  for (const array of positions) {
+    for (let at = 0; at + 2 < array.length; at += 3) {
+      const distance = Math.hypot(array[at]! * factors[0]! - centre[0]!, array[at + 1]! * factors[1]! - centre[1]!, array[at + 2]! * factors[2]! - centre[2]!);
+      if (distance > radius) radius = distance;
+    }
+  }
+  return radius * 100;
+}
+
 function attachTexture(
   material: Material,
   binding: MaterialTextureBinding,
@@ -1422,6 +1461,8 @@ export async function packageGlb(options: {
   const rejectedMasks: UnsupportedTexture[] = [];
   const sharedGraphs = new Map<ExportedAssets, Map<string, Set<string>>>();
   const meshAssets = scopeMaterialFiles(options.assets, dirname(options.gltfPath));
+  // Computed on the first bake that reads ObjectRadius; null when the mesh has no positions.
+  let meshRadius: number | null | undefined;
   for (const material of root.listMaterials()) {
     const name = material.getName();
     const lookup = options.materialLookupNames?.get(name) ?? name;
@@ -1486,6 +1527,13 @@ export async function packageGlb(options: {
         kind: "engine-default-material",
         reason: "the mesh package names Unreal's default material (/Engine/EngineMaterials/WorldGridMaterial) and no pack material for this slot; the engine's default is not part of the pack, and a particle emitter or placing actor supplies the real material at runtime",
       };
+    } else if (resolved.sourceBlendMode === "BLEND_Additive" || resolved.sourceBlendMode === "BLEND_Modulate") {
+      // Evidence from the material itself, not its name or its nodes: an Additive or Modulate material is drawn from its
+      // Emissive alone (inferred from the engine's shading model; the shader source is not in the pack), so no albedo exists.
+      effect = {
+        kind: "additive-blend",
+        reason: `${lookupName} has BlendMode ${resolved.sourceBlendMode.slice("BLEND_".length)}: the renderer draws its Emissive only (${resolved.sourceBlendMode === "BLEND_Additive" ? "added to" : "multiplied with"} the scene), so BaseColor is never read and the package has no albedo for it`,
+      };
     }
     const graphRequest = (probe: boolean): GraphBakeRequest => ({
       materialName: material.getName(),
@@ -1498,6 +1546,10 @@ export async function packageGlb(options: {
       // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
       ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
       surface: () => surfaceOf(root, material),
+      objectRadius: () => {
+        if (meshRadius === undefined) meshRadius = objectRadiusOf(root, options.geometryScale) ?? null;
+        return meshRadius ?? undefined;
+      },
       readProps: (propsName) => {
         const propsPath = materialAssets.props.get(propsName);
         return propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
@@ -1714,6 +1766,12 @@ export async function packageGlb(options: {
         attachTexture(material, binding, texture);
         graphBindings.push(binding);
         packagingLimitations.push(...outcome.approximations);
+        const viewDependent = viewDependentNodes(outcome.approximations);
+        if (viewDependent.length > 0) {
+          packagingLimitations.push(
+            `view-dependent: approximated (${viewDependent.join(", ")}): Unreal shades these per view or per frame and has no flat-colour bake of its own, so this base colour is a recorded stand-in, not engine parity`,
+          );
+        }
         if (outcome.alpha?.binary && material.getAlphaMode() === "BLEND") {
           // A translucent material whose Opacity is a leaf-shaped mask is a cut-out. Sorted blending smears overlapping
           // cards over each other and the backdrop (grey, washed-out foliage), so it is exported as a masked card.
@@ -4708,7 +4766,7 @@ export async function importUnrealDirectory(
     if (effectSections.length > 0) {
       const byKind = (kind: string): number => effectSections.filter((section) => section.effect?.kind === kind).length;
       warnings.push(
-        `${effectSections.length} material sections have no albedo by design and are not failures (${byKind("emissive")} emissive-only effect, ${byKind("engine-default-material")} engine default material, ${byKind("particle")} particle material); each carries "effect" with the reason.`,
+        `${effectSections.length} material sections have no albedo by design and are not failures (${byKind("emissive")} emissive-only effect, ${byKind("engine-default-material")} engine default material, ${byKind("particle")} particle material, ${byKind("additive-blend")} additive or modulate blend); each carries "effect" with the reason.`,
       );
     }
     if (coverage.textured < coverage.sections) {

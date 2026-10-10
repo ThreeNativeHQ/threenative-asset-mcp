@@ -87,10 +87,13 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   reproduce it, so a section with no base colour asks the graph baker (`src/unreal/graph-baker.ts`,
   PRD-538): CUE4Parse dumps the graph, `material-graph.ts` evaluates a closed node set and bakes a
   base-colour PNG (`source: "graph"`). Anything it cannot evaluate (e.g. `ReflectionVectorWS` feeding a
-  cubemap lookup, `Time`) stays on the neutral fallback and is named under the section's `graph`.
+  cubemap lookup, `CameraVectorWS`, a `CollectionParameter`) stays on the neutral fallback and is named under the section's `graph`.
   Engine content functions are not in the pack, so a bake that relies on them is `heuristic`. View-dependent
   nodes stand in as recorded approximations: `Fresnel` as its mean over a sphere's visible surface,
-  `DepthFade` as fully faded in, `TwoSidedSign` as +1 (front face).
+  `DepthFade` as fully faded in, `TwoSidedSign` as +1 (front face), `Time` as 0 and `Panner` unpanned (one
+  snapshot keeps a panning texture's detail), `PrecomputedAOMask` as 0 (no built static lighting, as in the
+  thumbnail), `WorldAlignedTexture` as its texture's average. `VertexNormalWS`, `ObjectRadius` and a Tangent-to-World
+  `Transform` read the mesh itself (its UV-space normals, its bounding radius), so their bakes are per mesh.
 - **A "Cycle" or a PivotPainter node on a UE4 pack's colour path is the dump adapter, not the material.**
   A package saved before UE 4.12 records no `FCoreObjectVersion`, so every `FExpressionInput` is tagged
   properties, and CUE4Parse reads them in the native layout. The adapter re-reads the top-level inputs from the

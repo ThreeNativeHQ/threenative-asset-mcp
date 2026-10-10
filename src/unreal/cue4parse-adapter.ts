@@ -408,7 +408,8 @@ if (dumpAt >= 0)
     return;
 }
 
-const int GraphNodeLimit = 2000;
+// Inlined function bodies count: a layered master (Paragon's Master_SidesMarble) needs more than 2000.
+const int GraphNodeLimit = 10000;
 const int GraphFunctionDepthLimit = 8;
 // Properties that describe editor placement or bookkeeping, not the computation.
 var GraphIgnoredProperties = new HashSet<string>(StringComparer.Ordinal)
@@ -461,6 +462,8 @@ static object? GraphValue(object? value) => value switch
     FColor color => new[] { color.R / 255d, color.G / 255d, color.B / 255d, color.A / 255d },
     FVector vector => DumpVec(vector),
     FVector2D vector => new[] { DumpNum(vector.X), DumpNum(vector.Y) },
+    // A FunctionInput's PreviewValue: the constant an unconnected input compiles to.
+    FVector4 vector => new[] { DumpNum(vector.X), DumpNum(vector.Y), DumpNum(vector.Z), DumpNum(vector.W) },
     FName name => name.Text,
     string text => text,
     FScriptStruct script => GraphValue(script.StructType),
