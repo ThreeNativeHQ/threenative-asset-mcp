@@ -28,8 +28,8 @@ import { describeWithTools } from "./helpers/require-tool.js";
 const FIXTURES = join(import.meta.dirname, "fixtures", "uncooked-colours");
 
 describe("uncooked vertex-colour patches (embedded source)", () => {
-  it("is a new converter build, so an installed threenative.7 is re-provisioned", () => {
-    expect(UNCOOKED_CONVERTER.version).toBe("4.27.2.0+threenative.8");
+  it("is a new converter build, so an installed threenative.8 is re-provisioned", () => {
+    expect(UNCOOKED_CONVERTER.version).toBe("4.27.2.0+threenative.9");
   });
 
   it("reads a per-vertex-instance FVector4 Color indexed by VI id, and is idempotent", async () => {
@@ -102,7 +102,7 @@ describeWithTools(["python-imaging"], "uncooked vertex colours (patched Python, 
       const key = [positions[vertex * 3]!, positions[vertex * 3 + 1]!, positions[vertex * 3 + 2]!]
         .map((value) => value.toFixed(2))
         .join(",");
-      byPosition.set(key, [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!].map((value) => value / 255));
+      byPosition.set(key, [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!]);
     }
     return byPosition;
   }
@@ -124,26 +124,30 @@ describeWithTools(["python-imaging"], "uncooked vertex colours (patched Python, 
     for (const [position, rgba] of expected) {
       const found = byPosition.get(position);
       expect(found, `no vertex at ${position}`).toBeDefined();
-      rgba.forEach((channel, index) => expect(found![index]).toBeCloseTo(channel, 2));
+      rgba.forEach((channel, index) => expect(found![index]).toBe(channel));
     }
   }
 
+  // Expected channels are the bytes Unreal's shader reads: the UE4 build packs the linear FVector4f with
+  // FLinearColor::ToFColor(true) (sRGB RGB with the standard .0031308 breakpoint, linear alpha, then
+  // floor(channel * 255.999)), and VET_Color reads byte/255 with no gamma decode. Computed independently of
+  // the patch. Legacy alpha .5 packs to 127, unlike the modern rounded 128.
   it("maps a sparse, hole-retaining per-vertex-instance colour array by VI id", async () => {
     // Live VI ids (2, 5, 9) inside an allocated array of 12 slots (trailing holes after 9). The decoder
     // reports the source's allocated count; colour follows the vertex instance, not the vertex.
     // Instance 2 -> vertex 1 (glTF z = -UE x), 5 -> vertex 0, 9 -> vertex 2 (glTF x = UE y).
     await expectColours("colour", 12, [
-      ["0.00,0.00,0.00", [0, 1, 0.25, 0.35]],
-      ["0.00,0.00,-10.00", [1, 0.5, 0, 0.7]],
-      ["10.00,0.00,0.00", [0.2, 0.4, 0.6, 0.9]],
+      ["0.00,0.00,0.00", [0, 255, 137, 127]], // linear (0, 1, 0.25, 0.5)
+      ["0.00,0.00,-10.00", [255, 188, 0, 179]], // linear (1, 0.5, 0, 0.7)
+      ["10.00,0.00,0.00", [124, 170, 204, 230]], // linear (0.2, 0.4, 0.6, 0.9)
     ]);
   });
 
   it("keeps a dense source's colours correct", async () => {
     await expectColours("dense", 3, [
-      ["0.00,0.00,0.00", [0.2, 0.4, 0.6, 0.9]],
-      ["0.00,0.00,-10.00", [1, 0.5, 0, 0.7]],
-      ["10.00,0.00,0.00", [0, 1, 0.25, 0.35]],
+      ["0.00,0.00,0.00", [124, 170, 204, 230]], // linear (0.2, 0.4, 0.6, 0.9)
+      ["0.00,0.00,-10.00", [255, 188, 0, 179]], // linear (1, 0.5, 0, 0.7)
+      ["10.00,0.00,0.00", [0, 255, 137, 127]], // linear (0, 1, 0.25, 0.5)
     ]);
   });
 

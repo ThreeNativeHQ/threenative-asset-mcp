@@ -46,14 +46,14 @@ def build_desc(mode):
         # live; the holes keep the default so a mis-indexed read lands on white, never on a live colour.
         slots = [(1.0, 1.0, 1.0, 1.0) for _ in range(12)]
         slots[2] = (1.0, 0.5, 0.0, 0.7)
-        slots[5] = (0.0, 1.0, 0.25, 0.35)
+        slots[5] = (0.0, 1.0, 0.25, 0.5)
         slots[9] = (0.2, 0.4, 0.6, 0.9)
         vi_attrs['Color'] = colour_attr(slots)
     elif mode == 'dense':
         # A dense source (live ids 0,1,2) must keep working.
         vi_ids = [0, 1, 2]
         vi_elems = [1, 2, 0]
-        vi_attrs['Color'] = colour_attr([(1.0, 0.5, 0.0, 0.7), (0.0, 1.0, 0.25, 0.35), (0.2, 0.4, 0.6, 0.9)])
+        vi_attrs['Color'] = colour_attr([(1.0, 0.5, 0.0, 0.7), (0.0, 1.0, 0.25, 0.5), (0.2, 0.4, 0.6, 0.9)])
     elif mode == 'wrong-type':
         # FVector (3 floats), not the FVector4 the color path requires.
         vi_attrs['Color'] = attr(1, 3, 12, [0.0, 0.0, 0.0] * 12)

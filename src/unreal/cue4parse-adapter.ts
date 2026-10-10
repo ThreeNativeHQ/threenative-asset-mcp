@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.69",
+  version: "b4e95441+threenative.70",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3193,16 +3193,38 @@ static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string n
     scene.ToGltf2().SaveGLB(target);
 }
 
-// The linear RGBA of one vertex instance, kept in the source's channel order. glTF treats COLOR_0 as
-// linear, and Unreal's VertexColor node reads the same FVector4f, so no conversion is applied. A colour
-// index past the buffer would be a malformed mesh; Unreal's default white is used so the whole export
-// does not fail over one bad triangle.
+// One vertex instance's colour as the value Unreal's shader reads. The MeshDescription stores a linear
+// FVector4f, but the static-mesh build packs it with FLinearColor::ToFColor(true) -- sRGB-encoding RGB
+// (standard .0031308 breakpoint), keeping alpha linear, quantising to a byte -- and VET_Color reads that
+// byte / 255 with no gamma decode (the Platform.ush code applies a channel swizzle only). A glTF COLOR_0
+// of the raw source would make a client read a different colour than Unreal, so the shader value is
+// written instead. UE5.8's ToFColorSRGB takes RGB through a fast LUT, which may differ from this standard
+// sRGB curve by at most one byte; alpha is the same round-to-nearest. A colour index past the buffer would
+// be a malformed mesh; Unreal's default white is used so the whole export does not fail over one bad
+// triangle, and an unpainted mesh writes no COLOR_0 at all.
 static System.Numerics.Vector4 EditorVertexColor(float[] colors, int instance)
 {
     var at = instance * 4;
     return at >= 0 && at + 3 < colors.Length
-        ? new System.Numerics.Vector4(colors[at], colors[at + 1], colors[at + 2], colors[at + 3])
+        ? new System.Numerics.Vector4(SrgbVertexChannel(colors[at]), SrgbVertexChannel(colors[at + 1]), SrgbVertexChannel(colors[at + 2]), LinearVertexChannel(colors[at + 3]))
         : System.Numerics.Vector4.One;
+}
+
+// The byte Unreal's ToFColor(true) writes for a linear RGB channel, as the normalized value SharpGLTF
+// stores. MathF.Round(..., AwayFromZero) is the modern nearest byte (.5 up); the +0.5 offset makes
+// SharpGLTF's truncating byte encoder land on exactly that byte: floor((byte + 0.5) / 255 * 255) == byte.
+static float SrgbVertexChannel(float value)
+{
+    if (!float.IsFinite(value)) return value;
+    var linear = Math.Clamp(value, 0f, 1f);
+    var srgb = linear <= 0.0031308f ? linear * 12.92f : 1.055f * MathF.Pow(linear, 1f / 2.4f) - 0.055f;
+    return (MathF.Round(srgb * 255f, MidpointRounding.AwayFromZero) + 0.5f) / 255f;
+}
+
+// Alpha stays linear through ToFColor; only the RGB curve is applied.
+static float LinearVertexChannel(float value)
+{
+    return float.IsFinite(value) ? (MathF.Round(Math.Clamp(value, 0f, 1f) * 255f, MidpointRounding.AwayFromZero) + 0.5f) / 255f : value;
 }
 
 // Editor source art is stored the way FTextureSource keeps it, not as a display image. A

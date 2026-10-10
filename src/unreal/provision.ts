@@ -68,7 +68,7 @@ export const FABCLI_RELEASE = Object.freeze({
 /** GPL-3.0-or-later command-line converter, always executed out-of-process. */
 export const UNCOOKED_CONVERTER = Object.freeze({
   package: "unreal-assets-to-glb==4.27.2.0",
-  version: "4.27.2.0+threenative.8",
+  version: "4.27.2.0+threenative.9",
 });
 
 export interface ProvisionLog {
@@ -440,7 +440,8 @@ export function patchUncookedMeshDescriptionColors(source: string): string {
  * Carries the decoded per-vertex-instance colours from `StaticMesh.from_package` through the GLB
  * writer as glTF `COLOR_0`. Only the uncooked branch fills `mesh.colors`; the cooked/fallback branch
  * leaves it empty, and an empty buffer writes no `COLOR_0` at all. The accessor is normalized
- * UNSIGNED_BYTE RGBA in the source's linear channel order, matching the cooked writer.
+ * UNSIGNED_BYTE RGBA holding the packed value Unreal's shader reads (sRGB RGB, linear alpha), matching
+ * the cooked writer.
  */
 export function patchUncookedMeshColorExport(source: string): string {
   source = replaceRequired(
@@ -531,11 +532,18 @@ export function patchUncookedMeshColorExport(source: string): string {
             uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
             uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
 
-        # Vertex colour accessor — normalized UNSIGNED_BYTE RGBA, the linear channel order glTF
-        # treats COLOR_0 as, matching the cooked writer.
+        # Vertex colour accessor — normalized UNSIGNED_BYTE RGBA in the channel order Unreal's shader
+        # reads. The source's Color is a linear FVector4, but the static-mesh build packs it with
+        # FLinearColor::ToFColor(true): sRGB-encode RGB (standard .0031308 breakpoint), keep alpha linear,
+        # then floor(channel * 255.999). VET_Color reads that byte / 255 with no gamma decode, so COLOR_0
+        # carries the shader value, not the raw linear source.
         color_acc = None
         if has_colors:
-            color_bytes = np.clip(np.rint(color_arr * 255.0), 0.0, 255.0).astype(np.uint8).tobytes()
+            rgb = np.clip(color_arr[:, :3], 0.0, 1.0)
+            srgb = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(rgb, 1.0 / 2.4) - 0.055)
+            alpha = np.clip(color_arr[:, 3:4], 0.0, 1.0)
+            packed = np.concatenate([srgb, alpha], axis=1)
+            color_bytes = np.clip(np.floor(packed * 255.999), 0.0, 255.0).astype(np.uint8).tobytes()
             color_bv = _add_buffer_view(color_bytes, target=ARRAY_BUFFER)
             color_acc = _add_accessor(color_bv, COMP_UNSIGNED_BYTE, num_verts, "VEC4")
             accessors[color_acc].normalized = True

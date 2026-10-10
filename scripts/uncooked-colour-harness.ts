@@ -69,13 +69,13 @@ def build_desc(mode):
         # mis-indexed read lands on white, never on a live colour.
         slots = [(1.0, 1.0, 1.0, 1.0) for _ in range(12)]
         slots[2] = (1.0, 0.5, 0.0, 0.7)
-        slots[5] = (0.0, 1.0, 0.25, 0.35)
+        slots[5] = (0.0, 1.0, 0.25, 0.5)
         slots[9] = (0.2, 0.4, 0.6, 0.9)
         vi_attrs['Color'] = _attr(0, 4, 12, [channel for slot in slots for channel in slot])
     elif mode == 'dense':
         vi_ids = [0, 1, 2]
         vi_elems = [1, 2, 0]
-        vi_attrs['Color'] = _attr(0, 4, 3, [1.0, 0.5, 0.0, 0.7, 0.0, 1.0, 0.25, 0.35, 0.2, 0.4, 0.6, 0.9])
+        vi_attrs['Color'] = _attr(0, 4, 3, [1.0, 0.5, 0.0, 0.7, 0.0, 1.0, 0.25, 0.5, 0.2, 0.4, 0.6, 0.9])
     elif mode == 'wrong-type':
         vi_attrs['Color'] = _attr(1, 3, 12, [0.0, 0.0, 0.0] * 12)
     elif mode == 'wrong-count':
@@ -151,7 +151,7 @@ function colourByPosition(document: Awaited<ReturnType<NodeIO["read"]>>): Map<st
       .join(",");
     byPosition.set(
       key,
-      [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!].map((value) => value / 255),
+      [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!],
     );
   }
   return byPosition;
@@ -176,7 +176,7 @@ function expectColours(
     const found = byPosition.get(position);
     if (!found) fail(`${mode}: no vertex at ${position}`);
     rgba.forEach((channel, index) => {
-      if (Math.abs(found[index]! - channel) > 0.02) fail(`${mode}: ${position} channel ${index} is ${found[index]}, expected ${channel}`);
+      if (found[index] !== channel) fail(`${mode}: ${position} channel ${index} is ${found[index]}, expected ${channel}`);
     });
   }
 }
@@ -229,14 +229,14 @@ async function main(): Promise<void> {
     const load = async (mode: string): Promise<Colours> => ({ colors: counts[mode]!.colors, document: await io.read(join(root, `${mode}.glb`)) });
 
     expectColours("colour", await load("colour"), COLOUR_SLOTS, [
-      ["0.00,0.00,0.00", [0, 1, 0.25, 0.35]],
-      ["0.00,0.00,-10.00", [1, 0.5, 0, 0.7]],
-      ["10.00,0.00,0.00", [0.2, 0.4, 0.6, 0.9]],
+      ["0.00,0.00,0.00", [0, 255, 137, 127]], // linear (0, 1, 0.25, 0.5): legacy alpha floors to 127
+      ["0.00,0.00,-10.00", [255, 188, 0, 179]], // linear (1, 0.5, 0, 0.7)
+      ["10.00,0.00,0.00", [124, 170, 204, 230]], // linear (0.2, 0.4, 0.6, 0.9)
     ]);
     expectColours("dense", await load("dense"), 3, [
-      ["0.00,0.00,0.00", [0.2, 0.4, 0.6, 0.9]],
-      ["0.00,0.00,-10.00", [1, 0.5, 0, 0.7]],
-      ["10.00,0.00,0.00", [0, 1, 0.25, 0.35]],
+      ["0.00,0.00,0.00", [124, 170, 204, 230]], // linear (0.2, 0.4, 0.6, 0.9)
+      ["0.00,0.00,-10.00", [255, 188, 0, 179]], // linear (1, 0.5, 0, 0.7)
+      ["10.00,0.00,0.00", [0, 255, 137, 127]], // linear (0, 1, 0.25, 0.5)
     ]);
     for (const mode of ["no-colour", "wrong-type", "wrong-count"]) expectNoColours(mode, await load(mode));
 

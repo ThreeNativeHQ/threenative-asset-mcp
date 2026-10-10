@@ -268,6 +268,8 @@ describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled fr
       // Converter 68+: the vertex-colour writer, compiled against the SharpGLTF assemblies the modern converter ships.
       "static void WriteEditorMeshGlb(",
       "static System.Numerics.Vector4 EditorVertexColor(",
+      "static float SrgbVertexChannel(",
+      "static float LinearVertexChannel(",
     ].map((signature) => extractCSharp(CUE4PARSE_PROGRAM, signature));
     const record = CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("sealed record EditorMesh("));
     const editorMesh = record.slice(0, record.indexOf(");") + 2);
@@ -405,13 +407,16 @@ ${editorMesh}
 
   // The mesh writer must carry a MeshDescription's vertex colours so a material that reads VertexColor renders
   // (the Hornbeam Icon meshes), while a mesh without a colour buffer gets no COLOR_0 at all. The decoder reads
-  // the FVector4f attribute, the writer maps it to COLOR_0 by vertex instance, and SharpGLTF normalises it.
+  // the FVector4f attribute, and the writer maps it to COLOR_0 by vertex instance as the value Unreal's shader
+  // sees: the ship build packs the linear source with FLinearColor::ToFColor(true) (sRGB RGB, linear alpha, one
+  // byte) and VET_Color reads it back as byte/255 with no gamma decode. SharpGLTF stores that byte normalized.
   describe("MeshDescription vertex colours into glTF COLOR_0", () => {
     // Three vertex instances, each with a distinct linear RGBA. The vertex-index map is the permutation (2,0,1),
     // so instance i sits on a different vertex than i; a writer that indexed colours by vertex rather than
     // instance would put them in the wrong place. The export scales and swaps each position to (0,0,0), (1,0,0),
-    // (0,0,1) metres, so each colour can be read back by position.
-    const palette = [1, 0.5, 0, 0.7, 0, 1, 0.25, 0.35, 0.2, 0.4, 0.6, 0.9] as const;
+    // (0,0,1) metres, so each colour can be read back by position. Expected values below are the packed bytes
+    // (sRGB RGB, linear alpha, nearest byte) the shader reads, computed independently of the writer.
+    const palette = [1, 0.5, 0, 0.7, 0, 1, 0.25, 0.5, 0.2, 0.4, 0.6, 0.9] as const;
     const vertexIndices = [2, 0, 1] as const;
 
     async function coloursByPosition(glb: string): Promise<{ attribute: Accessor; byPosition: Map<string, number[]> } | null> {
@@ -425,7 +430,7 @@ ${editorMesh}
       const byPosition = new Map<string, number[]>();
       for (let vertex = 0; vertex < attribute.getCount(); vertex++) {
         const position = [positions[vertex * 3]!, positions[vertex * 3 + 1]!, positions[vertex * 3 + 2]!].map((value) => value.toFixed(3)).join(",");
-        byPosition.set(position, [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!].map((value) => value / 255));
+        byPosition.set(position, [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!]);
       }
       return { attribute, byPosition };
     }
@@ -447,15 +452,17 @@ ${editorMesh}
 
       // VertexIndex (2,0,1) maps instance 1 -> vertex 0 -> (0,0,0), instance 2 -> vertex 1 -> (1,0,0), and
       // instance 0 -> vertex 2 -> (0,0,1). Colours follow the instance, so palette order is not position order.
+      // Each packed byte is the sRGB curve of the channel (alpha linear), rounded to nearest with .5 up.
+      // Alpha 0.5 is the modern 128, not the legacy floor 127 (see the uncooked suite).
       const expected: ReadonlyArray<readonly [string, ReadonlyArray<number>]> = [
-        ["0.000,0.000,0.000", [palette[4], palette[5], palette[6], palette[7]]],
-        ["1.000,0.000,0.000", [palette[8], palette[9], palette[10], palette[11]]],
-        ["0.000,0.000,1.000", [palette[0], palette[1], palette[2], palette[3]]],
+        ["0.000,0.000,0.000", [0, 255, 137, 128]], // linear (0, 1, 0.25, 0.5)
+        ["1.000,0.000,0.000", [124, 170, 203, 230]], // linear (0.2, 0.4, 0.6, 0.9)
+        ["0.000,0.000,1.000", [255, 188, 0, 179]], // linear (1, 0.5, 0, 0.7)
       ];
       for (const [position, rgba] of expected) {
         const found = byPosition.get(position);
         expect(found, `no vertex at ${position}`).toBeDefined();
-        rgba.forEach((channel, index) => expect(found![index]).toBeCloseTo(channel, 2));
+        rgba.forEach((channel, index) => expect(found![index]).toBe(channel));
       }
     });
 
