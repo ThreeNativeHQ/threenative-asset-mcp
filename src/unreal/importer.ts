@@ -3335,11 +3335,16 @@ export async function importUnrealDirectory(
       }
     });
     for (const result of results) {
-      if (result.exported) {
+      const name = basename(result.entry.package, extname(result.entry.package));
+      // UE Viewer exits 0 for a Material whose graph it cannot express (an instance with no
+      // recognised parameters, for example) while writing no `.mat`/`.props.txt` for the package
+      // it was asked to export. An unrelated sibling's metadata does not prove this package
+      // succeeded, so require evidence keyed by the material's own basename before accepting it;
+      // otherwise let the modern converter try, exactly as for a failed export.
+      if (result.exported && (result.exported.mat.has(name) || result.exported.props.has(name))) {
         materialAssetsByFile.set(result.entry.file, result.exported);
         // A unique material exported here may also be referenced by a mesh whose export omitted
         // it. Duplicate names deliberately remain package-local.
-        const name = basename(result.entry.package, extname(result.entry.package));
         if (materialNameCounts.get(name) === 1) assets = mergeExported(assets, result.exported);
       } else {
         materialFallbackPackages.push(result.entry);
