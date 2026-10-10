@@ -731,8 +731,16 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
       // whose editor mesh thumbnail is the untinted albedo) is not a live tint on its own. Only
       // overrides are matched broadly: a master's oddly named default (its red `Base Color Tint
       // (Mask)` placeholder) is not a live colour and must not paint every un-tinted instance.
+      // A master that offers "Split Albedo Controls" reads `Albedo Tint Leaves` / `Albedo Tint Branches` when the
+      // instance turns the split on, and the plain `Albedo Tint` only when it is off. With the split on, the plain
+      // tint is not live whenever a split variant of it exists (Hornbeam keeps a magenta default there).
+      const splitOn = props.switchOverrides.some((entry) => entry.value && /\bsplit\b/i.test(entry.name));
+      const allVectorKeys = [...props.vectorOverrides, ...props.vectors].map((entry) => normalizedParameterName(entry.name));
+      const hasSplitVariant = (key: string): boolean =>
+        splitOn && allVectorKeys.some((other) => other.length > key.length && other.startsWith(key));
       for (const parameter of props.vectorOverrides) {
         const key = normalizedParameterName(parameter.name);
+        if (hasSplitVariant(key)) continue;
         if (isBaseColourTintOverride(key) && !baseColourTints.some((tint) => tint.key === key)) {
           baseColourTints.push({ key, value: parameter.value, mask: key.includes("mask"), override: true });
         }

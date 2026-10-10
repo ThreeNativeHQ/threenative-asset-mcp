@@ -147,3 +147,38 @@ describe("an instance's tint vector reaches the base-colour factor", () => {
     expect(resolved.baseColorFactor).toEqual([1, 1, 1, 1]);
   });
 });
+
+// A foliage master offers "Split Albedo Controls": on, it reads `Albedo Tint Leaves` / `Albedo Tint Branches`; off, the
+// plain `Albedo Tint`. The instance keeps a saturated default in the plain one and turns the split on, so the plain tint
+// is not live and must not paint every leaf.
+describe("a split albedo switch retires the plain tint", () => {
+  const withSwitch = (split: boolean): string =>
+    [
+      instanceProps("MA_Foliage", [
+        ["Albedo Tint", [1, 0, 0.78, 1]],
+        ["Albedo Tint Leaves", [1, 1, 1, 0]],
+      ]),
+      "StaticParameters =",
+      "{",
+      "    StaticSwitchParameters[1] =",
+      "    {",
+      "        StaticSwitchParameters[0] =",
+      "        {",
+      `            Value = ${split}`,
+      "            ParameterInfo = { Name=Split Albedo Controls }",
+      "            bOverride = true",
+      "        }",
+      "    }",
+      "}",
+    ].join("\n");
+
+  it("does not apply the plain tint when the split is on", () => {
+    const resolved = resolve({ MI_Leaf: { mat: "Diffuse=T_Leaf_ALB\n", props: withSwitch(true) } }, "MI_Leaf", ["T_Leaf_ALB"]);
+    expect(resolved.baseColorFactor).toEqual([1, 1, 1, 1]);
+  });
+
+  it("sibling: the plain tint still applies when the split is off", () => {
+    const resolved = resolve({ MI_Leaf: { mat: "Diffuse=T_Leaf_ALB\n", props: withSwitch(false) } }, "MI_Leaf", ["T_Leaf_ALB"]);
+    expect(resolved.baseColorFactor).toEqual([1, 0, 0.78, 1]);
+  });
+});
