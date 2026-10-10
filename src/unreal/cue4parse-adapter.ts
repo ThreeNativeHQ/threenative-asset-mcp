@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.68",
+  version: "b4e95441+threenative.69",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -518,6 +518,44 @@ static (FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bo
     return (expression, output, mask != 0 ? channels : null, constant, useConstant);
 }
 
+// A Custom node's Inputs array wraps each FExpressionInput in an FStructFallback that also carries the pin's
+// InputName. Returns the named pins in array order, or null with a reason when the layout is raw, a wrapper is
+// unreadable, or a name repeats; an unnamed pin keeps its index as a stable key. The value is the unwrapped
+// FExpressionInput, so its target, OutputIndex and mask survive unchanged.
+static List<(string Name, object Value)>? GraphCustomInputs(bool raw, UScriptArray array, out string? error)
+{
+    if (raw)
+    {
+        error = "Custom Inputs use a raw layout this converter cannot read";
+        return null;
+    }
+    var seen = new HashSet<string>(StringComparer.Ordinal);
+    var pins = new List<(string Name, object Value)>();
+    for (var element = 0; element < array.Properties.Count; element++)
+    {
+        if (array.Properties[element].GenericValue is not FScriptStruct { StructType: FStructFallback wrapper })
+        {
+            error = $"Custom Inputs[{element}] is not a struct wrapper";
+            return null;
+        }
+        var name = GraphText(GraphProperty(wrapper, "InputName")?.Tag?.GenericValue);
+        if (string.IsNullOrEmpty(name)) name = $"Inputs[{element}]";
+        if (!seen.Add(name))
+        {
+            error = $"Custom Inputs has a duplicate pin name {name}";
+            return null;
+        }
+        if (GraphProperty(wrapper, "Input")?.Tag?.GenericValue is not FScriptStruct { StructType: FExpressionInput input })
+        {
+            error = $"Custom Input {name} has no readable input";
+            return null;
+        }
+        pins.Add((name, input));
+    }
+    error = null;
+    return pins;
+}
+
 // Real Unreal reads an input as tagged properties when the package does not record FCoreObjectVersion at all.
 // CUE4Parse guesses from --engine when the package records nothing, and that guess is wrong for packages saved by UE 4.5.
 static bool GraphTaggedInputs(IPackage? package) =>
@@ -810,6 +848,13 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                             foreach (var element in array.Properties)
                                 guids.Add(element.GenericValue is FScriptStruct { StructType: FGuid attributeGuid } ? attributeGuid.ToString() : "");
                             node["attributeTypes"] = guids;
+                        }
+                        else if (className == "Custom" && name == "Inputs")
+                        {
+                            // A Custom node's Inputs array wraps each pin's FExpressionInput; name it from its InputName.
+                            var custom = GraphCustomInputs(GraphRawInputs(owner), array, out var customError);
+                            if (custom is null) node["error"] = customError;
+                            else foreach (var (pinName, pinValue) in custom) inputs[pinName] = Pin(pinValue, prefix, callInputs, depth);
                         }
                         else if (array.Properties.Count > 0 && array.Properties.All(element => GraphIsInput(element.GenericValue)))
                         {
