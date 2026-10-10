@@ -706,7 +706,7 @@ class Compiler {
   readonly program: Instruction[] = [];
   readonly unsupported = new Set<string>();
   readonly unavailable: string[] = [];
-  /** Refusals found while the program runs, at a texel the compile could not settle; `evaluate` returns the first one. */
+  /** Refusals found while the program runs, or while the compile runs it early on parameter values it knows; `evaluate` returns the first one. */
   readonly runtimeRefusals: string[] = [];
   readonly approximations = new Set<string>();
   readonly classes = new Set<string>();
@@ -2922,10 +2922,10 @@ function storedConstantZero(value: number | boolean | string | readonly number[]
  * read at all refuses.
  *
  * The proof is conservative. It refuses an incomplete body (truncated, errored, miscounted or dangling), an emission candidate
- * the adapter could not read, any unsupported node, approximation, unbound texture, unknown cycle, an uninterpretable stored
- * constant, or a nonzero or nonconstant value on the emission path. Switches take the instance's override, or else their stored
- * default: no BaseColor or cut-out demand flips one. Pins off the emission path (BaseColor, Normal, WorldPositionOffset, ...)
- * are never compiled for it.
+ * the adapter could not read, any unsupported node, approximation, unbound texture, refused evaluation, unknown cycle, an
+ * uninterpretable stored constant, or a nonzero or nonconstant value on the emission path. Switches take the instance's override,
+ * or else their stored default: no BaseColor or cut-out demand flips one. Pins off the emission path (BaseColor, Normal,
+ * WorldPositionOffset, ...) are never compiled for it.
  */
 export function proveEmissionZero(graph: MaterialGraph, parameters: GraphParameters): EmissionProof {
   const refuse = (reason: string): EmissionProof => ({ zero: false, reason: `${graph.material}: ${reason}` });
@@ -2936,6 +2936,9 @@ export function proveEmissionZero(graph: MaterialGraph, parameters: GraphParamet
   if (compiler.unavailable.length > 0) return refuse(`the emission cannot be read: ${compiler.unavailable.join("; ")}`);
   if (compiler.approximations.size > 0) return refuse(`the emission depends on approximated values: ${[...compiler.approximations].sort().join("; ")}`);
   if (compiler.unboundTextures.size > 0) return refuse(`the emission samples unbound textures ${[...compiler.unboundTextures].sort().join(", ")}`);
+  // A SmoothStep whose equal bounds are parameters runs at compile time, since the bake knows their values. Its zero span records
+  // a refusal and writes a 0 with no GPU result behind it, so that 0 is not a proof.
+  if (compiler.runtimeRefusals.length > 0) return refuse(`the emission depends on refused evaluations: ${compiler.runtimeRefusals.join("; ")}`);
   // The adapter stores an output it could not read under `<output>Error` and an Unreal UseConstant output under `<output>`.
   // Both are outside the pin graph, so they are checked here for each candidate, regardless of whether the root uses the
   // legacy pins or MaterialAttributes (`bUseMaterialAttributes` is not in the dump, so both candidates must be clean).

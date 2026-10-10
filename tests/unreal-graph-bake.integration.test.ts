@@ -1219,9 +1219,10 @@ describe("importUnrealDirectory graph bake", () => {
 
 /**
  * The Jungle master's shape in the importer's fixture: BaseColor is Mask x tint, and EmissiveColor is the Emissive switch
- * (stored default `switchStored`) between a glow and a zero constant. `glowOnly` wires the glow straight in instead.
+ * (stored default `switchStored`) between a glow and a zero constant. `glowOnly` wires the glow straight in instead, and
+ * `equalBounds` wires a SmoothStep of two equal parameters, which has no defined GPU result and so no zero proof.
  */
-function emissionMaster(options: { switchStored?: boolean; glowOnly?: boolean; truncated?: boolean } = {}): MaterialGraph {
+function emissionMaster(options: { switchStored?: boolean; glowOnly?: boolean; truncated?: boolean; equalBounds?: boolean } = {}): MaterialGraph {
   const stored = options.switchStored ?? false;
   const nodes: Raw[] = [
     node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: "/Game/Test/T_MasterMask.T_MasterMask", samplerType: "Masks" }),
@@ -1230,7 +1231,15 @@ function emissionMaster(options: { switchStored?: boolean; glowOnly?: boolean; t
     node("glow", "VectorParameter", { parameter: { name: "EmissiveColor", group: "" }, default: [1, 1, 1, 0] }),
     node("zero", "Constant3Vector", { constants: { Constant: [0, 0, 0, 1] } }),
     node("switch", "StaticSwitchParameter", { parameter: { name: "Emissive", group: "6 Emissive" }, default: stored, switchValue: stored, inputs: { A: pin("glow"), B: pin("zero") } }),
-    node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("mul"), EmissiveColor: pin(options.glowOnly ? "glow" : "switch") } }),
+    ...(options.equalBounds
+      ? [
+          node("lo", "ScalarParameter", { parameter: { name: "Lo", group: "" }, default: 0.5 }),
+          node("hi", "ScalarParameter", { parameter: { name: "Hi", group: "" }, default: 0.5 }),
+          node("v", "Constant", { constants: { R: 0.25 } }),
+          node("step", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }),
+        ]
+      : []),
+    node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("mul"), EmissiveColor: pin(options.equalBounds ? "step" : options.glowOnly ? "glow" : "switch") } }),
   ];
   return materialGraphSchema.parse({
     format: 1,
@@ -1274,6 +1283,14 @@ describe("importUnrealDirectory emission proof", () => {
   it("keeps it when the graph cannot be read in full", async () => {
     const { material } = await importWithGraph({ graph: emissionMaster({ truncated: true }), collectedEmissive: [1, 1, 1, 0] });
     expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+  });
+
+  // Equal parameter bounds: the bake refuses the SmoothStep, so the proof is not made and the stale factor and texture stay.
+  it("keeps the stale emissive factor and texture when EmissiveColor is a SmoothStep of two equal parameters", async () => {
+    const { report, material } = await importWithGraph({ graph: emissionMaster({ equalBounds: true }), collectedEmissive: [1, 1, 1, 0], emissiveTexture: true });
+    expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+    expect(material.getEmissiveTexture()).not.toBeNull();
+    expect(report.models[0]!.materials[0]!.limitations.join("\n")).not.toContain("source-proven zero emission");
   });
 
   // The resolver metadata never carries the input glTF material's own emissive slots, so those must trigger the probe too.

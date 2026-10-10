@@ -3554,6 +3554,7 @@ describe("proveEmissionZero", () => {
   }
   const glow = (id = "glow") => vectorParameter(id, "EmissiveColor", [1, 1, 1, 0]);
   const zero = (id = "zero") => constant3(id, [0, 0, 0]);
+  const scalar = (id: string, value: number) => node(id, "Constant", { constants: { R: value } });
   const makeAttrs = (id: string, emissive: string | null) =>
     node(id, "MakeMaterialAttributes", { inputs: { EmissiveColor: emissive === null ? null : pin(emissive) } });
   // The Jungle architecture master: EmissiveColor is the Emissive switch (A: the glow, B: a zero constant) and BaseColor sits
@@ -3710,6 +3711,28 @@ describe("proveEmissionZero", () => {
   it("refuses an EmissiveColor whose source the evaluator cannot read", () => {
     const graph = emission([node("weird", "UnknownFunctionClass"), makeAttrs("make", "weird")], { materialAttributes: pin("make") });
     expect(proveEmissionZero(graph, params({}))).toMatchObject({ zero: false });
+  });
+
+  // Equal bounds from two parameters: the bake knows both values, so the ramp runs at compile time. Its zero span is refused (the
+  // GPU's result there is undefined) and writes a 0 that reads as uniform. The refusal must stop the proof on either candidate: the
+  // dump does not say which one Unreal reads, so a clean zero on the other settles nothing.
+  const equalBoundsStep = () => [scalarParameter("lo", "Lo", 0.5), scalarParameter("hi", "Hi", 0.5), scalar("v", 0.25), node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } })];
+
+  it("refuses an emissive SmoothStep whose equal Min and Max are two parameters, on the legacy Emissive pin", () => {
+    expect(proveEmissionZero(emission(equalBoundsStep(), { emissive: pin("s") }), params({}))).toMatchObject({ zero: false, reason: expect.stringContaining("SmoothStep s") });
+  });
+
+  it("refuses the same SmoothStep on the MaterialAttributes candidate, beside a clean zero legacy Emissive", () => {
+    const attributes = emission([...equalBoundsStep(), zero(), makeAttrs("make", "s")], { emissive: pin("zero"), materialAttributes: pin("make") });
+    expect(proveEmissionZero(attributes, params({}))).toMatchObject({ zero: false, reason: expect.stringContaining("SmoothStep s") });
+  });
+
+  // Controls the new refusal must leave alone: a plain constant zero, and a SmoothStep whose Min, Max and Value share one source,
+  // which Unreal settles to 0 before any division. Neither records a refusal.
+  it("still proves zero for an ordinary constant zero and for a SmoothStep whose Min, Max and Value share one parameter", () => {
+    expect(proveEmissionZero(emission([zero()], { emissive: pin("zero") }), params({}))).toMatchObject({ zero: true });
+    const shared = [scalarParameter("lo", "Lo", 0.5), node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("lo"), Value: pin("lo") } })];
+    expect(proveEmissionZero(emission(shared, { emissive: pin("s") }), params({}))).toMatchObject({ zero: true });
   });
 
   // The adapter records an editor UseConstant output in `outputConstants`, not as a node, and an output it could not read under
