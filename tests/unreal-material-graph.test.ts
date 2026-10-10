@@ -7,6 +7,7 @@ import {
   bakeGraph,
   graphPathClasses,
   graphPathTextures,
+  proveEmissionZero,
   supportedEngineFunctions,
   supportedNodeClasses,
   type BakeResult,
@@ -3369,5 +3370,211 @@ describe("HeightLerp, SmoothThreshold and graphPathTextures", () => {
   it("supportedEngineFunctions lists HeightLerp", () => {
     expect(supportedEngineFunctions()).toContain("HeightLerp");
     expect(supportedEngineFunctions()).not.toContain("SmoothThreshold");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// The emission proof: a graph emits nothing for an instance only when every candidate is a uniform constant zero, on a
+// complete readable body, under the instance's switches. BaseColor and the other pins are not read for it.
+
+describe("proveEmissionZero", () => {
+  const EMISSIVE_GUID = MATERIAL_ATTRIBUTE_GUIDS.EmissiveColor;
+  const BASE_COLOR_GUID = MATERIAL_ATTRIBUTE_GUIDS.BaseColor;
+  const NORMAL_GUID = MATERIAL_ATTRIBUTE_GUIDS.Normal;
+  const WPO_GUID = MATERIAL_ATTRIBUTE_GUIDS.WorldPositionOffset;
+  const BREAK_OUTPUTS = ["BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal"];
+  type Out = ReturnType<typeof pin> | null;
+
+  function emission(nodes: Raw[], outputs: { emissive?: Out; materialAttributes?: Out; baseColor?: Out } = {}, extra: Raw = {}): MaterialGraph {
+    return materialGraphSchema.parse({
+      format: 1,
+      material: "M_Emission",
+      package: "/Game/Test/M_Emission",
+      truncated: false,
+      nodeCount: nodes.length,
+      outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null, ...outputs },
+      nodes,
+      ...extra,
+    });
+  }
+  const glow = (id = "glow") => vectorParameter(id, "EmissiveColor", [1, 1, 1, 0]);
+  const zero = (id = "zero") => constant3(id, [0, 0, 0]);
+  const makeAttrs = (id: string, emissive: string | null) =>
+    node(id, "MakeMaterialAttributes", { inputs: { EmissiveColor: emissive === null ? null : pin(emissive) } });
+  // The Jungle architecture master: EmissiveColor is the Emissive switch (A: the glow, B: a zero constant) and BaseColor sits
+  // on a node no evaluator reads. The stored default decides unless an instance overrides the switch.
+  const jungle = (stored: boolean) =>
+    emission(
+      [
+        glow(),
+        zero(),
+        node("switch", "StaticSwitchParameter", { parameter: { name: "Emissive", group: "6 Emissive" }, default: stored, switchValue: stored, inputs: { A: pin("glow"), B: pin("zero") } }),
+        node("dormant", "UnknownFunctionClass"),
+        node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("dormant"), EmissiveColor: pin("switch"), Normal: pin("dormant") } }),
+      ],
+      { materialAttributes: pin("make") },
+    );
+
+  it("proves the Jungle shape zero: the stored Emissive switch is off, and BaseColor's unsupported node is never read for it", async () => {
+    expect(proveEmissionZero(jungle(false), params({}))).toEqual({ zero: true, summary: expect.any(String) });
+    // The same graph's BaseColor is unsupported, so the bake refuses while the emission is still proved.
+    const baked = await bakeGraph({ graph: jungle(false), output: "baseColor", parameters: params({}), loadTexture: makeLoader({}).loadTexture });
+    expect(baked.status).toBe("unsupported");
+  });
+
+  it("follows the instance's override of the Emissive switch, whichever way the stored default points", () => {
+    expect(proveEmissionZero(jungle(false), params({ switches: { emissive:true } }))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(jungle(true), params({ switches: { emissive:false } }))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(jungle(true), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("requires both candidates to be zero once attributes are wired: a zero legacy Emissive and a glowing attribute do not prove", () => {
+    const withAttrs = (emissive: string | null, attributeEmissive: string) =>
+      emission([glow(), zero(), makeAttrs("make", attributeEmissive)], { emissive: emissive === null ? null : pin(emissive), materialAttributes: pin("make") });
+    expect(proveEmissionZero(withAttrs("glow", "zero"), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(withAttrs("zero", "glow"), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(withAttrs("zero", "zero"), params({}))).toMatchObject({ zero: true });
+    // An unwired legacy Emissive is Unreal's zero default, so the attributes decide alone.
+    expect(proveEmissionZero(withAttrs(null, "zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(withAttrs(null, "glow"), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("takes the legacy Emissive alone when no attributes are wired, and zero when nothing is wired", () => {
+    expect(proveEmissionZero(emission([zero()], { emissive: pin("zero") }), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(emission([glow()], { emissive: pin("glow") }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}), params({}))).toMatchObject({ zero: true });
+  });
+
+  it("refuses a truncated, errored, miscounted or dangling body", () => {
+    const wired = [zero(), makeAttrs("make", "zero")];
+    const outputs = { materialAttributes: pin("make") };
+    expect(proveEmissionZero(emission(wired, outputs, { truncated: true }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission(wired, outputs, { error: "dump failed" }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission(wired, outputs, { nodeCount: wired.length + 1 }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission(wired, { materialAttributes: pin("gone") }), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("refuses an attribute forwarding cycle instead of running away", () => {
+    // BaseColor is the only overridden field, so EmissiveColor is read through the cycle.
+    const cyclic = emission(
+      [
+        zero(),
+        node("a", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("b"), "Inputs[1]": pin("zero") }, attributeTypes: [BASE_COLOR_GUID] }),
+        node("b", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("a"), "Inputs[1]": pin("zero") }, attributeTypes: [BASE_COLOR_GUID] }),
+      ],
+      { materialAttributes: pin("a") },
+    );
+    expect(proveEmissionZero(cyclic, params({}))).toMatchObject({ zero: false });
+  });
+
+  it("refuses a nonconstant EmissiveColor, even one that multiplies to zero", () => {
+    const sampled = emission(
+      [textureSample("tex", "T_Mask"), zero(), node("mul", "Multiply", { inputs: { A: pin("tex", 0, RGB_MASK), B: pin("zero") } }), makeAttrs("make", "mul")],
+      { materialAttributes: pin("make") },
+    );
+    expect(proveEmissionZero(sampled, params({}))).toMatchObject({ zero: false });
+  });
+
+  it("lets a Set override the incoming EmissiveColor: a zero override over a glowing Make proves, a glowing one over a zero Make does not", () => {
+    const over = (incoming: string, override: string) =>
+      emission(
+        [glow(), zero(), makeAttrs("make", incoming), node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[1]": pin(override) }, attributeTypes: [EMISSIVE_GUID] })],
+        { materialAttributes: pin("set") },
+      );
+    expect(proveEmissionZero(over("glow", "zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(over("zero", "glow"), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("lerps the emission through BlendMaterialAttributes: zero at both ends proves, a glowing end does not", () => {
+    const blend = (top: string) =>
+      emission(
+        [
+          glow(),
+          zero(),
+          node("alpha", "Constant", { constants: { R: 0.5 } }),
+          makeAttrs("base", "zero"),
+          makeAttrs("top", top),
+          node("blend", "BlendMaterialAttributes", { inputs: { A: pin("base"), B: pin("top"), Alpha: pin("alpha") } }),
+        ],
+        { materialAttributes: pin("blend") },
+      );
+    expect(proveEmissionZero(blend("zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(blend("glow"), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("reads the emission through BreakMaterialAttributes and GetMaterialAttributes", () => {
+    const source = (emissive: string) => [glow(), zero(), makeAttrs("make", emissive)];
+    const broken = (emissive: string) =>
+      emission([...source(emissive), node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: BREAK_OUTPUTS })], {
+        emissive: pin("break", 4),
+      });
+    expect(proveEmissionZero(broken("zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(broken("glow"), params({}))).toMatchObject({ zero: false });
+    const got = (emissive: string) =>
+      emission(
+        [...source(emissive), node("get", "GetMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: ["EmissiveColor"], attributeTypes: [EMISSIVE_GUID] })],
+        { emissive: pin("get") },
+      );
+    expect(proveEmissionZero(got("zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(got("glow"), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("never lets a BaseColor flip decide a switch the emission shares: the stored branch decides, or the instance's override", () => {
+    // BaseColor and EmissiveColor read one Emissive switch. Its stored-on branch samples an unbound texture, the case the legacy
+    // BaseColor flip judges by, and the flip would pick the zero branch. The emission must not take that branch.
+    const shared = (stored: boolean) =>
+      emission(
+        [
+          node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: null, samplerType: "Masks" }),
+          glow(),
+          zero(),
+          node("tinted", "Multiply", { inputs: { A: pin("mask", 0, RGB_MASK), B: pin("glow") } }),
+          node("switch", "StaticSwitchParameter", { parameter: { name: "Emissive", group: "" }, default: stored, switchValue: stored, inputs: { A: pin("tinted"), B: pin("zero") } }),
+          node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("switch"), EmissiveColor: pin("switch") } }),
+        ],
+        { materialAttributes: pin("make") },
+      );
+    expect(proveEmissionZero(shared(true), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(shared(true), params({ switches: { emissive:false } }))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(shared(false), params({}))).toMatchObject({ zero: true });
+  });
+
+  it("does not read an unsupported Normal or WorldPositionOffset pin for the emission", () => {
+    const graph = emission(
+      [
+        zero(),
+        node("weird", "UnknownFunctionClass"),
+        makeAttrs("make", "zero"),
+        node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[1]": pin("weird"), "Inputs[2]": pin("weird") }, attributeTypes: [NORMAL_GUID, WPO_GUID] }),
+      ],
+      { materialAttributes: pin("set") },
+    );
+    expect(proveEmissionZero(graph, params({}))).toMatchObject({ zero: true });
+  });
+
+  it("refuses an EmissiveColor whose source the evaluator cannot read", () => {
+    const graph = emission([node("weird", "UnknownFunctionClass"), makeAttrs("make", "weird")], { materialAttributes: pin("make") });
+    expect(proveEmissionZero(graph, params({}))).toMatchObject({ zero: false });
+  });
+
+  // The adapter records an editor UseConstant output in `outputConstants`, not as a node, and an output it could not read under
+  // `<output>Error`. A graph with every pin unwired but a nonzero stored constant emits light, and the proof must refuse it.
+  it("refuses a nonzero stored EmissiveColor constant on an otherwise unwired graph (the adapter's actual shape)", () => {
+    const graph = emission([], {}, { outputConstants: { emissive: [1, 1, 1] } });
+    expect(proveEmissionZero(graph, params({}))).toMatchObject({ zero: false });
+  });
+
+  it("honours a stored constant that is exactly zero, and an absent constant, as Unreal's own zero", () => {
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: [0, 0, 0] } }), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: 0 } }), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(emission([], {}), params({}))).toMatchObject({ zero: true });
+  });
+
+  it("refuses an emission candidate output the adapter could not read or a stored constant it cannot interpret", () => {
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissiveError: "property EmissiveColor could not be read" } }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { materialAttributesError: "property MaterialAttributes could not be read" } }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { materialAttributes: [0, 0, 0, 1] } }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: "black" } }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: [0, 0, 1] } }), params({}))).toMatchObject({ zero: false });
   });
 });

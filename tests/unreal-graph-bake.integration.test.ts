@@ -870,7 +870,36 @@ process.exit(run.status === null ? 1 : run.status);
   await chmod(path, 0o755);
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean }) {
+/**
+ * The parent's EmissiveColor default (the collected block UE Viewer writes for a parent value) and the instance's override of
+ * the Emissive switch, in the layout `materials.ts` reads.
+ */
+function emissiveProps(options: { collectedEmissive?: readonly number[] | undefined; switchOverride?: boolean | undefined }): string {
+  const lines: string[] = [];
+  if (options.collectedEmissive) {
+    const [r, g, b, a] = options.collectedEmissive;
+    lines.push("CollectedVectorParameters[1] =", "{", "    CollectedVectorParameters[0] =", "    {", `        Value = { R=${r}, G=${g}, B=${b}, A=${a} }`, "        Name = EmissiveColor", "    }", "}");
+  }
+  if (options.switchOverride !== undefined) {
+    lines.push(
+      "StaticParameters =",
+      "{",
+      "    StaticSwitchParameters[1] =",
+      "    {",
+      "        StaticSwitchParameters[0] =",
+      "        {",
+      "            ParameterInfo = { Name=Emissive }",
+      `            Value = ${options.switchOverride}`,
+      "            bOverride = true",
+      "        }",
+      "    }",
+      "}",
+    );
+  }
+  return lines.length > 0 ? `\n${lines.join("\n")}` : "";
+}
+
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean; collectedEmissive?: [number, number, number, number]; switchOverride?: boolean; emissiveTexture?: boolean; inputEmissive?: { factor?: [number, number, number]; texture?: boolean }; inputBaseColorTexture?: boolean; emptyToolchain?: boolean }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -883,17 +912,45 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   const overrides: [string, string][] = options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]];
   // A packed roughness texture (SpecPower binds the metallicRoughness slot): a constant factor must not multiply into it.
   if (options.packedRoughness) overrides.push(["SpecPower", "T_Spec"]);
+  // An Emissive texture the instance binds: the stale-emission case drops it with the factor.
+  if (options.emissiveTexture) overrides.push(["Emissive", "T_InstanceGlow"]);
   // The exporter binds nothing to MI_Rock: its colour exists only in the graph.
   await writeMeshFixture(exported, {
     name: "Mesh",
     materialName: "MI_Rock",
     mat: "",
-    props: instanceProps("M_Master", overrides, {
-      scalars: options.instanceScalars,
-      vectors: options.instanceTint ? [["Base Color Tint", options.instanceTint]] : undefined,
-    }),
+    props:
+      instanceProps("M_Master", overrides, {
+        scalars: options.instanceScalars,
+        vectors: options.instanceTint ? [["Base Color Tint", options.instanceTint]] : undefined,
+      }) + emissiveProps({ collectedEmissive: options.collectedEmissive, switchOverride: options.switchOverride }),
     textures: [],
   });
+  if (options.inputEmissive || options.inputBaseColorTexture) {
+    // The converter can leave a base-colour or emissive texture, or an emissive factor, on the input glTF material, which the
+    // .mat/.props the resolver reads never mentions. The graph proof must preserve the base colour and handle the emission.
+    const io = new NodeIO();
+    const document = await io.read(join(exported, "Mesh.gltf"));
+    const inputMaterial = document.getRoot().listMaterials()[0]!;
+    const solidPng = async (rgba: readonly [number, number, number]) => {
+      const pixels = Buffer.alloc(2 * 2 * 4);
+      for (let index = 0; index < 4; index += 1) {
+        pixels[index * 4] = rgba[0];
+        pixels[index * 4 + 1] = rgba[1];
+        pixels[index * 4 + 2] = rgba[2];
+        pixels[index * 4 + 3] = 255;
+      }
+      return sharp(pixels, { raw: { width: 2, height: 2, channels: 4 } }).png().toBuffer();
+    };
+    if (options.inputBaseColorTexture) {
+      inputMaterial.setBaseColorTexture(document.createTexture("T_InputAlbedo").setImage(new Uint8Array(await solidPng([120, 90, 60]))).setMimeType("image/png"));
+    }
+    if (options.inputEmissive?.factor) inputMaterial.setEmissiveFactor([...options.inputEmissive.factor]);
+    if (options.inputEmissive?.texture) {
+      inputMaterial.setEmissiveTexture(document.createTexture("T_InputGlow").setImage(new Uint8Array(await solidPng([255, 200, 80]))).setMimeType("image/png"));
+    }
+    await io.write(join(exported, "Mesh.gltf"), document);
+  }
   if (options.normal) {
     const io = new NodeIO();
     const document = await io.read(join(exported, "Mesh.gltf"));
@@ -918,6 +975,10 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   if (options.packedRoughness) {
     await writeFile(join(content, "T_Spec.uasset"), Buffer.alloc(16));
     await writePng(join(exported, "T_Spec.png"), [128, 128, 128, 255], 4);
+  }
+  if (options.emissiveTexture) {
+    await writeFile(join(content, "T_InstanceGlow.uasset"), Buffer.alloc(16));
+    await writePng(join(exported, "T_InstanceGlow.png"), [255, 200, 80, 255], 4);
   }
   const umodel = join(root, "umodel");
   const textureLog = join(root, "texture-exports.log");
@@ -945,9 +1006,15 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     onlyPackages: ["Mesh"],
     concurrency: 1,
     freeSpaceBytes: 30_000_000_000,
-    environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: cacheDir },
+    environment: {
+      ...process.env,
+      THREENATIVE_UNREAL_CACHE_DIR: cacheDir,
+      // An empty toolchain with auto-install off: the graph baker must fail to provision and never download anything.
+      ...(options.emptyToolchain ? { THREENATIVE_TOOLCHAIN_AUTOINSTALL: "0", THREENATIVE_TOOLCHAIN_DIR: join(root, "toolchain") } : {}),
+    },
     umodel: { name: "umodel", path: umodel, version: "fixture" },
-    modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+    // No converter injected when the toolchain is empty: the graph baker must resolve-or-fail, never provision.
+    ...(options.emptyToolchain ? {} : { modernConverter: { name: "modern", path: converter, version: "fake-converter 1" } }),
     ...(options.graphBake === undefined ? {} : { graphBake: options.graphBake }),
   });
   const glb = await new NodeIO().read(join(outputDir, report.models[0]!.glb));
@@ -955,7 +1022,8 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   const dumped = await readFile(converterLog, "utf8").catch(() => "");
   const leftovers = await readdir(cacheDir, { recursive: true }).catch(() => [] as string[]);
   const textureExports = (await readFile(textureLog, "utf8").catch(() => "")).split("\n").filter(Boolean);
-  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, glb, dumped, leftovers, textureExports };
+  const toolchain = await readdir(join(root, "toolchain"), { recursive: true }).catch(() => [] as string[]);
+  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, glb, dumped, leftovers, textureExports, toolchain };
 }
 
 describe("importUnrealDirectory surface-driven graph bake", () => {
@@ -1146,6 +1214,109 @@ describe("importUnrealDirectory graph bake", () => {
     expect(material.getRoughnessFactor()).toBe(1);
     expect(section.limitations.join("\n")).toContain("not applied");
     expect(section.graph).toMatchObject({ status: "baked", vertexColorResidual: true });
+  });
+});
+
+/**
+ * The Jungle master's shape in the importer's fixture: BaseColor is Mask x tint, and EmissiveColor is the Emissive switch
+ * (stored default `switchStored`) between a glow and a zero constant. `glowOnly` wires the glow straight in instead.
+ */
+function emissionMaster(options: { switchStored?: boolean; glowOnly?: boolean; truncated?: boolean } = {}): MaterialGraph {
+  const stored = options.switchStored ?? false;
+  const nodes: Raw[] = [
+    node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: "/Game/Test/T_MasterMask.T_MasterMask", samplerType: "Masks" }),
+    node("tint", "Constant3Vector", { constants: { Constant: [0.5, 0.25, 1, 1] } }),
+    node("mul", "Multiply", { inputs: { A: pin("mask", [1, 1, 1, 0]), B: pin("tint") } }),
+    node("glow", "VectorParameter", { parameter: { name: "EmissiveColor", group: "" }, default: [1, 1, 1, 0] }),
+    node("zero", "Constant3Vector", { constants: { Constant: [0, 0, 0, 1] } }),
+    node("switch", "StaticSwitchParameter", { parameter: { name: "Emissive", group: "6 Emissive" }, default: stored, switchValue: stored, inputs: { A: pin("glow"), B: pin("zero") } }),
+    node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("mul"), EmissiveColor: pin(options.glowOnly ? "glow" : "switch") } }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: options.truncated ?? false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: pin("make") },
+    nodes,
+  });
+}
+
+describe("importUnrealDirectory emission proof", () => {
+  it("drops a stale white EmissiveColor the graph proves zero: the Emissive switch is off and no other path draws it", async () => {
+    const { report, onDisk, material } = await importWithGraph({ graph: emissionMaster(), collectedEmissive: [1, 1, 1, 0] });
+    expect(material.getEmissiveFactor()).toEqual([0, 0, 0]);
+    for (const reported of [report, onDisk]) {
+      expect(reported.models[0]!.materials[0]!.limitations.join("\n")).toContain("source-proven zero emission");
+    }
+  });
+
+  it("drops a stale Emissive texture with the factor, and nothing later reintroduces the factor", async () => {
+    const { material } = await importWithGraph({ graph: emissionMaster(), collectedEmissive: [1, 1, 1, 0], emissiveTexture: true });
+    expect(material.getEmissiveTexture()).toBeNull();
+    expect(material.getEmissiveFactor()).toEqual([0, 0, 0]);
+  });
+
+  it("keeps the stale EmissiveColor when the instance overrides the Emissive switch on", async () => {
+    const { report, material } = await importWithGraph({ graph: emissionMaster(), collectedEmissive: [1, 1, 1, 0], switchOverride: true });
+    expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+    expect(report.models[0]!.materials[0]!.limitations.join("\n")).not.toContain("source-proven zero emission");
+  });
+
+  it("keeps it when the stored switch is on, and when the graph's EmissiveColor is a glow with no switch", async () => {
+    for (const graph of [emissionMaster({ switchStored: true }), emissionMaster({ glowOnly: true })]) {
+      const { material } = await importWithGraph({ graph, collectedEmissive: [1, 1, 1, 0] });
+      expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+    }
+  });
+
+  it("keeps it when the graph cannot be read in full", async () => {
+    const { material } = await importWithGraph({ graph: emissionMaster({ truncated: true }), collectedEmissive: [1, 1, 1, 0] });
+    expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+  });
+
+  // The resolver metadata never carries the input glTF material's own emissive slots, so those must trigger the probe too.
+  it("drops an emissive factor the input glTF material carries, the slot the resolver metadata never sees", async () => {
+    const { material } = await importWithGraph({ graph: emissionMaster(), inputEmissive: { factor: [1, 0.5, 0.2] } });
+    expect(material.getEmissiveFactor()).toEqual([0, 0, 0]);
+    expect(material.getEmissiveTexture()).toBeNull();
+  });
+
+  it("drops an emissive texture the input glTF material carries, alone and together with a factor", async () => {
+    const textureOnly = await importWithGraph({ graph: emissionMaster(), inputEmissive: { texture: true } });
+    expect(textureOnly.material.getEmissiveTexture()).toBeNull();
+    expect(textureOnly.material.getEmissiveFactor()).toEqual([0, 0, 0]);
+    const both = await importWithGraph({ graph: emissionMaster(), inputEmissive: { factor: [1, 0.5, 0.2], texture: true } });
+    expect(both.material.getEmissiveTexture()).toBeNull();
+    expect(both.material.getEmissiveFactor()).toEqual([0, 0, 0]);
+  });
+
+  it("keeps the input glTF emission when the graph's emission is active, and when the proof is unavailable", async () => {
+    const active = await importWithGraph({ graph: emissionMaster({ glowOnly: true }), inputEmissive: { factor: [1, 0.5, 0.2], texture: true } });
+    expect(active.material.getEmissiveFactor()).toEqual([1, 0.5, 0.2]);
+    expect(active.material.getEmissiveTexture()).not.toBeNull();
+    const unknown = await importWithGraph({ graph: emissionMaster({ truncated: true }), inputEmissive: { factor: [1, 0.5, 0.2], texture: true } });
+    expect(unknown.material.getEmissiveFactor()).toEqual([1, 0.5, 0.2]);
+    expect(unknown.material.getEmissiveTexture()).not.toBeNull();
+  });
+
+  // With no toolchain and auto-install off, the proof is unavailable rather than attempted: a section with a resolved base
+  // colour and stale emission keeps both, and the import provisions nothing.
+  it("preserves an existing base colour and stale emission when an empty toolchain cannot prove zero, installing nothing", async () => {
+    const { report, material, toolchain, leftovers } = await importWithGraph({
+      graph: emissionMaster(),
+      collectedEmissive: [1, 1, 1, 0],
+      inputBaseColorTexture: true,
+      emptyToolchain: true,
+    });
+    expect(material.getBaseColorTexture()).not.toBeNull();
+    expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.limitations.join("\n")).not.toContain("source-proven zero emission");
+    // Nothing was installed: the toolchain root stayed empty and no .NET/CUE4Parse or converter cache appeared.
+    expect(toolchain).toEqual([]);
+    expect(leftovers.filter((entry) => /toolchain|dotnet|cue4parse|\.engine-|converter/i.test(entry))).toEqual([]);
   });
 });
 

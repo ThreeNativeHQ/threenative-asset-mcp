@@ -11,6 +11,8 @@ import {
   particleDrivenBaseColor,
   graphPathClasses,
   graphPathTextures,
+  proveEmissionZero,
+  type EmissionProof,
   type EmissiveEffect,
   type BakeResult,
   type GraphParameters,
@@ -125,6 +127,11 @@ export type GraphBakeOutcome = BakeResult & {
   readonly graphMaterial?: string;
   /** The parameters the evaluator saw, after nearest-wins merging over the instance chain. */
   readonly parameters?: GraphParameters;
+  /**
+   * Whether the graph emits no light for this instance (see `proveEmissionZero`). Present whenever the graph itself was read,
+   * on a bake, a probe or an effect alike, so the importer can drop a stale emissive binding or factor on that proof alone.
+   */
+  readonly emissionZero?: EmissionProof;
 };
 
 export type GraphBaker = (request: GraphBakeRequest) => Promise<GraphBakeOutcome>;
@@ -461,11 +468,13 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     }
     if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);
 
-    const effect = emissiveOnlyEffect(graph);
-    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material };
-    const noAlbedo = noColourOutput(graph);
-    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material };
+    // The emission proof reads the same instance parameters as the bake, so every outcome below carries it.
     const parameters = chainParameters(chain);
+    const emissionZero = proveEmissionZero(graph, parameters);
+    const effect = emissiveOnlyEffect(graph);
+    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material, emissionZero };
+    const noAlbedo = noColourOutput(graph);
+    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material, emissionZero };
     if (request.probe) {
       // Unreal applies a mesh's vertex colours only where the graph reads VertexColor; glTF multiplies COLOR_0 into
       // every base colour. The importer drops COLOR_0 when the BaseColor path does not read it.
@@ -483,6 +492,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       const classes = readable ? graphPathClasses(graph, "baseColor", parameters, request.alpha) : undefined;
       return {
         ...unavailable(`${graph.material} has a BaseColor output`),
+        emissionZero,
         ...(readable
           ? {
               ...(classes ? { vertexColorOnBaseColor: classes.includes("VertexColor") } : {}),
@@ -554,7 +564,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         const particle = particleDrivenBaseColor(graph!);
         // A refused texture is the reason even though the evaluator reports it only as missing: no exact source was chosen.
         const reason = unresolved.size > 0 ? `${[...unresolved.values()].join("; ")}; no source is selected, so the base colour is not baked` : result.reason;
-        return { ...result, reason, graphMaterial: graph!.material, parameters, ...(particle ? { particle } : {}) };
+        return { ...result, reason, graphMaterial: graph!.material, parameters, emissionZero, ...(particle ? { particle } : {}) };
       }
       const approximations = new Set(result.approximations);
       // A successful bake comes from a settled pass, so the classes are defined; an empty list is only the safe
@@ -569,6 +579,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         confidence: approximations.size === 0 ? "exact" : "heuristic",
         graphMaterial: graph!.material,
         parameters,
+        emissionZero,
         ...(residual ? { vertexColorResidual: true } : {}),
         ...(pbrFactors ? { pbrFactors } : {}),
       };

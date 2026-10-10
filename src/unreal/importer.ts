@@ -1926,6 +1926,33 @@ export async function packageGlb(options: {
     if (resolved.alphaMode === "MASK") material.setAlphaCutoff(resolved.alphaCutoff ?? 0.333);
     material.setDoubleSided(resolved.doubleSided);
 
+    // The resolver promotes the parent's EmissiveColor vector and binds any Emissive texture whether or not the graph's Emissive
+    // switch reaches them. The input glTF material can also carry its own emissive factor or texture (the converter's, not the
+    // resolver's), so both sources trigger the probe. Unreal draws none of them when the graph's emission is zero, so they are
+    // dropped on that source proof alone (`proveEmissionZero`, on the instance's overrides). An effect keeps its emission, a named
+    // fallback keeps its own, and an unknown proof leaves the material as it came. Clearing the section's own slots before the
+    // bindings are attached also keeps the factor from being set again by an emissive texture's attachment.
+    const staleEmission =
+      resolved.bindings.some((binding) => binding.slot === "emissive") ||
+      (resolved.emissiveFactor?.some((channel) => channel > 0) ?? false) ||
+      material.getEmissiveTexture() !== null ||
+      material.getEmissiveFactor().some((channel) => channel > 0);
+    if (staleEmission && effect === undefined && options.graphBaker && !hasNamedFallback(material.getName())) {
+      const probed = await options.graphBaker(graphRequest(true));
+      const proof = probed.emissionZero;
+      if (proof?.zero === true && probed.effect === undefined && probed.noAlbedo === undefined) {
+        resolved = {
+          ...resolved,
+          emissiveFactor: undefined,
+          bindings: resolved.bindings.filter((binding) => binding.slot !== "emissive"),
+          limitations: [...resolved.limitations, `source-proven zero emission: ${proof.summary}; the stale emissive factor and emissive bindings are dropped.`],
+        };
+        // The resolver metadata never saw the input material's own emissive slots, so remove those explicitly.
+        material.setEmissiveFactor([0, 0, 0]);
+        material.setEmissiveTexture(null);
+      }
+    }
+
     const ordered = [...resolved.bindings].sort(
       (left, right) => SLOT_ORDER.indexOf(left.slot) - SLOT_ORDER.indexOf(right.slot),
     );

@@ -253,11 +253,14 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
  * - CERTAIN, the pin is fed by a `ShadingModel` node: ShadingModel (D942...).
  * - INFERRED from the feeding function only (agrees with the Impostor_MS names): Specular (MF_generateSpecular),
  *   Roughness (MF_Roughness), OpacityMask (MF_BranchBlending / MF_DecorationBlending), WorldPositionOffset (MF_AdvancedWind).
+ * - CERTAIN, EmissiveColor (B769B54DD08D4440ABC21BA6CD27D0E2): its GUID and its unwired default of zero are the
+ *   EmissiveColor entry of Epic's MaterialAttributeDefinitionMap.cpp (UE 5.8.3, default FVector4(0,0,0,0)).
  * - UNKNOWN, deliberately absent: E8EBD0AD... (fed by a Masks-sampled texture; Opacity or AmbientOcclusion is a guess),
- *   Metallic, EmissiveColor, Opacity, AmbientOcclusion, and every other guid.
+ *   Metallic, Opacity, AmbientOcclusion, and every other guid.
  */
 export const MATERIAL_ATTRIBUTE_GUIDS = {
   BaseColor: "69B8D33616ED4D499AA497292F050F7A",
+  EmissiveColor: "B769B54DD08D4440ABC21BA6CD27D0E2",
   SubsurfaceColor: "5B8FC67951CE40829D777BEEF4F72C44",
   Specular: "9FDAB39925564CC98CD2D572C12C8FED",
   OpacityMask: "679FFB172BB5422CAD520483166E0C75",
@@ -447,8 +450,11 @@ interface Val {
  */
 const SCALAR_ATTRIBUTES = ["Metallic", "Roughness", "OpacityMask"] as const;
 type ScalarAttribute = (typeof SCALAR_ATTRIBUTES)[number];
-/** What an attributes read asks for: BaseColor, or one scalar. A static switch is judged by the demands its active reads make. */
-type Demand = "BaseColor" | ScalarAttribute;
+/**
+ * What an attributes read asks for: BaseColor, EmissiveColor, or one scalar. A static switch is judged by the demands its
+ * active reads make.
+ */
+type Demand = "BaseColor" | "EmissiveColor" | ScalarAttribute;
 /**
  * Unreal's default attribute values, which an unwired Make pin takes, and a Set or Blend with no incoming attributes. Epic's
  * Main Material node docs give Metallic 0 and Roughness 0.5; the Make and Set nodes are not documented separately. An
@@ -467,10 +473,17 @@ type Scalar = Val | UnknownScalar;
  * node wired to an attribute nobody reads is never visited. Making BaseColor lazy matters too: reading only Metallic or
  * Roughness (or the cut-out) of a Make/Set/Blend must not compile an unsupported node that feeds its BaseColor pin.
  */
+/**
+ * An EmissiveColor value: a vector; null when its pin is unwired (Unreal's default, zero); or unknown, which the emission proof
+ * refuses. The unknown marker is the same one a scalar uses.
+ */
+type Emission = Val | null | UnknownScalar;
 interface Attrs {
   kind: "attr";
   /** Compiles BaseColor on first read; null when the pin is unwired (Unreal's default black). */
   baseColor: () => Val | null;
+  /** Compiles EmissiveColor on first read. Only the emission proof reads it, so a bake never compiles an emission it does not need. */
+  emissive: () => Emission;
   scalars: Record<ScalarAttribute, () => Scalar>;
 }
 
@@ -847,6 +860,7 @@ class Compiler {
     return {
       kind: "attr",
       baseColor: () => this.attrField(attrs, "BaseColor", attrs.baseColor, cycle),
+      emissive: () => this.attrField(attrs, "EmissiveColor", attrs.emissive, cycle),
       scalars: this.perScalar((attribute) => () => this.attrField(attrs, attribute, attrs.scalars[attribute], cycle)),
     };
   }
@@ -866,6 +880,10 @@ class Compiler {
         record("BaseColor");
         return source.baseColor();
       },
+      emissive: () => {
+        record("EmissiveColor");
+        return source.emissive();
+      },
       scalars: this.perScalar((attribute) => () => {
         record(attribute);
         return source.scalars[attribute]();
@@ -876,23 +894,23 @@ class Compiler {
   /** An attributes value whose source compiles only when one of its fields is read, so a field another pin overrides never forces it. */
   private lazyAttrs(compute: () => Attrs): Attrs {
     const source = lazy(compute);
-    return { kind: "attr", baseColor: () => source().baseColor(), scalars: this.perScalar((attribute) => () => source().scalars[attribute]()) };
+    return { kind: "attr", baseColor: () => source().baseColor(), emissive: () => source().emissive(), scalars: this.perScalar((attribute) => () => source().scalars[attribute]()) };
   }
 
   /** An attributes value with no source: reading any of its fields marks `reason` unavailable, so the bake refuses rather than guesses. */
   private missingAttrs(reason: string): Attrs {
     const mark = lazy(() => this.markUnavailable(reason));
-    return { kind: "attr", baseColor: () => mark(), scalars: this.perScalar(() => () => mark()) };
+    return { kind: "attr", baseColor: () => mark(), emissive: () => mark(), scalars: this.perScalar(() => () => mark()) };
   }
 
-  /** Unreal's default attribute values: BaseColor black, each scalar its default. Nothing is compiled until a consumer reads it. */
+  /** Unreal's default attribute values: BaseColor black, EmissiveColor zero, each scalar its default. Nothing is compiled until a consumer reads it. */
   private defaultAttrs(): Attrs {
-    return { kind: "attr", baseColor: () => null, scalars: this.perScalar((attribute) => lazy((): Scalar => this.constant([DEFAULT_SCALAR[attribute]], 1))) };
+    return { kind: "attr", baseColor: () => null, emissive: () => null, scalars: this.perScalar((attribute) => lazy((): Scalar => this.constant([DEFAULT_SCALAR[attribute]], 1))) };
   }
 
-  /** A value from a source the bake does not model: BaseColor black (the unavailable mark stops the bake), each scalar unknown. */
+  /** A value from a source the bake does not model: BaseColor black (the unavailable mark stops the bake), every scalar and EmissiveColor unknown. */
   private unknownAttrs(): Attrs {
-    return { kind: "attr", baseColor: () => null, scalars: this.perScalar(() => () => unknownScalar()) };
+    return { kind: "attr", baseColor: () => null, emissive: () => unknownScalar(), scalars: this.perScalar(() => () => unknownScalar()) };
   }
 
   /** One scalar thunk per attribute: `make` builds the thunk for each. */
@@ -902,12 +920,27 @@ class Compiler {
 
   /** The same attributes with a BaseColor thunk (already-compiled values pass `() => value`). */
   private withBaseColor(attrs: Attrs, baseColor: () => Val | null): Attrs {
-    return { kind: "attr", baseColor, scalars: attrs.scalars };
+    return { kind: "attr", baseColor, emissive: attrs.emissive, scalars: attrs.scalars };
   }
 
   /** The same value with one scalar unknown: a layer function writes it and its body is engine content. */
   private withUnknown(attrs: Attrs, attribute: ScalarAttribute, path: string): Attrs {
-    return { kind: "attr", baseColor: attrs.baseColor, scalars: this.perScalar((other) => (other === attribute ? () => unknownScalar(path) : attrs.scalars[other])) };
+    return { kind: "attr", baseColor: attrs.baseColor, emissive: attrs.emissive, scalars: this.perScalar((other) => (other === attribute ? () => unknownScalar(path) : attrs.scalars[other])) };
+  }
+
+  /** An EmissiveColor pin of a Make or Set: unwired is null (Unreal's zero default); wired is its value, a malformed one unavailable. */
+  private emissivePin(input: GraphInput | null | undefined, label: string): Emission {
+    return this.vec(input, label) ?? null;
+  }
+
+  /** An EmissiveColor a consumer reads: its value, zero when unwired, or unknown, which names the consumer and the source. */
+  private emissiveOf(source: Attrs, consumer: string): Val {
+    const value = source.emissive();
+    if (value === null) return this.constant([0, 0, 0], 3);
+    if (value.kind !== "unknown") return value;
+    this.unsupported.add(consumer);
+    if (value.path) this.unsupported.add(value.path);
+    return this.constant([0, 0, 0], 3);
   }
 
   /** A vector wired to a scalar input contributes its first component, as HLSL truncates a vector to a float. */
@@ -1303,8 +1336,9 @@ class Compiler {
         // Every pin is compiled only when a consumer reads it: a Make whose BaseColor is unsupported still feeds a
         // Metallic/Roughness/OpacityMask path.
         const baseColor = lazy((): Val | null => this.vec(node.inputs.BaseColor, "MakeMaterialAttributes.BaseColor") ?? null);
+        const emissive = lazy((): Emission => this.emissivePin(node.inputs.EmissiveColor, "MakeMaterialAttributes.EmissiveColor"));
         const scalars = this.perScalar((attribute) => lazy((): Scalar => this.scalarPin(node.inputs[attribute], `MakeMaterialAttributes.${attribute}`) ?? this.constant([DEFAULT_SCALAR[attribute]], 1)));
-        return { kind: "attr", baseColor, scalars };
+        return { kind: "attr", baseColor, emissive, scalars };
       }
       case "BreakMaterialAttributes":
         return this.breakAttributes(node, output);
@@ -1669,6 +1703,11 @@ class Compiler {
       const source = this.attrs(node.inputs.MaterialAttributes, "BreakMaterialAttributes.MaterialAttributes") ?? this.unknownAttrs();
       return this.scalarOf(source, attribute, `BreakMaterialAttributes.${attribute}`);
     }
+    if (attribute === "EmissiveColor") {
+      // Unwired, the source is not a default (as for the scalars): which attributes the node should read is unknown.
+      const source = this.attrs(node.inputs.MaterialAttributes, "BreakMaterialAttributes.MaterialAttributes") ?? this.unknownAttrs();
+      return this.emissiveOf(source, "BreakMaterialAttributes.EmissiveColor");
+    }
     // Another attribute is never evaluated, so its source is not walked either.
     if (attribute !== "BaseColor") {
       this.unsupported.add(`BreakMaterialAttributes.${attribute}`);
@@ -1694,6 +1733,10 @@ class Compiler {
     if (attribute === "BaseColor") {
       const source = this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes");
       return source?.baseColor() ?? this.constant([0, 0, 0], 3);
+    }
+    if (attribute === "EmissiveColor") {
+      const source = this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes") ?? this.unknownAttrs();
+      return this.emissiveOf(source, "GetMaterialAttributes.EmissiveColor");
     }
     if (isScalarAttribute(attribute)) {
       const source = this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes") ?? this.unknownAttrs();
@@ -1728,6 +1771,8 @@ class Compiler {
     if (node.attributeTypes) {
       const colourIndex = node.attributeTypes.findIndex((guid) => sameGuid(guid, MATERIAL_ATTRIBUTE_GUIDS.BaseColor));
       const override = colourIndex >= 0 ? node.inputs[`Inputs[${colourIndex + 1}]`] : undefined;
+      const emissiveIndex = node.attributeTypes.findIndex((guid) => sameGuid(guid, MATERIAL_ATTRIBUTE_GUIDS.EmissiveColor));
+      const emissiveOverride = emissiveIndex >= 0 ? node.inputs[`Inputs[${emissiveIndex + 1}]`] : undefined;
       const incomingPin = node.inputs["Inputs[0]"];
       // The incoming attributes compile only when a field they supply is read, so an overridden field never reaches them.
       const base = incomingPin ? this.lazyAttrs(() => this.attrs(incomingPin, "SetMaterialAttributes.Inputs[0]") ?? this.defaultAttrs()) : this.defaultAttrs();
@@ -1747,7 +1792,8 @@ class Compiler {
       });
       // A wired override is compiled only when BaseColor is demanded, so a Set that only touches a scalar does not visit it.
       const baseColor = override ? lazy((): Val | null => this.vec(override, "SetMaterialAttributes.BaseColor") ?? null) : base.baseColor;
-      return { kind: "attr", baseColor, scalars: this.setScalars(base, pins, unnamed) };
+      const emissive = emissiveOverride ? lazy((): Emission => this.emissivePin(emissiveOverride, "SetMaterialAttributes.EmissiveColor")) : base.emissive;
+      return { kind: "attr", baseColor, emissive, scalars: this.setScalars(base, pins, unnamed) };
     }
     const override = this.namedPin(node, ["basecolor"]);
     const pins: Partial<Record<ScalarAttribute, GraphInput>> = {};
@@ -1771,7 +1817,9 @@ class Compiler {
     });
     const base = this.lazyAttrs(() => incoming() ?? (override ? this.defaultAttrs() : this.missingAttrs(`SetMaterialAttributes ${node.id} has no MaterialAttributes input`)));
     const baseColor = override ? lazy((): Val | null => this.vec(override, "SetMaterialAttributes.BaseColor") ?? null) : base.baseColor;
-    return { kind: "attr", baseColor, scalars: this.setScalars(base, pins, undefined) };
+    const emissiveOverride = this.namedPin(node, ["emissivecolor"]);
+    const emissive = emissiveOverride ? lazy((): Emission => this.emissivePin(emissiveOverride, "SetMaterialAttributes.EmissiveColor")) : base.emissive;
+    return { kind: "attr", baseColor, emissive, scalars: this.setScalars(base, pins, undefined) };
   }
 
   /** The wired pin whose name, ignoring case and non-alphanumerics, equals one of `names` (tried in order). */
@@ -1801,6 +1849,14 @@ class Compiler {
       const black = this.constant([0, 0, 0], 3);
       return this.lerp(base.baseColor() ?? black, top.baseColor() ?? black, alpha);
     });
+    const emissive = lazy((): Emission => {
+      const from = base.emissive();
+      const to = top.emissive();
+      if (from?.kind === "unknown") return from;
+      if (to?.kind === "unknown") return to;
+      const zero = this.constant([0, 0, 0], 3);
+      return this.lerp(from ?? zero, to ?? zero, alpha);
+    });
     const scalars = this.perScalar((attribute) =>
       lazy((): Scalar => {
         const from = base.scalars[attribute]();
@@ -1810,7 +1866,7 @@ class Compiler {
         return this.lerp(from, to, alpha);
       }),
     );
-    return { kind: "attr", baseColor, scalars };
+    return { kind: "attr", baseColor, emissive, scalars };
   }
 
   // -- texture coordinates --------------------------------------------------------------------------------
@@ -2448,6 +2504,16 @@ class Compiler {
     return compiled.baseColor() ?? this.constant([0, 0, 0], 3);
   }
 
+  /**
+   * The emission the graph's outputs carry, compiled here only: the legacy Emissive pin (undefined when unwired) and the
+   * EmissiveColor of the MaterialAttributes pin (undefined when that pin is unwired).
+   */
+  compileEmission(graph: MaterialGraph): { legacy: Val | undefined; attributes: Emission | undefined } {
+    const legacy = this.vec(graph.outputs.emissive, "Emissive output");
+    const attributes = graph.outputs.materialAttributes ? this.attrs(graph.outputs.materialAttributes, "MaterialAttributes output")?.emissive() : undefined;
+    return { legacy, attributes };
+  }
+
   /** Compiles the Opacity or OpacityMask pin; undefined when it is unwired or carries a material-attributes struct. */
   compileAlpha(graph: MaterialGraph, pin: "opacity" | "opacityMask"): Val | undefined {
     const wired = graph.outputs[pin];
@@ -2485,6 +2551,7 @@ function judgeSwitch(graph: MaterialGraph, parameters: GraphParameters, options:
     if (compiled?.kind === "attr") {
       for (const field of use.fields) {
         if (field === "BaseColor") compiled.baseColor();
+        else if (field === "EmissiveColor") compiled.emissive();
         else compiled.scalars[field]();
       }
     }
@@ -2724,6 +2791,85 @@ async function evaluate(
 }
 
 /** Alpha bytes at or above / at or below these count as fully opaque / fully clear. */
+// ---------------------------------------------------------------------------------------------------------
+// Emission proof
+
+/** Whether a graph emits no light for one instance. `zero` is set only on a proof (see `proveEmissionZero`). */
+export type EmissionProof = { readonly zero: true; readonly summary: string } | { readonly zero: false; readonly reason: string };
+
+/** The proof compiles on the stored switches, with no switch choices and no optional pins: anything they would decide is unknown. */
+const EMISSION_OPTIONS: CompileOptions = { allowUvSetFallback: false };
+
+/** A uniform constant zero: a constant whose RGB registers are exactly zero. A sampled or view-dependent value never is. */
+function isUniformZero(compiler: Compiler, value: Val): boolean {
+  if (!value.konst) return false;
+  for (let channel = 0; channel < Math.min(value.n, 3); channel++) {
+    if (compiler.registers[value.reg + channel] !== 0) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether a stored output constant (the adapter's `outputConstants`, from an editor `UseConstant` pin, which Unreal compiles
+ * instead of the wired expression) is exactly zero: `true` for a finite zero, `false` for a finite nonzero value, `undefined`
+ * when it is not a scalar number at all. Alpha is ignored: emission is RGB.
+ */
+function storedConstantZero(value: number | boolean | string | readonly number[]): boolean | undefined {
+  const channels = typeof value === "number" ? [value] : Array.isArray(value) ? value.slice(0, 3) : undefined;
+  if (!channels || channels.length === 0) return undefined;
+  if (!channels.every((channel) => typeof channel === "number" && Number.isFinite(channel))) return undefined;
+  return channels.every((channel) => channel === 0);
+}
+
+/**
+ * Proves that the graph emits no light for one instance, or says why it cannot. Unreal reads two candidates: the legacy Emissive
+ * pin, and the EmissiveColor of the MaterialAttributes pin when that is wired. The dump does not record bUseMaterialAttributes,
+ * so with attributes wired both candidates must be zero; an unwired candidate takes Unreal's default, zero. A candidate the
+ * adapter recorded as a constant (`outputConstants`) is read from there rather than from its pin, and a candidate it could not
+ * read at all refuses.
+ *
+ * The proof is conservative. It refuses an incomplete body (truncated, errored, miscounted or dangling), an emission candidate
+ * the adapter could not read, any unsupported node, approximation, unbound texture, unknown cycle, an uninterpretable stored
+ * constant, or a nonzero or nonconstant value on the emission path. Switches take the instance's override, or else their stored
+ * default: no BaseColor or cut-out demand flips one. Pins off the emission path (BaseColor, Normal, WorldPositionOffset, ...)
+ * are never compiled for it.
+ */
+export function proveEmissionZero(graph: MaterialGraph, parameters: GraphParameters): EmissionProof {
+  const refuse = (reason: string): EmissionProof => ({ zero: false, reason: `${graph.material}: ${reason}` });
+  if (graph.truncated || graph.error || graph.nodeCount !== graph.nodes.length) return refuse("the graph body is incomplete or unreadable");
+  const compiler = new Compiler(graph, parameters, EMISSION_OPTIONS);
+  const { legacy, attributes } = compiler.compileEmission(graph);
+  if (compiler.unsupported.size > 0) return refuse(`the emission depends on unsupported nodes ${[...compiler.unsupported].sort().join(", ")}`);
+  if (compiler.unavailable.length > 0) return refuse(`the emission cannot be read: ${compiler.unavailable.join("; ")}`);
+  if (compiler.approximations.size > 0) return refuse(`the emission depends on approximated values: ${[...compiler.approximations].sort().join("; ")}`);
+  if (compiler.unboundTextures.size > 0) return refuse(`the emission samples unbound textures ${[...compiler.unboundTextures].sort().join(", ")}`);
+  // The adapter stores an output it could not read under `<output>Error` and an Unreal UseConstant output under `<output>`.
+  // Both are outside the pin graph, so they are checked here for each candidate, regardless of whether the root uses the
+  // legacy pins or MaterialAttributes (`bUseMaterialAttributes` is not in the dump, so both candidates must be clean).
+  const constants = graph.outputConstants;
+  if (constants.emissiveError !== undefined || constants.materialAttributesError !== undefined) {
+    return refuse("an emission candidate output could not be read");
+  }
+  const checks: string[] = [];
+  const storedEmissive = constants.emissive;
+  if (storedEmissive !== undefined) {
+    const zero = storedConstantZero(storedEmissive);
+    if (zero === undefined) return refuse("the stored Emissive constant is not a readable value");
+    if (!zero) return refuse("the stored Emissive constant is not zero");
+    checks.push("Emissive a stored constant zero");
+  } else if (legacy === undefined) checks.push("Emissive unwired (Unreal's zero default)");
+  else if (isUniformZero(compiler, legacy)) checks.push("Emissive a constant zero");
+  else return refuse("Emissive is not a uniform constant zero");
+  if (constants.materialAttributes !== undefined) return refuse("the MaterialAttributes output is a stored constant the proof cannot read");
+  if (attributes === null) checks.push("MaterialAttributes.EmissiveColor unwired (Unreal's zero default)");
+  else if (attributes?.kind === "unknown") return refuse(`MaterialAttributes.EmissiveColor is not modelled${attributes.path ? ` (${attributes.path})` : ""}`);
+  else if (attributes !== undefined) {
+    if (!isUniformZero(compiler, attributes)) return refuse("MaterialAttributes.EmissiveColor is not a uniform constant zero");
+    checks.push("MaterialAttributes.EmissiveColor a constant zero");
+  }
+  return { zero: true, summary: checks.join(", ") };
+}
+
 const ALPHA_OPAQUE = 242;
 const ALPHA_CLEAR = 13;
 /** A baked opacity with at least this share of fully opaque or fully clear texels is a cut-out, not a gradient. */
