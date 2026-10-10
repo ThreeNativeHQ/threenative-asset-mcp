@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  type BoundedRunResult,
   type ExternalTool,
   ToolchainError,
   assertSupportedHost,
@@ -69,8 +70,25 @@ export const FABCLI_RELEASE = Object.freeze({
 /** GPL-3.0-or-later command-line converter, always executed out-of-process. */
 export const UNCOOKED_CONVERTER = Object.freeze({
   package: "unreal-assets-to-glb==4.27.2.0",
-  version: "4.27.2.0+threenative.9",
+  version: "4.27.2.0+threenative.10",
 });
+
+/**
+ * The flag the patched converter answers with its own pinned revision. The pip distribution only
+ * knows the upstream `4.27.2.0`, and its `--version` is upstream's, so our revision is a distinct
+ * flag the provisioner stamps in; nothing derives it from the package metadata.
+ */
+export const UNCOOKED_REVISION_FLAG = "--threenative-version";
+
+/** The owned cache location of the uncooked converter's console script. */
+export function uncookedConverterPath(environment: NodeJS.ProcessEnv = process.env): string {
+  return join(
+    toolchainCacheDir(environment),
+    "uncooked",
+    "venv",
+    process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
+  );
+}
 
 export interface ProvisionLog {
   (message: string): void;
@@ -138,6 +156,26 @@ async function canRun(executable: string, args: readonly string[], marker: RegEx
   try {
     const run = await runBounded(executable, args, { timeoutMs: 30_000 });
     return marker.test(`${run.stdout}\n${run.stderr}`);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The uncooked converter's `--help` is its ABI probe, and a run passes only when it exits 0 and prints
+ * both markers. `canRun` reads the text alone, so an install that prints the markers and then fails
+ * would pass it. Scoped here rather than changed in `canRun`, which UE Viewer's probe also uses and
+ * whose exit semantics differ.
+ */
+function uncookedHelpAccepted(run: BoundedRunResult): boolean {
+  const help = `${run.stdout}\n${run.stderr}`;
+  return run.code === 0 && /UE 4\.27 UAsset Parser/.test(help) && /gpu instances\/landscapes/.test(help);
+}
+
+/** Whether the executable at `path` passes {@link uncookedHelpAccepted}; one that cannot start does not. */
+async function uncookedHelpRuns(path: string): Promise<boolean> {
+  try {
+    return uncookedHelpAccepted(await runBounded(path, ["--help"], { timeoutMs: 30_000 }));
   } catch {
     return false;
   }
@@ -567,6 +605,44 @@ export function patchUncookedMeshColorExport(source: string): string {
 }
 
 /**
+ * Stamps the pinned revision onto the installed CLI as an argparse `version` action. The resolver
+ * reads this revision back from the concrete executable, so a cache entry installed before this
+ * feature — or one whose patches predate it — is detected stale and re-provisioned rather than being
+ * reported as the current build. `--version` still answers the upstream pip version, which is why
+ * this is a separate flag.
+ */
+export function patchUncookedCliRevision(source: string): string {
+  return replaceRequired(
+    source,
+    `    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )`,
+    `    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )
+    parser.add_argument(
+        '--threenative-version',
+        action='version',
+        version='${UNCOOKED_CONVERTER.version}',
+        help='Print the threenative-pinned converter revision and exit'
+    )`,
+    "threenative revision flag",
+  );
+}
+
+/**
+ * Test-only substitution for the pip install. Production callers never pass it; a unit test uses it
+ * so an upgrade of a stale owned cache can be exercised without running pip or touching the network.
+ * The hook must leave `executable` runnable: answering `--help` with the ABI marker and
+ * `--threenative-version` with `UNCOOKED_CONVERTER.version`.
+ */
+export interface UncookedProvisionHooks {
+  readonly install?: (executable: string, environment: NodeJS.ProcessEnv, log: ProvisionLog) => Promise<void>;
+}
+
+/**
  * Installs the GPL converter in its own virtual environment and applies narrow compatibility
  * fixes to that external program. The fixes preserve uncooked-package PersistentGuid fields,
  * preserve numbered FNames (M_Wood_2), and make --skip-textures actually skip its multi-gigabyte
@@ -574,20 +650,29 @@ export function patchUncookedMeshColorExport(source: string): string {
  * a preview web server. The fifth patch merges serialized Blueprint component templates into
  * placed level instances; it does not execute Blueprint bytecode. A sixth patch decodes bounded
  * UE4 ISM/HISM/foliage matrix arrays for standards-based GPU instancing. A seventh patch decodes
- * editor LandscapeComponent heightmaps from their package-relative bulk payloads. No converter
- * code is linked into this Node package.
+ * editor LandscapeComponent heightmaps from their package-relative bulk payloads. An eighth stamps
+ * the pinned threenative revision onto the CLI so the resolver can tell a stale install from the
+ * current one. No converter code is linked into this Node package.
  */
 export async function provisionUncookedConverter(
   environment: NodeJS.ProcessEnv = process.env,
   log: ProvisionLog = silent,
+  hooks: UncookedProvisionHooks = {},
 ): Promise<string> {
   assertSupportedHost();
   const cache = join(toolchainCacheDir(environment), "uncooked");
   const venv = join(cache, "venv");
-  const executable = join(
-    venv,
-    process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
-  );
+  const executable = uncookedConverterPath(environment);
+
+  if (hooks.install) {
+    await hooks.install(executable, environment, log);
+    if (!(await uncookedHelpRuns(executable))) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
+    }
+    log(`Installed uncooked Unreal converter at ${executable}`);
+    return executable;
+  }
+
   const python = await pythonExecutable(environment);
   const safeEnvironment = childEnvironment(environment);
   // Python console scripts embed the interpreter's absolute path in their shebang, so a venv
@@ -1169,6 +1254,7 @@ def find_umap_path(input_dir, umap_filename):`,
     )`,
       "scene-json argument",
     );
+    cliSource = patchUncookedCliRevision(cliSource);
     cliSource = replaceRequired(
       cliSource,
       `    else:
@@ -1202,7 +1288,7 @@ def find_umap_path(input_dir, umap_filename):`,
     meshSource = patchUncookedMeshColorExport(meshSource);
     await writeFile(meshPath, meshSource);
 
-    if (!(await canRun(executable, ["--help"], /gpu instances\/landscapes/))) {
+    if (!(await uncookedHelpRuns(executable))) {
       throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
     }
     log(`Installed uncooked Unreal converter at ${executable}`);
@@ -1315,11 +1401,76 @@ export async function provisionModernConverter(
   }
 }
 
+/**
+ * Reads the revision the installed converter reports on `--threenative-version`. An install from
+ * before the revision patch rejects the flag and exits non-zero, so this is undefined — deliberately
+ * not the pip package's upstream `--version`, which is not our revision.
+ */
+async function readUncookedRevision(path: string): Promise<string | undefined> {
+  try {
+    const run = await runBounded(path, [UNCOOKED_REVISION_FLAG], { timeoutMs: 30_000 });
+    if (run.code !== 0) return undefined;
+    return `${run.stdout}\n${run.stderr}`
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The uncooked resolver is revision-aware. An explicit override or a PATH tool is the user's and is
+ * never overwritten: a wrong or absent revision is rejected with how to fix it. The owned cache is
+ * verified the same way, and a stale entry is re-provisioned only when auto-install is enabled.
+ */
+async function resolveOrProvisionUncooked(
+  environment: NodeJS.ProcessEnv,
+  log: ProvisionLog,
+  hooks: UncookedProvisionHooks,
+): Promise<string> {
+  try {
+    const found = await resolveExecutable("uncooked", environment);
+    const revision = await readUncookedRevision(found);
+    if (revision === UNCOOKED_CONVERTER.version) return found;
+    const override = environment.THREENATIVE_UNCOOKED_CONVERTER_PATH?.trim();
+    const reported = revision ? `threenative revision ${revision}` : "no threenative revision";
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      override
+        ? `THREENATIVE_UNCOOKED_CONVERTER_PATH points at "${found}", which reports ${reported}, not the required ${UNCOOKED_CONVERTER.version}. Unset it so the importer can provision a compatible converter.`
+        : `"${found}" on PATH reports ${reported}, not the required ${UNCOOKED_CONVERTER.version}. Remove it from PATH so the importer can provision a compatible converter.`,
+    );
+  } catch (error) {
+    if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
+    const cached = uncookedConverterPath(environment);
+    const revision = await readUncookedRevision(cached);
+    const hasHelp = await uncookedHelpRuns(cached);
+    // Both must hold: the help ABI alone passes on an install too old to carry the revision flag, which
+    // is exactly the stale cache this guards against, and a revision alone does not prove it runs.
+    if (revision === UNCOOKED_CONVERTER.version && hasHelp) return cached;
+    if (!autoInstallEnabled(environment)) {
+      if (!hasHelp && revision === undefined) throw error;
+      const state = revision === UNCOOKED_CONVERTER.version
+        ? "not runnable: its --help must exit 0 and print the converter's markers"
+        : revision ? `threenative revision ${revision}` : "not the pinned revision";
+      throw new ToolchainError(
+        "UNREAL_TOOL_UNUSABLE",
+        `The provisioned uncooked converter at "${cached}" is ${state}; expected ${UNCOOKED_CONVERTER.version}. Set THREENATIVE_TOOLCHAIN_AUTOINSTALL=1 (the default) and retry to re-provision it.`,
+      );
+    }
+    log(`Re-provisioning the uncooked converter: the cache is not a runnable ${UNCOOKED_CONVERTER.version} converter.`);
+    return await provisionUncookedConverter(environment, log, hooks);
+  }
+}
+
 async function resolveOrProvision(
   name: "umodel" | "fabcli" | "uncooked" | "modern",
   environment: NodeJS.ProcessEnv,
   log: ProvisionLog,
+  uncookedHooks: UncookedProvisionHooks = {},
 ): Promise<string> {
+  if (name === "uncooked") return resolveOrProvisionUncooked(environment, log, uncookedHooks);
   try {
     const found = await resolveExecutable(name, environment);
     // A PATH umodel is whatever the user happened to install; the 2022 upstream release rejects
@@ -1331,34 +1482,24 @@ async function resolveOrProvision(
     throw new ToolchainError("UNREAL_TOOL_NOT_FOUND", `${found} does not accept -psk; no capable UE Viewer was found.`);
   } catch (error) {
     if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
-    const cached = name === "uncooked"
-      ? join(
-          toolchainCacheDir(environment),
-          "uncooked",
-          "venv",
-          process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
-        )
-      : name === "modern"
-        ? join(toolchainCacheDir(environment), "modern", "bin", process.platform === "win32" ? "ThreeNativeConverter.exe" : "ThreeNativeConverter")
-        : join(
-          toolchainCacheDir(environment),
-          name,
-          process.platform === "win32" ? `${name}.exe` : name,
-        );
+    const cached = name === "modern"
+      ? join(toolchainCacheDir(environment), "modern", "bin", process.platform === "win32" ? "ThreeNativeConverter.exe" : "ThreeNativeConverter")
+      : join(
+        toolchainCacheDir(environment),
+        name,
+        process.platform === "win32" ? `${name}.exe` : name,
+      );
     const marker = name === "umodel"
       ? /UE Viewer/i
       : name === "fabcli"
         ? /fabcli/i
-        : name === "modern"
-          ? new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-          : /gpu instances\/landscapes/;
-    const probe = name === "umodel" ? UMODEL_PROBE : name === "fabcli" ? ["--version"] : name === "modern" ? ["--version"] : ["--help"];
+        : new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const probe = name === "umodel" ? UMODEL_PROBE : ["--version"];
     if (await canRun(cached, probe, marker)) return cached;
     if (!autoInstallEnabled(environment)) throw error;
     if (name === "umodel") return await provisionUmodel(environment, log);
     if (name === "fabcli") return await provisionFabcli(environment, log);
-    if (name === "modern") return await provisionModernConverter(environment, log);
-    return await provisionUncookedConverter(environment, log);
+    return await provisionModernConverter(environment, log);
   }
 }
 
@@ -1413,14 +1554,24 @@ export async function ensureFabcli(
 export async function ensureUncookedConverter(
   environment: NodeJS.ProcessEnv = process.env,
   log: ProvisionLog = silent,
+  hooks: UncookedProvisionHooks = {},
 ): Promise<ExternalTool> {
   assertSupportedHost();
-  const path = await resolveOrProvision("uncooked", environment, log);
+  const path = await resolveOrProvision("uncooked", environment, log, hooks);
   const run = await runBounded(path, ["--help"], { timeoutMs: 30_000 });
-  if (!/UE 4\.27 UAsset Parser/.test(`${run.stdout}${run.stderr}`) || !/gpu instances\/landscapes/.test(`${run.stdout}${run.stderr}`)) {
+  if (!uncookedHelpAccepted(run)) {
     throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected uncooked Unreal converter.`);
   }
-  return { name: "uncooked", path, version: UNCOOKED_CONVERTER.version };
+  // The report records the revision actually read back from the concrete executable, never the
+  // constant: an external tool that somehow still does not match cannot be labelled as current.
+  const revision = await readUncookedRevision(path);
+  if (revision !== UNCOOKED_CONVERTER.version) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `"${path}" does not report the pinned threenative revision ${UNCOOKED_CONVERTER.version}${revision ? ` (it reports ${revision})` : ""}.`,
+    );
+  }
+  return { name: "uncooked", path, version: revision };
 }
 
 export async function ensureModernConverter(

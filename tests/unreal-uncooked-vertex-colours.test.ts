@@ -28,8 +28,8 @@ import { describeWithTools } from "./helpers/require-tool.js";
 const FIXTURES = join(import.meta.dirname, "fixtures", "uncooked-colours");
 
 describe("uncooked vertex-colour patches (embedded source)", () => {
-  it("is a new converter build, so an installed threenative.8 is re-provisioned", () => {
-    expect(UNCOOKED_CONVERTER.version).toBe("4.27.2.0+threenative.9");
+  it("is a new converter build, so an installed older revision is re-provisioned", () => {
+    expect(UNCOOKED_CONVERTER.version).toBe("4.27.2.0+threenative.10");
   });
 
   it("reads a per-vertex-instance FVector4 Color indexed by VI id, and is idempotent", async () => {
