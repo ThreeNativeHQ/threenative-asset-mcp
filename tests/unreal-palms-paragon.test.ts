@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,13 +8,13 @@ import { describe, expect, it, onTestFinished } from "vitest";
 import { createGraphBaker } from "../src/unreal/graph-baker.js";
 import { parsePropsFile, resolveMaterial } from "../src/unreal/materials.js";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
-import { importUnrealDirectory } from "../src/unreal/importer.js";
+import { geometryScaleFor, importUnrealDirectory } from "../src/unreal/importer.js";
 import type { ImportedMaterialSection, ImportReport } from "../src/unreal/importer.js";
 import { scorePack } from "../src/unreal/parity.js";
 import type { PropertyDump } from "../src/unreal/property-dump.js";
 import { readBuildScale3D } from "../src/unreal/mesh-build-scale.js";
 import { writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fixture.js";
-import { NodeIO } from "@gltf-transform/core";
+import { Document, NodeIO } from "@gltf-transform/core";
 
 async function scratch(prefix: string): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), prefix));
@@ -175,7 +175,7 @@ describe("an override that points outside the pack supersedes the ancestor defau
 // source model's BuildScale3D (8, 8, 8 here) when it builds the render data. The GLB came out 8x too small.
 
 /** A UE4.19-shaped package: a real summary up to the name table, then one StaticMesh-like tagged property block. */
-function buildPackage(scales: readonly (readonly [number, number, number])[], options: { hasGuid?: boolean; withProperty?: boolean } = {}): Buffer {
+function buildPackage(scales: readonly (readonly [number, number, number])[], options: { hasGuid?: boolean; withProperty?: boolean; ue5?: boolean } = {}): Buffer {
   const names = ["None", "StaticMesh", "BuildSettings", "BuildScale3D", "StructProperty", "Vector", "bUseHighPrecisionTangentBasis"];
   const fstring = (text: string): Buffer => {
     const raw = Buffer.from(`${text}\0`, "utf8");
@@ -189,17 +189,25 @@ function buildPackage(scales: readonly (readonly [number, number, number])[], op
     out.writeInt32LE(value);
     return out;
   };
-  const summaryLength = 4 + 4 + 4 + 4 + 4 + 4 /* custom versions */ + 4 /* header size */ + folder.length + 4 /* flags */ + 4 + 4;
+  // UE5 (legacy -8) adds the UE5 file version after the UE4 one.
+  const versions = options.ue5 ? [i32(-8), i32(864), i32(522), i32(1009), i32(0)] : [i32(-7), i32(864), i32(516), i32(0)];
+  const summaryLength = 4 + versions.length * 4 + 4 /* custom versions */ + 4 /* header size */ + folder.length + 4 /* flags */ + 4 + 4;
   const table = Buffer.concat(names.flatMap((name) => [fstring(name), Buffer.alloc(4)]));
   const header = Buffer.concat([
-    i32(0x9e2a83c1 | 0), i32(-7), i32(864), i32(516), i32(0), i32(0), i32(summaryLength + table.length), folder, i32(0), i32(names.length), i32(summaryLength),
+    i32(0x9e2a83c1 | 0), ...versions, i32(0), i32(summaryLength + table.length), folder, i32(0), i32(names.length), i32(summaryLength),
   ]);
   const name = (text: string): Buffer => Buffer.concat([i32(names.indexOf(text)), i32(0)]);
   const tags = scales.map((scale) =>
     Buffer.concat([
-      name("BuildScale3D"), name("StructProperty"), i32(12), i32(0), name("Vector"), Buffer.alloc(16), Buffer.from([options.hasGuid ? 1 : 0]),
+      // UE5's large-world-coordinate FVector is three doubles.
+      name("BuildScale3D"), name("StructProperty"), i32(options.ue5 ? 24 : 12), i32(0), name("Vector"), Buffer.alloc(16), Buffer.from([options.hasGuid ? 1 : 0]),
       ...(options.hasGuid ? [Buffer.alloc(16, 7)] : []),
-      ...scale.map((component) => { const out = Buffer.alloc(4); out.writeFloatLE(component); return out; }),
+      ...scale.map((component) => {
+        const out = Buffer.alloc(options.ue5 ? 8 : 4);
+        if (options.ue5) out.writeDoubleLE(component);
+        else out.writeFloatLE(component);
+        return out;
+      }),
     ]),
   );
   return Buffer.concat([header, table, ...(options.withProperty === false ? [] : tags)]);
@@ -211,12 +219,24 @@ describe("BuildScale3D of an uncooked UE4 StaticMesh", () => {
     expect(readBuildScale3D(buildPackage([[2, 3, 4]], { hasGuid: true }))).toEqual([2, 3, 4]);
   });
 
-  it("is undefined when the package has no such property, or is not a UE4 legacy -7 package", () => {
+  it("reads a UE5 (legacy -8) editor mesh's double-precision scale (a flame card built at 0.025 x 0.025 x 0.075)", () => {
+    expect(readBuildScale3D(buildPackage([[0.025, 0.025, 0.075]], { ue5: true }))).toEqual([0.025, 0.025, 0.075]);
+  });
+
+  it("is undefined when the package has no such property, or is neither a legacy -7 nor -8 package", () => {
     expect(readBuildScale3D(buildPackage([], { withProperty: false }))).toBeUndefined();
-    const ue5 = buildPackage([[8, 8, 8]]);
-    ue5.writeInt32LE(-8, 4);
-    expect(readBuildScale3D(ue5)).toBeUndefined();
+    const other = buildPackage([[8, 8, 8]]);
+    other.writeInt32LE(-6, 4);
+    expect(readBuildScale3D(other)).toBeUndefined();
     expect(readBuildScale3D(Buffer.alloc(8))).toBeUndefined();
+  });
+
+  it("moves the scale onto each exporter's glTF axes, after the converter's unit", () => {
+    expect(geometryScaleFor("umodel", 1, [2, 3, 4])).toEqual([2, 4, 3]);
+    expect(geometryScaleFor("converter", 1, [2, 3, 4])).toEqual([3, 4, 2]);
+    expect(geometryScaleFor("converter", 0.01, [2, 3, 4])).toEqual([0.03, 0.04, 0.02]);
+    expect(geometryScaleFor("converter", 0.01, [1, 1, 1])).toBe(0.01);
+    expect(geometryScaleFor("umodel", 1, undefined)).toBe(1);
   });
 
   it("does not take a non-positive or non-finite scale", () => {
@@ -262,6 +282,56 @@ describe("BuildScale3D of an uncooked UE4 StaticMesh", () => {
     const { max, report } = await importMesh([2, 3, 5]);
     expect(max).toEqual([2, 10, 0]);
     expect(report.warnings.join("\n")).toContain("non-uniform");
+  });
+
+  // A UE5 editor mesh goes to the CUE4Parse converter, which decodes the same raw source model and writes (Y, Z, X).
+  async function importUe5Mesh(scale: readonly [number, number, number]) {
+    const root = await scratch("build-scale-ue5-");
+    const sourceDir = join(root, "source");
+    const content = join(sourceDir, "Content", "Test");
+    await mkdir(content, { recursive: true });
+    await writeFile(join(content, "Mesh.uasset"), buildPackage([scale], { ue5: true }));
+    const document = new Document();
+    const buffer = document.createBuffer();
+    const position = document.createAccessor("POSITION").setType("VEC3").setArray(new Float32Array([0, 0, 0, 1, 0, 0, 0, 2, 0])).setBuffer(buffer);
+    const primitive = document.createPrimitive().setAttribute("POSITION", position).setMaterial(document.createMaterial("M_Plain"));
+    document.createScene().addChild(document.createNode("Mesh").setMesh(document.createMesh("Mesh").addPrimitive(primitive)));
+    const glb = join(root, "Mesh.glb");
+    await new NodeIO().write(glb, document);
+    const converter = join(root, "converter");
+    await writeFile(
+      converter,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const { join } = require("node:path");
+const argv = process.argv.slice(2);
+if (argv.includes("--version")) { process.stdout.write("fake-modern 1\\n"); process.exit(0); }
+const out = argv[argv.indexOf("--export-dir") + 1];
+fs.mkdirSync(join(out, "Meshes"), { recursive: true });
+fs.copyFileSync(${JSON.stringify(glb)}, join(out, "Meshes", "Mesh.glb"));
+`,
+    );
+    await chmod(converter, 0o755);
+    const umodel = join(root, "umodel");
+    await writeFakeUmodel(umodel, { classes: { Mesh: ["StaticMesh"] }, listExitCode: 1 });
+    const report = await importUnrealDirectory({
+      sourceDir,
+      outputDir: join(root, "output"),
+      concurrency: 1,
+      freeSpaceBytes: 30_000_000_000,
+      graphBake: false,
+      environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache"), THREENATIVE_TOOLCHAIN_DIR: join(root, "toolchain") },
+      umodel: { name: "umodel", path: umodel, version: "fixture" },
+      modernConverter: { name: "modern", path: converter, version: "fake-modern 1" },
+    });
+    return report;
+  }
+
+  it("scales a UE5 editor mesh the converter decoded, on the converter's axes", async () => {
+    // UE (x, y, z) = (2, 3, 5) -> glTF x (= UE y) * 3, y (up = UE z) * 5, z (= UE x) * 2.
+    const report = await importUe5Mesh([2, 3, 5]);
+    expect(report.models[0]?.boundsMetres).toEqual([3, 10, 0]);
+    expect(report.warnings.join("\n")).toContain("BuildScale3D (2, 3, 5)");
   });
 
   it("leaves a mesh without the property exactly as exported", async () => {

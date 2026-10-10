@@ -586,3 +586,33 @@ describe("S3 Summer-sibling substitution", () => {
     expect(score(section("MI_Cave_Rock_Pillar", ["moss_a"])).substituted).toBe(0);
   });
 });
+
+describe("S1 and HLOD proxy packages", () => {
+  // A level's HLOD package: an HLODProxy plus the generated cluster mesh, named after the level, not the package.
+  const withProxy = (proxy: boolean): PropertyDump => {
+    const cave = caveDump();
+    return dumpOf(
+      ...cave.packages,
+      pkg(
+        "/Game/Maps/HLOD/Level_0_HLOD",
+        ...(proxy ? [{ name: "Level_0_HLOD", class: "HLODProxy" } as Exp] : []),
+        mesh("Level_0_HLOD_0_SingleCluster", "/Game/Maps/HLOD/M_Level_0_HLOD_0.M_Level_0_HLOD_0"),
+      ),
+    );
+  };
+  const report = () =>
+    reportOf([model(MESH_PKG, [section("MI_Cave_Rock_Pillar", ["T_Cave_Rock_Pillar_M", "T_Cave_Rock_Pillar_N"])])]);
+
+  it("counts a package the dump shows is an HLODProxy apart, not as a missing mesh", () => {
+    const score = scorePack(withProxy(true), report());
+    expect(score.coverage.missingTotal).toBe(0);
+    expect(score.coverage.hlodProxyPackages).toBe(1);
+    expect(score.coverage.expected).toBe(1);
+  });
+
+  it("still calls the same mesh missing without the HLODProxy export as evidence", () => {
+    const score = scorePack(withProxy(false), report());
+    expect(score.coverage.missing.map((entry) => entry.package)).toEqual(["maps/hlod/level_0_hlod"]);
+    expect(score.coverage.hlodProxyPackages).toBe(0);
+  });
+});

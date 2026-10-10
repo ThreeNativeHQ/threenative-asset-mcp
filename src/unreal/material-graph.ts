@@ -107,6 +107,7 @@ const SUPPORTED_NODE_CLASSES = [
   "TextureSampleParameter2D",
   "ScalarParameter",
   "VectorParameter",
+  "CollectionParameter",
   "Constant",
   "Constant2Vector",
   "Constant3Vector",
@@ -751,6 +752,14 @@ class Compiler {
         const stored = Array.isArray(node.default) ? node.default : [0, 0, 0, 0];
         const value = override ?? stored;
         return this.constant([value[0] ?? 0, value[1] ?? 0, value[2] ?? 0, value[3] ?? 1], 4);
+      }
+      case "CollectionParameter": {
+        // A MaterialParameterCollection entry at its default value: what the editor shows until gameplay changes it.
+        // Instances cannot override it. Without a default the collection was not readable.
+        const stored = node.default;
+        if (typeof stored === "number") return this.constant([stored], 1);
+        if (Array.isArray(stored)) return this.constant([stored[0] ?? 0, stored[1] ?? 0, stored[2] ?? 0, stored[3] ?? 0], 4);
+        return this.unsupportedNode(node);
       }
       case "Constant": {
         const r = node.constants.R;

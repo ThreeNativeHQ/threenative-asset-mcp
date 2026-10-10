@@ -10,6 +10,16 @@ export interface StaticMeshUassetOptions {
   readonly slots: readonly string[];
   /** `[lod, section, slot]` entries of `SectionInfoMap`. */
   readonly sectionMap: readonly (readonly [number, number, number])[];
+  /**
+   * UE4 object version: 514 (4.18, default), 516 (4.19, whose summary adds a LocalizationId string) or 522 (4.27, whose
+   * imports each add a PackageName).
+   */
+  readonly ue4Version?: 514 | 516 | 522;
+  /**
+   * The package each slot's material is imported from (`/Game/...`), as a real mesh's import table records it:
+   * the material import's outer is a `Package` import. Without it every import is a bare class import.
+   */
+  readonly materialPackages?: Readonly<Record<string, string>>;
 }
 
 export function staticMeshUasset(options: StaticMeshUassetOptions): Buffer {
@@ -62,11 +72,29 @@ export function staticMeshUasset(options: StaticMeshUassetOptions): Buffer {
   const sectionInfoMap = Buffer.concat([tag("SectionInfoMap", "StructProperty", sectionInfoBody.length), fname("MeshSectionInfoMap"), guid, Buffer.from([0]), sectionInfoBody]);
   const body = Buffer.concat([staticMaterials, sectionInfoMap, fname("None")]);
 
-  const imports = Buffer.concat(importNames.map((name) => Buffer.concat([fname("/Script/Engine"), fname("Class"), i32(0), fname(name)])));
+  // Package imports follow the slot imports, so the slot indices above stay -(index + 2).
+  const packagePaths = [...new Set(Object.values(options.materialPackages ?? {}))];
+  const outerOf = (name: string): number => {
+    const path = options.materialPackages?.[name];
+    return path === undefined ? 0 : -(importNames.length + packagePaths.indexOf(path) + 1);
+  };
+  const version = options.ue4Version ?? 514;
+  const packageName = version >= 520 ? fname("None") : Buffer.alloc(0);
+  const imports = Buffer.concat([
+    ...importNames.map((name, index) =>
+      index > 0 && options.materialPackages?.[name] !== undefined
+        ? Buffer.concat([fname("/Script/Engine"), fname("MaterialInstanceConstant"), i32(outerOf(name)), fname(name), packageName])
+        : Buffer.concat([fname("/Script/Engine"), fname("Class"), i32(0), fname(name), packageName]),
+    ),
+    ...packagePaths.map((path) => Buffer.concat([fname("/Script/CoreUObject"), fname("Package"), i32(0), fname(path), packageName])),
+  ]);
+  const importCount = importNames.length + packagePaths.length;
+  // 4.19 (516) editor packages carry a LocalizationId FString after the name table offset.
+  const localizationId = version >= 516 ? Buffer.concat([i32(33), Buffer.from("0123456789ABCDEF0123456789ABCDEF\0", "latin1")]) : Buffer.alloc(0);
   // Header: magic, legacy -7, UE3 0, UE4 514, licensee 0, no custom versions, total size, folder "None", flags,
   // name count/offset, gatherable text count/offset, export count/offset, import count/offset.
   const folder = Buffer.concat([i32(5), Buffer.from("None\0", "latin1")]);
-  const fixed = 4 * 6 + 4 + folder.length + 4 + 4 * 8;
+  const fixed = 4 * 6 + 4 + folder.length + 4 + 4 * 8 + localizationId.length;
   const nameTable = (): Buffer =>
     Buffer.concat(names.map((name) => Buffer.concat([i32(name.length + 1), Buffer.from(`${name}\0`, "latin1"), Buffer.alloc(4)])));
   // Names are final once every tag is built; the header needs their table size, so build it now.
@@ -78,7 +106,7 @@ export function staticMeshUasset(options: StaticMeshUassetOptions): Buffer {
     i32(-1641380927),
     i32(-7),
     i32(0),
-    i32(514),
+    i32(version),
     i32(0),
     i32(0),
     i32(totalHeaderSize),
@@ -86,11 +114,12 @@ export function staticMeshUasset(options: StaticMeshUassetOptions): Buffer {
     i32(0),
     i32(names.length),
     i32(nameOffset),
+    localizationId,
     i32(0),
     i32(importOffset),
     i32(0),
     i32(totalHeaderSize),
-    i32(importNames.length),
+    i32(importCount),
     i32(importOffset),
   ]);
   if (header.length !== fixed) throw new Error(`header is ${header.length} bytes, expected ${fixed}`);

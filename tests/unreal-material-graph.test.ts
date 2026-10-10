@@ -2221,3 +2221,42 @@ describe("layered architecture masters: texture objects, render-path switches, s
     expect((await bake(graph({}))).status).toBe("unavailable");
   });
 });
+
+describe("CollectionParameter", () => {
+  // A pack-wide colour grade: albedo x a MaterialParameterCollection entry (intensity) and + a collection colour.
+  const graded = (intensity: number | null, overlay: number[] | null): MaterialGraph =>
+    makeGraph(
+      [
+        node("add", "Add", { inputs: { A: pin("mul"), B: pin("overlay", 0, RGB_MASK) } }),
+        multiply("mul", pin("tex", 0, RGB_MASK), pin("intensity")),
+        textureSample("tex", "T_Albedo"),
+        node("intensity", "CollectionParameter", { parameter: { name: "Albedo_Intensity", group: "" }, default: intensity, collection: "/Game/Test/MPC_Grade.MPC_Grade" }),
+        node("overlay", "CollectionParameter", { parameter: { name: "Albedo_Overlay", group: "" }, default: overlay, collection: "/Game/Test/MPC_Grade.MPC_Grade" }),
+      ],
+      pin("add"),
+    );
+
+  it("evaluates a collection entry at its default, scalar or colour", async () => {
+    const loader = makeLoader({ T_Albedo: { png: await flat([128, 128, 128])(), srgb: true } });
+    const result = await bakeGraph({ graph: graded(0.5, [0.1, 0, 0, 1]), output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 });
+    const pixel = (await pixelsOf(result))(0, 0);
+    const grey = decode(128);
+    expect(pixel[0]).toBeCloseTo(encode(grey * 0.5 + 0.1), -0.5);
+    expect(pixel[1]).toBeCloseTo(encode(grey * 0.5), -0.5);
+    expect(pixel[2]).toBeCloseTo(encode(grey * 0.5), -0.5);
+  });
+
+  it("is unsupported when the dump could not read the collection's default", async () => {
+    const loader = makeLoader({ T_Albedo: { png: await flat([128, 128, 128])(), srgb: true } });
+    const result = await bakeGraph({ graph: graded(null, [0, 0, 0, 1]), output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 });
+    expect(result.status).toBe("unsupported");
+    if (result.status === "unsupported") expect(result.unsupported).toEqual(["CollectionParameter"]);
+  });
+
+  it("is wired into the converter's graph dump (converter 62 onwards)", async () => {
+    const { CUE4PARSE_PROGRAM } = await import("../src/unreal/cue4parse-adapter.js");
+    expect(CUE4PARSE_PROGRAM).toContain('className == "CollectionParameter"');
+    expect(CUE4PARSE_PROGRAM).toContain('"ScalarParameters"');
+    expect(CUE4PARSE_PROGRAM).toContain('"VectorParameters"');
+  });
+});
