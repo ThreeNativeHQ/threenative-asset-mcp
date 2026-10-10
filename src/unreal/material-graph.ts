@@ -65,6 +65,8 @@ export interface BakeRequest {
   output: "baseColor";
   parameters: GraphParameters;
   loadTexture: TextureLoader;
+  /** The pack's own Unreal version (`X.Y`), when known, to judge whether an engine body came from the same version. */
+  packEngine?: string;
   /** Square output edge in pixels. Default 1024. */
   size?: number;
   /**
@@ -575,6 +577,8 @@ interface CompileOptions {
   particleColor?: readonly [number, number, number, number] | undefined;
   /** Bounding-sphere radius of the mesh in Unreal units, for `ObjectRadius`. */
   objectRadius?: number | undefined;
+  /** The pack's own Unreal version (`X.Y`), when known: an engine body from another version is an approximation. */
+  packEngine?: string | undefined;
 }
 
 const PARTICLE_COLOR_NOTE =
@@ -2098,6 +2102,17 @@ class Compiler {
 
   // -- function calls -------------------------------------------------------------------------------------
 
+  /**
+   * An engine body is exact only when the content it came from is the pack's own Unreal version. Otherwise, or when the
+   * pack's version is unknown, the bake names the function and its content version and is reported as heuristic.
+   */
+  private noteEngineBody(name: string, provenance: { readonly version: string; readonly package: string }): void {
+    const pack = this.options.packEngine;
+    if (pack !== undefined && pack === provenance.version) return;
+    const packNote = pack === undefined ? "the pack's Unreal version is unknown" : `the pack is ${pack}`;
+    this.approximations.add(`${name} read from engine content ${provenance.version} (${provenance.package}); ${packNote}`);
+  }
+
   private functionCall(node: GraphNode, output: number): Compiled {
     const name = functionBaseName(node.function);
     const lower = (name ?? "").toLowerCase();
@@ -2108,6 +2123,7 @@ class Compiler {
     if (node.fn?.outputs.some(Boolean)) {
       const inner = node.fn.outputs[output];
       if (inner) {
+        if (node.fn.engine) this.noteEngineBody(name ?? node.function ?? node.id, node.fn.engine);
         const innerNode = this.nodes.get(inner);
         if (!innerNode) return this.markUnavailable(`function ${name ?? node.id} output refers to missing node ${inner}`);
         return this.nodeOutput(innerNode, 0);
@@ -2982,7 +2998,7 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
 
   // The colour and the requested cut-out are compiled under one settled set of static-switch choices, so a switch takes one
   // branch for both, and its demands are the attributes the two of them read through it.
-  const options: CompileOptions = { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined, objectRadius: request.objectRadius };
+  const options: CompileOptions = { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined, objectRadius: request.objectRadius, packEngine: request.packEngine };
   const settled = settleSwitches(graph, request.parameters, options, request.alpha);
   if (settled.kind === "refused") {
     return { status: "unavailable", reason: `static switches of ${graph.material} do not settle (${settled.switches.join(", ")}): each flips with the demands of the colour and the cut-out` };

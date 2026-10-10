@@ -2,6 +2,7 @@ import { readdir } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import sharp from "sharp";
 import { dumpEngineArg } from "../fab/routes.js";
+import { assertEngineContentDirectory, engineContentFromEnvironment, engineVersionOf, type EngineContentConfig } from "./engine-content.js";
 import { dumpMaterialGraphs } from "./graph-dump.js";
 import type { MaterialGraph } from "./graph-dump.js";
 import {
@@ -165,6 +166,11 @@ export interface GraphBakerOptions {
    * exporter the caller's `assets.png` map is the binding (see `GraphBakeAssets`).
    */
   readonly exportTexture?: ((name: string, reference?: string) => Promise<string | GraphTextureSource | undefined>) | undefined;
+  /**
+   * Engine content that supplies the `/Engine/` material functions a pack names. Read from THREENATIVE_ENGINE_CONTENT_DIR
+   * and THREENATIVE_ENGINE_CONTENT_VERSION only when a graph is actually needed; absent means no engine content.
+   */
+  readonly engineContent?: EngineContentConfig | undefined;
   /** Test seam; production runs the converter's `--dump-graphs` mode. */
   readonly dumpGraphs?: typeof dumpMaterialGraphs;
 }
@@ -385,12 +391,15 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         "Some sections have no base-colour texture; reading the pack's material graphs with CUE4Parse to bake them (the converter and its .NET SDK are installed once on first use; set graphBake:false or THREENATIVE_TOOLCHAIN_AUTOINSTALL=0 to skip).",
       );
       try {
+        const engineContent = options.engineContent ?? engineContentFromEnvironment(environment);
+        if (engineContent) await assertEngineContentDirectory(engineContent);
         const dumped = await dump(options.sourceDir, {
           // The importer carries `UE_4.18`; the converter wants `4.18` and refuses anything else.
           ...(options.engine && dumpEngineArg(options.engine) ? { engine: dumpEngineArg(options.engine)! } : {}),
           environment,
           ...(options.log ? { log: options.log } : {}),
           ...(options.modernConverter ? { converterPath: options.modernConverter.path } : {}),
+          ...(engineContent ? { engineContent } : {}),
         });
         return { graphs: dumped, invalid: dumped.invalid ?? new Map<string, string>() };
       } catch (error) {
@@ -528,6 +537,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         parameters,
         size,
         allowUvSetFallback: true,
+        ...(engineVersionOf(options.engine) ? { packEngine: engineVersionOf(options.engine)! } : {}),
         // Unreal feeds white to ParticleColor outside a particle emitter.
         particleColor: [1, 1, 1, 1],
         ...(request.alpha ? { alpha: request.alpha } : {}),

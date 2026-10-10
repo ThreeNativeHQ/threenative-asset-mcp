@@ -7,6 +7,10 @@ on:
       - src/unreal/provision.ts
       - src/unreal/toolchain.ts
       - src/unreal/cue4parse-adapter.ts
+      - src/unreal/engine-content.ts
+      - tests/unreal-engine-content.test.ts
+      - tests/unreal-engine-content-compiled.test.ts
+      - tests/helpers/engine-content-driver/Driver.cs
       - src/fab/fabcli.ts
       - scripts/provision-toolchain.ts
       - scripts/uncooked-colour-harness.ts
@@ -17,6 +21,10 @@ on:
       - src/unreal/provision.ts
       - src/unreal/toolchain.ts
       - src/unreal/cue4parse-adapter.ts
+      - src/unreal/engine-content.ts
+      - tests/unreal-engine-content.test.ts
+      - tests/unreal-engine-content-compiled.test.ts
+      - tests/helpers/engine-content-driver/Driver.cs
       - src/fab/fabcli.ts
       - scripts/provision-toolchain.ts
       - scripts/uncooked-colour-harness.ts
@@ -80,6 +88,16 @@ jobs:
           CI: "true"
           THREENATIVE_TOOLCHAIN_DIR: ${{ runner.temp }}/toolchain
         run: npx vitest run tests/unreal-converter-ue5-sources.test.ts tests/unreal-converter-custom-inputs.test.ts
+
+      # Mandatory and licence-free. The engine-content helper is compiled against the installed CUE4Parse assembly the fresh
+      # toolchain published in modern/bin and run on real links, trees and the pinned provider's keys. The licensed closure
+      # proof is env-gated and never runs here, so this step is its only assurance on a fresh host. CI=true turns a missing
+      # SDK or CUE4Parse assembly into a failure.
+      - name: Compile and run the engine content helper against the fresh toolchain
+        env:
+          CI: "true"
+          THREENATIVE_TOOLCHAIN_DIR: ${{ runner.temp }}/toolchain
+        run: npx vitest run tests/unreal-engine-content-compiled.test.ts tests/unreal-engine-content.test.ts
 
       # The uncooked colour decoder test mirrors the anchors in stubs; this runs the real installed
       # converter (extract_geometry -> StaticMesh -> export_glb/pygltflib). A missing converter fails here.

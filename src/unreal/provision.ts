@@ -13,6 +13,7 @@ import {
 } from "./toolchain.js";
 import {
   CUE4PARSE_PATCH,
+  CUE4PARSE_ENGINE_CONTENT,
   CUE4PARSE_PROGRAM,
   CUE4PARSE_PROJECT,
   CUE4PARSE_SOURCE,
@@ -1293,6 +1294,7 @@ export async function provisionModernConverter(
     const project = join(adapter, "ThreeNativeConverter.csproj");
     await writeFile(project, CUE4PARSE_PROJECT);
     await writeFile(join(adapter, "Program.cs"), CUE4PARSE_PROGRAM);
+    await writeFile(join(adapter, "EngineContent.cs"), CUE4PARSE_ENGINE_CONTENT);
     await rm(bin, { recursive: true, force: true });
     const runtime = process.platform === "win32"
       ? process.arch === "arm64" ? "win-arm64" : "win-x64"
@@ -1432,4 +1434,17 @@ export async function ensureModernConverter(
     throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected modern Unreal converter.`);
   }
   return { name: "modern", path, version: CUE4PARSE_SOURCE.version };
+}
+
+/**
+ * The .NET 10 SDK that builds the modern converter, found without installing one: the host's `dotnet` or the copy the
+ * provisioner cached. A test that compiles against the pinned CUE4Parse source uses it; a missing SDK is a provisioning
+ * failure, so the test refuses rather than installing from inside a test.
+ */
+export async function modernSdkExecutable(environment: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const host = await runBounded("dotnet", ["--version"], { timeoutMs: 30_000, environment: childEnvironment(environment) }).catch(() => undefined);
+  if (host?.code === 0 && /^10\./.test(host.stdout.trim())) return "dotnet";
+  const cached = join(toolchainCacheDir(environment), "modern", "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
+  if (await canRun(cached, ["--version"], /^10\./m)) return cached;
+  throw new ToolchainError("UNREAL_TOOL_NOT_FOUND", "The .NET 10 SDK that builds the modern Unreal converter is missing; run npm run provision:toolchain.");
 }

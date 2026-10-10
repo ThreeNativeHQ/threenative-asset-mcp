@@ -42,6 +42,7 @@ import {
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
 import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphPbrFactors, type GraphTextureSource } from "./graph-baker.js";
+import { assertEngineContentDirectory, engineContentFromEnvironment, type EngineContentConfig } from "./engine-content.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
 import {
@@ -561,6 +562,15 @@ export async function hashSourceTree(
     hash.update("\n");
   }
   return `sha256:${hash.digest("hex")}`;
+}
+
+/**
+ * The identity of an explicitly configured engine content root: its path, its Unreal version, and every byte under it.
+ * Adding, changing or moving an engine body changes the fingerprint, so a cached import cannot reuse stale graph bakes.
+ */
+export async function engineContentIdentity(config: EngineContentConfig): Promise<{ root: string; version: string; fingerprint: string }> {
+  await assertEngineContentDirectory(config);
+  return { root: config.dir, version: config.version, fingerprint: await hashSourceTree(config.dir, await listFiles(config.dir)) };
 }
 
 /** Rejects any generated name that would escape the directory it is written into. */
@@ -2652,6 +2662,10 @@ export async function importUnrealDirectory(
   const sourceHash = await hashSourceTree(sourceDir, files);
 
   const umodel = request.umodel ?? (await ensureUmodel(environment, log));
+  // Engine content decides what a pack's /Engine/ function bodies evaluate to, so its root, version and bytes key the cache.
+  // Read only when graph baking can use it; without it the key is the one it was before engine content existed.
+  const engineContent = request.graphBake !== false ? engineContentFromEnvironment(environment) : undefined;
+  const engineContentKey = engineContent ? await engineContentIdentity(engineContent) : undefined;
   const cacheKey = createHash("sha256")
     .update(
       JSON.stringify({
@@ -2665,6 +2679,7 @@ export async function importUnrealDirectory(
         maxTextureSize: request.maxTextureSize ?? null,
         only: request.onlyPackages ? [...request.onlyPackages].sort() : null,
         lods: lodsArg ?? null,
+        ...(engineContentKey ? { engineContent: engineContentKey } : {}),
         uncookedConverter: request.uncookedConverter?.version ?? null,
         modernConverter: request.modernConverter?.version ?? null,
       }),
@@ -3148,6 +3163,7 @@ export async function importUnrealDirectory(
     return run;
   };
   // PRD-538: lazy, so a run that never meets a colourless section never provisions or spawns the converter.
+  // The same engine content the cache key was computed from, so the bake can never read a different root than the one keyed.
   const graphBaker = request.graphBake === false ? undefined : createGraphBaker({
     exportTexture,
     sourceDir,
@@ -3156,6 +3172,7 @@ export async function importUnrealDirectory(
     log,
     modernConverter: request.modernConverter,
     maxTextureSize: request.maxTextureSize,
+    engineContent,
   });
   const soundPackages = classified.filter((entry) => entry.hasSound && !entry.error);
   const dataPackages = classified.filter((entry) => entry.dataClass !== undefined && !entry.error);

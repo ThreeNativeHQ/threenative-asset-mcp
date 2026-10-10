@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { z } from "zod";
+import { type EngineContentConfig } from "./engine-content.js";
 import { ensureModernConverter } from "./provision.js";
 import { ToolchainError, runBounded } from "./toolchain.js";
 
@@ -30,6 +31,8 @@ const functionSchema = z
     /** First readable entry of `outputs`. */
     output: z.string().nullable(),
     outputNames: z.array(z.string()).optional(),
+    /** Set only on a body read from the explicitly configured engine content: the `X.Y` content and the `/Engine/` package. */
+    engine: z.object({ version: z.string().min(1), package: z.string().min(1) }).strict().optional(),
   })
   .strict();
 
@@ -153,6 +156,8 @@ export interface DumpMaterialGraphsOptions {
   log?: (message: string) => void;
   /** Use this converter instead of provisioning the pinned one. */
   converterPath?: string;
+  /** Engine functions a pack's material functions name are read from this explicitly configured content root. */
+  engineContent?: EngineContentConfig;
 }
 
 /**
@@ -171,6 +176,9 @@ export async function dumpMaterialGraphs(
     const args = [sourceDir, "--dump-graphs", scratch];
     if (options.engine) args.push("--engine", options.engine);
     if (options.filter) args.push("--filter", options.filter);
+    if (options.engineContent) {
+      args.push("--engine-content", options.engineContent.dir, "--engine-content-version", options.engineContent.version);
+    }
     const run = await runBounded(executable, args, {
       timeoutMs: 20 * 60_000,
       ...(options.environment ? { environment: options.environment } : {}),

@@ -291,6 +291,78 @@ export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
 </Project>
 `;
 
+/**
+ * The engine-content rules the converter and its compiled tests share: the root, the key the pinned provider gives a loose
+ * directory, the exact /Engine/ reference lookup, and the provenance of a loaded body. Written beside Program.cs and compiled
+ * against the pinned CUE4Parse source by tests/unreal-engine-content-compiled.test.ts, so the tests run the shipped code.
+ */
+export const CUE4PARSE_ENGINE_CONTENT = String.raw`using CUE4Parse.FileProvider;
+using CUE4Parse.UE4.Assets;
+
+public static class EngineContent
+{
+    // The configured root, without a trailing separator. It must be an existing directory that is not a filesystem root and holds
+    // no .uproject (a project, not Engine/Content). A link at the root or anywhere under it is refused before anything is read:
+    // links are never followed or skipped, because the provider would read through them and a cache key would miss the bytes.
+    public static string Root(string configured)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(configured));
+        var directory = new DirectoryInfo(root);
+        if (!directory.Exists) throw new DirectoryNotFoundException($"engine content directory not found: {root}");
+        if (directory.Parent is null) throw new InvalidDataException($"engine content root cannot be a filesystem root: {root}");
+        if (directory.LinkTarget is not null) throw new InvalidDataException($"engine content root is a link: {root}; links are refused, not followed");
+        if (directory.GetFiles("*.uproject", SearchOption.TopDirectoryOnly).Length > 0) throw new InvalidDataException($"engine content root holds a .uproject, so it is a project rather than Engine/Content: {root}");
+        var pending = new Stack<DirectoryInfo>();
+        pending.Push(directory);
+        while (pending.Count > 0)
+        {
+            foreach (var entry in pending.Pop().EnumerateFileSystemInfos())
+            {
+                if (entry.LinkTarget is not null) throw new InvalidDataException($"engine content contains a link at {entry.FullName}; links are refused, not followed or skipped");
+                if (entry is DirectoryInfo child) pending.Push(child);
+            }
+        }
+        return root;
+    }
+
+    // The key prefix the pinned provider gives a loose directory: DirectoryInfo.Name, the name it reads, which carries no trailing
+    // separator. Root refuses a .uproject, the only input that would give the provider a different mount.
+    public static string MountPrefix(string root) => new DirectoryInfo(Path.TrimEndingDirectorySeparator(root)).Name + "/";
+
+    // The one key an exact /Engine/<folders>/<name>.<name> reference names under the mount, or false for anything else: an object
+    // name that is not the package's own, a path outside /Engine/, an empty, dot or parent segment, a backslash, a drive-style
+    // segment or a control character. Nothing is matched by basename, so a same-named body elsewhere is never selected.
+    public static bool TryExactReference(string mountPrefix, string reference, out string key, out string objectName)
+    {
+        key = string.Empty;
+        objectName = string.Empty;
+        const string engine = "/Engine/";
+        if (!reference.StartsWith(engine, StringComparison.OrdinalIgnoreCase)) return false;
+        var dot = reference.LastIndexOf('.');
+        if (dot < 0) return false;
+        var packagePath = reference[..dot];
+        objectName = reference[(dot + 1)..];
+        if (objectName.Length == 0 || objectName != packagePath[(packagePath.LastIndexOf('/') + 1)..]) return false;
+        var folders = packagePath[engine.Length..].Split('/');
+        if (folders.Any(folder => folder.Length == 0 || folder == "." || folder == ".." || folder.Contains('\\') || folder.Contains(':') || folder.Any(char.IsControl))) return false;
+        key = mountPrefix + string.Join('/', folders) + ".uasset";
+        return true;
+    }
+
+    // The /Engine/ path of a loaded body's package, when the engine provider loaded that package; otherwise null. Provenance is the
+    // provider that loaded the package (IPackage.Provider), never the path a pack names the body by: a pack-owned package keeps no
+    // engine provenance even under the engine's own name, and a body reached by a nested call into engine content keeps its own.
+    public static string? PackagePath(IPackage? owner, IFileProvider? engineProvider, string? mountPrefix)
+    {
+        if (owner is null || engineProvider is null || mountPrefix is null || !ReferenceEquals(owner.Provider, engineProvider)) return null;
+        // A loaded package is named by its provider key without the extension: "<mount>/Functions/A/B".
+        var name = owner.Name;
+        if (!name.StartsWith(mountPrefix, StringComparison.OrdinalIgnoreCase) || name.Length == mountPrefix.Length) return null;
+        return "/Engine/" + name[mountPrefix.Length..];
+    }
+}
+`;
+
 export const CUE4PARSE_PROGRAM = String.raw`using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -387,6 +459,25 @@ string? olderEngineAttempts = null;
 
 var engineAt = Array.IndexOf(args, "--engine");
 var game = engineAt >= 0 ? ParseGame(args[engineAt + 1]) : DetectGame(root);
+// Engine content is an explicitly configured Engine/Content root and the X.Y version it was cooked for: both or neither.
+// It has its own provider and VersionContainer, so the pack's provider and its graph export loop are unchanged.
+var engineContentAt = Array.IndexOf(args, "--engine-content");
+var engineContentVersionAt = Array.IndexOf(args, "--engine-content-version");
+if ((engineContentAt >= 0) != (engineContentVersionAt >= 0)) throw new ArgumentException("--engine-content and --engine-content-version must be given together");
+DefaultFileProvider? engineProvider = null;
+string? engineContentVersion = null;
+string? engineContentKeyPrefix = null;
+if (engineContentAt >= 0)
+{
+    // Refused before the provider enumerates anything: a link at the root or under it, a filesystem root, or a project.
+    var engineRoot = EngineContent.Root(args[engineContentAt + 1]);
+    engineContentVersion = args[engineContentVersionAt + 1];
+    engineProvider = new DefaultFileProvider(engineRoot, SearchOption.AllDirectories, new VersionContainer(ParseGame(engineContentVersion)), StringComparer.OrdinalIgnoreCase);
+    engineProvider.Initialize();
+    engineProvider.PostMount();
+    // The provider keys a loose directory under its own name, so the Content root's keys begin "Content/".
+    engineContentKeyPrefix = EngineContent.MountPrefix(engineRoot);
+}
 var provider = new DefaultFileProvider(root, SearchOption.AllDirectories, new VersionContainer(game), StringComparer.OrdinalIgnoreCase);
 var mappings = Directory.EnumerateFiles(root, "*.usmap", SearchOption.AllDirectories).ToArray();
 if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length} .usmap files. Keep only the mapping that matches this asset's game/version.");
@@ -974,7 +1065,8 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
     UObject? GraphLoadFunction(FPackageIndex? functionIndex, string? path)
     {
         try { if (functionIndex?.Load<UObject>() is { } direct) return direct; } catch { }
-        if (string.IsNullOrEmpty(path) || path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return null;
+        if (string.IsNullOrEmpty(path)) return null;
+        if (path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return GraphLoadEngineFunction(path);
         var slash = path.LastIndexOf('/');
         var functionName = path[(slash + 1)..];
         var dot = functionName.IndexOf('.');
@@ -993,6 +1085,26 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
             for (var index = 0; index < functionPackage.ExportsLazy.Length; index++)
             {
                 if (DumpExportName(functionPackage, index) == functionName) return functionPackage.ExportsLazy[index].Value;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // The one engine package an exact /Engine/<folders>/<name>.<name> reference names, read from the configured content root.
+    // Nothing is matched by basename and nothing falls back to another mount: the reference must name exactly that package
+    // and object, and the key must exist exactly under the configured root (EngineContent.TryExactReference).
+    UObject? GraphLoadEngineFunction(string path)
+    {
+        if (engineProvider is null || engineContentKeyPrefix is null) return null;
+        if (!EngineContent.TryExactReference(engineContentKeyPrefix, path, out var key, out var objectName)) return null;
+        if (!engineProvider.Files.ContainsKey(key)) return null;
+        try
+        {
+            var enginePackage = engineProvider.LoadPackage(key);
+            for (var index = 0; index < enginePackage.ExportsLazy.Length; index++)
+            {
+                if (DumpExportName(enginePackage, index) == objectName) return enginePackage.ExportsLazy[index].Value;
             }
         }
         catch { }
@@ -1051,6 +1163,11 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         var callPins = (Dictionary<string, object?>) node["inputs"]!;
         // The call stores each wired input and only a guid for the function input it feeds.
         var function = GraphLoadFunction(functionIndex, node["function"] as string);
+        // A body records the configured engine content it came from only when the engine provider loaded its package. The package
+        // that loaded it decides, not the path the call names: a pack may mount its own package under /Engine/.
+        var enginePackage = function is null ? null : EngineContent.PackagePath(function.Owner, engineProvider, engineContentKeyPrefix);
+        if (enginePackage is not null && engineContentVersion is not null)
+            fn["engine"] = new Dictionary<string, object?> { ["version"] = engineContentVersion, ["package"] = enginePackage };
         var inputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
         var outputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
         if (function is not null)
@@ -3461,6 +3578,7 @@ static EGame DetectGame(string root)
 
 static EGame ParseGame(string version) => version switch
 {
+    "5.8" => EGame.GAME_UE5_8,
     "5.7" => EGame.GAME_UE5_7,
     "5.6" => EGame.GAME_UE5_6,
     "5.5" => EGame.GAME_UE5_5,
