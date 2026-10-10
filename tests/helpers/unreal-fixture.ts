@@ -250,6 +250,31 @@ process.exit(0);
   await chmod(path, 0o755);
 }
 
+/**
+ * The modern converter as a material fallback meets it. A test whose UE Viewer export is deliberately empty
+ * (`emptyExports`) sends that material to the fallback; this stand-in answers each `--filter` package with the
+ * empty `Materials/<name>.props.txt` of a package with no texture parameters. Passing it explicitly keeps the
+ * fallback off the host's toolchain cache, so the result does not depend on which converter the machine has.
+ */
+export async function writeFakeModernMaterialConverter(path: string): Promise<void> {
+  const script = `#!/usr/bin/env node
+"use strict";
+const fs = require("node:fs");
+const { basename, join } = require("node:path");
+const argv = process.argv.slice(2);
+if (argv.includes("--version")) { process.stdout.write("fake-converter 1\\n"); process.exit(0); }
+const exportAt = argv.indexOf("--export-dir");
+const filterAt = argv.indexOf("--filter");
+if (exportAt >= 0 && filterAt >= 0) {
+  fs.mkdirSync(join(argv[exportAt + 1], "Materials"), { recursive: true });
+  fs.writeFileSync(join(argv[exportAt + 1], "Materials", basename(argv[filterAt + 1]) + ".props.txt"), "");
+}
+process.exit(0);
+`;
+  await writeFile(path, script);
+  await chmod(path, 0o755);
+}
+
 export interface FakeFabCliOptions {
   readonly version?: string;
   readonly authStatus?: unknown;

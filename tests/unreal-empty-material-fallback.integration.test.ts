@@ -43,15 +43,20 @@ function masterGraph(): MaterialGraph {
  * A UE Viewer stand-in: the mesh export copies `meshDir`; a material-only export writes only an UNRELATED
  * sidecar, never one named after the material, exactly as UE Viewer exits 0 with nothing for an instance
  * whose parameters it cannot read. The unrelated file keeps the export index non-empty so the bug (an empty
- * index being accepted just because it is truthy) is exercised rather than a null check.
+ * index being accepted just because it is truthy) is exercised rather than a null check. `standalone` maps a
+ * package to a directory its own export copies instead, so a test can give one material its own sidecar;
+ * `argvLog` records every invocation.
  */
-async function writeFakeUmodel(path: string, meshDir: string, classes: Record<string, readonly string[]>): Promise<void> {
+async function writeFakeUmodel(path: string, meshDir: string, classes: Record<string, readonly string[]>, options: { standalone?: Record<string, string>; argvLog?: string } = {}): Promise<void> {
   const script = `#!/usr/bin/env node
 "use strict";
 const fs = require("node:fs");
 const { basename, join } = require("node:path");
 const argv = process.argv.slice(2);
+const argvLog = ${JSON.stringify(options.argvLog ?? "")};
 const classes = ${JSON.stringify(classes)};
+const standalone = ${JSON.stringify(options.standalone ?? {})};
+if (argvLog) fs.appendFileSync(argvLog, JSON.stringify(argv) + "\\n");
 if (argv.includes("-version")) { process.stdout.write("UE Viewer (UModel)\\nCompiled fixture\\n"); process.exit(0); }
 const selector = argv.filter((entry) => !entry.startsWith("-")).pop();
 const target = basename(selector || "").replace(/\\.(uasset|umap)$/i, "");
@@ -64,6 +69,7 @@ if (argv.includes("-export")) {
   const out = argv.find((entry) => entry.indexOf("-out=") === 0).slice(5);
   fs.mkdirSync(out, { recursive: true });
   if (target === "Mesh") fs.cpSync(${JSON.stringify(meshDir)}, out, { recursive: true });
+  else if (standalone[target]) fs.cpSync(standalone[target], out, { recursive: true });
   else { fs.writeFileSync(join(out, "Other.mat"), "Diffuse=None\\n"); fs.writeFileSync(join(out, "Other.props.txt"), ""); }
   process.exit(0);
 }
@@ -103,7 +109,7 @@ process.exit(0);
   await chmod(path, 0o755);
 }
 
-async function readConverterCalls(path: string): Promise<unknown[][]> {
+async function readArgvLog(path: string): Promise<unknown[][]> {
   const text = await readFile(path, "utf8").catch(() => "");
   return text.split("\n").filter(Boolean).map((line) => JSON.parse(line) as unknown[]);
 }
@@ -113,6 +119,9 @@ const materialExportFor = (calls: unknown[][], name: string): unknown[] | undefi
     (args) => args.includes("--export-dir") && args.includes("--filter") &&
       String(args[args.indexOf("--filter") + 1]).includes(name),
   );
+
+/** The package a UE Viewer invocation exports: its last argument that is not a flag. */
+const exportedSelector = (args: unknown[]): string => String(args.filter((arg) => !String(arg).startsWith("-")).pop());
 
 function writeSource(content: string): Promise<void> {
   return Promise.all([
@@ -159,7 +168,7 @@ it("falls back to the modern converter for an empty UE Viewer material export an
     modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
   });
 
-  const calls = await readConverterCalls(converterLog);
+  const calls = await readArgvLog(converterLog);
   expect(materialExportFor(calls, INSTANCE)).toBeDefined();
 
   expect(report.models).toHaveLength(1);
@@ -190,11 +199,19 @@ it("keeps a material whose own sidecar UE Viewer did export, without a modern fa
   const outputDir = join(root, "output");
   await mkdir(content, { recursive: true });
   await writeSource(content);
-  await writeMeshFixture(meshDir, { name: "Mesh", materialName: INSTANCE, mat: "Diffuse=T_Own", props: "", textures: ["T_Own"] });
+  // The mesh export keeps the texture but no sidecar for the instance, so the instance resolves only from its own standalone export.
+  await writeMeshFixture(meshDir, { name: "Mesh", materialName: INSTANCE, mat: "", props: "", textures: [] });
+  await unlink(join(meshDir, `${INSTANCE}.mat`));
+  await unlink(join(meshDir, `${INSTANCE}.props.txt`));
   await writePng(join(meshDir, "T_Own.png"), [40, 80, 120, 255]);
+  const instanceDir = join(root, "instance-export");
+  await mkdir(instanceDir, { recursive: true });
+  await writeFile(join(instanceDir, `${INSTANCE}.mat`), "Diffuse=T_Own\n");
+  await writeFile(join(instanceDir, `${INSTANCE}.props.txt`), "");
 
   const umodel = join(root, "umodel");
-  await writeFakeUmodel(umodel, meshDir, CLASSES);
+  const umodelLog = join(root, "umodel.log");
+  await writeFakeUmodel(umodel, meshDir, CLASSES, { standalone: { [INSTANCE]: instanceDir }, argvLog: umodelLog });
   const converter = join(root, "converter");
   const converterLog = join(root, "converter.log");
   await writeFakeModernConverter(converter, masterGraph(), converterLog);
@@ -208,7 +225,10 @@ it("keeps a material whose own sidecar UE Viewer did export, without a modern fa
     modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
   });
 
-  const calls = await readConverterCalls(converterLog);
+  // The standalone branch ran: UE Viewer was asked for the instance itself, and its own sidecar satisfied it.
+  const umodelCalls = await readArgvLog(umodelLog);
+  expect(umodelCalls.filter((args) => args.includes("-export")).map(exportedSelector)).toContainEqual(expect.stringContaining(INSTANCE));
+  const calls = await readArgvLog(converterLog);
   expect(materialExportFor(calls, INSTANCE)).toBeUndefined();
   expect(report.models).toHaveLength(1);
   const section = report.models[0]!.materials[0]!;
