@@ -32,7 +32,7 @@ import {
 import { childEnvironment, resolveExecutable, ToolchainError } from "../src/unreal/toolchain.js";
 import { patchUncookedPackageVersionGates, UEVIEWER_SOURCE } from "../src/unreal/provision.js";
 import { runImportCli } from "../src/cli.js";
-import { writeFakeUmodel, writeMeshFixture, writePng, writePsaFixture, writeWavFixture } from "./helpers/unreal-fixture.js";
+import { writeFakeModernMaterialConverter, writeFakeUmodel, writeMeshFixture, writePng, writePsaFixture, writeWavFixture } from "./helpers/unreal-fixture.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -346,8 +346,8 @@ describe("UE Viewer material metadata", () => {
     expect(parsed.blendMode).toBe("BLEND_Masked");
     expect(parsed.opacityMaskClipValue).toBeCloseTo(0.4);
     expect(parsed.collected).toEqual([
-      { name: "Diffuse", texture: "T_Leaf_Atlas" },
-      { name: "Normal", texture: "T_Leaf_N" },
+      { name: "Diffuse", texture: "T_Leaf_Atlas", reference: "Texture2D'Content/Game/T_Leaf_Atlas.T_Leaf_Atlas'" },
+      { name: "Normal", texture: "T_Leaf_N", reference: "Texture2D'Content/Game/T_Leaf_N.T_Leaf_N'" },
     ]);
   });
 
@@ -371,8 +371,8 @@ TextureParameterValues[2] =
 `);
     expect(parsed.parent).toBe("M_Master");
     expect(parsed.overrides).toEqual([
-      { name: "NRM", texture: "T_Pillar_N" },
-      { name: "Mask", texture: "T_Pillar_M" },
+      { name: "NRM", texture: "T_Pillar_N", reference: "Texture2D'Content/Game/T_Pillar_N.T_Pillar_N'" },
+      { name: "Mask", texture: "T_Pillar_M", reference: "Texture2D'Content/Game/T_Pillar_M.T_Pillar_M'" },
     ]);
   });
 
@@ -519,7 +519,7 @@ TwoSided = false
  ParameterValue = Texture2D'T_New_N.T_New_N'
  ParameterName = None
 }`);
-    expect(parsed.overrides).toEqual([{ name: "Normal", texture: "T_New_N" }]);
+    expect(parsed.overrides).toEqual([{ name: "Normal", texture: "T_New_N", reference: "Texture2D'T_New_N.T_New_N'" }]);
   });
 
   const sharedGraph = `Diffuse=Moss_A\nNormal=Bark_N\nOther[0]=Moss_N\nOther[1]=Bark_A_\nOther[2]=Branch_A\nOther[3]=Branch_N\nOther[4]=Leaf_A_02\nOther[5]=Leaf_N\nOther[6]=Leaf_O\n`;
@@ -1540,11 +1540,14 @@ process.exit(1);
       Buffer.concat([header, Buffer.from("AssetImportData\0Texture2D\0MaterialInstanceConstant\0")]),
     );
 
+    const modern = join(workspace.sourceDir, "..", "modern-converter");
+    await writeFakeModernMaterialConverter(modern);
     const report = await importUnrealDirectory({
       sourceDir: workspace.sourceDir,
       outputDir: workspace.outputDir,
       environment: workspace.environment,
       umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: modern, version: "fake-converter 1" },
       onlyPackages: ["SM_Rock", "MI_Rock"],
     });
 
@@ -2674,11 +2677,14 @@ for (const face of Object.keys(faces)) {
     });
     await writeFile(join(workspace.sourceDir, "Content", "Game", "M_Glass.uasset"), "glass");
 
+    const modern = join(workspace.sourceDir, "..", "modern-converter");
+    await writeFakeModernMaterialConverter(modern, { emptyExports: ["M_Glass"] });
     const report = await importUnrealDirectory({
       sourceDir: workspace.sourceDir,
       outputDir: workspace.outputDir,
       environment: workspace.environment,
       umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: modern, version: "fake-converter 1" },
     });
 
     expect(report.counts).toMatchObject({ materialAssets: 1, failed: 0 });

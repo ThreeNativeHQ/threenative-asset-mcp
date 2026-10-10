@@ -47,7 +47,7 @@ function masterGraph(): MaterialGraph {
  * package to a directory its own export copies instead, so a test can give one material its own sidecar;
  * `argvLog` records every invocation.
  */
-async function writeFakeUmodel(path: string, meshDir: string, classes: Record<string, readonly string[]>, options: { standalone?: Record<string, string>; argvLog?: string } = {}): Promise<void> {
+async function writeFakeUmodel(path: string, meshDir: string, classes: Record<string, readonly string[]>, options: { standalone?: Record<string, string>; argvLog?: string; failExports?: readonly string[] } = {}): Promise<void> {
   const script = `#!/usr/bin/env node
 "use strict";
 const fs = require("node:fs");
@@ -56,6 +56,7 @@ const argv = process.argv.slice(2);
 const argvLog = ${JSON.stringify(options.argvLog ?? "")};
 const classes = ${JSON.stringify(classes)};
 const standalone = ${JSON.stringify(options.standalone ?? {})};
+const failExports = ${JSON.stringify(options.failExports ?? [])};
 if (argvLog) fs.appendFileSync(argvLog, JSON.stringify(argv) + "\\n");
 if (argv.includes("-version")) { process.stdout.write("UE Viewer (UModel)\\nCompiled fixture\\n"); process.exit(0); }
 const selector = argv.filter((entry) => !entry.startsWith("-")).pop();
@@ -68,6 +69,7 @@ if (argv.includes("-list")) {
 if (argv.includes("-export")) {
   const out = argv.find((entry) => entry.indexOf("-out=") === 0).slice(5);
   fs.mkdirSync(out, { recursive: true });
+  if (failExports.includes(target)) { process.stderr.write("Ignoring " + target + " due to a simulated read failure\\n"); process.exit(1); }
   if (target === "Mesh") fs.cpSync(${JSON.stringify(meshDir)}, out, { recursive: true });
   else if (standalone[target]) fs.cpSync(standalone[target], out, { recursive: true });
   else { fs.writeFileSync(join(out, "Other.mat"), "Diffuse=None\\n"); fs.writeFileSync(join(out, "Other.props.txt"), ""); }
@@ -80,12 +82,13 @@ process.exit(0);
 }
 
 /** The modern converter: dumps the master graph and, for a material export, writes the instance's `Parent`. */
-async function writeFakeModernConverter(path: string, graph: MaterialGraph, argvLog: string): Promise<void> {
+async function writeFakeModernConverter(path: string, graph: MaterialGraph, argvLog: string, options: { emptyExports?: readonly string[]; failExports?: readonly string[] } = {}): Promise<void> {
   const script = `#!/usr/bin/env node
 "use strict";
 const fs = require("node:fs");
 const { basename, join } = require("node:path");
 const argv = process.argv.slice(2);
+const options = ${JSON.stringify(options)};
 fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(argv) + "\\n");
 if (argv.includes("--version")) { process.stdout.write("fake-converter 1\\n"); process.exit(0); }
 const dumpAt = argv.indexOf("--dump-graphs");
@@ -98,6 +101,8 @@ const exportAt = argv.indexOf("--export-dir");
 const filterAt = argv.indexOf("--filter");
 if (exportAt >= 0 && filterAt >= 0) {
   const name = basename(argv[filterAt + 1]);
+  if ((options.failExports || []).includes(name)) { process.stderr.write("fatal: simulated converter failure for " + name + "\\n"); process.exit(1); }
+  if ((options.emptyExports || []).includes(name)) { fs.mkdirSync(argv[exportAt + 1], { recursive: true }); process.exit(0); }
   fs.mkdirSync(join(argv[exportAt + 1], "Materials"), { recursive: true });
   const props = name === ${JSON.stringify(INSTANCE)} ? "Parent = Material'/Game/Test/${PARENT}.${PARENT}'\\n" : "";
   fs.writeFileSync(join(argv[exportAt + 1], "Materials", name + ".props.txt"), props);
@@ -236,4 +241,81 @@ it("keeps a material whose own sidecar UE Viewer did export, without a modern fa
   expect(section.bindings).toContainEqual(
     expect.objectContaining({ slot: "baseColor", source: expect.not.stringMatching("graph") }),
   );
+});
+
+/**
+ * The fallback is only honest when the modern converter ran and produced nothing, not when it failed:
+ * a non-zero modern exit is a real error and must keep the package failed instead of silently promoting
+ * the metadata-free UE Viewer export.
+ */
+it("keeps the package failed when the modern converter exits non-zero", async () => {
+  const root = await mkdtemp(join(tmpdir(), "empty-material-modern-fail-"));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const sourceDir = join(root, "source");
+  const content = join(sourceDir, "Content", "Test");
+  const meshDir = join(root, "mesh-export");
+  const outputDir = join(root, "output");
+  await mkdir(content, { recursive: true });
+  await writeSource(content);
+  await writeMeshFixture(meshDir, { name: "Mesh", materialName: INSTANCE, mat: "", props: "", textures: [] });
+  await unlink(join(meshDir, `${INSTANCE}.mat`));
+  await unlink(join(meshDir, `${INSTANCE}.props.txt`));
+
+  const umodel = join(root, "umodel");
+  await writeFakeUmodel(umodel, meshDir, CLASSES);
+  const converter = join(root, "converter");
+  const converterLog = join(root, "converter.log");
+  await writeFakeModernConverter(converter, masterGraph(), converterLog, { failExports: [INSTANCE] });
+
+  const report = await importUnrealDirectory({
+    sourceDir,
+    outputDir,
+    concurrency: 1,
+    freeSpaceBytes: 30_000_000_000,
+    umodel: { name: "umodel", path: umodel, version: "fixture" },
+    modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+  });
+
+  const calls = await readArgvLog(converterLog);
+  expect(materialExportFor(calls, INSTANCE)).toBeDefined();
+  expect(report.materialAssets.map((material) => material.name)).not.toContain(INSTANCE);
+  expect(report.failed.map((entry) => entry.package)).toEqual([expect.stringContaining(INSTANCE)]);
+});
+
+/**
+ * UE Viewer failing to export the package leaves no isolated legacy result to fall back to, so an empty
+ * modern converter must still fail it rather than promote a package neither exporter could describe.
+ */
+it("keeps the package failed when UE Viewer had no successful export and the modern converter is empty", async () => {
+  const root = await mkdtemp(join(tmpdir(), "empty-material-both-empty-"));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const sourceDir = join(root, "source");
+  const content = join(sourceDir, "Content", "Test");
+  const meshDir = join(root, "mesh-export");
+  const outputDir = join(root, "output");
+  await mkdir(content, { recursive: true });
+  await writeSource(content);
+  await writeMeshFixture(meshDir, { name: "Mesh", materialName: INSTANCE, mat: "", props: "", textures: [] });
+  await unlink(join(meshDir, `${INSTANCE}.mat`));
+  await unlink(join(meshDir, `${INSTANCE}.props.txt`));
+
+  const umodel = join(root, "umodel");
+  await writeFakeUmodel(umodel, meshDir, CLASSES, { failExports: [INSTANCE] });
+  const converter = join(root, "converter");
+  const converterLog = join(root, "converter.log");
+  await writeFakeModernConverter(converter, masterGraph(), converterLog, { emptyExports: [INSTANCE] });
+
+  const report = await importUnrealDirectory({
+    sourceDir,
+    outputDir,
+    concurrency: 1,
+    freeSpaceBytes: 30_000_000_000,
+    umodel: { name: "umodel", path: umodel, version: "fixture" },
+    modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+  });
+
+  const calls = await readArgvLog(converterLog);
+  expect(materialExportFor(calls, INSTANCE)).toBeDefined();
+  expect(report.materialAssets.map((material) => material.name)).not.toContain(INSTANCE);
+  expect(report.failed.map((entry) => entry.package)).toEqual([expect.stringContaining(INSTANCE)]);
 });

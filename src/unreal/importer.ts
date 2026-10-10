@@ -3342,6 +3342,10 @@ export async function importUnrealDirectory(
     materialNameCounts.set(name, (materialNameCounts.get(name) ?? 0) + 1);
   }
   const materialAssetsByFile = new Map<string, ExportedAssets>();
+  // UE Viewer exit 0 exports that carry no sidecar named after the package they were asked for. Kept
+  // isolated so that, only if the modern converter also has nothing to say, the package can still be
+  // promoted as a truthful named/neutral fallback instead of dropped.
+  const legacyEmptyMaterialExports = new Map<string, ExportedAssets>();
   const materialFallbackPackages: PackageClassification[] = [];
   const materialsNeedingExport = materialPackages.filter((entry) => {
     if (entry.needsModernConverter) return false;
@@ -3391,6 +3395,10 @@ export async function importUnrealDirectory(
         // it. Duplicate names deliberately remain package-local.
         if (materialNameCounts.get(name) === 1) assets = mergeExported(assets, result.exported);
       } else {
+        // UE Viewer exited 0 but wrote no sidecar named after this package. Remember its isolated
+        // export; if the modern converter is also empty, that is the only honest evidence the pack
+        // has no PBR metadata, and the package can still become a named/neutral fallback.
+        if (result.exported) legacyEmptyMaterialExports.set(result.entry.file, result.exported);
         materialFallbackPackages.push(result.entry);
       }
     }
@@ -3901,13 +3909,31 @@ export async function importUnrealDirectory(
       const exported = await indexExported(isolated);
       return exported.mat.has(name) || exported.props.has(name)
         ? { entry, exported }
-        : { entry, reason: "The modern Material converter produced no metadata." };
+        : { entry, empty: true as const };
     });
     for (const result of results) {
-      if (result.exported) {
+      if ("exported" in result) {
         materialAssetsByFile.set(result.entry.file, result.exported);
         const name = basename(result.entry.package, extname(result.entry.package));
         if (materialNameCounts.get(name) === 1) assets = mergeExported(assets, result.exported);
+      } else if ("empty" in result && result.empty) {
+        // Both exporters ran and neither supplied a sidecar for this package. Promote the original
+        // isolated UE Viewer export as-is: it carries no sidecar named after the package, so
+        // resolveMaterial honestly reports resolved:false and falls back to a named or neutral
+        // swatch rather than claiming a decoded parent.
+        const prior = legacyEmptyMaterialExports.get(result.entry.file);
+        if (prior) {
+          const name = basename(result.entry.package, extname(result.entry.package));
+          materialAssetsByFile.set(result.entry.file, prior);
+          warnings.push(
+            `Both the modern converter and UE Viewer supplied no PBR metadata for ${name}; it is kept as a named or neutral reusable fallback without a decoded parent.`,
+          );
+        } else {
+          failed.push({
+            package: result.entry.package,
+            reason: "The modern Material converter produced no metadata and UE Viewer had no successful export for this package.",
+          });
+        }
       } else {
         failed.push({ package: result.entry.package, reason: result.reason ?? "Modern Material conversion failed." });
       }
