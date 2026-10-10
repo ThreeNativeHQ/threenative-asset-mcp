@@ -173,6 +173,9 @@ const SUPPORTED_NODE_CLASSES = [
   "Ceil",
   "Floor",
   "Sine",
+  "SmoothStep",
+  "SquareRoot",
+  "CrossProduct",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -216,6 +219,9 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "MatLayerBlend_TenLayerBlend",
   "Lerp_ScratchGrime",
   "MetallicShading",
+  "VectorLength",
+  "RemapValueRange",
+  "LinearGradient",
 ] as const;
 
 /**
@@ -527,6 +533,15 @@ const BREAK_NORMAL_NOTE =
 
 const TEN_LAYER_NOTE =
   "MatLayerBlend_TenLayerBlend: Input20 is the base, Input21 the baked normal, and each (Input2k = layer, Input2k+1 = alpha) is lerped over the result from k = 9 (next to the base) up to k = 0 (top); inferred from the pins, engine body unavailable";
+
+const VECTOR_LENGTH_NOTE =
+  "VectorLength: sqrt(dot(Input0, Input0)) over the input's components; engine body unavailable, inferred from the name";
+
+const REMAP_VALUE_RANGE_NOTE =
+  "RemapValueRange: lerp(Input3, Input4, (Input0 - Input1) / (Input2 - Input1)), i.e. Input from [Input Low, Input High] to [Target Low, Target High], unclamped; engine body unavailable, inferred from the pins";
+
+const LINEAR_GRADIENT_NOTE =
+  "LinearGradient: the U or V texture coordinate (UV0 unless a UV input is wired) as a 0-1 ramp, by output name; engine body unavailable, inferred from the pins";
 
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
@@ -939,6 +954,16 @@ class Compiler {
         if (!input) return this.markUnavailable(`${node.class} ${node.id} has no input`);
         return this.unary(input, node.class === "Ceil" ? Math.ceil : Math.floor);
       }
+      case "SmoothStep":
+        return this.smoothStep(node);
+      case "SquareRoot": {
+        // HLSL sqrt; a negative input (NaN on the GPU) is taken as 0.
+        const input = this.vec(node.inputs.Input, "SquareRoot.Input");
+        if (!input) return this.markUnavailable(`SquareRoot ${node.id} has no input`);
+        return this.unary(input, (x) => Math.sqrt(x > 0 ? x : 0));
+      }
+      case "CrossProduct":
+        return this.crossProduct(node);
       case "Sine": {
         // sin(Input * 2 pi / Period) for a positive Period (default 1), else sin(Input).
         const input = this.vec(node.inputs.Input, "Sine.Input");
@@ -1070,6 +1095,44 @@ class Compiler {
             r[o + 1] = r[o + 2] = r[o + 3] = r[o]!;
           });
     return this.lerp(input, luminance, this.operand(node, "Fraction", "Fraction", 1));
+  }
+
+  /**
+   * SmoothStep(Min, Max, Value) = t * t * (3 - 2t) with t = saturate((Value - Min) / (Max - Min)), HLSL's smoothstep.
+   * Unwired pins take ConstMin 0, ConstMax 1 and ConstValue 0, Unreal's defaults; Max = Min is guarded like Divide.
+   */
+  private smoothStep(node: GraphNode): Compiled {
+    const low = this.operand(node, "Min", "ConstMin", 0);
+    const high = this.operand(node, "Max", "ConstMax", 1);
+    const value = this.operand(node, "Value", "ConstValue", 0);
+    const n = Math.max(low.n, high.n, value.n);
+    const stride = (operand: Val) => (operand.n === 1 ? 0 : 1);
+    const [sl, sh, sv] = [stride(low), stride(high), stride(value)];
+    return this.emit([low, high, value], n, (o) => (r) => {
+      for (let index = 0; index < 4; index++) {
+        const min = r[low.reg + index * sl]!;
+        const span = r[high.reg + index * sh]! - min;
+        const raw = (r[value.reg + index * sv]! - min) / (Math.abs(span) < 1e-6 ? (span < 0 ? -1e-6 : 1e-6) : span);
+        const t = raw < 0 ? 0 : raw > 1 ? 1 : raw;
+        r[o + index] = t * t * (3 - 2 * t);
+      }
+    });
+  }
+
+  /** CrossProduct(A, B): the 3-component cross product; a narrower operand's missing components are 0. */
+  private crossProduct(node: GraphNode): Compiled {
+    const a = this.vec(node.inputs.A, "CrossProduct.A");
+    const b = this.vec(node.inputs.B, "CrossProduct.B");
+    if (!a || !b) return this.markUnavailable(`CrossProduct ${node.id} is missing an input`);
+    const component = (value: Val, r: Float64Array, index: number): number => (value.n === 1 ? r[value.reg]! : index < value.n ? r[value.reg + index]! : 0);
+    return this.emit([a, b], 3, (o) => (r) => {
+      const [ax, ay, az] = [component(a, r, 0), component(a, r, 1), component(a, r, 2)];
+      const [bx, by, bz] = [component(b, r, 0), component(b, r, 1), component(b, r, 2)];
+      r[o] = ay * bz - az * by;
+      r[o + 1] = az * bx - ax * bz;
+      r[o + 2] = ax * by - ay * bx;
+      r[o + 3] = 0;
+    });
   }
 
   private dotProduct(node: GraphNode): Compiled {
@@ -1845,6 +1908,22 @@ class Compiler {
       }
       case "matlayerblend_tenlayerblend":
         return this.tenLayerBlend(node, name);
+      case "vectorlength": {
+        const wired = this.namedPin(node, ["input0", "vector", "input"]) ?? Object.values(node.inputs).find((input) => input);
+        const input = this.vec(wired, `${name}.Input0`);
+        if (!input) return this.markUnavailable(`${name} ${node.id} has no input`);
+        this.approximations.add(VECTOR_LENGTH_NOTE);
+        const n = input.n;
+        return this.emit([input], 1, (o) => (r) => {
+          let sum = 0;
+          for (let index = 0; index < n; index++) sum += r[input.reg + index]! ** 2;
+          r[o] = r[o + 1] = r[o + 2] = r[o + 3] = Math.sqrt(sum);
+        });
+      }
+      case "remapvaluerange":
+        return this.remapValueRange(node, name);
+      case "lineargradient":
+        return this.linearGradient(node, name, output);
       case "lerp_scratchgrime": {
         // (Input0 = base colour, Input1 = scratch colour, Input2 = grime colour, Input3 = scratch mask, Input4 = grime mask):
         // lerp(lerp(base, scratch, scratch mask), grime, grime mask). An unwired colour or mask leaves its stage out.
@@ -1880,6 +1959,32 @@ class Compiler {
       default:
         return undefined;
     }
+  }
+
+  /**
+   * RemapValueRange(Input0 = Input, Input1 = Input Low, Input2 = Input High, Input3 = Target Low, Input4 = Target High), see
+   * `REMAP_VALUE_RANGE_NOTE`. Every pin must be wired: the function's own defaults are engine content the pack does not carry.
+   */
+  private remapValueRange(node: GraphNode, name: string): Compiled {
+    const pins = ["Input0", "Input1", "Input2", "Input3", "Input4"].map((pinName) => (node.inputs[pinName] ? this.vec(node.inputs[pinName], `${name}.${pinName}`) : undefined));
+    if (pins.some((value) => value === undefined)) return this.markUnavailable(`${name} ${node.id} needs all five of Input0..Input4 wired (its defaults are engine content)`);
+    const [input, inLow, inHigh, outLow, outHigh] = pins as Val[];
+    this.approximations.add(REMAP_VALUE_RANGE_NOTE);
+    const span = this.binary(inHigh!, inLow!, (high, low) => high - low);
+    const fraction = this.binary(this.binary(input!, inLow!, (x, low) => x - low), span, (x, y) => x / (Math.abs(y) < 1e-6 ? (y < 0 ? -1e-6 : 1e-6) : y));
+    return this.lerp(outLow!, outHigh!, fraction);
+  }
+
+  /** LinearGradient: see `LINEAR_GRADIENT_NOTE`. An output named neither U nor V (or a third output) is unsupported. */
+  private linearGradient(node: GraphNode, name: string, output: number): Compiled {
+    const outputName = node.outputNames?.[output] ?? "";
+    const axis = /^u/i.test(outputName) ? 0 : /^v/i.test(outputName) ? 1 : outputName === "" && output < 2 ? output : -1;
+    if (axis < 0) return this.markUnsupported(`${name}.${outputName || `output${output}`}`);
+    const wired = Object.values(node.inputs).find((input) => input);
+    const uv = wired ? this.vec(wired, `${name}.UVs`) : this.defaultUv();
+    if (!uv) return this.markUnavailable(`${name} ${node.id} has no UV input`);
+    this.approximations.add(LINEAR_GRADIENT_NOTE);
+    return this.gather(uv, [uv.n === 1 ? 0 : axis]);
   }
 
   /** See `TEN_LAYER_NOTE`. An unwired layer or alpha leaves that layer out. */

@@ -936,6 +936,122 @@ describe("HueShift", () => {
   });
 });
 
+describe("SmoothStep, SquareRoot, CrossProduct, VectorLength, RemapValueRange and LinearGradient", () => {
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  /** The grey every channel of a scalar BaseColor encodes to. */
+  const grey = (linear: number) => [encode(linear), encode(linear), encode(linear)];
+  /** An engine function of the math library, as the dump shows a call whose body is engine content. */
+  const mathCall = (id: string, name: string, inputs: Raw, outputNames: string[] = ["Result"]): Raw => ({
+    ...engineCall(id, name, inputs),
+    function: `/Engine/Functions/Engine_MaterialFunctions02/Math/${name}.${name}`,
+    outputNames,
+  });
+
+  it("SmoothStep is HLSL smoothstep(Min, Max, Value), exact, with Unreal's ConstMin 0 / ConstMax 1 defaults", async () => {
+    const step = (value: number, wiredRange: boolean) =>
+      bake(
+        makeGraph(
+          [
+            node("s", "SmoothStep", { inputs: { Value: pin("v"), ...(wiredRange ? { Min: pin("lo"), Max: pin("hi") } : {}) } }),
+            scalar("v", value),
+            scalar("lo", 0.2),
+            scalar("hi", 0.6),
+          ],
+          pin("s"),
+        ),
+      );
+    // t = (0.4 - 0.2) / 0.4 = 0.5 -> 0.5; t = 0.75 -> 0.84375; below and above the range clamp to 0 and 1.
+    expect((await pixelsOf(await step(0.4, true)))(0, 0)).toEqual(grey(0.5));
+    expect((await pixelsOf(await step(0.5, true)))(1, 1)).toEqual(grey(0.84375));
+    expect((await pixelsOf(await step(0.1, true)))(0, 1)).toEqual(grey(0));
+    expect((await pixelsOf(await step(0.9, true)))(1, 0)).toEqual(grey(1));
+    // Unwired Min and Max are 0 and 1: smoothstep(0, 1, 0.25) = 0.15625.
+    const unwired = await step(0.25, false);
+    expect((await pixelsOf(unwired))(0, 0)).toEqual(grey(0.15625));
+    expect(unwired).toMatchObject({ status: "baked", confidence: "exact", approximations: [] });
+    // A stored ConstMax with the pin unwired: smoothstep(0, 0.5, 0.25) = 0.5.
+    const stored = await bake(makeGraph([node("s", "SmoothStep", { inputs: { Value: pin("v") }, constants: { ConstMax: 0.5 } }), scalar("v", 0.25)], pin("s")));
+    expect((await pixelsOf(stored))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("SmoothStep steps per channel of a vector Value", async () => {
+    const result = await bake(makeGraph([node("s", "SmoothStep", { inputs: { Value: pin("v", 0, RGB_MASK) } }), constant3("v", [0, 0.5, 1])], pin("s")));
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0), encode(0.5), encode(1)]);
+  });
+
+  it("SquareRoot is exact, and a negative input reads 0 instead of NaN", async () => {
+    const root = (value: number) => bake(makeGraph([node("q", "SquareRoot", { inputs: { Input: pin("v") } }), scalar("v", value)], pin("q")));
+    const quarter = await root(0.25);
+    expect((await pixelsOf(quarter))(0, 0)).toEqual(grey(0.5));
+    expect(quarter).toMatchObject({ confidence: "exact", approximations: [] });
+    expect((await pixelsOf(await root(-0.5)))(0, 0)).toEqual(grey(0));
+    expect((await bake(makeGraph([node("q", "SquareRoot")], pin("q")))).status).toBe("unavailable");
+  });
+
+  it("CrossProduct is the exact 3-component cross product", async () => {
+    const cross = (a: [number, number, number], b: [number, number, number]) =>
+      bake(makeGraph([node("x", "CrossProduct", { inputs: { A: pin("a", 0, RGB_MASK), B: pin("b", 0, RGB_MASK) } }), constant3("a", a), constant3("b", b)], pin("x")));
+    expect((await pixelsOf(await cross([1, 0, 0], [0, 1, 0])))(0, 0)).toEqual([0, 0, 255]);
+    expect((await pixelsOf(await cross([0, 1, 0], [0, 0, 1])))(1, 1)).toEqual([255, 0, 0]);
+    // (0.5, 0.25, 0) x (0, 0.5, 0.5) = (0.125, -0.25, 0.25): the negative component clamps to 0 in the PNG.
+    expect((await pixelsOf(await cross([0.5, 0.25, 0], [0, 0.5, 0.5])))(0, 0)).toEqual([encode(0.125), 0, encode(0.25)]);
+  });
+
+  it("VectorLength is sqrt(dot(v, v)), recorded as an inferred engine body", async () => {
+    const result = await bake(makeGraph([mathCall("l", "VectorLength", { Input0: pin("v", 0, RGB_MASK) }), constant3("v", [0.3, 0.4, 0])], pin("l")));
+    expect((await pixelsOf(result))(0, 0)).toEqual(grey(0.5));
+    expect(result).toMatchObject({ confidence: "heuristic" });
+    if (result.status === "baked") expect(result.approximations).toEqual([expect.stringMatching(/^VectorLength: sqrt\(dot\(Input0, Input0\)\)/)]);
+  });
+
+  it("RemapValueRange maps Input from [Input Low, Input High] to [Target Low, Target High], unclamped", async () => {
+    const remap = (inputs: Record<string, number>, value: Raw = scalar("x", 0.5)) =>
+      bake(
+        makeGraph(
+          [
+            mathCall("r", "RemapValueRange", Object.fromEntries([["Input0", pin("x", 0, value.class === "Constant3Vector" ? RGB_MASK : null)], ...Object.keys(inputs).map((key) => [key, pin(key)])])),
+            value,
+            ...Object.entries(inputs).map(([key, constant]) => scalar(key, constant)),
+          ],
+          pin("r"),
+        ),
+      );
+    // 0.5 in [0, 1] to [0, 0.7] is 0.35, a remap that compresses an albedo.
+    const compressed = await remap({ Input1: 0, Input2: 1, Input3: 0, Input4: 0.7 });
+    expect((await pixelsOf(compressed))(0, 0)).toEqual(grey(0.35));
+    expect(compressed).toMatchObject({ confidence: "heuristic" });
+    if (compressed.status === "baked") expect(compressed.approximations).toEqual([expect.stringMatching(/^RemapValueRange: lerp\(Input3, Input4/)]);
+    // 0.5 in [0.25, 0.75] to [1, 0] is 0.5; 0.5 in [0, 0.25] to [0, 0.1] is 0.2 (not clamped to 0.1).
+    expect((await pixelsOf(await remap({ Input1: 0.25, Input2: 0.75, Input3: 1, Input4: 0 })))(1, 0)).toEqual(grey(0.5));
+    expect((await pixelsOf(await remap({ Input1: 0, Input2: 0.25, Input3: 0, Input4: 0.1 })))(0, 1)).toEqual(grey(0.2));
+    // Per channel on a colour.
+    expect((await pixelsOf(await remap({ Input1: 0, Input2: 1, Input3: 0.2, Input4: 0.6 }, constant3("x", [0, 0.5, 1]))))(0, 0)).toEqual([encode(0.2), encode(0.4), encode(0.6)]);
+    // A pin left unwired: its default is engine content, so the bake refuses rather than guess.
+    expect((await remap({ Input1: 0, Input2: 1, Input3: 0 })).status).toBe("unavailable");
+  });
+
+  it("LinearGradient's U and V outputs are the texture coordinate ramps, by output name", async () => {
+    const gradient = (output: number, inputs: Raw = {}) =>
+      bake(makeGraph([mathCall("g", "LinearGradient", inputs, ["UGradient", "VGradient"]), textureCoordinate("uv", [2, 2])], pin("g", output)));
+    // A 2x2 bake samples u, v at 0.25 and 0.75.
+    const u = await pixelsOf(await gradient(0));
+    expect([u(0, 0), u(1, 0), u(0, 1)]).toEqual([grey(0.25), grey(0.75), grey(0.25)]);
+    const v = await pixelsOf(await gradient(1));
+    expect([v(0, 0), v(1, 0), v(0, 1)]).toEqual([grey(0.25), grey(0.25), grey(0.75)]);
+    // A wired UV input replaces UV0: tiling 2 doubles the ramp (0.5 at the first texel).
+    expect((await pixelsOf(await gradient(0, { Input0: pin("uv") })))(0, 0)).toEqual(grey(0.5));
+    const result = await gradient(0);
+    if (result.status === "baked") expect(result.approximations).toEqual([expect.stringMatching(/^LinearGradient: the U or V texture coordinate/)]);
+  });
+
+  it("lists them in the supported sets", () => {
+    for (const name of ["SmoothStep", "SquareRoot", "CrossProduct"]) expect(supportedNodeClasses()).toContain(name);
+    for (const name of ["VectorLength", "RemapValueRange", "LinearGradient"]) expect(supportedEngineFunctions()).toContain(name);
+  });
+});
+
 describe("graphPathClasses and supportedNodeClasses", () => {
   it("lists the classes on the active path only", () => {
     const nodes: Raw[] = [
