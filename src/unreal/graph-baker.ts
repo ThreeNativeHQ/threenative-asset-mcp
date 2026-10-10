@@ -55,6 +55,14 @@ export interface GraphBakeRequest {
    */
   readonly vertexColor?: readonly [number, number, number, number] | undefined;
   /**
+   * Set by the importer only when every primitive using this section keeps glTF `COLOR_0` (the mesh carries the
+   * colour Unreal's `VertexColor` node reads) and the section's consumer is OPAQUE. It lets the baker accept a graph
+   * whose BaseColor output is the `VertexColor` node's RGB exactly (see `directVertexColorGraph`): the mesh supplies
+   * the colour, so a copied graph with that node lowered to neutral white bakes a residual-factor PNG and the original
+   * `COLOR_0` stays authoritative. Absent, such a graph is unsupported exactly as before.
+   */
+  readonly directVertexColor?: boolean | undefined;
+  /**
    * Only classify: report whether the material is an emissive-only effect and never bake. The importer probes a
    * translucent section that already has a base-colour texture, which a plain request would not look at.
    */
@@ -88,6 +96,12 @@ export type GraphBakeOutcome = BakeResult & {
    * truncated or unreadable.
    */
   readonly vertexColorOnBaseColor?: boolean;
+  /**
+   * Present when the bake lowered a direct `BaseColor -> VertexColor` graph to neutral white (see
+   * `directVertexColorGraph`): the mesh's `COLOR_0` supplies the colour and the baked PNG is only a residual factor,
+   * not the colour itself. Only set for that proved composition.
+   */
+  readonly vertexColorResidual?: boolean;
   /**
    * Probe only: the textures the active BaseColor path samples, and whether the instance chain overrides a static
    * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first. Absent when that path
@@ -256,6 +270,36 @@ export function graphReadsObjectRadius(graph: MaterialGraph): boolean {
   return graph.nodes.some((node) => node.class === "ObjectRadius");
 }
 
+/**
+ * The one composition where a `VertexColor` graph is exactly representable without baking the colour: BaseColor is the
+ * `VertexColor` node's output 0 with the RGB channel selection (`[1,1,1,0]`, or a null mask, which the evaluator reads
+ * as RGB for output 0), the graph is neither truncated nor errored, the node is readable, and neither an Opacity nor an
+ * OpacityMask path is wired. No function, Make, arithmetic, swizzle or other general VertexColor use qualifies.
+ */
+export function directVertexColorGraph(graph: MaterialGraph): boolean {
+  if (graph.truncated || graph.error) return false;
+  const { baseColor, opacity, opacityMask } = graph.outputs;
+  if (!baseColor || opacity || opacityMask) return false;
+  if (baseColor.output !== 0) return false;
+  if (baseColor.mask !== null && !(baseColor.mask[0] === 1 && baseColor.mask[1] === 1 && baseColor.mask[2] === 1 && baseColor.mask[3] === 0)) return false;
+  const node = graph.nodes.find((candidate) => candidate.id === baseColor.node);
+  return node !== undefined && node.class === "VertexColor" && node.error === undefined;
+}
+
+/**
+ * A copy of `graph` whose BaseColor-producing node is a neutral white `Constant3Vector`. The bake of this copy is a
+ * residual factor only; the original graph is left untouched for probes, class reporting and source provenance.
+ */
+export function whiteLoweredGraph(graph: MaterialGraph): MaterialGraph {
+  const target = graph.outputs.baseColor?.node;
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) =>
+      node.id === target ? { id: node.id, class: "Constant3Vector", inputs: {}, constants: { Constant: [1, 1, 1, 0] } } : node,
+    ),
+  };
+}
+
 /** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
 function normalisedPackage(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^(?:Game|Content)\//i, "").toLowerCase();
@@ -407,7 +451,13 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
 
     const surface = request.surface && graphReadsSurface(graph) ? request.surface() : undefined;
     const objectRadius = request.objectRadius && graphReadsObjectRadius(graph) ? request.objectRadius() : undefined;
-    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}|radius:${objectRadius ?? "none"}`;
+    // A flagged request that names an exactly representable direct VertexColor graph bakes a neutral residual and leaves
+    // the mesh's COLOR_0 to carry the colour: not the same result as the same assets/params asked without the flag, so
+    // the flag is part of the cache key.
+    const residual = request.directVertexColor === true && request.alpha === undefined && directVertexColorGraph(graph);
+    // Unflagged direct-VC graphs and non-direct VC graphs still compile to `unsupported` and are never memoised under
+    // the flagged key.
+    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|dvc:${request.directVertexColor === true ? "1" : "0"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}|radius:${objectRadius ?? "none"}`;
     let perAssets = bakes.get(request.assets);
     if (!perAssets) {
       perAssets = new Map();
@@ -419,7 +469,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     const pending = (async (): Promise<GraphBakeOutcome> => {
       const unresolved = new Map<string, string>();
       const result = await bakeGraph({
-        graph: graph!,
+        graph: residual ? whiteLoweredGraph(graph!) : graph!,
         output: "baseColor",
         parameters,
         size,
@@ -471,6 +521,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         confidence: approximations.size === 0 ? "exact" : "heuristic",
         graphMaterial: graph!.material,
         parameters,
+        ...(residual ? { vertexColorResidual: true } : {}),
       };
       bakeBytes += result.png.length;
       return baked;

@@ -6,7 +6,7 @@ import { NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { describe, expect, it, onTestFinished } from "vitest";
 
-import { chainParameters, createGraphBaker } from "../src/unreal/graph-baker.js";
+import { chainParameters, createGraphBaker, directVertexColorGraph } from "../src/unreal/graph-baker.js";
 import { parsePropsFile } from "../src/unreal/materials.js";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
 import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
@@ -93,7 +93,11 @@ function moss(): MaterialGraph {
   });
 }
 
-const instanceProps = (parent: string, overrides: [string, string][]): string =>
+const instanceProps = (
+  parent: string,
+  overrides: [string, string][],
+  extras: { scalars?: [string, number][] | undefined; vectors?: [string, [number, number, number, number]][] | undefined } = {},
+): string =>
   [
     `Parent = Material3'Content/Test/${parent}.${parent}'`,
     ...overrides.flatMap(([name, texture], index) => [
@@ -104,12 +108,79 @@ const instanceProps = (parent: string, overrides: [string, string][]): string =>
       `    ParameterName = ${name}`,
       "}",
     ]),
+    ...(extras.scalars ?? []).flatMap(([name, value], index) => [
+      `ScalarParameterValues[${index}] =`,
+      "{",
+      `    ParameterInfo = { Name=${name} }`,
+      `    ParameterValue = ${value}`,
+      "}",
+    ]),
+    ...(extras.vectors ?? []).flatMap(([name, value], index) => [
+      `VectorParameterValues[${index}] =`,
+      "{",
+      `    ParameterInfo = { Name=${name} }`,
+      `    ParameterValue = { R=${value[0]}, G=${value[1]}, B=${value[2]}, A=${value[3]} }`,
+      "}",
+    ]),
   ].join("\n");
 
 const encode = (unit: number): number => {
   const value = Math.min(1, Math.max(0, unit));
   return Math.round((value <= 0.0031308 ? value * 12.92 : 1.055 * value ** (1 / 2.4) - 0.055) * 255);
 };
+
+// BaseColor = VertexColor.RGB exactly (the Hornbeam icon master's proven composition): the mesh's COLOR_0 is the colour
+// and the graph adds nothing, so a white residual factor reproduces Unreal when glTF multiplies COLOR_0 in.
+function vertexColorDirect(materialName = "M_Master", mask: number[] | null = [1, 1, 1, 0]): MaterialGraph {
+  return materialGraphSchema.parse({
+    format: 1,
+    material: materialName,
+    package: `/Game/Test/${materialName}`,
+    truncated: false,
+    nodeCount: 2,
+    outputs: {
+      baseColor: { node: "vertex", output: 0, mask },
+      roughness: pin("rough"),
+      metallic: null,
+      emissive: null,
+      opacity: null,
+      opacityMask: null,
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes: [node("vertex", "VertexColor"), node("rough", "Constant", { constants: { R: 0 } })],
+  });
+}
+
+// Any use that is not the exact direct RGB selection: a component swizzle, an arithmetic combination, or an opacity path.
+function vertexColorSwizzled(): MaterialGraph {
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: 3,
+    outputs: {
+      baseColor: { node: "swizzle", output: 0, mask: null },
+      roughness: null,
+      metallic: null,
+      emissive: null,
+      opacity: null,
+      opacityMask: null,
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes: [
+      node("vertex", "VertexColor"),
+      node("swizzle", "ComponentMask", { inputs: { Input: pin("vertex", [1, 1, 1, 0]) }, channelMask: [0, 1, 0, 0] }),
+    ],
+  });
+}
+
+function vertexColorWithOpacity(): MaterialGraph {
+  const graph = vertexColorDirect();
+  return materialGraphSchema.parse({ ...graph, outputs: { ...graph.outputs, opacity: pin("opaque") }, nodes: [...graph.nodes, node("opaque", "Constant", { constants: { R: 1 } })] });
+}
 
 async function firstPixel(png: Buffer | Uint8Array): Promise<number[]> {
   const { data } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
@@ -457,6 +528,56 @@ describe("createGraphBaker", () => {
     expect(outcome.status).toBe("unsupported");
     expect(outcome.status === "unsupported" && outcome.unsupported).toContain("VertexColor");
   });
+
+  it("bakes a neutral residual for a flagged exact VertexColor graph and keeps the colour out of the PNG", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const baker = createGraphBaker({
+      sourceDir,
+      maxTextureSize: 8,
+      dumpGraphs: async () => new Map([["M_Master", vertexColorDirect()]]),
+    })!;
+    const request = { materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps };
+    const flagged = await baker({ ...request, directVertexColor: true });
+    expect(flagged.status).toBe("baked");
+    expect(flagged.status === "baked" && flagged.vertexColorResidual).toBe(true);
+    expect(flagged.status === "baked" && flagged.confidence).toBe("exact");
+    expect(await firstPixel(flagged.status === "baked" ? flagged.png : Buffer.alloc(4))).toEqual([255, 255, 255]);
+    // The same assets and parameters asked without the guarantee flag is a different result under a different cache key.
+    const unflagged = await baker(request);
+    expect(unflagged.status).toBe("unsupported");
+  });
+
+  it("accepts a null output-0 mask but rejects every other VertexColor use", () => {
+    expect(directVertexColorGraph(vertexColorDirect("M_Master", null))).toBe(true);
+    expect(directVertexColorGraph(vertexColorDirect())).toBe(true);
+    expect(directVertexColorGraph(vertexColorSwizzled())).toBe(false);
+    expect(directVertexColorGraph(masterGraph("vertex-color"))).toBe(false);
+    expect(directVertexColorGraph(vertexColorWithOpacity())).toBe(false);
+    expect(directVertexColorGraph({ ...vertexColorDirect(), truncated: true })).toBe(false);
+    expect(directVertexColorGraph({ ...vertexColorDirect(), error: "unreadable" })).toBe(false);
+    const outputs = { ...vertexColorDirect().outputs, baseColor: { node: "vertex", output: 1, mask: null } };
+    expect(directVertexColorGraph({ ...vertexColorDirect(), outputs })).toBe(false);
+  });
+
+  it("never lowers a swizzle, arithmetic or opacity VertexColor graph even when the flag is set", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    for (const graph of [vertexColorSwizzled(), masterGraph("vertex-color"), vertexColorWithOpacity()]) {
+      const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+      const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
+      expect(outcome.status).toBe("unsupported");
+      expect(outcome.vertexColorResidual).toBeUndefined();
+    }
+  });
+
+  it("reports a flagged direct VertexColor graph unavailable when the graph is truncated or errored", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    for (const graph of [{ ...vertexColorDirect(), truncated: true }, { ...vertexColorDirect(), error: "unreadable" }]) {
+      const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+      const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
+      expect(outcome.status).toBe("unavailable");
+      expect(outcome.vertexColorResidual).toBeUndefined();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------
@@ -518,7 +639,7 @@ process.exit(run.status === null ? 1 : run.status);
   await chmod(path, 0o755);
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number] }) {
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number] }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -533,7 +654,10 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     name: "Mesh",
     materialName: "MI_Rock",
     mat: "",
-    props: instanceProps("M_Master", options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]]),
+    props: instanceProps("M_Master", options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]], {
+      scalars: options.instanceScalars,
+      vectors: options.instanceTint ? [["Base Color Tint", options.instanceTint]] : undefined,
+    }),
     textures: [],
   });
   if (options.normal) {
@@ -593,7 +717,7 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   const dumped = await readFile(converterLog, "utf8").catch(() => "");
   const leftovers = await readdir(cacheDir, { recursive: true }).catch(() => [] as string[]);
   const textureExports = (await readFile(textureLog, "utf8").catch(() => "")).split("\n").filter(Boolean);
-  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, dumped, leftovers, textureExports };
+  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, glb, dumped, leftovers, textureExports };
 }
 
 describe("importUnrealDirectory surface-driven graph bake", () => {
@@ -662,6 +786,63 @@ describe("importUnrealDirectory graph bake", () => {
     expect(section.limitations.join("\n")).toContain("VertexColor evaluated as white");
     expect(section.bindings).toContainEqual(expect.objectContaining({ source: "graph", confidence: "heuristic" }));
     expect(report.materialCoverage.graphBaked).toBe(1);
+  });
+
+  it("bakes a white residual for a direct VertexColor graph and keeps the mesh's COLOR_0 colours exact", async () => {
+    const { report, onDisk, material, glb } = await importWithGraph({ graph: vertexColorDirect(), vertexColors: true });
+    const texture = material.getBaseColorTexture();
+    expect(texture).not.toBeNull();
+    // Neutral residual: the actual colour is not in the PNG.
+    expect(await firstPixel(texture!.getImage()!)).toEqual([255, 255, 255]);
+    // White factor, so glTF's factor x texture x COLOR_0 equals Unreal's VertexColor (no 0.8 dimming).
+    expect(material.getBaseColorFactor()).toEqual([1, 1, 1, 1]);
+    expect(material.getAlphaMode()).toBe("OPAQUE");
+    const primitive = glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    expect([...primitive.getAttribute("COLOR_0")!.getArray()!]).toEqual([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.graph).toMatchObject({ status: "baked", confidence: "exact", unsupportedNodes: [], vertexColorResidual: true });
+    // No false "mesh carries no vertex colours" note: the mesh does carry them.
+    expect(section.graph?.approximations.join("\n")).not.toContain("the mesh carries no vertex colours");
+    expect(section.limitations.join("\n")).toContain("COLOR_0 supplies the base colour");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ source: "graph", confidence: "exact" }));
+    expect(onDisk.models[0]!.materials[0]!.graph?.vertexColorResidual).toBe(true);
+  });
+
+  it("keeps an OPAQUE direct VertexColor section when an unused instance Opacity scalar and tint alpha are present", async () => {
+    // Regression: the direct VertexColor graph proves there is no alpha path (no Opacity/OpacityMask output), so an
+    // unused instance scalar Opacity and a tint alpha of 0.5 must not lower the proved-OPAQUE section to BLEND. Doing
+    // so let COLOR_0's alpha decide visibility and broke the prerequisite that the mesh's COLOR_0 is the colour.
+    const { report, material, glb } = await importWithGraph({
+      graph: vertexColorDirect(),
+      vertexColors: true,
+      instanceScalars: [["Opacity", 0.5]],
+      instanceTint: [1, 1, 1, 0.5],
+    });
+    const texture = material.getBaseColorTexture();
+    expect(texture).not.toBeNull();
+    // The residual stays the exact identity: no tint alpha folded into the factor, no 0.8 dimming.
+    expect(await firstPixel(texture!.getImage()!)).toEqual([255, 255, 255]);
+    expect(material.getBaseColorFactor()).toEqual([1, 1, 1, 1]);
+    expect(material.getAlphaMode()).toBe("OPAQUE");
+    const primitive = glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    expect([...primitive.getAttribute("COLOR_0")!.getArray()!]).toEqual([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.graph).toMatchObject({ status: "baked", confidence: "exact", vertexColorResidual: true });
+    expect(section.limitations.join("\n")).toContain("COLOR_0 supplies the base colour");
+  });
+
+  it("keeps default white for a direct VertexColor graph on a mesh that carries no COLOR_0", async () => {
+    const { report, material, glb } = await importWithGraph({ graph: vertexColorDirect() });
+    const texture = material.getBaseColorTexture();
+    expect(texture).not.toBeNull();
+    expect(await firstPixel(texture!.getImage()!)).toEqual([255, 255, 255]);
+    expect(material.getBaseColorFactor()).toEqual([1, 1, 1, 1]);
+    // No invented colour buffer: a glTF client leaves the base colour at the white factor, like Unreal's default node.
+    expect(glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!.getAttribute("COLOR_0")).toBeNull();
+    const section = report.models[0]!.materials[0]!;
+    expect(section.graph).toMatchObject({ status: "baked", confidence: "heuristic" });
+    expect(section.graph?.vertexColorResidual).toBeUndefined();
+    expect(section.graph?.approximations.join("\n")).toContain("VertexColor evaluated as white: the mesh carries no vertex colours");
   });
 });
 

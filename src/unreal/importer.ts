@@ -157,6 +157,8 @@ export interface ImportedMaterialSection {
     readonly unsupportedNodes: readonly string[];
     readonly approximations: readonly string[];
     readonly reason?: string;
+    /** True when the bake lowered a direct BaseColor->VertexColor graph to a neutral white residual (see the limitation). */
+    readonly vertexColorResidual?: boolean;
   };
 }
 
@@ -1771,6 +1773,10 @@ export async function packageGlb(options: {
       // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
       // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
       ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
+      // A painted, OPAQUE section keeps its COLOR_0: the mesh carries the colour the graph's VertexColor reads. The
+      // flag lets the baker accept a graph whose BaseColor is that node's RGB exactly, baking a neutral white residual
+      // while COLOR_0 stays authoritative. A translucent section may blend vertex alpha, so it is not flagged.
+      ...(resolved.alphaMode === "OPAQUE" && usesVertexColors(root, material) ? { directVertexColor: true } : {}),
       surface: () => surfaceOf(root, material),
       objectRadius: () => {
         if (meshRadius === undefined) meshRadius = objectRadiusOf(root, options.geometryScale) ?? null;
@@ -2039,6 +2045,13 @@ export async function packageGlb(options: {
         attachTexture(material, binding, texture);
         graphBindings.push(binding);
         packagingLimitations.push(...outcome.approximations);
+        if (outcome.vertexColorResidual) {
+          // The mesh's COLOR_0 supplies the colour; the white PNG only makes glTF's product reproduce Unreal exactly.
+          // baseColorFactor stays white, so the residual is the identity and no tint or 0.8 fallback is applied.
+          packagingLimitations.push(
+            `${material.getName()}'s graph wires BaseColor directly to VertexColor: the mesh's COLOR_0 supplies the base colour and the baked white graph base colour is a neutral residual factor, so a glTF client reproduces Unreal's colour.`,
+          );
+        }
         const viewDependent = viewDependentNodes(outcome.approximations);
         if (viewDependent.length > 0) {
           packagingLimitations.push(
@@ -2054,7 +2067,13 @@ export async function packageGlb(options: {
             `Opacity is a binary cut-out (${(outcome.alpha.opaqueShare * 100).toFixed(0)}% of texels opaque): exported as alphaMode MASK instead of BLEND, because blended overlapping cards render grey and unsorted.`,
           );
         }
-        graphReport = { status: "baked", confidence: outcome.confidence, unsupportedNodes: [], approximations: [...outcome.approximations] };
+        graphReport = {
+          status: "baked",
+          confidence: outcome.confidence,
+          unsupportedNodes: [],
+          approximations: [...outcome.approximations],
+          ...(outcome.vertexColorResidual ? { vertexColorResidual: true } : {}),
+        };
       } else if (outcome.status === "unsupported") {
         graphReport = { status: "unsupported", unsupportedNodes: [...outcome.unsupported], approximations: [], reason: outcome.reason };
       } else {
@@ -2090,9 +2109,12 @@ export async function packageGlb(options: {
       if (resolved.baseColorFactor[3] < 1 && material.getAlphaMode() === "OPAQUE") {
         material.setAlphaMode("BLEND");
       }
-    } else if (resolved.baseColorFactor && resolved.baseColorFactor[3] < 1) {
+    } else if (resolved.baseColorFactor && resolved.baseColorFactor[3] < 1 && graphReport?.vertexColorResidual !== true) {
       // A baked graph already contains its tints (multiplying the instance's colour in again would apply them twice)
       // and an emissive effect has no albedo tint to apply, but the instance's opacity still holds. Only alpha carries over.
+      // A direct VertexColor residual is the exception: the graph wires no opacity path, so an unused instance scalar
+      // Opacity (or tint alpha) must not lower an OPAQUE section to BLEND — that would make COLOR_0's alpha decide
+      // visibility. The mesh's COLOR_0 stays authoritative and the factor stays the identity white.
       const [r, g, b] = material.getBaseColorFactor();
       material.setBaseColorFactor([r, g, b, resolved.baseColorFactor[3]]);
       if (material.getAlphaMode() === "OPAQUE") material.setAlphaMode("BLEND");
