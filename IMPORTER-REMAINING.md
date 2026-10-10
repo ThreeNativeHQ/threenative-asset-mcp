@@ -54,3 +54,23 @@ Known accepted exception candidates: Paladin beard (engine texture not in the pa
 - Owner forest screenshot (P2): need glTF asset names for the white pine trunk tops.
 - Decide whether GAS S4 and Paragon become named exceptions in PRD-537.
 - Optional: re-extract `libUnrealEditor-Engine.so` and `Engine/Content/Functions` so engine content functions bake exactly instead of heuristically.
+
+## 6. State at merge time (2026-10-10)
+
+- Everything above landed on `main` via PR #36 (`feat/parity-sweep-licences` fast-forwarded from `fix/graph-view-nodes`); backup bundle at `~/.cache/threenative-asset-mcp/backup-2026-10-10/`.
+- Merged **with named exceptions**: GAS S4 and Paragon S4/S3 are failing, not waived (see PRD-537 Decisions, 2026-10-10). AC-6 is still open.
+- Not run before merge: Spruce IN2 eye check, Paragon S10 result, metadata-replay sibling check for importer 89, `fidelity-baseline.ts check/update`, empty-toolchain run, fresh-eyes review. These are the first items of the follow-up.
+
+## 7. Follow-up PR checklist (in order)
+
+1. Read Spruce IN2 sheets by eye (trunk, branch and leaf bind their own textures); if wrong, iterate on `chainOverridesSwitch`/probe in `importer.ts`.
+2. Read Paragon S10 import-report warnings; fix the 9567 "texture could not be loaded" cause; handle `BreakMaterialAttributes.Metallic`; raise/verify graph node cap (converter bump) and the `M_Dawn_Reference` parent chain.
+3. GAS: export `Custom` node inputs from the converter and model the hair/eye/eyelash engine functions, or accept a recorded exception in PRD-537.
+4. Re-run Medieval (both), Downtown West, Hornbeam (both), Asian male, Common Hazel on the merged head; fix S1/S2/S3 failures.
+5. UE5 mesh writer: carry vertex colours (Hornbeam Icon meshes white).
+6. Fidelity baseline: `check`, then `update` (ratchet) after every sweep.
+7. Final sharded sweep, sheets read by eye, sheets published to `pr36-assets` and linked from the follow-up PR.
+8. `npm run build`, full suite (default workers), `npm run test:leaks`, empty-toolchain run, fresh-eyes review.
+9. PRD-537/538 bookkeeping: tick with evidence; move to `done/` only when AC-6 holds. Open: `ROUTE_PREFERENCE` calibration, AC-5 live Hornbeam run, AC-7 parity half, AC-3, PRD-538 AC-4, AC-9 delivery to the sandbox remote.
+10. Owner actions: npm publish, engine pin bump (`threenative-engine/packages/core`), Epic-source provenance decision, forest screenshot asset names, Fab licence check (`FAB_BROWSER_HEADLESS=0`) or `--assume-licence` decision.
+11. Cleanup: `.worktrees/*` and merged local branches (arm/*, base/*, fix/sweep-*, worktree-agent-*, merge/*), `toolchain-m-*`, `parity-m-*`, `parity-tmp`, named `fab-downloads` dirs, `/tmp/arm-*`; keep `*-assets` branches. Commit or archive the `.afk/2026-10-08-fidelity-sweep.md` log (D-night-1..11).
