@@ -11,7 +11,7 @@ parity.
 - Before (importer 91): [hornbeam-icon-before-i91.jpg](hornbeam-icon-before-i91.jpg)
 - After (importer 93): [hornbeam-icon-after-i93.jpg](hornbeam-icon-after-i93.jpg)
 
-Before is still dark blue versus the after's cyan. Both are rated **suspect** at fidelity **70.7**,
+Both imports remain dark blue versus the source thumbnail's cyan. Both are rated **suspect** at fidelity **70.7**,
 so this is **not an improvement claim** — only a side-by-side record.
 
 ## Jungle wall and the three other Paragon meshes
