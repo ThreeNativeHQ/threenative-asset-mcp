@@ -66,6 +66,42 @@ describe("a resolved .mat forbids parameter defaults from inventing slots", () =
     expect(bound).not.toContain("TX_Fill_ALB");
   });
 
+  it("does not bind a master's Emissive placeholder that is also its replaced Albedo default (modern converter)", () => {
+    // The UE5 converter names no slots in the .mat (`Other[n]` only), so the guard above cannot apply.
+    // The master fills Albedo and Emissive with one placeholder; the instance replaces Albedo only.
+    const resolved = resolve(
+      {
+        MI_Crate: {
+          mat: "Other[0]=TX_Crate_ALB\nOther[1]=TX_Crate_NRM\nOther[2]=TX_Crate_RMA\n",
+          props: instanceProps("MM_Master", [["Albedo", "TX_Crate_ALB"], ["Normal", "TX_Crate_NRM"], ["RMA", "TX_Crate_RMA"]]),
+        },
+        MM_Master: {
+          mat: "Other[0]=TX_Fill_NRM\nOther[1]=TX_Fill_ALB\nOther[2]=TX_Fill_ALB\nOther[3]=TX_Fill_RMA\n",
+          props: masterProps([["Normal", "TX_Fill_NRM"], ["Albedo", "TX_Fill_ALB"], ["Emissive", "TX_Fill_ALB"], ["RMA", "TX_Fill_RMA"]]),
+        },
+      },
+      "MI_Crate",
+      ["TX_Crate_ALB", "TX_Crate_NRM", "TX_Crate_RMA", "TX_Fill_ALB", "TX_Fill_NRM", "TX_Fill_RMA"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "emissive")).toBeUndefined();
+    expect(resolved.bindings.find((b) => b.slot === "baseColor")).toMatchObject({ texture: "TX_Crate_ALB" });
+  });
+
+  it("keeps an Emissive default that no replaced Albedo shares (modern converter)", () => {
+    const resolved = resolve(
+      {
+        MI_Lamp: { mat: "Other[0]=TX_Lamp_ALB\n", props: instanceProps("MM_Master", [["Albedo", "TX_Lamp_ALB"]]) },
+        MM_Master: {
+          mat: "Other[0]=TX_Fill_ALB\nOther[1]=TX_Glow_E\n",
+          props: masterProps([["Albedo", "TX_Fill_ALB"], ["Emissive", "TX_Glow_E"]]),
+        },
+      },
+      "MI_Lamp",
+      ["TX_Lamp_ALB", "TX_Fill_ALB", "TX_Glow_E"],
+    );
+    expect(resolved.bindings.find((b) => b.slot === "emissive")).toMatchObject({ texture: "TX_Glow_E" });
+  });
+
   it("still binds the Emissive the resolved graph actually names", () => {
     const resolved = resolve(
       {

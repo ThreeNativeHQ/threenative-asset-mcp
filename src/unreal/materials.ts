@@ -546,7 +546,7 @@ interface SupersededDefault {
  * Returns each parent default (by texture) that some instance in the chain overrides with a
  * different texture, keyed by the parent's texture.
  */
-function supersededDefaults(request: ResolveMaterialRequest): Map<string, SupersededDefault> {
+function supersededDefaults(request: ResolveMaterialRequest): { readonly superseded: Map<string, SupersededDefault>; readonly albedoPlaceholders: Set<string> } {
   const chain: PropsFile[] = [];
   const visited = new Set<string>();
   for (let current: string | undefined = request.name; current && chain.length < MAX_PARENT_DEPTH; ) {
@@ -581,6 +581,13 @@ function supersededDefaults(request: ResolveMaterialRequest): Map<string, Supers
       }
     }
   }
+  // A master that fills every parameter with one placeholder per map type (Old West: TX_Fill_01_ALB is the default of
+  // both Albedo and Emissive) has its Albedo replaced by each instance. The same texture left as the Emissive default
+  // is that placeholder, not light the instance emits: binding it washes the whole surface out.
+  const albedoPlaceholders = new Set<string>();
+  for (const [texture, replacement] of result) {
+    if (planForParameterName(replacement.parameter)?.slot === "baseColor") albedoPlaceholders.add(texture);
+  }
   // A texture that is also the effective value of a parameter nobody overrides is still in use;
   // suppressing it would drop a real binding.
   const overridden = new Set(chain.flatMap((props) => [...props.overrides.map((override) => override.name), ...props.unresolvedOverrides].map(key)));
@@ -589,7 +596,7 @@ function supersededDefaults(request: ResolveMaterialRequest): Map<string, Supers
       if (!overridden.has(key(parameter.name))) result.delete(parameter.texture);
     }
   }
-  return result;
+  return { superseded: result, albedoPlaceholders };
 }
 
 /**
@@ -602,7 +609,7 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   const seenMaterials = new Set<string>();
   const parents: string[] = [];
   const limitations = new Set<string>();
-  const superseded = supersededDefaults(request);
+  const { superseded, albedoPlaceholders } = supersededDefaults(request);
 
   let alphaMode: ResolvedMaterial["alphaMode"] = "OPAQUE";
   let alphaCutoff: number | undefined;
@@ -703,6 +710,11 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
         const plan = planForParameterName(parameter.name);
         if (!plan) continue;
         if (matNamedTextures?.has(parameter.texture)) continue;
+        if (plan.slot === "emissive" && albedoPlaceholders.has(parameter.texture)) {
+          claimed.add(parameter.texture);
+          limitations.add(`${parameter.texture} is the master's placeholder for Albedo and Emissive; the instance replaces Albedo, so it is not bound as emissive.`);
+          continue;
+        }
         bind(plan, parameter.texture, "props", "heuristic");
       }
       // An instance's own overrides fill slots umodel did not resolve. They never displace a
