@@ -397,6 +397,18 @@ function functionBaseName(reference: string | null | undefined): string | undefi
   return dot < 0 ? afterSlash : afterSlash.slice(0, dot);
 }
 
+/** The engine's HeightLerp by its object path: the only function reference the HeightLerp approximation stands for. */
+const ENGINE_HEIGHT_LERP = "/Engine/Functions/Engine_MaterialFunctions02/Texturing/HeightLerp.HeightLerp";
+
+/**
+ * Whether a call names the engine's HeightLerp. The dump may give Unreal's export form, `MaterialFunction'...'` (quoted or not),
+ * which is the same reference. A bare name, a /Game path or another /Engine path with the same basename is not the engine's function.
+ */
+function isEngineHeightLerp(reference: string | null | undefined): boolean {
+  const path = reference?.trim().replace(/^\w+'(.*)'$/, "$1").replace(/^"(.*)"$/, "$1");
+  return path?.toLowerCase() === ENGINE_HEIGHT_LERP.toLowerCase();
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Compiler
 
@@ -1725,8 +1737,9 @@ class Compiler {
       return this.cheapContrast(input, contrast);
     }
     if (lower === "hueshift") return this.hueShift(node, name!);
-    // A pack that carries its own HeightLerp body keeps it (the body path below); only the engine's own function is evaluated here.
-    if (lower === "heightlerp" && node.fn?.outputs[output] == null) return this.heightLerp(node, output, name!);
+    // Only the engine's own HeightLerp is evaluated here, and only when the pack carries no body for the call. A pack body on any output
+    // is the pack's: an output it lacks is unsupported below, never the engine's lerp.
+    if (isEngineHeightLerp(node.function) && !node.fn?.outputs.some(Boolean)) return this.heightLerp(node, output, name!);
     if (!node.fn?.outputs.some(Boolean)) {
       const layered = this.layerFunction(node, lower, name!, output);
       if (layered) return layered;

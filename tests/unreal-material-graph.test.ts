@@ -2450,7 +2450,7 @@ describe("CollectionParameter", () => {
 });
 
 describe("HeightLerp, SmoothThreshold and graphPathTextures", () => {
-  const HEIGHT_LERP = "/Engine/Functions/Engine_MaterialFunctions02/Texturing/HeightLerp";
+  const HEIGHT_LERP = "/Engine/Functions/Engine_MaterialFunctions02/Texturing/HeightLerp.HeightLerp";
   const SMOOTH_THRESHOLD = "/Engine/Functions/Engine_MaterialFunctions02/SmoothThreshold";
   const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
     bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
@@ -2460,10 +2460,10 @@ describe("HeightLerp, SmoothThreshold and graphPathTextures", () => {
   });
   // A HeightLerp call as the dump has it: no function body, pins as the UE 4.27 texturing docs name them.
   // A = red and B = blue (linear); the height is the texture's red channel.
-  const heightLerp = (phase: number, contrast: number): Raw[] => [
+  const heightLerp = (phase: number, contrast: number, reference = HEIGHT_LERP): Raw[] => [
     node("hl", "FunctionCall", {
       inputs: { A: pin("a"), B: pin("b"), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin("contrast") },
-      function: HEIGHT_LERP,
+      function: reference,
       outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
     }),
     constant3("a", [1, 0, 0]),
@@ -2584,6 +2584,42 @@ describe("HeightLerp, SmoothThreshold and graphPathTextures", () => {
     expect(result.status).toBe("baked");
     const pixel = await pixelsOf(result);
     expect(pixel(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+  });
+
+  it("HeightLerp from a pack or another engine path with no body is unsupported, not the engine's lerp", async () => {
+    for (const reference of ["/Game/Custom/HeightLerp.HeightLerp", "/Engine/Custom/Texturing/HeightLerp.HeightLerp"]) {
+      const result = await bake(makeGraph(heightLerp(0.5, 0, reference), pin("hl", 0, RGB_MASK)), await heightMap());
+      expect(result, reference).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining([expect.stringMatching(/^HeightLerp/)]) });
+    }
+  });
+
+  it("HeightLerp from a pack body that lacks the requested output is unsupported, not the engine's lerp", async () => {
+    // The body has Results only. Results bakes from it; Alpha is the pack's to define, so the engine's Alpha does not stand in for it.
+    const withBodyOnResults = (): Raw[] => [
+      node("hl", "FunctionCall", {
+        inputs: { A: pin("a"), B: pin("b"), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin("contrast") },
+        function: "/Game/Custom/HeightLerp.HeightLerp",
+        outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+        fn: { inputs: {}, outputs: ["hl/body", null, null], output: "hl/body", outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"] },
+      }),
+      constant3("hl/body", [0.25, 0.5, 0.75]),
+      ...heightLerp(0.5, 0).slice(1),
+    ];
+    const results = await bake(makeGraph(withBodyOnResults(), pin("hl", 0, RGB_MASK)), await heightMap());
+    expect(results.status).toBe("baked");
+    const pixel = await pixelsOf(results);
+    expect(pixel(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    const alpha = await bake(makeGraph(withBodyOnResults(), pin("hl", 1)), await heightMap());
+    expect(alpha).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining([expect.stringMatching(/^HeightLerp/)]) });
+  });
+
+  it("HeightLerp recognizes the engine's reference in Unreal's MaterialFunction export form", async () => {
+    const textures = await heightMap();
+    const plain = await pixelsOf(await bake(makeGraph(heightLerp(0.5, 0), pin("hl", 0, RGB_MASK)), textures));
+    const exported = await bake(makeGraph(heightLerp(0.5, 0, `MaterialFunction'${HEIGHT_LERP}'`), pin("hl", 0, RGB_MASK)), textures);
+    expect(exported.status).toBe("baked");
+    const pixel = await pixelsOf(exported);
+    for (const x of [0, 1]) expect(pixel(x, 0)).toEqual(plain(x, 0));
   });
 
   it("SmoothThreshold stays unsupported (no public definition available)", async () => {
