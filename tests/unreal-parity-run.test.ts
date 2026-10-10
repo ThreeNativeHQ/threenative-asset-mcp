@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -654,16 +654,52 @@ setInterval(() => {}, 1000);
   }, 20_000);
 });
 
+describe("liveness probe", () => {
+  it.skipIf(process.platform !== "linux")("does not count a zombie as alive: it has exited and only waits for its parent to reap it", async () => {
+    const child = spawn("sh", ["-c", "exit 0"], { stdio: "ignore" });
+    const pid = child.pid!;
+    const exited = new Promise<void>((done) => child.once("exit", () => done()));
+    // Blocking the event loop keeps libuv from reaping the child, so it stays a zombie until this wait ends.
+    const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    const deadline = Date.now() + 10_000;
+    while (procState(pid) !== "Z" && Date.now() < deadline) pause(1);
+    expect(procState(pid)).toBe("Z");
+    expect(isAlive(pid)).toBe(false);
+    await exited;
+  });
+
+  it("still counts a running process as alive, so the cleanup assertions keep their teeth", () => {
+    expect(isAlive(process.pid)).toBe(true);
+  });
+});
+
 function createRequireResolve(specifier: string): string {
   return createRequire(import.meta.url).resolve(specifier);
 }
 
 function isAlive(pid: number): boolean {
+  const state = procState(pid);
+  if (state === undefined) {
+    // No /proc entry: the process is gone, or this platform has no /proc and kill(pid, 0) is all there is.
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  // kill(pid, 0) also succeeds for a zombie (exited, not yet reaped by its parent); X is a task tearing down.
+  return state !== "Z" && state !== "X";
+}
+
+/** The state letter from /proc/<pid>/stat ("R", "S", "Z", ...), or undefined when the entry cannot be read. */
+function procState(pid: number): string | undefined {
   try {
-    process.kill(pid, 0);
-    return true;
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // "<pid> (<comm>) <state> ...": comm may contain spaces and parentheses, so cut at the last ")".
+    return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
   } catch {
-    return false;
+    return undefined;
   }
 }
 
