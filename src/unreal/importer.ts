@@ -57,7 +57,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 84;
+export const IMPORTER_VERSION = 85;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1437,6 +1437,14 @@ export async function dropUnreadVertexColours(
   if (!graphBaker || !usesVertexColors(root, material)) return undefined;
   const outcome = await graphBaker(probe());
   if (outcome.vertexColorOnBaseColor !== false) return undefined;
+  const dropped = dropVertexColours(root, material);
+  return dropped === 0
+    ? undefined
+    : `Vertex colours (COLOR_0) dropped from ${dropped} primitive(s): ${outcome.graphMaterial ?? "the material"}'s BaseColor does not read VertexColor, so Unreal ignores them, while a glTF client would multiply them into the base colour.`;
+}
+
+/** Removes COLOR_0 from every primitive that renders with `material`; returns how many primitives lost it. */
+function dropVertexColours(root: ReturnType<Document["getRoot"]>, material: Material): number {
   let dropped = 0;
   for (const mesh of root.listMeshes()) {
     for (const primitive of mesh.listPrimitives()) {
@@ -1448,9 +1456,7 @@ export async function dropUnreadVertexColours(
       if (colour.listParents().every((parent) => parent.propertyType === "Root")) colour.dispose();
     }
   }
-  return dropped === 0
-    ? undefined
-    : `Vertex colours (COLOR_0) dropped from ${dropped} primitive(s): ${outcome.graphMaterial ?? "the material"}'s BaseColor does not read VertexColor, so Unreal ignores them, while a glTF client would multiply them into the base colour.`;
+  return dropped;
 }
 
 /** True when any primitive that renders with `material` carries a COLOR_0 attribute. */
@@ -1568,8 +1574,11 @@ export async function packageGlb(options: {
     // UE Viewer names a section it could not resolve `dummy_material_<n>` and paints it a debug
     // colour. Shipping that name would put a placeholder into a game asset and let a reader
     // mistake it for a real material, so it is renamed to something that says what it is.
-    const unresolvedSection = /^dummy_material(_\d+)?$/i.test(name);
-    if (unresolvedSection) {
+    // CUE4Parse names a section whose slot holds no material `None` (a null package index); Unreal draws it with the
+    // engine default material.
+    const emptySlot = name === "None";
+    const unresolvedSection = emptySlot || /^dummy_material(_\d+)?$/i.test(name);
+    if (unresolvedSection && !emptySlot) {
       material.setName(`${basename(options.glbPath, ".glb")}_unresolved_section_${index}`);
     }
     const materialRequest: ResolveMaterialRequest = {
@@ -1604,7 +1613,12 @@ export async function packageGlb(options: {
       }
     }
     let effect: ImportedMaterialEffect | undefined;
-    if (unresolvedSection && (await options.namesEngineDefaultMaterial?.())) {
+    if (emptySlot) {
+      effect = {
+        kind: "engine-default-material",
+        reason: "the mesh assigns no material to this slot (None), so Unreal draws it with its default material (/Engine/EngineMaterials/WorldGridMaterial), an engine asset outside the pack; a Blueprint or component override that supplies the real material at runtime is not part of the mesh",
+      };
+    } else if (unresolvedSection && (await options.namesEngineDefaultMaterial?.())) {
       effect = {
         kind: "engine-default-material",
         reason: "the mesh package names Unreal's default material (/Engine/EngineMaterials/WorldGridMaterial) and no pack material for this slot; the engine's default is not part of the pack, and a particle emitter or placing actor supplies the real material at runtime",
@@ -1641,7 +1655,13 @@ export async function packageGlb(options: {
     // the base colour of every primitive that has it. Skeletal meshes often carry black or mask vertex colours a
     // material never reads, which rendered whole characters black. When the material's graph is known and its BaseColor
     // path does not read VertexColor, the attribute is dropped.
-    const vertexColourLimitation = await dropUnreadVertexColours(root, material, options.graphBaker, () => graphRequest(true));
+    // WorldGridMaterial does not read VertexColor either: a MetaHuman face's RGB region-mask vertex colours turned its
+    // empty slots saturated green and cyan in a glTF viewer.
+    const defaultMaterialDropped = effect?.kind === "engine-default-material" ? dropVertexColours(root, material) : 0;
+    const vertexColourLimitation =
+      defaultMaterialDropped > 0
+        ? `Vertex colours (COLOR_0) dropped from ${defaultMaterialDropped} primitive(s): Unreal's default material (WorldGridMaterial) does not read VertexColor, so Unreal ignores them, while a glTF client would multiply them into the base colour.`
+        : await dropUnreadVertexColours(root, material, options.graphBaker, () => graphRequest(true));
     // A translucent section with a base-colour texture is not otherwise looked at by the graph baker, yet an unlit or
     // additive effect names its emissive mask `Diffuse`. Ask the graph whether Emissive is its only colour output.
     if (

@@ -560,11 +560,58 @@ describe("importer: a slot holding the engine default material (SM_leaf)", () =>
     expect(report.materialCoverage.effect).toBe(1);
   });
 
+  it("drops COLOR_0 from an engine-default slot: WorldGridMaterial does not read VertexColor", async () => {
+    const { section, primitive } = await importFixture({
+      graph: particleTintedMaster(),
+      materialName: "dummy_material_0",
+      props: "",
+      textures: [],
+      meshPackageText: "/Engine/EngineMaterials/WorldGridMaterial\0WorldGridMaterial",
+      vertexColor: [0, 1, 0, 1],
+    });
+    expect(section.effect).toMatchObject({ kind: "engine-default-material" });
+    expect(primitive.getAttribute("COLOR_0")).toBeNull();
+    expect(section.limitations.join("\n")).toContain("Vertex colours (COLOR_0) dropped from 1 primitive(s)");
+  });
+
   it("claims nothing when the mesh package does not name the engine default material", async () => {
     const { section, report } = await leaf("/Game/Test/SomeOtherMaterial");
     expect(section.resolved).toBe(false);
     expect(section.effect).toBeUndefined();
     expect(report.materialCoverage.effect).toBe(0);
+  });
+});
+
+describe("importer: a slot the mesh assigns no material (CUE4Parse names it None)", () => {
+  it("drops the region-mask COLOR_0 and says Unreal draws its default material", async () => {
+    // A MetaHuman face mesh with empty slots and RGB region-mask vertex colours rendered saturated green and cyan in a
+    // glTF viewer; Unreal draws an empty slot with WorldGridMaterial, which never reads VertexColor.
+    const { section, primitive, material, report } = await importFixture({
+      graph: particleTintedMaster(),
+      materialName: "None",
+      props: "",
+      textures: [],
+      vertexColor: [0, 1, 0, 1],
+    });
+    expect(primitive.getAttribute("COLOR_0")).toBeNull();
+    expect(section.limitations.join("\n")).toContain("Vertex colours (COLOR_0) dropped from 1 primitive(s)");
+    expect(section.resolved).toBe(false);
+    expect(section.effect).toMatchObject({ kind: "engine-default-material" });
+    expect(section.effect?.reason).toContain("assigns no material");
+    expect(material.getBaseColorFactor()).toEqual([0.8, 0.8, 0.8, 1]);
+    expect(report.materialCoverage.effect).toBe(1);
+  });
+
+  it("keeps COLOR_0 on a named material whose graph is unknown", async () => {
+    const { section, primitive } = await importFixture({
+      graph: particleTintedMaster(),
+      materialName: "MI_Unknown",
+      props: "",
+      textures: [],
+      vertexColor: [0, 1, 0, 1],
+    });
+    expect(primitive.getAttribute("COLOR_0")).not.toBeNull();
+    expect(section.effect).toBeUndefined();
   });
 });
 
