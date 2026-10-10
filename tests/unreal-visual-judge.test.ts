@@ -55,6 +55,25 @@ it("passes a normal coloured object", () => {
   expect(result.stats.meanSaturation).toBeGreaterThan(0.3);
 });
 
+it("flags an object dominated by pure hues (region-mask vertex colours bound as albedo)", () => {
+  // Green above, cyan below, shaded: what a MetaHuman face's RGB region mask looks like multiplied into a grey base colour.
+  const mask = judgeRender(tile(60, (x, y) => {
+    const shade = 140 + Math.round(noise(x, y) * 60);
+    return y < 50 ? [0, shade, 0] : [0, shade, shade];
+  }), { expectColoured: true });
+  expect(mask.stats.pureHueFraction).toBeGreaterThan(0.9);
+  expect(mask.verdict).toBe("suspect");
+  expect(mask.reasons.join("\n")).toContain("pure hues");
+  // Lit skin-like albedo is saturated but nowhere near pure.
+  const skin = judgeRender(tile(60, (x, y) => [190 + noise(x, y) * 30, 130 + noise(x, y) * 25, 100 + noise(x, y) * 20]), { expectColoured: true });
+  expect(skin.stats.pureHueFraction).toBe(0);
+  expect(skin.verdict).toBe("ok");
+  // One pure hue is a flat-colour material (a prototyping solid blue), not a mask.
+  const solid = judgeRender(tile(60, (x, y) => [0, 0, 140 + Math.round(noise(x, y) * 60)]), { expectColoured: true });
+  expect(solid.stats.pureHueRegions).toBe(1);
+  expect(solid.verdict).toBe("ok");
+});
+
 it("flags a white object, and fails it when the report claims colour", () => {
   const white = tile(60, () => [255, 255, 255]);
   const plain = judgeRender(white);

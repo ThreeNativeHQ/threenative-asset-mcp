@@ -35,6 +35,17 @@ export const WASHED_OUT_LUMA = 200;
  * 1.4-1.5x. 1.6 catches the solid-card regression while leaving dense real cards alone.
  */
 export const SOLID_CARD_FILL_FACTOR = 1.6;
+/** HSV saturation at or above which a pixel counts as a pure hue (`JudgeStats.pureHueFraction`). */
+export const PURE_HUE_SATURATION = 0.85;
+/**
+ * A render whose object pixels are mostly pure hues, split over at least two distinct hues, shows a region mask, vertex
+ * colours or a debug texture, not a lit material. A MetaHuman face whose RGB region-mask vertex colours were multiplied
+ * into its base colour put 0.95 of its pixels there (green and cyan); lit albedo (the same character's skin textures)
+ * had none. One pure hue alone is a flat-colour material (a prototyping MI_Solid_Blue) and is not flagged.
+ */
+export const PURE_HUE_DOMINANT_FRACTION = 0.6;
+/** Share of object pixels a pure hue sextant needs to count as one of the mask's regions. */
+export const PURE_HUE_REGION_FRACTION = 0.1;
 /** Object pixels below this make a fill ratio meaningless: a handful of pixels trivially fills its box. */
 export const MIN_FILL_MASK_PIXELS = 200;
 const NEAR_WHITE = 235;
@@ -53,6 +64,10 @@ export interface JudgeStats {
   neutralFraction: number;
   /** Mean HSV saturation of the object pixels, 0..1. */
   meanSaturation: number;
+  /** Share of object pixels at or above `PURE_HUE_SATURATION`: pure primaries and secondaries, not lit materials. */
+  pureHueFraction: number;
+  /** Hue sextants (centred on red, yellow, green, cyan, blue, magenta) holding `PURE_HUE_REGION_FRACTION` of pure pixels. */
+  pureHueRegions: number;
   meanLuma: number;
   lumaStdDev: number;
   /**
@@ -96,6 +111,8 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
   let white = 0;
   let neutral = 0;
   let saturation = 0;
+  let pureHue = 0;
+  const pureSextants = [0, 0, 0, 0, 0, 0];
   let luma = 0;
   let lumaSquares = 0;
   let minX = image.width;
@@ -125,7 +142,12 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
     const min = Math.min(r, g, b);
     if (min > NEAR_WHITE) white++;
     if (max - min < NEUTRAL_SPREAD) neutral++;
-    saturation += max === 0 ? 0 : (max - min) / max;
+    const pixelSaturation = max === 0 ? 0 : (max - min) / max;
+    saturation += pixelSaturation;
+    if (pixelSaturation >= PURE_HUE_SATURATION) {
+      pureHue++;
+      pureSextants[hueSextant(r, g, b, max, min)]!++;
+    }
     const y = 0.299 * r + 0.587 * g + 0.114 * b;
     luma += y;
     lumaSquares += y * y;
@@ -140,6 +162,8 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
     nearWhiteFraction: white / n,
     neutralFraction: neutral / n,
     meanSaturation: saturation / n,
+    pureHueFraction: pureHue / n,
+    pureHueRegions: pureSextants.filter((count) => count / n >= PURE_HUE_REGION_FRACTION).length,
     meanLuma,
     lumaStdDev: Math.sqrt(Math.max(0, lumaSquares / n - meanLuma * meanLuma)),
     fillRatio: boundingBox === 0 ? 0 : objectPixels / boundingBox,
@@ -174,6 +198,17 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
   if (isWhite) raise("suspect", `white: ${(stats.nearWhiteFraction * 100).toFixed(0)}% of object pixels are near-white`);
   else if (isGhost) raise("suspect", "ghost: uniform grey object with no shading, pale or close to the background");
   else if (isWashedOut) raise("suspect", "washed out: near-neutral and very bright");
+  // Several pure saturated hues over most of the object are a mask or debug colour, unless Unreal's own thumbnail agrees.
+  if (
+    stats.pureHueFraction >= PURE_HUE_DOMINANT_FRACTION &&
+    stats.pureHueRegions >= 2 &&
+    !((options.colourSimilarity ?? 0) >= STRONG_COLOUR_AGREEMENT)
+  ) {
+    raise(
+      "suspect",
+      `pure hues: ${(stats.pureHueFraction * 100).toFixed(0)}% of object pixels are fully saturated across ${stats.pureHueRegions} hues (a region mask, vertex colours or debug texture shown as albedo?)`,
+    );
+  }
   // Silhouette: a flat card that ignores its alpha cut-out renders as a solid rectangle, filling its
   // bounding box far more than the real cut-out does. Compare only when both masks have enough pixels
   // for the ratio to mean anything.
@@ -206,4 +241,11 @@ export function judgeRender(image: RgbaImage, options: JudgeOptions = {}): Judge
     for (const reason of fidelity.reasons) raise(fidelity.verdict, `fidelity ${options.fidelity.score.toFixed(0)}/100: ${reason}`);
   }
   return { verdict, reasons, stats };
+}
+
+/** Hue sextant 0..5 centred on red, yellow, green, cyan, blue and magenta; `max > min`. */
+function hueSextant(r: number, g: number, b: number, max: number, min: number): number {
+  const delta = max - min;
+  const hue = max === r ? ((g - b) / delta + 6) % 6 : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
+  return Math.round(hue) % 6;
 }

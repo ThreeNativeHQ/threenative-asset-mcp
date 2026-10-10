@@ -674,6 +674,25 @@ async function unreadVertexColourBox(dir: string, name: string): Promise<string>
   return path;
 }
 
+/** A grey box whose COLOR_0 is an RGB region mask (green top, cyan bottom), kept: what the judge must flag. */
+async function regionMaskVertexColourBox(dir: string, name: string): Promise<string> {
+  const path = join(dir, `${name}.glb`);
+  await writeGlb(path, { name, geometry: "cube", baseColorFactor: [0.8, 0.8, 0.8, 1] });
+  const io = new NodeIO();
+  const document = await io.read(path);
+  const root = document.getRoot();
+  const primitive = root.listMeshes()[0]!.listPrimitives()[0]!;
+  const positions = primitive.getAttribute("POSITION")!;
+  const colours = new Float32Array(positions.getCount() * 4);
+  for (let i = 0; i < positions.getCount(); i++) {
+    const top = positions.getElement(i, [0, 0, 0])[1]! > 0;
+    colours.set([0, 1, top ? 0 : 1, 1], i * 4);
+  }
+  primitive.setAttribute("COLOR_0", document.createAccessor("COLOR_0").setType("VEC4").setArray(colours).setBuffer(root.listBuffers()[0]!));
+  await io.write(path, document);
+  return path;
+}
+
 async function buildFixtures(dir: string): Promise<Fixture[]> {
   const wood = await woodTexture();
   const ragged = await raggedAlphaTexture();
@@ -737,6 +756,7 @@ async function buildFixtures(dir: string): Promise<Fixture[]> {
   fixtures.push({ name: "matte-leaf-specular", path: await importedNeedleCard(dir, "matte-leaf-specular", { specular: 0.1, solidMask: true }) });
   fixtures.push({ name: "default-leaf-specular", path: await importedNeedleCard(dir, "default-leaf-specular", { solidMask: true }) });
   fixtures.push({ name: "unread-black-vertex-colours", path: await unreadVertexColourBox(dir, "unread-black-vertex-colours") });
+  fixtures.push({ name: "region-mask-vertex-colours", path: await regionMaskVertexColourBox(dir, "region-mask-vertex-colours") });
   await write("solid-box", { geometry: "cube", baseColorFactor: [0.15, 0.3, 0.85, 1] });
   await write("neutral-grey", { geometry: "cube", baseColorFactor: [0.5, 0.5, 0.5, 1] });
   await write("solid-quad", { geometry: "quad", baseColorFactor: [0.2, 0.7, 0.3, 1] });
@@ -928,6 +948,14 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     expect(r).toBeGreaterThan(70);
     expect(r).toBeGreaterThan(g * 1.3);
     expect(g).toBeGreaterThan(b * 1.3);
+  });
+
+  it("the judge flags a render dominated by region-mask vertex colours, and passes the plain solid box", () => {
+    const mask = judgeRender(byName.get("region-mask-vertex-colours")!, { expectColoured: true });
+    expect(mask.verdict).toBe("suspect");
+    expect(mask.reasons.join("\n")).toContain("pure hues");
+    expect(judgeRender(byName.get("solid-box")!, { expectColoured: true }).verdict).toBe("ok");
+    expect(judgeRender(byName.get("vivid-atlas-card")!).reasons.join("\n")).not.toContain("pure hues");
   });
 
   it("the solid box hue matches its base-colour factor", () => {
