@@ -249,6 +249,7 @@ async function importFixture(options: {
   /** Bytes appended to the mesh package, which the importer scans for the engine default material. */
   meshPackageText?: string;
   vertexColor?: readonly [number, number, number, number];
+  saturatedUv?: boolean;
 }) {
   const root = await scratch("effect-import-");
   const sourceDir = join(root, "source");
@@ -265,6 +266,7 @@ async function importFixture(options: {
     props: options.props,
     textures: [],
     ...(options.vertexColor ? { vertexColor: options.vertexColor } : {}),
+    ...(options.saturatedUv ? { saturatedUv: true } : {}),
   });
   for (const [name, rgb] of options.textures) await writePng(join(exported, `${name}.png`), [...rgb, 255], 4);
   const umodel = join(root, "umodel");
@@ -513,6 +515,27 @@ describe("importer: vertex colours the material never reads", () => {
     });
     expect(primitive.getAttribute("COLOR_0")).not.toBeNull();
     expect(section.limitations.join("\n")).not.toContain("COLOR_0) dropped");
+  });
+});
+
+describe("importer: half-float UVs stored as -65504", () => {
+  it("resets the saturation value so it never reaches glTF, and says so", async () => {
+    // Dead-tree bark carried -65504 in a UV channel: a renderer that wraps it samples an arbitrary texel.
+    const { primitive, report } = await importFixture({
+      graph: graphOf(
+        "M_Cloth",
+        [node("albedo", "TextureSample", { texture: "/Game/Test/T_Cloth_D.T_Cloth_D", samplerType: "Color" })],
+        { baseColor: pin("albedo", 0, [1, 1, 1, 0]) },
+      ),
+      materialName: "MI_Cloth",
+      props: ["Parent = Material3'Content/Test/M_Cloth.M_Cloth'", "BlendMode = BLEND_Opaque (0)"].join("\n"),
+      mat: "Diffuse=T_Cloth_D\n",
+      textures: [["T_Cloth_D", [120, 90, 60]]],
+      saturatedUv: true,
+    });
+    const uv = primitive.getAttribute("TEXCOORD_0")!.getArray()!;
+    expect(Math.min(...uv)).toBeGreaterThanOrEqual(0);
+    expect(report.warnings.join("\n")).toContain("-65504");
   });
 });
 

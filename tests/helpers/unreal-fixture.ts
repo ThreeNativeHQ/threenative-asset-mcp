@@ -20,6 +20,8 @@ export interface MeshFixtureOptions {
   readonly textures: readonly string[];
   /** Emits a tangent accessor whose every element is zero, as UE Viewer does for UE4 meshes. */
   readonly degenerateTangents?: boolean;
+  /** Stores -65504 (-MAX_FLT16) in the second vertex's U, as UE does for an unused half-float UV. */
+  readonly saturatedUv?: boolean;
   /** Emits a COLOR_0 accessor with this linear RGBA on every vertex. */
   readonly vertexColor?: readonly [number, number, number, number];
 }
@@ -134,7 +136,7 @@ export async function writeMeshFixture(
   const uv = document
     .createAccessor("TEXCOORD_0")
     .setType("VEC2")
-    .setArray(new Float32Array([0, 0, 1, 0, 0, 1]))
+    .setArray(new Float32Array(options.saturatedUv ? [0, 0, -65504, 0, 0, 1] : [0, 0, 1, 0, 0, 1]))
     .setBuffer(buffer);
   const lightmapUv = document
     .createAccessor("TEXCOORD_1")

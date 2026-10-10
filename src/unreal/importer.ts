@@ -57,7 +57,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 75;
+export const IMPORTER_VERSION = 76;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1249,6 +1249,8 @@ export interface PackagedModel {
   readonly sections: ImportedMaterialSection[];
   readonly prunedUvSets: number;
   readonly droppedTangents: number;
+  /** UV components stored as the half-float saturation value (|x| >= 65504), reset to 0 so none reaches glTF. */
+  readonly saturatedUvs: number;
   /** Seam-duplicated render vertices given the morph delta their twin already carried. */
   readonly repairedMorphDeltas: number;
   /** Co-located vertices whose morph deltas disagreed in a way no single value could repair. */
@@ -1519,6 +1521,7 @@ export async function packageGlb(options: {
   const scalarRoughnessTextures = new Map<Texture, Texture>();
   let prunedUvSets = 0;
   let droppedTangents = 0;
+  let saturatedUvs = 0;
   let repairedMorphDeltas = 0;
   let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
@@ -2009,6 +2012,23 @@ export async function packageGlb(options: {
         }
       }
 
+      // UE stores an unused or clamped half-float UV as -MAX_FLT16 (-65504). It is not a coordinate, and
+      // a renderer that wraps it samples an arbitrary texel, so the component is reset to 0.
+      for (const semantic of primitive.listSemantics().filter((name) => name.startsWith("TEXCOORD_"))) {
+        const attribute = primitive.getAttribute(semantic);
+        if (!attribute) continue;
+        const element = [0, 0];
+        for (let index = 0; index < attribute.getCount(); index += 1) {
+          attribute.getElement(index, element);
+          const u = element[0] ?? 0;
+          const v = element[1] ?? 0;
+          if (Math.abs(u) < 65504 && Math.abs(v) < 65504) continue;
+          if (Math.abs(u) >= 65504) { element[0] = 0; saturatedUvs += 1; }
+          if (Math.abs(v) >= 65504) { element[1] = 0; saturatedUvs += 1; }
+          attribute.setElement(index, element);
+        }
+      }
+
       const seams = repairSeamMorphDeltas(primitive);
       repairedMorphDeltas += seams.repaired;
       conflictingMorphDeltas += seams.conflicting;
@@ -2054,6 +2074,7 @@ export async function packageGlb(options: {
     sections,
     prunedUvSets,
     droppedTangents,
+    saturatedUvs,
     repairedMorphDeltas,
     conflictingMorphDeltas,
   };
@@ -3843,6 +3864,7 @@ export async function importUnrealDirectory(
   const transforms: Record<string, number> = {};
   let prunedUvSets = 0;
   let droppedTangents = 0;
+  let saturatedUvs = 0;
   let repairedMorphDeltas = 0;
   let conflictingMorphDeltas = 0;
   const rejectedMasks: UnsupportedTexture[] = [];
@@ -3951,6 +3973,7 @@ export async function importUnrealDirectory(
           });
           prunedUvSets += packaged.prunedUvSets;
           droppedTangents += packaged.droppedTangents;
+          saturatedUvs += packaged.saturatedUvs;
           repairedMorphDeltas += packaged.repairedMorphDeltas;
           conflictingMorphDeltas += packaged.conflictingMorphDeltas;
           for (const name of packaged.attachedPsa) attachedPsa.add(name);
@@ -4078,6 +4101,7 @@ export async function importUnrealDirectory(
         });
         prunedUvSets += packaged.prunedUvSets;
         droppedTangents += packaged.droppedTangents;
+        saturatedUvs += packaged.saturatedUvs;
         repairedMorphDeltas += packaged.repairedMorphDeltas;
         conflictingMorphDeltas += packaged.conflictingMorphDeltas;
         const validated = await validateGlb(glbPath);
@@ -4885,6 +4909,11 @@ export async function importUnrealDirectory(
       graphBaked: sections.filter((section) => section.graph?.status === "baked").length,
       effect: sections.filter((section) => section.effect !== undefined).length,
     };
+    if (saturatedUvs > 0) {
+      warnings.push(
+        `Reset ${saturatedUvs} UV components stored as the half-float saturation value (-65504) to 0; Unreal writes it for an unused or clamped UV channel.`,
+      );
+    }
     if (droppedTangents > 0) {
       warnings.push(
         `Dropped ${droppedTangents} zero-length TANGENT vectors UE Viewer wrote for these meshes; the runtime derives the tangent frame from UVs instead.`,
