@@ -7,6 +7,7 @@ import type { MaterialGraph } from "./graph-dump.js";
 import {
   bakeGraph,
   emissiveOnlyEffect,
+  noColourOutput,
   particleDrivenBaseColor,
   graphPathClasses,
   type EmissiveEffect,
@@ -75,6 +76,8 @@ export type GraphBakeOutcome = BakeResult & {
    * the emitter, not the package, sets this section's colour.
    */
   readonly particle?: string;
+  /** Present when the graph wires no colour output at all (see `noColourOutput`): Unreal draws its default black BaseColor. */
+  readonly noAlbedo?: string;
   /**
    * Probe only: whether the BaseColor path reads VertexColor (after static switches). Absent when the graph is unknown,
    * truncated or unreadable.
@@ -315,6 +318,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
 
     const effect = emissiveOnlyEffect(graph);
     if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material };
+    const noAlbedo = noColourOutput(graph);
+    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material };
     const parameters = chainParameters(chain);
     if (request.probe) {
       // Unreal applies a mesh's vertex colours only where the graph reads VertexColor; glTF multiplies COLOR_0 into

@@ -9,7 +9,7 @@ import { describe, expect, it, onTestFinished } from "vitest";
 import { createGraphBaker } from "../src/unreal/graph-baker.js";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
 import { importUnrealDirectory, type ImportedMaterialSection, type ImportedModel, type ImportReport } from "../src/unreal/importer.js";
-import { bakeGraph, emissiveOnlyEffect, particleDrivenBaseColor, type GraphParameters, type TextureRaster } from "../src/unreal/material-graph.js";
+import { bakeGraph, emissiveOnlyEffect, noColourOutput, particleDrivenBaseColor, type GraphParameters, type TextureRaster } from "../src/unreal/material-graph.js";
 import { scorePack } from "../src/unreal/parity.js";
 import type { PropertyDump } from "../src/unreal/property-dump.js";
 import { writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fixture.js";
@@ -470,6 +470,56 @@ describe("importer: a particle material whose BaseColor reads DynamicParameter",
     expect(section.textured).toBe(false);
     expect(report.materialCoverage.effect).toBe(1);
     expect(report.warnings.join("\n")).toContain("1 particle material");
+  });
+});
+
+/** A bolt overlay: the textures feed Roughness, Opacity and Normal; BaseColor, MaterialAttributes and Emissive are unwired. */
+function overlayGraph(extra: { truncated?: boolean; outputConstants?: Record<string, unknown> } = {}): MaterialGraph {
+  const nodes = [
+    node("rough", "TextureSample", { texture: "/Game/Test/T_Bolts_R.T_Bolts_R", samplerType: "Color" }),
+    node("alpha", "TextureSample", { texture: "/Game/Test/T_Bolts_A.T_Bolts_A", samplerType: "Color" }),
+    node("normal", "TextureSample", { texture: "/Game/Test/T_Bolts_N.T_Bolts_N", samplerType: "Normal" }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Bolts",
+    package: "/Game/Test/M_Bolts",
+    truncated: extra.truncated ?? false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: null, roughness: pin("rough", 0, [1, 1, 1, 0]), metallic: null, emissive: null, opacity: pin("alpha", 0, [1, 1, 1, 0]), opacityMask: null, normal: pin("normal", 0, [1, 1, 1, 0]), materialAttributes: null },
+    outputConstants: extra.outputConstants ?? {},
+    nodes,
+  });
+}
+
+describe("noColourOutput", () => {
+  it("names a graph that wires no BaseColor, MaterialAttributes or Emissive: Unreal's default BaseColor is black", () => {
+    expect(noColourOutput(overlayGraph())).toContain("wires no BaseColor, MaterialAttributes or Emissive (only opacity, roughness, normal)");
+  });
+
+  it("claims nothing for a graph with a colour output, a truncated graph, an unread output or a constant BaseColor", () => {
+    expect(noColourOutput(particleTintedMaster())).toBeUndefined();
+    expect(noColourOutput(emissiveOnlyGraph())).toBeUndefined();
+    expect(noColourOutput(overlayGraph({ truncated: true }))).toBeUndefined();
+    expect(noColourOutput(overlayGraph({ outputConstants: { baseColorError: "property BaseColor could not be read" } }))).toBeUndefined();
+    expect(noColourOutput(overlayGraph({ outputConstants: { baseColor: [0.5, 0.2, 0.1, 1] } }))).toBeUndefined();
+  });
+});
+
+describe("importer: a translucent overlay whose graph wires no colour output", () => {
+  it("records the section as having no albedo by design (not a parity colour miss) instead of an unavailable graph", async () => {
+    const { section, report } = await importFixture({
+      graph: overlayGraph(),
+      materialName: "M_Bolts",
+      props: "BlendMode = BLEND_Translucent (2)\n",
+      textures: [["T_Bolts_A", [200, 200, 200]], ["T_Bolts_R", [90, 90, 90]]],
+    });
+    expect(section.graph).toMatchObject({ status: "unavailable" });
+    expect(section.effect).toMatchObject({ kind: "no-base-colour" });
+    expect(section.effect?.reason).toContain("default BaseColor, black");
+    expect(section.textured).toBe(false);
+    expect(report.materialCoverage.effect).toBe(1);
+    expect(report.warnings.join("\n")).toContain("1 with no colour output");
   });
 });
 

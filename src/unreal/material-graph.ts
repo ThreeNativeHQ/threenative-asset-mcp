@@ -2186,6 +2186,22 @@ export function emissiveOnlyEffect(graph: MaterialGraph): EmissiveEffect | undef
   };
 }
 
+/**
+ * The reason a graph has no albedo, when it wires no colour output at all: no BaseColor, no MaterialAttributes and no
+ * Emissive (a normal or roughness overlay whose textures feed only Opacity, Roughness or Normal). Unreal shades an
+ * unwired BaseColor with its default value, black, so the package holds no albedo for the section. Undefined for any graph
+ * that wires a colour output, or that was truncated or could not be dumped (an unread pin is not an unwired one).
+ */
+export function noColourOutput(graph: MaterialGraph): string | undefined {
+  if (graph.truncated || graph.error) return undefined;
+  const { baseColor, materialAttributes, emissive } = graph.outputs;
+  if (baseColor || materialAttributes || emissive) return undefined;
+  if (Object.keys(graph.outputConstants).some((key) => key.endsWith("Error"))) return undefined;
+  if (graph.outputConstants.baseColor !== undefined) return undefined;
+  const wired = (["opacity", "opacityMask", "roughness", "metallic", "normal"] as const).filter((pin) => graph.outputs[pin]);
+  return `${graph.material} wires no BaseColor, MaterialAttributes or Emissive (only ${wired.length > 0 ? wired.join(", ") : "nothing"}): Unreal shades it with the default BaseColor, black, so the package has no albedo for it`;
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Bake
 
