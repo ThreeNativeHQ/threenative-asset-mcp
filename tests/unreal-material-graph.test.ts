@@ -1570,6 +1570,17 @@ describe("per-instance and engine utility nodes of layered cliff materials", () 
     expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("ObjectScale evaluated as 1"))).toBe(true);
   });
 
+  it("BoundingBoxBased_0-1_UVW (a backdrop's gradient mapping) stands in as the mesh UV, not an unsupported node, and says so", async () => {
+    const result = await bake(makeGraph([engineOutputs("bbox", "BoundingBoxBased_0-1_UVW", "Texturing", ["UVW"])], pin("bbox", 0, RGB_MASK)));
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    expect(pixel(3, 0)[0]!).toBeGreaterThan(pixel(0, 0)[0]!);
+    expect(pixel(0, 3)[1]!).not.toBe(pixel(0, 0)[1]);
+    expect(pixel(1, 1)[2]).toBe(encode(0.5));
+    expect(result.status === "baked" && result.confidence).toBe("heuristic");
+    expect(result.status === "baked" && result.approximations.some((note) => note.startsWith("BoundingBoxBased_0-1_UVW evaluated as the mesh UV0"))).toBe(true);
+  });
+
   it("WorldAlignedBlend (the cliff-rock moss overlay) stands in as half the surface and says so, not an unsupported node", async () => {
     // MF_moss-overlay-function: BaseColor = lerp(rock, moss, WorldAlignedBlend."w/ Vertex Normals"). The mask follows the
     // world normal, which a UV-space bake cannot hold; before this the whole section fell back to neutral grey.

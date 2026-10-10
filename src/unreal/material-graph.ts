@@ -197,6 +197,7 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "BreakOutFloat4Components",
   "SplitComponents",
   "ObjectScale",
+  "BoundingBoxBased_0-1_UVW",
   "WorldAlignedBlend",
   "WorldAlignedTexture",
   "FlowMaps_Simple",
@@ -452,6 +453,8 @@ const OBJECT_POSITION_NOTE =
 const PER_INSTANCE_RANDOM_NOTE =
   "PerInstanceRandom evaluated as 0.5, the middle of its 0..1 range: a baked texture is shared by every placed instance";
 
+const BOUNDING_BOX_UVW_NOTE =
+  "BoundingBoxBased_0-1_UVW evaluated as the mesh UV0 with W = 0.5: the function maps the pixel's position across the object's bounding box to 0..1, and a bake has no object-space position (engine body unavailable, inferred from the name)";
 const OBJECT_SCALE_NOTE =
   "ObjectScale evaluated as 1 (an unscaled instance): a placed instance's scale would change texture tiling; engine body unavailable";
 
@@ -1646,6 +1649,17 @@ class Compiler {
     if (!node.fn?.outputs.some(Boolean)) {
       const layered = this.layerFunction(node, lower, name!, output);
       if (layered) return layered;
+    }
+    if (lower === "boundingboxbased_0-1_uvw" && !node.fn?.outputs.some(Boolean)) {
+      this.approximations.add(BOUNDING_BOX_UVW_NOTE);
+      const reg = this.allocate();
+      this.program.push((r, texel) => {
+        r[reg] = texel.u;
+        r[reg + 1] = texel.v;
+        r[reg + 2] = 0.5;
+        r[reg + 3] = 1;
+      });
+      return { kind: "vec", reg, n: 3, konst: false };
     }
     if (lower === "objectscale" && !node.fn?.outputs.some(Boolean)) {
       // Outputs: Scale XYZ (vector), Scale X, Scale Y, Scale Z. The scale of the placed instance is not known to a bake.
