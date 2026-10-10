@@ -61,12 +61,20 @@ describe("editor texture payload decode (converter program)", () => {
     expect(CUE4PARSE_PROGRAM).toMatch(/No StaticMesh, SkeletalMesh, Texture2D[^\n]*Loaded export types[^\n]*textureFailures/);
   });
 
+  it("finds an embedded texture's package by its package key, not by its export name", () => {
+    // Medieval Village 5.3: nineteen Texture2D_0 exports (named for the object, not the file) reported
+    // "texture package file not found on disk", so no source art was read and the whole run exited 1.
+    expect(CUE4PARSE_PROGRAM).toMatch(
+      /var packageFiles = Directory\.EnumerateFiles\(root, Path\.GetFileNameWithoutExtension\(key\) \+ "\.uasset"[\s\S]*?var textureFile = packageFiles\.FirstOrDefault\(\)\s*\n\s*\?\? candidates\.FirstOrDefault/,
+    );
+  });
+
   it("does not fetch a native Oodle runtime at decode time", () => {
     expect(CUE4PARSE_PROGRAM).not.toContain("OodleHelper");
   });
 
   it("bumps the converter version so a stale binary is rebuilt", () => {
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.63");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.64");
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
   });
 });

@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.63",
+  version: "b4e95441+threenative.64",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2281,9 +2281,15 @@ foreach (var key in provider.Files.Keys.Where(key =>
             // on the UE5 version, the complete source PNG is inline or wrapped in FCompressedBuffer
             // blocks. Preserving it is lossless and does not require the derived-data cache.
             var normalizedKey = key.Replace('\\', '/');
+            // An export is named for the object (Texture2D_0 inside a material package), not for
+            // the file, so the package's own key resolves it before the export name does.
+            var packageFiles = Directory.EnumerateFiles(root, Path.GetFileNameWithoutExtension(key) + ".uasset", SearchOption.AllDirectories)
+                .Where(candidate => normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
+                .ToArray();
             var candidates = Directory.EnumerateFiles(root, texture.Name + ".uasset", SearchOption.AllDirectories).ToArray();
-            var textureFile = candidates.FirstOrDefault(candidate =>
-                normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
+            var textureFile = packageFiles.FirstOrDefault()
+                ?? candidates.FirstOrDefault(candidate =>
+                    normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
                 ?? (candidates.Length == 1 ? candidates[0] : null);
             if (textureFile is null || new FileInfo(textureFile).Length > 1_073_741_824)
             {
