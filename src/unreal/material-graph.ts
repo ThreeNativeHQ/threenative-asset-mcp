@@ -534,6 +534,9 @@ const BREAK_NORMAL_NOTE =
 const TEN_LAYER_NOTE =
   "MatLayerBlend_TenLayerBlend: Input20 is the base, Input21 the baked normal, and each (Input2k = layer, Input2k+1 = alpha) is lerped over the result from k = 9 (next to the base) up to k = 0 (top); inferred from the pins, engine body unavailable";
 
+const TEN_LAYER_DEFAULT_BASE_NOTE =
+  "MatLayerBlend_TenLayerBlend: Input20 (the base) is unwired, so the layers blend over Unreal's default attribute values (BaseColor black); engine body unavailable";
+
 const VECTOR_LENGTH_NOTE =
   "VectorLength: sqrt(dot(Input0, Input0)) over the input's components; engine body unavailable, inferred from the name";
 
@@ -1992,7 +1995,10 @@ class Compiler {
     const count = Object.keys(node.inputs).filter((pinName) => /^Input\d+$/.test(pinName)).length;
     if (count !== 22) return this.markUnsupported(`${name}(${count} inputs)`);
     let result = this.attrs(node.inputs.Input20, `${name}.Input20`);
-    if (!result) return this.markUnavailable(`${name} ${node.id} has no base material (Input20)`);
+    if (!result) {
+      this.approximations.add(TEN_LAYER_DEFAULT_BASE_NOTE);
+      result = { kind: "attr", baseColor: null };
+    }
     this.approximations.add(TEN_LAYER_NOTE);
     for (let layer = 9; layer >= 0; layer--) {
       const topPin = node.inputs[`Input${layer * 2}`];

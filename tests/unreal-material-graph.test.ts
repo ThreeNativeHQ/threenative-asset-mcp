@@ -2270,6 +2270,48 @@ describe("layered architecture masters: texture objects, render-path switches, s
     expect(notes(half).some((note) => note.startsWith("MatLayerBlend_TenLayerBlend"))).toBe(true);
   });
 
+  it("MatLayerBlend_TenLayerBlend with no base (Input20 unwired) blends its layers over Unreal's default attributes, so a nested blend still bakes", async () => {
+    // A character master nests a ten-layer blend (a decal layer: flakes over hard metal, no base) as one layer of the outer
+    // blend; the inner call wires only Input16..Input19 and the baked normal.
+    const inner = (alpha: number) => [
+      engineFn("inner", "MaterialLayerFunctions/MatLayerBlend_TenLayerBlend", {
+        ...Object.fromEntries(Array.from({ length: 22 }, (_, index) => [`Input${index}`, null])),
+        Input16: pin("flakes"),
+        Input17: pin("flakesAlpha"),
+        Input18: pin("metal"),
+        Input19: pin("metalAlpha"),
+        Input21: pin("normalMap", 0, RGB_MASK),
+      }),
+      ...layer("flakes", [0.8, 0.8, 0.9]),
+      ...layer("metal", [0.4, 0.3, 0.2]),
+      node("flakesAlpha", "Constant", { constants: { R: 0 } }),
+      node("metalAlpha", "Constant", { constants: { R: alpha } }),
+      node("normalMap", "ReflectionVectorWS"),
+    ];
+    const outer = (alpha: number) =>
+      makeGraph(
+        [
+          breakColour("out", "ten"),
+          engineFn("ten", "MaterialLayerFunctions/MatLayerBlend_TenLayerBlend", {
+            ...Object.fromEntries(Array.from({ length: 22 }, (_, index) => [`Input${index}`, null])),
+            Input14: pin("inner"),
+            Input15: pin("innerAlpha"),
+            Input20: pin("cloth"),
+          }),
+          ...inner(alpha),
+          ...layer("cloth", [0.2, 0.5, 0.2]),
+          node("innerAlpha", "Constant", { constants: { R: 1 } }),
+        ],
+        pin("out", 0, RGB_MASK),
+      );
+    const covered = await bake(outer(1));
+    expect(covered.status).toBe("baked");
+    expect((await pixelsOf(covered))(0, 0)).toEqual([encode(0.4), encode(0.3), encode(0.2)]);
+    expect(notes(covered).some((note) => note.includes("Input20 (the base) is unwired"))).toBe(true);
+    // Where no layer of the inner blend covers, the default attributes show: BaseColor black.
+    expect((await pixelsOf(await bake(outer(0))))(0, 0)).toEqual([0, 0, 0]);
+  });
+
   it("MatLayerBlend helpers: Break/Override/MultiplyBaseColor act on BaseColor, the others pass it through, without walking their other pins", async () => {
     const base = layer("base", [0.2, 0.4, 0.6]);
     const call = (name: string, inputs: Raw) => engineFn("f", `MaterialLayerFunctions/${name}`, inputs, name === "MatLayerBlend_BreakBaseColor" ? ["BaseColor"] : ["Blended Material"]);
