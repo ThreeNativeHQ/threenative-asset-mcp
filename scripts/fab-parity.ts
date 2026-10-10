@@ -557,6 +557,8 @@ async function sheetFor(
       selection: "spread",
       ...(thumbnails.size > 0 ? { thumbnails: new Map([...thumbnails].map(([k, v]) => [join(outputDir, k), v])) } : {}),
       expectColoured: new Set([...colouredGlbKeys(report)].map((k) => join(outputDir, k))),
+      // The picture is an Unreal-style approximation; the metrics and baseline stay on the neutral render.
+      pictureLighting: "unreal-like",
     });
     const sims = result.judge.flatMap((j) => (j.similarity === undefined ? [] : [j.similarity]));
     writeJsonAtomic(join(out, "sheets", `${label}.json`), { sheet: rel, judge: result.judge });

@@ -20,6 +20,16 @@ const CAPTION = 84;
 const BACKGROUND = { r: 128, g: 128, b: 128 };
 const PANEL = { r: 30, g: 31, b: 36 };
 
+/**
+ * How the sheet's picture (the "AFTER IMPORT" tile) is lit. `neutral` is the flat three.js light the metrics are
+ * measured under. `unreal-like` adds a daylight key, a restrained sky fill and a grey checkered ground that catches a
+ * cast shadow, approximating the look of an Unreal editor thumbnail. It is a picture-only approximation: the camera,
+ * lighting and ground are not the editor's, so the judge's numbers are always measured on the `neutral` render.
+ */
+export type PictureLighting = "neutral" | "unreal-like";
+/** The fixed camera every render pass shares (so a change of lighting is the only difference between passes). */
+export const PICTURE_CAMERA = Object.freeze({ fov: 40, direction: [1, 0.75, 1.2] as const, fit: 1.05 });
+
 export interface ContactSheetOptions {
   /** One imported GLB per entry; the file name (without `.glb`) is the tile label. */
   glbPaths: readonly string[];
@@ -48,6 +58,17 @@ export interface ContactSheetOptions {
    * fidelity metric. Derived from licensed packs: local-only, never commit.
    */
   dumpTilesDir?: string;
+  /**
+   * Lighting of the sheet's picture only. `neutral` (default) keeps every existing caller and golden unchanged.
+   * `unreal-like` adds an extra supersampled pass with a daylight key, a sky fill and a grey checkered ground for
+   * the picture; the judge's metrics stay on the neutral render.
+   */
+  pictureLighting?: PictureLighting;
+  /**
+   * Deterministic test seam: tile indices the `unreal-like` pass must fail, so a tile that rendered in the neutral
+   * pass but fails the lit pass is reported instead of silently drawn blank. Never set in production.
+   */
+  litFailureProbe?: readonly number[];
 }
 
 export interface TileJudgement {
@@ -166,8 +187,17 @@ function serve(response: ServerResponse, bytes: Uint8Array, type: string): void 
   response.end(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
 }
 
-function pageHtml(tileSize: number, count: number, columns: number, rows: number, supersample: number): string {
-  const payload = JSON.stringify({ tile: tileSize, count, columns, rows, ss: supersample });
+function pageHtml(
+  tileSize: number,
+  count: number,
+  columns: number,
+  rows: number,
+  supersample: number,
+  lighting: PictureLighting,
+  shadows: boolean,
+  litFailureProbe: readonly number[],
+): string {
+  const payload = JSON.stringify({ tile: tileSize, count, columns, rows, ss: supersample, lighting, shadows, litFailureProbe });
   return `<!doctype html><html><body>
 <script type="importmap">{"imports":{"three":"/three.module.js","three/addons/":"/jsm/"}}</script>
 <script type="module">
@@ -176,6 +206,22 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 const options = ${payload};
 const size = options.tile;
+const lit = options.lighting === 'unreal-like';
+const shadows = options.shadows !== false;
+// A subtle grey checker like an editor thumbnail's floor: two close greys, never pure white or black.
+const makeChecker = () => {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64; canvas.height = 64;
+  const g = canvas.getContext('2d');
+  g.fillStyle = '#c2c2c2'; g.fillRect(0, 0, 64, 64);
+  g.fillStyle = '#b0b0b0';
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) if ((x + y) % 2 === 0) g.fillRect(x * 8, y * 8, 8, 8);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.RepeatWrapping; texture.wrapT = THREE.RepeatWrapping;
+  texture.anisotropy = 4;
+  return texture;
+};
 try {
   const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
   renderer.setPixelRatio(options.ss);
@@ -183,10 +229,30 @@ try {
   renderer.setClearColor(0x808080, 1);
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x808080);
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.2));
-  const light = new THREE.DirectionalLight(0xffffff, 2.4);
-  light.position.set(2, 4, 3);
-  scene.add(light);
+  let key;
+  let checker;
+  let groundMaterial;
+  if (lit) {
+    // Unreal-style approximation: a restrained sky fill and one daylight key that casts a shadow. No hinted engine values.
+    // The shadows flag is a deterministic test control (default on); off leaves the fill, key and ground identical.
+    scene.add(new THREE.HemisphereLight(0xc2d4ea, 0x3c3c3c, 0.9));
+    key = new THREE.DirectionalLight(0xfff3e2, 2.2);
+    if (shadows) {
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      key.castShadow = true;
+      key.shadow.mapSize.set(1024, 1024);
+      key.shadow.bias = -0.0005;
+    }
+    scene.add(key); scene.add(key.target);
+    checker = makeChecker();
+    groundMaterial = new THREE.MeshStandardMaterial({ map: checker, roughness: 1, metalness: 0 });
+  } else {
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.2));
+    const light = new THREE.DirectionalLight(0xffffff, 2.4);
+    light.position.set(2, 4, 3);
+    scene.add(light);
+  }
   const camera = new THREE.PerspectiveCamera(40, 1, 0.001, 100000);
   const loader = new GLTFLoader();
   loader.setMeshoptDecoder(MeshoptDecoder);
@@ -204,7 +270,9 @@ try {
     }
   });
   for (let i = 0; i < options.count; i++) {
+    let ground;
     try {
+      if (lit && options.litFailureProbe.includes(i)) throw new Error('lit failure probe');
       const gltf = await Promise.race([loader.loadAsync('/glb/' + i + '.glb'), timeout(30000)]);
       const model = gltf.scene;
       scene.add(model);
@@ -218,11 +286,48 @@ try {
       camera.position.copy(center).addScaledVector(direction, distance);
       camera.near = distance / 100; camera.far = distance * 10; camera.updateProjectionMatrix();
       camera.lookAt(center);
+      if (lit) {
+        // Ground, key light and shadow camera all scale to this model's bounds; nothing assumes a fixed unit size.
+        model.traverse((o) => { if (o.isMesh) { o.castShadow = shadows; o.receiveShadow = true; } });
+        // Large enough that its far edge stays outside the framing (a small plane's near edge showed as a triangle).
+        const groundSize = radius * 128;
+        ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), groundMaterial);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.set(center.x, box.min.y, center.z);
+        ground.receiveShadow = true;
+        // One checker cell per 4*radius of world space, so enlarging the plane keeps the checker's physical scale.
+        const repeat = Math.max(2, Math.round(groundSize / (4 * radius)));
+        checker.repeat.set(repeat, repeat);
+        scene.add(ground);
+        // Daylight key about 40 degrees up, 75 degrees off the camera's azimuth on the other side (negative), so the
+        // cast shadow falls to the left, as in the Unreal reference.
+        const azimuth = Math.atan2(direction.z, direction.x) - (75 * Math.PI) / 180;
+        const elevation = (40 * Math.PI) / 180;
+        const toLight = new THREE.Vector3(
+          Math.cos(elevation) * Math.cos(azimuth),
+          Math.sin(elevation),
+          Math.cos(elevation) * Math.sin(azimuth),
+        );
+        key.position.copy(center).addScaledVector(toLight, radius * 8);
+        key.target.position.copy(center);
+        key.target.updateMatrixWorld();
+        if (shadows) {
+          const shadowCamera = key.shadow.camera;
+          const half = radius * 3;
+          shadowCamera.left = -half; shadowCamera.right = half;
+          shadowCamera.top = half; shadowCamera.bottom = -half;
+          shadowCamera.near = radius * 0.1; shadowCamera.far = radius * 24;
+          shadowCamera.updateProjectionMatrix();
+          key.shadow.normalBias = radius * 0.01;
+        }
+      }
       renderer.render(scene, camera);
       context.drawImage(renderer.domElement, (i % options.columns) * size, Math.floor(i / options.columns) * size, size, size);
+      if (ground) { scene.remove(ground); ground.geometry.dispose(); }
       scene.remove(model); dispose(model);
       tiles.push({ ok: true });
     } catch (error) {
+      if (ground) { scene.remove(ground); ground.geometry.dispose(); }
       tiles.push({ ok: false, error: String(error && error.message || error) });
     }
   }
@@ -254,8 +359,14 @@ async function renderGrid(
   timeoutMs: number,
   /** Render at this multiple of the tile size and box-filter down (1 = the plain alpha-tested render). */
   supersample = 1,
+  /** Default `neutral`: the flat light the fidelity metrics are measured under. */
+  lighting: PictureLighting = "neutral",
+  /** Default true; only meaningful with `unreal-like` (the deterministic shadow control). */
+  shadows = true,
+  /** Deterministic test seam; tile indices the lit pass must fail. */
+  litFailureProbe: readonly number[] = [],
 ): Promise<RenderedGrid> {
-  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample), "utf8");
+  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample, lighting, shadows, litFailureProbe), "utf8");
   const server = createServer((request, response) => {
     const url = (request.url ?? "/").split("?")[0]!;
     const glb = /^\/glb\/(\d+)\.glb$/.exec(url);
@@ -348,6 +459,10 @@ export async function renderTiles(options: {
   readonly timeoutMs?: number;
   /** Render at this multiple of the tile and box-filter down; default 1. */
   readonly supersample?: number;
+  /** Default `neutral`, which is what the committed goldens are. `unreal-like` is a picture-only approximation. */
+  readonly lighting?: PictureLighting;
+  /** Default true; with `unreal-like`, false keeps the fill, key and ground but drops the cast shadow (a control). */
+  readonly shadows?: boolean;
 }): Promise<RenderedTiles> {
   const tile = Math.max(16, Math.round(options.tile ?? 160));
   const paths = options.glbPaths;
@@ -359,7 +474,7 @@ export async function renderTiles(options: {
     score: 0,
     failed: false,
   }));
-  const grid = await renderGrid(candidates, tile, columns, rows, options.timeoutMs ?? 180_000, options.supersample ?? 1);
+  const grid = await renderGrid(candidates, tile, columns, rows, options.timeoutMs ?? 180_000, options.supersample ?? 1, options.lighting ?? "neutral", options.shadows ?? true);
   const decoded = await decodeRgba(grid.png);
   return {
     png: grid.png,
@@ -408,6 +523,7 @@ export async function renderContactSheet(
   const timeoutMs = options.timeoutMs ?? 180_000;
   const meshesTotal = options.glbPaths.length;
   const withThumbnails = options.thumbnails !== undefined;
+  const pictureLighting = options.pictureLighting ?? "neutral";
 
   const all: Candidate[] = await Promise.all(
     options.glbPaths.map(async (path) => {
@@ -437,19 +553,37 @@ export async function renderContactSheet(
   let rendered: boolean[] = [];
   let gridPng: Buffer | undefined;
   let shapeGridPng: Buffer | undefined;
+  let pictureLightPng: Buffer | undefined;
   const loadable = selected.filter((c) => !c.failed);
   if (loadable.length > 0) {
     // Failed candidates are not sent to the browser; keep their cells blank in place.
     const cells = selected.map((c) => (c.failed ? { ...c, path: "" } : c));
     const grid = await renderGrid(cells, tile, columns, rows, timeoutMs);
     gridPng = grid.png;
+    const neutralRendered = grid.rendered.map((ok, index) => ok && !selected[index]!.failed);
     // An alpha-tested cut-out has hard edges at 1x while Unreal's thumbnail is anti-aliased, so thin needles read sparser
     // than they are. The silhouette-mass measure and the sheet picture use a 2x supersampled render; colour stays at 1x.
     if (withThumbnails) {
       const shape = await renderGrid(cells, tile, columns, rows, timeoutMs, SHAPE_SUPERSAMPLE);
       shapeGridPng = shape.png;
     }
-    rendered = grid.rendered.map((ok, index) => ok && !selected[index]!.failed);
+    // The lit picture is a separate supersampled pass; it never replaces the neutral pixels the judge measures.
+    if (pictureLighting === "unreal-like") {
+      const picture = await renderGrid(cells, tile, columns, rows, timeoutMs, SHAPE_SUPERSAMPLE, "unreal-like", true, options.litFailureProbe ?? []);
+      pictureLightPng = picture.png;
+      // A tile the neutral pass rendered but the lit pass dropped would otherwise be drawn blank while the neutral
+      // counts and judge still call it a success. Never substitute the neutral pixels: name the tile and fail.
+      const dropped = selected
+        .map((candidate, index) => ({ candidate, index }))
+        .filter(({ index }) => neutralRendered[index] === true && picture.rendered[index] !== true);
+      if (dropped.length > 0) {
+        throw new Error(
+          `unreal-like picture pass failed for ${dropped.map(({ candidate, index }) => `tile ${index} "${candidate.name}"`).join(", ")} ` +
+            "while the neutral render succeeded; refusing to draw a blank AFTER IMPORT tile",
+        );
+      }
+    }
+    rendered = neutralRendered;
   }
   const meshesRendered = rendered.filter(Boolean).length;
   const meshesFailed = count - meshesRendered;
@@ -561,8 +695,16 @@ export async function renderContactSheet(
     }
   }
 
+  const afterImportLine =
+    pictureLighting === "unreal-like"
+      ? "Each tile: ORIGINAL = Unreal editor thumbnail | AFTER IMPORT = Unreal-style picture approximation."
+      : "Each tile: ORIGINAL = Unreal editor thumbnail of that asset | AFTER IMPORT = our GLB, neutral light.";
+  const scoreLine =
+    pictureLighting === "unreal-like"
+      ? "Camera and lighting differ from the editor; colour scores are measured in the neutral view."
+      : "Colour similarity compares object colour only (camera and lighting differ). It is not a match score.";
   const header = withThumbnails ? REFERENCE_BAND : HEADER;
-  const caption = withThumbnails ? CAPTION + 14 : CAPTION;
+  const caption = (withThumbnails ? CAPTION + 14 : CAPTION) + (!withThumbnails && pictureLighting === "unreal-like" ? 36 : 0);
   const width = Math.max(galleryWidth + gridWidth, withThumbnails ? 760 : 0);
   const height = header + bodyHeight + caption;
   const gridLeft = galleryWidth;
@@ -571,12 +713,13 @@ export async function renderContactSheet(
   const svg: string[] = [];
   if (withThumbnails) {
     const referenceLeft = galleryPanel === undefined ? 10 : 10 + 240 + 12;
+    const noteWidth = Math.max(40, Math.floor((width - referenceLeft) / 6.6));
     svg.push(
       text(referenceLeft, 28, 15, "#e8e8ee", clip(options.title, 70), 'font-weight="bold"'),
       ...(options.subtitle !== undefined ? [text(referenceLeft, 50, 12, "#c8c8d4", clip(options.subtitle, 110))] : []),
       text(referenceLeft, 74, 12, "#9a9aaa", galleryPanel === undefined ? "no gallery image" : "Fab gallery image at left: reference only, a lit full scene"),
-      text(referenceLeft, 94, 12, "#9a9aaa", "Each tile: ORIGINAL = Unreal editor thumbnail of that asset | AFTER IMPORT = our GLB, neutral light."),
-      text(referenceLeft, 112, 12, "#9a9aaa", "Colour similarity compares object colour only (camera and lighting differ). It is not a match score."),
+      text(referenceLeft, 94, 12, "#9a9aaa", clip(afterImportLine, noteWidth)),
+      text(referenceLeft, 112, 12, "#9a9aaa", clip(scoreLine, noteWidth)),
     );
   } else {
     svg.push(
@@ -654,6 +797,13 @@ export async function renderContactSheet(
       `visual judge: ${judgeSummary.ok} ok, ${judgeSummary.suspect} suspect, ${judgeSummary.fail} fail (green, amber, red dot)`,
     ),
   );
+  if (!withThumbnails && pictureLighting === "unreal-like") {
+    const noteWidth = Math.floor(width / 6.6);
+    svg.push(
+      text(10, bottom + 108, 12, "#9a9aaa", clip("AFTER IMPORT = our GLB, an Unreal-style picture approximation.", noteWidth)),
+      text(10, bottom + 124, 12, "#9a9aaa", clip("Camera and lighting differ; scores are measured in the neutral view.", noteWidth)),
+    );
+  }
 
   if (galleryPanel !== undefined) {
     layers.push(
@@ -662,8 +812,9 @@ export async function renderContactSheet(
         : { input: galleryPanel, left: 0, top: header + Math.floor((bodyHeight - galleryHeight) / 2) },
     );
   }
-  // The picture shows the supersampled tiles when there are any (the thumbnail beside it is anti-aliased).
-  const pictureGridPng = shapeGridPng ?? gridPng;
+  // The picture shows the supersampled tiles when there are any (the thumbnail beside it is anti-aliased). With
+  // unreal-like lighting it shows a separate lit pass; the judge's metrics above stay on the neutral render.
+  const pictureGridPng = pictureLightPng ?? shapeGridPng ?? gridPng;
   if (pictureGridPng !== undefined) {
     if (withThumbnails) {
       // The browser grid is `columns` tiles wide; move each render beside its thumbnail.

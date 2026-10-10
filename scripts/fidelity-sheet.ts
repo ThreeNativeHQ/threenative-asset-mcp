@@ -2,16 +2,19 @@
  * Measures how close an imported pack looks to Unreal's own thumbnails, without re-importing.
  *
  *   npx tsx scripts/fidelity-sheet.ts --source <pack dir> --import <import output dir> --out <dir> [--max 36]
+ *       [--picture-lighting neutral|unreal-like]
  *
  * Needs the import output (its import-report.json) and the source pack (for the editor thumbnails). Writes
  * <out>/sheet.jpg, <out>/fidelity.json (per tile: score 0..100, hue EMD, saturation ratio, density ratio,
- * lightness ratio, judge verdict) and <out>/tiles/<n>-<name>.{reference,render}.png. Everything under <out> derives
- * from a licensed pack: local-only, never commit it. Exit 0 always; read the table.
+ * lightness ratio, judge verdict), <out>/picture-lighting.json (which preset the picture used) and
+ * <out>/tiles/<n>-<name>.{reference,render}.png. The picture defaults to an Unreal-style approximation; the fidelity
+ * numbers are always measured in the neutral view, so they do not change with the picture preset. Everything under
+ * <out> derives from a licensed pack: local-only, never commit it. Exit 0 always; read the table.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import { colouredGlbKeys, renderContactSheet } from "../src/unreal/contact-sheet.js";
+import { PICTURE_CAMERA, colouredGlbKeys, renderContactSheet, type PictureLighting } from "../src/unreal/contact-sheet.js";
 import { findThumbnails } from "../src/unreal/package-thumbnail.js";
 
 function arg(name: string): string | undefined {
@@ -27,6 +30,8 @@ if (!source || !importDir || !out) {
   process.exit(2);
 }
 const max = Number(arg("--max") ?? 36);
+// The sheet picture defaults to the Unreal-style approximation; `--picture-lighting neutral` restores the flat view.
+const pictureLighting: PictureLighting = arg("--picture-lighting") === "neutral" ? "neutral" : "unreal-like";
 const report = JSON.parse(readFileSync(join(importDir, "import-report.json"), "utf8"));
 mkdirSync(out, { recursive: true });
 const thumbnails = await findThumbnails({ sourceDir: resolve(source), report });
@@ -40,8 +45,23 @@ const result = await renderContactSheet({
   thumbnails: new Map([...thumbnails].map(([k, v]) => [absolute(k), v])),
   expectColoured: new Set([...colouredGlbKeys(report)].map(absolute)),
   dumpTilesDir: join(out, "tiles"),
+  pictureLighting,
 });
 writeFileSync(join(out, "fidelity.json"), JSON.stringify(result.judge, null, 1));
+// Numbers only: what the picture was lit with, the metric preset it does NOT change, and the shared camera.
+writeFileSync(
+  join(out, "picture-lighting.json"),
+  JSON.stringify(
+    {
+      preset: pictureLighting,
+      picture: pictureLighting === "unreal-like" ? "unreal-style approximation (camera and lighting differ)" : "flat neutral light",
+      metricsPreset: "neutral",
+      camera: { fov: PICTURE_CAMERA.fov, direction: [...PICTURE_CAMERA.direction], fit: PICTURE_CAMERA.fit },
+    },
+    null,
+    1,
+  ),
+);
 const rows = result.judge.map((j) => ({
   name: j.name,
   verdict: j.verdict,

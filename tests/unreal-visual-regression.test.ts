@@ -5,9 +5,9 @@ import { fileURLToPath } from "node:url";
 
 import { Document, NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 
-import { renderTiles } from "../src/unreal/contact-sheet.js";
+import { renderContactSheet, renderTiles } from "../src/unreal/contact-sheet.js";
 import { dropUnreadVertexColours, packageGlb } from "../src/unreal/importer.js";
 import type { SourceMaterial } from "../src/unreal/source-material.js";
 import { writeMeshFixture } from "./helpers/unreal-fixture.js";
@@ -863,6 +863,46 @@ describeWithTools(["chromium"], "unreal visual regression goldens", () => {
     // Same needles, same camera: only the edge treatment differs, and the fringe adds object pixels.
     expect(smooth.stats.objectPixels).toBeGreaterThan(plain.stats.objectPixels * 1.15);
     expect(smooth.stats.coverage).toBeLessThan(plain.stats.coverage * 3);
+  });
+
+  it("the unreal-like picture grounds the model and casts a shadow, while the default render stays the neutral golden", async () => {
+    const path = paths.get("solid-box")!;
+    const neutral = (await renderTiles({ glbPaths: [path], tile: TILE })).tiles[0]!;
+    // The default is still the neutral render the committed goldens pin (a new option must not move it).
+    const golden = await decodeRgba(await readFile(join(GOLDEN_DIR, "solid-box.png")));
+    expect((await compareImages(neutral, golden)).ssim).toBeGreaterThanOrEqual(GOLDEN_SSIM_MIN);
+    // Two unreal-like passes differ only in whether the key casts a shadow (same camera, fill and ground), so a
+    // darkening outside the model's neutral silhouette is the cast shadow, not the darker floor.
+    const shadowed = (await renderTiles({ glbPaths: [path], tile: TILE, lighting: "unreal-like" })).tiles[0]!;
+    const flat = (await renderTiles({ glbPaths: [path], tile: TILE, lighting: "unreal-like", shadows: false })).tiles[0]!;
+    let darkened = 0;
+    for (let i = 0; i < neutral.data.length; i += 4) {
+      const background =
+        Math.abs(neutral.data[i]! - 128) <= 3 && Math.abs(neutral.data[i + 1]! - 128) <= 3 && Math.abs(neutral.data[i + 2]! - 128) <= 3;
+      if (!background) continue;
+      const on = 0.2126 * shadowed.data[i]! + 0.7152 * shadowed.data[i + 1]! + 0.0722 * shadowed.data[i + 2]!;
+      const off = 0.2126 * flat.data[i]! + 0.7152 * flat.data[i + 1]! + 0.0722 * flat.data[i + 2]!;
+      if (off - on >= 20) darkened++;
+    }
+    expect(darkened).toBeGreaterThan(20);
+  });
+
+  it("fails explicitly when the lit picture pass drops a tile the neutral pass rendered", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tn-lit-failure-"));
+    onTestFinished(() => rm(dir, { recursive: true, force: true }));
+    const box = join(dir, "SM_Box.glb");
+    await writeGlb(box, { name: "SM_Box", geometry: "cube", baseColorFactor: [0.8, 0.2, 0.2, 1] });
+    // A deterministic seam makes the lit pass drop tile 0, which the neutral pass renders; it must name the tile.
+    await expect(
+      renderContactSheet({
+        glbPaths: [box],
+        outPath: join(dir, "sheet.jpg"),
+        title: "Lit failure",
+        tile: TILE,
+        pictureLighting: "unreal-like",
+        litFailureProbe: [0],
+      }),
+    ).rejects.toThrow(/tile 0 "SM_Box"/);
   });
 
   it("a vivid leaf atlas cut out by a packed opacity map keeps its colour instead of the neutral grey fallback (Fern Collection)", () => {
