@@ -212,10 +212,32 @@ export const PREREQUISITES: readonly Prerequisite[] = [
   commandPrerequisite("tar", "toolchain", ["--version"], "tar", "gnu-tar"),
 ];
 
-export type TestToolId = "node" | "ffmpeg" | "ffprobe" | "python-imaging" | "chromium";
+/** The SharpGLTF assemblies the modern converter ships beside its executable. */
+const SHARPGLTF_ASSEMBLIES = ["SharpGLTF.Core.dll", "SharpGLTF.Runtime.dll", "SharpGLTF.Toolkit.dll"] as const;
+
+/**
+ * Test-only entries, kept out of PREREQUISITES so `npm run doctor` never requires them. Suites reach
+ * them through prerequisiteById.
+ */
+const TEST_ONLY_PREREQUISITES: readonly Prerequisite[] = [
+  {
+    id: "modern-converter",
+    label: "modern converter (private .NET SDK and SharpGLTF assemblies)",
+    group: "toolchain",
+    check: (env) => {
+      const modern = join(toolchainCacheDir(env), "modern");
+      const dotnet = join(modern, "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
+      const required = [dotnet, ...SHARPGLTF_ASSEMBLIES.map((assembly) => join(modern, "bin", assembly))];
+      return { ok: required.every((path) => fileExists(path)) };
+    },
+    fix: `npx tsx -e 'import { ensureModernConverter } from "./src/unreal/provision.ts"; ensureModernConverter(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'`,
+  },
+];
+
+export type TestToolId = "node" | "ffmpeg" | "ffprobe" | "python-imaging" | "chromium" | "modern-converter";
 
 export function prerequisiteById(id: string): Prerequisite {
-  const found = PREREQUISITES.find((entry) => entry.id === id);
+  const found = [...PREREQUISITES, ...TEST_ONLY_PREREQUISITES].find((entry) => entry.id === id);
   if (!found) throw new Error(`Unknown prerequisite: ${id}`);
   return found;
 }

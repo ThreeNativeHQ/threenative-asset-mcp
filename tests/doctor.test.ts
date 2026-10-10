@@ -1,11 +1,11 @@
-import { mkdtemp, readdir, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
 import { describe, expect, it, onTestFinished } from "vitest";
 
 import { runDoctor } from "../scripts/doctor.js";
-import { PREREQUISITES } from "../scripts/prerequisites.js";
+import { PREREQUISITES, prerequisiteById } from "../scripts/prerequisites.js";
 
 /** A PATH directory holding a symlink to every executable on this PATH except the named ones. */
 async function pathWithout(...hidden: string[]): Promise<string> {
@@ -65,5 +65,30 @@ describe("npm run doctor", () => {
   it("warns, without failing, for a missing toolchain item unless --toolchain is set", () => {
     const { lines } = runDoctor({ env: process.env, groups: ["toolchain"] });
     expect(lines.some((entry) => entry.startsWith("missing"))).toBe(false);
+  });
+});
+
+describe("test-only prerequisites", () => {
+  it("resolve modern-converter by id without putting it in the doctor catalogue", () => {
+    expect(prerequisiteById("modern-converter").id).toBe("modern-converter");
+    expect(PREREQUISITES.map((entry) => entry.id)).not.toContain("modern-converter");
+  });
+
+  it("pass only with the private .NET SDK and all three SharpGLTF assemblies in the toolchain cache", async () => {
+    const cache = await mkdtemp(join(tmpdir(), "asset-mcp-modern-prereq-"));
+    onTestFinished(() => rm(cache, { recursive: true, force: true }));
+    const env = { ...process.env, THREENATIVE_TOOLCHAIN_DIR: cache };
+    const modern = prerequisiteById("modern-converter");
+    const dotnet = join(cache, "modern", "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
+    const bin = join(cache, "modern", "bin");
+    await mkdir(join(cache, "modern", "dotnet"), { recursive: true });
+    await mkdir(bin, { recursive: true });
+    expect(modern.check(env).ok).toBe(false);
+    await writeFile(dotnet, "");
+    await writeFile(join(bin, "SharpGLTF.Core.dll"), "");
+    await writeFile(join(bin, "SharpGLTF.Runtime.dll"), "");
+    expect(modern.check(env).ok).toBe(false);
+    await writeFile(join(bin, "SharpGLTF.Toolkit.dll"), "");
+    expect(modern.check(env).ok).toBe(true);
   });
 });

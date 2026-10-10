@@ -58,6 +58,12 @@ jobs:
           sudo apt-get install --yes --no-install-recommends ffmpeg
           npx --no-install playwright install --with-deps chromium
 
+      # The compiled UE5 decoder suite fails under CI=true without the modern converter; bound its provisioning too.
+      - name: Provision the modern Unreal converter
+        timeout-minutes: 15
+        run: |
+          npx tsx -e 'import { ensureModernConverter } from "./src/unreal/provision.ts"; ensureModernConverter(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'
+
       - name: Typecheck
         id: typecheck
         run: npm run typecheck
@@ -155,6 +161,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends ffmpeg
           npx --no-install playwright install --with-deps chromium
+
+      # The compiled UE5 decoder suite fails under CI=true without the modern converter; bound its provisioning too.
+      - name: Provision the modern Unreal converter
+        timeout-minutes: 15
+        run: |
+          npx tsx -e 'import { ensureModernConverter } from "./src/unreal/provision.ts"; ensureModernConverter(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'
 
       - name: Build the distributable
         run: npm run build

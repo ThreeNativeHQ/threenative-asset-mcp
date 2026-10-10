@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.67",
+  version: "b4e95441+threenative.68",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2998,6 +2998,7 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
         return text;
     }
     var arrays = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+    var kinds = new Dictionary<string, int>(StringComparer.Ordinal);
     var names = new Dictionary<string, string[]>(StringComparer.Ordinal);
     var live = new Dictionary<string, bool[]>(StringComparer.Ordinal);
     var elementTypes = reader.ReadInt32();
@@ -3050,6 +3051,7 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
                     var elementSize = reader.ReadInt32();
                     var elements = reader.ReadInt32();
                     arrays[key] = reader.ReadBytes(checked(elementSize * elements));
+                    kinds[key] = kind;
                 }
                 // The default value is written even for an attribute with no channels, so its size
                 // comes from the attribute type: FVector4f, FVector3f, FVector2f, float, int32, and
@@ -3069,11 +3071,22 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
         throw new InvalidDataException("Mesh description was not fully consumed.");
     float[] Floats(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, float>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
     int[] Ints(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, int>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
+    // A vertex-instance colour is a linear FVector4f (attribute kind 0, 16 bytes), the layout Unreal
+    // writes for MeshAttribute::VertexInstance::Color. Any other stored type would need a reinterpretation
+    // this reader does not do, so it is left absent rather than guessed; absent also means no colour buffer.
+    float[] Colors()
+    {
+        const string key = "VertexInstances[0].Color[0]";
+        return arrays.TryGetValue(key, out var bytes) && kinds.TryGetValue(key, out var kind) && kind == 0
+            ? MemoryMarshal.Cast<byte, float>(bytes).ToArray()
+            : [];
+    }
     return new EditorMesh(
         Floats("Vertices[0].Position[0]"),
         Ints("VertexInstances[0].VertexIndex[0]"),
         Floats("VertexInstances[0].Normal[0]"),
         Floats("VertexInstances[0].TextureCoordinate[0]"),
+        Colors(),
         Ints("Triangles[0].VertexInstanceIndex[0]"),
         Ints("Triangles[0].PolygonGroupIndex[0]"),
         live.TryGetValue("Triangles", out var triangles) ? triangles : [],
@@ -3081,16 +3094,17 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
 }
 
 // Writes the decoded source model with the cooked glTF writer's conventions: centimetres to metres,
-// Unreal's Z-up swapped to glTF's Y-up, and Unreal's triangle order kept (the axis swap and
-// Unreal's left-handedness cancel). Vertex colours and tangents are left out, as the UE Viewer
-// route leaves them out: Megascans vertex colours are wind masks, not tint, and glTF clients
-// generate MikkTSpace tangents when none are given.
+// Unreal's Z-up swapped to glTF's Y-up, and Unreal's triangle order kept (the axis swap and Unreal's
+// left-handedness cancel). Tangents are still left out, so a glTF client generates MikkTSpace tangents.
+// A source model whose MeshDescription carries a per-vertex-instance Color is written as COLOR_0, as the
+// cooked writer does; glTF clients with a material that does not read it would still multiply it into the
+// base colour, so the importer drops COLOR_0 for those sections. Without such an attribute no COLOR_0 is
+// written at all, so nothing is invented for an unpainted mesh.
 static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string name, string target)
 {
-    var builder = new SharpGLTF.Geometry.MeshBuilder<
-        SharpGLTF.Geometry.VertexTypes.VertexPositionNormal,
-        SharpGLTF.Geometry.VertexTypes.VertexTexture1,
-        SharpGLTF.Geometry.VertexTypes.VertexEmpty>(name);
+    // Every vertex instance must have a colour for the attribute to line up with the instance indexing,
+    // so a colour buffer of any other length is treated as absent rather than padded or truncated.
+    var colors = mesh.VertexColors.Length == mesh.InstanceVertices.Length * 4 ? mesh.VertexColors : null;
     var materials = new Dictionary<int, SharpGLTF.Materials.MaterialBuilder>();
     SharpGLTF.Materials.MaterialBuilder Material(int group)
     {
@@ -3100,32 +3114,50 @@ static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string n
         materials[group] = material;
         return material;
     }
-    SharpGLTF.Geometry.VertexBuilder<
-        SharpGLTF.Geometry.VertexTypes.VertexPositionNormal,
-        SharpGLTF.Geometry.VertexTypes.VertexTexture1,
-        SharpGLTF.Geometry.VertexTypes.VertexEmpty> Vertex(int instance)
+    SharpGLTF.Geometry.MeshBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty> Build<TMaterial>(Func<int, System.Numerics.Vector2, TMaterial> materialVertex)
+        where TMaterial : struct, SharpGLTF.Geometry.VertexTypes.IVertexMaterial
     {
-        var vertex = mesh.InstanceVertices[instance];
-        var position = new System.Numerics.Vector3(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 2], mesh.Positions[vertex * 3 + 1]) * 0.01f;
-        var normal = new System.Numerics.Vector3(mesh.Normals[instance * 3], mesh.Normals[instance * 3 + 2], mesh.Normals[instance * 3 + 1]);
-        normal = normal.LengthSquared() > 1e-12f && float.IsFinite(normal.LengthSquared()) ? System.Numerics.Vector3.Normalize(normal) : System.Numerics.Vector3.UnitY;
-        var uv = new System.Numerics.Vector2(mesh.Uv0[instance * 2], mesh.Uv0[instance * 2 + 1]);
-        return new(new SharpGLTF.Geometry.VertexTypes.VertexPositionNormal(position, normal), new SharpGLTF.Geometry.VertexTypes.VertexTexture1(uv));
-    }
-    var triangleCount = mesh.TriangleInstances.Length / 3;
-    for (var triangle = 0; triangle < triangleCount; triangle++)
-    {
-        if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
-        var group = triangle < mesh.TriangleGroups.Length ? mesh.TriangleGroups[triangle] : 0;
-        builder.UsePrimitive(Material(group)).AddTriangle(
-            Vertex(mesh.TriangleInstances[triangle * 3]),
-            Vertex(mesh.TriangleInstances[triangle * 3 + 1]),
-            Vertex(mesh.TriangleInstances[triangle * 3 + 2]));
+        var builder = new SharpGLTF.Geometry.MeshBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty>(name);
+        SharpGLTF.Geometry.VertexBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty> Vertex(int instance)
+        {
+            var vertex = mesh.InstanceVertices[instance];
+            var position = new System.Numerics.Vector3(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 2], mesh.Positions[vertex * 3 + 1]) * 0.01f;
+            var normal = new System.Numerics.Vector3(mesh.Normals[instance * 3], mesh.Normals[instance * 3 + 2], mesh.Normals[instance * 3 + 1]);
+            normal = normal.LengthSquared() > 1e-12f && float.IsFinite(normal.LengthSquared()) ? System.Numerics.Vector3.Normalize(normal) : System.Numerics.Vector3.UnitY;
+            var uv = new System.Numerics.Vector2(mesh.Uv0[instance * 2], mesh.Uv0[instance * 2 + 1]);
+            return new(new SharpGLTF.Geometry.VertexTypes.VertexPositionNormal(position, normal), materialVertex(instance, uv));
+        }
+        var triangleCount = mesh.TriangleInstances.Length / 3;
+        for (var triangle = 0; triangle < triangleCount; triangle++)
+        {
+            if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
+            var group = triangle < mesh.TriangleGroups.Length ? mesh.TriangleGroups[triangle] : 0;
+            builder.UsePrimitive(Material(group)).AddTriangle(
+                Vertex(mesh.TriangleInstances[triangle * 3]),
+                Vertex(mesh.TriangleInstances[triangle * 3 + 1]),
+                Vertex(mesh.TriangleInstances[triangle * 3 + 2]));
+        }
+        return builder;
     }
     var scene = new SharpGLTF.Scenes.SceneBuilder();
-    scene.AddRigidMesh(builder, System.Numerics.Matrix4x4.Identity);
+    if (colors is null)
+        scene.AddRigidMesh(Build((instance, uv) => new SharpGLTF.Geometry.VertexTypes.VertexTexture1(uv)), System.Numerics.Matrix4x4.Identity);
+    else
+        scene.AddRigidMesh(Build((instance, uv) => new SharpGLTF.Geometry.VertexTypes.VertexColor1Texture1(EditorVertexColor(colors, instance), uv)), System.Numerics.Matrix4x4.Identity);
     Directory.CreateDirectory(Path.GetDirectoryName(target)!);
     scene.ToGltf2().SaveGLB(target);
+}
+
+// The linear RGBA of one vertex instance, kept in the source's channel order. glTF treats COLOR_0 as
+// linear, and Unreal's VertexColor node reads the same FVector4f, so no conversion is applied. A colour
+// index past the buffer would be a malformed mesh; Unreal's default white is used so the whole export
+// does not fail over one bad triangle.
+static System.Numerics.Vector4 EditorVertexColor(float[] colors, int instance)
+{
+    var at = instance * 4;
+    return at >= 0 && at + 3 < colors.Length
+        ? new System.Numerics.Vector4(colors[at], colors[at + 1], colors[at + 2], colors[at + 3])
+        : System.Numerics.Vector4.One;
 }
 
 // Editor source art is stored the way FTextureSource keeps it, not as a display image. A
@@ -3448,6 +3480,7 @@ sealed record EditorMesh(
     int[] InstanceVertices,
     float[] Normals,
     float[] Uv0,
+    float[] VertexColors,
     int[] TriangleInstances,
     int[] TriangleGroups,
     bool[] LiveTriangles,

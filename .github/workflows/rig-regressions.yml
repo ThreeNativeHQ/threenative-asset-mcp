@@ -58,6 +58,11 @@ jobs:
           sudo apt-get install --yes --no-install-recommends ffmpeg
           npx --no-install playwright install --with-deps chromium
 
+      - name: Provision the modern Unreal converter
+        timeout-minutes: 15
+        run: |
+          npx tsx -e 'import { ensureModernConverter } from "./src/unreal/provision.ts"; ensureModernConverter(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'
+
       - run: npm run typecheck
 
       # Each integration file can launch Chromium, Python and installed MCP

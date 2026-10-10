@@ -72,6 +72,13 @@ jobs:
           set -o pipefail
           npm run provision:toolchain 2>&1 | tee "$RUNNER_TEMP/provision.log"
 
+      # CI=true turns a missing .NET SDK or SharpGLTF assembly into a failure, so this step cannot skip the suite.
+      - name: Compile the UE5 source decoders against the fresh toolchain
+        env:
+          CI: "true"
+          THREENATIVE_TOOLCHAIN_DIR: ${{ runner.temp }}/toolchain
+        run: npx vitest run tests/unreal-converter-ue5-sources.test.ts
+
       - name: Summarize provisioning
         if: always()
         run: |

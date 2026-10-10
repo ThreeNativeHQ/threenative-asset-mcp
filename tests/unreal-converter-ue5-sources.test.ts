@@ -1,13 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { NodeIO, type Accessor } from "@gltf-transform/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
 import { toolchainCacheDir } from "../src/unreal/provision.js";
+import { describeWithTools } from "./helpers/require-tool.js";
 
 // Three UE5 editor-package layouts the modern converter did not read (converter 61):
 //  - TSCF_UEDELTA texture sources (UE 5.6+ default): raw pixels, row-delta filtered per tile. No PNG or
@@ -15,9 +16,9 @@ import { toolchainCacheDir } from "../src/unreal/provision.js";
 //  - The UE 5.8 compact FName array in an FMeshDescription: the static mesh had no readable source model.
 //  - A UE4-saved MaterialInstanceConstant inside a UE5 artifact: CUE4Parse throws before filling the typed
 //    TextureParameterValues, so the instance exported no textures although its tagged properties hold them.
-// The decoders are pure functions in the embedded program. When the private .NET SDK the converter build
-// installs is present, they are compiled on their own and run against synthetic data encoded here from
-// Unreal's documented tile rules; elsewhere the program-text checks still pin the wiring.
+// The decoders are pure functions in the embedded program. They are compiled on their own, against the private
+// .NET SDK and SharpGLTF assemblies of the `modern-converter` test prerequisite, and run against synthetic data
+// encoded here from Unreal's documented tile rules. Without them the compiled suite skips locally and fails under CI=true.
 
 /** Extracts one top-level C# declaration (signature line through its matching brace) from the program. */
 function extractCSharp(program: string, signature: string): string {
@@ -162,20 +163,19 @@ function element(name: string, count: number, attributes: readonly Attribute[], 
   return Buffer.concat(parts);
 }
 
-function meshDescription(slotNames: readonly string[], compactNames: boolean): Buffer {
+function meshDescription(slotNames: readonly string[], compactNames: boolean, colors?: readonly number[], vertexIndices: readonly number[] = [0, 1, 2]): Buffer {
+  const vertexInstances: Attribute[] = [
+    { name: "VertexIndex", kind: 4, extent: 1, elementSize: 4, data: int32(...vertexIndices) },
+    { name: "Normal", kind: 1, extent: 1, elementSize: 12, data: floats([0, 0, 1, 0, 0, 1, 0, 0, 1]) },
+    { name: "TextureCoordinate", kind: 2, extent: 1, elementSize: 8, data: floats([0, 0, 1, 0, 0, 1]) },
+    // MeshAttribute::VertexInstance::Color is an FVector4f (attribute kind 0, 16 bytes); it is optional, so
+    // it only appears when the package carried one.
+    ...(colors ? [{ name: "Color", kind: 0 as const, extent: 1, elementSize: 16, data: floats(colors) }] : []),
+  ];
   return Buffer.concat([
     int32(5),
     element("Vertices", 3, [{ name: "Position ", kind: 1, extent: 1, elementSize: 12, data: floats([0, 0, 0, 100, 0, 0, 0, 100, 0]) }], compactNames),
-    element(
-      "VertexInstances",
-      3,
-      [
-        { name: "VertexIndex", kind: 4, extent: 1, elementSize: 4, data: int32(0, 1, 2) },
-        { name: "Normal", kind: 1, extent: 1, elementSize: 12, data: floats([0, 0, 1, 0, 0, 1, 0, 0, 1]) },
-        { name: "TextureCoordinate", kind: 2, extent: 1, elementSize: 8, data: floats([0, 0, 1, 0, 0, 1]) },
-      ],
-      compactNames,
-    ),
+    element("VertexInstances", 3, vertexInstances, compactNames),
     element(
       "Triangles",
       1,
@@ -226,9 +226,10 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
 });
 
 const DOTNET = join(toolchainCacheDir(), "modern", "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
-const haveDotnet = existsSync(DOTNET);
+// The glTF vertex-colour writer compiles against the SharpGLTF assemblies the provisioned converter ships.
+const SHARPGLTF_BIN = join(toolchainCacheDir(), "modern", "bin");
 
-describe.skipIf(!haveDotnet)("UE5 editor source decoders (compiled from the embedded program)", () => {
+describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled from the embedded program)", () => {
   let root = "";
   let harness = "";
   const environment = (): NodeJS.ProcessEnv => ({
@@ -250,7 +251,11 @@ describe.skipIf(!haveDotnet)("UE5 editor source decoders (compiled from the embe
     await writeFile(
       join(project, "Decoders.csproj"),
       `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>` +
-        `<ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><UseSharedCompilation>false</UseSharedCompilation></PropertyGroup></Project>`,
+        `<ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><UseSharedCompilation>false</UseSharedCompilation></PropertyGroup>` +
+        `<ItemGroup>${["SharpGLTF.Core", "SharpGLTF.Runtime", "SharpGLTF.Toolkit"]
+          .map((assembly) => `<Reference Include="${assembly}"><HintPath>${join(SHARPGLTF_BIN, assembly + ".dll")}</HintPath></Reference>`)
+          .join("")}</ItemGroup>` +
+        `</Project>`,
     );
     const functions = [
       "static (int BytesPerPixel, int SampleBytes) UeDeltaPixelLayout(",
@@ -260,6 +265,9 @@ describe.skipIf(!haveDotnet)("UE5 editor source decoders (compiled from the embe
       ...(CUE4PARSE_PROGRAM.includes("static EditorMesh ReadMeshDescriptionLayout(") ? ["static EditorMesh ReadMeshDescriptionLayout("] : []),
       // Absent before converter 67.
       ...(CUE4PARSE_PROGRAM.includes("static string MaterialSidecarName(") ? ["static string MaterialSidecarName("] : []),
+      // Converter 68+: the vertex-colour writer, compiled against the SharpGLTF assemblies the modern converter ships.
+      "static void WriteEditorMeshGlb(",
+      "static System.Numerics.Vector4 EditorVertexColor(",
     ].map((signature) => extractCSharp(CUE4PARSE_PROGRAM, signature));
     const record = CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("sealed record EditorMesh("));
     const editorMesh = record.slice(0, record.indexOf(");") + 2);
@@ -282,6 +290,12 @@ else if (args[0] == "sidecar")
       ? `var owners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     Console.WriteLine(string.Join(" ", args.Skip(1).Select(claim => claim.Split('=')).Select(parts => MaterialSidecarName(owners, parts[0], parts.Length > 1 ? parts[1] : null))));`
       : `Console.WriteLine(string.Join(" ", args.Skip(1).Select(claim => claim.Split('=')[0])));`}
+}
+else if (args[0] == "colormesh")
+{
+    var mesh = ReadMeshDescription(File.ReadAllBytes(args[1]));
+    WriteEditorMeshGlb(mesh, mesh.GroupSlots.Length > 0 ? mesh.GroupSlots : new[] { "SlotA" }, "colormesh", args[2]);
+    Console.WriteLine("ok " + mesh.VertexColors.Length);
 }
 else
 {
@@ -387,5 +401,70 @@ ${editorMesh}
     const file = join(root, "mesh-compact-two.bin");
     await writeFile(file, meshDescription(["SlotA", "SlotB"], true));
     expect(run("mesh", file)).toMatch(/^error NotSupportedException: FName attribute ImportedMaterialSlotName has 2 distinct names for 2 elements/);
+  });
+
+  // The mesh writer must carry a MeshDescription's vertex colours so a material that reads VertexColor renders
+  // (the Hornbeam Icon meshes), while a mesh without a colour buffer gets no COLOR_0 at all. The decoder reads
+  // the FVector4f attribute, the writer maps it to COLOR_0 by vertex instance, and SharpGLTF normalises it.
+  describe("MeshDescription vertex colours into glTF COLOR_0", () => {
+    // Three vertex instances, each with a distinct linear RGBA. The vertex-index map is the permutation (2,0,1),
+    // so instance i sits on a different vertex than i; a writer that indexed colours by vertex rather than
+    // instance would put them in the wrong place. The export scales and swaps each position to (0,0,0), (1,0,0),
+    // (0,0,1) metres, so each colour can be read back by position.
+    const palette = [1, 0.5, 0, 0.7, 0, 1, 0.25, 0.35, 0.2, 0.4, 0.6, 0.9] as const;
+    const vertexIndices = [2, 0, 1] as const;
+
+    async function coloursByPosition(glb: string): Promise<{ attribute: Accessor; byPosition: Map<string, number[]> } | null> {
+      const document = await new NodeIO().read(glb);
+      const primitive = document.getRoot().listMeshes().flatMap((mesh) => mesh.listPrimitives())[0];
+      if (!primitive) throw new Error("the writer produced no primitive");
+      const attribute = primitive.getAttribute("COLOR_0");
+      if (!attribute) return null;
+      const positions = primitive.getAttribute("POSITION")!.getArray()!;
+      const components = attribute.getArray()!;
+      const byPosition = new Map<string, number[]>();
+      for (let vertex = 0; vertex < attribute.getCount(); vertex++) {
+        const position = [positions[vertex * 3]!, positions[vertex * 3 + 1]!, positions[vertex * 3 + 2]!].map((value) => value.toFixed(3)).join(",");
+        byPosition.set(position, [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!].map((value) => value / 255));
+      }
+      return { attribute, byPosition };
+    }
+
+    it("writes the source's per-vertex-instance colours as normalized RGBA COLOR_0", async () => {
+      const file = join(root, "mesh-colour.bin");
+      await writeFile(file, meshDescription(["SlotA"], false, palette, vertexIndices));
+      const glb = join(root, "mesh-colour.glb");
+      // The decoder reports the colour component count it read (three instances x four channels).
+      expect(run("colormesh", file, glb)).toBe("ok 12");
+
+      const result = await coloursByPosition(glb);
+      expect(result).not.toBeNull();
+      const { attribute, byPosition } = result!;
+      expect(attribute.getType()).toBe("VEC4");
+      expect(attribute.getComponentType()).toBe(5121); // UNSIGNED_BYTE
+      expect(attribute.getNormalized()).toBe(true);
+      expect(attribute.getCount()).toBe(3);
+
+      // VertexIndex (2,0,1) maps instance 1 -> vertex 0 -> (0,0,0), instance 2 -> vertex 1 -> (1,0,0), and
+      // instance 0 -> vertex 2 -> (0,0,1). Colours follow the instance, so palette order is not position order.
+      const expected: ReadonlyArray<readonly [string, ReadonlyArray<number>]> = [
+        ["0.000,0.000,0.000", [palette[4], palette[5], palette[6], palette[7]]],
+        ["1.000,0.000,0.000", [palette[8], palette[9], palette[10], palette[11]]],
+        ["0.000,0.000,1.000", [palette[0], palette[1], palette[2], palette[3]]],
+      ];
+      for (const [position, rgba] of expected) {
+        const found = byPosition.get(position);
+        expect(found, `no vertex at ${position}`).toBeDefined();
+        rgba.forEach((channel, index) => expect(found![index]).toBeCloseTo(channel, 2));
+      }
+    });
+
+    it("writes no COLOR_0 for a MeshDescription without a Color attribute", async () => {
+      const file = join(root, "mesh-nocolour.bin");
+      await writeFile(file, meshDescription(["SlotA"], false));
+      const glb = join(root, "mesh-nocolour.glb");
+      expect(run("colormesh", file, glb)).toBe("ok 0");
+      expect(await coloursByPosition(glb)).toBeNull();
+    });
   });
 });
