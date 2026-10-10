@@ -68,7 +68,7 @@ export const FABCLI_RELEASE = Object.freeze({
 /** GPL-3.0-or-later command-line converter, always executed out-of-process. */
 export const UNCOOKED_CONVERTER = Object.freeze({
   package: "unreal-assets-to-glb==4.27.2.0",
-  version: "4.27.2.0+threenative.7",
+  version: "4.27.2.0+threenative.8",
 });
 
 export interface ProvisionLog {
@@ -359,8 +359,10 @@ async function pythonExecutable(environment: NodeJS.ProcessEnv): Promise<string>
 }
 
 function replaceRequired(source: string, before: string, after: string, label: string): string {
+  // `after` contains `before` for the append-style patches, so check it first: a second application is
+  // a no-op rather than appending the inserted lines again.
+  if (source.includes(after)) return source;
   if (!source.includes(before)) {
-    if (source.includes(after)) return source;
     throw new ToolchainError(
       "UNREAL_TOOL_UNUSABLE",
       `The pinned uncooked converter no longer matches the verified ${label} patch.`,
@@ -374,6 +376,185 @@ function replaceRequired(source: string, before: string, after: string, label: s
 export function patchUncookedPackageVersionGates(source: string): string {
   source = replaceRequired(source, "VER_UE4_ADDED_PACKAGE_OWNER = 517", "VER_UE4_ADDED_PACKAGE_OWNER = 518", "UE4 package-owner start version");
   return replaceRequired(source, "VER_UE4_NON_OUTER_PACKAGE_IMPORT = 519", "VER_UE4_NON_OUTER_PACKAGE_IMPORT = 520", "UE4 package-owner end version");
+}
+
+/**
+ * Teaches the uncooked MeshDescription parser to read the per-vertex-instance ``Color`` attribute,
+ * which ``extract_geometry`` read as Normal/TextureCoordinate only and dropped. Unreal's editor meshes
+ * (the Hornbeam UE 5.1 foliage icons) store a linear FVector4f here; a material that samples VertexColor
+ * multiplies it into the base colour, so without it those pieces render as the material's untinted
+ * default.
+ *
+ * Like ``Normal`` and ``TextureCoordinate``, the ``Color`` attribute is a ``TArray`` indexed by
+ * vertex-instance *element* ID: Unreal serializes it over the allocated slots, so holes between live
+ * instances are retained and ``color_values[vi]`` is instance ``vi``'s colour. It is therefore returned
+ * as read (never re-zipped through the live-id list), and only when the serialized array matches the
+ * source's allocated slot count (``num_elements``) and spans every live instance. A truncated array or
+ * an instance id past its end cannot be trusted, so no colour is written rather than a fabricated white
+ * for a malformed record. Mirrors the cooked writer (`EditorVertexColor`) in `cue4parse-adapter.ts`.
+ */
+export function patchUncookedMeshDescriptionColors(source: string): string {
+  source = replaceRequired(
+    source,
+    `    # --- Normals (per vertex instance, FVector) ---
+    normals = []
+    normal_entry = vi_attrs.get('Normal')
+    if normal_entry and normal_entry['type'] == 1 and normal_entry['arrays']:
+        normals = _bulk_floats(normal_entry, 3)
+
+    # --- UV channels (per vertex instance, FVector2D) ---`,
+    `    # --- Normals (per vertex instance, FVector) ---
+    normals = []
+    normal_entry = vi_attrs.get('Normal')
+    if normal_entry and normal_entry['type'] == 1 and normal_entry['arrays']:
+        normals = _bulk_floats(normal_entry, 3)
+
+    # --- Vertex colours (per vertex instance, FVector4) ---
+    # Indexed by vertex-instance ID (holes retained), so it is used as read. Accept it only when the
+    # array matches the source's allocated slot count and every live instance is inside it; otherwise
+    # leave it empty so no COLOR_0 (and no invented white) is written for a malformed record.
+    colors = []
+    color_entry = vi_attrs.get('Color')
+    if color_entry and color_entry['type'] == 0 and color_entry['arrays']:
+        color_values = _bulk_floats(color_entry, 4)
+        allocated = color_entry.get('num_elements')
+        if (isinstance(allocated, int) and allocated > 0 and vi_ids
+                and len(color_values) == allocated and max(vi_ids) < allocated):
+            colors = color_values
+
+    # --- UV channels (per vertex instance, FVector2D) ---`,
+    "uncooked vertex colours",
+  );
+  return replaceRequired(
+    source,
+    `        'normals': normals,
+        'uvs': uv_channels,`,
+    `        'normals': normals,
+        'colors': colors,
+        'uvs': uv_channels,`,
+    "uncooked vertex colours in geometry",
+  );
+}
+
+/**
+ * Carries the decoded per-vertex-instance colours from `StaticMesh.from_package` through the GLB
+ * writer as glTF `COLOR_0`. Only the uncooked branch fills `mesh.colors`; the cooked/fallback branch
+ * leaves it empty, and an empty buffer writes no `COLOR_0` at all. The accessor is normalized
+ * UNSIGNED_BYTE RGBA in the source's linear channel order, matching the cooked writer.
+ */
+export function patchUncookedMeshColorExport(source: string): string {
+  source = replaceRequired(
+    source,
+    `        self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels`,
+    `        self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels
+        # Per vertex instance, linear RGBA from the source's Color attribute; empty when absent.
+        self.colors: List[Optional[Tuple[float, float, float, float]]] = []`,
+    "StaticMesh colours field",
+  );
+  source = replaceRequired(
+    source,
+    `                mesh.uvs = geo['uvs']
+                mesh.triangles = geo['triangles']`,
+    `                mesh.uvs = geo['uvs']
+                mesh.colors = geo.get('colors') or []
+                mesh.triangles = geo['triangles']`,
+    "StaticMesh colours transport",
+  );
+  source = replaceRequired(
+    source,
+    `    uvs = mesh.uvs[0] if mesh.uvs else []
+    has_normals = bool(mesh.normals)
+    has_uvs = bool(uvs)`,
+    `    uvs = mesh.uvs[0] if mesh.uvs else []
+    has_normals = bool(mesh.normals)
+    has_uvs = bool(uvs)
+    has_colors = bool(mesh.colors)`,
+    "GLB colour presence",
+  );
+  source = replaceRequired(
+    source,
+    `                    if has_uvs and vi < len(uvs):
+                        u, v = uvs[vi]
+                    else:
+                        u, v = 0.0, 0.0
+
+                    local_verts.append((px, py, pz, nx, ny, nz, u, v))`,
+    `                    if has_uvs and vi < len(uvs):
+                        u, v = uvs[vi]
+                    else:
+                        u, v = 0.0, 0.0
+
+                    # Colour — per vertex instance; Unreal's default white when the mesh has no
+                    # colour buffer or the instance is outside it.
+                    if has_colors and vi < len(mesh.colors) and mesh.colors[vi] is not None:
+                        cr, cg, cb, ca = mesh.colors[vi]
+                    else:
+                        cr, cg, cb, ca = 1.0, 1.0, 1.0, 1.0
+
+                    local_verts.append((px, py, pz, nx, ny, nz, u, v, cr, cg, cb, ca))`,
+    "GLB per-instance colour",
+  );
+  source = replaceRequired(
+    source,
+    `        pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
+        norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
+        uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)`,
+    `        pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
+        norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
+        uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)
+        color_arr = np.array([(v[8], v[9], v[10], v[11]) for v in local_verts], dtype=np.float32)`,
+    "GLB colour array",
+  );
+  source = replaceRequired(
+    source,
+    `    COMP_FLOAT = 5126
+    COMP_UNSIGNED_SHORT = 5123
+    COMP_UNSIGNED_INT = 5125`,
+    `    COMP_FLOAT = 5126
+    COMP_UNSIGNED_SHORT = 5123
+    COMP_UNSIGNED_INT = 5125
+    COMP_UNSIGNED_BYTE = 5121`,
+    "GLB unsigned-byte component type",
+  );
+  source = replaceRequired(
+    source,
+    `        # UV accessor
+        uv_acc = None
+        if has_uvs:
+            uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
+            uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
+
+        # Index accessor`,
+    `        # UV accessor
+        uv_acc = None
+        if has_uvs:
+            uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
+            uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
+
+        # Vertex colour accessor — normalized UNSIGNED_BYTE RGBA, the linear channel order glTF
+        # treats COLOR_0 as, matching the cooked writer.
+        color_acc = None
+        if has_colors:
+            color_bytes = np.clip(np.rint(color_arr * 255.0), 0.0, 255.0).astype(np.uint8).tobytes()
+            color_bv = _add_buffer_view(color_bytes, target=ARRAY_BUFFER)
+            color_acc = _add_accessor(color_bv, COMP_UNSIGNED_BYTE, num_verts, "VEC4")
+            accessors[color_acc].normalized = True
+
+        # Index accessor`,
+    "GLB colour accessor",
+  );
+  return replaceRequired(
+    source,
+    `        if uv_acc is not None:
+            prim.attributes.TEXCOORD_0 = uv_acc
+        prim.indices = idx_acc`,
+    `        if uv_acc is not None:
+            prim.attributes.TEXCOORD_0 = uv_acc
+        if color_acc is not None:
+            prim.attributes.COLOR_0 = color_acc
+        prim.indices = idx_acc`,
+    "GLB colour attribute",
+  );
 }
 
 /**
@@ -996,6 +1177,11 @@ def find_umap_path(input_dir, umap_filename):`,
     );
     await writeFile(cliPath, cliSource);
 
+    const uncookedMeshPath = join(moduleDir, "uncooked_mesh.py");
+    let uncookedMeshSource = (await readFile(uncookedMeshPath, "utf8")).replace(/\r\n/g, "\n");
+    uncookedMeshSource = patchUncookedMeshDescriptionColors(uncookedMeshSource);
+    await writeFile(uncookedMeshPath, uncookedMeshSource);
+
     const meshPath = join(moduleDir, "mesh.py");
     let meshSource = (await readFile(meshPath, "utf8")).replace(/\r\n/g, "\n");
     meshSource = replaceRequired(
@@ -1004,6 +1190,7 @@ def find_umap_path(input_dir, umap_filename):`,
       `        mat = Material()\n        if mesh.material_slots:\n            slot_idx = (mesh.section_info_map[mat_idx]\n                        if mesh.section_info_map and mat_idx < len(mesh.section_info_map)\n                        else mat_idx)\n            if slot_idx < len(mesh.material_slots):\n                mat.name = mesh.material_slots[slot_idx][1]\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
       "material names",
     );
+    meshSource = patchUncookedMeshColorExport(meshSource);
     await writeFile(meshPath, meshSource);
 
     if (!(await canRun(executable, ["--help"], /gpu instances\/landscapes/))) {

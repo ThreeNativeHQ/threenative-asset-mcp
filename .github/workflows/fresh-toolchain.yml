@@ -9,6 +9,7 @@ on:
       - src/unreal/cue4parse-adapter.ts
       - src/fab/fabcli.ts
       - scripts/provision-toolchain.ts
+      - scripts/uncooked-colour-harness.ts
       - .github/workflows/fresh-toolchain.yml
   push:
     branches: [main]
@@ -18,6 +19,7 @@ on:
       - src/unreal/cue4parse-adapter.ts
       - src/fab/fabcli.ts
       - scripts/provision-toolchain.ts
+      - scripts/uncooked-colour-harness.ts
       - .github/workflows/fresh-toolchain.yml
   # Upstream archives change without a commit here, so provisioning can break between runs.
   schedule:
@@ -78,6 +80,13 @@ jobs:
           CI: "true"
           THREENATIVE_TOOLCHAIN_DIR: ${{ runner.temp }}/toolchain
         run: npx vitest run tests/unreal-converter-ue5-sources.test.ts
+
+      # The uncooked colour decoder test mirrors the anchors in stubs; this runs the real installed
+      # converter (extract_geometry -> StaticMesh -> export_glb/pygltflib). A missing converter fails here.
+      - name: Run the real uncooked vertex-colour harness
+        env:
+          THREENATIVE_TOOLCHAIN_DIR: ${{ runner.temp }}/toolchain
+        run: npx tsx scripts/uncooked-colour-harness.ts
 
       - name: Summarize provisioning
         if: always()
