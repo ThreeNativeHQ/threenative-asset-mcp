@@ -1711,22 +1711,41 @@ export async function packageGlb(options: {
       }
     }
     // The flattened `.mat` lists the first texture of each class, which is not the branch a static switch picks: a
-    // winter spruce's trunk, branch and leaf instances all flattened to the bark atlas. When the instance chain
-    // overrides a switch and the graph's active BaseColor path never samples the bound texture, the binding is stale;
-    // it is dropped so the graph baker (below) supplies the colour the chosen branch actually reads.
+    // winter spruce's trunk, branch and leaf instances all flattened to the bark atlas. When the instance chain overrides
+    // a switch and the graph's active BaseColor path does not sample the bound texture, the binding is stale. It is
+    // replaced only by a bake of that path that succeeds (its cut-out included, through the graph block below). A bake
+    // that fails keeps the flattened binding and reports it unverified: nothing here claims a replacement it did not make.
+    let graphReport: ImportedMaterialSection["graph"];
     if (options.graphBaker && !hasNamedFallback(material.getName()) && chainOverridesSwitch(lookupName, graphRequest(true).readProps)) {
       const staleBase = resolved.bindings.find((binding) => binding.slot === "baseColor" && binding.source !== "graph");
-      if (staleBase) {
-        const probed = await options.graphBaker(graphRequest(true));
-        const active = probed.baseColourTextures?.map((texture) => texture.toLowerCase());
-        const bound = [staleBase.texture, staleBase.secondaryTexture].filter((texture): texture is string => texture !== undefined);
-        if (probed.switchOverridden && active && active.length > 0 && !bound.some((texture) => active.includes(texture.toLowerCase()))) {
+      // Only the primary albedo decides staleness. The secondary texture is the flattened opacity map, which can share a name
+      // with a texture the active branch blends into its base colour; that match would keep the wrong albedo.
+      const probed = staleBase ? await options.graphBaker(graphRequest(true)) : undefined;
+      const active = probed?.baseColourTextures?.map((texture) => texture.toLowerCase());
+      if (staleBase && (!active || !active.includes(staleBase.texture.toLowerCase()))) {
+        const baked = await options.graphBaker(graphRequest(false));
+        if (baked.status === "baked") {
+          // texturesUsed lists the base colour's samples only (the cut-out compiles separately), so the same primary test applies.
+          if (!baked.texturesUsed.some((used) => used.toLowerCase() === staleBase.texture.toLowerCase())) {
+            resolved = {
+              ...resolved,
+              bindings: resolved.bindings.filter((binding) => binding.slot !== "baseColor"),
+              limitations: [
+                ...resolved.limitations,
+                `${staleBase.texture} dropped as base colour: the instance's static switches select a graph branch that samples ${baked.texturesUsed.join(", ")}, so the colour is baked from the graph.`,
+              ],
+            };
+          }
+        } else {
+          graphReport =
+            baked.status === "unsupported"
+              ? { status: "unsupported", unsupportedNodes: [...baked.unsupported], approximations: [], reason: baked.reason }
+              : { status: "unavailable", unsupportedNodes: [], approximations: [], reason: baked.reason };
           resolved = {
             ...resolved,
-            bindings: resolved.bindings.filter((binding) => binding.slot !== "baseColor"),
             limitations: [
               ...resolved.limitations,
-              `${staleBase.texture} dropped as base colour: the instance's static switches select a graph branch that samples ${[...new Set(probed.baseColourTextures)].join(", ")}, so the colour is baked from the graph.`,
+              `${staleBase.texture} kept as base colour, unverified: the instance's static switches may select a graph branch the flattened .mat does not show, and that branch could not be baked (${baked.reason}).`,
             ],
           };
         }
@@ -1883,7 +1902,6 @@ export async function packageGlb(options: {
     // PRD-538: colour that exists only in the material graph. Glass, mirrors and lights keep their named
     // fallbacks; everything else that has no base-colour texture asks the graph baker.
     const graphBindings: MaterialTextureBinding[] = [];
-    let graphReport: ImportedMaterialSection["graph"];
     if (material.getBaseColorTexture() === null && options.graphBaker && !hasNamedFallback(material.getName())) {
       const outcome = await options.graphBaker(graphRequest(false));
       if (outcome.effect && !effect) effect = { kind: "emissive", reason: outcome.effect.reason };

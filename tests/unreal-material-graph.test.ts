@@ -6,6 +6,7 @@ import {
   MATERIAL_ATTRIBUTE_GUIDS,
   bakeGraph,
   graphPathClasses,
+  graphPathTextures,
   supportedEngineFunctions,
   supportedNodeClasses,
   type BakeResult,
@@ -2445,5 +2446,166 @@ describe("CollectionParameter", () => {
     expect(CUE4PARSE_PROGRAM).toContain('className == "CollectionParameter"');
     expect(CUE4PARSE_PROGRAM).toContain('"ScalarParameters"');
     expect(CUE4PARSE_PROGRAM).toContain('"VectorParameters"');
+  });
+});
+
+describe("HeightLerp, SmoothThreshold and graphPathTextures", () => {
+  const HEIGHT_LERP = "/Engine/Functions/Engine_MaterialFunctions02/Texturing/HeightLerp";
+  const SMOOTH_THRESHOLD = "/Engine/Functions/Engine_MaterialFunctions02/SmoothThreshold";
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  // A grey 2x2 height map: the left column is 64, the right 255. A Masks sampler reads it raw, so H = 64/255 and 1.
+  const heightMap = async (): Promise<Record<string, Fixture>> => ({
+    T_Height: { png: await pngOf(2, 2, (x) => (x === 0 ? [64, 64, 64] : [255, 255, 255])), srgb: false },
+  });
+  // A HeightLerp call as the dump has it: no function body, pins as the UE 4.27 texturing docs name them.
+  // A = red and B = blue (linear); the height is the texture's red channel.
+  const heightLerp = (phase: number, contrast: number): Raw[] => [
+    node("hl", "FunctionCall", {
+      inputs: { A: pin("a"), B: pin("b"), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin("contrast") },
+      function: HEIGHT_LERP,
+      outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+    }),
+    constant3("a", [1, 0, 0]),
+    constant3("b", [0, 0, 1]),
+    node("phase", "Constant", { constants: { R: phase } }),
+    textureSample("height", "T_Height", "Masks"),
+    node("contrast", "Constant", { constants: { R: contrast } }),
+  ];
+
+  // The same call with A, B and Contrast fed by the named nodes, so a test can wire an unsupported node to a pin the output does not
+  // read. SmoothThreshold has no public definition, so the "gate" node stays unsupported wherever it is read.
+  const heightLerpFed = (from: { a: string; b: string; contrast: string }): Raw[] => [
+    node("hl", "FunctionCall", {
+      inputs: { A: pin(from.a), B: pin(from.b), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin(from.contrast) },
+      function: HEIGHT_LERP,
+      outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+    }),
+    constant3("a", [1, 0, 0]),
+    constant3("b", [0, 0, 1]),
+    node("phase", "Constant", { constants: { R: 0.5 } }),
+    textureSample("height", "T_Height", "Masks"),
+    node("contrast", "Constant", { constants: { R: 0.2 } }),
+    node("gate", "FunctionCall", { function: SMOOTH_THRESHOLD }),
+  ];
+
+  it("HeightLerp Results at Transition Phase 0.5 is the standard lerp of A and B by the height", async () => {
+    const result = await bake(makeGraph(heightLerp(0.5, 0), pin("hl", 0, RGB_MASK)), await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    // Contrast 0 makes Alpha the height itself, so Results = (1 - H, 0, H) in linear light, encoded per channel.
+    for (const [x, height] of [[0, 64 / 255], [1, 1]] as const) expect(pixel(x, 0)).toEqual([encode(1 - height), 0, encode(height)]);
+  });
+
+  it("HeightLerp reads its pins by position when the dump names them Input0 to Input4, as the Spruce dump does", async () => {
+    const positional: Raw[] = [
+      node("hl", "FunctionCall", {
+        inputs: { Input0: pin("a"), Input1: pin("b"), Input2: pin("phase"), Input3: pin("height", 0, [1, 0, 0, 0]), Input4: pin("contrast") },
+        function: HEIGHT_LERP,
+        outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+      }),
+      constant3("a", [1, 0, 0]),
+      constant3("b", [0, 0, 1]),
+      node("phase", "Constant", { constants: { R: 0.5 } }),
+      textureSample("height", "T_Height", "Masks"),
+      node("contrast", "Constant", { constants: { R: 0 } }),
+    ];
+    const result = await bake(makeGraph(positional, pin("hl", 0, RGB_MASK)), await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    for (const [x, height] of [[0, 64 / 255], [1, 1]] as const) expect(pixel(x, 0)).toEqual([encode(1 - height), 0, encode(height)]);
+  });
+
+  it("HeightLerp Alpha output (index 1) applies CheapContrast to the height, as the CheapContrast node does", async () => {
+    const textures = await heightMap();
+    const alpha = await pixelsOf(await bake(makeGraph(heightLerp(0.5, 0.2), pin("hl", 1)), textures));
+    const cheap = await pixelsOf(
+      await bake(
+        makeGraph(
+          [engineCall("cc", "CheapContrast", { In: pin("height", 0, RGB_MASK), Contrast: pin("contrast") }), textureSample("height", "T_Height", "Masks"), node("contrast", "Constant", { constants: { R: 0.2 } })],
+          pin("cc", 0, RGB_MASK),
+        ),
+        textures,
+      ),
+    );
+    // Contrast 0.2 keeps the dark column between the clamps, so the stretch is exercised (1.5 would clamp both columns to 0 and 1).
+    expect(alpha(0, 0)[0]).not.toBe(alpha(1, 0)[0]);
+    for (const x of [0, 1]) expect(alpha(x, 0)).toEqual(cheap(x, 0));
+  });
+
+  it("HeightLerp Lerp Alpha No Contrast output (index 2) is the raw height whatever the contrast", async () => {
+    const result = await bake(makeGraph(heightLerp(0.5, 1.5), pin("hl", 2)), await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(64 / 255), encode(64 / 255), encode(64 / 255)]);
+    expect(pixel(1, 0)).toEqual([255, 255, 255]);
+  });
+
+  it("HeightLerp at a Transition Phase other than 0.5 stays unsupported", async () => {
+    const result = await bake(makeGraph(heightLerp(0.3, 0), pin("hl", 0, RGB_MASK)), await heightMap());
+    expect(result).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining([expect.stringMatching(/^HeightLerp/)]) });
+  });
+
+  it("HeightLerp Alpha evaluates without A or B, so an unsupported node wired to them is not reported", async () => {
+    const textures = await heightMap();
+    const clean = await pixelsOf(await bake(makeGraph(heightLerp(0.5, 0.2), pin("hl", 1)), textures));
+    const gated = await bake(makeGraph(heightLerpFed({ a: "gate", b: "gate", contrast: "contrast" }), pin("hl", 1)), textures);
+    expect(gated).toMatchObject({ status: "baked" });
+    const pixel = await pixelsOf(gated);
+    for (const x of [0, 1]) expect(pixel(x, 0)).toEqual(clean(x, 0));
+  });
+
+  it("HeightLerp Lerp Alpha No Contrast evaluates without A, B or Contrast", async () => {
+    const result = await bake(makeGraph(heightLerpFed({ a: "gate", b: "gate", contrast: "gate" }), pin("hl", 2)), await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(64 / 255), encode(64 / 255), encode(64 / 255)]);
+    expect(pixel(1, 0)).toEqual([255, 255, 255]);
+  });
+
+  it("HeightLerp Results and Alpha still report an unsupported node on a pin they read", async () => {
+    const textures = await heightMap();
+    const results = await bake(makeGraph(heightLerpFed({ a: "gate", b: "b", contrast: "contrast" }), pin("hl", 0, RGB_MASK)), textures);
+    const alpha = await bake(makeGraph(heightLerpFed({ a: "a", b: "b", contrast: "gate" }), pin("hl", 1)), textures);
+    expect(results).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining(["SmoothThreshold"]) });
+    expect(alpha).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining(["SmoothThreshold"]) });
+  });
+
+  it("HeightLerp evaluates the pack's own body when it carries one, instead of the engine function", async () => {
+    // A body on the called output wins: the engine's lerp of A and B is not evaluated, so the body's colour is what bakes.
+    const call = node("hl", "FunctionCall", {
+      inputs: { A: pin("a"), B: pin("b"), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin("contrast") },
+      function: HEIGHT_LERP,
+      outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+      fn: { inputs: {}, outputs: ["hl/body"], output: "hl/body", outputNames: [""] },
+    });
+    const graph = makeGraph([call, constant3("hl/body", [0.25, 0.5, 0.75]), ...heightLerp(0.5, 0).slice(1)], pin("hl", 0, RGB_MASK));
+    const result = await bake(graph, await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+  });
+
+  it("SmoothThreshold stays unsupported (no public definition available)", async () => {
+    const graph = makeGraph(
+      [node("st", "FunctionCall", { inputs: { Input: pin("height", 0, RGB_MASK) }, function: SMOOTH_THRESHOLD }), textureSample("height", "T_Height", "Masks")],
+      pin("st"),
+    );
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining(["SmoothThreshold"]) });
+  });
+
+  it("graphPathTextures reports no textures when the BaseColor path reads an unsupported node", () => {
+    // Positive control first: a readable path names its texture, so the undefined below comes from the unsupported node.
+    expect(graphPathTextures(makeGraph([textureSample("bark", "T_Bark")], pin("bark", 0, RGB_MASK)))).toEqual(["T_Bark"]);
+    const blocked = makeGraph(
+      [multiply("m", pin("bark", 0, RGB_MASK), pin("st")), textureSample("bark", "T_Bark"), node("st", "FunctionCall", { function: SMOOTH_THRESHOLD })],
+      pin("m", 0, RGB_MASK),
+    );
+    expect(graphPathTextures(blocked)).toBeUndefined();
+  });
+
+  it("supportedEngineFunctions lists HeightLerp", () => {
+    expect(supportedEngineFunctions()).toContain("HeightLerp");
+    expect(supportedEngineFunctions()).not.toContain("SmoothThreshold");
   });
 });

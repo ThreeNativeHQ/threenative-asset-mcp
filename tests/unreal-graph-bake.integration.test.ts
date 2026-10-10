@@ -339,6 +339,31 @@ describe("createGraphBaker", () => {
     expect((await plain({ materialName: "s", lookupName: "MI_Rock", assets, readProps, objectRadius: () => { throw new Error("radius asked for a graph that does not read it"); } })).status).toBe("baked");
   });
 
+  it("probes the BaseColor textures of a readable path only, never those a partial compile reaches past an unsupported node", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    // BaseColor = mask x SmoothThreshold(mask): the SmoothThreshold function has no body in the pack, so the bake cannot run.
+    const blocked = materialGraphSchema.parse({
+      format: 1,
+      material: "M_Master",
+      package: "/Game/Test/M_Master",
+      truncated: false,
+      nodeCount: 3,
+      outputs: { baseColor: pin("mul", [1, 1, 1, 0]), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+      nodes: [
+        node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: "/Game/Test/T_MasterMask.T_MasterMask", samplerType: "Masks" }),
+        node("gate", "FunctionCall", { function: "/Engine/Functions/Engine_MaterialFunctions02/SmoothThreshold", inputs: { Input0: pin("mask", [1, 1, 1, 0]) } }),
+        node("mul", "Multiply", { inputs: { A: pin("mask", [1, 1, 1, 0]), B: pin("gate") } }),
+      ],
+    });
+    const probeBlocked = createGraphBaker({ sourceDir, dumpGraphs: async () => new Map([["M_Master", blocked]]) })!;
+    const blockedOutcome = await probeBlocked({ materialName: "MI_Rock", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(blockedOutcome.baseColourTextures).toBeUndefined();
+
+    const probeReadable = createGraphBaker({ sourceDir, dumpGraphs: async () => new Map([["M_Master", masterGraph()]]) })!;
+    const readableOutcome = await probeReadable({ materialName: "MI_Rock", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(readableOutcome.baseColourTextures).toEqual(["T_InstanceMask"]);
+  });
+
   it("is unavailable without a source package and does not touch the converter", async () => {
     const { sourceDir, assets, readProps } = await fixture();
     let dumps = 0;

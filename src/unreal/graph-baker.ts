@@ -86,7 +86,8 @@ export type GraphBakeOutcome = BakeResult & {
   readonly vertexColorOnBaseColor?: boolean;
   /**
    * Probe only: the textures the active BaseColor path samples, and whether the instance chain overrides a static
-   * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first.
+   * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first. Absent when that path
+   * has a node the evaluator cannot read, since a bake of it would fail too.
    */
   readonly baseColourTextures?: readonly string[];
   readonly switchOverridden?: boolean;
@@ -255,8 +256,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       }
     })());
 
-  // Active BaseColor-path texture names per graph and parameter set (probe results).
-  const pathTextures = new Map<string, string[]>();
+  // Active BaseColor-path texture names per graph and parameter set (probe results); undefined when the path is unreadable.
+  const pathTextures = new Map<string, string[] | undefined>();
   // Decoded textures, shared across every section of the import.
   const rasters = new Map<string, Promise<TextureRaster | undefined>>();
   const rasterSizes = new Map<string, number>();
@@ -334,17 +335,18 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       // Unreal applies a mesh's vertex colours only where the graph reads VertexColor; glTF multiplies COLOR_0 into
       // every base colour. The importer drops COLOR_0 when the BaseColor path does not read it.
       const readable = !graph.truncated && !graph.error;
+      // Textures are reported only for a path that compiles without unsupported nodes. A partial compile reaches textures the
+      // bake never samples (those under an unsupported node), so trusting them would keep or drop a binding on evidence the
+      // bake cannot confirm; the importer then asks for the bake itself.
+      const pathKey = `${graph.package}|${parametersKey(parameters)}`;
+      if (readable && !pathTextures.has(pathKey)) pathTextures.set(pathKey, graphPathTextures(graph, parameters));
+      const names = readable ? pathTextures.get(pathKey) : undefined;
       return {
         ...unavailable(`${graph.material} has a BaseColor output`),
         ...(readable
           ? {
               vertexColorOnBaseColor: graphPathClasses(graph, "baseColor", parameters).includes("VertexColor"),
-              baseColourTextures: (pathTextures.get(`${graph.package}|${parametersKey(parameters)}`) ??
-                (() => {
-                  const names = graphPathTextures(graph, parameters);
-                  pathTextures.set(`${graph.package}|${parametersKey(parameters)}`, names);
-                  return names;
-                })()),
+              ...(names ? { baseColourTextures: names } : {}),
               switchOverridden: chain.some((props) => props.switchOverrides.length > 0),
             }
           : {}),

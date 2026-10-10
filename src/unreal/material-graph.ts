@@ -222,6 +222,7 @@ const SUPPORTED_ENGINE_FUNCTIONS = [
   "VectorLength",
   "RemapValueRange",
   "LinearGradient",
+  "HeightLerp",
 ] as const;
 
 /**
@@ -548,6 +549,11 @@ const LINEAR_GRADIENT_NOTE =
 
 const VERTEX_COLOR_WHITE_NOTE =
   "VertexColor evaluated as white: the mesh carries no vertex colours (Unreal's default); an instance painted in a level would differ";
+
+/** HeightLerp's output names in pin order, used when the dump carries none (the public UE 4.27 texturing docs). */
+const HEIGHT_LERP_OUTPUTS = ["Results", "Alpha", "Lerp Alpha No Contrast"] as const;
+const HEIGHT_LERP_NOTE =
+  "HeightLerp: engine body unavailable; evaluated as the public texturing docs describe it (Transition Phase 0.5 is a standard lerp of A and B by the height, with CheapContrast on the height for Alpha), so the transition curve is an approximation";
 
 class Compiler {
   registers = new Float64Array(256);
@@ -1716,10 +1722,11 @@ class Compiler {
       const operands = this.engineOperands(node, "in", "contrast", name!);
       if (!operands) return this.constant([0], 1);
       const [input, contrast] = operands;
-      const stretched = this.lerp(this.unary(contrast, (x) => -x), this.unary(contrast, (x) => 1 + x), input);
-      return this.unary(stretched, (x) => (x < 0 ? 0 : x > 1 ? 1 : x));
+      return this.cheapContrast(input, contrast);
     }
     if (lower === "hueshift") return this.hueShift(node, name!);
+    // A pack that carries its own HeightLerp body keeps it (the body path below); only the engine's own function is evaluated here.
+    if (lower === "heightlerp" && node.fn?.outputs[output] == null) return this.heightLerp(node, output, name!);
     if (!node.fn?.outputs.some(Boolean)) {
       const layered = this.layerFunction(node, lower, name!, output);
       if (layered) return layered;
@@ -1814,6 +1821,60 @@ class Compiler {
     if (name) this.classes.add(name);
     this.walkInputs(node);
     return this.constant([0], 1);
+  }
+
+  /** CheapContrast(In, Contrast): lerp(-Contrast, 1 + Contrast, In), clamped to 0..1. */
+  private cheapContrast(input: Val, contrast: Val): Val {
+    const stretched = this.lerp(this.unary(contrast, (x) => -x), this.unary(contrast, (x) => 1 + x), input);
+    return this.unary(stretched, (x) => (x < 0 ? 0 : x > 1 ? 1 : x));
+  }
+
+  /**
+   * HeightLerp(A, B, Transition Phase, Height Texture, Contrast), by the pins and outputs of the public UE 4.27 texturing
+   * docs: Results = lerp(A, B, Alpha), Alpha = the height with CheapContrast applied, Lerp Alpha No Contrast = the height.
+   * The docs call Transition Phase 0.5 the standard lerp and say other phases bias the transition toward the bottom or top
+   * of the heightmap without giving the curve, so only 0.5 is evaluated: any other phase, or one that varies per texel, is
+   * unsupported. Outputs are matched by the dump's output names, or by the documented order when it has none.
+   */
+  private heightLerp(node: GraphNode, output: number, name: string): Compiled {
+    const outputName = (node.outputNames?.[output] ?? HEIGHT_LERP_OUTPUTS[output] ?? "").toLowerCase();
+    // The Spruce dump names function pins Input0..Input4; the docs give the pins in this order but no numbering, so the
+    // positions are inferred from that dump's wiring: Input0/Input1 are colour values, Input2 a per-texel phase, Input3 a
+    // texture channel (the height), Input4 a constant contrast. Pin names are the fallback for a dump that carries them.
+    // The phase and the height decide every output, so both are compiled for all of them. Each output then compiles only the pins
+    // it reads (Results: A, B, Contrast; Alpha: Contrast; Lerp Alpha No Contrast: neither), so an unsupported node wired to an
+    // unused pin is not part of the value and is not reported.
+    const phase = this.vec(this.namedPin(node, ["transitionphase", "input2"]), `${name}.Transition Phase`);
+    const height = this.vec(this.namedPin(node, ["heighttexture", "input3"]), `${name}.Height Texture`);
+    if (!phase || !height) return this.markUnavailable(`${name} ${node.id} is missing an input`);
+    if (!phase.konst || this.registers[phase.reg] !== 0.5) {
+      this.unsupported.add(`${name} (Transition Phase ${phase.konst ? this.registers[phase.reg] : "varies"})`);
+      this.classes.add(name);
+      this.walkInputs(node);
+      return this.constant([0], 1);
+    }
+    this.approximations.add(HEIGHT_LERP_NOTE);
+    const raw = this.gather(height, [0]);
+    switch (outputName) {
+      case "results": {
+        const a = this.vec(this.namedPin(node, ["a", "input0"]), `${name}.A`);
+        const b = this.vec(this.namedPin(node, ["b", "input1"]), `${name}.B`);
+        const contrast = this.vec(this.namedPin(node, ["contrast", "input4"]), `${name}.Contrast`);
+        if (!a || !b || !contrast) return this.markUnavailable(`${name} ${node.id} is missing an input`);
+        return this.lerp(a, b, this.cheapContrast(raw, contrast));
+      }
+      case "alpha": {
+        const contrast = this.vec(this.namedPin(node, ["contrast", "input4"]), `${name}.Contrast`);
+        if (!contrast) return this.markUnavailable(`${name} ${node.id} is missing an input`);
+        return this.cheapContrast(raw, contrast);
+      }
+      case "lerp alpha no contrast":
+        return raw;
+      default:
+        this.unsupported.add(`${name} (output ${outputName || output})`);
+        this.classes.add(name);
+        return this.constant([0], 1);
+    }
   }
 
   /**
@@ -2117,10 +2178,12 @@ export function graphPathClasses(graph: MaterialGraph, output: "baseColor", para
 
 /**
  * Names of the textures the active BaseColor path samples (static switches followed to their chosen branch), in
- * compile order. Empty when the path is unreadable or samples none.
+ * compile order. Undefined when the path is not fully readable: an unsupported or unavailable node on it means the
+ * textures a compile reached are not the ones a bake would sample, so a caller must not act on them.
  */
-export function graphPathTextures(graph: MaterialGraph, parameters: GraphParameters = NO_PARAMETERS): string[] {
+export function graphPathTextures(graph: MaterialGraph, parameters: GraphParameters = NO_PARAMETERS): string[] | undefined {
   const { compiler } = compile(graph, parameters, { allowUvSetFallback: true });
+  if (compiler.unsupported.size > 0 || compiler.unavailable.length > 0) return undefined;
   return [...new Set(compiler.slots.map((slot) => slot.name))];
 }
 
