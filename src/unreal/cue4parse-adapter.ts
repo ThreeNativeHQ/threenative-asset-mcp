@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.66",
+  version: "b4e95441+threenative.67",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -1159,6 +1159,33 @@ static List<Dictionary<string, object?>> DumpSlots(UObject mesh, IPackage packag
             slots.Add(DumpSlot("", DumpPath(package, material)));
     return slots;
 }
+// The name a material's Materials/<name>.mat and .props.txt are written under. One run can export two
+// packages with one object name: a MetaHuman instance (Kellan/Face/MI_X) whose parent is a same-named
+// instance in Common/ (Common/Face/MI_X). The first package to claim a name keeps it; a later package of
+// that name, told apart by its package path, gets "<name>__2" (then __3, ...), so it can no longer
+// overwrite the instance's own overrides, and the child's Parent line names the suffixed sidecar. A
+// package without a known path never counts as different.
+static string MaterialSidecarName(Dictionary<string, string> owners, string name, string? packagePath)
+{
+    var identity = packagePath ?? "";
+    var candidate = name;
+    for (var suffix = 2; ; suffix++)
+    {
+        if (!owners.TryGetValue(candidate, out var owner))
+        {
+            owners[candidate] = identity;
+            return candidate;
+        }
+        if (owner.Length == 0 || identity.Length == 0 || owner.Equals(identity, StringComparison.OrdinalIgnoreCase))
+        {
+            // The spelling first claimed, so one package always lands on one file.
+            var claimed = owners.Keys.First(key => key.Equals(candidate, StringComparison.OrdinalIgnoreCase));
+            if (owner.Length == 0 && identity.Length > 0) owners[claimed] = identity;
+            return claimed;
+        }
+        candidate = name + "__" + suffix;
+    }
+}
 // A MaterialInstanceConstant's TextureParameterValues. CUE4Parse fills the typed array only after
 // UMaterialInstance.Deserialize returns; on a UE4 package inside a UE5 artifact (UE 4.25 materials
 // beside UE 5.1 meshes) it throws on the UE5-only cached-data flag first, so the typed array stays
@@ -1319,6 +1346,8 @@ Exception? lastLoadError = null;
 var textureFailures = new List<string>();
 var selectedExportTypes = new HashSet<string>(StringComparer.Ordinal);
 var exportedMaterials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+// Materials/<name>.mat and .props.txt per sidecar name -> the package that owns it (see MaterialSidecarName).
+var materialSidecarOwners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var exportedSprites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 var exportedMeshes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 var assetLookupDiagnostics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1465,8 +1494,14 @@ async Task ExportMaterialAsync(string initialName, string? initialPath = null)
     {
         var materialName = next.Name;
         if (!exportedMaterials.Add(next.Path ?? materialName)) continue;
+        var sidecarName = MaterialSidecarName(materialSidecarOwners, materialName, next.Path);
         var materialKey = MaterialKey(materialName, next.Path);
         if (materialKey is null) continue;
+        // A parent whose own package is not in the pack falls back to the first package of its name. When that is one
+        // this run already wrote (the instance itself, for a same-named parent), writing it again under the parent's
+        // sidecar name would only make the instance its own parent: the parent stays absent instead.
+        if (next.Path is not null && !GamePackagePath(materialKey).Equals(next.Path, StringComparison.OrdinalIgnoreCase) &&
+            exportedMaterials.Contains(GamePackagePath(materialKey))) continue;
         IPackage package;
         try { package = provider.LoadPackage(materialKey); } catch { continue; }
         var exports = package.GetExports().ToArray();
@@ -1501,22 +1536,25 @@ async Task ExportMaterialAsync(string initialName, string? initialPath = null)
         }
 
         var parentName = "";
+        var parentSidecar = "";
         string? parentPath = null;
         if (material.TryGetValue<FPackageIndex>(out var parent, "Parent") && !parent.IsNull && parent.Name != "None")
         {
             parentName = parent.Name;
             try { parentPath = ResolvedPackagePath(package.ResolvePackageIndex(parent)); } catch { parentPath = null; }
             pending.Enqueue((parentName, parentPath));
+            // Claimed now, so this instance's Parent line names the sidecar the parent is written under.
+            parentSidecar = MaterialSidecarName(materialSidecarOwners, parentName, parentPath);
         }
 
         references = references.Distinct().ToList();
         var materialDirectory = Path.Combine(output, "Materials");
         Directory.CreateDirectory(materialDirectory);
         var mat = string.Join("\n", references.Select((entry, index) => $"Other[{index}]={entry.Texture}")) + "\n";
-        await File.WriteAllTextAsync(Path.Combine(materialDirectory, materialName + ".mat"), mat);
+        await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".mat"), mat);
         var props = new StringBuilder();
         // The parent's package path lets the importer pick between same-named parents.
-        if (parentName.Length > 0) props.AppendLine($"Parent = Material'{(parentPath is null ? parentName : parentPath)}.{parentName}'");
+        if (parentName.Length > 0) props.AppendLine($"Parent = Material'{(parentPath is null ? parentName : parentPath)}.{parentSidecar}'");
         if (material is UMaterial baseMaterial)
         {
             props.AppendLine($"BlendMode = {baseMaterial.BlendMode}");
@@ -1541,7 +1579,7 @@ async Task ExportMaterialAsync(string initialName, string? initialPath = null)
             props.AppendLine("    }");
         }
         props.AppendLine("}");
-        await File.WriteAllTextAsync(Path.Combine(materialDirectory, materialName + ".props.txt"), props.ToString());
+        await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".props.txt"), props.ToString());
 
         foreach (var textureName in references.Select(entry => entry.Texture).Distinct(StringComparer.OrdinalIgnoreCase))
         {

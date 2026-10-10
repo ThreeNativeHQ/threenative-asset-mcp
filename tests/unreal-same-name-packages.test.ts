@@ -153,6 +153,52 @@ describe("same-named UE5 packages", () => {
   });
 });
 
+describe("an instance whose parent shares its name (MetaHuman Kellan/MI_X -> Common/MI_X)", () => {
+  const MESH = ["AssetImportData", "StaticMesh", "MeshDescriptionBulkData"];
+  const MATERIAL = ["MaterialInstanceConstant", "MaterialInstanceBasePropertyOverrides"];
+  const props = (parent: string, parameters: Record<string, string>) =>
+    `text:Parent = Material'${parent}'\nBlendMode = BLEND_Opaque\nCollectedTextureParameters[${Object.keys(parameters).length}] =\n{\n` +
+    Object.entries(parameters)
+      .map(([name, texture], index) => `    CollectedTextureParameters[${index}] =\n    {\n        Texture = Texture2D'${texture}.${texture}'\n        Name = ${name}\n        Group = None\n    }\n`)
+      .join("") +
+    "}\n";
+
+  it("binds the instance's own override, reading the parent from the suffixed sidecar converter 67 writes it under", async () => {
+    const root = await scratch();
+    const glb = join(root, "head.glb");
+    await triangle(glb, 1, "MI_Head");
+    const own = join(root, "T_Head_D.png");
+    const fallback = join(root, "T_Default_White.png");
+    await writePng(own, [200, 120, 90, 255], 4);
+    await writePng(fallback, [255, 255, 255, 255], 4);
+    // The isolated run of Kellan's instance: its own sidecar keeps the name, the same-named Common parent is MI_Head__2.
+    const chain = {
+      "Materials/MI_Head.mat": "text:Other[0]=T_Head_D\n",
+      "Materials/MI_Head.props.txt": props("/Game/Common/Face/MI_Head.MI_Head__2", { BaseColor: "T_Head_D" }),
+      "Materials/MI_Head__2.mat": "text:Other[0]=T_Default_White\n",
+      "Materials/MI_Head__2.props.txt": props("/Game/Common/M_Skin.M_Skin", {}),
+      "Materials/M_Skin.mat": "text:Other[0]=T_Default_White\n",
+      "Materials/M_Skin.props.txt": props("", { BaseColor: "T_Default_White" }).replace("Parent = Material''\n", ""),
+      "Materials/T_Head_D.png": own,
+      "Materials/T_Default_White.png": fallback,
+    };
+    const { report } = await runImport(root, { "Kellan/Face/MI_Head": MATERIAL, "Common/Face/MI_Head": MATERIAL, "Kellan/Face/SM_Head": MESH }, {
+      "": { "Meshes/SM_Head.glb": glb, "Meshes/SM_Head.materials.json": 'text:{"MI_Head":"/Game/Kellan/Face/MI_Head"}', ...chain },
+      "Kellan/Face/MI_Head": chain,
+      "Common/Face/MI_Head": {
+        "Materials/MI_Head.mat": "text:Other[0]=T_Default_White\n",
+        "Materials/MI_Head.props.txt": props("/Game/Common/M_Skin.M_Skin", {}),
+        "Materials/M_Skin.mat": "text:Other[0]=T_Default_White\n",
+        "Materials/M_Skin.props.txt": props("", { BaseColor: "T_Default_White" }).replace("Parent = Material''\n", ""),
+        "Materials/T_Default_White.png": fallback,
+      },
+    });
+    const section = report.models.find((model) => model.name === "SM_Head")?.materials[0];
+    expect(section?.bindings.find((binding) => binding.slot === "baseColor")?.texture).toBe("T_Head_D");
+    expect(section?.bindings.some((binding) => binding.texture === "T_Default_White")).toBe(false);
+  });
+});
+
 describe("same-named UE4.26 packages on the MeshDescription route", () => {
   /** An uncooked 4.26 editor mesh head: legacy -7, object version 522, editor-only names. */
   function ue4Package(): Buffer {

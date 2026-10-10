@@ -208,6 +208,17 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
     expect(CUE4PARSE_PROGRAM).not.toContain("foreach (var parameter in instance.TextureParameterValues)");
   });
 
+  it("writes a material under the sidecar name it claimed and points the instance's Parent line at its parent's", () => {
+    // Without this a same-named parent (Kellan/MI_X -> Common/MI_X) overwrote the instance's Materials/MI_X.props.txt.
+    expect(CUE4PARSE_PROGRAM).toContain("var sidecarName = MaterialSidecarName(materialSidecarOwners, materialName, next.Path);");
+    expect(CUE4PARSE_PROGRAM).toContain("parentSidecar = MaterialSidecarName(materialSidecarOwners, parentName, parentPath);");
+    expect(CUE4PARSE_PROGRAM).toContain('Path.Combine(materialDirectory, sidecarName + ".props.txt")');
+    expect(CUE4PARSE_PROGRAM).toContain('Path.Combine(materialDirectory, sidecarName + ".mat")');
+    expect(CUE4PARSE_PROGRAM).not.toContain('Path.Combine(materialDirectory, materialName + ".props.txt")');
+    // A parent missing from the pack must not fall back to the same-named instance already written (a self-parent).
+    expect(CUE4PARSE_PROGRAM).toContain("exportedMaterials.Contains(GamePackagePath(materialKey))) continue;");
+  });
+
   it("names a compact FName layout it refuses instead of a bare 'no readable source model'", () => {
     expect(CUE4PARSE_PROGRAM).toContain("ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles)");
     expect(CUE4PARSE_PROGRAM).toContain("ReadMeshDescriptionLayout(raw, compactNames: true, 0)");
@@ -247,6 +258,8 @@ describe.skipIf(!haveDotnet)("UE5 editor source decoders (compiled from the embe
       "static EditorMesh ReadMeshDescription(",
       // Absent before converter 61; the old reader is the single function above.
       ...(CUE4PARSE_PROGRAM.includes("static EditorMesh ReadMeshDescriptionLayout(") ? ["static EditorMesh ReadMeshDescriptionLayout("] : []),
+      // Absent before converter 67.
+      ...(CUE4PARSE_PROGRAM.includes("static string MaterialSidecarName(") ? ["static string MaterialSidecarName("] : []),
     ].map((signature) => extractCSharp(CUE4PARSE_PROGRAM, signature));
     const record = CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("sealed record EditorMesh("));
     const editorMesh = record.slice(0, record.indexOf(");") + 2);
@@ -261,6 +274,14 @@ if (args[0] == "delta")
     var size = args[2].Split('x').Select(int.Parse).ToArray();
     UndoUeDelta(data, 0, size[0], size[1], bytesPerPixel, sampleBytes);
     File.WriteAllBytes(args[1] + ".out", data);
+}
+else if (args[0] == "sidecar")
+{
+    // Each argument is "Name" or "Name=/Game/Package/Path": the sidecar name each claim gets, in order.
+    ${CUE4PARSE_PROGRAM.includes("static string MaterialSidecarName(")
+      ? `var owners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    Console.WriteLine(string.Join(" ", args.Skip(1).Select(claim => claim.Split('=')).Select(parts => MaterialSidecarName(owners, parts[0], parts.Length > 1 ? parts[1] : null))));`
+      : `Console.WriteLine(string.Join(" ", args.Skip(1).Select(claim => claim.Split('=')[0])));`}
 }
 else
 {
@@ -352,6 +373,14 @@ ${editorMesh}
     const classic = join(root, "mesh-classic-tail.bin");
     await writeFile(classic, Buffer.concat([meshDescription(["SlotA"], false), Buffer.from([0, 1, 2, 3, 4, 5, 6, 7])]));
     expect(run("mesh", classic)).toMatch(/^error /);
+  });
+
+  it("gives a second package of one material name its own sidecar name, so it cannot overwrite the first", () => {
+    // A MetaHuman instance and its same-named parent in Common/, then the parent claimed again, an unrelated material, and a
+    // claim without a package path (it never counts as a different package).
+    expect(run("sidecar", "MI_Head=/Game/Kellan/Face/MI_Head", "mi_head=/Game/Common/Face/MI_Head", "MI_Head=/Game/Common/Face/MI_Head", "M_Skin=/Game/Common/M_Skin", "MI_Head")).toBe(
+      "MI_Head mi_head__2 mi_head__2 M_Skin MI_Head",
+    );
   });
 
   it("refuses a compact FName attribute with several distinct names rather than guess the mapping", async () => {
