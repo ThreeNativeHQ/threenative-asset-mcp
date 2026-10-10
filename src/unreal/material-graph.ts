@@ -186,6 +186,7 @@ const SUPPORTED_NODE_CLASSES = [
   "Floor",
   "Sine",
   "SmoothStep",
+  "HairColor",
   "SquareRoot",
   "CrossProduct",
 ] as const;
@@ -443,6 +444,11 @@ interface Val {
   uvScale?: [number, number];
   /** The value derives from `WorldPosition`: a texture sampled at it has no UV-space meaning, so its average stands in. */
   world?: true;
+  /**
+   * A literal of the graph: a Constant node, an unwired default, or arithmetic on those alone. Only these are constants to
+   * Unreal's translator; a parameter or Time is known here at bake time but is a run-time value there.
+   */
+  literal?: true;
 }
 /**
  * A scalar attribute the bake carries beside BaseColor: the closed set a BaseColor or cut-out path reads through Break, Get
@@ -538,6 +544,28 @@ const BREAK_ATTRIBUTES = ["BaseColor", "Metallic", "Specular", "Roughness", "Emi
 const pinKey = (name: string): string => name.toLowerCase().replace(/[^a-z0-9]/g, "");
 /** Every attribute a SetMaterialAttributes pin can be named for. A pin with one of these names is an override, never the incoming attributes. */
 const RECOGNISED_PINS = new Set([...BREAK_ATTRIBUTES, ...Object.keys(MATERIAL_ATTRIBUTE_GUIDS)].map(pinKey));
+/** A value clamped to [0, 1]; NaN stays NaN. */
+const saturate = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
+/** Two pins wired to one output with one mask carry one value; Unreal's translator tests the same thing by compiled chunk index. */
+const sameWire = (a: GraphInput | null | undefined, b: GraphInput | null | undefined): boolean =>
+  !!a && !!b && a.node === b.node && a.output === b.output && JSON.stringify(a.mask ?? null) === JSON.stringify(b.mask ?? null);
+/**
+ * SmoothStep over constants, as Unreal folds it: 0 below the lower bound, 1 at or above the upper one, and the Hermite ramp
+ * between. Reversed bounds never reach the ramp, so they switch at the lower bound.
+ */
+const foldedSmoothStep = (low: number, high: number, x: number): number => {
+  if (x < low) return 0;
+  if (x >= high) return 1;
+  const t = (x - low) / (high - low);
+  return t * t * (3 - 2 * t);
+};
+/** The longitudinal width at which Unreal's hair shading (UE 5.8) takes its absorption fit. */
+const HAIR_BETA = 0.3;
+/** The absorption-to-colour scale at HAIR_BETA: a degree-5 polynomial in beta, from the practical hair model Unreal's shader cites. */
+const HAIR_SCALE = [5.969, -0.215, 2.532, -10.73, 5.574, 0.245].reduce((sum, coefficient, power) => sum + coefficient * HAIR_BETA ** power, 0);
+/** Absorption per unit of melanin for each channel: eumelanin (black), pheomelanin (red), from the energy-conserving hair model. */
+const EUMELANIN_ABSORPTION = [0.506, 0.841, 1.653];
+const PHEOMELANIN_ABSORPTION = [0.343, 0.733, 1.924];
 
 interface CompileOptions {
   allowUvSetFallback: boolean;
@@ -678,6 +706,8 @@ class Compiler {
   readonly program: Instruction[] = [];
   readonly unsupported = new Set<string>();
   readonly unavailable: string[] = [];
+  /** Refusals found while the program runs, at a texel the compile could not settle; `evaluate` returns the first one. */
+  readonly runtimeRefusals: string[] = [];
   readonly approximations = new Set<string>();
   readonly classes = new Set<string>();
   readonly slots: TextureSlot[] = [];
@@ -727,9 +757,10 @@ class Compiler {
     const reg = this.allocate();
     const instruction = build(reg);
     const world = inputs.some((input) => input.world) ? ({ world: true } as const) : {};
+    const literal = inputs.every((input) => input.literal) ? ({ literal: true } as const) : {};
     if (!texelDependent && inputs.every((input) => input.konst)) {
       instruction(this.registers, { u: 0, v: 0 });
-      return { kind: "vec", reg, n, konst: true, ...world };
+      return { kind: "vec", reg, n, konst: true, ...world, ...literal };
     }
     this.program.push(instruction);
     return { kind: "vec", reg, n, konst: false, ...world };
@@ -977,7 +1008,7 @@ class Compiler {
     const wired = node.inputs[pinName];
     if (wired) return this.vec(wired, `${node.class}.${pinName}`) ?? this.constant([fallback], 1);
     const stored = node.constants[constantName];
-    return this.constant([typeof stored === "number" ? stored : fallback], 1);
+    return { ...this.constant([typeof stored === "number" ? stored : fallback], 1), literal: true };
   }
 
   /** Value of a static-bool pin, which must reduce to a constant. */
@@ -1049,11 +1080,11 @@ class Compiler {
       }
       case "Constant": {
         const r = node.constants.R;
-        return this.constant([typeof r === "number" ? r : 0], 1);
+        return { ...this.constant([typeof r === "number" ? r : 0], 1), literal: true };
       }
       case "Constant2Vector": {
         const { R, G } = node.constants;
-        return this.constant([typeof R === "number" ? R : 0, typeof G === "number" ? G : 0], 2);
+        return { ...this.constant([typeof R === "number" ? R : 0, typeof G === "number" ? G : 0], 2), literal: true };
       }
       case "Constant3Vector":
       case "Constant4Vector": {
@@ -1061,7 +1092,7 @@ class Compiler {
         const values = Array.isArray(packed)
           ? packed
           : ["R", "G", "B", "A"].map((name) => (typeof node.constants[name] === "number" ? (node.constants[name] as number) : 0));
-        return this.constant([values[0] ?? 0, values[1] ?? 0, values[2] ?? 0, values[3] ?? 0], node.class === "Constant3Vector" ? 3 : 4);
+        return { ...this.constant([values[0] ?? 0, values[1] ?? 0, values[2] ?? 0, values[3] ?? 0], node.class === "Constant3Vector" ? 3 : 4), literal: true };
       }
       // Class defaults below are Unreal's; the dumper omits a constant that equals its default.
       case "Multiply": {
@@ -1228,6 +1259,8 @@ class Compiler {
       }
       case "SmoothStep":
         return this.smoothStep(node);
+      case "HairColor":
+        return this.hairColor(node);
       case "SquareRoot": {
         // HLSL sqrt; a negative input (NaN on the GPU) is taken as 0.
         const input = this.vec(node.inputs.Input, "SquareRoot.Input");
@@ -1374,8 +1407,12 @@ class Compiler {
   }
 
   /**
-   * SmoothStep(Min, Max, Value) = t * t * (3 - 2t) with t = saturate((Value - Min) / (Max - Min)), HLSL's smoothstep.
-   * Unwired pins take ConstMin 0, ConstMax 1 and ConstValue 0, Unreal's defaults; Max = Min is guarded like Divide.
+   * SmoothStep(Min, Max, Value), settled the way Unreal's translator settles it before any division. A Value from Min's source
+   * is 0 and one from Max's source is 1; the Min check runs last, so one source for all three is 0. Min and Max from one source,
+   * or equal literals, make a step (Value >= Min). All-literal inputs fold as Unreal's constant rule does. Otherwise the HLSL
+   * ramp runs per texel, t = saturate((Value - Min) / (Max - Min)). A parameter or Time is a run-time value to Unreal, so it
+   * takes the ramp even when the bake knows it. A texel where Min and Max from different sources are equal has no defined GPU
+   * result, so the bake refuses there instead of dividing by a made-up span.
    */
   private smoothStep(node: GraphNode): Compiled {
     const low = this.operand(node, "Min", "ConstMin", 0);
@@ -1384,13 +1421,68 @@ class Compiler {
     const n = Math.max(low.n, high.n, value.n);
     const stride = (operand: Val) => (operand.n === 1 ? 0 : 1);
     const [sl, sh, sv] = [stride(low), stride(high), stride(value)];
-    return this.emit([low, high, value], n, (o) => (r) => {
+    const inputs = [low, high, value];
+    if (sameWire(node.inputs.Value, node.inputs.Min)) return { ...this.constant([0], n), literal: true };
+    if (sameWire(node.inputs.Value, node.inputs.Max)) return { ...this.constant([1], n), literal: true };
+    if (sameWire(node.inputs.Min, node.inputs.Max) || this.sameConstant(low, high)) {
+      return this.emit(inputs, n, (o) => (r) => {
+        for (let index = 0; index < 4; index++) r[o + index] = r[value.reg + index * sv]! >= r[low.reg + index * sl]! ? 1 : 0;
+      });
+    }
+    if (low.literal && high.literal && value.literal) {
+      return this.emit(inputs, n, (o) => (r) => {
+        for (let index = 0; index < 4; index++) r[o + index] = foldedSmoothStep(r[low.reg + index * sl]!, r[high.reg + index * sh]!, r[value.reg + index * sv]!);
+      });
+    }
+    const refusal = `SmoothStep ${node.id}: Min and Max from different sources are equal at a texel, where the GPU's result is undefined`;
+    return this.emit(inputs, n, (o) => (r) => {
       for (let index = 0; index < 4; index++) {
         const min = r[low.reg + index * sl]!;
         const span = r[high.reg + index * sh]! - min;
-        const raw = (r[value.reg + index * sv]! - min) / (Math.abs(span) < 1e-6 ? (span < 0 ? -1e-6 : 1e-6) : span);
+        if (span === 0) {
+          // A channel past the result's width is unused, and an RGB input holds no value in its alpha register.
+          if (index < n && !this.runtimeRefusals.includes(refusal)) this.runtimeRefusals.push(refusal);
+          r[o + index] = 0;
+          continue;
+        }
+        const raw = (r[value.reg + index * sv]! - min) / span;
         const t = raw < 0 ? 0 : raw > 1 ? 1 : raw;
         r[o + index] = t * t * (3 - 2 * t);
+      }
+    });
+  }
+
+  /** Two literals of one width holding the same values: Unreal compares the constant values, not their wires. */
+  private sameConstant(a: Val, b: Val): boolean {
+    if (!a.literal || !b.literal || a.n !== b.n) return false;
+    for (let index = 0; index < a.n; index++) if (this.registers[a.reg + index] !== this.registers[b.reg + index]) return false;
+    return true;
+  }
+
+  /**
+   * HairColor(Melanin, Redness, DyeColor): Unreal's hair colour, as its shading function computes it. Melanin and redness
+   * saturate to [0, 1]. The melanin depth -ln(1 - melanin), floored so full melanin stays finite, splits into eumelanin
+   * (1 - redness) and pheomelanin (redness). A dye channel adds the absorption that would show that colour alone, and each
+   * channel is exp(-sqrt(absorption) * scale), which is 0 for a dye channel of 0. Unwired pins take Unreal's defaults:
+   * melanin 0.5, redness 0, white dye. A wired vector into a scalar pin reads its first component; a scalar into DyeColor
+   * broadcasts to every channel.
+   */
+  private hairColor(node: GraphNode): Compiled {
+    const melanin = this.scalarPin(node.inputs.Melanin, "HairColor.Melanin") ?? this.constant([0.5], 1);
+    const redness = this.scalarPin(node.inputs.Redness, "HairColor.Redness") ?? this.constant([0], 1);
+    const dye = this.vec(node.inputs.DyeColor, "HairColor.DyeColor") ?? this.constant([1, 1, 1], 3);
+    if (dye.n === 2) return this.markUnavailable("HairColor.DyeColor has two components, which Unreal's float3 parameter does not take");
+    const dyeStride = dye.n === 1 ? 0 : 1;
+    return this.emit([melanin, redness, dye], 3, (o) => (r) => {
+      const depth = -Math.log(Math.max(1 - saturate(r[melanin.reg]!), 1e-4));
+      const redShare = saturate(r[redness.reg]!);
+      const eumelanin = depth * (1 - redShare);
+      const pheomelanin = depth * redShare;
+      for (let channel = 0; channel < 3; channel++) {
+        // ln(colour) / scale is the absorption that shows this colour alone; a zero channel absorbs without limit.
+        const dyeAbsorption = (Math.log(saturate(r[dye.reg + channel * dyeStride]!)) / HAIR_SCALE) ** 2;
+        const absorption = eumelanin * EUMELANIN_ABSORPTION[channel]! + pheomelanin * PHEOMELANIN_ABSORPTION[channel]! + dyeAbsorption;
+        r[o + channel] = Math.exp(-Math.sqrt(absorption) * HAIR_SCALE);
       }
     });
   }
@@ -2784,6 +2876,7 @@ async function evaluate(
         texel.nz = surface.normals[at + 2]!;
       }
       for (let index = 0; index < program.length; index++) program[index]!(registers, texel);
+      if (compiler.runtimeRefusals.length > 0) return compiler.runtimeRefusals[0];
       onTexel(x, y, registers);
     }
   }

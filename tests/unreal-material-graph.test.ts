@@ -932,6 +932,81 @@ describe("HueShift", () => {
   });
 });
 
+describe("HairColor: Unreal's hair colour from melanin, redness and dye", () => {
+  const bake = (graph: MaterialGraph) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  const colourAt = async (graph: MaterialGraph): Promise<number[]> => (await pixelsOf(await bake(graph)))(0, 0);
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  /** A HairColor with the given pins, each a node of `nodes` (the HairColor is "h"). */
+  const hair = (nodes: Raw[], inputs: Raw = {}): MaterialGraph => makeGraph([node("h", "HairColor", { inputs }), ...nodes], pin("h"));
+  /** Melanin 0.6, redness 0.25 and dye (0.8, 0.5, 0.9): the sample the numbers below were calculated for. */
+  const sample = (): MaterialGraph =>
+    hair([scalar("m", 0.6), scalar("r", 0.25), constant3("d", [0.8, 0.5, 0.9])], { Melanin: pin("m"), Redness: pin("r"), DyeColor: pin("d") });
+
+  it("is a supported node class", () => {
+    expect(supportedNodeClasses()).toContain("HairColor");
+  });
+
+  it("matches an independently calculated sample", async () => {
+    // Linear values of Unreal's hair absorption formula at beta 0.3, evaluated outside the repo in float64 (python3).
+    const result = await bake(sample());
+    expect(result).toMatchObject({ status: "baked", confidence: "exact", approximations: [] });
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.0212556458), encode(0.00590210797), encode(0.000614527618)]);
+  });
+
+  it("unwired pins take Unreal's defaults: melanin 0.5, redness 0 and white dye", async () => {
+    const explicit = hair([scalar("m", 0.5), scalar("r", 0), constant3("d", [1, 1, 1])], { Melanin: pin("m"), Redness: pin("r"), DyeColor: pin("d") });
+    const unwired = await colourAt(hair([]));
+    expect(unwired).toEqual(await colourAt(explicit));
+    // The same formula at melanin 0.5, no redness and white dye: linear (0.0305840551, 0.0111555056, 0.00183079769).
+    expect(unwired).toEqual([encode(0.0305840551), encode(0.0111555056), encode(0.00183079769)]);
+  });
+
+  it("melanin 0 with the default dye is white", async () => {
+    expect(await colourAt(hair([scalar("m", 0)], { Melanin: pin("m") }))).toEqual([255, 255, 255]);
+  });
+
+  it("with no melanin, the dye shows its own colour", async () => {
+    const dyeOnly = hair([scalar("m", 0), constant3("d", [0.8, 0.5, 0.2])], { Melanin: pin("m"), DyeColor: pin("d") });
+    expect(await colourAt(dyeOnly)).toEqual([encode(0.8), encode(0.5), encode(0.2)]);
+  });
+
+  it("a dye channel of 0 gives 0 and leaves the other channels unchanged", async () => {
+    // An 8-bit bake cannot show a NaN (it also writes 0), so this checks that red is exactly 0 and green and blue are unchanged.
+    const dark = hair([scalar("m", 0.6), scalar("r", 0.25), constant3("d", [0, 0.5, 0.9])], { Melanin: pin("m"), Redness: pin("r"), DyeColor: pin("d") });
+    const [red, green, blue] = await colourAt(dark);
+    expect(red).toBe(0);
+    expect([green, blue]).toEqual((await colourAt(sample())).slice(1));
+  });
+
+  it("saturates melanin and redness to [0, 1]", async () => {
+    const at = (melanin: number, redness: number) => colourAt(hair([scalar("m", melanin), scalar("r", redness)], { Melanin: pin("m"), Redness: pin("r") }));
+    // Melanin below 0 is none: white.
+    expect(await at(-0.5, 0)).toEqual([255, 255, 255]);
+    // Melanin above 1 reads as 1; both are black in 8 bits, so this only guards the floor on 1 - melanin.
+    expect(await at(1.5, 0.25)).toEqual(await at(1, 0.25));
+    // Redness above 1 reads as 1: the eumelanin share 1 - redness would otherwise go negative.
+    expect(await at(0.6, 1.5)).toEqual(await at(0.6, 1));
+  });
+
+  it("a vector wired to Melanin or Redness reads its first component", async () => {
+    const vectors = hair([constant3("m", [0.6, 0.1, 0.9]), constant3("r", [0.25, 0.9, 0.1])], { Melanin: pin("m"), Redness: pin("r") });
+    const scalars = hair([scalar("m", 0.6), scalar("r", 0.25)], { Melanin: pin("m"), Redness: pin("r") });
+    expect(await colourAt(vectors)).toEqual(await colourAt(scalars));
+  });
+
+  it("a scalar wired to DyeColor broadcasts to every channel", async () => {
+    const scalarDye = hair([scalar("m", 0.6), scalar("d", 0.5)], { Melanin: pin("m"), DyeColor: pin("d") });
+    const vectorDye = hair([scalar("m", 0.6), constant3("d", [0.5, 0.5, 0.5])], { Melanin: pin("m"), DyeColor: pin("d") });
+    expect(await colourAt(scalarDye)).toEqual(await colourAt(vectorDye));
+  });
+
+  it("refuses a 2-component DyeColor, which has no float3 conversion", async () => {
+    const graph = hair([node("d", "Constant2Vector", { constants: { R: 0.5, G: 0.5 } })], { DyeColor: pin("d") });
+    expect(await bake(graph)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("HairColor.DyeColor") });
+  });
+});
+
 describe("SmoothStep, SquareRoot, CrossProduct, VectorLength, RemapValueRange and LinearGradient", () => {
   const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
     bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
@@ -975,6 +1050,86 @@ describe("SmoothStep, SquareRoot, CrossProduct, VectorLength, RemapValueRange an
   it("SmoothStep steps per channel of a vector Value", async () => {
     const result = await bake(makeGraph([node("s", "SmoothStep", { inputs: { Value: pin("v", 0, RGB_MASK) } }), constant3("v", [0, 0.5, 1])], pin("s")));
     expect((await pixelsOf(result))(0, 0)).toEqual([encode(0), encode(0.5), encode(1)]);
+  });
+
+  // Unreal's translator settles these before any division: a Value from Max's source is 1, one from Min's source is 0,
+  // and Min and Max from one source (or equal constants) make a step. Only the ramp itself divides.
+  it("SmoothStep settles a Value from Max's source at 1, even where Min's constant equals it", async () => {
+    const graph = makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("half"), Max: pin("v"), Value: pin("v") } }), scalar("v", 0.5), scalar("half", 0.5)], pin("s"));
+    expect((await pixelsOf(await bake(graph)))(0, 0)).toEqual(grey(1));
+  });
+
+  it("SmoothStep settles a Value from Min's source at 0, and one source for all three at 0 (the Min check runs last)", async () => {
+    const fromMin = makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("v"), Value: pin("v") }, constants: { ConstMax: 1 } }), scalar("v", 0.5)], pin("s"));
+    expect((await pixelsOf(await bake(fromMin)))(0, 0)).toEqual(grey(0));
+    const oneSource = makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("v"), Max: pin("v"), Value: pin("v") } }), scalar("v", 0.5)], pin("s"));
+    expect((await pixelsOf(await bake(oneSource)))(0, 0)).toEqual(grey(0));
+  });
+
+  it("SmoothStep with Min and Max from one source steps at the threshold: below 0, at and above 1", async () => {
+    const at = (value: number) => bake(makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("lo"), Value: pin("v") } }), scalar("lo", 0.5), scalar("v", value)], pin("s")));
+    expect((await pixelsOf(await at(0.25)))(0, 0)).toEqual(grey(0));
+    expect((await pixelsOf(await at(0.5)))(0, 0)).toEqual(grey(1));
+    expect((await pixelsOf(await at(0.75)))(0, 0)).toEqual(grey(1));
+  });
+
+  it("SmoothStep with equal constant bounds steps at the threshold, from distinct constant nodes too", async () => {
+    const at = (value: number) =>
+      bake(makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }), scalar("lo", 0.5), scalar("hi", 0.5), scalar("v", value)], pin("s")));
+    expect((await pixelsOf(await at(0.25)))(0, 0)).toEqual(grey(0));
+    expect((await pixelsOf(await at(0.5)))(0, 0)).toEqual(grey(1));
+    expect((await pixelsOf(await at(0.75)))(0, 0)).toEqual(grey(1));
+  });
+
+  it("SmoothStep with reversed constant bounds folds as Unreal's constant rule: 0 below Min, 1 from Min up", async () => {
+    // Min 0.75 above Max 0.25. The runtime ramp would give 0.5 at 0.5; the constant fold is 0 there.
+    const at = (value: number) => bake(makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }), scalar("lo", 0.75), scalar("hi", 0.25), scalar("v", value)], pin("s")));
+    expect((await pixelsOf(await at(0.5)))(0, 0)).toEqual(grey(0));
+    expect((await pixelsOf(await at(0.8)))(0, 0)).toEqual(grey(1));
+  });
+
+  it("SmoothStep refuses the bake where Min and Max from different sources meet, rather than dividing by an epsilon", async () => {
+    // T_Lo is 64 everywhere; T_Hi is 64 at texel (0, 0) and 191 elsewhere, so the two meet at one texel.
+    const textures = {
+      T_Lo: { png: await pngOf(2, 2, () => [64, 64, 64]), srgb: false },
+      T_Hi: { png: await pngOf(2, 2, (x, y) => (x === 0 && y === 0 ? [64, 64, 64] : [191, 191, 191])), srgb: false },
+    };
+    const graph = makeGraph(
+      [node("s", "SmoothStep", { inputs: { Min: pin("lo", 0, RGB_MASK), Max: pin("hi", 0, RGB_MASK), Value: pin("v") } }), textureSample("lo", "T_Lo"), textureSample("hi", "T_Hi"), scalar("v", 0.5)],
+      pin("s"),
+    );
+    expect(await bake(graph, textures)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("SmoothStep s") });
+  });
+
+  it("SmoothStep from distinct textures that never meet keeps the HLSL ramp", async () => {
+    const textures = {
+      T_Lo: { png: await pngOf(2, 2, () => [64, 64, 64]), srgb: false },
+      T_Hi: { png: await pngOf(2, 2, () => [191, 191, 191]), srgb: false },
+    };
+    const graph = makeGraph(
+      [node("s", "SmoothStep", { inputs: { Min: pin("lo", 0, RGB_MASK), Max: pin("hi", 0, RGB_MASK), Value: pin("v") } }), textureSample("lo", "T_Lo"), textureSample("hi", "T_Hi"), scalar("v", 0.5)],
+      pin("s"),
+    );
+    // t = (0.5 - 64/255) / (191/255 - 64/255) = 0.5 exactly, and smoothstep(0.5) = 0.5.
+    expect((await pixelsOf(await bake(graph, textures)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("SmoothStep reads parameter bounds as run-time values: reversed ones ramp as HLSL does, not as a constant fold", async () => {
+    // A ScalarParameter is a uniform in Unreal, not a compile-time constant, so the constant rule never applies to it.
+    const graph = makeGraph(
+      [node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }), scalarParameter("lo", "Lo", 0.75), scalarParameter("hi", "Hi", 0.25), scalar("v", 0.5)],
+      pin("s"),
+    );
+    // t = (0.5 - 0.75) / (0.25 - 0.75) = 0.5, and smoothstep(0.5) = 0.5.
+    expect((await pixelsOf(await bake(graph)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("SmoothStep refuses equal bounds from two parameters, as it does equal bounds from distinct sources", async () => {
+    const graph = makeGraph(
+      [node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }), scalarParameter("lo", "Lo", 0.5), scalarParameter("hi", "Hi", 0.5), scalar("v", 0.25)],
+      pin("s"),
+    );
+    expect(await bake(graph)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("SmoothStep s") });
   });
 
   it("SquareRoot is exact, and a negative input reads 0 instead of NaN", async () => {
