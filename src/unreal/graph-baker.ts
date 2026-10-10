@@ -93,7 +93,8 @@ export type GraphBakeOutcome = BakeResult & {
   readonly noAlbedo?: string;
   /**
    * Probe only: whether the BaseColor path reads VertexColor (after static switches). Absent when the graph is unknown,
-   * truncated or unreadable.
+   * truncated or unreadable, and when its switch choices never settle (the active path is then no path at all, so the
+   * importer must not drop a mesh's COLOR_0 on it).
    */
   readonly vertexColorOnBaseColor?: boolean;
   /**
@@ -434,14 +435,19 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       // Textures are reported only for a path that compiles without unsupported nodes. A partial compile reaches textures the
       // bake never samples (those under an unsupported node), so trusting them would keep or drop a binding on evidence the
       // bake cannot confirm; the importer then asks for the bake itself.
-      const pathKey = `${graph.package}|${parametersKey(parameters)}`;
-      if (readable && !pathTextures.has(pathKey)) pathTextures.set(pathKey, graphPathTextures(graph, parameters));
+      // The cut-out settles a shared switch alongside the colour, so the same graph under a different alpha has a
+      // different active path: the alpha is part of the key, not just of the probe that fills it.
+      const pathKey = `${graph.package}|${parametersKey(parameters)}|alpha:${request.alpha ?? "none"}`;
+      if (readable && !pathTextures.has(pathKey)) pathTextures.set(pathKey, graphPathTextures(graph, parameters, request.alpha));
       const names = readable ? pathTextures.get(pathKey) : undefined;
+      // Undefined when the switch choices never settle: the classes describe no bake, so the probe must not claim the
+      // path does not read VertexColor (that would drop a mesh's COLOR_0 on an unknown path).
+      const classes = readable ? graphPathClasses(graph, "baseColor", parameters, request.alpha) : undefined;
       return {
         ...unavailable(`${graph.material} has a BaseColor output`),
         ...(readable
           ? {
-              vertexColorOnBaseColor: graphPathClasses(graph, "baseColor", parameters).includes("VertexColor"),
+              ...(classes ? { vertexColorOnBaseColor: classes.includes("VertexColor") } : {}),
               ...(names ? { baseColourTextures: names } : {}),
               switchOverridden: chain.some((props) => props.switchOverrides.length > 0),
             }
@@ -513,7 +519,9 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         return { ...result, reason, graphMaterial: graph!.material, parameters, ...(particle ? { particle } : {}) };
       }
       const approximations = new Set(result.approximations);
-      const classes = graphPathClasses(graph!, "baseColor", parameters);
+      // A successful bake comes from a settled pass, so the classes are defined; an empty list is only the safe
+      // fallback for reporting, never a claim that the path has no class.
+      const classes = graphPathClasses(graph!, "baseColor", parameters, request.alpha) ?? [];
       if (classes.includes("StaticSwitchParameter") || classes.includes("StaticBoolParameter")) approximations.add(STATIC_SWITCH_NOTE);
       const baked: GraphBakeOutcome = {
         ...result,

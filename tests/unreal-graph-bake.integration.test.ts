@@ -182,6 +182,87 @@ function vertexColorWithOpacity(): MaterialGraph {
   return materialGraphSchema.parse({ ...graph, outputs: { ...graph.outputs, opacity: pin("opaque") }, nodes: [...graph.nodes, node("opaque", "Constant", { constants: { R: 1 } })] });
 }
 
+const ATTRIBUTE_OUTPUTS = ["BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal"];
+const ROUGHNESS = 3;
+const OPACITY_MASK = 6;
+const output = (nodeId: string, index: number, mask: number[] | null = null) => ({ node: nodeId, output: index, mask });
+const breakOf = (id: string, source: string): Raw => node(id, "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: ATTRIBUTE_OUTPUTS });
+const make = (id: string, baseColor: string, overrides: Raw = {}): Raw => node(id, "MakeMaterialAttributes", { inputs: { BaseColor: pin(baseColor), ...overrides } });
+const switchOf = (id: string, a: string, b: string, name: string): Raw => node(id, "StaticSwitchParameter", { inputs: { A: pin(a), B: pin(b) }, parameter: { name, group: "" }, default: true });
+const unboundTexture = (id: string): Raw => node(id, "TextureSampleParameter2D", { parameter: { name: "BaseTexture", group: "Base" }, default: null, texture: null, samplerType: "Color" });
+const textured = (id: string, texture: string, samplerType = "Color"): Raw => node(id, "TextureSample", { texture: `/Game/Test/${texture}.${texture}`, samplerType });
+const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+const constant3 = (id: string, rgb: number[]): Raw => node(id, "Constant3Vector", { constants: { Constant: [...rgb, 1].slice(0, 4) } });
+
+// Outer switch A reads the inner switch's BaseColor (unbound on inner A, so outer flips to B); outer B reads the inner
+// Roughness (bound on both), so it flips back to A. The two choices alternate forever: the switch set never settles.
+function cyclingSwitchGraph(): MaterialGraph {
+  const nodes: Raw[] = [
+    breakOf("reader", "outer"),
+    switchOf("outer", "makeA", "makeB", "UseOuter"),
+    make("makeA", "innerBreak"),
+    make("makeB", "innerRoughColour"),
+    breakOf("innerBreak", "inner"),
+    node("innerRoughColour", "Multiply", { inputs: { A: output("innerBreak", ROUGHNESS), B: pin("white") } }),
+    switchOf("inner", "innerA", "innerB", "UseInner"),
+    make("innerA", "unbound", { Roughness: pin("roughA") }),
+    make("innerB", "white", { Roughness: pin("roughB") }),
+    scalar("roughA", 0.2),
+    scalar("roughB", 0.8),
+    unboundTexture("unbound"),
+    constant3("white", [1, 1, 1]),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: output("reader", 0), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+    nodes,
+  });
+}
+
+// One switch read by both the colour and the cut-out. Branch A's OpacityMask is unbound, so on its own the colour keeps
+// A (bound) while the cut-out flips to B; the union flips to B, so the cut-out's alpha picks the BaseColor branch.
+// `vertexOnB` puts the VertexColor node on B's BaseColor path, so the probe's class report flips with the alpha too.
+function alphaSharedSwitchGraph(vertexOnB: boolean): MaterialGraph {
+  const good = textured("good", "T_InstanceMask");
+  const alt = textured("alt", "T_MasterMask");
+  const mixB: Raw = node("mixB", "Multiply", { inputs: { A: pin("alt", [1, 1, 1, 0]), B: vertexOnB ? pin("vertex", [1, 1, 1, 0]) : pin("tint", [1, 1, 1, 0]) } });
+  const nodes: Raw[] = [
+    breakOf("reader", "sw"),
+    node("sw", "StaticSwitchParameter", { inputs: { A: pin("makeA"), B: pin("makeB") }, parameter: { name: "UseA", group: "" }, default: true }),
+    node("makeA", "MakeMaterialAttributes", { inputs: { BaseColor: pin("good", [1, 1, 1, 0]), OpacityMask: pin("badMask", [1, 0, 0, 0]) } }),
+    node("makeB", "MakeMaterialAttributes", { inputs: { BaseColor: pin("mixB", [1, 1, 1, 0]), OpacityMask: pin("goodMask", [1, 0, 0, 0]) } }),
+    good,
+    alt,
+    mixB,
+    constant3("tint", [1, 1, 1]),
+    node("vertex", "VertexColor"),
+    textured("goodMask", "T_MasterMask", "LinearColor"),
+    node("badMask", "TextureSampleParameter2D", { parameter: { name: "Unbound", group: "Base" }, default: null, texture: null, samplerType: "LinearColor" }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: {
+      baseColor: output("reader", 0, [1, 1, 1, 0]),
+      roughness: null,
+      metallic: null,
+      emissive: null,
+      opacity: null,
+      opacityMask: output("reader", OPACITY_MASK, [1, 0, 0, 0]),
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes,
+  });
+}
+
 async function firstPixel(png: Buffer | Uint8Array): Promise<number[]> {
   const { data } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   return [...data.subarray(0, 3)];
@@ -433,6 +514,66 @@ describe("createGraphBaker", () => {
     const probeReadable = createGraphBaker({ sourceDir, dumpGraphs: async () => new Map([["M_Master", masterGraph()]]) })!;
     const readableOutcome = await probeReadable({ materialName: "MI_Rock", lookupName: "MI_Rock", assets, readProps, probe: true });
     expect(readableOutcome.baseColourTextures).toEqual(["T_InstanceMask"]);
+  });
+
+  it("omits vertexColorOnBaseColor on a probe whose switch choices never settle, rather than claim it does not read VertexColor", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const cycle = createGraphBaker({ sourceDir, dumpGraphs: async () => new Map([["M_Master", cyclingSwitchGraph()]]) })!;
+    const outcome = await cycle({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(outcome.status).toBe("unavailable");
+    // The active path describes no bake, so the probe must not say `false`: the importer would drop the mesh's COLOR_0.
+    expect(outcome.vertexColorOnBaseColor).toBeUndefined();
+    expect(outcome.baseColourTextures).toBeUndefined();
+  });
+
+  it("settles a shared switch with the requested cut-out, so the probe names the BaseColor branch the bake samples", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const graph = alphaSharedSwitchGraph(false);
+    const make = (it: MaterialGraph) => createGraphBaker({ sourceDir, maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", it]]) })!;
+
+    // Cache-catch order: the masked probe first, the opaque one second on the same asset index. A path cache keyed
+    // without the alpha would hand the opaque probe the masked branch's texture.
+    const maskedFirst = make(graph);
+    const masked = await maskedFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true, alpha: "opacityMask" });
+    expect(masked.baseColourTextures).toEqual(["T_MasterMask"]);
+    const opaque = await maskedFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(opaque.baseColourTextures).toEqual(["T_InstanceMask"]);
+
+    // The other order on a fresh baker proves the key carries the alpha, not just the first probe that filled it.
+    const opaqueFirst = make(graph);
+    expect((await opaqueFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true })).baseColourTextures).toEqual(["T_InstanceMask"]);
+    expect((await opaqueFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true, alpha: "opacityMask" })).baseColourTextures).toEqual(["T_MasterMask"]);
+
+    // The bake of each alpha samples the same texture the probe named for it.
+    const maskedBake = await maskedFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, alpha: "opacityMask" });
+    if (maskedBake.status !== "baked") throw new Error(`expected a bake, got ${maskedBake.status}`);
+    expect(maskedBake.texturesUsed).toEqual(["T_MasterMask"]);
+    const opaqueBake = await maskedFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps });
+    if (opaqueBake.status !== "baked") throw new Error(`expected a bake, got ${opaqueBake.status}`);
+    expect(opaqueBake.texturesUsed).toEqual(["T_InstanceMask"]);
+  });
+
+  it("changes the active BaseColor classes with the cut-out, so the probe's VertexColor report follows the bake's branch", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", alphaSharedSwitchGraph(true)]]) })!;
+
+    // With the cut-out the union flips the switch to B, whose BaseColor reads VertexColor: the probe keeps the class even
+    // though the probe compile cannot evaluate VertexColor, and names no textures (the existing, preserved contract).
+    const masked = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true, alpha: "opacityMask" });
+    expect(masked.vertexColorOnBaseColor).toBe(true);
+    expect(masked.baseColourTextures).toBeUndefined();
+
+    const opaque = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(opaque.vertexColorOnBaseColor).toBe(false);
+    expect(opaque.baseColourTextures).toEqual(["T_InstanceMask"]);
+
+    // The bake takes the same branch: with the cut-out B (T_MasterMask and VertexColor), without it A.
+    const maskedBake = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, alpha: "opacityMask", vertexColor: [1, 1, 1, 1] });
+    if (maskedBake.status !== "baked") throw new Error(`expected a bake, got ${maskedBake.status}`);
+    expect(maskedBake.texturesUsed).toEqual(["T_MasterMask"]);
+    const opaqueBake = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps });
+    if (opaqueBake.status !== "baked") throw new Error(`expected a bake, got ${opaqueBake.status}`);
+    expect(opaqueBake.texturesUsed).toEqual(["T_InstanceMask"]);
   });
 
   it("is unavailable without a source package and does not touch the converter", async () => {
@@ -773,6 +914,17 @@ describe("importUnrealDirectory graph bake", () => {
     expect(section.graph?.unsupportedNodes).toContain("VertexColor");
     expect(section.bindings.some((binding) => binding.source === "graph")).toBe(false);
     expect(report.materialCoverage.graphBaked).toBe(0);
+  });
+
+  it("keeps COLOR_0 when the graph's switch choices never settle, instead of dropping it on an unknown path", async () => {
+    const { report, glb, material } = await importWithGraph({ graph: cyclingSwitchGraph(), vertexColors: true });
+    // The probe cannot say the BaseColor path reads VertexColor: it never settles, so COLOR_0 must survive.
+    const primitive = glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    expect([...primitive.getAttribute("COLOR_0")!.getArray()!]).toEqual([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.limitations.join("\n")).not.toContain("COLOR_0");
+    // The same refusal leaves the section on the neutral fallback.
+    expect(material.getBaseColorTexture()).toBeNull();
   });
 
   it("evaluates VertexColor as white for a mesh without COLOR_0 and reports the approximation", async () => {

@@ -2539,11 +2539,16 @@ const PATH_OPTIONS: CompileOptions = { allowUvSetFallback: true };
  * Distinct node classes on the active path of an output, plus the names of engine functions that had no
  * body to inline. Switches follow their active branch only, settled with the same cut-out `alpha` a bake of this graph
  * would take. Works without textures, so the report can build its histogram for materials that never bake.
+ *
+ * Undefined when a switch choice never settles. The classes of a cycling path describe no bake, so a caller must not
+ * act on them: in particular it must not read "no VertexColor class" as "the path does not read VertexColor" and drop a
+ * mesh's COLOR_0. A settled pass still reports the classes it reached even where the evaluator cannot bake them, since
+ * VertexColor itself is unsupported yet a class the path reads.
  */
-export function graphPathClasses(graph: MaterialGraph, output: "baseColor", parameters: GraphParameters = NO_PARAMETERS, alpha?: "opacity" | "opacityMask"): string[] {
+export function graphPathClasses(graph: MaterialGraph, output: "baseColor", parameters: GraphParameters = NO_PARAMETERS, alpha?: "opacity" | "opacityMask"): string[] | undefined {
   if (output !== "baseColor") return [];
   const settled = settleSwitches(graph, parameters, PATH_OPTIONS, alpha);
-  return settled.kind === "settled" ? [...settled.pass.colour.classes].sort() : [];
+  return settled.kind === "settled" ? [...settled.pass.colour.classes].sort() : undefined;
 }
 
 /**

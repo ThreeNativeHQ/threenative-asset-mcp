@@ -1839,6 +1839,11 @@ describe("attribute-scoped reads: static switches and legacy Set overrides", () 
         status: "unavailable",
         reason: expect.stringContaining("do not settle"),
       });
+      // The probe reports the same refusal: no classes and no textures, so a caller never reads a cycling path as one
+      // that does not read VertexColor (which would drop a painted mesh's COLOR_0).
+      const cycling = makeGraph([breakOf("reader", "outer"), ...nodes], pin("reader"));
+      expect(graphPathClasses(cycling, "baseColor")).toBeUndefined();
+      expect(graphPathTextures(cycling)).toBeUndefined();
     });
   });
 
