@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.64",
+  version: "b4e95441+threenative.65",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -1677,15 +1677,15 @@ void RecordMeshFailure(string name, string kind, IEnumerable<ExportResult> resul
     meshFailures[name] = flat.Length <= 500 ? flat : flat[..500];
 }
 
-// A UE4 package that predates the run's engine profile lists fewer custom versions, so CUE4Parse
-// fills the gaps from the profile and reads the file in a later layout (a wider soft-vertex, for
+// A package that predates the run's engine profile (a UE4 or early UE5 package read as UE5.3) lists
+// fewer custom versions, so CUE4Parse fills the gaps from the profile and reads the file in a later layout (a wider soft-vertex, for
 // one). The package then yields a SkeletalMesh with no LODs. Re-reading it under an older UE4
 // profile is the only decoder that can tell, and costs nothing for a mesh that already loaded.
 var olderEngineProviders = new Dictionary<EGame, DefaultFileProvider>();
 USkeletalMesh? ReloadSkeletalMeshWithOlderEngine(string packageKey, string meshName)
 {
-    if (game < EGame.GAME_UE4_0 || game >= EGame.GAME_UE5_0) return null;
-    foreach (var older in new[] { EGame.GAME_UE4_24, EGame.GAME_UE4_22, EGame.GAME_UE4_20 })
+    if (game < EGame.GAME_UE4_0) return null;
+    foreach (var older in new[] { EGame.GAME_UE4_27, EGame.GAME_UE4_24, EGame.GAME_UE4_22, EGame.GAME_UE4_20 })
     {
         if (older >= game) continue;
         try
@@ -1707,7 +1707,7 @@ USkeletalMesh? ReloadSkeletalMeshWithOlderEngine(string packageKey, string meshN
         }
         catch (Exception) { }
     }
-    olderEngineAttempts = "UE 4.24, 4.22 and 4.20";
+    olderEngineAttempts = "UE 4.27, 4.24, 4.22 and 4.20";
     return null;
 }
 

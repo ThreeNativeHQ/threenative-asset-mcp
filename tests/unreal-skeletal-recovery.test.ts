@@ -226,8 +226,16 @@ describe("the pinned CUE4Parse build for uncooked UE4 SkeletalMesh packages", ()
     // The run's profile (UE4.27 for a loose legacy -7 pack) gives a package that predates it a
     // wider soft-vertex layout; only an older profile reads such a file.
     expect(CUE4PARSE_PROGRAM).toContain("ReloadSkeletalMeshWithOlderEngine(key, mesh.Name)");
-    expect(CUE4PARSE_PROGRAM).toContain("new[] { EGame.GAME_UE4_24, EGame.GAME_UE4_22, EGame.GAME_UE4_20 }");
+    expect(CUE4PARSE_PROGRAM).toContain("new[] { EGame.GAME_UE4_27, EGame.GAME_UE4_24, EGame.GAME_UE4_22, EGame.GAME_UE4_20 }");
     expect(CUE4PARSE_PROGRAM).toContain("mesh.LODModels is { Length: > 0 }");
+  });
+
+  it("also retries under UE4 profiles when the run itself is UE5, where a UE4-saved package lacks the UE5 custom versions", () => {
+    // A UE5.3 run reads a UE4-saved mesh with the UE5.3 soft-vertex and LOD-info layouts that are not in the file. The retry
+    // used to return early for any UE5 game, so those meshes stayed missing from S1 coverage.
+    const retry = /USkeletalMesh\? ReloadSkeletalMeshWithOlderEngine[\s\S]*?\n}\n/.exec(CUE4PARSE_PROGRAM)?.[0] ?? "";
+    expect(retry).not.toBe("");
+    expect(retry).not.toContain("game >= EGame.GAME_UE5_0");
   });
 
   it("names the cause of every mesh it could not write on stderr", () => {
