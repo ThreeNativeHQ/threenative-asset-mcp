@@ -7,7 +7,7 @@ import { NodeIO, type Accessor } from "@gltf-transform/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
-import { toolchainCacheDir } from "../src/unreal/provision.js";
+import { modernSdkExecutable, toolchainCacheDir } from "../src/unreal/provision.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
 // Three UE5 editor-package layouts the modern converter did not read (converter 61):
@@ -16,8 +16,8 @@ import { describeWithTools } from "./helpers/require-tool.js";
 //  - The UE 5.8 compact FName array in an FMeshDescription: the static mesh had no readable source model.
 //  - A UE4-saved MaterialInstanceConstant inside a UE5 artifact: CUE4Parse throws before filling the typed
 //    TextureParameterValues, so the instance exported no textures although its tagged properties hold them.
-// The decoders are pure functions in the embedded program. They are compiled on their own, against the private
-// .NET SDK and SharpGLTF assemblies of the `modern-converter` test prerequisite, and run against synthetic data
+// The decoders are pure functions in the embedded program. They are compiled on their own, against the .NET 10
+// SDK and SharpGLTF assemblies of the `modern-converter` test prerequisite, and run against synthetic data
 // encoded here from Unreal's documented tile rules. Without them the compiled suite skips locally and fails under CI=true.
 
 /** Extracts one top-level C# declaration (signature line through its matching brace) from the program. */
@@ -225,13 +225,13 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
   });
 });
 
-const DOTNET = join(toolchainCacheDir(), "modern", "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
 // The glTF vertex-colour writer compiles against the SharpGLTF assemblies the provisioned converter ships.
 const SHARPGLTF_BIN = join(toolchainCacheDir(), "modern", "bin");
 
 describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled from the embedded program)", () => {
   let root = "";
   let harness = "";
+  let sdk = "";
   const environment = (): NodeJS.ProcessEnv => ({
     ...process.env,
     DOTNET_CLI_HOME: join(root, "home"),
@@ -244,6 +244,8 @@ describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled fr
   });
 
   beforeAll(async () => {
+    // The installed .NET 10 SDK, never a provisioner: a missing one fails here rather than installing into a cache.
+    sdk = await modernSdkExecutable(process.env);
     root = await mkdtemp(join(tmpdir(), "asset-mcp-cs-decoders-"));
     await mkdir(join(root, "tmp"), { recursive: true });
     const project = join(root, "project");
@@ -321,7 +323,7 @@ ${editorMesh}
 `,
     );
     try {
-      execFileSync(DOTNET, ["build", project, "-c", "Release", "-o", join(root, "bin"), "-nodeReuse:false"], {
+      execFileSync(sdk, ["build", project, "-c", "Release", "-o", join(root, "bin"), "-nodeReuse:false"], {
         env: environment(),
         stdio: "pipe",
         timeout: 240_000,
@@ -338,7 +340,7 @@ ${editorMesh}
   });
 
   const run = (...args: string[]): string =>
-    execFileSync(DOTNET, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
+    execFileSync(sdk, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
 
   it.each([
     // [format, width, height, bytes per pixel, sample bytes]

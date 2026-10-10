@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
-import { toolchainCacheDir } from "../src/unreal/provision.js";
+import { modernSdkExecutable, toolchainCacheDir } from "../src/unreal/provision.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
 // A `MaterialExpressionCustom` node's `Inputs` array stores each pin as an `FStructFallback` wrapper whose
@@ -56,12 +56,12 @@ function extractCSharp(program: string, signature: string): string {
   throw new Error(`unbalanced braces after ${signature}`);
 }
 
-const DOTNET = join(toolchainCacheDir(), "modern", "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
 const CUE4PARSE_BIN = join(toolchainCacheDir(), "modern", "bin");
 
 describeWithTools(["modern-converter"], "Custom node named inputs (compiled from the embedded program)", () => {
   let root = "";
   let harness = "";
+  let sdk = "";
   const environment = (): NodeJS.ProcessEnv => ({
     ...process.env,
     DOTNET_CLI_HOME: join(root, "home"),
@@ -86,6 +86,8 @@ describeWithTools(["modern-converter"], "Custom node named inputs (compiled from
   });
 
   beforeAll(async () => {
+    // The installed .NET 10 SDK, never a provisioner: a missing one fails here rather than installing into a cache.
+    sdk = await modernSdkExecutable(process.env);
     root = await mkdtemp(join(tmpdir(), "asset-mcp-custom-inputs-"));
     await mkdir(join(root, "tmp"), { recursive: true });
     const project = join(root, "project");
@@ -178,7 +180,7 @@ ${functions.join("\n")}
 `,
     );
     try {
-      execFileSync(DOTNET, ["build", project, "-c", "Release", "-o", join(root, "bin"), "-nodeReuse:false"], {
+      execFileSync(sdk, ["build", project, "-c", "Release", "-o", join(root, "bin"), "-nodeReuse:false"], {
         env: environment(),
         stdio: "pipe",
         timeout: 240_000,
@@ -191,7 +193,7 @@ ${functions.join("\n")}
   }, 300_000);
 
   const run = (...args: string[]): string =>
-    execFileSync(DOTNET, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
+    execFileSync(sdk, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
 
   it("reads each pin's InputName, its real Expression index, output index and mask", () => {
     expect(run("custom", "ok")).toBe("BaseColor:3:2:1,0,0,0 Roughness:7:5:0,0,1,0");
