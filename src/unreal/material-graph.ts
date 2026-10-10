@@ -9,9 +9,9 @@ import type { SurfaceNormals } from "./surface-normals.js";
  * How it works: the graph is compiled once into a flat list of instructions over a small register file
  * (4 floats per register). Subtrees that do not depend on the texel (parameters, constants, switches) are
  * folded at compile time; only texture samples, texture coordinates and the arithmetic that depends on them
- * run per texel. Nothing is allocated per node per texel. Only the BaseColor attribute of a
- * MaterialAttributes value is carried; the other attributes (roughness, normal, ...) are never evaluated,
- * so a path that needs one of them is reported as unsupported rather than guessed.
+ * run per texel. Nothing is allocated per node per texel. Of a MaterialAttributes value, BaseColor, Metallic, Roughness and
+ * OpacityMask are carried, and every one of them only as far as a consumer reads it; the other attributes (normal, ...) are
+ * never evaluated, so a path that needs one of them is reported as unsupported rather than guessed.
  *
  * Conventions (each is pinned by a test):
  * - Colour space: textures flagged `srgb: true` that are sampled with a `Color` sampler are decoded to
@@ -441,10 +441,61 @@ interface Val {
   /** The value derives from `WorldPosition`: a texture sampled at it has no UV-space meaning, so its average stands in. */
   world?: true;
 }
-/** A MaterialAttributes value. Only BaseColor is carried (null = the attribute is not wired = black). */
+/**
+ * A scalar attribute the bake carries beside BaseColor: the closed set a BaseColor or cut-out path reads through Break, Get
+ * or Set. OpacityMask is here because a masked leaf card's silhouette lives in it (a cut-out, not a plain opacity factor).
+ */
+const SCALAR_ATTRIBUTES = ["Metallic", "Roughness", "OpacityMask"] as const;
+type ScalarAttribute = (typeof SCALAR_ATTRIBUTES)[number];
+/** What an attributes read asks for: BaseColor, or one scalar. A static switch is judged by the demands its active reads make. */
+type Demand = "BaseColor" | ScalarAttribute;
+/**
+ * Unreal's default attribute values, which an unwired Make pin takes, and a Set or Blend with no incoming attributes. Epic's
+ * Main Material node docs give Metallic 0 and Roughness 0.5; the Make and Set nodes are not documented separately. An
+ * unwired OpacityMask is 1 (a masked material is opaque where nothing masks it), the value the Main Material node shows.
+ */
+const DEFAULT_SCALAR: Record<ScalarAttribute, number> = { Metallic: 0, Roughness: 0.5, OpacityMask: 1 };
+/** A scalar the bake does not model: its source is unsupported, or an override pin whose GUID the table does not name. */
+interface UnknownScalar {
+  kind: "unknown";
+  /** The diagnostic a consumer reports alongside its own name. */
+  path?: string | undefined;
+}
+type Scalar = Val | UnknownScalar;
+/**
+ * A MaterialAttributes value. BaseColor and each scalar are memoised thunks, compiled only when a consumer reads them, so a
+ * node wired to an attribute nobody reads is never visited. Making BaseColor lazy matters too: reading only Metallic or
+ * Roughness (or the cut-out) of a Make/Set/Blend must not compile an unsupported node that feeds its BaseColor pin.
+ */
 interface Attrs {
   kind: "attr";
-  baseColor: Val | null;
+  /** Compiles BaseColor on first read; null when the pin is unwired (Unreal's default black). */
+  baseColor: () => Val | null;
+  scalars: Record<ScalarAttribute, () => Scalar>;
+}
+
+/** Memoises `compute`: it runs on the first read only, so a lazily compiled scalar is emitted once. */
+function lazy<T>(compute: () => T): () => T {
+  let done = false;
+  let value: T | undefined;
+  return () => {
+    if (!done) {
+      value = compute();
+      done = true;
+    }
+    return value as T;
+  };
+}
+
+const unknownScalar = (path?: string): UnknownScalar => ({ kind: "unknown", path });
+
+/** The attribute a GUID names in MATERIAL_ATTRIBUTE_GUIDS, or undefined for a GUID the table does not name. */
+function attributeOfGuid(guid: string): string | undefined {
+  return Object.entries(MATERIAL_ATTRIBUTE_GUIDS).find(([, value]) => sameGuid(guid, value))?.[0];
+}
+
+function isScalarAttribute(name: string | undefined): name is ScalarAttribute {
+  return (SCALAR_ATTRIBUTES as readonly string[]).includes(name ?? "");
 }
 /**
  * A texture object (`TextureObject`, `TextureObjectParameter`, or a function input carrying one): not a value, only a
@@ -470,6 +521,10 @@ type Instruction = (registers: Float64Array, texel: TexelContext) => void;
 const RGB_MASK = [1, 1, 1, 0];
 const TEXTURE_OUTPUT_MASKS: readonly number[][] = [RGB_MASK, [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
 const BREAK_ATTRIBUTES = ["BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal"];
+/** A pin name as `namedPin` matches it: lower case, without punctuation. */
+const pinKey = (name: string): string => name.toLowerCase().replace(/[^a-z0-9]/g, "");
+/** Every attribute a SetMaterialAttributes pin can be named for. A pin with one of these names is an override, never the incoming attributes. */
+const RECOGNISED_PINS = new Set([...BREAK_ATTRIBUTES, ...Object.keys(MATERIAL_ATTRIBUTE_GUIDS)].map(pinKey));
 
 interface CompileOptions {
   allowUvSetFallback: boolean;
@@ -494,6 +549,8 @@ const BOUNDING_BOX_UVW_NOTE =
   "BoundingBoxBased_0-1_UVW evaluated as the mesh UV0 with W = 0.5: the function maps the pixel's position across the object's bounding box to 0..1, and a bake has no object-space position (engine body unavailable, inferred from the name)";
 const DEFAULT_ATTRIBUTES_NOTE =
   "SetMaterialAttributes has no incoming attributes and no BaseColor pin: BaseColor is Unreal's default attribute value (black)";
+const ATTRIBUTE_CYCLE_REASON =
+  "material attributes forward in a cycle: a node's incoming attributes lead back to its own output";
 const OBJECT_SCALE_NOTE =
   "ObjectScale evaluated as 1 (an unscaled instance): a placed instance's scale would change texture tiling; engine body unavailable";
 
@@ -585,6 +642,23 @@ const HEIGHT_LERP_OUTPUTS = ["Results", "Alpha", "Lerp Alpha No Contrast"] as co
 const HEIGHT_LERP_NOTE =
   "HeightLerp: engine body unavailable; evaluated as the public texturing docs describe it (Transition Phase 0.5 is a standard lerp of A and B by the height, with CheapContrast on the height for Alpha), so the transition curve is an approximation";
 
+/** The branch an unoverridden static switch takes, and whether the probe took the other branch than its stored default. */
+interface SwitchChoice {
+  value: boolean;
+  flipped: boolean;
+}
+/** The settled branch of each unoverridden static switch, by node id. Every compile of one pass shares the same map. */
+type SwitchChoices = Map<string, SwitchChoice>;
+/** An unoverridden static switch that a pass's active reads reached, with the demands those reads made of it. */
+interface SwitchUse {
+  node: GraphNode;
+  label: string;
+  stored: boolean;
+  /** The attributes read through the switch (BaseColor, or a scalar). Empty when only a plain value is read through it. */
+  fields: Set<Demand>;
+}
+type SwitchUses = Map<string, SwitchUse>;
+
 class Compiler {
   registers = new Float64Array(256);
   registerCount = 0;
@@ -599,16 +673,19 @@ class Compiler {
   private walkingInputs = 0;
   private readonly active = new Set<string>();
   private readonly textureRegisters = new Map<string, Val>();
+  /** Attribute fields currently being read, by the attributes value and field, so a forwarding cycle is seen. */
+  private readonly attrReads = new WeakMap<Attrs, Set<Demand>>();
   private readonly nodes = new Map<string, GraphNode>();
   /** Texture parameters this compile reached that the instance chain does not bind (and the graph gives no texture). */
   readonly unboundTextures = new Set<string>();
-
   constructor(
     private readonly graph: MaterialGraph,
     private readonly parameters: GraphParameters,
     private readonly options: CompileOptions,
-    /** Branch choices of unoverridden static switches, shared with the trial compilers so each switch is decided once. */
-    private readonly switchChoices: Map<string, { value: boolean; flipped: boolean }> = new Map(),
+    /** The settled branch of each unoverridden static switch; a switch the pass has not settled takes its stored default. */
+    private readonly switchChoices: SwitchChoices = new Map(),
+    /** Set on the compiles of a pass, which record the switches their active reads reach; trial compilers leave it unset. */
+    private readonly switchUses?: SwitchUses,
   ) {
     for (const node of graph.nodes) this.nodes.set(node.id, node);
   }
@@ -708,6 +785,7 @@ class Compiler {
     const node = this.nodes.get(input.node);
     if (!node) return this.markUnavailable(`pin refers to missing node ${input.node}`);
     const compiled = this.nodeOutput(node, input.output);
+    if (compiled.kind === "attr") return this.guardAttrs(compiled);
     if (compiled.kind !== "vec") return compiled;
     const fallbackMask = (node.class.startsWith("TextureSample") || node.class === "VertexColor" || node.class === "ParticleColor") && input.output >= 0 && input.output < TEXTURE_OUTPUT_MASKS.length ? TEXTURE_OUTPUT_MASKS[input.output]! : null;
     return this.applyMask(compiled, input.mask ?? fallbackMask);
@@ -738,9 +816,128 @@ class Compiler {
     if (!compiled) return undefined;
     if (compiled.kind !== "attr") {
       this.markUnavailable(`${label} expected MaterialAttributes`);
-      return { kind: "attr", baseColor: null };
+      return this.unknownAttrs();
     }
     return compiled;
+  }
+
+  /**
+   * Field-level cycle guard for attribute forwarding. `nodeOutput.active` sees a node that reaches itself while it is being
+   * evaluated, but a node that forwards another node's attributes reads that source only after its own evaluation has
+   * returned (a `lazyAttrs` source, or the lazy BaseColor/scalar thunk of a Make, Blend or layer function). A cycle then
+   * reads the same field of the same attributes forever, with `nodeOutput.active` already cleared, and overflows the stack.
+   * Each read of an attributes field is guarded: a read that re-enters the same field reports the loop and refuses the bake
+   * (`markUnavailable`) instead of recursing.
+   */
+  private attrField<T>(attrs: Attrs, field: Demand, compute: () => T, cycle: () => T): T {
+    let reading = this.attrReads.get(attrs);
+    if (reading?.has(field)) return cycle();
+    if (!reading) this.attrReads.set(attrs, (reading = new Set()));
+    reading.add(field);
+    try {
+      return compute();
+    } finally {
+      reading.delete(field);
+    }
+  }
+
+  /** `attrs` with every field read guarded by `attrField`, so a forwarding cycle refuses the bake rather than recurses. */
+  private guardAttrs(attrs: Attrs): Attrs {
+    const cycle = () => this.markUnavailable(ATTRIBUTE_CYCLE_REASON);
+    return {
+      kind: "attr",
+      baseColor: () => this.attrField(attrs, "BaseColor", attrs.baseColor, cycle),
+      scalars: this.perScalar((attribute) => () => this.attrField(attrs, attribute, attrs.scalars[attribute], cycle)),
+    };
+  }
+
+  /**
+   * An attributes value read through an unoverridden static switch: each field read is recorded as a demand of that switch, so
+   * the probe judges the switch by the attributes its active reads ask for. Consumers memoise their reads, so a field is
+   * recorded the first time it is read, which is all the probe needs.
+   */
+  private watchSwitch(id: string, compiled: Compiled): Compiled {
+    if (compiled.kind !== "attr") return compiled;
+    const source = compiled;
+    const record = (field: Demand) => this.switchUses?.get(id)?.fields.add(field);
+    return {
+      kind: "attr",
+      baseColor: () => {
+        record("BaseColor");
+        return source.baseColor();
+      },
+      scalars: this.perScalar((attribute) => () => {
+        record(attribute);
+        return source.scalars[attribute]();
+      }),
+    };
+  }
+
+  /** An attributes value whose source compiles only when one of its fields is read, so a field another pin overrides never forces it. */
+  private lazyAttrs(compute: () => Attrs): Attrs {
+    const source = lazy(compute);
+    return { kind: "attr", baseColor: () => source().baseColor(), scalars: this.perScalar((attribute) => () => source().scalars[attribute]()) };
+  }
+
+  /** An attributes value with no source: reading any of its fields marks `reason` unavailable, so the bake refuses rather than guesses. */
+  private missingAttrs(reason: string): Attrs {
+    const mark = lazy(() => this.markUnavailable(reason));
+    return { kind: "attr", baseColor: () => mark(), scalars: this.perScalar(() => () => mark()) };
+  }
+
+  /** Unreal's default attribute values: BaseColor black, each scalar its default. Nothing is compiled until a consumer reads it. */
+  private defaultAttrs(): Attrs {
+    return { kind: "attr", baseColor: () => null, scalars: this.perScalar((attribute) => lazy((): Scalar => this.constant([DEFAULT_SCALAR[attribute]], 1))) };
+  }
+
+  /** A value from a source the bake does not model: BaseColor black (the unavailable mark stops the bake), each scalar unknown. */
+  private unknownAttrs(): Attrs {
+    return { kind: "attr", baseColor: () => null, scalars: this.perScalar(() => () => unknownScalar()) };
+  }
+
+  /** One scalar thunk per attribute: `make` builds the thunk for each. */
+  private perScalar(make: (attribute: ScalarAttribute) => () => Scalar): Record<ScalarAttribute, () => Scalar> {
+    return { Metallic: make("Metallic"), Roughness: make("Roughness"), OpacityMask: make("OpacityMask") };
+  }
+
+  /** The same attributes with a BaseColor thunk (already-compiled values pass `() => value`). */
+  private withBaseColor(attrs: Attrs, baseColor: () => Val | null): Attrs {
+    return { kind: "attr", baseColor, scalars: attrs.scalars };
+  }
+
+  /** The same value with one scalar unknown: a layer function writes it and its body is engine content. */
+  private withUnknown(attrs: Attrs, attribute: ScalarAttribute, path: string): Attrs {
+    return { kind: "attr", baseColor: attrs.baseColor, scalars: this.perScalar((other) => (other === attribute ? () => unknownScalar(path) : attrs.scalars[other])) };
+  }
+
+  /** A vector wired to a scalar input contributes its first component, as HLSL truncates a vector to a float. */
+  private scalarPin(input: GraphInput | null | undefined, label: string): Val | undefined {
+    const value = this.vec(input, label);
+    return value && value.n > 1 ? this.applyMask(value, [1, 0, 0, 0]) : value;
+  }
+
+  /** A scalar a consumer reads: compiled, or unknown, which names the consumer and the source that decides it. */
+  private scalarOf(source: Attrs, attribute: ScalarAttribute, consumer: string): Val {
+    const value = source.scalars[attribute]();
+    if (value.kind !== "unknown") return value;
+    this.unsupported.add(consumer);
+    if (value.path) this.unsupported.add(value.path);
+    return this.constant([0], 1);
+  }
+
+  /**
+   * The scalars of a SetMaterialAttributes over `base`. A pin for a scalar replaces it. A wired pin whose GUID the table does
+   * not name could be any attribute, so every scalar without a pin of its own is unknown; `unnamed` is that pin's diagnostic.
+   */
+  private setScalars(base: Attrs, pins: Partial<Record<ScalarAttribute, GraphInput>>, unnamed: string | undefined): Record<ScalarAttribute, () => Scalar> {
+    return this.perScalar((attribute) =>
+      lazy((): Scalar => {
+        const pin = pins[attribute];
+        if (pin) return this.scalarPin(pin, `SetMaterialAttributes.${attribute}`) ?? this.constant([DEFAULT_SCALAR[attribute]], 1);
+        if (unnamed !== undefined) return unknownScalar(unnamed);
+        return base.scalars[attribute]();
+      }),
+    );
   }
 
   private operand(node: GraphNode, pinName: string, constantName: string, fallback: number): Val {
@@ -1023,7 +1220,7 @@ class Compiler {
         const override = node.parameter ? this.parameters.switches.get(node.parameter.name.toLowerCase()) : undefined;
         const stored = typeof node.default === "boolean" ? node.default : node.switchValue === true;
         if (override !== undefined) return this.branch(node, override);
-        return this.branch(node, this.unoverriddenSwitch(node, stored));
+        return this.watchSwitch(node.id, this.branch(node, this.unoverriddenSwitch(node, stored)));
       }
       case "StaticSwitch":
         return this.branch(node, this.staticBool(node.inputs.Value, node.switchValue === true, "StaticSwitch.Value"));
@@ -1103,8 +1300,11 @@ class Compiler {
         // Its value only reaches the ShadingModel slot of a SetMaterialAttributes, never BaseColor.
         return this.constant([0], 1);
       case "MakeMaterialAttributes": {
-        const baseColor = this.vec(node.inputs.BaseColor, "MakeMaterialAttributes.BaseColor") ?? null;
-        return { kind: "attr", baseColor };
+        // Every pin is compiled only when a consumer reads it: a Make whose BaseColor is unsupported still feeds a
+        // Metallic/Roughness/OpacityMask path.
+        const baseColor = lazy((): Val | null => this.vec(node.inputs.BaseColor, "MakeMaterialAttributes.BaseColor") ?? null);
+        const scalars = this.perScalar((attribute) => lazy((): Scalar => this.scalarPin(node.inputs[attribute], `MakeMaterialAttributes.${attribute}`) ?? this.constant([DEFAULT_SCALAR[attribute]], 1)));
+        return { kind: "attr", baseColor, scalars };
       }
       case "BreakMaterialAttributes":
         return this.breakAttributes(node, output);
@@ -1338,7 +1538,11 @@ class Compiler {
   private walkInputs(node: GraphNode): void {
     this.walkingInputs++;
     try {
-      for (const input of Object.values(node.inputs)) this.pin(input);
+      for (const input of Object.values(node.inputs)) {
+        const compiled = this.pin(input);
+        // An attributes input is followed to its BaseColor, which is lazy now, so the classes under it are still reported.
+        if (compiled?.kind === "attr") compiled.baseColor();
+      }
     } finally {
       this.walkingInputs--;
     }
@@ -1349,19 +1553,15 @@ class Compiler {
    * parent's default. When that default branch samples a texture parameter that neither the instance chain nor the
    * graph binds (Unreal would sample its black default), it cannot be the branch the instance is using, and the other
    * branch is taken if every texture it samples is bound. Recorded as an approximation.
+   *
+   * The probe judges only the attributes the active reads take through the switch (see `judgeSwitch`), so a Roughness read
+   * is not flipped by an unbound BaseColor texture it never samples. A pass takes the choices it was given; a switch those
+   * do not settle takes its stored default here, and the next pass compiles with the choice the probe then gives it.
    */
   private unoverriddenSwitch(node: GraphNode, stored: boolean): boolean {
-    let choice = this.switchChoices.get(node.id);
-    if (!choice) {
-      choice = { value: stored, flipped: false };
-      this.switchChoices.set(node.id, choice);
-      const unboundIn = (value: boolean): boolean => {
-        const trial = new Compiler(this.graph, this.parameters, this.options, this.switchChoices);
-        trial.pin(value ? (node.inputs.A ?? node.inputs.True) : (node.inputs.B ?? node.inputs.False));
-        return trial.unboundTextures.size > 0;
-      };
-      if (unboundIn(stored) && !unboundIn(!stored)) choice = { value: !stored, flipped: true };
-      this.switchChoices.set(node.id, choice);
+    const choice = this.switchChoices.get(node.id) ?? { value: stored, flipped: false };
+    if (this.switchUses && !this.switchUses.has(node.id)) {
+      this.switchUses.set(node.id, { node, label: node.parameter?.name ?? node.id, stored, fields: new Set() });
     }
     if (choice.flipped) {
       this.approximations.add(
@@ -1464,32 +1664,44 @@ class Compiler {
   private breakAttributes(node: GraphNode, output: number): Compiled {
     const names = node.outputNames && node.outputNames.length > 0 ? node.outputNames : BREAK_ATTRIBUTES;
     const attribute = names[output] ?? BREAK_ATTRIBUTES[output] ?? `output${output}`;
+    if (isScalarAttribute(attribute)) {
+      // Unwired, the source is not a default: which attributes the node should read is unknown.
+      const source = this.attrs(node.inputs.MaterialAttributes, "BreakMaterialAttributes.MaterialAttributes") ?? this.unknownAttrs();
+      return this.scalarOf(source, attribute, `BreakMaterialAttributes.${attribute}`);
+    }
     // Another attribute is never evaluated, so its source is not walked either.
     if (attribute !== "BaseColor") {
       this.unsupported.add(`BreakMaterialAttributes.${attribute}`);
       return this.constant([0], 1);
     }
     const source = this.attrs(node.inputs.MaterialAttributes, "BreakMaterialAttributes.MaterialAttributes");
-    return source?.baseColor ?? this.constant([0, 0, 0], 3);
+    return source?.baseColor() ?? this.constant([0, 0, 0], 3);
   }
 
   /**
    * GetMaterialAttributes: output 0 passes the attributes through when `outputNames[0]` says so; the other outputs are
-   * typed by `attributeTypes` (offset by that pass-through output). Only BaseColor is carried, so any other attribute
-   * on the path is unsupported, and its source is not walked.
+   * typed by `attributeTypes` (offset by that pass-through output). BaseColor and the scalars are carried. A GUID the table
+   * does not name is read by its output name when that name is a scalar; any other attribute on the path is unsupported,
+   * and its source is not walked.
    */
   private getAttributes(node: GraphNode, output: number): Compiled {
     const names = node.outputNames ?? [];
     const passThrough = names[0] === "MaterialAttributes";
     if (passThrough && output === 0) return this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes") ?? this.markUnavailable(`GetMaterialAttributes ${node.id} has no MaterialAttributes input`);
     const guid = node.attributeTypes?.[output - (passThrough ? 1 : 0)];
-    if (guid === undefined) return this.markUnsupported(`GetMaterialAttributes.output${output}`);
-    if (!sameGuid(guid, MATERIAL_ATTRIBUTE_GUIDS.BaseColor)) {
-      this.unsupported.add(`GetMaterialAttributes.${names[output] || guid}`);
-      return this.constant([0], 1);
+    const known = guid === undefined ? undefined : attributeOfGuid(guid);
+    const attribute = known ?? (isScalarAttribute(names[output]) ? names[output] : undefined);
+    if (attribute === "BaseColor") {
+      const source = this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes");
+      return source?.baseColor() ?? this.constant([0, 0, 0], 3);
     }
-    const source = this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes");
-    return source?.baseColor ?? this.constant([0, 0, 0], 3);
+    if (isScalarAttribute(attribute)) {
+      const source = this.attrs(node.inputs.MaterialAttributes, "GetMaterialAttributes.MaterialAttributes") ?? this.unknownAttrs();
+      return this.scalarOf(source, attribute, `GetMaterialAttributes.${attribute}`);
+    }
+    if (guid === undefined) return this.markUnsupported(`GetMaterialAttributes.output${output}`);
+    this.unsupported.add(`GetMaterialAttributes.${names[output] || guid}`);
+    return this.constant([0], 1);
   }
 
   private blendAttributes(node: GraphNode): Compiled {
@@ -1505,8 +1717,8 @@ class Compiler {
   }
 
   /**
-   * SetMaterialAttributes: the incoming attributes with per-attribute overrides. Only BaseColor is carried, and only the
-   * two pins that decide it are visited, so a node feeding any other slot (ShadingModel, Normal, WPO, ...) cannot block.
+   * SetMaterialAttributes: the incoming attributes with per-attribute overrides. BaseColor and the scalars are carried, and
+   * only the pins that decide them are visited, so a node feeding any other slot (ShadingModel, Normal, WPO, ...) cannot block.
    *
    * Real dumps name the pins `Inputs[i]`: `Inputs[0]` is the incoming attributes and `Inputs[i]` (i >= 1) carries the
    * attribute `attributeTypes[i - 1]`. The BaseColor pin is the one typed with the BaseColor guid; an unwired one keeps the
@@ -1517,43 +1729,54 @@ class Compiler {
       const colourIndex = node.attributeTypes.findIndex((guid) => sameGuid(guid, MATERIAL_ATTRIBUTE_GUIDS.BaseColor));
       const override = colourIndex >= 0 ? node.inputs[`Inputs[${colourIndex + 1}]`] : undefined;
       const incomingPin = node.inputs["Inputs[0]"];
-      const incoming = incomingPin ? this.attrs(incomingPin, "SetMaterialAttributes.Inputs[0]") : undefined;
-      if (override) {
-        const colour = this.vec(override, "SetMaterialAttributes.BaseColor");
-        return { kind: "attr", baseColor: colour ?? null };
-      }
-      if (!incomingPin) {
+      // The incoming attributes compile only when a field they supply is read, so an overridden field never reaches them.
+      const base = incomingPin ? this.lazyAttrs(() => this.attrs(incomingPin, "SetMaterialAttributes.Inputs[0]") ?? this.defaultAttrs()) : this.defaultAttrs();
+      if (!incomingPin && !override) {
         // Nothing wired into the attributes at all: Unreal starts from the default attributes, whose BaseColor is black (an
         // eye-occlusion or shadow-card material that only sets Opacity and the shading model).
         this.approximations.add(DEFAULT_ATTRIBUTES_NOTE);
-        return { kind: "attr", baseColor: null };
       }
-      return incoming ?? this.markUnavailable(`SetMaterialAttributes ${node.id} has no incoming attributes and no BaseColor input`);
+      const pins: Partial<Record<ScalarAttribute, GraphInput>> = {};
+      let unnamed: string | undefined;
+      node.attributeTypes.forEach((guid, index) => {
+        const pin = node.inputs[`Inputs[${index + 1}]`];
+        if (!pin) return;
+        const attribute = attributeOfGuid(guid);
+        if (attribute === undefined) unnamed = unnamed ?? `SetMaterialAttributes.${guid}`;
+        else if (isScalarAttribute(attribute)) pins[attribute] = pin;
+      });
+      // A wired override is compiled only when BaseColor is demanded, so a Set that only touches a scalar does not visit it.
+      const baseColor = override ? lazy((): Val | null => this.vec(override, "SetMaterialAttributes.BaseColor") ?? null) : base.baseColor;
+      return { kind: "attr", baseColor, scalars: this.setScalars(base, pins, unnamed) };
     }
     const override = this.namedPin(node, ["basecolor"]);
+    const pins: Partial<Record<ScalarAttribute, GraphInput>> = {};
+    for (const attribute of SCALAR_ATTRIBUTES) {
+      const pin = this.namedPin(node, [attribute.toLowerCase()]);
+      if (pin) pins[attribute] = pin;
+    }
     const incomingName = this.namedPin(node, ["materialattributes", "inputs0", "inputs"]);
-    let incoming: Attrs | undefined;
-    if (incomingName) incoming = this.attrs(incomingName, "SetMaterialAttributes.MaterialAttributes");
-    else {
-      for (const input of Object.values(node.inputs)) {
-        if (!input || input === override) continue;
+    // The incoming attributes are searched for only when a field they supply is read, so an overridden field never reaches them.
+    // The named overrides are resolved above and never probed here: an unused unsupported Roughness or Normal must not make a
+    // BaseColor read unsupported. What is left is searched for an unnamed incoming attributes pin; a pin named for a recognised
+    // attribute is an override, never that pin.
+    const incoming = lazy((): Attrs | undefined => {
+      if (incomingName) return this.attrs(incomingName, "SetMaterialAttributes.MaterialAttributes");
+      for (const [key, input] of Object.entries(node.inputs)) {
+        if (!input || RECOGNISED_PINS.has(pinKey(key))) continue;
         const compiled = this.pin(input);
-        if (compiled?.kind === "attr") {
-          incoming = compiled;
-          break;
-        }
+        if (compiled?.kind === "attr") return compiled;
       }
-    }
-    if (override) {
-      const colour = this.vec(override, "SetMaterialAttributes.BaseColor");
-      return { kind: "attr", baseColor: colour ?? null };
-    }
-    return incoming ?? this.markUnavailable(`SetMaterialAttributes ${node.id} has no MaterialAttributes input`);
+      return undefined;
+    });
+    const base = this.lazyAttrs(() => incoming() ?? (override ? this.defaultAttrs() : this.missingAttrs(`SetMaterialAttributes ${node.id} has no MaterialAttributes input`)));
+    const baseColor = override ? lazy((): Val | null => this.vec(override, "SetMaterialAttributes.BaseColor") ?? null) : base.baseColor;
+    return { kind: "attr", baseColor, scalars: this.setScalars(base, pins, undefined) };
   }
 
   /** The wired pin whose name, ignoring case and non-alphanumerics, equals one of `names` (tried in order). */
   private namedPin(node: GraphNode, names: readonly string[]): GraphInput | undefined {
-    const normalised = Object.entries(node.inputs).map(([key, input]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ""), input] as const);
+    const normalised = Object.entries(node.inputs).map(([key, input]) => [pinKey(key), input] as const);
     for (const wanted of names) {
       const found = normalised.find(([key, input]) => key === wanted && input);
       if (found) return found[1] ?? undefined;
@@ -1572,9 +1795,22 @@ class Compiler {
     return [a, b];
   }
 
+  /** BlendMaterialAttributes: every attribute is lerped by alpha; BaseColor and each scalar are compiled only when read. */
   private blendAttrs(base: Attrs, top: Attrs, alpha: Val): Attrs {
-    const black = this.constant([0, 0, 0], 3);
-    return { kind: "attr", baseColor: this.lerp(base.baseColor ?? black, top.baseColor ?? black, alpha) };
+    const baseColor = lazy((): Val | null => {
+      const black = this.constant([0, 0, 0], 3);
+      return this.lerp(base.baseColor() ?? black, top.baseColor() ?? black, alpha);
+    });
+    const scalars = this.perScalar((attribute) =>
+      lazy((): Scalar => {
+        const from = base.scalars[attribute]();
+        const to = top.scalars[attribute]();
+        if (from.kind === "unknown") return from;
+        if (to.kind === "unknown") return to;
+        return this.lerp(from, to, alpha);
+      }),
+    );
+    return { kind: "attr", baseColor, scalars };
   }
 
   // -- texture coordinates --------------------------------------------------------------------------------
@@ -1717,7 +1953,23 @@ class Compiler {
   private functionCall(node: GraphNode, output: number): Compiled {
     const name = functionBaseName(node.function);
     const lower = (name ?? "").toLowerCase();
-    // Engine functions are matched by name before inlining. Each is trusted only as far as its comment says.
+    // A pack that carries its own body is authoritative, whatever the function is named: the body is inlined before every
+    // engine-name handler below, so a project function that shadows an engine name (MatLayerBlend_Standard, FuzzyShading,
+    // PivotPainter, ...) is evaluated from its own graph. Only the requested output is followed, so a body's other outputs
+    // cannot block it; a body that does not define the requested output is named rather than guessed from the engine name.
+    if (node.fn?.outputs.some(Boolean)) {
+      const inner = node.fn.outputs[output];
+      if (inner) {
+        const innerNode = this.nodes.get(inner);
+        if (!innerNode) return this.markUnavailable(`function ${name ?? node.id} output refers to missing node ${inner}`);
+        return this.nodeOutput(innerNode, 0);
+      }
+      this.unsupported.add(name ?? "FunctionCall");
+      if (name) this.classes.add(name);
+      this.walkInputs(node);
+      return this.constant([0], 1);
+    }
+    // Engine functions are matched by name next. Each is trusted only as far as its comment says.
     if (lower === "matlayerblend_standard") return this.layerBlendStandard(node, name!);
     if (lower === "matlayerblend_simple") {
       // Same pin shape as Standard (base, layer, alpha); the engine body is not in the pack, so the per-attribute lerp is inferred.
@@ -1780,12 +2032,12 @@ class Compiler {
       });
       return { kind: "vec", reg, n: 3, konst: false };
     }
-    if (lower === "objectscale" && !node.fn?.outputs.some(Boolean)) {
+    if (lower === "objectscale") {
       // Outputs: Scale XYZ (vector), Scale X, Scale Y, Scale Z. The scale of the placed instance is not known to a bake.
       this.approximations.add(OBJECT_SCALE_NOTE);
       return output === 0 ? this.constant([1, 1, 1], 3) : this.constant([1], 1);
     }
-    if (lower === "worldalignedblend" && !node.fn?.outputs.some(Boolean)) {
+    if (lower === "worldalignedblend") {
       // Every output (Alpha, w/ Vertex Normals, w/ Explicit Normal) is a 0..1 mask driven by a world-space normal.
       for (const input of Object.values(node.inputs)) this.pin(input);
       if (!this.options.surface) {
@@ -1803,12 +2055,11 @@ class Compiler {
         r[o] = r[o + 1] = r[o + 2] = r[o + 3] = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
       }, true);
     }
-    if (lower === "splitcomponents" && !node.fn?.outputs.some(Boolean)) return this.splitComponents(node, output, name!);
-    // A pack that carries its own body (a Datasmith project holds UVEdit) is evaluated from that body instead.
-    const hasBody = node.fn?.outputs[output] != null;
-    if (lower === "customrotator" && !hasBody) return this.customRotator(node, name!);
-    if (lower === "uvedit" && !hasBody) return this.uvEdit(node, name!);
-    if (lower === "convertfromdiffspec" && !hasBody) {
+    if (lower === "splitcomponents") return this.splitComponents(node, output, name!);
+    // A pack that carries its own body was inlined above; these name-matched handlers cover a pack that does not.
+    if (lower === "customrotator") return this.customRotator(node, name!);
+    if (lower === "uvedit") return this.uvEdit(node, name!);
+    if (lower === "convertfromdiffspec") {
       const attribute = node.outputNames?.[output] ?? ["BaseColor", "Metallic", "Specular"][output] ?? `output${output}`;
       if (attribute !== "BaseColor") {
         // Only BaseColor is evaluated; the Metallic/Specular split of the diffuse+specular pair is the engine body's.
@@ -1842,18 +2093,10 @@ class Compiler {
       this.classes.add(name!);
       return this.constant([0], 1);
     }
-    const inner = node.fn?.outputs[output];
-    // Plain vector plumbing of the engine library. A pack that carries its own body of the same name keeps its body.
-    if (!node.fn?.outputs.some(Boolean)) {
-      const makeWidth = /^makefloat([234])$/.exec(lower)?.[1];
-      if (makeWidth) return this.makeFloat(node, Number(makeWidth), name!);
-      if (/^breakoutfloat[234]components$/.test(lower)) return this.breakOut(node, output, name!);
-    }
-    if (inner) {
-      const innerNode = this.nodes.get(inner);
-      if (!innerNode) return this.markUnavailable(`function ${name ?? node.id} output refers to missing node ${inner}`);
-      return this.nodeOutput(innerNode, 0);
-    }
+    // Plain vector plumbing of the engine library.
+    const makeWidth = /^makefloat([234])$/.exec(lower)?.[1];
+    if (makeWidth) return this.makeFloat(node, Number(makeWidth), name!);
+    if (/^breakoutfloat[234]components$/.test(lower)) return this.breakOut(node, output, name!);
     // No body: an engine function the evaluator does not know. Walk its inputs so the report is complete.
     this.unsupported.add(name ?? "FunctionCall");
     if (name) this.classes.add(name);
@@ -1961,9 +2204,16 @@ class Compiler {
    */
   private layerFunction(node: GraphNode, lower: string, name: string, output: number): Compiled | undefined {
     switch (lower) {
+      case "matlayerblend_modulateroughness": {
+        // It writes Roughness, whose semantics are engine content: the layer's Roughness is unknown, while Metallic and BaseColor
+        // pass through.
+        const source = this.attrs(node.inputs.Input0, `${name}.Input0`);
+        if (!source) return this.markUnavailable(`${name} ${node.id} has no Input0`);
+        this.approximations.add(MAT_LAYER_PASS_NOTE(name));
+        return this.withUnknown(source, "Roughness", `${name}.Roughness`);
+      }
       // Attribute -> attribute functions that write something other than BaseColor: Input0 is the incoming attributes.
       case "matlayerblend_emissive":
-      case "matlayerblend_modulateroughness":
       case "matlayerblend_modulatespecular":
       case "matlayerblend_replacenormals":
       case "matlayerblend_normalflatten":
@@ -1981,7 +2231,7 @@ class Compiler {
         const source = this.attrs(node.inputs.Input0, `${name}.Input0`);
         if (!source) return this.markUnavailable(`${name} ${node.id} has no Input0`);
         this.approximations.add(`${name}: the BaseColor of Input0; engine body unavailable`);
-        return source.baseColor ?? this.constant([0, 0, 0], 3);
+        return source.baseColor() ?? this.constant([0, 0, 0], 3);
       }
       case "matlayerblend_breaknormal":
         // The attributes on Input0 are not walked: only their normal is read, and a normal is not carried.
@@ -1992,21 +2242,29 @@ class Compiler {
         const base = this.attrs(node.inputs.Input0, `${name}.Input0`);
         if (!base) return this.markUnavailable(`${name} ${node.id} has no Input0`);
         this.approximations.add(`${name}: BaseColor replaced by Input1 (lerped by Input2 when wired); engine body unavailable`);
-        const colour = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
-        if (!colour) return base;
-        if (!node.inputs.Input2) return { kind: "attr", baseColor: colour };
-        const alpha = this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1);
-        return { kind: "attr", baseColor: this.lerp(base.baseColor ?? this.constant([0, 0, 0], 3), colour, alpha) };
+        // Lazy: a Metallic/Roughness/OpacityMask read through this layer must not compile the replacement colour.
+        const baseColor = lazy((): Val | null => {
+          const colour = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
+          if (!colour) return base.baseColor();
+          if (!node.inputs.Input2) return colour;
+          const alpha = this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1);
+          return this.lerp(base.baseColor() ?? this.constant([0, 0, 0], 3), colour, alpha);
+        });
+        return this.withBaseColor(base, baseColor);
       }
       case "matlayerblend_multiplybasecolor": {
         // (Input0 = attributes, Input1 = colour, Input2 = amount, unwired = 1): BaseColor x lerp(1, colour, amount).
         const base = this.attrs(node.inputs.Input0, `${name}.Input0`);
         if (!base) return this.markUnavailable(`${name} ${node.id} has no Input0`);
         this.approximations.add(`${name}: BaseColor multiplied by lerp(1, Input1, Input2); engine body unavailable`);
-        const colour = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
-        if (!colour || !base.baseColor) return base;
-        const amount = node.inputs.Input2 ? (this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1)) : this.constant([1], 1);
-        return { kind: "attr", baseColor: this.binary(base.baseColor, this.lerp(this.constant([1], 1), colour, amount), (x, y) => x * y) };
+        const baseColor = lazy((): Val | null => {
+          const current = base.baseColor();
+          const colour = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
+          if (!colour || !current) return current;
+          const amount = node.inputs.Input2 ? (this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1)) : this.constant([1], 1);
+          return this.binary(current, this.lerp(this.constant([1], 1), colour, amount), (x, y) => x * y);
+        });
+        return this.withBaseColor(base, baseColor);
       }
       case "matlayerblend_tenlayerblend":
         return this.tenLayerBlend(node, name);
@@ -2096,7 +2354,7 @@ class Compiler {
     let result = this.attrs(node.inputs.Input20, `${name}.Input20`);
     if (!result) {
       this.approximations.add(TEN_LAYER_DEFAULT_BASE_NOTE);
-      result = { kind: "attr", baseColor: null };
+      result = this.defaultAttrs();
     }
     this.approximations.add(TEN_LAYER_NOTE);
     for (let layer = 9; layer >= 0; layer--) {
@@ -2166,11 +2424,15 @@ class Compiler {
     const base = this.attrs(node.inputs.Input0, `${name}.Input0`);
     if (!base) return this.markUnavailable(`${name} ${node.id} has no Input0`);
     this.approximations.add(MAT_LAYER_TINT_NOTE);
-    const tint = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
-    if (!tint || !base.baseColor) return base;
-    const alpha = node.inputs.Input2 ? this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1) : this.constant([1], 1);
-    const weight = this.lerp(this.constant([1], 1), tint, alpha);
-    return { kind: "attr", baseColor: this.binary(base.baseColor, weight, (x, y) => x * y) };
+    const baseColor = lazy((): Val | null => {
+      const current = base.baseColor();
+      const tint = node.inputs.Input1 ? this.vec(node.inputs.Input1, `${name}.Input1`) : undefined;
+      if (!tint || !current) return current;
+      const alpha = node.inputs.Input2 ? this.vec(node.inputs.Input2, `${name}.Input2`) ?? this.constant([1], 1) : this.constant([1], 1);
+      const weight = this.lerp(this.constant([1], 1), tint, alpha);
+      return this.binary(current, weight, (x, y) => x * y);
+    });
+    return this.withBaseColor(base, baseColor);
   }
 
   // -- entry ----------------------------------------------------------------------------------------------
@@ -2183,7 +2445,7 @@ class Compiler {
     if (!compiled) return undefined;
     if (compiled.kind === "vec") return compiled;
     if (compiled.kind === "tex") return this.markUnavailable("BaseColor is wired to a texture object, not a value");
-    return compiled.baseColor ?? this.constant([0, 0, 0], 3);
+    return compiled.baseColor() ?? this.constant([0, 0, 0], 3);
   }
 
   /** Compiles the Opacity or OpacityMask pin; undefined when it is unwired or carries a material-attributes struct. */
@@ -2195,32 +2457,104 @@ class Compiler {
   }
 }
 
-function compile(graph: MaterialGraph, parameters: GraphParameters, options: CompileOptions) {
-  const compiler = new Compiler(graph, parameters, options);
-  const value = compiler.compileBaseColor(graph);
-  return { compiler, value };
+/** The colour and, when a cut-out is requested, the cut-out: each a compile of this pass's switch choices. */
+interface Pass {
+  colour: Compiler;
+  value: Val | undefined;
+  cut?: { compiler: Compiler; value: Val | undefined };
+}
+
+function compilePass(graph: MaterialGraph, parameters: GraphParameters, options: CompileOptions, cutOut: "opacity" | "opacityMask" | undefined, choices: SwitchChoices, uses: SwitchUses): Pass {
+  const colour = new Compiler(graph, parameters, options, choices, uses);
+  const value = colour.compileBaseColor(graph);
+  if (!cutOut) return { colour, value };
+  const cut = new Compiler(graph, parameters, options, choices, uses);
+  return { colour, value, cut: { compiler: cut, value: cut.compileAlpha(graph, cutOut) } };
+}
+
+/**
+ * The branch a switch takes once a pass has recorded the attributes its active reads take through it: the legacy
+ * unbound-texture flip, judged only by those attributes. The trial compilers take the pass's choices for nested switches and
+ * publish nothing, so a branch's probe cannot decide a switch the bake does not read through that branch.
+ */
+function judgeSwitch(graph: MaterialGraph, parameters: GraphParameters, options: CompileOptions, choices: SwitchChoices, use: SwitchUse): SwitchChoice {
+  const unboundIn = (value: boolean): boolean => {
+    const trial = new Compiler(graph, parameters, options, choices);
+    const compiled = trial.pin(value ? (use.node.inputs.A ?? use.node.inputs.True) : (use.node.inputs.B ?? use.node.inputs.False));
+    // An attributes branch is lazy: force the demanded attributes so their textures are seen, and no other attribute is evaluated.
+    if (compiled?.kind === "attr") {
+      for (const field of use.fields) {
+        if (field === "BaseColor") compiled.baseColor();
+        else compiled.scalars[field]();
+      }
+    }
+    return trial.unboundTextures.size > 0;
+  };
+  const { stored } = use;
+  return unboundIn(stored) && !unboundIn(!stored) ? { value: !stored, flipped: true } : { value: stored, flipped: false };
+}
+
+const choiceKey = (choices: SwitchChoices): string => JSON.stringify([...choices].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+
+/** The settled compiles of one graph, or the switches whose choices keep changing (and so cannot be settled). */
+type Settled = { kind: "settled"; pass: Pass } | { kind: "refused"; switches: string[] };
+
+/**
+ * Compiles the colour and the requested cut-out under switch choices that agree with the demands those very compiles make.
+ * Each pass takes the choices it is given and records what its active reads ask of every switch. The branches the probe gives
+ * those demands are the next pass's, compiled on fresh compilers; a switch the pass does not reach keeps its last choice. A
+ * pass whose choices are already the ones the probe gives is the answer. A configuration seen before means the choices cycle,
+ * and the graph is refused. Each pass that is not the answer yields a configuration not seen before, and there are finitely
+ * many, so the loop ends without a cap.
+ */
+function settleSwitches(graph: MaterialGraph, parameters: GraphParameters, options: CompileOptions, alpha: "opacity" | "opacityMask" | undefined): Settled {
+  const cutOut = alpha && graph.outputs[alpha] ? alpha : undefined;
+  let choices: SwitchChoices = new Map();
+  const seen = new Set([choiceKey(choices)]);
+  for (;;) {
+    const uses: SwitchUses = new Map();
+    const pass = compilePass(graph, parameters, options, cutOut, choices, uses);
+    // A switch this pass does not reach keeps the choice it was last judged: the trials of the branches that reach it read that.
+    const next: SwitchChoices = new Map(choices);
+    const unsettled: string[] = [];
+    for (const [id, use] of uses) {
+      const target = judgeSwitch(graph, parameters, options, choices, use);
+      next.set(id, target);
+      const held = choices.get(id) ?? { value: use.stored, flipped: false };
+      if (held.value !== target.value || held.flipped !== target.flipped) unsettled.push(use.label);
+    }
+    if (unsettled.length === 0) return { kind: "settled", pass };
+    const key = choiceKey(next);
+    if (seen.has(key)) return { kind: "refused", switches: unsettled };
+    seen.add(key);
+    choices = next;
+  }
 }
 
 const NO_PARAMETERS: GraphParameters = { textures: new Map(), vectors: new Map(), scalars: new Map(), switches: new Map() };
+/** The path probes compile without a bake's vertex, particle or surface inputs; a switch is judged the same either way. */
+const PATH_OPTIONS: CompileOptions = { allowUvSetFallback: true };
 
 /**
  * Distinct node classes on the active path of an output, plus the names of engine functions that had no
- * body to inline. Switches follow their active branch only. Works without textures, so the report can
- * build its histogram for materials that never bake.
+ * body to inline. Switches follow their active branch only, settled with the same cut-out `alpha` a bake of this graph
+ * would take. Works without textures, so the report can build its histogram for materials that never bake.
  */
-export function graphPathClasses(graph: MaterialGraph, output: "baseColor", parameters: GraphParameters = NO_PARAMETERS): string[] {
+export function graphPathClasses(graph: MaterialGraph, output: "baseColor", parameters: GraphParameters = NO_PARAMETERS, alpha?: "opacity" | "opacityMask"): string[] {
   if (output !== "baseColor") return [];
-  const { compiler } = compile(graph, parameters, { allowUvSetFallback: true });
-  return [...compiler.classes].sort();
+  const settled = settleSwitches(graph, parameters, PATH_OPTIONS, alpha);
+  return settled.kind === "settled" ? [...settled.pass.colour.classes].sort() : [];
 }
 
 /**
- * Names of the textures the active BaseColor path samples (static switches followed to their chosen branch), in
+ * Names of the textures the active BaseColor path samples (static switches settled with the requested cut-out), in
  * compile order. Undefined when the path is not fully readable: an unsupported or unavailable node on it means the
  * textures a compile reached are not the ones a bake would sample, so a caller must not act on them.
  */
-export function graphPathTextures(graph: MaterialGraph, parameters: GraphParameters = NO_PARAMETERS): string[] | undefined {
-  const { compiler } = compile(graph, parameters, { allowUvSetFallback: true });
+export function graphPathTextures(graph: MaterialGraph, parameters: GraphParameters = NO_PARAMETERS, alpha?: "opacity" | "opacityMask"): string[] | undefined {
+  const settled = settleSwitches(graph, parameters, PATH_OPTIONS, alpha);
+  if (settled.kind !== "settled") return undefined;
+  const compiler = settled.pass.colour;
   if (compiler.unsupported.size > 0 || compiler.unavailable.length > 0) return undefined;
   return [...new Set(compiler.slots.map((slot) => slot.name))];
 }
@@ -2399,7 +2733,14 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
     return { status: "unavailable", reason: `graph ${graph.material} has no BaseColor output` };
   }
 
-  const { compiler, value } = compile(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined, objectRadius: request.objectRadius });
+  // The colour and the requested cut-out are compiled under one settled set of static-switch choices, so a switch takes one
+  // branch for both, and its demands are the attributes the two of them read through it.
+  const options: CompileOptions = { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined, objectRadius: request.objectRadius };
+  const settled = settleSwitches(graph, request.parameters, options, request.alpha);
+  if (settled.kind === "refused") {
+    return { status: "unavailable", reason: `static switches of ${graph.material} do not settle (${settled.switches.join(", ")}): each flips with the demands of the colour and the cut-out` };
+  }
+  const { colour: compiler, value, cut } = settled.pass;
   if (compiler.unsupported.size > 0) {
     const unsupported = [...compiler.unsupported].sort();
     return { status: "unsupported", unsupported, reason: `BaseColor of ${graph.material} depends on unsupported nodes: ${unsupported.join(", ")}` };
@@ -2425,10 +2766,10 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
   const approximations = new Set(compiler.approximations);
   const alphaPin = request.alpha && graph.outputs[request.alpha] ? request.alpha : undefined;
   let alphaSummary: { pin: "opacity" | "opacityMask"; opaqueShare: number; binary: boolean } | undefined;
-  if (alphaPin) {
+  if (alphaPin && cut) {
     // The cut-out is its own compile, so an alpha path the evaluator cannot read costs only the cut-out: the colour stays.
-    const alphaCompiler = new Compiler(graph, request.parameters, { allowUvSetFallback: request.allowUvSetFallback === true, vertexColor: request.vertexColor, particleColor: request.particleColor, surface: request.surface !== undefined, objectRadius: request.objectRadius });
-    const alphaValue = alphaCompiler.compileAlpha(graph, alphaPin);
+    const alphaCompiler = cut.compiler;
+    const alphaValue = cut.value;
     if (alphaCompiler.unsupported.size > 0 || alphaCompiler.unavailable.length > 0 || !alphaValue) {
       const why = alphaCompiler.unsupported.size > 0 ? `unsupported nodes ${[...alphaCompiler.unsupported].sort().join(", ")}` : alphaCompiler.unavailable.join("; ") || "no readable path";
       approximations.add(`${alphaPin} could not be evaluated (${why}); the base colour stays fully opaque`);
