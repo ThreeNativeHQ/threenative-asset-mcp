@@ -10,6 +10,7 @@ import {
   noColourOutput,
   particleDrivenBaseColor,
   graphPathClasses,
+  graphPathTextures,
   type EmissiveEffect,
   type BakeResult,
   type GraphParameters,
@@ -83,6 +84,12 @@ export type GraphBakeOutcome = BakeResult & {
    * truncated or unreadable.
    */
   readonly vertexColorOnBaseColor?: boolean;
+  /**
+   * Probe only: the textures the active BaseColor path samples, and whether the instance chain overrides a static
+   * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first.
+   */
+  readonly baseColourTextures?: readonly string[];
+  readonly switchOverridden?: boolean;
   /** The dumped graph that was evaluated (the root `Material` of the instance chain). */
   readonly graphMaterial?: string;
   /** The parameters the evaluator saw, after nearest-wins merging over the instance chain. */
@@ -248,6 +255,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       }
     })());
 
+  // Active BaseColor-path texture names per graph and parameter set (probe results).
+  const pathTextures = new Map<string, string[]>();
   // Decoded textures, shared across every section of the import.
   const rasters = new Map<string, Promise<TextureRaster | undefined>>();
   const rasterSizes = new Map<string, number>();
@@ -327,7 +336,18 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       const readable = !graph.truncated && !graph.error;
       return {
         ...unavailable(`${graph.material} has a BaseColor output`),
-        ...(readable ? { vertexColorOnBaseColor: graphPathClasses(graph, "baseColor", parameters).includes("VertexColor") } : {}),
+        ...(readable
+          ? {
+              vertexColorOnBaseColor: graphPathClasses(graph, "baseColor", parameters).includes("VertexColor"),
+              baseColourTextures: (pathTextures.get(`${graph.package}|${parametersKey(parameters)}`) ??
+                (() => {
+                  const names = graphPathTextures(graph, parameters);
+                  pathTextures.set(`${graph.package}|${parametersKey(parameters)}`, names);
+                  return names;
+                })()),
+              switchOverridden: chain.some((props) => props.switchOverrides.length > 0),
+            }
+          : {}),
       };
     }
 

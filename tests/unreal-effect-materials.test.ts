@@ -771,3 +771,67 @@ describe("importer: a bake that stands in for a view- or time-dependent node say
     expect(plain.section.limitations.some((line) => line.startsWith("view-dependent"))).toBe(false);
   });
 });
+
+describe("importer: an instance whose static switch picks a branch the flattened .mat does not list first", () => {
+  /** A winter tree master: BaseColor = (IsLeaf ? T_Leaf : T_Bark), the shape of one master serving trunk, branch and leaf. */
+  function treeMaster(): MaterialGraph {
+    return graphOf(
+      "M_Tree",
+      [
+        node("switch", "StaticSwitchParameter", {
+          inputs: { A: pin("leaf", 0, [1, 1, 1, 0]), B: pin("bark", 0, [1, 1, 1, 0]) },
+          parameter: { name: "true = leaf, false = trunk", group: "" },
+          default: true,
+          switchValue: true,
+        }),
+        node("leaf", "TextureSample", { texture: "/Game/Test/T_Leaf.T_Leaf", samplerType: "Color" }),
+        node("bark", "TextureSample", { texture: "/Game/Test/T_Bark.T_Bark", samplerType: "Color" }),
+      ],
+      { baseColor: pin("switch") },
+    );
+  }
+  const instance = (isLeaf: boolean): string =>
+    [
+      "Parent = Material3'Content/Test/M_Tree.M_Tree'",
+      "BlendMode = BLEND_Opaque (0)",
+      "StaticParameters =",
+      "{",
+      "    StaticSwitchParameters[1] =",
+      "    {",
+      "        StaticSwitchParameters[0] =",
+      "        {",
+      `            Value = ${isLeaf}`,
+      "            ParameterInfo = { Name=true = leaf, false = trunk }",
+      "            bOverride = true",
+      "        }",
+      "    }",
+      "}",
+    ].join("\n");
+  // UE Viewer flattens every instance of the master to the first texture it meets: the bark.
+  const flattened = "Diffuse=T_Bark\nOther[0]=T_Leaf\n";
+  const textures: [string, [number, number, number]][] = [
+    ["T_Bark", [120, 60, 30]],
+    ["T_Leaf", [30, 160, 40]],
+  ];
+
+  async function bakedColour(material: { getBaseColorTexture(): { getImage(): Uint8Array | null } | null }): Promise<[number, number, number]> {
+    const { data } = await sharp(material.getBaseColorTexture()!.getImage()!).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    return [data[0]!, data[1]!, data[2]!];
+  }
+
+  it("binds the branch the switch selects instead of the first texture the .mat lists", async () => {
+    const { material, section } = await importFixture({ graph: treeMaster(), materialName: "MI_Leaf", props: instance(true), mat: flattened, textures });
+    const [red, green] = await bakedColour(material);
+    expect(green).toBeGreaterThan(red);
+    expect(section.graph).toMatchObject({ status: "baked" });
+    expect(section.limitations.join("\n")).toContain("T_Bark dropped as base colour");
+  });
+
+  it("keeps the .mat binding when the selected branch samples that texture (sibling)", async () => {
+    const { material, section } = await importFixture({ graph: treeMaster(), materialName: "MI_Trunk", props: instance(false), mat: flattened, textures });
+    const [red, green] = await bakedColour(material);
+    expect(red).toBeGreaterThan(green);
+    expect(section.graph).toBeUndefined();
+    expect(section.limitations.join("\n")).not.toContain("dropped as base colour");
+  });
+});

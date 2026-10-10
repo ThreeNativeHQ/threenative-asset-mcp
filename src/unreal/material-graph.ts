@@ -2115,6 +2115,15 @@ export function graphPathClasses(graph: MaterialGraph, output: "baseColor", para
   return [...compiler.classes].sort();
 }
 
+/**
+ * Names of the textures the active BaseColor path samples (static switches followed to their chosen branch), in
+ * compile order. Empty when the path is unreadable or samples none.
+ */
+export function graphPathTextures(graph: MaterialGraph, parameters: GraphParameters = NO_PARAMETERS): string[] {
+  const { compiler } = compile(graph, parameters, { allowUvSetFallback: true });
+  return [...new Set(compiler.slots.map((slot) => slot.name))];
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Particle materials
 

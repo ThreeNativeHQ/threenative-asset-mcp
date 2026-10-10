@@ -57,7 +57,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 88;
+export const IMPORTER_VERSION = 89;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1469,6 +1469,20 @@ function usesVertexColors(root: ReturnType<Document["getRoot"]>, material: Mater
 }
 
 /** Glass, mirror and light sections keep their named PBR fallbacks; no graph bake is attempted for them. */
+/** True when any link of the instance chain starting at `name` overrides a static switch. */
+function chainOverridesSwitch(name: string, readProps: (name: string) => string | undefined): boolean {
+  const visited = new Set<string>();
+  for (let current: string | undefined = name; current && visited.size < 16 && !visited.has(current); ) {
+    visited.add(current);
+    const text = readProps(current);
+    if (!text) return false;
+    const props = parsePropsFile(text);
+    if (props.switchOverrides.length > 0) return true;
+    current = props.parent;
+  }
+  return false;
+}
+
 function hasNamedFallback(materialName: string): boolean {
   const lower = materialName.toLowerCase();
   return lower.includes("glass") || lower.includes("mirror") || /(?:^|_)light(?:_|$)/.test(lower);
@@ -1694,6 +1708,28 @@ export async function packageGlb(options: {
             ...(emissiveMask ? [`${emissiveMask.texture} is an emissive mask: it is bound as emissive, and its red channel also drives alpha because glTF has no additive blending.`] : []),
           ],
         };
+      }
+    }
+    // The flattened `.mat` lists the first texture of each class, which is not the branch a static switch picks: a
+    // winter spruce's trunk, branch and leaf instances all flattened to the bark atlas. When the instance chain
+    // overrides a switch and the graph's active BaseColor path never samples the bound texture, the binding is stale;
+    // it is dropped so the graph baker (below) supplies the colour the chosen branch actually reads.
+    if (options.graphBaker && !hasNamedFallback(material.getName()) && chainOverridesSwitch(lookupName, graphRequest(true).readProps)) {
+      const staleBase = resolved.bindings.find((binding) => binding.slot === "baseColor" && binding.source !== "graph");
+      if (staleBase) {
+        const probed = await options.graphBaker(graphRequest(true));
+        const active = probed.baseColourTextures?.map((texture) => texture.toLowerCase());
+        const bound = [staleBase.texture, staleBase.secondaryTexture].filter((texture): texture is string => texture !== undefined);
+        if (probed.switchOverridden && active && active.length > 0 && !bound.some((texture) => active.includes(texture.toLowerCase()))) {
+          resolved = {
+            ...resolved,
+            bindings: resolved.bindings.filter((binding) => binding.slot !== "baseColor"),
+            limitations: [
+              ...resolved.limitations,
+              `${staleBase.texture} dropped as base colour: the instance's static switches select a graph branch that samples ${[...new Set(probed.baseColourTextures)].join(", ")}, so the colour is baked from the graph.`,
+            ],
+          };
+        }
       }
     }
     const authored = await options.sourceMaterial?.(name, lookupName);

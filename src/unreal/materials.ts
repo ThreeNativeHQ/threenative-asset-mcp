@@ -216,7 +216,8 @@ export function parsePropsFile(text: string): PropsFile {
   const number = "[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[Ee][-+]?\\d+)?";
   const readName = (line: string): string | undefined => {
     const legacy = /ParameterName\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
-    const modern = /ParameterInfo\s*=\s*\{\s*Name\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
+    // A parameter name may hold a comma ("true = leaf, false = trunk"), so the name runs to the closing brace.
+    const modern = /ParameterInfo\s*=\s*\{\s*Name\s*=\s*([^}\r\n]+)/.exec(line)?.[1]?.trim();
     const collected = /\bName\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
     return [legacy, modern, collected].find((name) => name && name !== "None");
   };
