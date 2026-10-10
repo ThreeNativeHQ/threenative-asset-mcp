@@ -81,6 +81,12 @@ export interface GraphBakeRequest {
   readonly objectRadius?: (() => number | undefined) | undefined;
 }
 
+/** Literal Roughness and Metallic values the graph's own outputs set (see `sourceScalarFactors`). */
+export interface GraphPbrFactors {
+  readonly roughness?: number;
+  readonly metallic?: number;
+}
+
 export type GraphBakeOutcome = BakeResult & {
   /** Present when the material wires only Emissive: no albedo exists in the package (see `emissiveOnlyEffect`). */
   readonly effect?: EmissiveEffect;
@@ -103,6 +109,11 @@ export type GraphBakeOutcome = BakeResult & {
    * not the colour itself. Only set for that proved composition.
    */
   readonly vertexColorResidual?: boolean;
+  /**
+   * Present with a `vertexColorResidual` bake when the graph's own Roughness or Metallic output is a literal constant (see
+   * `sourceScalarFactors`). The importer applies them as glTF factors only where no packed metallicRoughness texture is bound.
+   */
+  readonly pbrFactors?: GraphPbrFactors;
   /**
    * Probe only: the textures the active BaseColor path samples, and whether the instance chain overrides a static
    * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first. Absent when that path
@@ -278,7 +289,8 @@ export function graphReadsObjectRadius(graph: MaterialGraph): boolean {
  * OpacityMask path is wired. No function, Make, arithmetic, swizzle or other general VertexColor use qualifies.
  */
 export function directVertexColorGraph(graph: MaterialGraph): boolean {
-  if (graph.truncated || graph.error) return false;
+  // A wired attributes output may make the individual root pins dormant; the dump does not record which mode is active.
+  if (graph.truncated || graph.error || graph.outputs.materialAttributes) return false;
   const { baseColor, opacity, opacityMask } = graph.outputs;
   if (!baseColor || opacity || opacityMask) return false;
   if (baseColor.output !== 0) return false;
@@ -299,6 +311,32 @@ export function whiteLoweredGraph(graph: MaterialGraph): MaterialGraph {
       node.id === target ? { id: node.id, class: "Constant3Vector", inputs: {}, constants: { Constant: [1, 1, 1, 0] } } : node,
     ),
   };
+}
+
+/**
+ * The literal Roughness and Metallic the graph's own outputs set, for a residual bake. A factor is proved only when its output
+ * pin is output 0 with a null or R-only mask, wired to a readable `Constant` with no wired inputs: an omitted R is that
+ * Constant's default, 0, and a finite R in [0, 1] is taken as written. Anything else gives no factor (an unconnected pin, another
+ * output, a wider mask, a parameter or other node, a malformed or out-of-range value, a truncated or errored graph). Nothing is
+ * guessed, capped or clamped, and the instance's scalar parameters are never read: a graph that does not wire them cannot use them.
+ */
+function sourceScalarFactors(graph: MaterialGraph): GraphPbrFactors | undefined {
+  if (graph.truncated || graph.error) return undefined;
+  const roughness = literalScalarOutput(graph, graph.outputs.roughness);
+  const metallic = literalScalarOutput(graph, graph.outputs.metallic);
+  if (roughness === undefined && metallic === undefined) return undefined;
+  return { ...(roughness === undefined ? {} : { roughness }), ...(metallic === undefined ? {} : { metallic }) };
+}
+
+function literalScalarOutput(graph: MaterialGraph, pin: MaterialGraph["outputs"]["roughness"]): number | undefined {
+  if (!pin || pin.output !== 0) return undefined;
+  if (pin.mask !== null && !(pin.mask[0] === 1 && pin.mask[1] === 0 && pin.mask[2] === 0 && pin.mask[3] === 0)) return undefined;
+  const source = graph.nodes.find((candidate) => candidate.id === pin.node);
+  if (!source || source.class !== "Constant" || source.error !== undefined) return undefined;
+  if (Object.values(source.inputs).some((input) => input !== null)) return undefined;
+  const value = source.constants.R;
+  if (value === undefined) return 0;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
 }
 
 /** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
@@ -523,6 +561,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       // fallback for reporting, never a claim that the path has no class.
       const classes = graphPathClasses(graph!, "baseColor", parameters, request.alpha) ?? [];
       if (classes.includes("StaticSwitchParameter") || classes.includes("StaticBoolParameter")) approximations.add(STATIC_SWITCH_NOTE);
+      // Read from the original graph, not the white-lowered copy that was baked, and cached with the residual it belongs to.
+      const pbrFactors = residual ? sourceScalarFactors(graph!) : undefined;
       const baked: GraphBakeOutcome = {
         ...result,
         approximations: [...approximations].sort(),
@@ -530,6 +570,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         graphMaterial: graph!.material,
         parameters,
         ...(residual ? { vertexColorResidual: true } : {}),
+        ...(pbrFactors ? { pbrFactors } : {}),
       };
       bakeBytes += result.png.length;
       return baked;

@@ -41,7 +41,7 @@ import {
   type PaperTileMapDescriptor,
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
-import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphTextureSource } from "./graph-baker.js";
+import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphPbrFactors, type GraphTextureSource } from "./graph-baker.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
 import {
@@ -57,7 +57,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 90;
+export const IMPORTER_VERSION = 91;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -2022,6 +2022,8 @@ export async function packageGlb(options: {
     // PRD-538: colour that exists only in the material graph. Glass, mirrors and lights keep their named
     // fallbacks; everything else that has no base-colour texture asks the graph baker.
     const graphBindings: MaterialTextureBinding[] = [];
+    // The literal Roughness/Metallic of a proved residual bake (see `sourceScalarFactors`), applied once the factors below are set.
+    let sourceFactors: GraphPbrFactors | undefined;
     if (material.getBaseColorTexture() === null && options.graphBaker && !hasNamedFallback(material.getName())) {
       const outcome = await options.graphBaker(graphRequest(false));
       if (outcome.effect && !effect) effect = { kind: "emissive", reason: outcome.effect.reason };
@@ -2051,6 +2053,7 @@ export async function packageGlb(options: {
           packagingLimitations.push(
             `${material.getName()}'s graph wires BaseColor directly to VertexColor: the mesh's COLOR_0 supplies the base colour and the baked white graph base colour is a neutral residual factor, so a glTF client reproduces Unreal's colour.`,
           );
+          sourceFactors = outcome.pbrFactors;
         }
         const viewDependent = viewDependentNodes(outcome.approximations);
         if (viewDependent.length > 0) {
@@ -2137,6 +2140,25 @@ export async function packageGlb(options: {
       }
     }
     if (resolved.roughnessFactor !== undefined) material.setRoughnessFactor(resolved.roughnessFactor);
+    if (sourceFactors) {
+      // The graph's own constant replaces the instance scalar and the neutral fallback. A bound metallicRoughness texture would
+      // be multiplied by a factor, so there the constant is not applied and the texture's own values stand.
+      const constants = [
+        ...(sourceFactors.roughness !== undefined ? [`Roughness ${sourceFactors.roughness}`] : []),
+        ...(sourceFactors.metallic !== undefined ? [`Metallic ${sourceFactors.metallic}`] : []),
+      ].join(", ");
+      if (material.getMetallicRoughnessTexture() === null) {
+        if (sourceFactors.metallic !== undefined) material.setMetallicFactor(sourceFactors.metallic);
+        if (sourceFactors.roughness !== undefined) material.setRoughnessFactor(sourceFactors.roughness);
+        packagingLimitations.push(
+          `Source graph ${constants}: literal Constant(s) wired straight to the output; the glTF factor(s) are set to them, and no packed metallicRoughness texture is bound to multiply.`,
+        );
+      } else {
+        packagingLimitations.push(
+          `Source graph ${constants}: a literal Constant, but this section binds a packed metallicRoughness texture, so the constant is not applied and that texture's values stand. They are not claimed to match Unreal.`,
+        );
+      }
+    }
     // Unreal's `Specular` input is a dielectric F0 of 0.08 x Specular (0.5 gives the glTF default 0.04). A matte foliage
     // master with Specular 0.1 has F0 0.008, a fifth of glTF's default, so leaving the default adds a pale sheen that
     // washes the green out. Only a constant is applied; 0.5 (the engine default) changes nothing.

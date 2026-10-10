@@ -263,6 +263,42 @@ function alphaSharedSwitchGraph(vertexOnB: boolean): MaterialGraph {
   });
 }
 
+
+function vertexColorWithAttributes(): MaterialGraph {
+  const graph = vertexColorDirect();
+  return materialGraphSchema.parse({
+    ...graph,
+    outputs: { ...graph.outputs, materialAttributes: pin("attrs") },
+    nodes: [...graph.nodes,
+      node("attrs", "MakeMaterialAttributes", { inputs: { BaseColor: pin("otherColour"), Roughness: pin("otherRoughness") } }),
+      node("otherColour", "Constant3Vector", { constants: { Constant: [1, 0, 0, 1] } }),
+      node("otherRoughness", "Constant", { constants: { R: 0.7 } }),
+    ],
+  });
+}
+
+// The direct VertexColor graph with Roughness and Metallic wired to the given pins (absent: unconnected) and the extra nodes they reach.
+function vertexColorScalars(outputs: { roughness?: Raw | null; metallic?: Raw | null }, nodes: Raw[] = []): MaterialGraph {
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length + 1,
+    outputs: {
+      baseColor: { node: "vertex", output: 0, mask: [1, 1, 1, 0] },
+      roughness: outputs.roughness ?? null,
+      metallic: outputs.metallic ?? null,
+      emissive: null,
+      opacity: null,
+      opacityMask: null,
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes: [node("vertex", "VertexColor"), ...nodes],
+  });
+}
+
 async function firstPixel(png: Buffer | Uint8Array): Promise<number[]> {
   const { data } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   return [...data.subarray(0, 3)];
@@ -694,6 +730,7 @@ describe("createGraphBaker", () => {
     expect(directVertexColorGraph(vertexColorSwizzled())).toBe(false);
     expect(directVertexColorGraph(masterGraph("vertex-color"))).toBe(false);
     expect(directVertexColorGraph(vertexColorWithOpacity())).toBe(false);
+    expect(directVertexColorGraph(vertexColorWithAttributes())).toBe(false);
     expect(directVertexColorGraph({ ...vertexColorDirect(), truncated: true })).toBe(false);
     expect(directVertexColorGraph({ ...vertexColorDirect(), error: "unreadable" })).toBe(false);
     const outputs = { ...vertexColorDirect().outputs, baseColor: { node: "vertex", output: 1, mask: null } };
@@ -702,7 +739,7 @@ describe("createGraphBaker", () => {
 
   it("never lowers a swizzle, arithmetic or opacity VertexColor graph even when the flag is set", async () => {
     const { sourceDir, assets, readProps } = await fixture();
-    for (const graph of [vertexColorSwizzled(), masterGraph("vertex-color"), vertexColorWithOpacity()]) {
+    for (const graph of [vertexColorSwizzled(), masterGraph("vertex-color"), vertexColorWithOpacity(), vertexColorWithAttributes()]) {
       const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
       const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
       expect(outcome.status).toBe("unsupported");
@@ -717,6 +754,59 @@ describe("createGraphBaker", () => {
       const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
       expect(outcome.status).toBe("unavailable");
       expect(outcome.vertexColorResidual).toBeUndefined();
+    }
+  });
+
+  it("carries the literal Roughness and Metallic on the cached residual outcome, an omitted R being 0", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const graph = vertexColorScalars({ roughness: pin("rough"), metallic: pin("metal") }, [
+      node("rough", "Constant", { constants: { R: 0.25 } }),
+      node("metal", "Constant", { constants: {} }),
+    ]);
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+    const request = { materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true };
+    const first = await baker(request);
+    expect(first.status === "baked" && first.pbrFactors).toEqual({ roughness: 0.25, metallic: 0 });
+    // The same request is answered from the memo, so the factors come back with the cached residual.
+    expect(await baker(request)).toBe(first);
+  });
+
+  it("accepts a literal on output 0 with a null or R-only mask, at either end of [0, 1]", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const cases: Array<[string, MaterialGraph, number]> = [
+      ["an R-only mask", vertexColorScalars({ roughness: pin("rough", [1, 0, 0, 0]) }, [node("rough", "Constant", { constants: { R: 0.25 } })]), 0.25],
+      ["an upper bound of 1", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 1 } })]), 1],
+      ["a lower bound of 0", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 0 } })]), 0],
+    ];
+    for (const [label, graph, expected] of cases) {
+      const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+      const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
+      expect(outcome.status === "baked" && outcome.pbrFactors?.roughness, label).toBe(expected);
+    }
+  });
+
+  it("withholds the factor for any pin, node or value it cannot prove, and the residual itself still bakes", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const constant = (R: unknown) => node("rough", "Constant", { constants: { R } });
+    const cases: Array<[string, MaterialGraph]> = [
+      ["an unconnected Roughness", vertexColorScalars({}, [constant(0.25)])],
+      ["a Roughness from output 1", vertexColorScalars({ roughness: { node: "rough", output: 1, mask: null } }, [constant(0.25)])],
+      ["a Roughness with a G-only mask", vertexColorScalars({ roughness: pin("rough", [0, 1, 0, 0]) }, [constant(0.25)])],
+      ["a Roughness above 1", vertexColorScalars({ roughness: pin("rough") }, [constant(1.5)])],
+      ["a negative Roughness", vertexColorScalars({ roughness: pin("rough") }, [constant(-0.5)])],
+      ["a Roughness written as a string", vertexColorScalars({ roughness: pin("rough") }, [constant("0.25")])],
+      ["a Roughness written as an array", vertexColorScalars({ roughness: pin("rough") }, [constant([0.25])])],
+      ["a Roughness read from a parameter", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "ScalarParameter", { parameter: { name: "Roughness", group: "" }, default: 0.25 })])],
+      ["a Constant with a wired input", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { inputs: { A: pin("vertex") }, constants: { R: 0.25 } })])],
+      ["a Roughness whose node is missing", vertexColorScalars({ roughness: pin("gone") })],
+      ["a Roughness whose node failed to load", vertexColorScalars({ roughness: pin("rough") }, [{ id: "rough", class: "Constant", error: "unreadable" }])],
+    ];
+    for (const [label, graph] of cases) {
+      const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+      const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
+      expect(outcome.status, label).toBe("baked");
+      expect(outcome.vertexColorResidual, label).toBe(true);
+      expect(outcome.pbrFactors, label).toBeUndefined();
     }
   });
 });
@@ -780,7 +870,7 @@ process.exit(run.status === null ? 1 : run.status);
   await chmod(path, 0o755);
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number] }) {
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -790,12 +880,15 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   await writeFile(join(content, "Mesh.uasset"), Buffer.alloc(16));
   await writeFile(join(content, "MI_Rock.uasset"), Buffer.alloc(16));
   await writeFile(join(content, "M_Master.uasset"), Buffer.alloc(16));
+  const overrides: [string, string][] = options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]];
+  // A packed roughness texture (SpecPower binds the metallicRoughness slot): a constant factor must not multiply into it.
+  if (options.packedRoughness) overrides.push(["SpecPower", "T_Spec"]);
   // The exporter binds nothing to MI_Rock: its colour exists only in the graph.
   await writeMeshFixture(exported, {
     name: "Mesh",
     materialName: "MI_Rock",
     mat: "",
-    props: instanceProps("M_Master", options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]], {
+    props: instanceProps("M_Master", overrides, {
       scalars: options.instanceScalars,
       vectors: options.instanceTint ? [["Base Color Tint", options.instanceTint]] : undefined,
     }),
@@ -822,6 +915,10 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   await writeFile(join(content, "T_MasterMask.uasset"), Buffer.alloc(16));
   await writePng(join(exported, "T_InstanceMask.png"), [200, 100, 50, 255], 4);
   await writePng(join(exported, "T_MasterMask.png"), [10, 10, 10, 255], 4);
+  if (options.packedRoughness) {
+    await writeFile(join(content, "T_Spec.uasset"), Buffer.alloc(16));
+    await writePng(join(exported, "T_Spec.png"), [128, 128, 128, 255], 4);
+  }
   const umodel = join(root, "umodel");
   const textureLog = join(root, "texture-exports.log");
   const cacheDir = join(root, "cache");
@@ -995,6 +1092,60 @@ describe("importUnrealDirectory graph bake", () => {
     expect(section.graph).toMatchObject({ status: "baked", confidence: "heuristic" });
     expect(section.graph?.vertexColorResidual).toBeUndefined();
     expect(section.graph?.approximations.join("\n")).toContain("VertexColor evaluated as white: the mesh carries no vertex colours");
+  });
+
+  it("applies a literal Roughness and Metallic to the GLB and report, an omitted R being Unreal's default 0", async () => {
+    const graph = vertexColorScalars({ roughness: pin("rough"), metallic: pin("metal") }, [
+      node("rough", "Constant", { constants: {} }),
+      node("metal", "Constant", { constants: { R: 1 } }),
+    ]);
+    const { report, onDisk, material } = await importWithGraph({ graph, vertexColors: true });
+    expect(material.getRoughnessFactor()).toBe(0);
+    expect(material.getMetallicFactor()).toBe(1);
+    for (const reported of [report, onDisk]) {
+      const section = reported.models[0]!.materials[0]!;
+      expect(section.factors).toMatchObject({ roughness: 0, metallic: 1 });
+      expect(section.limitations.join("\n")).toContain("Roughness 0, Metallic 1");
+    }
+  });
+
+  it("carries a literal Roughness of 0.25 through the GLB and report, and an unused instance Roughness of 0.8 does not override it", async () => {
+    const graph = vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 0.25 } })]);
+    const { report, onDisk, material } = await importWithGraph({ graph, vertexColors: true, instanceScalars: [["Roughness", 0.8]] });
+    expect(material.getRoughnessFactor()).toBe(0.25);
+    for (const reported of [report, onDisk]) {
+      const section = reported.models[0]!.materials[0]!;
+      expect(section.factors.roughness).toBe(0.25);
+      expect(section.graph).toMatchObject({ status: "baked", vertexColorResidual: true });
+    }
+  });
+
+  it("keeps the 0.8 fallback when the graph's Roughness is not a proven literal: out of range, another output, or a parameter", async () => {
+    const cases: Array<[string, MaterialGraph]> = [
+      ["out of range", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 1.5 } })])],
+      ["output 1", vertexColorScalars({ roughness: { node: "rough", output: 1, mask: null } }, [node("rough", "Constant", { constants: { R: 0.25 } })])],
+      ["a parameter", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "ScalarParameter", { parameter: { name: "Roughness", group: "" }, default: 0.25 })])],
+    ];
+    for (const [label, graph] of cases) {
+      const { report, material } = await importWithGraph({ graph, vertexColors: true });
+      const section = report.models[0]!.materials[0]!;
+      expect(material.getRoughnessFactor(), label).toBe(0.8);
+      expect(section.factors.roughness, label).toBe(0.8);
+      expect(section.graph, label).toMatchObject({ status: "baked", vertexColorResidual: true });
+      expect(section.limitations.join("\n"), label).not.toContain("literal Constant");
+    }
+  });
+
+  it("does not multiply a literal Roughness into a packed metallicRoughness texture, and records that the constant is not applied", async () => {
+    const graph = vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 0.25 } })]);
+    const { report, material } = await importWithGraph({ graph, vertexColors: true, packedRoughness: true });
+    const section = report.models[0]!.materials[0]!;
+    expect(material.getMetallicRoughnessTexture()).not.toBeNull();
+    // The packed path keeps its own factors (metallic 0, roughness 1), so the texture's channels stand unscaled.
+    expect(material.getMetallicFactor()).toBe(0);
+    expect(material.getRoughnessFactor()).toBe(1);
+    expect(section.limitations.join("\n")).toContain("not applied");
+    expect(section.graph).toMatchObject({ status: "baked", vertexColorResidual: true });
   });
 });
 
