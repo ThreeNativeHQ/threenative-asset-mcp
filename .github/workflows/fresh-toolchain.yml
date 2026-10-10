@@ -79,7 +79,7 @@ jobs:
         env:
           CI: "true"
           THREENATIVE_TOOLCHAIN_DIR: ${{ runner.temp }}/toolchain
-        run: npx vitest run tests/unreal-converter-ue5-sources.test.ts
+        run: npx vitest run tests/unreal-converter-ue5-sources.test.ts tests/unreal-converter-custom-inputs.test.ts
 
       # The uncooked colour decoder test mirrors the anchors in stubs; this runs the real installed
       # converter (extract_geometry -> StaticMesh -> export_glb/pygltflib). A missing converter fails here.
