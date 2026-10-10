@@ -114,7 +114,7 @@ describe("BuildScale3D on the uncooked MeshDescription route", () => {
   it("multiplies the source model by a uniform build scale, as Unreal's render data is", async () => {
     const { max, report } = await importMesh([1.4, 1.4, 1.4]);
     expect(max).toEqual([1.4, 2.8, 4.2]);
-    expect(report.warnings.join("\n")).toContain("BuildScale3D (1.399999976158142, 1.399999976158142, 1.399999976158142); the source model's geometry");
+    expect(report.warnings.join("\n")).toContain("BuildScale3D (1.399999976158142, 1.399999976158142, 1.399999976158142); the decoded source geometry was scaled by it");
   });
 
   it("maps a non-uniform scale through the converter's axes (glTF x, y, z = Unreal y, z, x)", async () => {

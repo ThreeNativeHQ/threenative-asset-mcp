@@ -494,9 +494,6 @@ const WORLD_POSITION_NOTE =
 const PRECOMPUTED_AO_MASK_NOTE =
   "PrecomputedAOMask evaluated as 0: Unreal's value without built static lighting (the editor thumbnail, a movable or unbuilt mesh); a level built with Lightmass's AO material mask would darken crevices";
 
-const VERTEX_NORMAL_NOTE =
-  "VertexNormalWS evaluated as the mesh's own vertex normal (unrotated instance): Unreal Z (up) is glTF +Y; the horizontal axes follow UE Viewer's export order (X = glTF x, Y = glTF z)";
-
 const TRANSFORM_LOCAL_WORLD_NOTE =
   "Transform between Local and World space is the identity: the bake is one unrotated, unscaled instance";
 
@@ -918,15 +915,6 @@ class Compiler {
         // against the editor thumbnails of the pieces that read it (see the PR's fidelity table).
         this.approximations.add(PRECOMPUTED_AO_MASK_NOTE);
         return this.constant([0], 1);
-      case "VertexNormalWS":
-        if (!this.options.surface) return this.unsupportedNode(node);
-        this.approximations.add(VERTEX_NORMAL_NOTE);
-        return this.emit([], 3, (o) => (r, texel) => {
-          r[o] = texel.nx ?? 0;
-          r[o + 1] = texel.nz ?? 0;
-          r[o + 2] = texel.ny ?? 1;
-          r[o + 3] = 0;
-        }, true);
       case "Transform":
         return this.transform(node);
       case "ObjectRadius": {

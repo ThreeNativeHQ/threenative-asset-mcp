@@ -621,10 +621,10 @@ describe("importer: an Additive or Modulate material is classified by its BlendM
     }
   });
 
-  it("Translucent with the same graph is not an effect: the unsupported node stays a miss", async () => {
+  it("Translucent with the same graph is a particle effect, not an additive-blend one: the emitter supplies the colour", async () => {
     const { section, report } = await spark("BLEND_Translucent (2)");
-    expect(section.effect).toBeUndefined();
-    expect(report.materialCoverage.effect).toBe(0);
+    expect(section.effect).toMatchObject({ kind: "particle" });
+    expect(report.materialCoverage.effect).toBe(1);
     expect(section.graph).toMatchObject({ status: "unsupported", unsupportedNodes: ["DynamicParameter"] });
   });
 });

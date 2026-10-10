@@ -1988,7 +1988,7 @@ describe("layered architecture masters: texture objects, render-path switches, s
     const pixel = await pixelsOf(result);
     expect(pixel(0, 0)).toEqual([encode(0.2), encode(0.1), encode(0)]);
     expect(pixel(3, 0)).toEqual([encode(0.6), encode(0.6), encode(0.6)]);
-    expect(notes(result).some((note) => note.startsWith("VertexNormalWS evaluated as the mesh's own vertex normal"))).toBe(true);
+    expect(notes(result).some((note) => note.startsWith("VertexNormalWS evaluated from the mesh's own vertex normals"))).toBe(true);
     expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["VertexNormalWS"] });
   });
 
