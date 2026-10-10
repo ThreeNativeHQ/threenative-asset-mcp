@@ -9,3 +9,9 @@ The source thumbnail is cyan. The new import is visibly brighter blue than impor
 Runtime: importer95, modern71, verified uncooked4.27.2.0+threenative.10. Production code6280b95 (docs-only HEAD298fad8 during import). The converter now emits COLOR_0 bytes(0,26,139,0), rather than the stale writer's(0,3,66,0); neutral opaque vertex-colour material residual remains in use.
 
 [New comparison](hornbeam-icon-after-i95-uncooked10.jpg). [Previous comparison](../2026-10-10-i94/hornbeam-icon-after-i93.jpg).
+
+## Winter Spruce, opt-in engine bodies
+
+[Source/import comparison](spruce-after-i95-engine71.jpg). **No visual improvement:** importer95/native71 with paired5.8engine content produces the same GLB and sheet as the earlier importer90/native69 attribute run. Judge **64.1 / suspect**; density2.19, mass2.26, lightness0.63. Parent inspected the source/import sheet: pale foliage remains unlike the snowy blue-green reference.
+
+Provenance: source code2426703 extracted read-only; later6280b95 changes uncooked revision resolution, which this UModel route does not use. Native71 verified from the fresh converter. HeightLerp/SmoothThreshold are no longer named unsupported, but26sections remain blocked by If,68by missing TilingNoise05, and94baked sections retain SpeedTreeColorVariation/default-switch heuristics. Engine bodies alone have not closed Spruce parity.
