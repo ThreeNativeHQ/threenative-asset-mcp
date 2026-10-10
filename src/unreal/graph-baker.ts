@@ -154,7 +154,9 @@ export function chainParameters(chain: readonly PropsFile[]): GraphParameters {
   const textures = new Map<string, string>();
   const vectors = new Map<string, [number, number, number, number]>();
   const scalars = new Map<string, number>();
+  const switches = new Map<string, boolean>();
   for (const props of chain) {
+    for (const entry of props.switchOverrides) mergeFirst(switches, entry.name, entry.value);
     for (const entry of props.overrides) mergeFirst(textures, entry.name, entry.texture);
     for (const entry of props.vectorOverrides) mergeFirst(vectors, entry.name, [...entry.value]);
     for (const entry of props.scalarOverrides) mergeFirst(scalars, entry.name, entry.value);
@@ -164,7 +166,7 @@ export function chainParameters(chain: readonly PropsFile[]): GraphParameters {
     for (const entry of props.vectors) mergeFirst(vectors, entry.name, [...entry.value]);
     for (const entry of props.scalars) mergeFirst(scalars, entry.name, entry.value);
   }
-  return { textures, vectors, scalars, switches: new Map() };
+  return { textures, vectors, scalars, switches };
 }
 
 function parametersKey(parameters: GraphParameters): string {

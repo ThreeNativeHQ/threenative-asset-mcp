@@ -121,6 +121,11 @@ export interface PropsFile {
   readonly scalarOverrides: readonly ScalarParameter[];
   readonly vectors: readonly VectorParameter[];
   readonly vectorOverrides: readonly VectorParameter[];
+  /**
+   * `StaticParameters.StaticSwitchParameters` the instance overrides (`bOverride = true`): the branch it takes at a
+   * `StaticSwitchParameter` node, whatever the parent's default is.
+   */
+  readonly switchOverrides: readonly { readonly name: string; readonly value: boolean }[];
   readonly parent: string | undefined;
   /**
    * The parent's package path as the `Parent =` line spells it (`Content/Pack/Dir/MI_Name`, no object suffix), or undefined
@@ -201,6 +206,7 @@ export function parsePropsFile(text: string): PropsFile {
   const scalarOverrides: ScalarParameter[] = [];
   const vectors: VectorParameter[] = [];
   const vectorOverrides: VectorParameter[] = [];
+  const switchOverrides: { name: string; value: boolean }[] = [];
   let inCollected = false;
   let collectedDepth = 0;
   let depth = 0;
@@ -266,6 +272,13 @@ export function parsePropsFile(text: string): PropsFile {
   collectScalars("ScalarParameterValues", scalarOverrides);
   collectVectors("CollectedVectorParameters", vectors);
   collectVectors("VectorParameterValues", vectorOverrides);
+  for (const block of indexedBlocks("StaticSwitchParameters")) {
+    if (/StaticSwitchParameters\[\d+\]/.test(block)) continue;
+    const name = readName(block);
+    const value = /\bValue\s*=\s*(true|false)\b/.exec(block)?.[1];
+    const overridden = /\bbOverride\s*=\s*(true|false)\b/.exec(block)?.[1];
+    if (name && value !== undefined && overridden !== "false") switchOverrides.push({ name, value: value === "true" });
+  }
   for (const block of indexedBlocks("TextureParameterValues")) {
     if (/TextureParameterValues\[\d+\]/.test(block)) continue;
     const name = readName(block);
@@ -342,6 +355,7 @@ export function parsePropsFile(text: string): PropsFile {
     scalarOverrides,
     vectors,
     vectorOverrides,
+    switchOverrides,
     parent,
     parentPackage,
     streamingTextures,

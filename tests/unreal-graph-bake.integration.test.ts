@@ -142,6 +142,41 @@ describe("chainParameters over modern-converter props", () => {
   });
 });
 
+describe("chainParameters over UE Viewer static switch overrides", () => {
+  const switches = (parent: string | undefined, entries: [string, boolean, boolean][]): string =>
+    [
+      ...(parent ? [`Parent = MaterialInstanceConstant'${parent}.${parent}'`] : []),
+      "StaticParameters =",
+      "{",
+      `    StaticSwitchParameters[${entries.length}] =`,
+      "    {",
+      ...entries.flatMap(([name, value, overridden], index) => [
+        `        StaticSwitchParameters[${index}] =`,
+        "        {",
+        `            Value = ${value}`,
+        `            ParameterInfo = { Name=${name} }`,
+        `            bOverride = ${overridden}`,
+        "        }",
+      ]),
+      "    }",
+      "}",
+    ].join("\n");
+
+  it("reads an instance's overridden switches and the nearest level wins", () => {
+    const instance = parsePropsFile(switches("MI_Parent", [["Split Albedo Controls", true, true], ["Winter", false, true]]));
+    const parent = parsePropsFile(switches(undefined, [["Split Albedo Controls", false, true], ["Seasons", true, true]]));
+    const parameters = chainParameters([instance, parent]);
+    expect(parameters.switches.get("split albedo controls")).toBe(true);
+    expect(parameters.switches.get("winter")).toBe(false);
+    expect(parameters.switches.get("seasons")).toBe(true);
+  });
+
+  it("ignores an entry the instance lists without overriding it", () => {
+    const instance = parsePropsFile(switches(undefined, [["Split Albedo Controls", true, false]]));
+    expect(chainParameters([instance]).switches.has("split albedo controls")).toBe(false);
+  });
+});
+
 describe("createGraphBaker", () => {
   async function fixture() {
     const root = await scratch("graph-bake-unit-");
