@@ -67,6 +67,17 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
 
 ## Fab and Unreal imports
 
+- **Local official engine reference:** `/home/joao/projects/UnrealEngine-5.8.3`, tag
+  `5.8.3-release`, commit `396c9f059903aed5fec78ecd3d437a40c6415368`. This is a shallow,
+  blob-filtered sparse clone made through authenticated `gh`; expand the sparse paths when needed.
+  Use it to verify importer semantics (MeshDescription colours, vertex buffers/shaders, material
+  expressions, texture decoding) and locate engine material-function dependencies. Engine content
+  assets require separate dependency retrieval; no full Setup or engine build is implied. Keep
+  Epic source/assets local and record provenance rather than copying them into this repo. If the
+  needed behavior is binary-only, João requires **DeepSeek v4.1 Flash using the REA repo**; locate
+  its workflow/toolkit through `/home/joao/projects/unreal-rea-docs`. `/home/joao/UE58` is only a
+  partial binary installation. Verify visual results with the judge and contact sheets by eye.
+
 - **Login is the user's.** The MCP never signs in. For an agent session with no display, run
   `fabcli auth login --manual` under a pseudo-terminal (it refuses a non-TTY stdin). The user opens
   the printed `epicgames.com/id/login?redirectUrl=…` link in the browser where they are already
