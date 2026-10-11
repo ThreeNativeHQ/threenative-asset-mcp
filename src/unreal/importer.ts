@@ -2426,8 +2426,8 @@ export async function packageGlb(options: {
       conflictingMorphDeltas += seams.conflicting;
 
       if (options.keepAllUvSets) continue;
-      // UE Viewer emits every Unreal UV channel, including lightmap sets no runtime material
-      // reads. They are pure size in a source asset that a compiler will copy again.
+      // The lossy policy, for a caller that wants a runtime-only copy. UE Viewer emits every Unreal UV channel, including
+      // lightmap sets no bound material reads; the importer keeps them as authored source data (`keepAllUvSets: true`).
       for (let set = 1; set < 8; set += 1) {
         const material = primitive.getMaterial();
         const usedInfos = material ? [material.getBaseColorTextureInfo(), material.getNormalTextureInfo(), material.getMetallicRoughnessTextureInfo(), material.getEmissiveTextureInfo(), material.getOcclusionTextureInfo()] : [];
@@ -4475,7 +4475,7 @@ export async function importUnrealDirectory(
             glbPath,
             assets,
             maxTextureSize: request.maxTextureSize,
-            keepAllUvSets: false,
+            keepAllUvSets: true,
             imageCache,
             copyright,
             sidecars,
@@ -4605,7 +4605,7 @@ export async function importUnrealDirectory(
           glbPath,
           assets: source.assets,
           maxTextureSize: request.maxTextureSize,
-          keepAllUvSets: false,
+          keepAllUvSets: true,
           imageCache,
           copyright,
           sidecars,
@@ -4718,7 +4718,7 @@ export async function importUnrealDirectory(
           glbPath,
           assets,
           maxTextureSize: request.maxTextureSize,
-          keepAllUvSets: false,
+          keepAllUvSets: true,
           imageCache,
           copyright,
           materialLookupNames: lookupNames,
