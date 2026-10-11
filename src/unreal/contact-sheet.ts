@@ -44,6 +44,11 @@ export const PICTURE_CAMERA = Object.freeze({ fov: 40, direction: [1, 0.75, 1.2]
  * these values, so a test that pins them pins the picture itself.
  */
 export const PICTURE_RENDERER = Object.freeze({ toneMapping: "ACESFilmicToneMapping", toneMappingExposure: 1 });
+/**
+ * Revision of the `unreal-like` picture contract: its lights, camera, tone mapping, floor and source handling. Bump it whenever
+ * one of those changes, so a stored picture is never taken for one this renderer would draw (`preview-reference-workflow.ts`).
+ */
+export const PICTURE_CONTRACT_REVISION = 1;
 
 /**
  * Source metadata of the environment that actually lit a picture, with a digest of the radiance it was given. The

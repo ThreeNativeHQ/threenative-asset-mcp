@@ -2,19 +2,11 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, type FileHandle } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { ThumbnailGridSource } from "./thumbnail-floor.js";
+import type { ThumbnailGridSource, ThumbnailSourceGrid } from "./thumbnail-floor.js";
 import type { ThumbnailEnvironmentSource, ThumbnailSourceRadiance } from "./thumbnail-lighting.js";
 
-/**
- * Stand-in for the Grid's public sourceGrid type until it merges: decoded RGBA8, row-major, top row first.
- * Its source is the caller's record, not an attestation of file identity or redistribution rights.
- */
-export interface ThumbnailReferenceGrid {
-  readonly width: number;
-  readonly height: number;
-  readonly rgba: Uint8Array;
-  readonly source: ThumbnailGridSource;
-}
+/** The public `ThumbnailSourceGrid`, under the name this loader first used. Kept so existing imports still compile. */
+export type ThumbnailReferenceGrid = ThumbnailSourceGrid;
 
 /** Digests of the bytes actually read. The decoded arrays are never serialised. */
 export interface ThumbnailReferenceProfileReport {
@@ -25,7 +17,7 @@ export interface ThumbnailReferenceProfileReport {
 
 export interface ThumbnailReferenceProfile {
   readonly sourceEnvironment: ThumbnailSourceRadiance;
-  readonly sourceGrid: ThumbnailReferenceGrid;
+  readonly sourceGrid: ThumbnailSourceGrid;
   readonly report: ThumbnailReferenceProfileReport;
 }
 

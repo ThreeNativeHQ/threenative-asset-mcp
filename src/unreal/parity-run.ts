@@ -22,6 +22,7 @@ import { z } from "zod";
 import type { FabOwnedListing } from "../fab/fabcli.js";
 import { compareEngines, decoderRoute, oldestEngine } from "../fab/routes.js";
 import type { MissAttribution, PackScore } from "./parity.js";
+import type { PictureIdentity } from "./preview-reference-workflow.js";
 import { textureIdentityReason, type CrossDecodeProof, type TextureProof } from "./texture-proof.js";
 
 export type ParityRoute = "umodel" | "mesh-description" | "cue4parse" | "unknown";
@@ -139,6 +140,8 @@ export interface EntrySheet {
    * (it has an editor thumbnail) means a model that renders as nothing and still scores PASS.
    */
   readonly warnings?: readonly string[];
+  /** What lit the sheet (`preview-reference-workflow.ts`). `--resume --sheets` keeps this sheet only when it matches. */
+  readonly picture?: PictureIdentity;
 }
 
 /** The judge's reason for an empty render (`judgeRender`). */
@@ -1057,10 +1060,12 @@ Options:
   --sheets               Contact sheet per pack (default on): <out>/sheets/<listing8>-<artifact>.jpg,
                          each piece's Unreal editor thumbnail beside its render, with a visual-judge
                          verdict per tile (white, ghost, specks, washed out, colour similarity)
+                         Lit by THREENATIVE_UNREAL_PREVIEW_REFERENCE (a local profile) when it is set.
   --no-sheets            Skip the sheets
   -h, --help             Print this help
 
-Exit codes: 0 done, 1 error, 2 Fab session/download failure (partial scorecard written), 130 interrupted.`;
+Exit codes: 0 done, 1 error, 2 bad input (invalid reference, or a --resume --sheets refusal) or Fab
+session/download failure (partial scorecard written), 130 interrupted.`;
 
 export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let corpus: "library" = "library";

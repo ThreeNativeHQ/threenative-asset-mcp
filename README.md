@@ -653,6 +653,13 @@ glTF's standard punctual-light extension has no area-light type.
 replay them with `FAB_METADATA_DIR=<dir> npx vitest run tests/fab-metadata.test.ts`. Dumps hold
 licensed pack names and are local-only: never commit them.
 
+Set `THREENATIVE_UNREAL_PREVIEW_REFERENCE=/path/to/reference.json` to light the comparison sheets (`parity:fab` and
+`scripts/fidelity-sheet.ts`) with a local version-1 reference profile: radiance and Grid binaries beside the JSON, each
+checked by SHA-256. It is read once per command, and an invalid profile stops the run before any download. Unset, the
+sheets use the approximation and say so. Each picture records what lit it (`identity` in `picture-lighting.json`,
+`sheets/<label>.json` and the scorecard entry). `--resume --sheets` refuses a kept sheet drawn otherwise: resume into a
+new `--out`, or add `--no-sheets`. Profiles and binaries derive from licensed packs: keep them local-only, never commit them.
+
 ## Configuration
 
 | Variable                        | Default                                            | Purpose                                                  |
