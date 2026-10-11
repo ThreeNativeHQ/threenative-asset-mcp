@@ -30,7 +30,7 @@ const FIXTURES = join(import.meta.dirname, "fixtures", "uncooked-colours");
 
 describe("uncooked vertex-colour patches (embedded source)", () => {
   it("is a new converter build, so an installed older revision is re-provisioned", () => {
-    expect(UNCOOKED_CONVERTER.version).toBe("4.27.2.0+threenative.10");
+    expect(UNCOOKED_CONVERTER.version).toBe("4.27.2.0+threenative.11");
   });
 
   it("reads a per-vertex-instance FVector4 Color indexed by VI id, and is idempotent", async () => {

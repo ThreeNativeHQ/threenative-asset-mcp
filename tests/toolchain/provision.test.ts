@@ -204,7 +204,7 @@ describe("uncooked converter revision resolution", () => {
     });
   });
 
-  it.each(["4.27.2.0", "4.27.2.0+threenative.10-extra", "not-a-revision"])(
+  it.each(["4.27.2.0", "4.27.2.0+threenative.11-extra", "not-a-revision"])(
     "does not accept %s as the pinned revision",
     async (bogus) => {
       const { environment } = await fixture({ cached: revisionTool(bogus), autoInstall: false });

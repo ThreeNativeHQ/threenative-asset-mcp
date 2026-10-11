@@ -2807,7 +2807,7 @@ for (const face of Object.keys(faces)) {
         environment: workspace.environment,
         umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
       }),
-    ).rejects.toThrow(/No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene/);
+    ).rejects.toThrow(/No package produced a valid model, texture, RGBA16F data texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene/);
     await expect(stat(workspace.outputDir)).rejects.toThrow();
   });
 

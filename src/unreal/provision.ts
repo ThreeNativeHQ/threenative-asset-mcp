@@ -209,7 +209,7 @@ export const FABCLI_RELEASE = Object.freeze({
 /** GPL-3.0-or-later command-line converter, always executed out-of-process. */
 export const UNCOOKED_CONVERTER = Object.freeze({
   package: "unreal-assets-to-glb==4.27.2.0",
-  version: "4.27.2.0+threenative.10",
+  version: "4.27.2.0+threenative.11",
 });
 
 /**
