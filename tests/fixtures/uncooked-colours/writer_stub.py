@@ -127,6 +127,9 @@ def export_glb(mesh: StaticMesh, filepath: str):
                     else:
                         nx, ny, nz = 0.0, 1.0, 0.0
 
+                    # UV — no V-flip needed: UE5 stores textures top-to-bottom
+                    # (same as PNG/glTF), and the UV coordinate (0,0) already
+                    # maps to the first pixel row in both engines.
                     if has_uvs and vi < len(uvs):
                         u, v = uvs[vi]
                     else:

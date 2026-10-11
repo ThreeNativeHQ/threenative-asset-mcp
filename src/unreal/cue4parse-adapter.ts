@@ -3416,6 +3416,44 @@ int ExportGroomPayloads(byte[] bytes, string name)
 // exactly one FName layout reads it that way; without that count, or with a mismatch, it stays a refusal.
 static EditorMesh ReadMeshDescription(byte[] raw, int cachedTriangles = 0)
 {
+    var mesh = ReadMeshDescriptionInEitherLayout(raw, cachedTriangles);
+    // Checked once the layout is settled: inside an attempt, a refusal would be retried as the other FName layout and
+    // reported as that layout's error.
+    CheckActiveUvChannels(mesh);
+    return mesh;
+}
+
+// Every UV channel spans every allocated vertex instance (holes included), as Normal and VertexIndex do, and each live
+// triangle corner names an allocated instance with a finite coordinate in every channel. Only live triangles are written,
+// so only their corners need one. A channel that does not span, or a corner with a non-finite coordinate, is refused
+// rather than padded.
+static void CheckActiveUvChannels(EditorMesh mesh)
+{
+    var instances = mesh.InstanceVertices.Length;
+    foreach (var (channel, values) in mesh.UvChannels)
+    {
+        if (values.Length != instances * 2)
+            throw new InvalidDataException("UV channel " + channel + " has " + values.Length / 2 + " values for " + instances + " vertex instances.");
+    }
+    for (var triangle = 0; triangle < mesh.TriangleInstances.Length / 3; triangle++)
+    {
+        if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
+        for (var corner = 0; corner < 3; corner++)
+        {
+            var instance = mesh.TriangleInstances[triangle * 3 + corner];
+            if (instance < 0 || instance >= instances)
+                throw new InvalidDataException("Triangle " + triangle + " uses vertex instance " + instance + " of " + instances + ".");
+            foreach (var (channel, values) in mesh.UvChannels)
+            {
+                if (!float.IsFinite(values[instance * 2]) || !float.IsFinite(values[instance * 2 + 1]))
+                    throw new InvalidDataException("UV channel " + channel + " is not finite at vertex instance " + instance + ".");
+            }
+        }
+    }
+}
+
+static EditorMesh ReadMeshDescriptionInEitherLayout(byte[] raw, int cachedTriangles)
+{
     // Both FName array layouts are tried; only one consumes the whole payload.
     try
     {
@@ -3453,10 +3491,18 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
         reader.ReadByte();
         return text;
     }
+    // A TextureCoordinate index is one UV channel: an FVector2f (kind 2, eight bytes) in at most eight channels, which is
+    // what Unreal's UV sets are. Any other layout is one this reader does not map, so it is refused by name.
+    void CheckUvChannel(int channel, int kind, int elementSize)
+    {
+        if (channel >= 8) throw new NotSupportedException("VertexInstance TextureCoordinate channel " + channel + " is past the eight UV channels Unreal allows");
+        if (kind != 2 || elementSize != 8) throw new NotSupportedException("VertexInstance TextureCoordinate channel " + channel + " is attribute kind " + kind + " with " + elementSize + "-byte elements, not FVector2f");
+    }
     var arrays = new Dictionary<string, byte[]>(StringComparer.Ordinal);
     var kinds = new Dictionary<string, int>(StringComparer.Ordinal);
     var names = new Dictionary<string, string[]>(StringComparer.Ordinal);
     var live = new Dictionary<string, bool[]>(StringComparer.Ordinal);
+    var textureCoordinates = 0; // the UV channels of the VertexInstances element: one TextureCoordinate index each
     var elementTypes = reader.ReadInt32();
     if (elementTypes is < 1 or > 64) throw new InvalidDataException("Not a mesh description.");
     for (var elementIndex = 0; elementIndex < elementTypes; elementIndex++)
@@ -3481,6 +3527,7 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
                 reader.ReadInt32();
                 reader.ReadInt32();
                 var indices = reader.ReadInt32();
+                if (element == "VertexInstances" && attribute == "TextureCoordinate") textureCoordinates = indices;
                 for (var index = 0; index < indices; index++)
                 {
                     reader.ReadInt32(); // extent
@@ -3506,6 +3553,7 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
                     }
                     var elementSize = reader.ReadInt32();
                     var elements = reader.ReadInt32();
+                    if (element == "VertexInstances" && attribute == "TextureCoordinate") CheckUvChannel(index, kind, elementSize);
                     arrays[key] = reader.ReadBytes(checked(elementSize * elements));
                     kinds[key] = kind;
                 }
@@ -3537,21 +3585,33 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
             ? MemoryMarshal.Cast<byte, float>(bytes).ToArray()
             : [];
     }
+    // UV channel n is TextureCoordinate index n: one FVector2f per allocated vertex instance, holes included, so it spans
+    // the same count as VertexIndex and Normal. A channel that does not is refused rather than padded or renumbered.
+    var instanceVertices = Ints("VertexInstances[0].VertexIndex[0]");
+    var uvChannels = new (int Channel, float[] Values)[textureCoordinates];
+    for (var channel = 0; channel < textureCoordinates; channel++)
+        uvChannels[channel] = (channel, MemoryMarshal.Cast<byte, float>(arrays["VertexInstances[0].TextureCoordinate[" + channel + "]"]).ToArray());
+    var triangleInstances = Ints("Triangles[0].VertexInstanceIndex[0]");
+    var triangleLive = live.TryGetValue("Triangles", out var triangleFlags) ? triangleFlags : [];
     return new EditorMesh(
         Floats("Vertices[0].Position[0]"),
-        Ints("VertexInstances[0].VertexIndex[0]"),
+        instanceVertices,
         Floats("VertexInstances[0].Normal[0]"),
-        Floats("VertexInstances[0].TextureCoordinate[0]"),
+        uvChannels,
         Colors(),
-        Ints("Triangles[0].VertexInstanceIndex[0]"),
+        triangleInstances,
         Ints("Triangles[0].PolygonGroupIndex[0]"),
-        live.TryGetValue("Triangles", out var triangles) ? triangles : [],
+        triangleLive,
         names.TryGetValue("PolygonGroups[0].ImportedMaterialSlotName[0]", out var slots) ? slots : []);
 }
 
 // Writes the decoded source model with the cooked glTF writer's conventions: centimetres to metres,
 // Unreal's Z-up swapped to glTF's Y-up, and Unreal's triangle order kept (the axis swap and Unreal's
 // left-handedness cancel). Tangents are still left out, so a glTF client generates MikkTSpace tangents.
+// Every UV channel the MeshDescription carries is written as TEXCOORD_<index> at its own index, and only those: an
+// absent channel is not written, no set is zero-filled or renumbered, and a source without UV channels has no TEXCOORD
+// at all. Each primitive stores every distinct vertex once, keyed by its whole value (position, normal, colour and all
+// channels), so instances that differ only in a later channel keep separate vertices.
 // A source model whose MeshDescription carries a per-vertex-instance Color is written as COLOR_0, as the
 // cooked writer does; glTF clients with a material that does not read it would still multiply it into the
 // base colour, so the importer drops COLOR_0 for those sections. Without such an attribute no COLOR_0 is
@@ -3561,47 +3621,138 @@ static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string n
     // Every vertex instance must have a colour for the attribute to line up with the instance indexing,
     // so a colour buffer of any other length is treated as absent rather than padded or truncated.
     var colors = mesh.VertexColors.Length == mesh.InstanceVertices.Length * 4 ? mesh.VertexColors : null;
-    var materials = new Dictionary<int, SharpGLTF.Materials.MaterialBuilder>();
-    SharpGLTF.Materials.MaterialBuilder Material(int group)
+    var root = SharpGLTF.Schema2.ModelRoot.CreateModel();
+    SharpGLTF.Schema2.Mesh? gltfMesh = null;
+    var materials = new Dictionary<int, SharpGLTF.Schema2.Material>();
+    SharpGLTF.Schema2.Material Material(int group)
     {
         if (materials.TryGetValue(group, out var existing)) return existing;
-        var material = new SharpGLTF.Materials.MaterialBuilder(group >= 0 && group < materialNames.Length ? materialNames[group] : "MaterialSlot_" + group)
+        var builder = new SharpGLTF.Materials.MaterialBuilder(group >= 0 && group < materialNames.Length ? materialNames[group] : "MaterialSlot_" + group)
             .WithBaseColor(System.Numerics.Vector4.One);
+        var material = SharpGLTF.Schema2.Toolkit.CreateMaterial(root, builder);
         materials[group] = material;
         return material;
     }
-    SharpGLTF.Geometry.MeshBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty> Build<TMaterial>(Func<int, System.Numerics.Vector2, TMaterial> materialVertex)
-        where TMaterial : struct, SharpGLTF.Geometry.VertexTypes.IVertexMaterial
+    // One vertex instance's packed value: position and normal converted as before, the colour (when the mesh has one)
+    // as the value Unreal's shader reads, then each UV channel at the instance's own index.
+    float[] PackVertex(int instance)
     {
-        var builder = new SharpGLTF.Geometry.MeshBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty>(name);
-        SharpGLTF.Geometry.VertexBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty> Vertex(int instance)
+        var vertex = mesh.InstanceVertices[instance];
+        var position = new System.Numerics.Vector3(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 2], mesh.Positions[vertex * 3 + 1]) * 0.01f;
+        var normal = new System.Numerics.Vector3(mesh.Normals[instance * 3], mesh.Normals[instance * 3 + 2], mesh.Normals[instance * 3 + 1]);
+        normal = normal.LengthSquared() > 1e-12f && float.IsFinite(normal.LengthSquared()) ? System.Numerics.Vector3.Normalize(normal) : System.Numerics.Vector3.UnitY;
+        var packed = new List<float> { position.X, position.Y, position.Z, normal.X, normal.Y, normal.Z };
+        if (colors is not null)
         {
-            var vertex = mesh.InstanceVertices[instance];
-            var position = new System.Numerics.Vector3(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 2], mesh.Positions[vertex * 3 + 1]) * 0.01f;
-            var normal = new System.Numerics.Vector3(mesh.Normals[instance * 3], mesh.Normals[instance * 3 + 2], mesh.Normals[instance * 3 + 1]);
-            normal = normal.LengthSquared() > 1e-12f && float.IsFinite(normal.LengthSquared()) ? System.Numerics.Vector3.Normalize(normal) : System.Numerics.Vector3.UnitY;
-            var uv = new System.Numerics.Vector2(mesh.Uv0[instance * 2], mesh.Uv0[instance * 2 + 1]);
-            return new(new SharpGLTF.Geometry.VertexTypes.VertexPositionNormal(position, normal), materialVertex(instance, uv));
+            var color = EditorVertexColor(colors, instance);
+            packed.AddRange(new[] { color.X, color.Y, color.Z, color.W });
         }
-        var triangleCount = mesh.TriangleInstances.Length / 3;
-        for (var triangle = 0; triangle < triangleCount; triangle++)
-        {
-            if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
-            var group = triangle < mesh.TriangleGroups.Length ? mesh.TriangleGroups[triangle] : 0;
-            builder.UsePrimitive(Material(group)).AddTriangle(
-                Vertex(mesh.TriangleInstances[triangle * 3]),
-                Vertex(mesh.TriangleInstances[triangle * 3 + 1]),
-                Vertex(mesh.TriangleInstances[triangle * 3 + 2]));
-        }
-        return builder;
+        foreach (var (_, values) in mesh.UvChannels) packed.AddRange(new[] { values[instance * 2], values[instance * 2 + 1] });
+        return packed.ToArray();
     }
-    var scene = new SharpGLTF.Scenes.SceneBuilder();
-    if (colors is null)
-        scene.AddRigidMesh(Build((instance, uv) => new SharpGLTF.Geometry.VertexTypes.VertexTexture1(uv)), System.Numerics.Matrix4x4.Identity);
-    else
-        scene.AddRigidMesh(Build((instance, uv) => new SharpGLTF.Geometry.VertexTypes.VertexColor1Texture1(EditorVertexColor(colors, instance), uv)), System.Numerics.Matrix4x4.Identity);
+    SharpGLTF.Schema2.Accessor VertexAccessor(byte[] bytes, int count, SharpGLTF.Schema2.DimensionType dimensions, SharpGLTF.Schema2.EncodingType encoding = SharpGLTF.Schema2.EncodingType.FLOAT, bool normalized = false)
+    {
+        var view = root.UseBufferView(bytes, 0, null, 0, SharpGLTF.Schema2.BufferMode.ARRAY_BUFFER);
+        var accessor = root.CreateAccessor();
+        accessor.SetVertexData(view, 0, count, dimensions, encoding, normalized);
+        return accessor;
+    }
+    SharpGLTF.Schema2.Accessor IndexAccessor(IReadOnlyList<int> indices, int vertexCount)
+    {
+        // The narrowest index type that holds every vertex index: UNSIGNED_SHORT up to 65536 vertices.
+        var wide = vertexCount > 65536;
+        var bytes = wide
+            ? MemoryMarshal.AsBytes(indices.Select(index => (uint)index).ToArray().AsSpan()).ToArray()
+            : MemoryMarshal.AsBytes(indices.Select(index => (ushort)index).ToArray().AsSpan()).ToArray();
+        var view = root.UseBufferView(bytes, 0, null, 0, SharpGLTF.Schema2.BufferMode.ELEMENT_ARRAY_BUFFER);
+        var accessor = root.CreateAccessor();
+        accessor.SetIndexData(view, 0, indices.Count, wide ? SharpGLTF.Schema2.IndexEncodingType.UNSIGNED_INT : SharpGLTF.Schema2.IndexEncodingType.UNSIGNED_SHORT);
+        return accessor;
+    }
+    static byte[] FloatBytes(float[] values) => MemoryMarshal.AsBytes(values.AsSpan()).ToArray();
+    // The byte a normalized UNSIGNED_BYTE COLOR_0 stores for an encoded channel. The encoders above add half a step, so
+    // truncating at 255 lands on the byte Unreal's ToFColor(true) writes, exactly as the SharpGLTF encoder did.
+    static byte ColourByte(float encoded) => (byte)Math.Clamp(MathF.Floor(encoded * 255f), 0f, 255f);
+    // Two corners at one position make a zero-area triangle, which the builder this writer replaces dropped (whatever their
+    // normal, colour or UVs); the position is the first three components of a packed vertex.
+    bool SamePosition(float[] left, float[] right) => left.AsSpan(0, 3).SequenceEqual(right.AsSpan(0, 3));
+    // Triangles are grouped by material slot, one primitive per slot in the order each slot is first used, and only the
+    // live triangles are written.
+    var groupOrder = new List<int>();
+    var groupTriangles = new Dictionary<int, List<int>>();
+    for (var triangle = 0; triangle < mesh.TriangleInstances.Length / 3; triangle++)
+    {
+        if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
+        var group = triangle < mesh.TriangleGroups.Length ? mesh.TriangleGroups[triangle] : 0;
+        if (!groupTriangles.TryGetValue(group, out var triangles))
+        {
+            groupOrder.Add(group);
+            groupTriangles[group] = triangles = new List<int>();
+        }
+        triangles.Add(triangle);
+    }
+    foreach (var group in groupOrder)
+    {
+        var vertices = new List<float[]>();
+        var vertexOf = new Dictionary<float[], int>(new EditorVertexComparer());
+        var indices = new List<int>();
+        foreach (var triangle in groupTriangles[group])
+        {
+            var corners = new[] { PackVertex(mesh.TriangleInstances[triangle * 3]), PackVertex(mesh.TriangleInstances[triangle * 3 + 1]), PackVertex(mesh.TriangleInstances[triangle * 3 + 2]) };
+            // A triangle with two corners at one position is dropped, as it always was. The UV channels and normals only split
+            // vertices, so the triangles, and therefore the index buffer of a single-channel source, are unchanged.
+            if (SamePosition(corners[0], corners[1]) || SamePosition(corners[1], corners[2]) || SamePosition(corners[2], corners[0])) continue;
+            foreach (var packed in corners)
+            {
+                if (!vertexOf.TryGetValue(packed, out var local))
+                {
+                    local = vertices.Count;
+                    vertices.Add(packed);
+                    vertexOf.Add(packed, local);
+                }
+                indices.Add(local);
+            }
+        }
+        // A group whose triangles were all dropped has no primitive, as before.
+        if (indices.Count == 0) continue;
+        gltfMesh ??= root.CreateMesh(name);
+        var count = vertices.Count;
+        var positions = new float[count * 3];
+        var normals = new float[count * 3];
+        var colourBytes = colors is null ? null : new byte[count * 4];
+        var uvs = mesh.UvChannels.Select(_ => new float[count * 2]).ToArray();
+        for (var vertex = 0; vertex < count; vertex++)
+        {
+            var packed = vertices[vertex];
+            Array.Copy(packed, 0, positions, vertex * 3, 3);
+            Array.Copy(packed, 3, normals, vertex * 3, 3);
+            var at = 6;
+            if (colourBytes is not null)
+            {
+                for (var component = 0; component < 4; component++) colourBytes[vertex * 4 + component] = ColourByte(packed[at + component]);
+                at += 4;
+            }
+            for (var channel = 0; channel < uvs.Length; channel++)
+            {
+                uvs[channel][vertex * 2] = packed[at];
+                uvs[channel][vertex * 2 + 1] = packed[at + 1];
+                at += 2;
+            }
+        }
+        var primitive = gltfMesh.CreatePrimitive();
+        primitive.Material = Material(group);
+        primitive.SetVertexAccessor("POSITION", VertexAccessor(FloatBytes(positions), count, SharpGLTF.Schema2.DimensionType.VEC3));
+        primitive.SetVertexAccessor("NORMAL", VertexAccessor(FloatBytes(normals), count, SharpGLTF.Schema2.DimensionType.VEC3));
+        if (colourBytes is not null)
+            primitive.SetVertexAccessor("COLOR_0", VertexAccessor(colourBytes, count, SharpGLTF.Schema2.DimensionType.VEC4, SharpGLTF.Schema2.EncodingType.UNSIGNED_BYTE, normalized: true));
+        for (var channel = 0; channel < uvs.Length; channel++)
+            primitive.SetVertexAccessor("TEXCOORD_" + mesh.UvChannels[channel].Channel, VertexAccessor(FloatBytes(uvs[channel]), count, SharpGLTF.Schema2.DimensionType.VEC2));
+        primitive.SetIndexAccessor(IndexAccessor(indices, count));
+    }
+    var scene = root.UseScene(0);
+    if (gltfMesh is not null) SharpGLTF.Schema2.Toolkit.WithMesh(scene.CreateNode(), gltfMesh);
     Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-    scene.ToGltf2().SaveGLB(target);
+    root.SaveGLB(target);
 }
 
 // One vertex instance's colour as the value Unreal's shader reads. The MeshDescription stores a linear
@@ -4183,7 +4334,7 @@ sealed record EditorMesh(
     float[] Positions,
     int[] InstanceVertices,
     float[] Normals,
-    float[] Uv0,
+    (int Channel, float[] Values)[] UvChannels,
     float[] VertexColors,
     int[] TriangleInstances,
     int[] TriangleGroups,
@@ -4191,4 +4342,19 @@ sealed record EditorMesh(
     string[] GroupSlots);
 sealed record Rgba16fSourceArt(string Format, int SizeX, int SizeY, int NumSlices, int NumMips, bool PngCompressed, string Compression, bool Srgb, long ElementCount, byte[]? Bytes);
 sealed record Rgba16fDataTexture(int Width, int Height, byte[] Bytes);
+
+// Packed glTF vertices are equal when every component is equal under float.Equals, so -0 matches 0 and NaN matches
+// NaN: the equality the MeshBuilder this writer replaces used. Every present UV channel is a component of the key, so
+// vertices that differ only in a later channel stay apart.
+sealed class EditorVertexComparer : IEqualityComparer<float[]>
+{
+    public bool Equals(float[]? left, float[]? right) => left!.AsSpan().SequenceEqual(right!.AsSpan());
+
+    public int GetHashCode(float[] vertex)
+    {
+        var hash = new HashCode();
+        foreach (var component in vertex) hash.Add(component);
+        return hash.ToHashCode();
+    }
+}
 `;

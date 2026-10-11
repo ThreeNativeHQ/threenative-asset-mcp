@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { NodeIO } from "@gltf-transform/core";
+import { NodeIO, type Primitive } from "@gltf-transform/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -16,7 +17,7 @@ import { describeWithTools } from "./helpers/require-tool.js";
 // The uncooked UE4.27 converter is a GPL Python package installed at provision time. Its
 // `extract_geometry` read a MeshDescription's Normal and TextureCoordinate attributes but dropped the
 // per-vertex-instance Color, so a material that samples VertexColor (the Hornbeam UE 5.1 foliage icons,
-// which decode through the uncooked route) rendered without it.
+// which decode through the uncooked route) rendered without it. The writer also kept only UV channel 0.
 //
 // The Color attribute is a `TArray` indexed by vertex-instance *element* ID, serialized across the
 // allocated slots with holes retained — not packed by live id. These fixtures mirror the exact upstream
@@ -58,6 +59,29 @@ describe("uncooked vertex-colour patches (embedded source)", () => {
     expect(patchUncookedMeshColorExport(patched)).toBe(patched);
   });
 
+  it("writes every present UV channel as its own TEXCOORD_<n>, read at the vertex instance, and is idempotent", async () => {
+    const source = await readFile(join(FIXTURES, "writer_stub.py"), "utf8");
+    const patched = patchUncookedMeshColorExport(source);
+    expect(patched).toContain("for uv_index, channel in enumerate(mesh.uvs):");
+    expect(patched).toContain("uv_values = _uv_values_at(uv_index, channel, vertex_instances)");
+    expect(patched).toContain("setattr(prim.attributes, 'TEXCOORD_%d' % uv_index, uv_acc)");
+    // The channel-0-only writer is gone: no single UV array, no UV0 read through the position's loop.
+    expect(patched).not.toContain("prim.attributes.TEXCOORD_0 = uv_acc");
+    expect(patched).not.toContain("uv_arr");
+    expect(patched).not.toContain("u, v = uvs[vi]");
+    expect(patchUncookedMeshColorExport(patched)).toBe(patched);
+  });
+
+  it("refuses a UV channel set it cannot write exactly, rather than padding or renumbering it", async () => {
+    const source = await readFile(join(FIXTURES, "writer_stub.py"), "utf8");
+    const patched = patchUncookedMeshColorExport(source);
+    expect(patched).toContain('raise ValueError(f"mesh has {len(mesh.uvs)} UV channels; Unreal allows 8")');
+    expect(patched).toContain("does not cover vertex instance {vi}");
+    expect(patched).toContain("is negative, so UV channel {uv_index} cannot be read there");
+    expect(patched).toContain("is not finite at vertex instance {vi}");
+    expect(patched).not.toContain("u, v = 0.0, 0.0");
+  });
+
   it("refuses the real installed source rather than silently no-op when an anchor drifts", () => {
     // A missing anchor must throw, not return the source unchanged: replaceRequired is the guard.
     expect(() => patchUncookedMeshDescriptionColors("# not the converter\n")).toThrow(/uncooked vertex colours/);
@@ -90,6 +114,15 @@ describeWithTools(["python-imaging"], "uncooked vertex colours (patched Python, 
     return { colors, glb, document: await new NodeIO().read(glb) };
   }
 
+  /** Like `render`, but a refused export (the writer's ValueError) is reported rather than thrown, with no GLB. */
+  async function renderOutcome(mode: string): Promise<{ error?: string; glb: string; document?: Awaited<ReturnType<NodeIO["read"]>> }> {
+    const glb = join(root, `${mode}.glb`);
+    const output = execFileSync("python3", [harness, mode, glb], { encoding: "utf8", timeout: 60_000, cwd: root });
+    const result = JSON.parse(output) as { error?: string };
+    if (result.error !== undefined) return { error: result.error, glb };
+    return { glb, document: await new NodeIO().read(glb) };
+  }
+
   function colourByPosition(document: Awaited<ReturnType<NodeIO["read"]>>): Map<string, number[]> | null {
     const primitive = document.getRoot().listMeshes().flatMap((mesh) => mesh.listPrimitives())[0];
     if (!primitive) throw new Error("the writer produced no primitive");
@@ -99,10 +132,8 @@ describeWithTools(["python-imaging"], "uncooked vertex colours (patched Python, 
     const components = attribute.getArray()!;
     const byPosition = new Map<string, number[]>();
     for (let vertex = 0; vertex < attribute.getCount(); vertex++) {
-      const key = [positions[vertex * 3]!, positions[vertex * 3 + 1]!, positions[vertex * 3 + 2]!]
-        .map((value) => value.toFixed(2))
-        .join(",");
-      byPosition.set(key, [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!]);
+      const position = [positions[vertex * 3]!, positions[vertex * 3 + 1]!, positions[vertex * 3 + 2]!].map((value) => value.toFixed(2)).join(",");
+      byPosition.set(position, [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!]);
     }
     return byPosition;
   }
@@ -159,4 +190,94 @@ describeWithTools(["python-imaging"], "uncooked vertex colours (patched Python, 
       expect(colourByPosition(document)).toBeNull();
     },
   );
+
+  describe("UV channels as TEXCOORD_<n>", () => {
+    // The live instances, in the order the writer emits them, and the stub's coordinate map: 2 sits on (0,0,-10),
+    // 5 on (0,0,0), 9 on (10,0,0).
+    const LIVE_SLOTS = [2, 5, 9];
+    const LOCAL_POSITIONS = ["0.00,0.00,-10.00", "0.00,0.00,0.00", "10.00,0.00,0.00"] as const;
+    // The synthetic value of channel `channel` at allocated slot `slot`: exact multiples of 1/64, distinct everywhere.
+    const uvAt = (channel: number, slot: number): number[] => [(channel * 16 + slot) / 64, (slot * 4 + channel) / 64];
+
+    function primitiveOf(document: Awaited<ReturnType<NodeIO["read"]>>): Primitive {
+      return document.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    }
+    function texcoord(primitive: Primitive, channel: number, vertex: number): number[] {
+      const values = primitive.getAttribute(`TEXCOORD_${channel}`)!.getArray()!;
+      return [values[vertex * 2]!, values[vertex * 2 + 1]!];
+    }
+    function vertexPositions(primitive: Primitive): string[] {
+      const values = primitive.getAttribute("POSITION")!.getArray()!;
+      const count = primitive.getAttribute("POSITION")!.getCount();
+      return Array.from({ length: count }, (_, vertex) =>
+        [values[vertex * 3]!, values[vertex * 3 + 1]!, values[vertex * 3 + 2]!].map((value) => value.toFixed(2)).join(","),
+      );
+    }
+    const indices = (primitive: Primitive): number[] => Array.from(primitive.getIndices()!.getArray()!);
+    const texcoordSemantics = (primitive: Primitive): string[] => primitive.listSemantics().filter((name) => name.startsWith("TEXCOORD_")).sort();
+
+    it("writes all eight channels of a sparse instance set at their own TEXCOORD index, read per vertex instance", async () => {
+      const { document } = await renderOutcome("uv-full");
+      const primitive = primitiveOf(document!);
+      expect(texcoordSemantics(primitive)).toEqual(["TEXCOORD_0", "TEXCOORD_1", "TEXCOORD_2", "TEXCOORD_3", "TEXCOORD_4", "TEXCOORD_5", "TEXCOORD_6", "TEXCOORD_7"]);
+      expect(vertexPositions(primitive)).toEqual([...LOCAL_POSITIONS]);
+      expect(indices(primitive)).toEqual([0, 1, 2]);
+      for (let channel = 0; channel < 8; channel++) {
+        LIVE_SLOTS.forEach((slot, local) => expect(texcoord(primitive, channel, local), `channel ${channel}, slot ${slot}`).toEqual(uvAt(channel, slot)));
+      }
+    });
+
+    it("keeps a seam between instances that differ only in a later channel", async () => {
+      // Instances 0 and 3 share vertex 0, normal and UV0; only UV1 differs, so they must stay two vertices.
+      const { document } = await renderOutcome("uv-seam");
+      const primitive = primitiveOf(document!);
+      expect(primitive.getAttribute("POSITION")!.getCount()).toBe(4);
+      expect(indices(primitive)).toEqual([0, 1, 2, 3, 2, 1]);
+      expect(texcoord(primitive, 0, 0)).toEqual([0, 0]);
+      expect(texcoord(primitive, 0, 3)).toEqual([0, 0]);
+      expect(texcoord(primitive, 1, 0)).toEqual([0.25, 0.5]);
+      expect(texcoord(primitive, 1, 3)).toEqual([0.75, 0.5]);
+      expect(vertexPositions(primitive)[0]).toBe(vertexPositions(primitive)[3]);
+    });
+
+    it("writes only the channels a two-channel source carries", async () => {
+      const { document } = await renderOutcome("uv-two");
+      const primitive = primitiveOf(document!);
+      expect(texcoordSemantics(primitive)).toEqual(["TEXCOORD_0", "TEXCOORD_1"]);
+      LIVE_SLOTS.forEach((slot, local) => {
+        expect(texcoord(primitive, 0, local)).toEqual(uvAt(0, slot));
+        expect(texcoord(primitive, 1, local)).toEqual(uvAt(1, slot));
+      });
+    });
+
+    it("writes no TEXCOORD for a source that carries no UV channel", async () => {
+      const { document } = await renderOutcome("uv-none");
+      expect(texcoordSemantics(primitiveOf(document!))).toEqual([]);
+    });
+
+    it("does not read a non-finite value in an unused hole, so it refuses nothing", async () => {
+      const { document } = await renderOutcome("uv-hole-nan");
+      const primitive = primitiveOf(document!);
+      [2, 5, 9].forEach((slot, local) => expect(texcoord(primitive, 1, local)).toEqual(uvAt(1, slot)));
+      expect(Array.from(primitive.getAttribute("TEXCOORD_1")!.getArray()!).every(Number.isFinite)).toBe(true);
+    });
+
+    it.each([
+      // No UV reader runs for these, so the position path must refuse an instance outside the map, or a mapped vertex
+      // outside the position array, rather than read it from the end (-1) or zero-fill it (past the end).
+      ["uv-none-negative", "vertex instance -1 is outside the mesh's 10 mapped instances"],
+      ["uv-none-above", "vertex instance 10 is outside the mesh's 10 mapped instances"],
+      ["uv-none-map-negative", "vertex instance 9 maps to vertex -1, outside the mesh's 3 vertices"],
+      ["uv-none-map-above", "vertex instance 9 maps to vertex 3, outside the mesh's 3 vertices"],
+      ["uv-excess", "mesh has 9 UV channels; Unreal allows 8"],
+      ["uv-short", "UV channel 1 has 6 values and does not cover vertex instance 9"],
+      ["uv-nonfinite", "UV channel 1 is not finite at vertex instance 5"],
+      // Python reads a -1 from the end of a list: the export must refuse, not take the last sample.
+      ["uv-negative", "vertex instance -1 is outside the mesh's 10 mapped instances"],
+    ] as const)("refuses %s, writing no GLB rather than padding, renumbering or wrapping", async (mode, message) => {
+      const outcome = await renderOutcome(mode);
+      expect(outcome.error).toBe(message);
+      expect(existsSync(outcome.glb)).toBe(false);
+    });
+  });
 });

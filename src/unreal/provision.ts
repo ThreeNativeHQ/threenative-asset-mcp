@@ -679,11 +679,16 @@ export function patchUncookedMeshDescriptionColors(source: string): string {
 }
 
 /**
- * Carries the decoded per-vertex-instance colours from `StaticMesh.from_package` through the GLB
- * writer as glTF `COLOR_0`. Only the uncooked branch fills `mesh.colors`; the cooked/fallback branch
- * leaves it empty, and an empty buffer writes no `COLOR_0` at all. The accessor is normalized
- * UNSIGNED_BYTE RGBA holding the packed value Unreal's shader reads (sRGB RGB, linear alpha), matching
- * the cooked writer.
+ * Carries the decoded per-vertex-instance colours and every UV channel from `StaticMesh.from_package`
+ * through the GLB writer. Colours become `COLOR_0`: only the uncooked branch fills `mesh.colors`, the
+ * cooked/fallback branch leaves it empty, and an empty buffer writes no `COLOR_0` at all. The accessor is
+ * normalized UNSIGNED_BYTE RGBA holding the packed value Unreal's shader reads (sRGB RGB, linear alpha),
+ * matching the cooked writer. UV channels become `TEXCOORD_<n>`, one per channel the source carries, at
+ * its own index: a channel is never padded with zeros or renumbered. A channel set the writer cannot carry
+ * exactly (more than eight, or not covering every active vertex instance, non-finite there, or addressed by a
+ * negative index) refuses the export rather than writing a guess. Every triangle corner is also bounds-checked
+ * before its position is read, with or without UVs: an instance outside the vertex-instance map, or a mapped
+ * vertex outside the position array, refuses the export rather than being read from the end or zero-filled.
  */
 export function patchUncookedMeshColorExport(source: string): string {
   source = replaceRequired(
@@ -705,36 +710,75 @@ export function patchUncookedMeshColorExport(source: string): string {
   );
   source = replaceRequired(
     source,
-    `    uvs = mesh.uvs[0] if mesh.uvs else []
-    has_normals = bool(mesh.normals)
-    has_uvs = bool(uvs)`,
-    `    uvs = mesh.uvs[0] if mesh.uvs else []
-    has_normals = bool(mesh.normals)
-    has_uvs = bool(uvs)
-    has_colors = bool(mesh.colors)`,
-    "GLB colour presence",
+    `def export_glb(mesh: StaticMesh, filepath: str`,
+    `def _uv_values_at(uv_index, channel, vertex_instances):
+    """The (u, v) of one UV channel at each vertex instance of a primitive, read at that instance's own index.
+
+    A channel that does not cover every vertex instance, or holds a non-finite value at one, is refused
+    rather than padded with zeros: the mesh is then not exported. A negative index is refused too, since
+    Python would read it from the end of the channel and take another instance's coordinate.
+    """
+    values = []
+    for vi in vertex_instances:
+        if vi < 0:
+            raise ValueError(f"vertex instance {vi} is negative, so UV channel {uv_index} cannot be read there")
+        if vi >= len(channel):
+            raise ValueError(f"UV channel {uv_index} has {len(channel)} values and does not cover vertex instance {vi}")
+        u, v = channel[vi]
+        if not (np.isfinite(u) and np.isfinite(v)):
+            raise ValueError(f"UV channel {uv_index} is not finite at vertex instance {vi}")
+        values.append((u, v))
+    return values
+
+
+def export_glb(mesh: StaticMesh, filepath: str`,
+    "UV channel helper",
   );
   source = replaceRequired(
     source,
-    `                    if has_uvs and vi < len(uvs):
+    `    uvs = mesh.uvs[0] if mesh.uvs else []
+    has_normals = bool(mesh.normals)
+    has_uvs = bool(uvs)`,
+    `    if len(mesh.uvs) > 8:
+        raise ValueError(f"mesh has {len(mesh.uvs)} UV channels; Unreal allows 8")
+    has_normals = bool(mesh.normals)
+    has_colors = bool(mesh.colors)`,
+    "GLB colour and UV presence",
+  );
+  source = replaceRequired(
+    source,
+    `                    v_idx = mesh.vi_to_vertex[vi] if vi < len(mesh.vi_to_vertex) else vi
+                    pos = mesh.vertices[v_idx] if v_idx < len(mesh.vertices) else (0.0, 0.0, 0.0)`,
+    `                    # Every triangle corner is checked before its position or normal is read, with or without UVs:
+                    # an instance outside the map, or a mapped vertex outside the position array, refuses the export.
+                    # Python would otherwise take a negative index from the end, and zero-fill a past-the-end one.
+                    if not 0 <= vi < len(mesh.vi_to_vertex):
+                        raise ValueError(f"vertex instance {vi} is outside the mesh's {len(mesh.vi_to_vertex)} mapped instances")
+                    v_idx = mesh.vi_to_vertex[vi]
+                    if not 0 <= v_idx < len(mesh.vertices):
+                        raise ValueError(f"vertex instance {vi} maps to vertex {v_idx}, outside the mesh's {len(mesh.vertices)} vertices")
+                    pos = mesh.vertices[v_idx]`,
+    "GLB vertex instance bounds",
+  );
+  source = replaceRequired(
+    source,
+    `                    # UV — no V-flip needed: UE5 stores textures top-to-bottom
+                    # (same as PNG/glTF), and the UV coordinate (0,0) already
+                    # maps to the first pixel row in both engines.
+                    if has_uvs and vi < len(uvs):
                         u, v = uvs[vi]
                     else:
                         u, v = 0.0, 0.0
 
                     local_verts.append((px, py, pz, nx, ny, nz, u, v))`,
-    `                    if has_uvs and vi < len(uvs):
-                        u, v = uvs[vi]
-                    else:
-                        u, v = 0.0, 0.0
-
-                    # Colour — per vertex instance; Unreal's default white when the mesh has no
+    `                    # Colour — per vertex instance; Unreal's default white when the mesh has no
                     # colour buffer or the instance is outside it.
                     if has_colors and vi < len(mesh.colors) and mesh.colors[vi] is not None:
                         cr, cg, cb, ca = mesh.colors[vi]
                     else:
                         cr, cg, cb, ca = 1.0, 1.0, 1.0, 1.0
 
-                    local_verts.append((px, py, pz, nx, ny, nz, u, v, cr, cg, cb, ca))`,
+                    local_verts.append((px, py, pz, nx, ny, nz, cr, cg, cb, ca))`,
     "GLB per-instance colour",
   );
   source = replaceRequired(
@@ -744,8 +788,7 @@ export function patchUncookedMeshColorExport(source: string): string {
         uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)`,
     `        pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
         norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
-        uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)
-        color_arr = np.array([(v[8], v[9], v[10], v[11]) for v in local_verts], dtype=np.float32)`,
+        color_arr = np.array([(v[6], v[7], v[8], v[9]) for v in local_verts], dtype=np.float32)`,
     "GLB colour array",
   );
   source = replaceRequired(
@@ -768,11 +811,16 @@ export function patchUncookedMeshColorExport(source: string): string {
             uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
 
         # Index accessor`,
-    `        # UV accessor
-        uv_acc = None
-        if has_uvs:
-            uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
-            uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
+    `        # UV accessors — one per channel the source carries, at its own TEXCOORD index. Each channel is read
+        # at the vertex instance of every local vertex (vi_to_local, the mapping position and normal use), so
+        # instances that differ only in a later channel keep separate vertices, and an absent channel is not
+        # written. UE stores (0,0) at the first pixel row in both engines, so no V-flip is needed.
+        vertex_instances = list(vi_to_local)
+        uv_accessors = []
+        for uv_index, channel in enumerate(mesh.uvs):
+            uv_values = _uv_values_at(uv_index, channel, vertex_instances)
+            uv_bv = _add_buffer_view(np.array(uv_values, dtype=np.float32).tobytes(), target=ARRAY_BUFFER)
+            uv_accessors.append((uv_index, _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")))
 
         # Vertex colour accessor — normalized UNSIGNED_BYTE RGBA in the channel order Unreal's shader
         # reads. The source's Color is a linear FVector4, but the static-mesh build packs it with
@@ -791,19 +839,19 @@ export function patchUncookedMeshColorExport(source: string): string {
             accessors[color_acc].normalized = True
 
         # Index accessor`,
-    "GLB colour accessor",
+    "GLB UV and colour accessors",
   );
   return replaceRequired(
     source,
     `        if uv_acc is not None:
             prim.attributes.TEXCOORD_0 = uv_acc
         prim.indices = idx_acc`,
-    `        if uv_acc is not None:
-            prim.attributes.TEXCOORD_0 = uv_acc
+    `        for uv_index, uv_acc in uv_accessors:
+            setattr(prim.attributes, 'TEXCOORD_%d' % uv_index, uv_acc)
         if color_acc is not None:
             prim.attributes.COLOR_0 = color_acc
         prim.indices = idx_acc`,
-    "GLB colour attribute",
+    "GLB attributes",
   );
 }
 
@@ -836,120 +884,48 @@ export function patchUncookedCliRevision(source: string): string {
 }
 
 /**
- * Test-only substitution for the pip install. Production callers never pass it; a unit test uses it
- * so an upgrade of a stale owned cache can be exercised without running pip or touching the network.
- * The hook must leave `executable` runnable: answering `--help` with the ABI marker and
- * `--threenative-version` with `UNCOOKED_CONVERTER.version`.
+ * Applies the converter's compatibility patches to an installed `uasset` package, in the order the
+ * provisioner has always applied them. Each patch is idempotent and throws when its anchor is missing, so a
+ * drifted upstream is refused rather than half-patched. The provisioner runs this on a fresh pip install; the
+ * colour harness runs it on a pristine copy of the pinned wheel, so both exercise the same sequence.
  */
-export interface UncookedProvisionHooks {
-  readonly install?: (executable: string, environment: NodeJS.ProcessEnv, log: ProvisionLog) => Promise<void>;
-}
+export async function patchUncookedModuleSources(moduleDir: string): Promise<void> {
+  const packagePath = join(moduleDir, "package.py");
+  let packageSource = patchUncookedPackageVersionGates(
+    (await readFile(packagePath, "utf8")).replace(/\r\n/g, "\n"),
+  );
+  packageSource = replaceRequired(
+    packageSource,
+    `        # 24. PersistentGuid (ObjectVersion >= VER_UE4_ADDED_PACKAGE_OWNER) - SKIPPED for cooked packages\n        # 25. OwnerPersistentGuid (VER_UE4_ADDED_PACKAGE_OWNER <= ObjectVersion < VER_UE4_NON_OUTER_PACKAGE_IMPORT) - SKIPPED for cooked packages\n        # Note: These editor-only fields may not be present in some packages`,
+    `        # 24. PersistentGuid exists when editor-only data was not filtered.\n        if (self.package_flags & 0x80000000) == 0 and self.file_version_ue4 >= VER_UE4_ADDED_PACKAGE_OWNER:\n            r.skip(16)\n\n        # 25. OwnerPersistentGuid existed for one package-version window.\n        if ((self.package_flags & 0x80000000) == 0 and\n                VER_UE4_ADDED_PACKAGE_OWNER <= self.file_version_ue4 < VER_UE4_NON_OUTER_PACKAGE_IMPORT):\n            r.skip(16)`,
+    "uncooked package-header",
+  );
+  packageSource = replaceRequired(
+    packageSource,
+    `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            if has_package_name:`,
+    `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            if has_package_name:`,
+    "numbered import FName",
+  );
+  packageSource = replaceRequired(
+    packageSource,
+    `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            entry.object_flags`,
+    `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            entry.object_flags`,
+    "numbered export FName",
+  );
+  await writeFile(packagePath, packageSource);
 
-/**
- * Installs the GPL converter in its own virtual environment and applies narrow compatibility
- * fixes to that external program. The fixes preserve uncooked-package PersistentGuid fields,
- * preserve numbered FNames (M_Wood_2), and make --skip-textures actually skip its multi-gigabyte
- * pixel cache. A fourth patch exposes its existing level parser as bounded JSON instead of starting
- * a preview web server. The fifth patch merges serialized Blueprint component templates into
- * placed level instances; it does not execute Blueprint bytecode. A sixth patch decodes bounded
- * UE4 ISM/HISM/foliage matrix arrays for standards-based GPU instancing. A seventh patch decodes
- * editor LandscapeComponent heightmaps from their package-relative bulk payloads. An eighth stamps
- * the pinned threenative revision onto the CLI so the resolver can tell a stale install from the
- * current one. No converter code is linked into this Node package.
- */
-export async function provisionUncookedConverter(
-  environment: NodeJS.ProcessEnv = process.env,
-  log: ProvisionLog = silent,
-  hooks: UncookedProvisionHooks = {},
-): Promise<string> {
-  assertSupportedHost();
-  const cache = join(toolchainCacheDir(environment), "uncooked");
-  const venv = join(cache, "venv");
-  const executable = uncookedConverterPath(environment);
-
-  if (hooks.install) {
-    await hooks.install(executable, environment, log);
-    if (!(await uncookedHelpRuns(executable))) {
-      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
-    }
-    log(`Installed uncooked Unreal converter at ${executable}`);
-    return executable;
-  }
-
-  const python = await pythonExecutable(environment);
-  const safeEnvironment = childEnvironment(environment);
-  // Python console scripts embed the interpreter's absolute path in their shebang, so a venv
-  // cannot be built in /tmp and renamed. Build at its final path and remove it on any failure.
-  await rm(venv, { recursive: true, force: true });
-  await mkdir(cache, { recursive: true });
-  try {
-    log(`Installing uncooked Unreal converter ${UNCOOKED_CONVERTER.package}…`);
-    const create = await runBounded(python, ["-m", "venv", venv], {
-      timeoutMs: 300_000,
-      environment: safeEnvironment,
-    });
-    if (create.code !== 0) {
-      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "Python could not create the converter virtual environment.");
-    }
-    const stagedPython = join(venv, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
-    const install = await runBounded(
-      stagedPython,
-      ["-m", "pip", "install", "--disable-pip-version-check", UNCOOKED_CONVERTER.package],
-      { timeoutMs: 900_000, maxOutputBytes: 32 * 1024 * 1024, environment: safeEnvironment },
-    );
-    if (install.code !== 0) {
-      throw new ToolchainError(
-        "UNREAL_TOOL_UNUSABLE",
-        `Installing ${UNCOOKED_CONVERTER.package} failed (pip exit ${install.code}).`,
-        true,
-      );
-    }
-    const locate = await runBounded(
-      stagedPython,
-      ["-c", "import pathlib,uasset; print(pathlib.Path(uasset.__file__).parent)"],
-      { timeoutMs: 30_000, environment: safeEnvironment },
-    );
-    const moduleDir = locate.stdout.trim();
-    if (locate.code !== 0 || !moduleDir) {
-      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The installed converter package could not be located.");
-    }
-
-    const packagePath = join(moduleDir, "package.py");
-    let packageSource = patchUncookedPackageVersionGates(
-      (await readFile(packagePath, "utf8")).replace(/\r\n/g, "\n"),
-    );
-    packageSource = replaceRequired(
-      packageSource,
-      `        # 24. PersistentGuid (ObjectVersion >= VER_UE4_ADDED_PACKAGE_OWNER) - SKIPPED for cooked packages\n        # 25. OwnerPersistentGuid (VER_UE4_ADDED_PACKAGE_OWNER <= ObjectVersion < VER_UE4_NON_OUTER_PACKAGE_IMPORT) - SKIPPED for cooked packages\n        # Note: These editor-only fields may not be present in some packages`,
-      `        # 24. PersistentGuid exists when editor-only data was not filtered.\n        if (self.package_flags & 0x80000000) == 0 and self.file_version_ue4 >= VER_UE4_ADDED_PACKAGE_OWNER:\n            r.skip(16)\n\n        # 25. OwnerPersistentGuid existed for one package-version window.\n        if ((self.package_flags & 0x80000000) == 0 and\n                VER_UE4_ADDED_PACKAGE_OWNER <= self.file_version_ue4 < VER_UE4_NON_OUTER_PACKAGE_IMPORT):\n            r.skip(16)`,
-      "uncooked package-header",
-    );
-    packageSource = replaceRequired(
-      packageSource,
-      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            if has_package_name:`,
-      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            if has_package_name:`,
-      "numbered import FName",
-    );
-    packageSource = replaceRequired(
-      packageSource,
-      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            entry.object_flags`,
-      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            entry.object_flags`,
-      "numbered export FName",
-    );
-    await writeFile(packagePath, packageSource);
-
-    const cliPath = join(moduleDir, "cli.py");
-    let cliSource = (await readFile(cliPath, "utf8")).replace(/\r\n/g, "\n");
-    cliSource = replaceRequired(
-      cliSource,
-      `    base_color_textures = [(fp, n) for fp, n in textures]  # export ALL textures`,
-      `    base_color_textures = [] if skip_textures else [(fp, n) for fp, n in textures]`,
-      "skip-textures",
-    );
-    cliSource = replaceRequired(
-      cliSource,
-      `def find_umap_path(input_dir, umap_filename):`,
-      `def export_scene_jsons(input_dir, output_dir):
+  const cliPath = join(moduleDir, "cli.py");
+  let cliSource = (await readFile(cliPath, "utf8")).replace(/\r\n/g, "\n");
+  cliSource = replaceRequired(
+    cliSource,
+    `    base_color_textures = [(fp, n) for fp, n in textures]  # export ALL textures`,
+    `    base_color_textures = [] if skip_textures else [(fp, n) for fp, n in textures]`,
+    "skip-textures",
+  );
+  cliSource = replaceRequired(
+    cliSource,
+    `def find_umap_path(input_dir, umap_filename):`,
+    `def export_scene_jsons(input_dir, output_dir):
     """Write bounded, non-interactive level data for the Node importer."""
     import math
     import struct
@@ -1439,15 +1415,15 @@ export async function provisionUncookedConverter(
 
 
 def find_umap_path(input_dir, umap_filename):`,
-      "scene-json exporter",
-    );
-    cliSource = replaceRequired(
-      cliSource,
-      `    parser.add_argument(
+    "scene-json exporter",
+  );
+  cliSource = replaceRequired(
+    cliSource,
+    `    parser.add_argument(
         '--filter', metavar='SUBSTRING', dest='mesh_filter',
         help='Only export meshes whose name contains this substring (case-insensitive)'
     )`,
-      `    parser.add_argument(
+    `    parser.add_argument(
         '--filter', metavar='SUBSTRING', dest='mesh_filter',
         help='Only export meshes whose name contains this substring (case-insensitive)'
     )
@@ -1455,41 +1431,123 @@ def find_umap_path(input_dir, umap_filename):`,
         '--scene-json-dir', metavar='DIR',
         help='Write parsed .umap actors/lights/blueprint components/gpu instances/landscapes as JSON without starting the preview server'
     )`,
-      "scene-json argument",
-    );
-    cliSource = patchUncookedCliRevision(cliSource);
-    cliSource = replaceRequired(
-      cliSource,
-      `    else:
+    "scene-json argument",
+  );
+  cliSource = patchUncookedCliRevision(cliSource);
+  cliSource = replaceRequired(
+    cliSource,
+    `    else:
         print("Skipping export (using existing Export/ directory)")
 
     # Preview if requested`,
-      `    else:
+    `    else:
         print("Skipping export (using existing Export/ directory)")
 
     if args.scene_json_dir:
         export_scene_jsons(input_dir, os.path.abspath(args.scene_json_dir))
 
     # Preview if requested`,
-      "scene-json invocation",
-    );
-    await writeFile(cliPath, cliSource);
+    "scene-json invocation",
+  );
+  await writeFile(cliPath, cliSource);
 
-    const uncookedMeshPath = join(moduleDir, "uncooked_mesh.py");
-    let uncookedMeshSource = (await readFile(uncookedMeshPath, "utf8")).replace(/\r\n/g, "\n");
-    uncookedMeshSource = patchUncookedMeshDescriptionColors(uncookedMeshSource);
-    await writeFile(uncookedMeshPath, uncookedMeshSource);
+  const uncookedMeshPath = join(moduleDir, "uncooked_mesh.py");
+  let uncookedMeshSource = (await readFile(uncookedMeshPath, "utf8")).replace(/\r\n/g, "\n");
+  uncookedMeshSource = patchUncookedMeshDescriptionColors(uncookedMeshSource);
+  await writeFile(uncookedMeshPath, uncookedMeshSource);
 
-    const meshPath = join(moduleDir, "mesh.py");
-    let meshSource = (await readFile(meshPath, "utf8")).replace(/\r\n/g, "\n");
-    meshSource = replaceRequired(
-      meshSource,
-      `        mat = Material()\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
-      `        mat = Material()\n        if mesh.material_slots:\n            slot_idx = (mesh.section_info_map[mat_idx]\n                        if mesh.section_info_map and mat_idx < len(mesh.section_info_map)\n                        else mat_idx)\n            if slot_idx < len(mesh.material_slots):\n                mat.name = mesh.material_slots[slot_idx][1]\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
-      "material names",
+  const meshPath = join(moduleDir, "mesh.py");
+  let meshSource = (await readFile(meshPath, "utf8")).replace(/\r\n/g, "\n");
+  meshSource = replaceRequired(
+    meshSource,
+    `        mat = Material()\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
+    `        mat = Material()\n        if mesh.material_slots:\n            slot_idx = (mesh.section_info_map[mat_idx]\n                        if mesh.section_info_map and mat_idx < len(mesh.section_info_map)\n                        else mat_idx)\n            if slot_idx < len(mesh.material_slots):\n                mat.name = mesh.material_slots[slot_idx][1]\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
+    "material names",
+  );
+  meshSource = patchUncookedMeshColorExport(meshSource);
+  await writeFile(meshPath, meshSource);
+}
+
+/**
+ * Test-only substitution for the pip install. Production callers never pass it; a unit test uses it
+ * so an upgrade of a stale owned cache can be exercised without running pip or touching the network.
+ * The hook must leave `executable` runnable: answering `--help` with the ABI marker and
+ * `--threenative-version` with `UNCOOKED_CONVERTER.version`.
+ */
+export interface UncookedProvisionHooks {
+  readonly install?: (executable: string, environment: NodeJS.ProcessEnv, log: ProvisionLog) => Promise<void>;
+}
+
+/**
+ * Installs the GPL converter in its own virtual environment and applies narrow compatibility
+ * fixes to that external program. The fixes preserve uncooked-package PersistentGuid fields,
+ * preserve numbered FNames (M_Wood_2), and make --skip-textures actually skip its multi-gigabyte
+ * pixel cache. A fourth patch exposes its existing level parser as bounded JSON instead of starting
+ * a preview web server. The fifth patch merges serialized Blueprint component templates into
+ * placed level instances; it does not execute Blueprint bytecode. A sixth patch decodes bounded
+ * UE4 ISM/HISM/foliage matrix arrays for standards-based GPU instancing. A seventh patch decodes
+ * editor LandscapeComponent heightmaps from their package-relative bulk payloads. An eighth stamps
+ * the pinned threenative revision onto the CLI so the resolver can tell a stale install from the
+ * current one. No converter code is linked into this Node package.
+ */
+export async function provisionUncookedConverter(
+  environment: NodeJS.ProcessEnv = process.env,
+  log: ProvisionLog = silent,
+  hooks: UncookedProvisionHooks = {},
+): Promise<string> {
+  assertSupportedHost();
+  const cache = join(toolchainCacheDir(environment), "uncooked");
+  const venv = join(cache, "venv");
+  const executable = uncookedConverterPath(environment);
+
+  if (hooks.install) {
+    await hooks.install(executable, environment, log);
+    if (!(await uncookedHelpRuns(executable))) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
+    }
+    log(`Installed uncooked Unreal converter at ${executable}`);
+    return executable;
+  }
+
+  const python = await pythonExecutable(environment);
+  const safeEnvironment = childEnvironment(environment);
+  // Python console scripts embed the interpreter's absolute path in their shebang, so a venv
+  // cannot be built in /tmp and renamed. Build at its final path and remove it on any failure.
+  await rm(venv, { recursive: true, force: true });
+  await mkdir(cache, { recursive: true });
+  try {
+    log(`Installing uncooked Unreal converter ${UNCOOKED_CONVERTER.package}…`);
+    const create = await runBounded(python, ["-m", "venv", venv], {
+      timeoutMs: 300_000,
+      environment: safeEnvironment,
+    });
+    if (create.code !== 0) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "Python could not create the converter virtual environment.");
+    }
+    const stagedPython = join(venv, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+    const install = await runBounded(
+      stagedPython,
+      ["-m", "pip", "install", "--disable-pip-version-check", UNCOOKED_CONVERTER.package],
+      { timeoutMs: 900_000, maxOutputBytes: 32 * 1024 * 1024, environment: safeEnvironment },
     );
-    meshSource = patchUncookedMeshColorExport(meshSource);
-    await writeFile(meshPath, meshSource);
+    if (install.code !== 0) {
+      throw new ToolchainError(
+        "UNREAL_TOOL_UNUSABLE",
+        `Installing ${UNCOOKED_CONVERTER.package} failed (pip exit ${install.code}).`,
+        true,
+      );
+    }
+    const locate = await runBounded(
+      stagedPython,
+      ["-c", "import pathlib,uasset; print(pathlib.Path(uasset.__file__).parent)"],
+      { timeoutMs: 30_000, environment: safeEnvironment },
+    );
+    const moduleDir = locate.stdout.trim();
+    if (locate.code !== 0 || !moduleDir) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The installed converter package could not be located.");
+    }
+
+    await patchUncookedModuleSources(moduleDir);
 
     if (!(await uncookedHelpRuns(executable))) {
       throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
