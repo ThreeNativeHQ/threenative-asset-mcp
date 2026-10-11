@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +19,7 @@ import {
   CUE4PARSE_PROJECT,
   CUE4PARSE_SOURCE,
 } from "./cue4parse-adapter.js";
+import { publishExecutable, runCandidate } from "./executable-publish.js";
 
 /**
  * The two external executables install themselves on first use. The PRD that specified this flow
@@ -54,10 +55,148 @@ export function toolchainCacheDir(
 export const UEVIEWER_SOURCE = Object.freeze({
   repository: "https://github.com/gildor2/UEViewer.git",
   commit: "a0bfb468d42be831b126632fd8a0ae6b3614f981",
-  prebuiltLinux: "https://www.gildor.org/down/47/umodel/umodel_linux.tar.gz",
   prebuiltWindows: "https://www.gildor.org/down/47/umodel/umodel_win32.zip",
   referer: "https://www.gildor.org/en/projects/umodel",
 });
+
+/**
+ * UE Viewer's Boolean-tag fix, applied to the pinned source before `build.sh`. The upstream reads a Boolean tag as
+ * `Ar << (byte&)Tag.BoolValue`, which writes one byte into an int and leaves the upper bytes as they were, so a
+ * serialized `false` reads as `true` wherever they are non-zero. The fixed build prints its markers on `-version`: those
+ * lines are the only evidence a binary carries the fixes. A path, a cache directory or a prebuilt is not.
+ */
+export const UMODEL_BOOLTAGS = Object.freeze({
+  marker: "ThreeNative-UModel-BoolTags-1",
+  /** Versioned by the whole patch set, so a Boolean-tag-only build in the previous directory is never reused. */
+  cacheDir: "umodel-booltags-2",
+});
+
+/** UE Viewer's normal-packing fix (see {@link patchUmodelNormalPacking}); its marker is printed beside the Boolean-tag one. */
+export const UMODEL_NORMALPACK = Object.freeze({
+  marker: "ThreeNative-UModel-NormalPack-1",
+});
+
+/** Whether `-version` text carries both fixes. The Boolean-tag marker alone is a build from before normal packing. */
+export function umodelCorrected(text: string): boolean {
+  return text.includes(UMODEL_BOOLTAGS.marker) && text.includes(UMODEL_NORMALPACK.marker);
+}
+
+/** The owned cache location of the Boolean-tag-fixed UE Viewer build. */
+export function umodelBoolTagsPath(environment: NodeJS.ProcessEnv = process.env): string {
+  return join(toolchainCacheDir(environment), UMODEL_BOOLTAGS.cacheDir, process.platform === "win32" ? "umodel.exe" : "umodel");
+}
+
+const UMODEL_BOOL_ALIAS = /Ar << \(byte&\)Tag\.BoolValue;([ \t]*)\/\/ byte/g;
+const UMODEL_BOOL_LOCAL = /\{ byte SerializedBool; Ar << SerializedBool; Tag\.BoolValue = SerializedBool; \}([ \t]*)\/\/ byte/g;
+
+/**
+ * Reads a Boolean tag into a local byte and then assigns the whole int. The upstream form writes the byte into the low
+ * end of `Tag.BoolValue` and keeps the upper bytes, so a serialized `false` reads as `true` wherever they are non-zero.
+ * Both Boolean sites are rewritten (UE4, and UE3 from object version 673); the UE3 < 673 full-int read is left alone.
+ * The sites are single-line, so the match does not depend on the file's line endings.
+ */
+export function patchUmodelBoolTagDeserialization(source: string): string {
+  const unpatched = source.match(UMODEL_BOOL_ALIAS)?.length ?? 0;
+  const patched = source.match(UMODEL_BOOL_LOCAL)?.length ?? 0;
+  if (unpatched === 0 && patched === 2) return source;
+  if (unpatched !== 2 || patched !== 0) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The pinned UE Viewer source has ${unpatched} unpatched and ${patched} patched Boolean tag sites, not the 2 expected; the patch was not applied.`,
+    );
+  }
+  return source.replace(UMODEL_BOOL_ALIAS, "{ byte SerializedBool; Ar << SerializedBool; Tag.BoolValue = SerializedBool; }$1// byte");
+}
+
+/**
+ * Adds both markers to UE Viewer's `-version` output on the lines after its banner, the Boolean-tag line first. A source
+ * that already carries only the Boolean-tag line gets the normal-packing line beside it. The new lines take the file's
+ * own line endings (upstream's Main.cpp is CRLF), and a second application changes nothing.
+ */
+export function patchUmodelVersionMarker(source: string): string {
+  const booleanLine = `\tappPrintf("${UMODEL_BOOLTAGS.marker}\\n");`;
+  const normalLine = `\tappPrintf("${UMODEL_NORMALPACK.marker}\\n");`;
+  const crlf = source.includes("\r\n");
+  const text = source.replace(/\r\n/g, "\n");
+  const hasBoolean = text.includes(booleanLine);
+  const hasNormal = text.includes(normalLine);
+  if (hasBoolean && hasNormal) return source;
+  const banner = "\t\t\tGBuildString, GCopyrightString, GLicenseString, GUmodelHomepage\n\t);\n";
+  const anchor = hasBoolean ? `${booleanLine}\n` : banner;
+  if (hasNormal || text.split(anchor).length !== 2) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      "The pinned UE Viewer source no longer matches the version banner, or carries a marker out of order; the markers were not added.",
+    );
+  }
+  const patched = text.replace(
+    anchor,
+    hasBoolean ? `${anchor}${normalLine}\n` : `${anchor}${booleanLine}\n${normalLine}\n`,
+  );
+  return crlf ? patched.replace(/\n/g, "\r\n") : patched;
+}
+
+/** UnMesh4.cpp's vertex loop as upstream a0bfb468 writes it: the normal is packed only inside the tangent guard. */
+const UMODEL_NORMAL_PACK_UPSTREAM = [
+  "\t\t\t// Pack normals",
+  "\t\t\tif (Lod->HasNormals)",
+  "\t\t\t{",
+  "\t\t\t\tCVec3 Normal = CVT(RawMesh.WedgeNormal[i]);",
+  "\t\t\t\tif (Lod->HasTangents)",
+  "\t\t\t\t{",
+  "\t\t\t\t\tCVec3 Tangent = CVT(RawMesh.WedgeTangent[i]);",
+  "\t\t\t\t\tCVec3 Binormal = CVT(RawMesh.WedgeBinormal[i]);",
+  "\t\t\t\t\tPack(V.Normal, Normal);",
+  "\t\t\t\t\tPack(V.Tangent, Tangent);",
+  "\t\t\t\t\tCVec3 ComputedBinormal;",
+  "\t\t\t\t\tcross(Normal, Tangent, ComputedBinormal);",
+  "\t\t\t\t\tfloat Sign = dot(Binormal, ComputedBinormal);",
+  "\t\t\t\t\tV.Normal.SetW(Sign > 0 ? 1.0f : -1.0f);",
+  "\t\t\t\t}",
+  "\t\t\t}",
+].join("\n");
+
+/** The same loop with the normal packed before the tangent guard. The handedness sign stays inside that guard. */
+const UMODEL_NORMAL_PACK_FIXED = [
+  "\t\t\t// Pack normals",
+  "\t\t\tif (Lod->HasNormals)",
+  "\t\t\t{",
+  "\t\t\t\tCVec3 Normal = CVT(RawMesh.WedgeNormal[i]);",
+  "\t\t\t\tPack(V.Normal, Normal);",
+  "\t\t\t\tif (Lod->HasTangents)",
+  "\t\t\t\t{",
+  "\t\t\t\t\tCVec3 Tangent = CVT(RawMesh.WedgeTangent[i]);",
+  "\t\t\t\t\tCVec3 Binormal = CVT(RawMesh.WedgeBinormal[i]);",
+  "\t\t\t\t\tPack(V.Tangent, Tangent);",
+  "\t\t\t\t\tCVec3 ComputedBinormal;",
+  "\t\t\t\t\tcross(Normal, Tangent, ComputedBinormal);",
+  "\t\t\t\t\tfloat Sign = dot(Binormal, ComputedBinormal);",
+  "\t\t\t\t\tV.Normal.SetW(Sign > 0 ? 1.0f : -1.0f);",
+  "\t\t\t\t}",
+  "\t\t\t}",
+].join("\n");
+
+/**
+ * UE Viewer exports a mesh that has normals but no tangents with zero normals: `Pack(V.Normal, Normal)` sits inside the
+ * tangent guard. The fix moves that one `Pack` ahead of the guard and leaves the tangent, the sign and everything else
+ * alone. The block must match exactly, once: an upstream that differs refuses the build rather than shipping the bug.
+ * A second application changes nothing, and the file's CRLF line endings are kept.
+ */
+export function patchUmodelNormalPacking(source: string): string {
+  const crlf = source.includes("\r\n");
+  const text = source.replace(/\r\n/g, "\n");
+  const upstream = text.split(UMODEL_NORMAL_PACK_UPSTREAM).length - 1;
+  const fixed = text.split(UMODEL_NORMAL_PACK_FIXED).length - 1;
+  if (upstream === 0 && fixed === 1) return source;
+  if (upstream !== 1 || fixed !== 0) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The pinned UE Viewer source has ${upstream} unpatched and ${fixed} patched normal packing blocks, not one of each; the patch was not applied.`,
+    );
+  }
+  const patched = text.replace(UMODEL_NORMAL_PACK_UPSTREAM, UMODEL_NORMAL_PACK_FIXED);
+  return crlf ? patched.replace(/\n/g, "\r\n") : patched;
+}
 
 export const FABCLI_RELEASE = Object.freeze({
   tag: "v0.1.0",
@@ -182,67 +321,57 @@ async function uncookedHelpRuns(path: string): Promise<boolean> {
 }
 
 /**
- * Installs UE Viewer into the toolchain cache. Gildor publishes a 32-bit Linux build that most
- * current distributions cannot load (libpng12, 32-bit SDL2), so the prebuilt is only ever tried,
- * never trusted: whatever it does, the source build is the fallback that actually produces a
- * runnable binary on a modern host.
+ * Test-only substitution for the patched source build. It must leave a UE Viewer binary at `destination`, and the
+ * provisioner still requires that binary to print both markers. Production callers never pass it, so tests neither
+ * download nor build.
  */
-export async function provisionUmodel(
-  environment: NodeJS.ProcessEnv = process.env,
-  log: ProvisionLog = silent,
-): Promise<string> {
-  assertSupportedHost();
-  const cache = join(toolchainCacheDir(environment), "umodel");
-  await mkdir(cache, { recursive: true });
-  const installed = join(cache, process.platform === "win32" ? "umodel.exe" : "umodel");
+export interface UmodelProvisionHooks {
+  readonly build?: (destination: string, log: ProvisionLog) => Promise<void>;
+}
 
+/**
+ * Whether the binary at `path` exits 0 on `-version` and prints both fix markers. This is the attestation that gates
+ * reuse of the owned build and its publication.
+ */
+export async function umodelCorrectedAt(path: string): Promise<boolean> {
+  const text = await runCandidate(path, ["-version"]);
+  return text !== undefined && umodelCorrected(text);
+}
+
+/**
+ * Applies one source patch to a file of the pinned source tree. A missing file refuses the build: a patch that quietly
+ * did nothing would ship the bug under a fixed label.
+ */
+async function patchUmodelSource(root: string, relative: string, patch: (source: string) => string): Promise<void> {
+  const path = join(root, ...relative.split("/"));
+  const source = await readFile(path, "utf8").catch(() => undefined);
+  if (source === undefined) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The pinned UE Viewer source has no ${relative}; the Boolean tag patch cannot be applied.`,
+    );
+  }
+  await writeFile(path, patch(source));
+}
+
+/**
+ * Applies the three UE Viewer fixes to a checkout of the pinned source. Its paths are the repository's own: `Unreal/` and
+ * `UmodelTool/` sit at the root, with no `src/` above them. Exported for the layout regression test only.
+ */
+export async function patchUmodelSourceTree(checkoutRoot: string): Promise<void> {
+  await patchUmodelSource(checkoutRoot, "Unreal/UnObject.cpp", patchUmodelBoolTagDeserialization);
+  await patchUmodelSource(checkoutRoot, "UmodelTool/Main.cpp", patchUmodelVersionMarker);
+  await patchUmodelSource(checkoutRoot, "Unreal/UnrealMesh/UnMesh4.cpp", patchUmodelNormalPacking);
+}
+
+/**
+ * Builds the pinned source with both fixes applied before `build.sh` compiles anything, and publishes the binary to
+ * `installed` only once it prints both markers (see `publishExecutable`). Linux only.
+ */
+async function buildPatchedUmodel(installed: string, log: ProvisionLog): Promise<void> {
   const staging = await mkdtemp(join(tmpdir(), "tn-umodel-"));
   try {
-    const isWindows = process.platform === "win32";
-    const archive = join(staging, isWindows ? "umodel.zip" : "umodel.tar.gz");
-    // The Linux prebuilt is a 32-bit i386 ELF. Without the i386 loader it cannot even start, so a
-    // 64-bit-only host goes straight to the source build instead of downloading it to find out.
-    const prebuiltRunnable =
-      isWindows || (await access("/lib/ld-linux.so.2").then(() => true, () => false));
-    if (!prebuiltRunnable) {
-      log("UE Viewer's Linux prebuilt is 32-bit and this host has no i386 loader; building from source.");
-    } else {
-      log("Downloading UE Viewer prebuilt binary…");
-      try {
-        await fetchToFile(
-          isWindows ? UEVIEWER_SOURCE.prebuiltWindows : UEVIEWER_SOURCE.prebuiltLinux,
-          archive,
-          { referer: UEVIEWER_SOURCE.referer },
-        );
-        const unpacked = join(staging, "prebuilt");
-        if (isWindows) await extractZip(archive, unpacked);
-        else await extractTarGz(archive, unpacked);
-        const candidate = join(unpacked, isWindows ? "umodel.exe" : "umodel");
-        await chmod(candidate, 0o755).catch(() => {});
-        if (await canRun(candidate, ["-version"], /UE Viewer/i)) {
-          await rename(candidate, installed).catch(async () => {
-            await writeFile(installed, await readFile(candidate));
-            await chmod(installed, 0o755);
-          });
-          log(`Installed prebuilt UE Viewer at ${installed}`);
-          return installed;
-        }
-        log("Prebuilt UE Viewer cannot run on this host; building from source.");
-      } catch (error) {
-        log(
-          `Prebuilt UE Viewer unavailable (${error instanceof Error ? error.name : "error"}); building from source.`,
-        );
-      }
-    }
-
-    if (process.platform !== "linux") {
-      throw new ToolchainError(
-        "UNREAL_TOOL_UNUSABLE",
-        "UE Viewer could not be installed automatically on this host. Install it from https://www.gildor.org/en/projects/umodel and set THREENATIVE_UMODEL_PATH.",
-      );
-    }
-
-    log("Building UE Viewer from source (one time, ~2 minutes)…");
+    log("Building UE Viewer from source with the Boolean tag and normal packing fixes (one time, ~2 minutes)…");
     const source = join(staging, "UEViewer");
     await mkdir(source, { recursive: true });
     const initialized = await runBounded("git", ["init", "--quiet"], {
@@ -273,6 +402,7 @@ export async function provisionUmodel(
         "The pinned UE Viewer source commit could not be fetched. Install umodel manually and set THREENATIVE_UMODEL_PATH.",
       );
     }
+    await patchUmodelSourceTree(source);
     const build = await runBounded("./build.sh", [], {
       cwd: source,
       timeoutMs: 1_800_000,
@@ -282,10 +412,83 @@ export async function provisionUmodel(
     if (build.code !== 0 || !(await canRun(built, ["-version"], /UE Viewer/i))) {
       throw new ToolchainError("UNREAL_TOOL_UNUSABLE", umodelBuildFailure(`${build.stdout}\n${build.stderr}`));
     }
-    await writeFile(installed, await readFile(built));
-    await chmod(installed, 0o755);
-    log(`Built UE Viewer at ${installed}`);
-    return installed;
+    await publishExecutable(built, installed, umodelCorrectedAt);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Installs the patched UE Viewer into its own cache, apart from every unpatched build, and accepts it only when it prints
+ * both markers.
+ */
+async function provisionPatchedUmodel(
+  environment: NodeJS.ProcessEnv,
+  log: ProvisionLog,
+  hooks: UmodelProvisionHooks,
+): Promise<string> {
+  await mkdir(join(toolchainCacheDir(environment), UMODEL_BOOLTAGS.cacheDir), { recursive: true });
+  const installed = umodelBoolTagsPath(environment);
+  if (hooks.build) {
+    await hooks.build(installed, log);
+  } else {
+    await buildPatchedUmodel(installed, log);
+  }
+  if (!(await umodelCorrectedAt(installed))) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The UE Viewer build at "${installed}" does not print ${UMODEL_BOOLTAGS.marker} and ${UMODEL_NORMALPACK.marker}, so it does not carry both fixes.`,
+    );
+  }
+  log(`Installed UE Viewer with the Boolean tag and normal packing fixes at ${installed}`);
+  return installed;
+}
+
+/**
+ * Installs UE Viewer for this host. Linux builds the pinned source with both source fixes, the only build this module
+ * treats as correct. Windows downloads the upstream prebuilt, which lacks the fix: it goes to the legacy cache and is
+ * reported as unverified. Other hosts have no automated install.
+ */
+export async function provisionUmodel(
+  environment: NodeJS.ProcessEnv = process.env,
+  log: ProvisionLog = silent,
+  hooks: UmodelProvisionHooks = {},
+): Promise<string> {
+  assertSupportedHost();
+  if (process.platform === "linux") return await provisionPatchedUmodel(environment, log, hooks);
+  if (process.platform !== "win32") {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      "UE Viewer could not be installed automatically on this host. Install it from https://www.gildor.org/en/projects/umodel and set THREENATIVE_UMODEL_PATH.",
+    );
+  }
+  const cache = join(toolchainCacheDir(environment), "umodel");
+  await mkdir(cache, { recursive: true });
+  const installed = join(cache, "umodel.exe");
+  const staging = await mkdtemp(join(tmpdir(), "tn-umodel-"));
+  try {
+    const archive = join(staging, "umodel.zip");
+    log("Downloading UE Viewer prebuilt binary…");
+    try {
+      await fetchToFile(UEVIEWER_SOURCE.prebuiltWindows, archive, { referer: UEVIEWER_SOURCE.referer });
+      const unpacked = join(staging, "prebuilt");
+      await extractZip(archive, unpacked);
+      const candidate = join(unpacked, "umodel.exe");
+      if (await canRun(candidate, ["-version"], /UE Viewer/i)) {
+        await rename(candidate, installed).catch(async () => {
+          await writeFile(installed, await readFile(candidate));
+        });
+        log(`Installed prebuilt UE Viewer at ${installed}; it lacks the Boolean tag fix, so it is reported unverified.`);
+        return installed;
+      }
+      log("Prebuilt UE Viewer cannot run on this host.");
+    } catch (error) {
+      log(`Prebuilt UE Viewer unavailable (${error instanceof Error ? error.name : "error"}).`);
+    }
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      "UE Viewer could not be installed automatically on this host. Install it from https://www.gildor.org/en/projects/umodel and set THREENATIVE_UMODEL_PATH.",
+    );
   } finally {
     await rm(staging, { recursive: true, force: true });
   }
@@ -1464,22 +1667,50 @@ async function resolveOrProvisionUncooked(
   }
 }
 
-async function resolveOrProvision(
-  name: "umodel" | "fabcli" | "uncooked" | "modern",
+/**
+ * UE Viewer's resolver. An explicit override is the user's and comes first. Without one, a build in the versioned cache
+ * that exits 0 and prints both markers wins over PATH. PATH and the owned legacy cache usually hold unpatched builds:
+ * a runnable PATH build is used whatever auto-install says, and reported unverified unless it prints both markers.
+ * Without a runnable PATH build, auto-install on Linux builds the patched UE Viewer and upgrades a runnable legacy
+ * build; other hosts keep a runnable legacy build, reported unverified. A failed upgrade throws; it never falls back
+ * to a build known to decode Boolean tags wrongly or to export zero normals.
+ */
+async function resolveOrProvisionUmodel(
   environment: NodeJS.ProcessEnv,
   log: ProvisionLog,
-  uncookedHooks: UncookedProvisionHooks = {},
+  hooks: UmodelProvisionHooks,
 ): Promise<string> {
-  if (name === "uncooked") return resolveOrProvisionUncooked(environment, log, uncookedHooks);
+  const override = environment.THREENATIVE_UMODEL_PATH?.trim();
+  const versioned = umodelBoolTagsPath(environment);
+  if (!override && (await umodelCorrectedAt(versioned))) return versioned;
   try {
-    const found = await resolveExecutable(name, environment);
+    const found = await resolveExecutable("umodel", environment);
     // A PATH umodel is whatever the user happened to install; the 2022 upstream release rejects
     // `-psk`, which every animation export passes. An explicit override stays the user's call.
-    if (name !== "umodel" || environment.THREENATIVE_UMODEL_PATH?.trim() || (await canRun(found, UMODEL_PROBE, /UE Viewer/i))) {
-      return found;
-    }
+    if (override || (await canRun(found, UMODEL_PROBE, /UE Viewer/i))) return found;
     log(`Ignoring ${found}: that UE Viewer build does not accept -psk.`);
     throw new ToolchainError("UNREAL_TOOL_NOT_FOUND", `${found} does not accept -psk; no capable UE Viewer was found.`);
+  } catch (error) {
+    if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
+    const legacy = join(toolchainCacheDir(environment), "umodel", process.platform === "win32" ? "umodel.exe" : "umodel");
+    const legacyRuns = await canRun(legacy, UMODEL_PROBE, /UE Viewer/i);
+    if (!autoInstallEnabled(environment)) {
+      if (legacyRuns) return legacy;
+      throw error;
+    }
+    // Only Linux can build the fix here. Elsewhere the legacy build is the only automated option, reported unverified.
+    if (legacyRuns && process.platform !== "linux") return legacy;
+    return await provisionUmodel(environment, log, hooks);
+  }
+}
+
+async function resolveOrProvision(
+  name: "fabcli" | "modern",
+  environment: NodeJS.ProcessEnv,
+  log: ProvisionLog,
+): Promise<string> {
+  try {
+    return await resolveExecutable(name, environment);
   } catch (error) {
     if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
     const cached = name === "modern"
@@ -1489,15 +1720,11 @@ async function resolveOrProvision(
         name,
         process.platform === "win32" ? `${name}.exe` : name,
       );
-    const marker = name === "umodel"
-      ? /UE Viewer/i
-      : name === "fabcli"
-        ? /fabcli/i
-        : new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    const probe = name === "umodel" ? UMODEL_PROBE : ["--version"];
-    if (await canRun(cached, probe, marker)) return cached;
+    const marker = name === "fabcli"
+      ? /fabcli/i
+      : new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    if (await canRun(cached, ["--version"], marker)) return cached;
     if (!autoInstallEnabled(environment)) throw error;
-    if (name === "umodel") return await provisionUmodel(environment, log);
     if (name === "fabcli") return await provisionFabcli(environment, log);
     return await provisionModernConverter(environment, log);
   }
@@ -1508,13 +1735,17 @@ const UMODEL_VERSION = /^UE Viewer.*$\n^(Compiled .*)$/m;
 /** Prints the banner only when the build parses `-psk`; older builds fail the command line first. */
 export const UMODEL_PROBE = ["-export", "-psk", "-version"] as const;
 
-/** UE Viewer, resolved from the environment, PATH, the toolchain cache, or a fresh install. */
+/**
+ * UE Viewer, resolved from the environment, the Boolean-tag cache, PATH, the legacy cache, or a fresh install. The
+ * version says whether the binary prints both fix markers, so provenance travels with the tool.
+ */
 export async function ensureUmodel(
   environment: NodeJS.ProcessEnv = process.env,
   log: ProvisionLog = silent,
+  hooks: UmodelProvisionHooks = {},
 ): Promise<ExternalTool> {
   assertSupportedHost();
-  const path = await resolveOrProvision("umodel", environment, log);
+  const path = await resolveOrProvisionUmodel(environment, log, hooks);
   const run = await runBounded(path, UMODEL_PROBE, { timeoutMs: 30_000 });
   const text = `${run.stdout}\n${run.stderr}`;
   if (!/UE Viewer/i.test(text)) {
@@ -1525,11 +1756,18 @@ export async function ensureUmodel(
         : `"${path}" does not identify itself as UE Viewer (umodel).`,
     );
   }
-  return {
-    name: "umodel",
-    path,
-    version: UMODEL_VERSION.exec(text)?.[1]?.trim() ?? "UE Viewer (unversioned)",
-  };
+  if (run.code !== 0) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `"${path}" fails with exit code ${run.code} on -version, so its banner and markers do not show that it works.`,
+    );
+  }
+  const banner = UMODEL_VERSION.exec(text)?.[1]?.trim() ?? "UE Viewer (unversioned)";
+  const missing = [UMODEL_BOOLTAGS.marker, UMODEL_NORMALPACK.marker].filter((marker) => !text.includes(marker));
+  const provenance = missing.length === 0
+    ? `${UMODEL_BOOLTAGS.marker} and ${UMODEL_NORMALPACK.marker} parser-verified`
+    : `unverified: no ${missing.join(" or no ")} marker, so Boolean tags or normal packing may be wrong`;
+  return { name: "umodel", path, version: `${banner}; ${provenance}` };
 }
 
 /** FabCLI, resolved the same way. Installing it never logs in — that stays the user's act. */
@@ -1557,7 +1795,7 @@ export async function ensureUncookedConverter(
   hooks: UncookedProvisionHooks = {},
 ): Promise<ExternalTool> {
   assertSupportedHost();
-  const path = await resolveOrProvision("uncooked", environment, log, hooks);
+  const path = await resolveOrProvisionUncooked(environment, log, hooks);
   const run = await runBounded(path, ["--help"], { timeoutMs: 30_000 });
   if (!uncookedHelpAccepted(run)) {
     throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected uncooked Unreal converter.`);

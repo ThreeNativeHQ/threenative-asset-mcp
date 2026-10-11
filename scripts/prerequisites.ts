@@ -252,7 +252,7 @@ const TEST_ONLY_PREREQUISITES: readonly Prerequisite[] = [
   },
 ];
 
-export type TestToolId = "node" | "ffmpeg" | "ffprobe" | "python-imaging" | "chromium" | "modern-converter";
+export type TestToolId = "node" | "ffmpeg" | "ffprobe" | "python-imaging" | "chromium" | "modern-converter" | "g++";
 
 export function prerequisiteById(id: string): Prerequisite {
   const found = [...PREREQUISITES, ...TEST_ONLY_PREREQUISITES].find((entry) => entry.id === id);
@@ -282,7 +282,8 @@ export function toolchainCacheDir(env: NodeJS.ProcessEnv): string {
 }
 
 const CACHED_TOOLS: readonly (readonly [label: string, relative: string])[] = [
-  ["UE Viewer", "umodel/umodel"],
+  ["UE Viewer (Boolean tag and normal packing fixes)", "umodel-booltags-2/umodel"],
+  ["UE Viewer (legacy, unverified)", "umodel/umodel"],
   ["FabCLI", "fabcli/fabcli"],
   ["uncooked converter", "uncooked/venv/bin/unreal-assets-to-glb"],
   ["modern converter", "modern/bin/ThreeNativeConverter"],

@@ -55,10 +55,14 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
 
 - **FabCLI**: release archives wrap the binary in `fabcli-<tag>-<platform>/`. Look inside archives
   with `findArchiveEntry`; never assume the root layout.
-- **UE Viewer**: the Linux prebuilt from gildor.org is a 32-bit i386 ELF, unrunnable without the
-  i386 loader, so 64-bit-only hosts build from source. The build needs `g++`, `perl`, `zlib1g-dev`,
-  `libpng-dev` and `libsdl2-dev`. `umodelBuildFailure` reads the compiler output and names the
-  missing package; keep that mapping current rather than listing guesses.
+- **UE Viewer**: Linux never downloads the gildor.org prebuilt (a 32-bit i386 ELF, unrunnable without
+  the i386 loader). It builds the pinned source with both fixes, `UMODEL_BOOLTAGS` and `UMODEL_NORMALPACK`;
+  Windows takes the upstream prebuilt, which has neither and is reported unverified. A binary counts as
+  corrected only when `-version` exits 0 and prints both markers (`umodelCorrected`). The patched build lives in the
+  `umodel-booltags-2` cache, so a Boolean-tag-only build in `-1` is never reused, and it is published by a
+  temp file and rename beside its destination (`publishExecutable`), never written over a running binary.
+  The build needs `g++`, `perl`, `zlib1g-dev`, `libpng-dev` and `libsdl2-dev`. `umodelBuildFailure` reads
+  the compiler output and names the missing package; keep that mapping current rather than listing guesses.
 - The uncooked converter provisions a Python venv; the modern converter installs a private .NET SDK
   and publishes CUE4Parse. Neither needs root.
 - The `Fresh toolchain` workflow provisions all four from an empty cache in `debian:13` (weekly,
