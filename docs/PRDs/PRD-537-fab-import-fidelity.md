@@ -191,3 +191,17 @@ Corrected 2026-10-10: these were filed as licence-blocked on 2026-10-08. They ar
 - [x] AC-8 [local]: `fab_list_owned` lists each artifact separately with its source engine and decoder route. proof: `npx vitest run tests/fab-import.integration.test.ts` — Evidence (2026-10-07): 24+ tests pass incl. the new three-artifact listing (`artifacts[]` with `artifactId`, `engineVersions`, `oldestEngine`, `route`, `targetPlatforms`); README and the tool description updated.
 
 **Verification:** the boxes above.
+
+### Active slice: normalized decoder hints and Hornbeam package compatibility
+
+Complexity: 3 → LOW; risk override: none. Two TypeScript implementation files plus a possible independent C# converter boundary. Existing PRD acceptance remains unchanged; these are prerequisites for the real corpus gates.
+
+Scope: reuse the dirty `importer-format-hint` lane, preserving its six-file patch. Normalize supported hints once, include the effective value in import cache identity, and pass it through all source-pack decoder calls. Missing/unsupported hints retain existing behavior. Engine-content provider version remains independently configured. Separately diagnose Hornbeam's UE4 object518 package being interpreted with UE5.1 custom-version defaults; any fix must derive package compatibility from header/custom-version evidence and official serializer gates, never global-version guessing, bool coercion or partial export.
+
+Consumer flow: Fab import request → importUnrealDirectory → cache identity and every source-pack converter invocation → observable argv/cache reuse. The later native flow is converter package load → package-specific version gates → complete genuine Hornbeam export. Existing decoder/provider paths are reused.
+
+- [ ] Hint AC [local]: changed effective hints rerun a real import sharing one cache, equivalent hints reuse; omitted/unsupported hint behavior preserved — proof: focused real-entry-point import integration regressions and typecheck.
+- [ ] Route AC [local]: same-name meshes, standalone/source textures and graph decodes receive normalized hints, while Engine content remains separate — proof: production-call argv recording regressions plus reviewed call census.
+- [ ] Hornbeam AC [local]: a source-backed package compatibility fix produces a complete genuine unfiltered import without accepting invalid bools/incomplete exports — proof: pinned converter build, actual package/export evidence and full official import. Diagnosis alone leaves this unticked.
+
+Phase 1: complete/review hint plumbing in the existing lane and inspect the supplied Hornbeam proof/source gates read-only in parallel. Phase 2: implement the evidenced package fix, run native regressions and genuine Hornbeam import with frozen inputs. Full86+24 acceptance, visual/source parity and final CI remain separate unfinished requirements. No ratchet/merge/release authorized by this slice.
