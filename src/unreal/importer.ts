@@ -2034,11 +2034,15 @@ export async function packageGlb(options: {
       // exclusion without any switch override. Only an unknown path is judged by the switches; with none overridden it stands unjudged.
       const bound = staleBase?.texture.toLowerCase();
       const stale = bound !== undefined && (active ? !active.includes(bound) : probed?.switchOverridden !== false);
-      if (staleBase && stale) {
+      // A bound texture the path does sample is still only part of the colour when a switch the chain itself overrides picks a branch
+      // that blends it with other textures (a tint-by-mask lerp): the flattened binding is that albedo alone. Without an override the
+      // path is the master's default and the binding stands as before.
+      const partial = bound !== undefined && active !== undefined && active.length > 1 && active.includes(bound) && probed?.switchOverridden === true;
+      if (staleBase && (stale || partial)) {
         const baked = await options.graphBaker(graphRequest(false));
         if (baked.status === "baked") {
           // texturesUsed lists the base colour's samples only (the cut-out compiles separately), so the same primary test applies.
-          if (!baked.texturesUsed.some((used) => used.toLowerCase() === staleBase.texture.toLowerCase())) {
+          if (partial || !baked.texturesUsed.some((used) => used.toLowerCase() === staleBase.texture.toLowerCase())) {
             resolved = {
               ...resolved,
               bindings: resolved.bindings.filter((binding) => binding.slot !== "baseColor"),

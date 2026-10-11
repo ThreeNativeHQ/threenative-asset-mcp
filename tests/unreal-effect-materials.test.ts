@@ -991,3 +991,104 @@ describe("importer: a stale flattened base colour is replaced only by a successf
     expect(await embeddedAlpha(material)).toEqual([128, 128]);
   });
 });
+
+describe("importer: a static switch that blends the bound albedo with a mask (tint by mask)", () => {
+  const SWITCH = "Tint By Mask?";
+  const BASE_TINT = [1, 0.5, 0.25];
+  const MASK_TINT = [0.25, 0.5, 1];
+  const MULTI = 1;
+  const CONTRAST = 2;
+  /** A curtain-shaped master: BaseColor = TintByMask? ? lerp(ALB*baseTint, ALB*maskTint, clamp(pow(Mask.R*multi, contrast))) : ALB. */
+  function curtainMaster(): MaterialGraph {
+    const rgb = [1, 1, 1, 0];
+    return graphOf(
+      "M_Curtain",
+      [
+        node("switch", "StaticSwitchParameter", {
+          inputs: { A: pin("blend", 0, rgb), B: pin("alb", 0, rgb) },
+          parameter: { name: SWITCH, group: "" },
+          default: false,
+          switchValue: false,
+        }),
+        node("alb", "TextureSample", { texture: "/Game/Test/T_Alb.T_Alb", samplerType: "Color" }),
+        node("mask", "TextureSample", { texture: "/Game/Test/T_Mask.T_Mask", samplerType: "Masks" }),
+        node("baseTint", "VectorParameter", { parameter: { name: "Albedo Color Tint (Base)", group: "" }, default: [...BASE_TINT, 1] }),
+        node("maskTint", "VectorParameter", { parameter: { name: "Base Color Tint (Mask)", group: "" }, default: [...MASK_TINT, 1] }),
+        node("multi", "ScalarParameter", { parameter: { name: "Tint Mask Multi", group: "" }, default: MULTI }),
+        node("contrast", "ScalarParameter", { parameter: { name: "Tint Mask Contrast", group: "" }, default: CONTRAST }),
+        node("albBase", "Multiply", { inputs: { A: pin("alb", 0, rgb), B: pin("baseTint", 0, rgb) } }),
+        node("albMask", "Multiply", { inputs: { A: pin("alb", 0, rgb), B: pin("maskTint", 0, rgb) } }),
+        node("scaled", "Multiply", { inputs: { A: pin("mask", 0, [1, 0, 0, 0]), B: pin("multi") } }),
+        node("curve", "Power", { inputs: { Base: pin("scaled"), Exponent: pin("contrast") } }),
+        node("weight", "Clamp", { inputs: { Input: pin("curve") } }),
+        node("blend", "LinearInterpolate", { inputs: { A: pin("albBase", 0, rgb), B: pin("albMask", 0, rgb), Alpha: pin("weight") } }),
+      ],
+      { baseColor: pin("switch") },
+    );
+  }
+  const parentLine = (parent: string, parentClass = "Material3"): string => `Parent = ${parentClass}'Content/Test/${parent}.${parent}'\nBlendMode = BLEND_Opaque (0)`;
+  const switchRow = (value: boolean, overridden = true): string =>
+    [
+      "StaticParameters =",
+      "{",
+      "    StaticSwitchParameters[1] =",
+      "    {",
+      "        StaticSwitchParameters[0] =",
+      "        {",
+      `            Value = ${value}`,
+      `            ParameterInfo = { Name=${SWITCH} }`,
+      `            bOverride = ${overridden}`,
+      "        }",
+      "    }",
+      "}",
+    ].join("\n");
+
+  // Independent expectation: sRGB decode of the colour texture, the mask sampled linear, lerp in linear light, sRGB encode.
+  const ALBEDO = [200, 100, 50];
+  const MASK_R = 128;
+  const decode = (value: number): number => (value / 255 <= 0.04045 ? value / 255 / 12.92 : ((value / 255 + 0.055) / 1.055) ** 2.4);
+  const encode = (linear: number): number => Math.round(255 * (linear <= 0.0031308 ? 12.92 * linear : 1.055 * linear ** (1 / 2.4) - 0.055));
+  const weight = Math.min(1, Math.max(0, (MASK_R / 255) * MULTI) ** CONTRAST);
+  const tinted = ALBEDO.map((channel, index) => {
+    const albedo = decode(channel);
+    const base = albedo * BASE_TINT[index]!;
+    return encode(base + (albedo * MASK_TINT[index]! - base) * weight);
+  });
+
+  async function firstPixel(material: { getBaseColorTexture(): { getImage(): Uint8Array | null } | null }): Promise<number[]> {
+    const { data } = await sharp(material.getBaseColorTexture()!.getImage()!).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    return [data[0]!, data[1]!, data[2]!];
+  }
+
+  it.each([
+    ["the instance overrides it true", { props: `${parentLine("M_Curtain")}\n${switchRow(true)}` }, true],
+    ["a parent instance overrides it true and the instance inherits", { props: parentLine("MI_CurtainParent", "MaterialInstanceConstant"), extraProps: { MI_CurtainParent: `${parentLine("M_Curtain")}\n${switchRow(true)}` } }, true],
+    ["the instance overrides it false", { props: `${parentLine("M_Curtain")}\n${switchRow(false)}` }, false],
+    ["the instance sets true with bOverride false (it inherits the master's false)", { props: `${parentLine("M_Curtain")}\n${switchRow(true, false)}` }, false],
+    ["the instance does not list it", { props: parentLine("M_Curtain") }, false],
+    ["the instance's false beats its parent's true", { props: `${parentLine("MI_CurtainParent", "MaterialInstanceConstant")}\n${switchRow(false)}`, extraProps: { MI_CurtainParent: `${parentLine("M_Curtain")}\n${switchRow(true)}` } }, false],
+  ] satisfies [string, { props: string; extraProps?: Record<string, string> }, boolean][])("when %s", async (_case, instance, blended) => {
+    const { material, section } = await importFixture({
+      graph: curtainMaster(),
+      materialName: "MI_Curtain",
+      ...instance,
+      // UE Viewer's flattened .mat binds the albedo texture alone, whatever the switch picks.
+      mat: "Diffuse=T_Alb\n",
+      textures: [
+        ["T_Alb", ALBEDO as [number, number, number]],
+        ["T_Mask", [MASK_R, MASK_R, MASK_R]],
+      ],
+    });
+    const pixel = await firstPixel(material);
+    if (blended) {
+      expect(section.graph).toMatchObject({ status: "baked" });
+      expect(section.limitations.join("\n")).toContain("T_Alb dropped as base colour");
+      pixel.forEach((channel, index) => expect(Math.abs(channel - tinted[index]!)).toBeLessThanOrEqual(2));
+      expect(pixel).not.toEqual(ALBEDO);
+    } else {
+      expect(section.graph).toBeUndefined();
+      expect(section.limitations.join("\n")).not.toContain("dropped as base colour");
+      expect(pixel).toEqual(ALBEDO);
+    }
+  });
+});
