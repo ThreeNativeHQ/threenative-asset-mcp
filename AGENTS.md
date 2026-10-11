@@ -162,3 +162,9 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   pack's mean fidelity falls more than 2 points, its worst piece more than 6, its failing tiles rise, or compared
   pieces drop; `update` only ever ratchets numbers up. Run `check` after every sweep before merging a fix, so a fix
   for one pack cannot silently undo another.
+
+## Comparison preview contract
+
+- Preserve the approved Unreal-like picture environment for before/after comparison sheets: UE4.19 reference world-space lights, source-environment orientation and intensity, source floor response and ACES exposure1. Keep the camera/framing policy consistent across a comparison. Never tune lighting or exposure per asset to improve a score.
+- Actual reference cubemap and Grid inputs are caller-supplied/local-only. Record their provenance and computed input digests. Label the hemisphere/procedural-floor fallback as an approximation; do not present it as the identical reference environment. Licensed assets are never bundled or auto-fetched by the renderer.
+- Keep neutral metric renders independent of picture lighting. Hardening must exercise the actual public renderer with synthetic HDR and asymmetric raster inputs: orientation, HDR values above1, light directions/intensities, floor scale/response, filmic exposure, cast shadows, input snapshot isolation, repeated renders and neutral/judge identity. Configuration changes require source-backed review and comparison evidence; licensed packs never become test fixtures.
