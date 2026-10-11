@@ -1,6 +1,11 @@
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
-import { applyThumbnailReferenceLighting, prepareThumbnailSourceEnvironment } from "../src/unreal/thumbnail-lighting.js";
+import {
+  applyThumbnailReferenceLighting,
+  assertThumbnailSourceRadiance,
+  prepareThumbnailSourceEnvironment,
+  type ThumbnailSourceRadiance,
+} from "../src/unreal/thumbnail-lighting.js";
 
 describe("UE 4.19.2 thumbnail reference lighting", () => {
   it("lights from the source world directions independently of camera, object position and scale", () => {
@@ -81,5 +86,58 @@ describe("UE 4.19.2 thumbnail reference lighting", () => {
       width: 1, height: 1, rgb: new Float32Array([Number.NaN, 0, 0]),
       source: { reference: "/Engine/Test", engine: "5.8", bytesSha256: "b".repeat(64), layout: "ue-source-longlat-rgb-f32", radianceDecode: "ue4.19-rgbe" },
     })).toThrow(/radiance must be finite/);
+  });
+
+  it("refuses a radiance array that is not exactly width*height*3 floats before creating a GPU texture", () => {
+    expect(() => prepareThumbnailSourceEnvironment(THREE, {
+      width: 2, height: 1, rgb: new Float32Array(5),
+      source: { reference: "/Engine/Test", engine: "5.8", bytesSha256: "b".repeat(64), layout: "ue-source-longlat-rgb-f32", radianceDecode: "ue4.19-rgbe" },
+    })).toThrow(/exactly width\*height\*3/);
+  });
+});
+
+describe("UE source radiance validation", () => {
+  const PROVENANCE = {
+    reference: "/Engine/Test",
+    engine: "5.8",
+    bytesSha256: "b".repeat(64),
+    layout: "ue-source-longlat-rgb-f32" as const,
+    radianceDecode: "ue4.19-rgbe" as const,
+  };
+  const malformed: [string, Record<string, unknown>][] = [
+    ["a non-string reference", { reference: ["/Engine/Test"] }],
+    ["a non-string engine", { engine: 5 }],
+    ["a SHA-256 array that stringifies to a digest", { bytesSha256: ["b".repeat(64)] }],
+  ];
+
+  // A Float64Array or Uint8Array can match the byte count of width*height*3 float32 values and still hold other numbers.
+  it.each([
+    ["a Float64Array of three values (24 bytes)", () => new Float64Array([2, 3, 4])],
+    ["a Uint8Array of 24 bytes", () => new Uint8Array(24)],
+  ])("refuses %s before it is read as radiance", (_label, makeRgb) => {
+    const input = { width: 2, height: 1, rgb: makeRgb(), source: PROVENANCE } as unknown as ThumbnailSourceRadiance;
+    expect(() => assertThumbnailSourceRadiance(input)).toThrow(/must be a Float32Array/);
+    expect(() => prepareThumbnailSourceEnvironment(THREE, input)).toThrow(/must be a Float32Array/);
+  });
+
+  it("accepts a Float32Array of exactly width*height*3 values and keeps them in order", () => {
+    const input: ThumbnailSourceRadiance = { width: 2, height: 1, rgb: new Float32Array([1, 2, 3, 4, 5, 6]), source: PROVENANCE };
+    expect(() => assertThumbnailSourceRadiance(input)).not.toThrow();
+    const prepared = prepareThumbnailSourceEnvironment(THREE, input);
+    expect(Array.from(prepared.texture.image.data!)).toEqual([1, 2, 3, 1, 4, 5, 6, 1]);
+    prepared.texture.dispose();
+  });
+
+  it.each(malformed)("refuses malformed provenance: %s", (_label, override) => {
+    const source = { ...PROVENANCE, ...override };
+    const input = { width: 1, height: 1, rgb: new Float32Array([0.5, 0.5, 0.5]), source } as unknown as ThumbnailSourceRadiance;
+    expect(() => assertThumbnailSourceRadiance(input)).toThrow(/explicit UE source longlat layout/);
+  });
+
+  it("keeps only the declared provenance fields on the prepared source", () => {
+    const source = { ...PROVENANCE, extraRadiance: new Float32Array([12, 13, 14]) };
+    const prepared = prepareThumbnailSourceEnvironment(THREE, { width: 1, height: 1, rgb: new Float32Array([1, 2, 3]), source });
+    expect(prepared.source).toEqual(PROVENANCE);
+    prepared.texture.dispose();
   });
 });

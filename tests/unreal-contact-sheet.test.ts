@@ -1,12 +1,14 @@
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Document, NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
-import { expect, it, onTestFinished } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 
-import { colouredGlbKeys, renderContactSheet } from "../src/unreal/contact-sheet.js";
+import { colouredGlbKeys, renderContactSheet, renderTiles } from "../src/unreal/contact-sheet.js";
+import type { ThumbnailSourceRadiance } from "../src/unreal/thumbnail-lighting.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
 async function scratch(): Promise<string> {
@@ -108,6 +110,71 @@ async function meanColor(
   const n = data.length / info.channels;
   return [sum[0]! / n, sum[1]! / n, sum[2]! / n];
 }
+
+const SOURCE = {
+  reference: "synthetic/hdr-band",
+  engine: "synthetic",
+  bytesSha256: "c".repeat(64),
+  layout: "ue-source-longlat-rgb-f32" as const,
+  radianceDecode: "ue5.8-rgbe" as const,
+};
+const RADIANCE = { width: 64, height: 32 };
+
+/** Synthetic longlat radiance, never a real asset: a dim sky with a full-width HDR band over rows [from, to). */
+function syntheticSky(from: number, to: number, value = 12): Float32Array {
+  const rgb = new Float32Array(RADIANCE.width * RADIANCE.height * 3);
+  for (let row = 0; row < RADIANCE.height; row++) {
+    const band = row >= from && row < to ? [value, value * 0.8, value * 0.6] : [0.4, 0.5, 0.7];
+    for (let column = 0; column < RADIANCE.width; column++) rgb.set(band, (row * RADIANCE.width + column) * 3);
+  }
+  return rgb;
+}
+
+function radianceDigest(rgb: Float32Array): string {
+  return createHash("sha256").update(Buffer.from(rgb.buffer, rgb.byteOffset, rgb.byteLength)).digest("hex");
+}
+
+/** Mean Rec.709 luma of a decoded RGBA tile, 0..255. */
+function meanLuma(tile: { readonly data: Uint8Array }): number {
+  let sum = 0;
+  for (let i = 0; i < tile.data.length; i += 4) sum += 0.2126 * tile.data[i]! + 0.7152 * tile.data[i + 1]! + 0.0722 * tile.data[i + 2]!;
+  return sum / (tile.data.length / 4);
+}
+
+/** Mean absolute RGB difference of two decoded RGBA tiles, 0..255. */
+function meanAbsDiff(a: { readonly data: Uint8Array }, b: { readonly data: Uint8Array }): number {
+  let sum = 0;
+  for (let i = 0; i < a.data.length; i += 4) for (let c = 0; c < 3; c++) sum += Math.abs(a.data[i + c]! - b.data[i + c]!);
+  return sum / ((a.data.length / 4) * 3);
+}
+
+describe("unreal source environment refusal", () => {
+  const valid = () => ({ width: RADIANCE.width, height: RADIANCE.height, rgb: syntheticSky(0, 4), source: SOURCE });
+  const refusals: [string, () => unknown, RegExp][] = [
+    ["a float short of width*height*3", () => ({ ...valid(), rgb: valid().rgb.subarray(1) }), /exactly width\*height\*3/],
+    ["a zero width", () => ({ ...valid(), width: 0 }), /positive whole dimensions/],
+    ["a fractional height", () => ({ ...valid(), height: 16.5 }), /positive whole dimensions/],
+    ["a plain array instead of a Float32Array", () => ({ ...valid(), rgb: Array.from(valid().rgb) }), /must be a Float32Array/],
+    ["a NaN", () => { const input = valid(); input.rgb[7] = Number.NaN; return input; }, /radiance must be finite/],
+    ["an infinite value", () => { const input = valid(); input.rgb[7] = Number.POSITIVE_INFINITY; return input; }, /radiance must be finite/],
+    ["a negative value", () => { const input = valid(); input.rgb[7] = -0.5; return input; }, /radiance must be finite and nonnegative/],
+    ["an unknown layout", () => ({ ...valid(), source: { ...SOURCE, layout: "equirect-png" } }), /explicit UE source longlat layout/],
+    ["an unknown radiance decode", () => ({ ...valid(), source: { ...SOURCE, radianceDecode: "srgb" } }), /explicit UE source longlat layout/],
+    ["a malformed SHA-256", () => ({ ...valid(), source: { ...SOURCE, bytesSha256: "not-a-digest" } }), /SHA-256 provenance/],
+    ["a Float64Array with the byte count of width*height*3 float32 values", () => ({ ...valid(), width: 2, height: 1, rgb: new Float64Array([2, 3, 4]) }), /must be a Float32Array/],
+    ["a Uint8Array with the byte count of width*height*3 float32 values", () => ({ ...valid(), width: 2, height: 1, rgb: new Uint8Array(24) }), /must be a Float32Array/],
+    ["a non-string reference", () => ({ ...valid(), source: { ...SOURCE, reference: ["/Engine/Test"] } }), /explicit UE source longlat layout/],
+  ];
+
+  it.each(refusals)("refuses %s with the validation error and writes no sheet", async (_label, make, message) => {
+    const dir = await scratch();
+    const out = join(dir, "sheet.jpg");
+    const sourceEnvironment = make() as ThumbnailSourceRadiance;
+    await expect(renderTiles({ glbPaths: [], sourceEnvironment })).rejects.toThrow(message);
+    await expect(renderContactSheet({ glbPaths: [], outPath: out, title: "Refused", sourceEnvironment })).rejects.toThrow(message);
+    await expect(stat(out)).rejects.toThrow();
+  });
+});
 
 describeWithTools(["chromium"], "unreal contact sheet", () => {
   it("renders a gallery panel and a grid of tiles, with a red cube predominantly red", async () => {
@@ -325,5 +392,136 @@ describeWithTools(["chromium"], "contact sheet reference shadow", () => {
     const tile = result.judge[0]!;
     expect(tile.similarity).toBeGreaterThan(0.5);
     expect(tile.reasons.join(" ")).not.toContain("colour similarity");
+  });
+});
+
+describeWithTools(["chromium"], "unreal source environment", () => {
+  it("lights the unreal-like picture from supplied HDR radiance, oriented with its first row as zenith and unclamped", async () => {
+    const dir = await scratch();
+    const cube = join(dir, "SM_Cube.glb");
+    await writeCube(cube, [0.8, 0.8, 0.8]);
+    const zenith = syntheticSky(0, 4);
+    const render = (rgb: Float32Array) =>
+      renderTiles({ glbPaths: [cube], tile: 128, lighting: "unreal-like", sourceEnvironment: { ...RADIANCE, rgb, source: SOURCE } });
+
+    const hemisphere = await renderTiles({ glbPaths: [cube], tile: 128, lighting: "unreal-like" });
+    const up = await render(zenith);
+    const down = await render(syntheticSky(RADIANCE.height - 4, RADIANCE.height));
+    const clamped = await render(Float32Array.from(zenith, (value) => Math.min(value, 1)));
+
+    // Absent option: the hemisphere picture carries no source report.
+    expect(Object.keys(hemisphere).sort()).toEqual(["png", "rendered", "tiles"]);
+    expect(up.sourceEnvironment).toEqual({
+      source: SOURCE,
+      width: RADIANCE.width,
+      height: RADIANCE.height,
+      radianceSha256: radianceDigest(zenith),
+      rotationY: Math.PI / 2,
+      intensity: 1.69,
+      limitations: expect.arrayContaining([expect.stringMatching(/PMREM/)]),
+    });
+    // Orientation: a zenith band lights the visible top faces; the same band at the nadir does not.
+    expect(meanLuma(up.tiles[0]!)).toBeGreaterThan(meanLuma(down.tiles[0]!) + 2);
+    // HDR: the 12.0 band must out-shine the same band clamped to 1.0.
+    expect(meanLuma(up.tiles[0]!)).toBeGreaterThan(meanLuma(clamped.tiles[0]!) + 2);
+    // The supplied environment is what changes the picture relative to the hemisphere fill.
+    expect(meanAbsDiff(up.tiles[0]!, hemisphere.tiles[0]!)).toBeGreaterThan(2);
+  });
+
+  it("leaves the neutral picture and its judge byte-identical whether or not an environment is supplied", async () => {
+    const dir = await scratch();
+    const red = join(dir, "SM_Red.glb");
+    await writeCube(red, [1, 0, 0]);
+    const sourceEnvironment = { ...RADIANCE, rgb: syntheticSky(0, 4), source: SOURCE };
+
+    const plain = await renderTiles({ glbPaths: [red], tile: 128 });
+    const supplied = await renderTiles({ glbPaths: [red], tile: 128, sourceEnvironment });
+    expect(supplied.png.equals(plain.png)).toBe(true);
+    expect(supplied.sourceEnvironment).toBeUndefined();
+
+    const plainSheet = await renderContactSheet({ glbPaths: [red], outPath: join(dir, "plain.jpg"), title: "Neutral", tile: 128 });
+    const suppliedSheet = await renderContactSheet({
+      glbPaths: [red],
+      outPath: join(dir, "supplied.jpg"),
+      title: "Neutral",
+      tile: 128,
+      sourceEnvironment,
+    });
+    expect(suppliedSheet.judge).toEqual(plainSheet.judge);
+    expect(suppliedSheet.sourceEnvironment).toBeUndefined();
+    expect((await readFile(join(dir, "supplied.jpg"))).equals(await readFile(join(dir, "plain.jpg")))).toBe(true);
+  });
+
+  it("keeps the lit sheet's judge on the neutral render and reports the environment only when it lit the picture", async () => {
+    const dir = await scratch();
+    const cube = join(dir, "SM_Cube.glb");
+    await writeCube(cube, [0.8, 0.8, 0.8]);
+    const sourceEnvironment = { ...RADIANCE, rgb: syntheticSky(0, 4), source: SOURCE };
+
+    const plain = await renderContactSheet({
+      glbPaths: [cube],
+      outPath: join(dir, "plain.jpg"),
+      title: "Lit",
+      tile: 128,
+      pictureLighting: "unreal-like",
+    });
+    const lit = await renderContactSheet({
+      glbPaths: [cube],
+      outPath: join(dir, "lit.jpg"),
+      title: "Lit",
+      tile: 128,
+      pictureLighting: "unreal-like",
+      sourceEnvironment,
+    });
+    expect(plain.sourceEnvironment).toBeUndefined();
+    expect(lit.judge).toEqual(plain.judge);
+    expect(lit.sourceEnvironment).toMatchObject({
+      source: SOURCE,
+      width: RADIANCE.width,
+      height: RADIANCE.height,
+      radianceSha256: radianceDigest(sourceEnvironment.rgb),
+      rotationY: Math.PI / 2,
+      intensity: 1.69,
+    });
+    expect((await readFile(join(dir, "lit.jpg"))).equals(await readFile(join(dir, "plain.jpg")))).toBe(false);
+  });
+
+  it("snapshots the radiance before the browser starts, so editing the caller's array afterwards cannot change the render", async () => {
+    const dir = await scratch();
+    const cube = join(dir, "SM_Cube.glb");
+    await writeCube(cube, [0.8, 0.8, 0.8]);
+    const rgb = syntheticSky(0, 4);
+    const digest = radianceDigest(rgb);
+
+    const pending = renderTiles({
+      glbPaths: [cube],
+      tile: 128,
+      lighting: "unreal-like",
+      sourceEnvironment: { ...RADIANCE, rgb, source: SOURCE },
+    });
+    rgb.fill(0);
+    expect((await pending).sourceEnvironment?.radianceSha256).toBe(digest);
+  });
+
+  it("reports only the declared source fields, so an extra key holding an array never reaches the public report", async () => {
+    const dir = await scratch();
+    const cube = join(dir, "SM_Cube.glb");
+    await writeCube(cube, [0.8, 0.8, 0.8]);
+    // An extra key carrying radiance by another name: the report must not copy it.
+    const source = { ...SOURCE, extraRadiance: Float32Array.from([12, 13, 14]) };
+    const sourceEnvironment = { ...RADIANCE, rgb: syntheticSky(0, 4), source };
+
+    const tiles = await renderTiles({ glbPaths: [cube], tile: 128, lighting: "unreal-like", sourceEnvironment });
+    expect(tiles.sourceEnvironment?.source).toEqual(SOURCE);
+
+    const sheet = await renderContactSheet({
+      glbPaths: [cube],
+      outPath: join(dir, "lit.jpg"),
+      title: "Declared",
+      tile: 128,
+      pictureLighting: "unreal-like",
+      sourceEnvironment,
+    });
+    expect(sheet.sourceEnvironment?.source).toEqual(SOURCE);
   });
 });

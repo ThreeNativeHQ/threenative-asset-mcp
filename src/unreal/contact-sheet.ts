@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createServer, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -10,7 +11,13 @@ import { createBrowserTempDir } from "../browser-temp.js";
 import { measureFidelity, withoutFloorShadow, type FidelityMetrics } from "./render-fidelity.js";
 import { colourSimilarity, decodeRgba, maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 import { judgeRender, type JudgeStats, type Verdict } from "./visual-judge.js";
-import { applyThumbnailReferenceLighting } from "./thumbnail-lighting.js";
+import {
+  applyThumbnailReferenceLighting,
+  assertThumbnailSourceRadiance,
+  prepareThumbnailSourceEnvironment,
+  type ThumbnailEnvironmentSource,
+  type ThumbnailSourceRadiance,
+} from "./thumbnail-lighting.js";
 import { createThumbnailReferenceFloor } from "./thumbnail-floor.js";
 
 const require = createRequire(import.meta.url);
@@ -32,6 +39,23 @@ const PANEL = { r: 30, g: 31, b: 36 };
 export type PictureLighting = "neutral" | "unreal-like";
 /** The fixed camera every render pass shares (so a change of lighting is the only difference between passes). */
 export const PICTURE_CAMERA = Object.freeze({ fov: 40, direction: [1, 0.75, 1.2] as const, fit: 1.05 });
+
+/**
+ * Source metadata of the environment that actually lit a picture, with a digest of the radiance it was given. The
+ * radiance itself is never reported. Provenance is the caller's claim, not verified here.
+ */
+export interface SourceEnvironmentReport {
+  readonly source: ThumbnailEnvironmentSource;
+  readonly width: number;
+  readonly height: number;
+  /** SHA-256 of the decoded radiance as supplied (float32 bytes, before orientation or intensity). */
+  readonly radianceSha256: string;
+  /** Orientation and intensity the browser applied (`prepareThumbnailSourceEnvironment`). */
+  readonly rotationY: number;
+  readonly intensity: number;
+  /** The approximations the browser applied, stated as the helper states them (PMREM and radiometry are not exact UE). */
+  readonly limitations: readonly string[];
+}
 
 export interface ContactSheetOptions {
   /** One imported GLB per entry; the file name (without `.glb`) is the tile label. */
@@ -64,7 +88,8 @@ export interface ContactSheetOptions {
   /**
    * Lighting of the sheet's picture only. `neutral` (default) keeps every existing caller and golden unchanged.
    * `unreal-like` adds a supersampled picture with three UE 4.19.2 reference lights plus approximate hemisphere fill
-   * (authored cubemap absent), and source floor math with a procedural Grid approximation; the judge's metrics stay on the neutral render.
+   * (authored cubemap absent, or the supplied `sourceEnvironment` in its place), and source floor math with a procedural
+   * Grid approximation; the judge's metrics stay on the neutral render.
    */
   pictureLighting?: PictureLighting;
   /**
@@ -72,6 +97,12 @@ export interface ContactSheetOptions {
    * pass but fails the lit pass is reported instead of silently drawn blank. Never set in production.
    */
   litFailureProbe?: readonly number[];
+  /**
+   * Caller-supplied decoded linear HDR radiance that lights the `unreal-like` picture in place of the hemisphere fill.
+   * Never fetched or guessed here. It is refused before any file is read or browser starts when malformed, and it is
+   * ignored under `neutral` lighting, so the neutral sheet and judge stay byte-identical.
+   */
+  sourceEnvironment?: ThumbnailSourceRadiance;
 }
 
 export interface TileJudgement {
@@ -106,6 +137,8 @@ export interface ContactSheetResult {
   judgeSummary: { ok: number; suspect: number; fail: number };
   /** Pieces drawn with an Unreal thumbnail beside them. */
   thumbnailsShown: number;
+  /** Present only when a supplied source environment lit the picture. */
+  sourceEnvironment?: SourceEnvironmentReport;
 }
 
 interface Candidate {
@@ -190,6 +223,57 @@ function serve(response: ServerResponse, bytes: Uint8Array, type: string): void 
   response.end(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
 }
 
+/** Served from one fixed path on a render's ephemeral localhost server; the radiance never appears in the page. */
+const ENVIRONMENT_RADIANCE_PATH = "/environment/radiance.f32";
+
+/** A validated private copy of a caller's radiance: the only form the browser is ever given. */
+interface SourceEnvironmentSnapshot {
+  readonly width: number;
+  readonly height: number;
+  readonly rgb: Float32Array;
+  readonly source: ThumbnailEnvironmentSource;
+  readonly radianceSha256: string;
+}
+
+/** What the browser reports after `prepareThumbnailSourceEnvironment` ran on the snapshot. */
+interface AppliedSourceEnvironment {
+  readonly rotationY: number;
+  readonly intensity: number;
+  readonly limitations: readonly string[];
+}
+
+/**
+ * Refuses a bad environment before any browser starts. It copies first and validates the copy, so the bytes served and
+ * digested are exactly the bytes that passed. Only the declared source fields are copied, by value: a spread would carry
+ * any extra key (an array, say) into the report and the page. Synchronous: callers take the snapshot before their first await.
+ */
+function snapshotSourceEnvironment(input: ThumbnailSourceRadiance): SourceEnvironmentSnapshot {
+  if (!(input.rgb instanceof Float32Array)) throw new Error("source environment radiance must be a Float32Array");
+  // A missing source reads as undefined fields, so the provenance validation (not a TypeError) refuses it.
+  const { reference, engine, bytesSha256, layout, radianceDecode } = (input.source ?? {}) as Partial<ThumbnailEnvironmentSource>;
+  const snapshot = {
+    width: input.width,
+    height: input.height,
+    rgb: new Float32Array(input.rgb),
+    source: Object.freeze({ reference, engine, bytesSha256, layout, radianceDecode }) as ThumbnailEnvironmentSource,
+  };
+  assertThumbnailSourceRadiance(snapshot);
+  const bytes = new Uint8Array(snapshot.rgb.buffer, snapshot.rgb.byteOffset, snapshot.rgb.byteLength);
+  return { ...snapshot, radianceSha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
+function describeSourceEnvironment(snapshot: SourceEnvironmentSnapshot, applied: AppliedSourceEnvironment): SourceEnvironmentReport {
+  return {
+    source: { ...snapshot.source },
+    width: snapshot.width,
+    height: snapshot.height,
+    radianceSha256: snapshot.radianceSha256,
+    rotationY: applied.rotationY,
+    intensity: applied.intensity,
+    limitations: [...applied.limitations],
+  };
+}
+
 function pageHtml(
   tileSize: number,
   count: number,
@@ -199,8 +283,20 @@ function pageHtml(
   lighting: PictureLighting,
   shadows: boolean,
   litFailureProbe: readonly number[],
+  environment: SourceEnvironmentSnapshot | undefined,
 ): string {
-  const payload = JSON.stringify({ tile: tileSize, count, columns, rows, ss: supersample, lighting, shadows, litFailureProbe });
+  // Only dimensions and provenance are serialized; `<` is escaped so caller-supplied strings cannot close the script.
+  const payload = JSON.stringify({
+    tile: tileSize,
+    count,
+    columns,
+    rows,
+    ss: supersample,
+    lighting,
+    shadows,
+    litFailureProbe,
+    environment: environment === undefined ? null : { width: environment.width, height: environment.height, source: environment.source },
+  }).replace(/</g, "\\u003c");
   return `<!doctype html><html><body>
 <script type="importmap">{"imports":{"three":"/three.module.js","three/addons/":"/jsm/"}}</script>
 <script type="module">
@@ -213,6 +309,8 @@ const lit = options.lighting === 'unreal-like';
 const shadows = options.shadows !== false;
 const applyThumbnailReferenceLighting = ${applyThumbnailReferenceLighting.toString()};
 const createThumbnailReferenceFloor = ${createThumbnailReferenceFloor.toString()};
+const assertThumbnailSourceRadiance = ${assertThumbnailSourceRadiance.toString()};
+const prepareThumbnailSourceEnvironment = ${prepareThumbnailSourceEnvironment.toString()};
 try {
   const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
   // UE4.19 thumbnail defaults enable filmic at exposure 1; Three ACES is an approximation, confined to the picture pass.
@@ -227,9 +325,15 @@ try {
   let referenceRig;
   let referenceFloor;
   let groundMaterial;
+  let sourceEnvironment;
   if (lit) {
-    // Source reference directions/intensities + old approximate hemisphere, not the authored UE cubemap.
-    referenceRig = applyThumbnailReferenceLighting(THREE, scene, { shadows });
+    // Source reference directions/intensities; the old approximate hemisphere stands in unless a source environment is supplied.
+    if (options.environment) {
+      const response = await fetch('${ENVIRONMENT_RADIANCE_PATH}');
+      if (!response.ok) throw new Error('source environment fetch failed: ' + response.status);
+      sourceEnvironment = prepareThumbnailSourceEnvironment(THREE, { ...options.environment, rgb: new Float32Array(await response.arrayBuffer()) });
+    }
+    referenceRig = applyThumbnailReferenceLighting(THREE, scene, { shadows, sourceEnvironment });
     key = referenceRig.primary;
     if (shadows) {
       renderer.shadowMap.enabled = true;
@@ -310,7 +414,11 @@ try {
     }
   }
   if (referenceFloor) referenceFloor.dispose();
-  window.__result = { ok: true, tiles, dataUrl: sheet.toDataURL('image/png') };
+  if (sourceEnvironment) { scene.environment = null; sourceEnvironment.texture.dispose(); }
+  window.__result = {
+    ok: true, tiles, dataUrl: sheet.toDataURL('image/png'),
+    ...(sourceEnvironment ? { environment: { rotationY: sourceEnvironment.rotationY, intensity: sourceEnvironment.intensity, limitations: sourceEnvironment.limitations } } : {}),
+  };
 } catch (error) {
   window.__result = { ok: false, error: String(error) };
 }
@@ -328,6 +436,8 @@ function clip(text: string, max: number): string {
 interface RenderedGrid {
   png: Buffer;
   rendered: boolean[];
+  /** Present only when the lit pass was given a source environment and applied it. */
+  environment?: AppliedSourceEnvironment;
 }
 
 async function renderGrid(
@@ -344,8 +454,10 @@ async function renderGrid(
   shadows = true,
   /** Deterministic test seam; tile indices the lit pass must fail. */
   litFailureProbe: readonly number[] = [],
+  /** Validated radiance for the lit pass only; served from one fixed path, never embedded in the page. */
+  environment?: SourceEnvironmentSnapshot,
 ): Promise<RenderedGrid> {
-  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample, lighting, shadows, litFailureProbe), "utf8");
+  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample, lighting, shadows, litFailureProbe, environment), "utf8");
   const server = createServer((request, response) => {
     const url = (request.url ?? "/").split("?")[0]!;
     const glb = /^\/glb\/(\d+)\.glb$/.exec(url);
@@ -358,7 +470,9 @@ async function renderGrid(
         },
       );
     if (url === "/" || url === "/index.html") serve(response, html, "text/html");
-    else if (glb && selected[Number(glb[1])]) {
+    else if (environment !== undefined && url === ENVIRONMENT_RADIANCE_PATH) {
+      serve(response, new Uint8Array(environment.rgb.buffer, environment.rgb.byteOffset, environment.rgb.byteLength), "application/octet-stream");
+    } else if (glb && selected[Number(glb[1])]) {
       void send(readFile(selected[Number(glb[1])]!.path), "model/gltf-binary");
     } else if (url.startsWith("/jsm/")) {
       void send(
@@ -401,13 +515,17 @@ async function renderGrid(
     );
     const raw = (await page.evaluate(
       () => (window as unknown as { __result: unknown }).__result,
-    )) as { ok: boolean; error?: string; tiles?: { ok: boolean }[]; dataUrl?: string };
+    )) as { ok: boolean; error?: string; tiles?: { ok: boolean }[]; dataUrl?: string; environment?: AppliedSourceEnvironment };
     if (!raw.ok || raw.dataUrl === undefined) {
       throw new Error(`contact sheet render failed: ${raw.error ?? pageErrors.join("; ")}`);
+    }
+    if (environment !== undefined && raw.environment === undefined) {
+      throw new Error("contact sheet render did not apply the source environment");
     }
     return {
       png: Buffer.from(raw.dataUrl.split(",")[1] ?? "", "base64"),
       rendered: (raw.tiles ?? []).map((entry) => entry.ok),
+      ...(raw.environment !== undefined ? { environment: raw.environment } : {}),
     };
   } finally {
     await browser?.close().catch(() => undefined);
@@ -423,6 +541,8 @@ export interface RenderedTiles {
   tiles: RgbaImage[];
   /** Whether each input rendered a model. */
   rendered: boolean[];
+  /** Present only when a supplied source environment lit these tiles. */
+  sourceEnvironment?: SourceEnvironmentReport;
 }
 
 /**
@@ -442,6 +562,8 @@ export async function renderTiles(options: {
   readonly lighting?: PictureLighting;
   /** Default true; with `unreal-like`, false keeps the fill, key and ground but drops the cast shadow (a control). */
   readonly shadows?: boolean;
+  /** Lights the `unreal-like` tiles in place of the hemisphere fill; see `ContactSheetOptions.sourceEnvironment`. */
+  readonly sourceEnvironment?: ThumbnailSourceRadiance;
 }): Promise<RenderedTiles> {
   const tile = Math.max(16, Math.round(options.tile ?? 160));
   const paths = options.glbPaths;
@@ -453,12 +575,29 @@ export async function renderTiles(options: {
     score: 0,
     failed: false,
   }));
-  const grid = await renderGrid(candidates, tile, columns, rows, options.timeoutMs ?? 180_000, options.supersample ?? 1, options.lighting ?? "neutral", options.shadows ?? true);
+  // Taken before the browser starts; only the unreal-like tiles are lit by it.
+  const environment = options.sourceEnvironment === undefined ? undefined : snapshotSourceEnvironment(options.sourceEnvironment);
+  const lighting = options.lighting ?? "neutral";
+  const grid = await renderGrid(
+    candidates,
+    tile,
+    columns,
+    rows,
+    options.timeoutMs ?? 180_000,
+    options.supersample ?? 1,
+    lighting,
+    options.shadows ?? true,
+    [],
+    lighting === "unreal-like" ? environment : undefined,
+  );
   const decoded = await decodeRgba(grid.png);
   return {
     png: grid.png,
     rendered: grid.rendered,
     tiles: paths.map((_, index) => cutTile(decoded, tile, index % columns, Math.floor(index / columns))),
+    ...(environment !== undefined && grid.environment !== undefined
+      ? { sourceEnvironment: describeSourceEnvironment(environment, grid.environment) }
+      : {}),
   };
 }
 
@@ -503,6 +642,8 @@ export async function renderContactSheet(
   const meshesTotal = options.glbPaths.length;
   const withThumbnails = options.thumbnails !== undefined;
   const pictureLighting = options.pictureLighting ?? "neutral";
+  // Taken before any file is read or browser starts; only the unreal-like picture is lit by it.
+  const environment = options.sourceEnvironment === undefined ? undefined : snapshotSourceEnvironment(options.sourceEnvironment);
 
   const all: Candidate[] = await Promise.all(
     options.glbPaths.map(async (path) => {
@@ -533,6 +674,7 @@ export async function renderContactSheet(
   let gridPng: Buffer | undefined;
   let shapeGridPng: Buffer | undefined;
   let pictureLightPng: Buffer | undefined;
+  let pictureEnvironment: AppliedSourceEnvironment | undefined;
   const loadable = selected.filter((c) => !c.failed);
   if (loadable.length > 0) {
     // Failed candidates are not sent to the browser; keep their cells blank in place.
@@ -548,8 +690,9 @@ export async function renderContactSheet(
     }
     // The lit picture is a separate supersampled pass; it never replaces the neutral pixels the judge measures.
     if (pictureLighting === "unreal-like") {
-      const picture = await renderGrid(cells, tile, columns, rows, timeoutMs, SHAPE_SUPERSAMPLE, "unreal-like", true, options.litFailureProbe ?? []);
+      const picture = await renderGrid(cells, tile, columns, rows, timeoutMs, SHAPE_SUPERSAMPLE, "unreal-like", true, options.litFailureProbe ?? [], environment);
       pictureLightPng = picture.png;
+      pictureEnvironment = picture.environment;
       // A tile the neutral pass rendered but the lit pass dropped would otherwise be drawn blank while the neutral
       // counts and judge still call it a success. Never substitute the neutral pixels: name the tile and fail.
       const dropped = selected
@@ -674,9 +817,12 @@ export async function renderContactSheet(
     }
   }
 
+  // The "no authored cubemap" caption is only true while the hemisphere fill stands in for the environment.
+  const applied = environment !== undefined && pictureEnvironment !== undefined ? describeSourceEnvironment(environment, pictureEnvironment) : undefined;
+  const lightingNote = applied === undefined ? "approximate hemisphere; no authored cubemap" : "supplied source environment (PMREM approximation)";
   const afterImportLine =
     pictureLighting === "unreal-like"
-      ? "AFTER IMPORT: UE4.19.2 lights + approximate hemisphere; no authored cubemap."
+      ? `AFTER IMPORT: UE4.19.2 lights + ${lightingNote}.`
       : "Each tile: ORIGINAL = Unreal editor thumbnail of that asset | AFTER IMPORT = our GLB, neutral light.";
   const scoreLine =
     pictureLighting === "unreal-like"
@@ -779,7 +925,7 @@ export async function renderContactSheet(
   if (!withThumbnails && pictureLighting === "unreal-like") {
     const noteWidth = Math.floor(width / 6.6);
     svg.push(
-      text(10, bottom + 108, 12, "#9a9aaa", clip("UE4.19.2 lights + approximate hemisphere; no authored cubemap.", noteWidth)),
+      text(10, bottom + 108, 12, "#9a9aaa", clip(`UE4.19.2 lights + ${lightingNote}.`, noteWidth)),
       text(10, bottom + 124, 12, "#9a9aaa", clip("Current camera; editor/config unknown; primary-only PCF. Scores: neutral.", noteWidth)),
     );
   }
@@ -837,5 +983,6 @@ export async function renderContactSheet(
     judge,
     judgeSummary,
     thumbnailsShown: thumbnailTiles.filter((t) => t !== undefined).length,
+    ...(applied !== undefined ? { sourceEnvironment: applied } : {}),
   };
 }

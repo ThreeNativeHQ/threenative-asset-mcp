@@ -9,6 +9,35 @@ export interface ThumbnailEnvironmentSource {
   readonly radianceDecode: "ue4.19-rgbe" | "ue5.8-rgbe";
 }
 
+/** Decoded linear HDR radiance in the source longlat layout: `width * height` RGB float triples, row-major, top row (zenith) first. */
+export interface ThumbnailSourceRadiance {
+  readonly width: number;
+  readonly height: number;
+  readonly rgb: Float32Array;
+  readonly source: ThumbnailEnvironmentSource;
+}
+
+/**
+ * Refuses anything that is not exactly the declared radiance: a Float32Array (a Float64Array or Uint8Array of the same byte
+ * count holds other numbers), positive whole dimensions, exactly width*height*3 elements, finite nonnegative values, and
+ * explicit layout, decode, reference, engine and SHA-256 provenance (string fields only). Values are never clamped.
+ * Self-contained, so the contact-sheet browser runs it inside `prepareThumbnailSourceEnvironment`.
+ */
+export function assertThumbnailSourceRadiance(input: ThumbnailSourceRadiance): void {
+  const { width, height, rgb, source } = input;
+  if (!(rgb instanceof Float32Array)) throw new Error("source environment radiance must be a Float32Array");
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 || rgb.length !== width * height * 3) {
+    throw new Error("source environment needs positive whole dimensions and exactly width*height*3 float values");
+  }
+  if (source.layout !== "ue-source-longlat-rgb-f32" || !["ue4.19-rgbe", "ue5.8-rgbe"].includes(source.radianceDecode) || typeof source.reference !== "string" || !source.reference || typeof source.engine !== "string" || !source.engine || typeof source.bytesSha256 !== "string" || !/^[a-f0-9]{64}$/i.test(source.bytesSha256)) {
+    throw new Error("source environment needs explicit UE source longlat layout, radiance decode, reference, engine and SHA-256 provenance");
+  }
+  for (let index = 0; index < rgb.length; index++) {
+    const value = rgb[index]!;
+    if (!Number.isFinite(value) || value < 0) throw new Error("source environment radiance must be finite and nonnegative");
+  }
+}
+
 export interface PreparedThumbnailSourceEnvironment {
   readonly texture: Three.DataTexture;
   readonly source: ThumbnailEnvironmentSource;
@@ -29,22 +58,13 @@ export interface PreparedThumbnailSourceEnvironment {
  */
 export function prepareThumbnailSourceEnvironment(
   THREE: typeof Three,
-  input: { readonly width: number; readonly height: number; readonly rgb: Float32Array; readonly source: ThumbnailEnvironmentSource },
+  input: ThumbnailSourceRadiance,
 ): PreparedThumbnailSourceEnvironment {
   const { width, height, rgb, source } = input;
-  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 || rgb.length !== width * height * 3) {
-    throw new Error("source environment needs positive whole dimensions and exactly width*height*3 float values");
-  }
-  if (source.layout !== "ue-source-longlat-rgb-f32" || !["ue4.19-rgbe", "ue5.8-rgbe"].includes(source.radianceDecode) || !source.reference || !source.engine || !/^[a-f0-9]{64}$/i.test(source.bytesSha256)) {
-    throw new Error("source environment needs explicit UE source longlat layout, radiance decode, reference, engine and SHA-256 provenance");
-  }
+  assertThumbnailSourceRadiance(input);
   const rgba = new Float32Array(width * height * 4);
   for (let pixel = 0; pixel < width * height; pixel++) {
-    for (let channel = 0; channel < 3; channel++) {
-      const value = rgb[pixel * 3 + channel]!;
-      if (!Number.isFinite(value) || value < 0) throw new Error("source environment radiance must be finite and nonnegative");
-      rgba[pixel * 4 + channel] = value;
-    }
+    for (let channel = 0; channel < 3; channel++) rgba[pixel * 4 + channel] = rgb[pixel * 3 + channel]!;
     rgba[pixel * 4 + 3] = 1;
   }
   const texture = new THREE.DataTexture(rgba, width, height, THREE.RGBAFormat, THREE.FloatType);
@@ -54,7 +74,8 @@ export function prepareThumbnailSourceEnvironment(
   texture.needsUpdate = true;
   return {
     texture,
-    source: { ...source },
+    // Only the declared fields: a spread would carry any extra key the caller attached (an array, say) into the prepared source.
+    source: { reference: source.reference, engine: source.engine, bytesSha256: source.bytesSha256, layout: source.layout, radianceDecode: source.radianceDecode },
     rotationY: Math.PI / 2,
     intensity: 1.69,
     limitations: [
