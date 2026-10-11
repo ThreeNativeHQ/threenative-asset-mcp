@@ -48,6 +48,25 @@ describeWithTools(["modern-converter"], "RGBA16F SourceArt read from a pinned UT
     });
   });
 
+  it("accepts an absent CompressionFormat as uncompressed: UE 4.19's Source has no such field", async () => {
+    const outcome = await producer.extractTexture({ source: { compression: null }, sourceArt: { payload } });
+    expect(outcome).toEqual({
+      ok: true,
+      format: "TSF_RGBA16F",
+      sizeX: 3,
+      sizeY: 2,
+      numSlices: 1,
+      numMips: 1,
+      pngCompressed: false,
+      compression: null,
+      srgb: false,
+      elementCount: 48,
+      payload: payload.toString("base64"),
+      width: 3,
+      height: 2,
+    });
+  });
+
   it("refuses a texture with no typed Source struct", async () => {
     const outcome = await producer.extractTexture({ sourceArt: { payload } });
     expect(outcome).toEqual({ ok: false, reason: "the texture has no typed Source struct" });
@@ -81,6 +100,10 @@ describeWithTools(["modern-converter"], "RGBA16F SourceArt read from a pinned UT
     ["a source with two mips", { source: { numMips: 2 } }, /holds 2 mips/],
     ["an sRGB texture", { source: {}, srgb: true }, /sRGB/],
     ["a zero width", { source: { sizeX: 0 } }, /dimensions 0x2/],
+    ["a literal None compression name", { source: { compression: "None" } }, /compression None/],
+    ["an unknown compression name", { source: { compression: "TSCF_Mystery" } }, /compression TSCF_Mystery/],
+    ["a CompressionFormat of another property type", { source: { compression: { integer: 0 } } }, /CompressionFormat is present but not an enum name/],
+    ["a PNG-compressed source with no CompressionFormat", { source: { compression: null, pngCompressed: true } }, /PNG-compressed/],
   ])("refuses %s", async (_label, change, reason) => {
     const outcome = await producer.extractTexture({ ...change, sourceArt: { payload } });
     expect(outcome).toMatchObject({ ok: false, reason: expect.stringMatching(reason) });

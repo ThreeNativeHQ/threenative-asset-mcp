@@ -466,11 +466,13 @@ if (exactAt >= 0)
     exactFile = EngineContent.ExactSource(exactKey)
         ?? throw new ArgumentException($"--exact-reference names no engine source: {args[exactAt + 1]}");
 }
-// Data-texture mode: one Texture2D of one package, named by its exact key under the root (the key without .uasset). It writes
-// the stored RGBA16F source bytes beside a manifest, and refuses any source it cannot reproduce exactly.
+// Data-texture mode: one Texture2D of one package, named by its root-relative selector (the package path without .uasset). The
+// selector is mapped onto the provider key of the one loose file at that exact path. It writes the stored RGBA16F source bytes
+// beside a manifest, and refuses any source it cannot reproduce exactly.
 var dataTextureAt = Array.IndexOf(args, "--data-texture");
 string? dataTextureSelector = null;
 string? dataTextureKey = null;
+Rgba16fPackage? dataTexturePackage = null;
 if (dataTextureAt >= 0)
 {
     if (exactAt >= 0 || filterAt >= 0) throw new ArgumentException("--data-texture cannot be combined with --filter or --exact-reference");
@@ -495,8 +497,8 @@ var requestedLods = lodsAt >= 0
 if (requestedLods.Length == 0) throw new ArgumentException("--lods needs at least one LOD index");
 bool MatchesFilter(string key)
 {
-    // Data-texture mode names one package by its exact key, case and separators included.
-    if (dataTextureKey is not null) return string.Equals(key, dataTextureKey, StringComparison.Ordinal);
+    // Data-texture mode names one package: the provider key its selector maps to, case and separators included.
+    if (dataTexturePackage is not null) return string.Equals(key, dataTexturePackage.Key, StringComparison.Ordinal);
     // Exact mode names one package by its key under the root: no suffix or basename can select another package.
     if (exactPackage is not null) return string.Equals(key, exactPackage, StringComparison.OrdinalIgnoreCase);
     if (filter is null) return true;
@@ -562,8 +564,7 @@ if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
-if (dataTextureKey is not null && !provider.Files.Keys.Any(candidate => string.Equals(candidate, dataTextureKey, StringComparison.Ordinal)))
-    throw RefuseRgba16fDataTexture(Path.GetFileName(dataTextureSelector!), $"no package has exactly the key {dataTextureSelector}.uasset under the source root");
+if (dataTextureKey is not null) dataTexturePackage = ResolveRgba16fPackage(provider, root, dataTextureSelector!);
 if (dumpAt >= 0)
 {
     var dumpPath = Path.GetFullPath(args[dumpAt + 1]);
@@ -2635,7 +2636,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
     // cannot encode the format, so the importer asks for this path after their failure instead.
     if (dataTextureKey is not null)
     {
-        ExportRgba16fDataTexture(package, provider, key, output, dataTextureSelector!);
+        ExportRgba16fDataTexture(package, provider, dataTexturePackage!, output, dataTextureSelector!);
         exported++;
         continue;
     }
@@ -2910,6 +2911,16 @@ static Rgba16fSourceArt ReadRgba16fSourceArt(UTexture2D texture)
         var text = properties.GetOrDefault<FName>(name).Text ?? "";
         return text[(text.LastIndexOf(':') + 1)..];
     }
+    // CompressionFormat is missing from a UE 4.19 Source, which predates the field, and the default there is uncompressed. Presence
+    // is checked first: a missing field is null, while a present one must read as an enum name, so a field of another type is refused
+    // instead of being taken for the default.
+    static string? CompressionName(FStructFallback properties)
+    {
+        if (!properties.Properties.Any(tag => string.Equals(tag.Name.Text, "CompressionFormat", StringComparison.OrdinalIgnoreCase))) return null;
+        var text = properties.TryGetValue<FName>(out var format, "CompressionFormat") ? format.Text ?? "" : "";
+        if (text.Length == 0) throw new InvalidDataException("the source CompressionFormat is present but not an enum name");
+        return text[(text.LastIndexOf(':') + 1)..];
+    }
     var bulk = texture.SourceArt ?? throw new InvalidDataException("the texture has no SourceArt bulk data");
     return new Rgba16fSourceArt(
         EnumName(source, "Format"),
@@ -2918,7 +2929,7 @@ static Rgba16fSourceArt ReadRgba16fSourceArt(UTexture2D texture)
         source.GetOrDefault<int>("NumSlices"),
         source.GetOrDefault<int>("NumMips"),
         source.GetOrDefault<bool>("bPNGCompressed", false),
-        EnumName(source, "CompressionFormat"),
+        CompressionName(source),
         texture.SRGB,
         (long) bulk.Header.ElementCount,
         bulk.ReadDataOnce());
@@ -2928,7 +2939,7 @@ static Rgba16fDataTexture ValidateRgba16fSourceArt(Rgba16fSourceArt source)
 {
     if (source.Format != "TSF_RGBA16F") throw new InvalidDataException($"source format {source.Format} is not TSF_RGBA16F");
     if (source.PngCompressed) throw new InvalidDataException("the source is PNG-compressed; Unreal never compresses RGBA16F, so the raw layout does not apply");
-    if (source.Compression is not ("" or "TSCF_None")) throw new InvalidDataException($"the source uses compression {source.Compression}; only uncompressed raw SourceArt is exported");
+    if (source.Compression is not (null or "TSCF_None")) throw new InvalidDataException($"the source uses compression {source.Compression}; only uncompressed raw SourceArt is exported");
     if (source.Srgb) throw new InvalidDataException("the texture is sRGB; its raw RGBA16F values are linear and must not be decoded");
     if (source.NumMips != 1) throw new InvalidDataException($"the source holds {source.NumMips} mips; exactly one mip is supported");
     if (source.NumSlices != 1) throw new InvalidDataException($"the source holds {source.NumSlices} slices; exactly one slice is supported");
@@ -2984,21 +2995,87 @@ static string WriteRgba16fDataTexture(string directory, string name, string pack
     File.Move(manifestPath + ".tmp", manifestPath, true);
     return manifestPath;
 }
-// Exports the one Texture2D named like the package file. The package file set is read through the provider, by exact key.
-static void ExportRgba16fDataTexture(IPackage package, DefaultFileProvider provider, string key, string output, string selector)
+// The provider key of the loose file at root/relativePath, found by its physical path and never by a key, a suffix or a basename.
+// The provider names a loose root after its own folder and folds keys case-insensitively, so a key can name another file. Null when
+// no file exists at that path. Refused when the file exists but the provider holds no loose entry for exactly it, or holds two.
+static string? ExactLooseKey(DefaultFileProvider provider, string root, string name, string relativePath)
+{
+    var physical = Path.GetFullPath(Path.Combine(root, relativePath));
+    // The file name is compared first, so only the files that share it pay for the full path comparison.
+    var fileName = Path.GetFileName(physical);
+    var keys = provider.Files
+        .Where(entry => entry.Value is CUE4Parse.FileProvider.Objects.OsGameFile loose && string.Equals(loose.ActualFile.Name, fileName, StringComparison.Ordinal) &&
+            string.Equals(Path.GetFullPath(loose.ActualFile.FullName), physical, StringComparison.Ordinal))
+        .Select(entry => entry.Key)
+        .ToArray();
+    if (keys.Length == 1) return keys[0];
+    if (keys.Length > 1)
+    {
+        var listed = string.Join(", ", keys);
+        throw RefuseRgba16fDataTexture(name, $"{relativePath} is registered {keys.Length} times ({listed}); exactly one key is needed");
+    }
+    if (File.Exists(physical)) throw RefuseRgba16fDataTexture(name, $"the provider registered no loose file at exactly {relativePath}");
+    return null;
+}
+// The package a --data-texture selector names: the provider key of its .uasset, the package name the manifest records (the selector
+// with .uasset, which the promotion checks), and the provider keys of the sidecars that exist at the same physical stem.
+static Rgba16fPackage ResolveRgba16fPackage(DefaultFileProvider provider, string root, string selector)
+{
+    var name = Path.GetFileName(selector);
+    var key = ExactLooseKey(provider, root, name, selector + ".uasset")
+        ?? throw RefuseRgba16fDataTexture(name, $"no package has exactly the key {selector}.uasset under the source root");
+    var sidecars = new Dictionary<string, string>();
+    foreach (var extension in new[] { ".uexp", ".ubulk", ".uptnl" })
+        if (ExactLooseKey(provider, root, name, selector + extension) is { } sidecar) sidecars[extension] = sidecar;
+    RequireConsumedPayloads(provider, name, selector, key, sidecars);
+    return new Rgba16fPackage(key, selector + ".uasset", sidecars);
+}
+// The payloads the load consumes for the package: FindPayloads on the file of the .uasset, the call LoadPackage makes. The provider folds
+// keys case-insensitively, so it can hand over a namesake of a sidecar the exact stem lacks. Each extension must be consumed by the object
+// the provider holds under its mapping key, or by nothing when the stem has no file. Anything else is refused before the package is read.
+static void RequireConsumedPayloads(DefaultFileProvider provider, string name, string selector, string key, Dictionary<string, string> sidecars)
+{
+    provider.Files.FindPayloads(provider.Files[key], out var uexp, out var ubulks, out var uptnls);
+    var consumed = new Dictionary<string, IReadOnlyList<CUE4Parse.FileProvider.Objects.GameFile>>
+    {
+        [".uexp"] = uexp is null ? [] : [uexp],
+        [".ubulk"] = ubulks,
+        [".uptnl"] = uptnls,
+    };
+    foreach (var (extension, payloads) in consumed)
+    {
+        var mappedKey = sidecars.GetValueOrDefault(extension);
+        if (payloads.Count > 1) throw RefuseRgba16fDataTexture(name, $"the provider would load {payloads.Count} {extension} files for {selector}; exactly one is needed");
+        if (payloads.Count == 0 && mappedKey is null) continue;
+        if (payloads.Count == 0)
+            throw RefuseRgba16fDataTexture(name, $"the provider would load no {extension} for {selector}, though {mappedKey} is registered at exactly that path");
+        if (mappedKey is null)
+            throw RefuseRgba16fDataTexture(name, $"the provider would load {payloads[0].Path} as the {extension} of {selector}, but no {extension} exists at exactly {selector}{extension}");
+        if (!object.ReferenceEquals(payloads[0], provider.Files[mappedKey]))
+            throw RefuseRgba16fDataTexture(name, $"the provider would load {payloads[0].Path} as the {extension} of {selector}, not {mappedKey}");
+    }
+}
+// The package file set the converter hashes: the .uasset, then each sidecar that exists, each read through its exact provider key.
+static List<(string Extension, byte[] Bytes)> ReadRgba16fPackageFiles(DefaultFileProvider provider, Rgba16fPackage mapping)
+{
+    var files = new List<(string Extension, byte[] Bytes)> { (".uasset", provider.Files[mapping.Key].Read()) };
+    foreach (var extension in new[] { ".uexp", ".ubulk", ".uptnl" })
+        if (mapping.Sidecars.TryGetValue(extension, out var sidecar)) files.Add((extension, provider.Files[sidecar].Read()));
+    return files;
+}
+// Exports the one Texture2D named like the package file. The package file set is read through the provider by its exact keys.
+static void ExportRgba16fDataTexture(IPackage package, DefaultFileProvider provider, Rgba16fPackage mapping, string output, string selector)
 {
     var name = Path.GetFileName(selector);
     var textures = package.GetExports().OfType<UTexture2D>().Where(candidate => candidate.Name == name).ToArray();
-    if (textures.Length != 1) throw RefuseRgba16fDataTexture(name, $"{textures.Length} Texture2D exports are named {name} in {key}; exactly one is needed");
+    if (textures.Length != 1) throw RefuseRgba16fDataTexture(name, $"{textures.Length} Texture2D exports are named {name} in {mapping.Key}; exactly one is needed");
     var texture = textures[0];
-    var stem = key[..^".uasset".Length];
-    var files = new List<(string Extension, byte[] Bytes)>();
-    foreach (var extension in new[] { ".uasset", ".uexp", ".ubulk", ".uptnl" })
-        if (provider.Files.TryGetValue(stem + extension, out var file)) files.Add((extension, file.Read()));
+    var files = ReadRgba16fPackageFiles(provider, mapping);
     Rgba16fDataTexture data;
     try { data = ValidateRgba16fSourceArt(ReadRgba16fSourceArt(texture)); }
     catch (InvalidDataException error) { throw RefuseRgba16fDataTexture(name, error.Message); }
-    var manifest = WriteRgba16fDataTexture(Path.Combine(output, "DataTextures"), name, key, texture.GetPathName(), PackageSetSha256(files), data, "threenative-cue4parse ${CUE4PARSE_SOURCE.version}");
+    // The manifest names the package by its root-relative selector, which is what the promotion checks, and never by the provider key.
+    var manifest = WriteRgba16fDataTexture(Path.Combine(output, "DataTextures"), name, mapping.PackageKey, texture.GetPathName(), PackageSetSha256(files), data, "threenative-cue4parse ${CUE4PARSE_SOURCE.version}");
     Console.WriteLine($"threenative-data-texture {name}: {manifest}");
 }
 // Names the refusal on stderr the way the importer reads texture failures, and returns the exception to throw.
@@ -4340,8 +4417,9 @@ sealed record EditorMesh(
     int[] TriangleGroups,
     bool[] LiveTriangles,
     string[] GroupSlots);
-sealed record Rgba16fSourceArt(string Format, int SizeX, int SizeY, int NumSlices, int NumMips, bool PngCompressed, string Compression, bool Srgb, long ElementCount, byte[]? Bytes);
+sealed record Rgba16fSourceArt(string Format, int SizeX, int SizeY, int NumSlices, int NumMips, bool PngCompressed, string? Compression, bool Srgb, long ElementCount, byte[]? Bytes);
 sealed record Rgba16fDataTexture(int Width, int Height, byte[] Bytes);
+sealed record Rgba16fPackage(string Key, string PackageKey, Dictionary<string, string> Sidecars);
 
 // Packed glTF vertices are equal when every component is equal under float.Equals, so -0 matches 0 and NaN matches
 // NaN: the equality the MeshBuilder this writer replaces used. Every present UV channel is a component of the key, so

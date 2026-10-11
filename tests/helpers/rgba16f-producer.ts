@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { CUE4PARSE_PROGRAM, CUE4PARSE_SOURCE } from "../../src/unreal/cue4parse-adapter.js";
 import { modernSdkExecutable, toolchainCacheDir } from "../../src/unreal/provision.js";
@@ -12,7 +12,10 @@ import { modernSdkExecutable, toolchainCacheDir } from "../../src/unreal/provisi
 // A typed case (`extractTexture`) builds a synthetic UTexture2D from the pinned types and runs the production reader,
 // ReadRgba16fSourceArt, on it. Only synthetic inputs reach it: nothing from a licensed pack.
 
-/** Extracts one top-level C# declaration (signature line through its matching brace) from the program. */
+/**
+ * Extracts one top-level C# declaration (signature line through its matching brace) from the program. The scanner skips string and
+ * char literals but not comments, so an apostrophe in a comment inside the declaration would open a char literal that runs on.
+ */
 export function extractCSharp(program: string, signature: string): string {
   const start = program.indexOf(signature);
   if (start < 0) throw new Error(`converter program has no ${signature}`);
@@ -66,6 +69,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using CUE4Parse.FileProvider;
+using CUE4Parse.MappingsProvider;
 using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Texture;
@@ -103,8 +107,12 @@ static UTexture2D SyntheticTexture(JObject spec)
             SyntheticTag("NumSlices", "IntProperty", new IntProperty((int)source["numSlices"]!)),
             SyntheticTag("NumMips", "IntProperty", new IntProperty((int)source["numMips"]!)),
             SyntheticTag("bPNGCompressed", "BoolProperty", new BoolProperty((bool?)source["pngCompressed"] ?? false)),
-            SyntheticTag("CompressionFormat", "EnumProperty", new EnumProperty(new FName("ETextureCompressionFormat::" + ((string?)source["compression"] ?? "TSCF_None")))),
         };
+        // A null compression leaves CompressionFormat out, as UE 4.19's Source has no such field. An object stands in for a field of another type.
+        if (source["compression"] is JObject wrongType)
+            fields.Add(SyntheticTag("CompressionFormat", "IntProperty", new IntProperty((int)wrongType["integer"]!)));
+        else if (source["compression"] is { Type: not JTokenType.Null } compression)
+            fields.Add(SyntheticTag("CompressionFormat", "EnumProperty", new EnumProperty(new FName("ETextureCompressionFormat::" + (string)compression))));
         texture.Properties.Add(SyntheticTag("Source", "StructProperty", new StructProperty(new FScriptStruct(new FStructFallback(fields)))));
     }
     if (spec["sourceArt"] is JObject art)
@@ -136,6 +144,64 @@ static FByteBulkData SyntheticBulk(byte[] payload, int elementCount, int sizeOnD
     return new FByteBulkData(new FAssetArchive(new FByteArchive("synthetic SourceArt", stream.ToArray(), versions), null));
 }
 `;
+
+// The loose-tree probe: a real DefaultFileProvider over the root the test names, initialized the way the converter initializes its
+// source root. Nothing here parses a file. The helper is a local function, so it precedes the type declarations (see EXPORTLESS_PACKAGE).
+const LOOSE_PROBE = `
+// Initializes a provider over one loose root and any extra roots the case names.
+static DefaultFileProvider LooseProvider(string root, JObject spec)
+{
+    var extra = ((JArray?)spec["extraDirectories"] ?? new JArray()).Select(item => new DirectoryInfo(Path.GetFullPath((string)item!))).ToArray();
+    var provider = new DefaultFileProvider(new DirectoryInfo(root), extra, SearchOption.AllDirectories, new VersionContainer(EGame.GAME_UE4_19), StringComparer.OrdinalIgnoreCase);
+    provider.Initialize();
+    provider.PostMount();
+    return provider;
+}
+`;
+
+// A package with no exports, for the export boundary to refuse before it reads a texture. It is a type, so it follows the local
+// functions and the records: top-level statements and local functions must precede type declarations.
+const EXPORTLESS_PACKAGE = `
+sealed class ExportlessPackage : IPackage
+{
+    public string Name { get; set; } = "ExportlessProbe";
+    public IFileProvider? Provider => null;
+    public TypeMappings? Mappings => null;
+    public FPackageFileSummary Summary => throw new NotSupportedException("the probe package has no summary");
+    public FNameEntrySerialized[] NameMap => Array.Empty<FNameEntrySerialized>();
+    public int ImportMapLength => 0;
+    public int ExportMapLength => 0;
+    public Lazy<UObject>[] ExportsLazy => Array.Empty<Lazy<UObject>>();
+    public bool IsFullyLoaded => true;
+    public bool CanDeserialize => false;
+    public bool HasFlags(EPackageFlags flags) => false;
+    public int GetExportIndex(string name, StringComparison comparisonType = StringComparison.Ordinal) => -1;
+    public ResolvedObject? ResolvePackageIndex(FPackageIndex? index) => null;
+}
+`;
+
+/** A --data-texture selector over a loose root: `root` is the converter's source root, `selector` is root-relative. */
+export interface LooseCase {
+  readonly root: string;
+  readonly selector: string;
+  /** Extra provider roots. The converter is never given any, so a case that names one forces a duplicate registration. */
+  readonly extraDirectories?: readonly string[];
+}
+
+/** The production resolver's answer: the exact provider key, the manifest's package name, the sidecar keys, and the hash. */
+export type ResolveOutcome =
+  | {
+      readonly ok: true;
+      readonly key: string;
+      readonly packageKey: string;
+      readonly sidecars: Readonly<Record<string, string>>;
+      readonly packageSha: string;
+      readonly files: readonly string[];
+    }
+  | { readonly ok: false; readonly reason: string };
+
+/** The production export boundary's refusal (it never succeeds here), with the directory the converter would have written into. */
+export type ExportOutcome = { readonly ok: boolean; readonly reason?: string; readonly directory: string };
 
 export interface ProducerFile {
   readonly extension: string;
@@ -178,7 +244,11 @@ export interface TextureCase {
     readonly numSlices?: number;
     readonly numMips?: number;
     readonly pngCompressed?: boolean;
-    readonly compression?: string;
+    /**
+     * The CompressionFormat field: an enum name, `null` for an absent field (UE 4.19's Source has none), or `{ integer }` for a
+     * field of another property type. Omitted, it is TSCF_None.
+     */
+    readonly compression?: string | null | { readonly integer: number };
   };
   /** The SourceArt bulk: `payload` is the stored bytes, `elementCount` the count the header declares, `sizeOnDisk` what it reads. */
   readonly sourceArt?: { readonly payload: Buffer; readonly elementCount?: number; readonly sizeOnDisk?: number };
@@ -195,7 +265,8 @@ export type TextureOutcome =
       readonly numSlices: number;
       readonly numMips: number;
       readonly pngCompressed: boolean;
-      readonly compression: string;
+      /** The compression name the reader found, or null when the field is absent. */
+      readonly compression: string | null;
       readonly srgb: boolean;
       readonly elementCount: number;
       /** The bytes the reader extracted, base64. */
@@ -238,10 +309,15 @@ export class Rgba16fProducer {
       extractCSharp(CUE4PARSE_PROGRAM, "static Rgba16fDataTexture ValidateRgba16fSourceArt("),
       extractCSharp(CUE4PARSE_PROGRAM, "static string PackageSetSha256("),
       extractCSharp(CUE4PARSE_PROGRAM, "static string WriteRgba16fDataTexture("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static string? ExactLooseKey("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static Rgba16fPackage ResolveRgba16fPackage("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static void RequireConsumedPayloads("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static List<(string Extension, byte[] Bytes)> ReadRgba16fPackageFiles("),
       extractCSharp(CUE4PARSE_PROGRAM, "static void ExportRgba16fDataTexture("),
       extractCSharp(CUE4PARSE_PROGRAM, "static Exception RefuseRgba16fDataTexture("),
       extractRecord(CUE4PARSE_PROGRAM, "sealed record Rgba16fSourceArt("),
       extractRecord(CUE4PARSE_PROGRAM, "sealed record Rgba16fDataTexture("),
+      extractRecord(CUE4PARSE_PROGRAM, "sealed record Rgba16fPackage("),
     ];
     // The harness reads one case as JSON, runs the validate-and-write path the converter runs, and prints the outcome.
     await writeFile(
@@ -273,6 +349,45 @@ if (input["texture"] is JObject typed)
     }
     return;
 }
+// The package mapping, run on a real provider over the loose tree the test wrote: the resolver's answer and the package-set hash it
+// would write, or the refusal it gives. The export mode runs the production export boundary with a package that has no exports.
+if (input["resolve"] is JObject resolve)
+{
+    var root = Path.GetFullPath((string)resolve["root"]!);
+    var provider = LooseProvider(root, resolve);
+    try
+    {
+        var mapping = ResolveRgba16fPackage(provider, root, (string)resolve["selector"]!);
+        var files = ReadRgba16fPackageFiles(provider, mapping);
+        Console.WriteLine(JsonConvert.SerializeObject(new
+        {
+            ok = true, key = mapping.Key, packageKey = mapping.PackageKey, sidecars = mapping.Sidecars,
+            packageSha = PackageSetSha256(files), files = files.Select(file => file.Extension).ToArray(),
+        }));
+    }
+    catch (InvalidDataException error)
+    {
+        Console.WriteLine(JsonConvert.SerializeObject(new { ok = false, reason = error.Message }));
+    }
+    return;
+}
+if (input["export"] is JObject export)
+{
+    var root = Path.GetFullPath((string)export["root"]!);
+    var selector = (string)export["selector"]!;
+    var provider = LooseProvider(root, export);
+    try
+    {
+        var mapping = ResolveRgba16fPackage(provider, root, selector);
+        ExportRgba16fDataTexture(new ExportlessPackage(), provider, mapping, Path.GetFullPath(args[1]), selector);
+        Console.WriteLine(JsonConvert.SerializeObject(new { ok = true }));
+    }
+    catch (InvalidDataException error)
+    {
+        Console.WriteLine(JsonConvert.SerializeObject(new { ok = false, reason = error.Message }));
+    }
+    return;
+}
 try
 {
     var source = new Rgba16fSourceArt(
@@ -282,7 +397,7 @@ try
         (int)input["numSlices"]!,
         (int)input["numMips"]!,
         (bool?)input["pngCompressed"] ?? false,
-        (string?)input["compression"] ?? "",
+        (string?)input["compression"],
         (bool)input["srgb"]!,
         (long)input["elementCount"]!,
         Convert.FromBase64String((string)input["payload"]!));
@@ -297,7 +412,9 @@ catch (InvalidDataException error)
     Console.WriteLine(JsonConvert.SerializeObject(new { ok = false, reason = error.Message }));
 }
 ${SYNTHETIC_TEXTURE}
+${LOOSE_PROBE}
 ${declarations.join("\n")}
+${EXPORTLESS_PACKAGE}
 `,
     );
     try {
@@ -367,7 +484,7 @@ ${declarations.join("\n")}
       numSlices: input.source.numSlices ?? 1,
       numMips: input.source.numMips ?? 1,
       pngCompressed: input.source.pngCompressed ?? false,
-      compression: input.source.compression ?? "TSCF_None",
+      compression: input.source.compression === undefined ? "TSCF_None" : input.source.compression,
     };
     const sourceArt = input.sourceArt === undefined ? undefined : {
       payload: input.sourceArt.payload.toString("base64"),
@@ -382,6 +499,51 @@ ${declarations.join("\n")}
       timeout: 60_000,
     });
     return JSON.parse(output.trim().split("\n").pop() ?? "{}") as TextureOutcome;
+  }
+
+  /**
+   * Writes a loose source tree under this producer's temporary root, which teardown removes, and returns the tree's directory.
+   * Each file holds a fake body: the resolver registers files by their paths and never parses them.
+   */
+  async looseTree(files: readonly string[]): Promise<string> {
+    const tree = join(this.root, `tree-${this.caseIndex++}`);
+    for (const file of files) {
+      await mkdir(dirname(join(tree, file)), { recursive: true });
+      await writeFile(join(tree, file), `fake package body of ${file}`);
+    }
+    return tree;
+  }
+
+  /** Whether the host tells names that differ only in case apart. Probed inside this producer's own temporary root. */
+  async caseSensitive(): Promise<boolean> {
+    const probe = join(this.root, "case-probe");
+    await mkdir(probe, { recursive: true });
+    await writeFile(join(probe, "Probe.txt"), "");
+    return !(await stat(join(probe, "probe.txt")).then(() => true, () => false));
+  }
+
+  /** Runs the production resolver on a --data-texture selector, over a real provider initialized on the loose root. */
+  async resolveDataTexture(input: LooseCase): Promise<ResolveOutcome> {
+    return (await this.runLooseMode("resolve", input)).outcome as ResolveOutcome;
+  }
+
+  /** Runs the production export boundary on the same selector, with a package that has no exports, into a fresh directory. */
+  async exportDataTexture(input: LooseCase): Promise<ExportOutcome> {
+    const { outcome, directory } = await this.runLooseMode("export", input);
+    return { ...(outcome as { ok: boolean; reason?: string }), directory };
+  }
+
+  private async runLooseMode(mode: "resolve" | "export", input: LooseCase): Promise<{ outcome: unknown; directory: string }> {
+    const directory = join(this.root, `case-${this.caseIndex++}`);
+    await mkdir(directory, { recursive: true });
+    const inputPath = join(directory, "input.json");
+    await writeFile(inputPath, JSON.stringify({ [mode]: input }));
+    const output = execFileSync(this.sdk, [this.harness, inputPath, join(directory, "out")], {
+      env: this.environment(),
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    return { outcome: JSON.parse(output.trim().split("\n").pop() ?? "{}"), directory: join(directory, "out") };
   }
 
   private environment(): NodeJS.ProcessEnv {
