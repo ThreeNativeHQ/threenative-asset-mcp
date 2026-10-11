@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
-import { Document, MathUtils, NodeIO, VertexLayout, type mat4, type Mesh, type Node, type vec3, type vec4 } from "@gltf-transform/core";
+import { Document, MathUtils, NodeIO, VertexLayout, type Accessor, type mat4, type Mesh, type Node, type vec3, type vec4 } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsUnlit, type Light } from "@gltf-transform/extensions";
 import { copyToDocument, dedup, getBounds, unpartition } from "@gltf-transform/functions";
 
@@ -572,6 +572,27 @@ function createEnginePrimitive(document: Document, name: string): Mesh | undefin
     );
 }
 
+/**
+ * `dedup()` merges byte-identical accessors, so a primitive whose lightmap UVs equal its UV0 ends up with both
+ * semantics on one accessor. The separate-layout writer gives each accessor one buffer view, so that view would carry
+ * two semantics: the interleaved layout the native host rejects. A semantic that shares an accessor with another gets
+ * a copy with the same values; the attributes and their data stay, only the sharing goes.
+ */
+function unshareAttributeAccessors(document: Document): void {
+  const semanticByAccessor = new Map<Accessor, string>();
+  for (const mesh of document.getRoot().listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      for (const semantic of primitive.listSemantics()) {
+        const accessor = primitive.getAttribute(semantic);
+        if (!accessor) continue;
+        const owner = semanticByAccessor.get(accessor);
+        if (owner === undefined) semanticByAccessor.set(accessor, semantic);
+        else if (owner !== semantic) primitive.setAttribute(semantic, accessor.clone());
+      }
+    }
+  }
+}
+
 /** Creates one ordinary GLB scene whose nodes instance the already-imported unique mesh resources. */
 export async function assembleSceneGlb(request: AssembleSceneRequest): Promise<ImportedScene> {
   const io = new NodeIO()
@@ -828,6 +849,7 @@ export async function assembleSceneGlb(request: AssembleSceneRequest): Promise<I
   // images before the GLB writer combines binary resources, or an otherwise valid scene can exceed
   // the uint32/typed-array boundary even though its unique resources fit comfortably below it.
   await document.transform(dedup(), unpartition());
+  unshareAttributeAccessors(document);
   const outputStem = request.outputStem ?? request.source.mapName;
   if (!outputStem || isAbsolute(outputStem) || outputStem.split(/[\\/]/).includes("..")) {
     throw new Error(`invalid scene output stem ${JSON.stringify(outputStem)}`);

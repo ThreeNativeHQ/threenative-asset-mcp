@@ -2716,7 +2716,7 @@ for (const face of Object.keys(faces)) {
     expect(interleavedBufferViews(await readFile(join(workspace.outputDir, model.glb)))).toBe(0);
   });
 
-  it("drops UE Viewer's all-zero tangents and its lightmap UV sets", async () => {
+  it("drops UE Viewer's all-zero tangents and keeps its lightmap UV sets", async () => {
     const workspace = await unrealWorkspace({ degenerateTangents: true });
     const report = await importUnrealDirectory({
       sourceDir: workspace.sourceDir,
@@ -2725,15 +2725,16 @@ for (const face of Object.keys(faces)) {
       umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
     });
     expect(report.warnings.join(" ")).toMatch(/zero-length TANGENT/);
-    expect(report.warnings.join(" ")).toMatch(/extra UV channels/);
+    expect(report.warnings.join(" ")).not.toMatch(/extra UV channels/);
 
     const model = report.models[0];
     if (!model) throw new Error("expected one model");
     const document = await new NodeIO().read(join(workspace.outputDir, model.glb));
     const primitive = document.getRoot().listMeshes()[0]?.listPrimitives()[0];
     expect(primitive?.getAttribute("TANGENT")).toBeNull();
-    expect(primitive?.getAttribute("TEXCOORD_1")).toBeNull();
-    expect(primitive?.getAttribute("TEXCOORD_0")).not.toBeNull();
+    // Both sets are authored source data and carry their exact values; the fixture's UV1 equals its UV0.
+    expect(Array.from(primitive?.getAttribute("TEXCOORD_0")?.getArray() ?? [])).toEqual([0, 0, 1, 0, 0, 1]);
+    expect(Array.from(primitive?.getAttribute("TEXCOORD_1")?.getArray() ?? [])).toEqual([0, 0, 1, 0, 0, 1]);
   });
 
   it("renames a section UE Viewer could not resolve and never calls it textured", async () => {
