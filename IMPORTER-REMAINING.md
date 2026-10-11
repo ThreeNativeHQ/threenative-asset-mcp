@@ -1,5 +1,16 @@
 # What is missing to finish the Fab/Unreal importer (PR #36)
 
+## Current follow-up checkpoint — 2026-10-11
+
+PR #40 is the active draft follow-up; PR #36 is already merged. Earlier sections below are historical checkpoints. AC-6 remains open.
+
+- Integrated importer100 / modern72 / uncooked10: HEAD68d2a5d passed typecheck, 1946 tests with5 skips, packed-MCP smoke15, clean leak gate and all6 exact-commit CI checks. Subsequent4375aa1 records the permanent preview guard policy only.
+- Preserve approved Unreal-like picture lighting, source HDR/Grid, ACES exposure1 and camera policy. Caller-supplied references remain private; resumed sheets require matching picture/input identity. Stronger functional/mutation tests are being completed; 512cm floor-period mutant exposed a genuine test gap. No visual baseline ratchet.
+- Fresh full-pack Spruce100 is **not verified**: stopped after native geometry export and3 staged GLBs exposed lost material overrides. Reproduced cause: UModel's256-byte directory buffer truncates long absolute output paths but exits0. Real binary probe with absolute output directory as cwd and literal `-out=./` restores byte-identical own material sidecars. Six-route implementation and regression tests are pending review. `-out=.` is unsafe because UModel resolves it against HOME.
+- The broader raw-sidecar reuse patch is excluded: it assumes an extra export folder absent from actual output. Modern material emission independently omits scalar/vector/static overrides; a separate source-aware fix is in progress.
+- Final scope remains every frozen runnable variant (37 listings/86 pairs), explicit24 UIDless unverified variants, remaining pack fixes, source/structural checks, actual visual judge and eyes on sheets, derivative JPEGs on PR40, sibling metadata replay, baseline check with ratchets only for accepted passing items, final gates, PRD evidence and owned-cache cleanup. Sweep harness review found provenance/resume evidence gaps; no final sweep has started.
+
+
 State as of 2026-10-10, branch `fix/graph-view-nodes` (importer 89, local only, not pushed).
 AC-6 (every pack passes S1–S4) is **not met**, so PR #36 is not mergeable yet.
 
