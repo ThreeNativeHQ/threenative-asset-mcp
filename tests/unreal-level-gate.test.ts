@@ -49,6 +49,8 @@ interface LevelSpec {
   readonly legacy: number;
   /** The name table the level is written with; defaults to `LEVEL_NAMES`. */
   readonly names?: readonly string[];
+  /** The UE4 object version the header records; defaults to 522, a version the scene parser is verified for. */
+  readonly objectVersion?: number;
 }
 
 interface RunOptions {
@@ -125,7 +127,7 @@ async function run(options: RunOptions) {
   const outputDir = join(root, "output");
   await mkdir(content, { recursive: true });
   await writeFile(join(content, "Mesh.uasset"), packageHead(MESH_NAMES, -7));
-  for (const level of options.levels) await writeFile(join(content, `${level.name}.umap`), packageHead(level.names ?? LEVEL_NAMES, level.legacy));
+  for (const level of options.levels) await writeFile(join(content, `${level.name}.umap`), packageHead(level.names ?? LEVEL_NAMES, level.legacy, level.objectVersion));
   for (const texture of options.textures ?? []) {
     await writeFile(join(content, `${texture}.uasset`), packageHead(["/Script/Engine", "Texture2D", texture, "TextureSource"], -7));
   }
@@ -251,5 +253,27 @@ describe("a package-named World owns the Texture2D exports beside it", () => {
     expect(report.scenes.map((scene) => scene.name)).toEqual(["DemoMap"]);
     expect((await umodelCalls()).filter((argv) => argv.includes("-export") && argv.at(-1)?.endsWith("DemoMap"))).toEqual([]);
     expect(report.warnings.join("\n")).toMatch(/\(Texture2D_0, DemoMap\).*unverified/);
+  });
+
+  // Object version 516 is UE 4.19, below the 517–522 range the scene parser is verified for: the level is skipped with
+  // its reason and never handed to either converter, and the standalone texture beside it still exports.
+  it("skips a UE 4.19 World (object version 516) with its reason, without a scene, a texture export or a failure", async () => {
+    const { attempt, uncookedCalls, umodelCalls } = await run({
+      behaviour: { writeScenes: true },
+      levels: [{ name: "DemoMap", legacy: -7, objectVersion: 516, names: WORLD_LEVEL_NAMES }],
+      objects: { DemoMap: LEVEL_OBJECTS },
+      textures: ["T_Rock"],
+    });
+    const report = await attempt;
+    expect(report.failed).toEqual([]);
+    expect(report.skipped).toContainEqual(
+      expect.objectContaining({ package: expect.stringContaining("DemoMap.umap"), reason: expect.stringContaining("object version 516") }),
+    );
+    expect(report.scenes).toEqual([]);
+    expect(report.models.map((model) => model.name)).toEqual(["Mesh"]);
+    expect(report.textures.map((texture) => texture.name)).toEqual(["T_Rock"]);
+    expect((await uncookedCalls()).some((argv) => argv.includes("--scene-json-dir"))).toBe(false);
+    expect((await umodelCalls()).filter((argv) => argv.includes("-export") && argv.at(-1)?.endsWith("DemoMap"))).toEqual([]);
+    expect(report.warnings.join("\n")).toMatch(/\(Texture2D_0\).*unverified/);
   });
 });
