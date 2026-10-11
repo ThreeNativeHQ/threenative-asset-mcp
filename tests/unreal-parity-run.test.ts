@@ -845,6 +845,98 @@ describe("S4 baseline delta (PRD-538 AC-4)", () => {
     expect(readBaselineS4Misses(join(directory, "missing.json"))).toBeNull();
   });
 
+  // A baseline is read only when its counts are finite nonnegative integers and its shape is a scorecard's.
+  const shareOnly = withS4({}, { artifactId: "A9", listingId: "bbbbbbbb-0000-0000-0000-000000000000" });
+  async function scorecardWith(entries: unknown[], packs: Record<string, unknown> = {}): Promise<string> {
+    const directory = await scratch();
+    mkdirSync(join(directory, "packs"));
+    for (const [label, pack] of Object.entries(packs)) {
+      writeFileSync(join(directory, "packs", `${label}.json`), JSON.stringify(pack));
+    }
+    const path = join(directory, "scorecard.json");
+    writeFileSync(path, JSON.stringify({ entries }));
+    return path;
+  }
+
+  it.each([
+    // Unrelated JSON: a corpus supervisor summary has neither a count nor entries, so it is not a baseline.
+    ["an unrelated corpus supervisor summary", JSON.stringify({ planned: 86, completed: 2, final: false })],
+    ["an empty object", "{}"],
+    ["a summary with no count and no entries", JSON.stringify({ summary: { s4Misses: null } })],
+    ["a null summary", JSON.stringify({ summary: null, entries: [] })],
+    ["JSON null", "null"],
+    ["a JSON number", "5"],
+    ["a JSON string", JSON.stringify("scorecard")],
+    ["a top-level array", "[]"],
+    // Wrong-type entries: refused, not skipped or thrown on.
+    ["a null entry", JSON.stringify({ entries: [null] })],
+    ["a scalar entry beside a counted one", JSON.stringify({ entries: [withS4({ missesTotal: 3 }), 5] })],
+    ["an entry whose summary is a string", JSON.stringify({ entries: [{ status: "fail", summary: "oops" }] })],
+    ["a verified entry with no colour result", JSON.stringify({ entries: [entry({ status: "pass" })] })],
+    ["entries that are null", JSON.stringify({ entries: null })],
+    ["entries that are a string", JSON.stringify({ entries: "abc" })],
+    ["entries that are a number", JSON.stringify({ entries: 5 })],
+    ["entries that are an object", JSON.stringify({ entries: {} })],
+    // Malformed counts: refused whole, so a corrupt count never becomes a partial total.
+    ["a negative recorded count", JSON.stringify({ summary: { s4Misses: -1 }, entries: [] })],
+    ["a fractional recorded count", JSON.stringify({ summary: { s4Misses: 1.5 }, entries: [] })],
+    ["a string recorded count", JSON.stringify({ summary: { s4Misses: "12" }, entries: [withS4({ missesTotal: 4 })] })],
+    ["a recorded count beyond the number range", '{"summary":{"s4Misses":1e400},"entries":[]}'],
+    [
+      "a negative entry count beside a valid one",
+      JSON.stringify({ entries: [withS4({ missesTotal: 2 }), withS4({ missesTotal: -1 })] }),
+    ],
+    ["a fractional entry count", JSON.stringify({ entries: [withS4({ missesTotal: 2.5 })] })],
+    [
+      "a string entry count",
+      JSON.stringify({ entries: [{ status: "fail", summary: { s4: { share: 0, missesTotal: "3" } } }] }),
+    ],
+  ])("returns null for %s", async (_label, json) => {
+    const path = join(await scratch(), "baseline.json");
+    writeFileSync(path, json);
+    expect(readBaselineS4Misses(path)).toBeNull();
+  });
+
+  it.each([
+    ["a negative count", -4],
+    ["a fractional count", 2.5],
+    ["a string count", "7"],
+  ])("returns null for a legacy entry whose per-pack file has %s", async (_label, count) => {
+    const path = await scorecardWith([shareOnly], { "bbbbbbbb-A9": { colour: { missesTotal: count } } });
+    expect(readBaselineS4Misses(path)).toBeNull();
+  });
+
+  it("returns null for an s4 that is not an object, even when the per-pack file has a count", async () => {
+    const path = await scorecardWith(
+      [{ ...shareOnly, summary: { ...shareOnly.summary, s4: 7 } }],
+      { "bbbbbbbb-A9": { colour: { missesTotal: 7 } } },
+    );
+    expect(readBaselineS4Misses(path)).toBeNull();
+  });
+
+  it("returns an explicitly recorded zero, which the entries do not replace", async () => {
+    const directory = await scratch();
+    const zero = { summary: { s4Misses: 0 }, entries: [withS4({ missesTotal: 5 })] };
+    writeFileSync(join(directory, "zero.json"), JSON.stringify(zero));
+    expect(readBaselineS4Misses(join(directory, "zero.json"))).toBe(0);
+    writeFileSync(join(directory, "bare.json"), JSON.stringify({ summary: { s4Misses: 0 } }));
+    expect(readBaselineS4Misses(join(directory, "bare.json"))).toBe(0);
+  });
+
+  it("keeps the zero of an empty entries array and skips errored, unverified and skipped entries", async () => {
+    expect(readBaselineS4Misses(await scorecardWith([]))).toBe(0);
+    const noColour = [entry({ status: "error" }), entry({ status: "unverified" }), entry({ status: "skipped" })];
+    expect(readBaselineS4Misses(await scorecardWith([...noColour, withS4({ missesTotal: 3 })]))).toBe(3);
+  });
+
+  it("sums legacy entries through their per-pack files, a zero pack included", async () => {
+    const path = await scorecardWith(
+      [withS4({ missesTotal: 4 }), shareOnly, { ...shareOnly, artifactId: "A8" }],
+      { "bbbbbbbb-A8": { colour: { missesTotal: 0 } }, "bbbbbbbb-A9": { colour: { missesTotal: 7 } } },
+    );
+    expect(readBaselineS4Misses(path)).toBe(11);
+  });
+
   it("parses --baseline", () => {
     expect(parseParityArgs(["--baseline", "/x/scorecard.json"]).baseline).toBe("/x/scorecard.json");
     expect(parseParityArgs([]).baseline).toBeUndefined();

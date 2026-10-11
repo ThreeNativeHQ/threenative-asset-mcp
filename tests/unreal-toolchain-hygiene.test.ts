@@ -1,7 +1,7 @@
-import { access, chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished } from "vitest";
 import { sweepStaleStaging } from "../src/unreal/importer.js";
 import {
   UMODEL_BOOLTAGS,
@@ -14,7 +14,7 @@ import {
   umodelBuildFailure,
   umodelCorrected,
 } from "../src/unreal/provision.js";
-import { runBounded } from "../src/unreal/toolchain.js";
+import { childEnvironment, runBounded } from "../src/unreal/toolchain.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
 /** The 2022 upstream UE Viewer lists -psk in its help yet rejects it on the command line. */
@@ -682,4 +682,46 @@ describe("UE Viewer build provenance", () => {
       expect(tool.version).toContain("parser-verified");
     },
   );
+});
+
+describe("child environment for bounded runs", () => {
+  it("forwards PYTHONDONTWRITEBYTECODE unchanged, so each child reads it with Python's own rules", () => {
+    for (const value of ["1", "0", "", "false"]) {
+      expect(childEnvironment({ PYTHONDONTWRITEBYTECODE: value }).PYTHONDONTWRITEBYTECODE).toBe(value);
+    }
+  });
+
+  it("does not add PYTHONDONTWRITEBYTECODE when the parent does not set it", () => {
+    expect(childEnvironment({ PATH: "/usr/bin" })).not.toHaveProperty("PYTHONDONTWRITEBYTECODE");
+  });
+
+  it("still drops variables the allowlist does not name", () => {
+    expect(childEnvironment({ PYTHONDONTWRITEBYTECODE: "1", SESSION_TOKEN: "not-a-token" })).not.toHaveProperty(
+      "SESSION_TOKEN",
+    );
+  });
+});
+
+// The suite has no bare python3 prerequisite. python-imaging is python3 with the NumPy and Pillow the
+// image tools need; this test launches that python3 and nothing else.
+describeWithTools(["python-imaging"], "child Python under the parent's no-bytecode switch", () => {
+  it("imports a module without writing __pycache__ when the parent sets PYTHONDONTWRITEBYTECODE=1", async () => {
+    const root = await mkdtemp(join(tmpdir(), "child-bytecode-"));
+    roots.push(root);
+    await writeFile(join(root, "probe_module.py"), "VALUE = 'imported'\n");
+    const previous = process.env.PYTHONDONTWRITEBYTECODE;
+    process.env.PYTHONDONTWRITEBYTECODE = "1";
+    onTestFinished(() => {
+      if (previous === undefined) delete process.env.PYTHONDONTWRITEBYTECODE;
+      else process.env.PYTHONDONTWRITEBYTECODE = previous;
+    });
+    // No environment option: the call takes the production default, childEnvironment().
+    const run = await runBounded("python3", ["-c", "import probe_module; print(probe_module.VALUE)"], {
+      cwd: root,
+      timeoutMs: 30_000,
+    });
+    expect(run.code).toBe(0);
+    expect(run.stdout.trim()).toBe("imported");
+    expect((await readdir(root, { recursive: true })).sort()).toEqual(["probe_module.py"]);
+  });
 });

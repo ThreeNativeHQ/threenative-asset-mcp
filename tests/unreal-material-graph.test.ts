@@ -870,14 +870,16 @@ describe("SetMaterialAttributes, PivotPainter2FoliageShader, Blend_Overlay and C
 });
 
 describe("HueShift", () => {
-  const NOTE = "HueShift: engine body unavailable; hue rotated by Input1 as a fraction of a turn";
+  const NOTE = "HueShift: engine body unavailable; hue rotated by Input0 as a fraction of a turn";
+  const IDENTITY_NOTE = "HueShift: engine body unavailable; hue-shift identity assumed for a zero or unwired Input0";
   const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
     bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  // The order the dump serializes the call in: Input0 is the scalar shift, Input1 the colour.
   const shifted = (colour: [number, number, number], shift: number | null) =>
     bake(
       makeGraph(
         [
-          engineCall("h", "HueShift", { Input0: pin("c", 0, RGB_MASK), ...(shift === null ? {} : { Input1: pin("s") }) }),
+          engineCall("h", "HueShift", { Input1: pin("c", 0, RGB_MASK), ...(shift === null ? {} : { Input0: pin("s") }) }),
           constant3("c", colour),
           node("s", "Constant", { constants: { R: shift ?? 0 } }),
         ],
@@ -885,11 +887,34 @@ describe("HueShift", () => {
       ),
     );
 
-  it("is an exact passthrough, with no approximation, for a zero or unwired shift", async () => {
+  it("reads the serialized call (Input0 = the Hue Shift scalar, Input1 = the colour product): zero keeps the colour, a third of a turn rotates it", async () => {
+    // The call as the dump serializes it: a FunctionCall whose body is not in the pack, with its shift a ScalarParameter at the default.
+    const serialized = (shift: number) =>
+      makeGraph(
+        [
+          { ...engineCall("h", "HueShift", { Input0: pin("hs"), Input1: pin("mul") }), function: "/Engine/Functions/Engine_MaterialFunctions02/HueShift.HueShift" },
+          scalarParameter("hs", "Hue Shift", shift),
+          multiply("mul", pin("t", 0, RGB_MASK), pin("tint")),
+          textureSample("t", "T_Red"),
+          constant3("tint", [0.5, 0.5, 0.5]),
+        ],
+        pin("h", 0, RGB_MASK),
+      );
+    const textures = { T_Red: { png: await flat([255, 0, 0])(), srgb: true } };
+    // Texel (255, 0, 0) is linear red and the 0.5 tint halves it: linear 0.5 is byte 188 in the red channel alone.
+    const zero = await bake(serialized(0), textures);
+    expect((await pixelsOf(zero))(0, 0)).toEqual([encode(0.5), 0, 0]);
+    if (zero.status === "baked") expect(zero).toMatchObject({ confidence: "heuristic", approximations: [IDENTITY_NOTE] });
+    const third = await bake(serialized(1 / 3), textures);
+    expect((await pixelsOf(third))(0, 0)).toEqual([0, encode(0.5), 0]);
+    if (third.status === "baked") expect(third).toMatchObject({ confidence: "heuristic", approximations: [NOTE] });
+  });
+
+  it("keeps the colour for a zero or unwired shift, but as a heuristic: the body is unavailable, so the identity is assumed", async () => {
     for (const shift of [0, null]) {
       const result = await shifted([0.5, 0.25, 0.125], shift);
       expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.5), encode(0.25), encode(0.125)]);
-      if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+      if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [IDENTITY_NOTE] });
     }
   });
 
@@ -911,12 +936,12 @@ describe("HueShift", () => {
     }
   });
 
-  it("works inside Multiply(HueShift(texture, constant), tint) and records the approximation once", async () => {
+  it("works inside Multiply(HueShift(constant, texture), tint) and records the approximation once", async () => {
     // Texel (255, 0, 0) is linear red; a third of a turn makes it green, and the 0.5 tint gives linear 0.5 = byte 188.
     const graph = makeGraph(
       [
         multiply("out", pin("h", 0, RGB_MASK), pin("tint")),
-        engineCall("h", "HueShift", { Input0: pin("t", 0, RGB_MASK), Input1: pin("s") }),
+        engineCall("h", "HueShift", { Input0: pin("s"), Input1: pin("t", 0, RGB_MASK) }),
         textureSample("t", "T_Red"),
         node("s", "Constant", { constants: { R: 1 / 3 } }),
         constant3("tint", [0.5, 0.5, 0.5]),
@@ -928,8 +953,73 @@ describe("HueShift", () => {
     if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [NOTE] });
   });
 
-  it("is unavailable without a colour input and listed as supported", async () => {
+  // The official body, read from explicit engine content, names its pins "Hue Shift Percentage" and "Texture", and its output does not
+  // load (`outputs: [null]`, no `error`). The production path falls through to this fallback, so the pins are found by those names too.
+  const loadedNull = (inputs: Raw) =>
+    node("h", "FunctionCall", {
+      inputs,
+      function: "/Engine/Functions/Engine_MaterialFunctions02/HueShift.HueShift",
+      outputNames: ["Result"],
+      fn: {
+        inputs: Object.fromEntries(Object.entries(inputs).map(([key, value]) => [key, value && (value as { node: string }).node])),
+        outputs: [null],
+        output: null,
+        engine: { version: "4.20", package: "/Engine/Functions/Engine_MaterialFunctions02/HueShift" },
+        outputNames: [""],
+      },
+    });
+
+  it("reads the loaded body's pins by name: a third of a turn rotates the colour, a zero shift keeps it as a heuristic", async () => {
+    const textures = { T_Red: { png: await flat([255, 0, 0])(), srgb: true } };
+    const loaded = (shift: number) =>
+      makeGraph(
+        [
+          loadedNull({ "Hue Shift Percentage": pin("hs"), Texture: pin("mul") }),
+          scalarParameter("hs", "Hue Shift", shift),
+          multiply("mul", pin("t", 0, RGB_MASK), pin("tint")),
+          textureSample("t", "T_Red"),
+          constant3("tint", [0.5, 0.5, 0.5]),
+        ],
+        pin("h", 0, RGB_MASK),
+      );
+    // Texel (255, 0, 0) is linear red and the 0.5 tint halves it: linear 0.5 is byte 188.
+    const third = await bake(loaded(1 / 3), textures);
+    expect((await pixelsOf(third))(0, 0)).toEqual([0, encode(0.5), 0]);
+    if (third.status === "baked") expect(third).toMatchObject({ confidence: "heuristic", approximations: [NOTE] });
+    const zero = await bake(loaded(0), textures);
+    expect((await pixelsOf(zero))(0, 0)).toEqual([encode(0.5), 0, 0]);
+    if (zero.status === "baked") expect(zero).toMatchObject({ confidence: "heuristic", approximations: [IDENTITY_NOTE] });
+  });
+
+  it("is unavailable on the loaded body without its Texture, and when a wired shift names a node the dump lacks", async () => {
+    const textures = { T_Red: { png: await flat([255, 0, 0])(), srgb: true } };
+    const noColour = await bake(makeGraph([loadedNull({ "Hue Shift Percentage": pin("hs"), Texture: null }), scalarParameter("hs", "Hue Shift", 1 / 3)], pin("h", 0, RGB_MASK)));
+    expect(noColour.status).toBe("unavailable");
+    // A wired shift is never the unwired identity, so its missing node is the reason, with either pin naming.
+    const missingCanonical = await bake(makeGraph([loadedNull({ "Hue Shift Percentage": pin("gone"), Texture: pin("t", 0, RGB_MASK) }), textureSample("t", "T_Red")], pin("h", 0, RGB_MASK)), textures);
+    expect(missingCanonical).toMatchObject({ status: "unavailable", reason: expect.stringContaining("missing node gone") });
+    const missingGeneric = await bake(makeGraph([engineCall("h", "HueShift", { Input0: pin("gone"), Input1: pin("t", 0, RGB_MASK) }), textureSample("t", "T_Red")], pin("h", 0, RGB_MASK)), textures);
+    expect(missingGeneric).toMatchObject({ status: "unavailable", reason: expect.stringContaining("missing node gone") });
+  });
+
+  it("refuses a wired pin it does not know, so a shift under another name never reads as unwired", async () => {
+    // The 5.8.3 manifest lists a different HueShift hash; that asset was not read, so its pin names are unverified.
+    const textures = { T_Red: { png: await flat([255, 0, 0])(), srgb: true } };
+    const renamed = (shift: ReturnType<typeof pin> | null) =>
+      makeGraph([loadedNull({ "Renamed Shift": shift, Texture: pin("t", 0, RGB_MASK) }), scalarParameter("hs", "Hue Shift", 1 / 3), textureSample("t", "T_Red")], pin("h", 0, RGB_MASK));
+    expect(await bake(renamed(pin("hs")), textures)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Renamed Shift") });
+    // The same pin left unwired is the unwired identity and changes nothing.
+    const unwired = await bake(renamed(null), textures);
+    expect((await pixelsOf(unwired))(0, 0)).toEqual([encode(1), 0, 0]);
+    if (unwired.status === "baked") expect(unwired).toMatchObject({ confidence: "heuristic", approximations: [IDENTITY_NOTE] });
+  });
+
+  it("is unavailable without a colour input, with or without a shift, and listed as supported", async () => {
     expect((await bake(makeGraph([engineCall("h", "HueShift", { Input1: null })], pin("h", 0, RGB_MASK)))).status).toBe("unavailable");
+    for (const shift of [0, 0.5]) {
+      const graph = makeGraph([engineCall("h", "HueShift", { Input0: pin("s"), Input1: null }), node("s", "Constant", { constants: { R: shift } })], pin("h", 0, RGB_MASK));
+      expect((await bake(graph)).status).toBe("unavailable");
+    }
     expect(supportedEngineFunctions()).toContain("HueShift");
   });
 });

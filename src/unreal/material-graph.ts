@@ -2524,17 +2524,25 @@ class Compiler {
   }
 
   /**
-   * HueShift(Input0 = colour, Input1 = shift): the engine body is not in the pack, so Input1 is read as a fraction of
-   * a full turn and the colour's hue is rotated by it (saturation and value unchanged). A zero or unwired shift is
-   * the identity and exact; anything else is a heuristic.
+   * HueShift(Input0 = shift, Input1 = colour), the order the dump serializes the call in, or the body's own pin names (Hue Shift
+   * Percentage, Texture) when the body is read but its output did not load and the call falls through to here. The engine body is
+   * not in the pack, so Input0 is read as a fraction of a full turn and the colour's hue is rotated by it (saturation and value
+   * unchanged). Every result is a heuristic: a zero or unwired shift is assumed to be the identity, which no source proves. A call
+   * with no colour is unavailable, and so is a shift wired to a node the dump lacks or a wired pin that neither layout names.
    */
   private hueShift(node: GraphNode, name: string): Compiled {
-    const colour = this.vec(this.namedPin(node, ["input0"]), `${name}.Input0`);
-    if (!colour) return this.markUnavailable(`${name} ${node.id} has no Input0 input`);
-    const wired = this.namedPin(node, ["input1"]);
-    const shift = wired ? this.vec(wired, `${name}.Input1`) : undefined;
-    if (!shift || (shift.konst && this.registers[shift.reg] === 0)) return colour;
-    this.approximations.add(`${name}: engine body unavailable; hue rotated by Input1 as a fraction of a turn`);
+    const colour = this.vec(this.namedPin(node, ["input1", "texture"]), `${name}.Input1`);
+    if (!colour) return this.markUnavailable(`${name} ${node.id} has no Input1 input`);
+    const wired = this.namedPin(node, ["input0", "hueshiftpercentage"]);
+    // An unwired shift is the identity, so a wired pin under a name neither layout uses must not pass for one.
+    const unknown = wired ? [] : Object.keys(node.inputs).filter((key) => node.inputs[key] && !["input1", "texture"].includes(pinKey(key)));
+    if (unknown.length) return this.markUnavailable(`${name} ${node.id} has a wired pin it does not know: ${unknown.join(", ")}`);
+    const shift = wired ? this.vec(wired, `${name}.Input0`) : undefined;
+    if (!shift || (shift.konst && this.registers[shift.reg] === 0)) {
+      this.approximations.add(`${name}: engine body unavailable; hue-shift identity assumed for a zero or unwired Input0`);
+      return colour;
+    }
+    this.approximations.add(`${name}: engine body unavailable; hue rotated by Input0 as a fraction of a turn`);
     return this.emit([colour, shift], colour.n, (o) => (r) => {
       const red = r[colour.reg]!;
       const green = r[colour.reg + 1]!;

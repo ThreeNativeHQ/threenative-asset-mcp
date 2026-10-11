@@ -525,7 +525,7 @@ describe("certifyTriangleAtlas: provenance", () => {
     expect(result.ownerAt(120, 120)).toBe(0);
     expect(result.exportOwnerMap()[120 * PAGE + 120]).toBe(1);
     expect(result.fingerprint).toBe(fingerprint);
-    expect(result.exportOwnerMap()).not.toBe(result.exportOwnerMap());
+    expect(Object.is(result.exportOwnerMap(), result.exportOwnerMap())).toBe(false);
   });
 
   it("fingerprints every input: equal inputs agree, a moved vertex or another remap does not", () => {
