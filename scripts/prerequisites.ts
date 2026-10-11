@@ -55,6 +55,22 @@ function runs(command: string, args: readonly string[], env: NodeJS.ProcessEnv):
   return runStatus(command, args, env) === 0;
 }
 
+/**
+ * True when `command --version` exits 0 and prints a .NET 10 SDK: the same test `modernSdkExecutable` applies to the
+ * host's `dotnet`. The output is read only to test the version and is never printed.
+ */
+function runsDotnet10(command: string, env: NodeJS.ProcessEnv): boolean {
+  const run = spawnSync(command, ["--version"], {
+    env,
+    encoding: "utf8",
+    shell: false,
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: PROBE_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  return run.error === undefined && run.status === 0 && /^10\./u.test(run.stdout.trim());
+}
+
 function isDebianLike(): boolean {
   if (!isLinux) return false;
   try {
@@ -212,10 +228,34 @@ export const PREREQUISITES: readonly Prerequisite[] = [
   commandPrerequisite("tar", "toolchain", ["--version"], "tar", "gnu-tar"),
 ];
 
-export type TestToolId = "node" | "ffmpeg" | "ffprobe" | "python-imaging" | "chromium";
+/** The SharpGLTF assemblies the modern converter ships beside its executable. */
+const SHARPGLTF_ASSEMBLIES = ["SharpGLTF.Core.dll", "SharpGLTF.Runtime.dll", "SharpGLTF.Toolkit.dll"] as const;
+
+/**
+ * Test-only entries, kept out of PREREQUISITES so `npm run doctor` never requires them. Suites reach
+ * them through prerequisiteById.
+ */
+const TEST_ONLY_PREREQUISITES: readonly Prerequisite[] = [
+  {
+    id: "modern-converter",
+    label: "modern converter (.NET 10 SDK and SharpGLTF assemblies)",
+    group: "toolchain",
+    check: (env) => {
+      const modern = join(toolchainCacheDir(env), "modern");
+      const cachedDotnet = join(modern, "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
+      // The host's dotnet first, as the provisioner orders it; the cached SDK is the fallback.
+      const sdk = runsDotnet10("dotnet", env) || runsDotnet10(cachedDotnet, env);
+      const assemblies = SHARPGLTF_ASSEMBLIES.map((assembly) => join(modern, "bin", assembly));
+      return { ok: sdk && assemblies.every((path) => fileExists(path)) };
+    },
+    fix: `npx tsx -e 'import { ensureModernConverter } from "./src/unreal/provision.ts"; ensureModernConverter(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'`,
+  },
+];
+
+export type TestToolId = "node" | "ffmpeg" | "ffprobe" | "python-imaging" | "chromium" | "modern-converter";
 
 export function prerequisiteById(id: string): Prerequisite {
-  const found = PREREQUISITES.find((entry) => entry.id === id);
+  const found = [...PREREQUISITES, ...TEST_ONLY_PREREQUISITES].find((entry) => entry.id === id);
   if (!found) throw new Error(`Unknown prerequisite: ${id}`);
   return found;
 }

@@ -6,7 +6,7 @@ import { NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { describe, expect, it, onTestFinished } from "vitest";
 
-import { chainParameters, createGraphBaker } from "../src/unreal/graph-baker.js";
+import { chainParameters, createGraphBaker, directVertexColorGraph } from "../src/unreal/graph-baker.js";
 import { parsePropsFile } from "../src/unreal/materials.js";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
 import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
@@ -93,7 +93,11 @@ function moss(): MaterialGraph {
   });
 }
 
-const instanceProps = (parent: string, overrides: [string, string][]): string =>
+const instanceProps = (
+  parent: string,
+  overrides: [string, string][],
+  extras: { scalars?: [string, number][] | undefined; vectors?: [string, [number, number, number, number]][] | undefined } = {},
+): string =>
   [
     `Parent = Material3'Content/Test/${parent}.${parent}'`,
     ...overrides.flatMap(([name, texture], index) => [
@@ -104,12 +108,196 @@ const instanceProps = (parent: string, overrides: [string, string][]): string =>
       `    ParameterName = ${name}`,
       "}",
     ]),
+    ...(extras.scalars ?? []).flatMap(([name, value], index) => [
+      `ScalarParameterValues[${index}] =`,
+      "{",
+      `    ParameterInfo = { Name=${name} }`,
+      `    ParameterValue = ${value}`,
+      "}",
+    ]),
+    ...(extras.vectors ?? []).flatMap(([name, value], index) => [
+      `VectorParameterValues[${index}] =`,
+      "{",
+      `    ParameterInfo = { Name=${name} }`,
+      `    ParameterValue = { R=${value[0]}, G=${value[1]}, B=${value[2]}, A=${value[3]} }`,
+      "}",
+    ]),
   ].join("\n");
 
 const encode = (unit: number): number => {
   const value = Math.min(1, Math.max(0, unit));
   return Math.round((value <= 0.0031308 ? value * 12.92 : 1.055 * value ** (1 / 2.4) - 0.055) * 255);
 };
+
+// BaseColor = VertexColor.RGB exactly (the Hornbeam icon master's proven composition): the mesh's COLOR_0 is the colour
+// and the graph adds nothing, so a white residual factor reproduces Unreal when glTF multiplies COLOR_0 in.
+function vertexColorDirect(materialName = "M_Master", mask: number[] | null = [1, 1, 1, 0]): MaterialGraph {
+  return materialGraphSchema.parse({
+    format: 1,
+    material: materialName,
+    package: `/Game/Test/${materialName}`,
+    truncated: false,
+    nodeCount: 2,
+    outputs: {
+      baseColor: { node: "vertex", output: 0, mask },
+      roughness: pin("rough"),
+      metallic: null,
+      emissive: null,
+      opacity: null,
+      opacityMask: null,
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes: [node("vertex", "VertexColor"), node("rough", "Constant", { constants: { R: 0 } })],
+  });
+}
+
+// Any use that is not the exact direct RGB selection: a component swizzle, an arithmetic combination, or an opacity path.
+function vertexColorSwizzled(): MaterialGraph {
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: 3,
+    outputs: {
+      baseColor: { node: "swizzle", output: 0, mask: null },
+      roughness: null,
+      metallic: null,
+      emissive: null,
+      opacity: null,
+      opacityMask: null,
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes: [
+      node("vertex", "VertexColor"),
+      node("swizzle", "ComponentMask", { inputs: { Input: pin("vertex", [1, 1, 1, 0]) }, channelMask: [0, 1, 0, 0] }),
+    ],
+  });
+}
+
+function vertexColorWithOpacity(): MaterialGraph {
+  const graph = vertexColorDirect();
+  return materialGraphSchema.parse({ ...graph, outputs: { ...graph.outputs, opacity: pin("opaque") }, nodes: [...graph.nodes, node("opaque", "Constant", { constants: { R: 1 } })] });
+}
+
+const ATTRIBUTE_OUTPUTS = ["BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal"];
+const ROUGHNESS = 3;
+const OPACITY_MASK = 6;
+const output = (nodeId: string, index: number, mask: number[] | null = null) => ({ node: nodeId, output: index, mask });
+const breakOf = (id: string, source: string): Raw => node(id, "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: ATTRIBUTE_OUTPUTS });
+const make = (id: string, baseColor: string, overrides: Raw = {}): Raw => node(id, "MakeMaterialAttributes", { inputs: { BaseColor: pin(baseColor), ...overrides } });
+const switchOf = (id: string, a: string, b: string, name: string): Raw => node(id, "StaticSwitchParameter", { inputs: { A: pin(a), B: pin(b) }, parameter: { name, group: "" }, default: true });
+const unboundTexture = (id: string): Raw => node(id, "TextureSampleParameter2D", { parameter: { name: "BaseTexture", group: "Base" }, default: null, texture: null, samplerType: "Color" });
+const textured = (id: string, texture: string, samplerType = "Color"): Raw => node(id, "TextureSample", { texture: `/Game/Test/${texture}.${texture}`, samplerType });
+const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+const constant3 = (id: string, rgb: number[]): Raw => node(id, "Constant3Vector", { constants: { Constant: [...rgb, 1].slice(0, 4) } });
+
+// Outer switch A reads the inner switch's BaseColor (unbound on inner A, so outer flips to B); outer B reads the inner
+// Roughness (bound on both), so it flips back to A. The two choices alternate forever: the switch set never settles.
+function cyclingSwitchGraph(): MaterialGraph {
+  const nodes: Raw[] = [
+    breakOf("reader", "outer"),
+    switchOf("outer", "makeA", "makeB", "UseOuter"),
+    make("makeA", "innerBreak"),
+    make("makeB", "innerRoughColour"),
+    breakOf("innerBreak", "inner"),
+    node("innerRoughColour", "Multiply", { inputs: { A: output("innerBreak", ROUGHNESS), B: pin("white") } }),
+    switchOf("inner", "innerA", "innerB", "UseInner"),
+    make("innerA", "unbound", { Roughness: pin("roughA") }),
+    make("innerB", "white", { Roughness: pin("roughB") }),
+    scalar("roughA", 0.2),
+    scalar("roughB", 0.8),
+    unboundTexture("unbound"),
+    constant3("white", [1, 1, 1]),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: output("reader", 0), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+    nodes,
+  });
+}
+
+// One switch read by both the colour and the cut-out. Branch A's OpacityMask is unbound, so on its own the colour keeps
+// A (bound) while the cut-out flips to B; the union flips to B, so the cut-out's alpha picks the BaseColor branch.
+// `vertexOnB` puts the VertexColor node on B's BaseColor path, so the probe's class report flips with the alpha too.
+function alphaSharedSwitchGraph(vertexOnB: boolean): MaterialGraph {
+  const good = textured("good", "T_InstanceMask");
+  const alt = textured("alt", "T_MasterMask");
+  const mixB: Raw = node("mixB", "Multiply", { inputs: { A: pin("alt", [1, 1, 1, 0]), B: vertexOnB ? pin("vertex", [1, 1, 1, 0]) : pin("tint", [1, 1, 1, 0]) } });
+  const nodes: Raw[] = [
+    breakOf("reader", "sw"),
+    node("sw", "StaticSwitchParameter", { inputs: { A: pin("makeA"), B: pin("makeB") }, parameter: { name: "UseA", group: "" }, default: true }),
+    node("makeA", "MakeMaterialAttributes", { inputs: { BaseColor: pin("good", [1, 1, 1, 0]), OpacityMask: pin("badMask", [1, 0, 0, 0]) } }),
+    node("makeB", "MakeMaterialAttributes", { inputs: { BaseColor: pin("mixB", [1, 1, 1, 0]), OpacityMask: pin("goodMask", [1, 0, 0, 0]) } }),
+    good,
+    alt,
+    mixB,
+    constant3("tint", [1, 1, 1]),
+    node("vertex", "VertexColor"),
+    textured("goodMask", "T_MasterMask", "LinearColor"),
+    node("badMask", "TextureSampleParameter2D", { parameter: { name: "Unbound", group: "Base" }, default: null, texture: null, samplerType: "LinearColor" }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: {
+      baseColor: output("reader", 0, [1, 1, 1, 0]),
+      roughness: null,
+      metallic: null,
+      emissive: null,
+      opacity: null,
+      opacityMask: output("reader", OPACITY_MASK, [1, 0, 0, 0]),
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes,
+  });
+}
+
+
+function vertexColorWithAttributes(): MaterialGraph {
+  const graph = vertexColorDirect();
+  return materialGraphSchema.parse({
+    ...graph,
+    outputs: { ...graph.outputs, materialAttributes: pin("attrs") },
+    nodes: [...graph.nodes,
+      node("attrs", "MakeMaterialAttributes", { inputs: { BaseColor: pin("otherColour"), Roughness: pin("otherRoughness") } }),
+      node("otherColour", "Constant3Vector", { constants: { Constant: [1, 0, 0, 1] } }),
+      node("otherRoughness", "Constant", { constants: { R: 0.7 } }),
+    ],
+  });
+}
+
+// The direct VertexColor graph with Roughness and Metallic wired to the given pins (absent: unconnected) and the extra nodes they reach.
+function vertexColorScalars(outputs: { roughness?: Raw | null; metallic?: Raw | null }, nodes: Raw[] = []): MaterialGraph {
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length + 1,
+    outputs: {
+      baseColor: { node: "vertex", output: 0, mask: [1, 1, 1, 0] },
+      roughness: outputs.roughness ?? null,
+      metallic: outputs.metallic ?? null,
+      emissive: null,
+      opacity: null,
+      opacityMask: null,
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes: [node("vertex", "VertexColor"), ...nodes],
+  });
+}
 
 async function firstPixel(png: Buffer | Uint8Array): Promise<number[]> {
   const { data } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
@@ -339,6 +527,91 @@ describe("createGraphBaker", () => {
     expect((await plain({ materialName: "s", lookupName: "MI_Rock", assets, readProps, objectRadius: () => { throw new Error("radius asked for a graph that does not read it"); } })).status).toBe("baked");
   });
 
+  it("probes the BaseColor textures of a readable path only, never those a partial compile reaches past an unsupported node", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    // BaseColor = mask x SmoothThreshold(mask): the SmoothThreshold function has no body in the pack, so the bake cannot run.
+    const blocked = materialGraphSchema.parse({
+      format: 1,
+      material: "M_Master",
+      package: "/Game/Test/M_Master",
+      truncated: false,
+      nodeCount: 3,
+      outputs: { baseColor: pin("mul", [1, 1, 1, 0]), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+      nodes: [
+        node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: "/Game/Test/T_MasterMask.T_MasterMask", samplerType: "Masks" }),
+        node("gate", "FunctionCall", { function: "/Engine/Functions/Engine_MaterialFunctions02/SmoothThreshold", inputs: { Input0: pin("mask", [1, 1, 1, 0]) } }),
+        node("mul", "Multiply", { inputs: { A: pin("mask", [1, 1, 1, 0]), B: pin("gate") } }),
+      ],
+    });
+    const probeBlocked = createGraphBaker({ sourceDir, dumpGraphs: async () => new Map([["M_Master", blocked]]) })!;
+    const blockedOutcome = await probeBlocked({ materialName: "MI_Rock", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(blockedOutcome.baseColourTextures).toBeUndefined();
+
+    const probeReadable = createGraphBaker({ sourceDir, dumpGraphs: async () => new Map([["M_Master", masterGraph()]]) })!;
+    const readableOutcome = await probeReadable({ materialName: "MI_Rock", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(readableOutcome.baseColourTextures).toEqual(["T_InstanceMask"]);
+  });
+
+  it("omits vertexColorOnBaseColor on a probe whose switch choices never settle, rather than claim it does not read VertexColor", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const cycle = createGraphBaker({ sourceDir, dumpGraphs: async () => new Map([["M_Master", cyclingSwitchGraph()]]) })!;
+    const outcome = await cycle({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(outcome.status).toBe("unavailable");
+    // The active path describes no bake, so the probe must not say `false`: the importer would drop the mesh's COLOR_0.
+    expect(outcome.vertexColorOnBaseColor).toBeUndefined();
+    expect(outcome.baseColourTextures).toBeUndefined();
+  });
+
+  it("settles a shared switch with the requested cut-out, so the probe names the BaseColor branch the bake samples", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const graph = alphaSharedSwitchGraph(false);
+    const make = (it: MaterialGraph) => createGraphBaker({ sourceDir, maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", it]]) })!;
+
+    // Cache-catch order: the masked probe first, the opaque one second on the same asset index. A path cache keyed
+    // without the alpha would hand the opaque probe the masked branch's texture.
+    const maskedFirst = make(graph);
+    const masked = await maskedFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true, alpha: "opacityMask" });
+    expect(masked.baseColourTextures).toEqual(["T_MasterMask"]);
+    const opaque = await maskedFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(opaque.baseColourTextures).toEqual(["T_InstanceMask"]);
+
+    // The other order on a fresh baker proves the key carries the alpha, not just the first probe that filled it.
+    const opaqueFirst = make(graph);
+    expect((await opaqueFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true })).baseColourTextures).toEqual(["T_InstanceMask"]);
+    expect((await opaqueFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true, alpha: "opacityMask" })).baseColourTextures).toEqual(["T_MasterMask"]);
+
+    // The bake of each alpha samples the same texture the probe named for it.
+    const maskedBake = await maskedFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps, alpha: "opacityMask" });
+    if (maskedBake.status !== "baked") throw new Error(`expected a bake, got ${maskedBake.status}`);
+    expect(maskedBake.texturesUsed).toEqual(["T_MasterMask"]);
+    const opaqueBake = await maskedFirst({ materialName: "s", lookupName: "MI_Rock", assets, readProps });
+    if (opaqueBake.status !== "baked") throw new Error(`expected a bake, got ${opaqueBake.status}`);
+    expect(opaqueBake.texturesUsed).toEqual(["T_InstanceMask"]);
+  });
+
+  it("changes the active BaseColor classes with the cut-out, so the probe's VertexColor report follows the bake's branch", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", alphaSharedSwitchGraph(true)]]) })!;
+
+    // With the cut-out the union flips the switch to B, whose BaseColor reads VertexColor: the probe keeps the class even
+    // though the probe compile cannot evaluate VertexColor, and names no textures (the existing, preserved contract).
+    const masked = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true, alpha: "opacityMask" });
+    expect(masked.vertexColorOnBaseColor).toBe(true);
+    expect(masked.baseColourTextures).toBeUndefined();
+
+    const opaque = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, probe: true });
+    expect(opaque.vertexColorOnBaseColor).toBe(false);
+    expect(opaque.baseColourTextures).toEqual(["T_InstanceMask"]);
+
+    // The bake takes the same branch: with the cut-out B (T_MasterMask and VertexColor), without it A.
+    const maskedBake = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps, alpha: "opacityMask", vertexColor: [1, 1, 1, 1] });
+    if (maskedBake.status !== "baked") throw new Error(`expected a bake, got ${maskedBake.status}`);
+    expect(maskedBake.texturesUsed).toEqual(["T_MasterMask"]);
+    const opaqueBake = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps });
+    if (opaqueBake.status !== "baked") throw new Error(`expected a bake, got ${opaqueBake.status}`);
+    expect(opaqueBake.texturesUsed).toEqual(["T_InstanceMask"]);
+  });
+
   it("is unavailable without a source package and does not touch the converter", async () => {
     const { sourceDir, assets, readProps } = await fixture();
     let dumps = 0;
@@ -432,6 +705,110 @@ describe("createGraphBaker", () => {
     expect(outcome.status).toBe("unsupported");
     expect(outcome.status === "unsupported" && outcome.unsupported).toContain("VertexColor");
   });
+
+  it("bakes a neutral residual for a flagged exact VertexColor graph and keeps the colour out of the PNG", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const baker = createGraphBaker({
+      sourceDir,
+      maxTextureSize: 8,
+      dumpGraphs: async () => new Map([["M_Master", vertexColorDirect()]]),
+    })!;
+    const request = { materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps };
+    const flagged = await baker({ ...request, directVertexColor: true });
+    expect(flagged.status).toBe("baked");
+    expect(flagged.status === "baked" && flagged.vertexColorResidual).toBe(true);
+    expect(flagged.status === "baked" && flagged.confidence).toBe("exact");
+    expect(await firstPixel(flagged.status === "baked" ? flagged.png : Buffer.alloc(4))).toEqual([255, 255, 255]);
+    // The same assets and parameters asked without the guarantee flag is a different result under a different cache key.
+    const unflagged = await baker(request);
+    expect(unflagged.status).toBe("unsupported");
+  });
+
+  it("accepts a null output-0 mask but rejects every other VertexColor use", () => {
+    expect(directVertexColorGraph(vertexColorDirect("M_Master", null))).toBe(true);
+    expect(directVertexColorGraph(vertexColorDirect())).toBe(true);
+    expect(directVertexColorGraph(vertexColorSwizzled())).toBe(false);
+    expect(directVertexColorGraph(masterGraph("vertex-color"))).toBe(false);
+    expect(directVertexColorGraph(vertexColorWithOpacity())).toBe(false);
+    expect(directVertexColorGraph(vertexColorWithAttributes())).toBe(false);
+    expect(directVertexColorGraph({ ...vertexColorDirect(), truncated: true })).toBe(false);
+    expect(directVertexColorGraph({ ...vertexColorDirect(), error: "unreadable" })).toBe(false);
+    const outputs = { ...vertexColorDirect().outputs, baseColor: { node: "vertex", output: 1, mask: null } };
+    expect(directVertexColorGraph({ ...vertexColorDirect(), outputs })).toBe(false);
+  });
+
+  it("never lowers a swizzle, arithmetic or opacity VertexColor graph even when the flag is set", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    for (const graph of [vertexColorSwizzled(), masterGraph("vertex-color"), vertexColorWithOpacity(), vertexColorWithAttributes()]) {
+      const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+      const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
+      expect(outcome.status).toBe("unsupported");
+      expect(outcome.vertexColorResidual).toBeUndefined();
+    }
+  });
+
+  it("reports a flagged direct VertexColor graph unavailable when the graph is truncated or errored", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    for (const graph of [{ ...vertexColorDirect(), truncated: true }, { ...vertexColorDirect(), error: "unreadable" }]) {
+      const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+      const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
+      expect(outcome.status).toBe("unavailable");
+      expect(outcome.vertexColorResidual).toBeUndefined();
+    }
+  });
+
+  it("carries the literal Roughness and Metallic on the cached residual outcome, an omitted R being 0", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const graph = vertexColorScalars({ roughness: pin("rough"), metallic: pin("metal") }, [
+      node("rough", "Constant", { constants: { R: 0.25 } }),
+      node("metal", "Constant", { constants: {} }),
+    ]);
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+    const request = { materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true };
+    const first = await baker(request);
+    expect(first.status === "baked" && first.pbrFactors).toEqual({ roughness: 0.25, metallic: 0 });
+    // The same request is answered from the memo, so the factors come back with the cached residual.
+    expect(await baker(request)).toBe(first);
+  });
+
+  it("accepts a literal on output 0 with a null or R-only mask, at either end of [0, 1]", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const cases: Array<[string, MaterialGraph, number]> = [
+      ["an R-only mask", vertexColorScalars({ roughness: pin("rough", [1, 0, 0, 0]) }, [node("rough", "Constant", { constants: { R: 0.25 } })]), 0.25],
+      ["an upper bound of 1", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 1 } })]), 1],
+      ["a lower bound of 0", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 0 } })]), 0],
+    ];
+    for (const [label, graph, expected] of cases) {
+      const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+      const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
+      expect(outcome.status === "baked" && outcome.pbrFactors?.roughness, label).toBe(expected);
+    }
+  });
+
+  it("withholds the factor for any pin, node or value it cannot prove, and the residual itself still bakes", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    const constant = (R: unknown) => node("rough", "Constant", { constants: { R } });
+    const cases: Array<[string, MaterialGraph]> = [
+      ["an unconnected Roughness", vertexColorScalars({}, [constant(0.25)])],
+      ["a Roughness from output 1", vertexColorScalars({ roughness: { node: "rough", output: 1, mask: null } }, [constant(0.25)])],
+      ["a Roughness with a G-only mask", vertexColorScalars({ roughness: pin("rough", [0, 1, 0, 0]) }, [constant(0.25)])],
+      ["a Roughness above 1", vertexColorScalars({ roughness: pin("rough") }, [constant(1.5)])],
+      ["a negative Roughness", vertexColorScalars({ roughness: pin("rough") }, [constant(-0.5)])],
+      ["a Roughness written as a string", vertexColorScalars({ roughness: pin("rough") }, [constant("0.25")])],
+      ["a Roughness written as an array", vertexColorScalars({ roughness: pin("rough") }, [constant([0.25])])],
+      ["a Roughness read from a parameter", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "ScalarParameter", { parameter: { name: "Roughness", group: "" }, default: 0.25 })])],
+      ["a Constant with a wired input", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { inputs: { A: pin("vertex") }, constants: { R: 0.25 } })])],
+      ["a Roughness whose node is missing", vertexColorScalars({ roughness: pin("gone") })],
+      ["a Roughness whose node failed to load", vertexColorScalars({ roughness: pin("rough") }, [{ id: "rough", class: "Constant", error: "unreadable" }])],
+    ];
+    for (const [label, graph] of cases) {
+      const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["M_Master", graph]]) })!;
+      const outcome = await baker({ materialName: "MI_Rock_s", lookupName: "MI_Rock", assets, readProps, directVertexColor: true });
+      expect(outcome.status, label).toBe("baked");
+      expect(outcome.vertexColorResidual, label).toBe(true);
+      expect(outcome.pbrFactors, label).toBeUndefined();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------
@@ -493,7 +870,36 @@ process.exit(run.status === null ? 1 : run.status);
   await chmod(path, 0o755);
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number] }) {
+/**
+ * The parent's EmissiveColor default (the collected block UE Viewer writes for a parent value) and the instance's override of
+ * the Emissive switch, in the layout `materials.ts` reads.
+ */
+function emissiveProps(options: { collectedEmissive?: readonly number[] | undefined; switchOverride?: boolean | undefined }): string {
+  const lines: string[] = [];
+  if (options.collectedEmissive) {
+    const [r, g, b, a] = options.collectedEmissive;
+    lines.push("CollectedVectorParameters[1] =", "{", "    CollectedVectorParameters[0] =", "    {", `        Value = { R=${r}, G=${g}, B=${b}, A=${a} }`, "        Name = EmissiveColor", "    }", "}");
+  }
+  if (options.switchOverride !== undefined) {
+    lines.push(
+      "StaticParameters =",
+      "{",
+      "    StaticSwitchParameters[1] =",
+      "    {",
+      "        StaticSwitchParameters[0] =",
+      "        {",
+      "            ParameterInfo = { Name=Emissive }",
+      `            Value = ${options.switchOverride}`,
+      "            bOverride = true",
+      "        }",
+      "    }",
+      "}",
+    );
+  }
+  return lines.length > 0 ? `\n${lines.join("\n")}` : "";
+}
+
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean; collectedEmissive?: [number, number, number, number]; switchOverride?: boolean; emissiveTexture?: boolean; inputEmissive?: { factor?: [number, number, number]; texture?: boolean }; inputBaseColorTexture?: boolean; emptyToolchain?: boolean }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -503,14 +909,48 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   await writeFile(join(content, "Mesh.uasset"), Buffer.alloc(16));
   await writeFile(join(content, "MI_Rock.uasset"), Buffer.alloc(16));
   await writeFile(join(content, "M_Master.uasset"), Buffer.alloc(16));
+  const overrides: [string, string][] = options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]];
+  // A packed roughness texture (SpecPower binds the metallicRoughness slot): a constant factor must not multiply into it.
+  if (options.packedRoughness) overrides.push(["SpecPower", "T_Spec"]);
+  // An Emissive texture the instance binds: the stale-emission case drops it with the factor.
+  if (options.emissiveTexture) overrides.push(["Emissive", "T_InstanceGlow"]);
   // The exporter binds nothing to MI_Rock: its colour exists only in the graph.
   await writeMeshFixture(exported, {
     name: "Mesh",
     materialName: "MI_Rock",
     mat: "",
-    props: instanceProps("M_Master", options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]]),
+    props:
+      instanceProps("M_Master", overrides, {
+        scalars: options.instanceScalars,
+        vectors: options.instanceTint ? [["Base Color Tint", options.instanceTint]] : undefined,
+      }) + emissiveProps({ collectedEmissive: options.collectedEmissive, switchOverride: options.switchOverride }),
     textures: [],
   });
+  if (options.inputEmissive || options.inputBaseColorTexture) {
+    // The converter can leave a base-colour or emissive texture, or an emissive factor, on the input glTF material, which the
+    // .mat/.props the resolver reads never mentions. The graph proof must preserve the base colour and handle the emission.
+    const io = new NodeIO();
+    const document = await io.read(join(exported, "Mesh.gltf"));
+    const inputMaterial = document.getRoot().listMaterials()[0]!;
+    const solidPng = async (rgba: readonly [number, number, number]) => {
+      const pixels = Buffer.alloc(2 * 2 * 4);
+      for (let index = 0; index < 4; index += 1) {
+        pixels[index * 4] = rgba[0];
+        pixels[index * 4 + 1] = rgba[1];
+        pixels[index * 4 + 2] = rgba[2];
+        pixels[index * 4 + 3] = 255;
+      }
+      return sharp(pixels, { raw: { width: 2, height: 2, channels: 4 } }).png().toBuffer();
+    };
+    if (options.inputBaseColorTexture) {
+      inputMaterial.setBaseColorTexture(document.createTexture("T_InputAlbedo").setImage(new Uint8Array(await solidPng([120, 90, 60]))).setMimeType("image/png"));
+    }
+    if (options.inputEmissive?.factor) inputMaterial.setEmissiveFactor([...options.inputEmissive.factor]);
+    if (options.inputEmissive?.texture) {
+      inputMaterial.setEmissiveTexture(document.createTexture("T_InputGlow").setImage(new Uint8Array(await solidPng([255, 200, 80]))).setMimeType("image/png"));
+    }
+    await io.write(join(exported, "Mesh.gltf"), document);
+  }
   if (options.normal) {
     const io = new NodeIO();
     const document = await io.read(join(exported, "Mesh.gltf"));
@@ -526,8 +966,20 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     primitive.setAttribute("COLOR_0", document.createAccessor("COLOR_0").setType("VEC4").setArray(new Float32Array([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1])).setBuffer(document.getRoot().listBuffers()[0]!));
     await io.write(join(exported, "Mesh.gltf"), document);
   }
+  // The textures the graph names are packages in the pack; the baker exports the exact one from source, never a same-named PNG
+  // the mesh export happened to carry.
+  await writeFile(join(content, "T_InstanceMask.uasset"), Buffer.alloc(16));
+  await writeFile(join(content, "T_MasterMask.uasset"), Buffer.alloc(16));
   await writePng(join(exported, "T_InstanceMask.png"), [200, 100, 50, 255], 4);
   await writePng(join(exported, "T_MasterMask.png"), [10, 10, 10, 255], 4);
+  if (options.packedRoughness) {
+    await writeFile(join(content, "T_Spec.uasset"), Buffer.alloc(16));
+    await writePng(join(exported, "T_Spec.png"), [128, 128, 128, 255], 4);
+  }
+  if (options.emissiveTexture) {
+    await writeFile(join(content, "T_InstanceGlow.uasset"), Buffer.alloc(16));
+    await writePng(join(exported, "T_InstanceGlow.png"), [255, 200, 80, 255], 4);
+  }
   const umodel = join(root, "umodel");
   const textureLog = join(root, "texture-exports.log");
   const cacheDir = join(root, "cache");
@@ -554,9 +1006,15 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     onlyPackages: ["Mesh"],
     concurrency: 1,
     freeSpaceBytes: 30_000_000_000,
-    environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: cacheDir },
+    environment: {
+      ...process.env,
+      THREENATIVE_UNREAL_CACHE_DIR: cacheDir,
+      // An empty toolchain with auto-install off: the graph baker must fail to provision and never download anything.
+      ...(options.emptyToolchain ? { THREENATIVE_TOOLCHAIN_AUTOINSTALL: "0", THREENATIVE_TOOLCHAIN_DIR: join(root, "toolchain") } : {}),
+    },
     umodel: { name: "umodel", path: umodel, version: "fixture" },
-    modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+    // No converter injected when the toolchain is empty: the graph baker must resolve-or-fail, never provision.
+    ...(options.emptyToolchain ? {} : { modernConverter: { name: "modern", path: converter, version: "fake-converter 1" } }),
     ...(options.graphBake === undefined ? {} : { graphBake: options.graphBake }),
   });
   const glb = await new NodeIO().read(join(outputDir, report.models[0]!.glb));
@@ -564,7 +1022,8 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   const dumped = await readFile(converterLog, "utf8").catch(() => "");
   const leftovers = await readdir(cacheDir, { recursive: true }).catch(() => [] as string[]);
   const textureExports = (await readFile(textureLog, "utf8").catch(() => "")).split("\n").filter(Boolean);
-  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, dumped, leftovers, textureExports };
+  const toolchain = await readdir(join(root, "toolchain"), { recursive: true }).catch(() => [] as string[]);
+  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, glb, dumped, leftovers, textureExports, toolchain };
 }
 
 describe("importUnrealDirectory surface-driven graph bake", () => {
@@ -622,6 +1081,17 @@ describe("importUnrealDirectory graph bake", () => {
     expect(report.materialCoverage.graphBaked).toBe(0);
   });
 
+  it("keeps COLOR_0 when the graph's switch choices never settle, instead of dropping it on an unknown path", async () => {
+    const { report, glb, material } = await importWithGraph({ graph: cyclingSwitchGraph(), vertexColors: true });
+    // The probe cannot say the BaseColor path reads VertexColor: it never settles, so COLOR_0 must survive.
+    const primitive = glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    expect([...primitive.getAttribute("COLOR_0")!.getArray()!]).toEqual([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.limitations.join("\n")).not.toContain("COLOR_0");
+    // The same refusal leaves the section on the neutral fallback.
+    expect(material.getBaseColorTexture()).toBeNull();
+  });
+
   it("evaluates VertexColor as white for a mesh without COLOR_0 and reports the approximation", async () => {
     const { report, material } = await importWithGraph({ graph: masterGraph("vertex-color") });
     const texture = material.getBaseColorTexture();
@@ -634,21 +1104,253 @@ describe("importUnrealDirectory graph bake", () => {
     expect(section.bindings).toContainEqual(expect.objectContaining({ source: "graph", confidence: "heuristic" }));
     expect(report.materialCoverage.graphBaked).toBe(1);
   });
+
+  it("bakes a white residual for a direct VertexColor graph and keeps the mesh's COLOR_0 colours exact", async () => {
+    const { report, onDisk, material, glb } = await importWithGraph({ graph: vertexColorDirect(), vertexColors: true });
+    const texture = material.getBaseColorTexture();
+    expect(texture).not.toBeNull();
+    // Neutral residual: the actual colour is not in the PNG.
+    expect(await firstPixel(texture!.getImage()!)).toEqual([255, 255, 255]);
+    // White factor, so glTF's factor x texture x COLOR_0 equals Unreal's VertexColor (no 0.8 dimming).
+    expect(material.getBaseColorFactor()).toEqual([1, 1, 1, 1]);
+    expect(material.getAlphaMode()).toBe("OPAQUE");
+    const primitive = glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    expect([...primitive.getAttribute("COLOR_0")!.getArray()!]).toEqual([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.graph).toMatchObject({ status: "baked", confidence: "exact", unsupportedNodes: [], vertexColorResidual: true });
+    // No false "mesh carries no vertex colours" note: the mesh does carry them.
+    expect(section.graph?.approximations.join("\n")).not.toContain("the mesh carries no vertex colours");
+    expect(section.limitations.join("\n")).toContain("COLOR_0 supplies the base colour");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ source: "graph", confidence: "exact" }));
+    expect(onDisk.models[0]!.materials[0]!.graph?.vertexColorResidual).toBe(true);
+  });
+
+  it("keeps an OPAQUE direct VertexColor section when an unused instance Opacity scalar and tint alpha are present", async () => {
+    // Regression: the direct VertexColor graph proves there is no alpha path (no Opacity/OpacityMask output), so an
+    // unused instance scalar Opacity and a tint alpha of 0.5 must not lower the proved-OPAQUE section to BLEND. Doing
+    // so let COLOR_0's alpha decide visibility and broke the prerequisite that the mesh's COLOR_0 is the colour.
+    const { report, material, glb } = await importWithGraph({
+      graph: vertexColorDirect(),
+      vertexColors: true,
+      instanceScalars: [["Opacity", 0.5]],
+      instanceTint: [1, 1, 1, 0.5],
+    });
+    const texture = material.getBaseColorTexture();
+    expect(texture).not.toBeNull();
+    // The residual stays the exact identity: no tint alpha folded into the factor, no 0.8 dimming.
+    expect(await firstPixel(texture!.getImage()!)).toEqual([255, 255, 255]);
+    expect(material.getBaseColorFactor()).toEqual([1, 1, 1, 1]);
+    expect(material.getAlphaMode()).toBe("OPAQUE");
+    const primitive = glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    expect([...primitive.getAttribute("COLOR_0")!.getArray()!]).toEqual([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.graph).toMatchObject({ status: "baked", confidence: "exact", vertexColorResidual: true });
+    expect(section.limitations.join("\n")).toContain("COLOR_0 supplies the base colour");
+  });
+
+  it("keeps default white for a direct VertexColor graph on a mesh that carries no COLOR_0", async () => {
+    const { report, material, glb } = await importWithGraph({ graph: vertexColorDirect() });
+    const texture = material.getBaseColorTexture();
+    expect(texture).not.toBeNull();
+    expect(await firstPixel(texture!.getImage()!)).toEqual([255, 255, 255]);
+    expect(material.getBaseColorFactor()).toEqual([1, 1, 1, 1]);
+    // No invented colour buffer: a glTF client leaves the base colour at the white factor, like Unreal's default node.
+    expect(glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!.getAttribute("COLOR_0")).toBeNull();
+    const section = report.models[0]!.materials[0]!;
+    expect(section.graph).toMatchObject({ status: "baked", confidence: "heuristic" });
+    expect(section.graph?.vertexColorResidual).toBeUndefined();
+    expect(section.graph?.approximations.join("\n")).toContain("VertexColor evaluated as white: the mesh carries no vertex colours");
+  });
+
+  it("applies a literal Roughness and Metallic to the GLB and report, an omitted R being Unreal's default 0", async () => {
+    const graph = vertexColorScalars({ roughness: pin("rough"), metallic: pin("metal") }, [
+      node("rough", "Constant", { constants: {} }),
+      node("metal", "Constant", { constants: { R: 1 } }),
+    ]);
+    const { report, onDisk, material } = await importWithGraph({ graph, vertexColors: true });
+    expect(material.getRoughnessFactor()).toBe(0);
+    expect(material.getMetallicFactor()).toBe(1);
+    for (const reported of [report, onDisk]) {
+      const section = reported.models[0]!.materials[0]!;
+      expect(section.factors).toMatchObject({ roughness: 0, metallic: 1 });
+      expect(section.limitations.join("\n")).toContain("Roughness 0, Metallic 1");
+    }
+  });
+
+  it("carries a literal Roughness of 0.25 through the GLB and report, and an unused instance Roughness of 0.8 does not override it", async () => {
+    const graph = vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 0.25 } })]);
+    const { report, onDisk, material } = await importWithGraph({ graph, vertexColors: true, instanceScalars: [["Roughness", 0.8]] });
+    expect(material.getRoughnessFactor()).toBe(0.25);
+    for (const reported of [report, onDisk]) {
+      const section = reported.models[0]!.materials[0]!;
+      expect(section.factors.roughness).toBe(0.25);
+      expect(section.graph).toMatchObject({ status: "baked", vertexColorResidual: true });
+    }
+  });
+
+  it("keeps the 0.8 fallback when the graph's Roughness is not a proven literal: out of range, another output, or a parameter", async () => {
+    const cases: Array<[string, MaterialGraph]> = [
+      ["out of range", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 1.5 } })])],
+      ["output 1", vertexColorScalars({ roughness: { node: "rough", output: 1, mask: null } }, [node("rough", "Constant", { constants: { R: 0.25 } })])],
+      ["a parameter", vertexColorScalars({ roughness: pin("rough") }, [node("rough", "ScalarParameter", { parameter: { name: "Roughness", group: "" }, default: 0.25 })])],
+    ];
+    for (const [label, graph] of cases) {
+      const { report, material } = await importWithGraph({ graph, vertexColors: true });
+      const section = report.models[0]!.materials[0]!;
+      expect(material.getRoughnessFactor(), label).toBe(0.8);
+      expect(section.factors.roughness, label).toBe(0.8);
+      expect(section.graph, label).toMatchObject({ status: "baked", vertexColorResidual: true });
+      expect(section.limitations.join("\n"), label).not.toContain("literal Constant");
+    }
+  });
+
+  it("does not multiply a literal Roughness into a packed metallicRoughness texture, and records that the constant is not applied", async () => {
+    const graph = vertexColorScalars({ roughness: pin("rough") }, [node("rough", "Constant", { constants: { R: 0.25 } })]);
+    const { report, material } = await importWithGraph({ graph, vertexColors: true, packedRoughness: true });
+    const section = report.models[0]!.materials[0]!;
+    expect(material.getMetallicRoughnessTexture()).not.toBeNull();
+    // The packed path keeps its own factors (metallic 0, roughness 1), so the texture's channels stand unscaled.
+    expect(material.getMetallicFactor()).toBe(0);
+    expect(material.getRoughnessFactor()).toBe(1);
+    expect(section.limitations.join("\n")).toContain("not applied");
+    expect(section.graph).toMatchObject({ status: "baked", vertexColorResidual: true });
+  });
+});
+
+/**
+ * The Jungle master's shape in the importer's fixture: BaseColor is Mask x tint, and EmissiveColor is the Emissive switch
+ * (stored default `switchStored`) between a glow and a zero constant. `glowOnly` wires the glow straight in instead, and
+ * `equalBounds` wires a SmoothStep of two equal parameters, which has no defined GPU result and so no zero proof.
+ */
+function emissionMaster(options: { switchStored?: boolean; glowOnly?: boolean; truncated?: boolean; equalBounds?: boolean } = {}): MaterialGraph {
+  const stored = options.switchStored ?? false;
+  const nodes: Raw[] = [
+    node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: "/Game/Test/T_MasterMask.T_MasterMask", samplerType: "Masks" }),
+    node("tint", "Constant3Vector", { constants: { Constant: [0.5, 0.25, 1, 1] } }),
+    node("mul", "Multiply", { inputs: { A: pin("mask", [1, 1, 1, 0]), B: pin("tint") } }),
+    node("glow", "VectorParameter", { parameter: { name: "EmissiveColor", group: "" }, default: [1, 1, 1, 0] }),
+    node("zero", "Constant3Vector", { constants: { Constant: [0, 0, 0, 1] } }),
+    node("switch", "StaticSwitchParameter", { parameter: { name: "Emissive", group: "6 Emissive" }, default: stored, switchValue: stored, inputs: { A: pin("glow"), B: pin("zero") } }),
+    ...(options.equalBounds
+      ? [
+          node("lo", "ScalarParameter", { parameter: { name: "Lo", group: "" }, default: 0.5 }),
+          node("hi", "ScalarParameter", { parameter: { name: "Hi", group: "" }, default: 0.5 }),
+          node("v", "Constant", { constants: { R: 0.25 } }),
+          node("step", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }),
+        ]
+      : []),
+    node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("mul"), EmissiveColor: pin(options.equalBounds ? "step" : options.glowOnly ? "glow" : "switch") } }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: options.truncated ?? false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: pin("make") },
+    nodes,
+  });
+}
+
+describe("importUnrealDirectory emission proof", () => {
+  it("drops a stale white EmissiveColor the graph proves zero: the Emissive switch is off and no other path draws it", async () => {
+    const { report, onDisk, material } = await importWithGraph({ graph: emissionMaster(), collectedEmissive: [1, 1, 1, 0] });
+    expect(material.getEmissiveFactor()).toEqual([0, 0, 0]);
+    for (const reported of [report, onDisk]) {
+      expect(reported.models[0]!.materials[0]!.limitations.join("\n")).toContain("source-proven zero emission");
+    }
+  });
+
+  it("drops a stale Emissive texture with the factor, and nothing later reintroduces the factor", async () => {
+    const { material } = await importWithGraph({ graph: emissionMaster(), collectedEmissive: [1, 1, 1, 0], emissiveTexture: true });
+    expect(material.getEmissiveTexture()).toBeNull();
+    expect(material.getEmissiveFactor()).toEqual([0, 0, 0]);
+  });
+
+  it("keeps the stale EmissiveColor when the instance overrides the Emissive switch on", async () => {
+    const { report, material } = await importWithGraph({ graph: emissionMaster(), collectedEmissive: [1, 1, 1, 0], switchOverride: true });
+    expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+    expect(report.models[0]!.materials[0]!.limitations.join("\n")).not.toContain("source-proven zero emission");
+  });
+
+  it("keeps it when the stored switch is on, and when the graph's EmissiveColor is a glow with no switch", async () => {
+    for (const graph of [emissionMaster({ switchStored: true }), emissionMaster({ glowOnly: true })]) {
+      const { material } = await importWithGraph({ graph, collectedEmissive: [1, 1, 1, 0] });
+      expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+    }
+  });
+
+  it("keeps it when the graph cannot be read in full", async () => {
+    const { material } = await importWithGraph({ graph: emissionMaster({ truncated: true }), collectedEmissive: [1, 1, 1, 0] });
+    expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+  });
+
+  // Equal parameter bounds: the bake refuses the SmoothStep, so the proof is not made and the stale factor and texture stay.
+  it("keeps the stale emissive factor and texture when EmissiveColor is a SmoothStep of two equal parameters", async () => {
+    const { report, material } = await importWithGraph({ graph: emissionMaster({ equalBounds: true }), collectedEmissive: [1, 1, 1, 0], emissiveTexture: true });
+    expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+    expect(material.getEmissiveTexture()).not.toBeNull();
+    expect(report.models[0]!.materials[0]!.limitations.join("\n")).not.toContain("source-proven zero emission");
+  });
+
+  // The resolver metadata never carries the input glTF material's own emissive slots, so those must trigger the probe too.
+  it("drops an emissive factor the input glTF material carries, the slot the resolver metadata never sees", async () => {
+    const { material } = await importWithGraph({ graph: emissionMaster(), inputEmissive: { factor: [1, 0.5, 0.2] } });
+    expect(material.getEmissiveFactor()).toEqual([0, 0, 0]);
+    expect(material.getEmissiveTexture()).toBeNull();
+  });
+
+  it("drops an emissive texture the input glTF material carries, alone and together with a factor", async () => {
+    const textureOnly = await importWithGraph({ graph: emissionMaster(), inputEmissive: { texture: true } });
+    expect(textureOnly.material.getEmissiveTexture()).toBeNull();
+    expect(textureOnly.material.getEmissiveFactor()).toEqual([0, 0, 0]);
+    const both = await importWithGraph({ graph: emissionMaster(), inputEmissive: { factor: [1, 0.5, 0.2], texture: true } });
+    expect(both.material.getEmissiveTexture()).toBeNull();
+    expect(both.material.getEmissiveFactor()).toEqual([0, 0, 0]);
+  });
+
+  it("keeps the input glTF emission when the graph's emission is active, and when the proof is unavailable", async () => {
+    const active = await importWithGraph({ graph: emissionMaster({ glowOnly: true }), inputEmissive: { factor: [1, 0.5, 0.2], texture: true } });
+    expect(active.material.getEmissiveFactor()).toEqual([1, 0.5, 0.2]);
+    expect(active.material.getEmissiveTexture()).not.toBeNull();
+    const unknown = await importWithGraph({ graph: emissionMaster({ truncated: true }), inputEmissive: { factor: [1, 0.5, 0.2], texture: true } });
+    expect(unknown.material.getEmissiveFactor()).toEqual([1, 0.5, 0.2]);
+    expect(unknown.material.getEmissiveTexture()).not.toBeNull();
+  });
+
+  // With no toolchain and auto-install off, the proof is unavailable rather than attempted: a section with a resolved base
+  // colour and stale emission keeps both, and the import provisions nothing.
+  it("preserves an existing base colour and stale emission when an empty toolchain cannot prove zero, installing nothing", async () => {
+    const { report, material, toolchain, leftovers } = await importWithGraph({
+      graph: emissionMaster(),
+      collectedEmissive: [1, 1, 1, 0],
+      inputBaseColorTexture: true,
+      emptyToolchain: true,
+    });
+    expect(material.getBaseColorTexture()).not.toBeNull();
+    expect(material.getEmissiveFactor()).toEqual([1, 1, 1]);
+    const section = report.models[0]!.materials[0]!;
+    expect(section.limitations.join("\n")).not.toContain("source-proven zero emission");
+    // Nothing was installed: the toolchain root stayed empty and no .NET/CUE4Parse or converter cache appeared.
+    expect(toolchain).toEqual([]);
+    expect(leftovers.filter((entry) => /toolchain|dotnet|cue4parse|\.engine-|converter/i.test(entry))).toEqual([]);
+  });
 });
 
 describe("graph textures that only a material function references", () => {
-  it("unit: falls back to exportTexture after assets.png and stays unavailable, named, when both fail", async () => {
+  it("unit: the exporter is authoritative before assets.png, and a same-named PNG never stands in for it", async () => {
     const root = await scratch("graph-bake-export-");
     const content = join(root, "source", "Content", "Test");
     await mkdir(content, { recursive: true });
     await writeFile(join(content, "M_Master.uasset"), Buffer.alloc(16));
     await writePng(join(root, "T_Late.png"), [200, 100, 50, 255], 4);
     const requested: string[] = [];
-    const make = (exportTexture: (name: string) => Promise<string | undefined>) =>
+    const make = (exportTexture: (name: string, reference?: string) => Promise<string | undefined>) =>
       createGraphBaker({ sourceDir: join(root, "source"), maxTextureSize: 4, exportTexture, dumpGraphs: async () => new Map([["M_Master", masterGraph("mask-tint", "T_Late")]]) })!;
     const request = { materialName: "M_Master", lookupName: "M_Master", assets: { png: new Map<string, string>() }, readProps: () => undefined };
-    const baked = await make(async (name) => {
+    const baked = await make(async (name, reference) => {
       requested.push(name);
+      expect(reference).toContain("T_Late");
       return join(root, "T_Late.png");
     })(request);
     expect(baked.status).toBe("baked");
@@ -656,14 +1358,18 @@ describe("graph textures that only a material function references", () => {
     const failed = await make(async () => undefined)(request);
     expect(failed).toMatchObject({ status: "unavailable" });
     expect(failed.status === "unavailable" && failed.reason).toContain("T_Late");
-    // assets.png wins when the mesh export did carry the texture.
+    // The exporter owns the answer: a same-named PNG the mesh export carried must not stand in when it cannot select the package.
     const asked: string[] = [];
     const present = await make(async (name) => {
       asked.push(name);
       return undefined;
     })({ ...request, assets: { png: new Map([["T_Late", join(root, "T_Late.png")]]) } });
-    expect(present.status).toBe("baked");
-    expect(asked).toEqual([]);
+    expect(present).toMatchObject({ status: "unavailable" });
+    expect(asked).toEqual(["T_Late"]);
+    // Without an exporter the caller's PNG map is the only binding.
+    const plain = createGraphBaker({ sourceDir: join(root, "source"), maxTextureSize: 4, dumpGraphs: async () => new Map([["M_Master", masterGraph("mask-tint", "T_Late")]]) })!;
+    const bound = await plain({ ...request, assets: { png: new Map([["T_Late", join(root, "T_Late.png")]]) } });
+    expect(bound.status).toBe("baked");
   });
 
   it("importer: exports the one package on demand, bakes it, and leaves nothing behind", async () => {

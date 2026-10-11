@@ -89,7 +89,10 @@ export interface MatFile {
 
 export interface CollectedTextureParameter {
   readonly name: string;
+  /** The texture's object name. */
   readonly texture: string;
+  /** The value as the props file writes it (`Texture2D'/Game/A/T_X.T_X'`), so the package is kept too. */
+  readonly reference?: string | undefined;
 }
 
 export interface ScalarParameter {
@@ -211,6 +214,7 @@ export function parsePropsFile(text: string): PropsFile {
   let collectedDepth = 0;
   let depth = 0;
   let pendingTexture: string | undefined;
+  let pendingReference: string | undefined;
   let pendingName: string | undefined;
 
   const number = "[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[Ee][-+]?\\d+)?";
@@ -283,8 +287,9 @@ export function parsePropsFile(text: string): PropsFile {
   for (const block of indexedBlocks("TextureParameterValues")) {
     if (/TextureParameterValues\[\d+\]/.test(block)) continue;
     const name = readName(block);
-    const texture = objectName(/ParameterValue\s*=\s*([^\r\n}]+)/.exec(block)?.[1] ?? "");
-    if (name && texture) overrides.push({ name, texture });
+    const value = /ParameterValue\s*=\s*([^\r\n}]+)/.exec(block)?.[1] ?? "";
+    const texture = objectName(value);
+    if (name && texture) overrides.push({ name, texture, reference: value.trim() });
     else if (name && /ParameterValue\s*=\s*None\b/.test(block)) unresolvedOverrides.push(name);
   }
   const streamingTextures = indexedBlocks("TextureStreamingData")
@@ -312,16 +317,21 @@ export function parsePropsFile(text: string): PropsFile {
       inCollected = true;
       collectedDepth = depth;
       pendingTexture = undefined;
+      pendingReference = undefined;
       pendingName = undefined;
     }
     if (inCollected) {
       const texture = /^Texture\s*=\s*(.+)$/.exec(line);
-      if (texture?.[1]) pendingTexture = objectName(texture[1]);
+      if (texture?.[1]) {
+        pendingTexture = objectName(texture[1]);
+        pendingReference = texture[1].trim();
+      }
       const name = /^Name\s*=\s*(.+)$/.exec(line);
       if (name?.[1]) pendingName = name[1].trim();
       if (pendingTexture && pendingName) {
-        collected.push({ name: pendingName, texture: pendingTexture });
+        collected.push({ name: pendingName, texture: pendingTexture, reference: pendingReference });
         pendingTexture = undefined;
+        pendingReference = undefined;
         pendingName = undefined;
       }
     }

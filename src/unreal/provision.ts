@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  type BoundedRunResult,
   type ExternalTool,
   ToolchainError,
   assertSupportedHost,
@@ -13,6 +14,7 @@ import {
 } from "./toolchain.js";
 import {
   CUE4PARSE_PATCH,
+  CUE4PARSE_ENGINE_CONTENT,
   CUE4PARSE_PROGRAM,
   CUE4PARSE_PROJECT,
   CUE4PARSE_SOURCE,
@@ -68,8 +70,25 @@ export const FABCLI_RELEASE = Object.freeze({
 /** GPL-3.0-or-later command-line converter, always executed out-of-process. */
 export const UNCOOKED_CONVERTER = Object.freeze({
   package: "unreal-assets-to-glb==4.27.2.0",
-  version: "4.27.2.0+threenative.7",
+  version: "4.27.2.0+threenative.10",
 });
+
+/**
+ * The flag the patched converter answers with its own pinned revision. The pip distribution only
+ * knows the upstream `4.27.2.0`, and its `--version` is upstream's, so our revision is a distinct
+ * flag the provisioner stamps in; nothing derives it from the package metadata.
+ */
+export const UNCOOKED_REVISION_FLAG = "--threenative-version";
+
+/** The owned cache location of the uncooked converter's console script. */
+export function uncookedConverterPath(environment: NodeJS.ProcessEnv = process.env): string {
+  return join(
+    toolchainCacheDir(environment),
+    "uncooked",
+    "venv",
+    process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
+  );
+}
 
 export interface ProvisionLog {
   (message: string): void;
@@ -137,6 +156,26 @@ async function canRun(executable: string, args: readonly string[], marker: RegEx
   try {
     const run = await runBounded(executable, args, { timeoutMs: 30_000 });
     return marker.test(`${run.stdout}\n${run.stderr}`);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The uncooked converter's `--help` is its ABI probe, and a run passes only when it exits 0 and prints
+ * both markers. `canRun` reads the text alone, so an install that prints the markers and then fails
+ * would pass it. Scoped here rather than changed in `canRun`, which UE Viewer's probe also uses and
+ * whose exit semantics differ.
+ */
+function uncookedHelpAccepted(run: BoundedRunResult): boolean {
+  const help = `${run.stdout}\n${run.stderr}`;
+  return run.code === 0 && /UE 4\.27 UAsset Parser/.test(help) && /gpu instances\/landscapes/.test(help);
+}
+
+/** Whether the executable at `path` passes {@link uncookedHelpAccepted}; one that cannot start does not. */
+async function uncookedHelpRuns(path: string): Promise<boolean> {
+  try {
+    return uncookedHelpAccepted(await runBounded(path, ["--help"], { timeoutMs: 30_000 }));
   } catch {
     return false;
   }
@@ -359,8 +398,10 @@ async function pythonExecutable(environment: NodeJS.ProcessEnv): Promise<string>
 }
 
 function replaceRequired(source: string, before: string, after: string, label: string): string {
+  // `after` contains `before` for the append-style patches, so check it first: a second application is
+  // a no-op rather than appending the inserted lines again.
+  if (source.includes(after)) return source;
   if (!source.includes(before)) {
-    if (source.includes(after)) return source;
     throw new ToolchainError(
       "UNREAL_TOOL_UNUSABLE",
       `The pinned uncooked converter no longer matches the verified ${label} patch.`,
@@ -377,6 +418,231 @@ export function patchUncookedPackageVersionGates(source: string): string {
 }
 
 /**
+ * Teaches the uncooked MeshDescription parser to read the per-vertex-instance ``Color`` attribute,
+ * which ``extract_geometry`` read as Normal/TextureCoordinate only and dropped. Unreal's editor meshes
+ * (the Hornbeam UE 5.1 foliage icons) store a linear FVector4f here; a material that samples VertexColor
+ * multiplies it into the base colour, so without it those pieces render as the material's untinted
+ * default.
+ *
+ * Like ``Normal`` and ``TextureCoordinate``, the ``Color`` attribute is a ``TArray`` indexed by
+ * vertex-instance *element* ID: Unreal serializes it over the allocated slots, so holes between live
+ * instances are retained and ``color_values[vi]`` is instance ``vi``'s colour. It is therefore returned
+ * as read (never re-zipped through the live-id list), and only when the serialized array matches the
+ * source's allocated slot count (``num_elements``) and spans every live instance. A truncated array or
+ * an instance id past its end cannot be trusted, so no colour is written rather than a fabricated white
+ * for a malformed record. Mirrors the cooked writer (`EditorVertexColor`) in `cue4parse-adapter.ts`.
+ */
+export function patchUncookedMeshDescriptionColors(source: string): string {
+  source = replaceRequired(
+    source,
+    `    # --- Normals (per vertex instance, FVector) ---
+    normals = []
+    normal_entry = vi_attrs.get('Normal')
+    if normal_entry and normal_entry['type'] == 1 and normal_entry['arrays']:
+        normals = _bulk_floats(normal_entry, 3)
+
+    # --- UV channels (per vertex instance, FVector2D) ---`,
+    `    # --- Normals (per vertex instance, FVector) ---
+    normals = []
+    normal_entry = vi_attrs.get('Normal')
+    if normal_entry and normal_entry['type'] == 1 and normal_entry['arrays']:
+        normals = _bulk_floats(normal_entry, 3)
+
+    # --- Vertex colours (per vertex instance, FVector4) ---
+    # Indexed by vertex-instance ID (holes retained), so it is used as read. Accept it only when the
+    # array matches the source's allocated slot count and every live instance is inside it; otherwise
+    # leave it empty so no COLOR_0 (and no invented white) is written for a malformed record.
+    colors = []
+    color_entry = vi_attrs.get('Color')
+    if color_entry and color_entry['type'] == 0 and color_entry['arrays']:
+        color_values = _bulk_floats(color_entry, 4)
+        allocated = color_entry.get('num_elements')
+        if (isinstance(allocated, int) and allocated > 0 and vi_ids
+                and len(color_values) == allocated and max(vi_ids) < allocated):
+            colors = color_values
+
+    # --- UV channels (per vertex instance, FVector2D) ---`,
+    "uncooked vertex colours",
+  );
+  return replaceRequired(
+    source,
+    `        'normals': normals,
+        'uvs': uv_channels,`,
+    `        'normals': normals,
+        'colors': colors,
+        'uvs': uv_channels,`,
+    "uncooked vertex colours in geometry",
+  );
+}
+
+/**
+ * Carries the decoded per-vertex-instance colours from `StaticMesh.from_package` through the GLB
+ * writer as glTF `COLOR_0`. Only the uncooked branch fills `mesh.colors`; the cooked/fallback branch
+ * leaves it empty, and an empty buffer writes no `COLOR_0` at all. The accessor is normalized
+ * UNSIGNED_BYTE RGBA holding the packed value Unreal's shader reads (sRGB RGB, linear alpha), matching
+ * the cooked writer.
+ */
+export function patchUncookedMeshColorExport(source: string): string {
+  source = replaceRequired(
+    source,
+    `        self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels`,
+    `        self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels
+        # Per vertex instance, linear RGBA from the source's Color attribute; empty when absent.
+        self.colors: List[Optional[Tuple[float, float, float, float]]] = []`,
+    "StaticMesh colours field",
+  );
+  source = replaceRequired(
+    source,
+    `                mesh.uvs = geo['uvs']
+                mesh.triangles = geo['triangles']`,
+    `                mesh.uvs = geo['uvs']
+                mesh.colors = geo.get('colors') or []
+                mesh.triangles = geo['triangles']`,
+    "StaticMesh colours transport",
+  );
+  source = replaceRequired(
+    source,
+    `    uvs = mesh.uvs[0] if mesh.uvs else []
+    has_normals = bool(mesh.normals)
+    has_uvs = bool(uvs)`,
+    `    uvs = mesh.uvs[0] if mesh.uvs else []
+    has_normals = bool(mesh.normals)
+    has_uvs = bool(uvs)
+    has_colors = bool(mesh.colors)`,
+    "GLB colour presence",
+  );
+  source = replaceRequired(
+    source,
+    `                    if has_uvs and vi < len(uvs):
+                        u, v = uvs[vi]
+                    else:
+                        u, v = 0.0, 0.0
+
+                    local_verts.append((px, py, pz, nx, ny, nz, u, v))`,
+    `                    if has_uvs and vi < len(uvs):
+                        u, v = uvs[vi]
+                    else:
+                        u, v = 0.0, 0.0
+
+                    # Colour — per vertex instance; Unreal's default white when the mesh has no
+                    # colour buffer or the instance is outside it.
+                    if has_colors and vi < len(mesh.colors) and mesh.colors[vi] is not None:
+                        cr, cg, cb, ca = mesh.colors[vi]
+                    else:
+                        cr, cg, cb, ca = 1.0, 1.0, 1.0, 1.0
+
+                    local_verts.append((px, py, pz, nx, ny, nz, u, v, cr, cg, cb, ca))`,
+    "GLB per-instance colour",
+  );
+  source = replaceRequired(
+    source,
+    `        pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
+        norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
+        uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)`,
+    `        pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
+        norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
+        uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)
+        color_arr = np.array([(v[8], v[9], v[10], v[11]) for v in local_verts], dtype=np.float32)`,
+    "GLB colour array",
+  );
+  source = replaceRequired(
+    source,
+    `    COMP_FLOAT = 5126
+    COMP_UNSIGNED_SHORT = 5123
+    COMP_UNSIGNED_INT = 5125`,
+    `    COMP_FLOAT = 5126
+    COMP_UNSIGNED_SHORT = 5123
+    COMP_UNSIGNED_INT = 5125
+    COMP_UNSIGNED_BYTE = 5121`,
+    "GLB unsigned-byte component type",
+  );
+  source = replaceRequired(
+    source,
+    `        # UV accessor
+        uv_acc = None
+        if has_uvs:
+            uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
+            uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
+
+        # Index accessor`,
+    `        # UV accessor
+        uv_acc = None
+        if has_uvs:
+            uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
+            uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
+
+        # Vertex colour accessor — normalized UNSIGNED_BYTE RGBA in the channel order Unreal's shader
+        # reads. The source's Color is a linear FVector4, but the static-mesh build packs it with
+        # FLinearColor::ToFColor(true): sRGB-encode RGB (standard .0031308 breakpoint), keep alpha linear,
+        # then floor(channel * 255.999). VET_Color reads that byte / 255 with no gamma decode, so COLOR_0
+        # carries the shader value, not the raw linear source.
+        color_acc = None
+        if has_colors:
+            rgb = np.clip(color_arr[:, :3], 0.0, 1.0)
+            srgb = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(rgb, 1.0 / 2.4) - 0.055)
+            alpha = np.clip(color_arr[:, 3:4], 0.0, 1.0)
+            packed = np.concatenate([srgb, alpha], axis=1)
+            color_bytes = np.clip(np.floor(packed * 255.999), 0.0, 255.0).astype(np.uint8).tobytes()
+            color_bv = _add_buffer_view(color_bytes, target=ARRAY_BUFFER)
+            color_acc = _add_accessor(color_bv, COMP_UNSIGNED_BYTE, num_verts, "VEC4")
+            accessors[color_acc].normalized = True
+
+        # Index accessor`,
+    "GLB colour accessor",
+  );
+  return replaceRequired(
+    source,
+    `        if uv_acc is not None:
+            prim.attributes.TEXCOORD_0 = uv_acc
+        prim.indices = idx_acc`,
+    `        if uv_acc is not None:
+            prim.attributes.TEXCOORD_0 = uv_acc
+        if color_acc is not None:
+            prim.attributes.COLOR_0 = color_acc
+        prim.indices = idx_acc`,
+    "GLB colour attribute",
+  );
+}
+
+/**
+ * Stamps the pinned revision onto the installed CLI as an argparse `version` action. The resolver
+ * reads this revision back from the concrete executable, so a cache entry installed before this
+ * feature — or one whose patches predate it — is detected stale and re-provisioned rather than being
+ * reported as the current build. `--version` still answers the upstream pip version, which is why
+ * this is a separate flag.
+ */
+export function patchUncookedCliRevision(source: string): string {
+  return replaceRequired(
+    source,
+    `    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )`,
+    `    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )
+    parser.add_argument(
+        '--threenative-version',
+        action='version',
+        version='${UNCOOKED_CONVERTER.version}',
+        help='Print the threenative-pinned converter revision and exit'
+    )`,
+    "threenative revision flag",
+  );
+}
+
+/**
+ * Test-only substitution for the pip install. Production callers never pass it; a unit test uses it
+ * so an upgrade of a stale owned cache can be exercised without running pip or touching the network.
+ * The hook must leave `executable` runnable: answering `--help` with the ABI marker and
+ * `--threenative-version` with `UNCOOKED_CONVERTER.version`.
+ */
+export interface UncookedProvisionHooks {
+  readonly install?: (executable: string, environment: NodeJS.ProcessEnv, log: ProvisionLog) => Promise<void>;
+}
+
+/**
  * Installs the GPL converter in its own virtual environment and applies narrow compatibility
  * fixes to that external program. The fixes preserve uncooked-package PersistentGuid fields,
  * preserve numbered FNames (M_Wood_2), and make --skip-textures actually skip its multi-gigabyte
@@ -384,20 +650,29 @@ export function patchUncookedPackageVersionGates(source: string): string {
  * a preview web server. The fifth patch merges serialized Blueprint component templates into
  * placed level instances; it does not execute Blueprint bytecode. A sixth patch decodes bounded
  * UE4 ISM/HISM/foliage matrix arrays for standards-based GPU instancing. A seventh patch decodes
- * editor LandscapeComponent heightmaps from their package-relative bulk payloads. No converter
- * code is linked into this Node package.
+ * editor LandscapeComponent heightmaps from their package-relative bulk payloads. An eighth stamps
+ * the pinned threenative revision onto the CLI so the resolver can tell a stale install from the
+ * current one. No converter code is linked into this Node package.
  */
 export async function provisionUncookedConverter(
   environment: NodeJS.ProcessEnv = process.env,
   log: ProvisionLog = silent,
+  hooks: UncookedProvisionHooks = {},
 ): Promise<string> {
   assertSupportedHost();
   const cache = join(toolchainCacheDir(environment), "uncooked");
   const venv = join(cache, "venv");
-  const executable = join(
-    venv,
-    process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
-  );
+  const executable = uncookedConverterPath(environment);
+
+  if (hooks.install) {
+    await hooks.install(executable, environment, log);
+    if (!(await uncookedHelpRuns(executable))) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
+    }
+    log(`Installed uncooked Unreal converter at ${executable}`);
+    return executable;
+  }
+
   const python = await pythonExecutable(environment);
   const safeEnvironment = childEnvironment(environment);
   // Python console scripts embed the interpreter's absolute path in their shebang, so a venv
@@ -979,6 +1254,7 @@ def find_umap_path(input_dir, umap_filename):`,
     )`,
       "scene-json argument",
     );
+    cliSource = patchUncookedCliRevision(cliSource);
     cliSource = replaceRequired(
       cliSource,
       `    else:
@@ -996,6 +1272,11 @@ def find_umap_path(input_dir, umap_filename):`,
     );
     await writeFile(cliPath, cliSource);
 
+    const uncookedMeshPath = join(moduleDir, "uncooked_mesh.py");
+    let uncookedMeshSource = (await readFile(uncookedMeshPath, "utf8")).replace(/\r\n/g, "\n");
+    uncookedMeshSource = patchUncookedMeshDescriptionColors(uncookedMeshSource);
+    await writeFile(uncookedMeshPath, uncookedMeshSource);
+
     const meshPath = join(moduleDir, "mesh.py");
     let meshSource = (await readFile(meshPath, "utf8")).replace(/\r\n/g, "\n");
     meshSource = replaceRequired(
@@ -1004,9 +1285,10 @@ def find_umap_path(input_dir, umap_filename):`,
       `        mat = Material()\n        if mesh.material_slots:\n            slot_idx = (mesh.section_info_map[mat_idx]\n                        if mesh.section_info_map and mat_idx < len(mesh.section_info_map)\n                        else mat_idx)\n            if slot_idx < len(mesh.material_slots):\n                mat.name = mesh.material_slots[slot_idx][1]\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
       "material names",
     );
+    meshSource = patchUncookedMeshColorExport(meshSource);
     await writeFile(meshPath, meshSource);
 
-    if (!(await canRun(executable, ["--help"], /gpu instances\/landscapes/))) {
+    if (!(await uncookedHelpRuns(executable))) {
       throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
     }
     log(`Installed uncooked Unreal converter at ${executable}`);
@@ -1098,6 +1380,7 @@ export async function provisionModernConverter(
     const project = join(adapter, "ThreeNativeConverter.csproj");
     await writeFile(project, CUE4PARSE_PROJECT);
     await writeFile(join(adapter, "Program.cs"), CUE4PARSE_PROGRAM);
+    await writeFile(join(adapter, "EngineContent.cs"), CUE4PARSE_ENGINE_CONTENT);
     await rm(bin, { recursive: true, force: true });
     const runtime = process.platform === "win32"
       ? process.arch === "arm64" ? "win-arm64" : "win-x64"
@@ -1118,11 +1401,76 @@ export async function provisionModernConverter(
   }
 }
 
+/**
+ * Reads the revision the installed converter reports on `--threenative-version`. An install from
+ * before the revision patch rejects the flag and exits non-zero, so this is undefined — deliberately
+ * not the pip package's upstream `--version`, which is not our revision.
+ */
+async function readUncookedRevision(path: string): Promise<string | undefined> {
+  try {
+    const run = await runBounded(path, [UNCOOKED_REVISION_FLAG], { timeoutMs: 30_000 });
+    if (run.code !== 0) return undefined;
+    return `${run.stdout}\n${run.stderr}`
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The uncooked resolver is revision-aware. An explicit override or a PATH tool is the user's and is
+ * never overwritten: a wrong or absent revision is rejected with how to fix it. The owned cache is
+ * verified the same way, and a stale entry is re-provisioned only when auto-install is enabled.
+ */
+async function resolveOrProvisionUncooked(
+  environment: NodeJS.ProcessEnv,
+  log: ProvisionLog,
+  hooks: UncookedProvisionHooks,
+): Promise<string> {
+  try {
+    const found = await resolveExecutable("uncooked", environment);
+    const revision = await readUncookedRevision(found);
+    if (revision === UNCOOKED_CONVERTER.version) return found;
+    const override = environment.THREENATIVE_UNCOOKED_CONVERTER_PATH?.trim();
+    const reported = revision ? `threenative revision ${revision}` : "no threenative revision";
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      override
+        ? `THREENATIVE_UNCOOKED_CONVERTER_PATH points at "${found}", which reports ${reported}, not the required ${UNCOOKED_CONVERTER.version}. Unset it so the importer can provision a compatible converter.`
+        : `"${found}" on PATH reports ${reported}, not the required ${UNCOOKED_CONVERTER.version}. Remove it from PATH so the importer can provision a compatible converter.`,
+    );
+  } catch (error) {
+    if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
+    const cached = uncookedConverterPath(environment);
+    const revision = await readUncookedRevision(cached);
+    const hasHelp = await uncookedHelpRuns(cached);
+    // Both must hold: the help ABI alone passes on an install too old to carry the revision flag, which
+    // is exactly the stale cache this guards against, and a revision alone does not prove it runs.
+    if (revision === UNCOOKED_CONVERTER.version && hasHelp) return cached;
+    if (!autoInstallEnabled(environment)) {
+      if (!hasHelp && revision === undefined) throw error;
+      const state = revision === UNCOOKED_CONVERTER.version
+        ? "not runnable: its --help must exit 0 and print the converter's markers"
+        : revision ? `threenative revision ${revision}` : "not the pinned revision";
+      throw new ToolchainError(
+        "UNREAL_TOOL_UNUSABLE",
+        `The provisioned uncooked converter at "${cached}" is ${state}; expected ${UNCOOKED_CONVERTER.version}. Set THREENATIVE_TOOLCHAIN_AUTOINSTALL=1 (the default) and retry to re-provision it.`,
+      );
+    }
+    log(`Re-provisioning the uncooked converter: the cache is not a runnable ${UNCOOKED_CONVERTER.version} converter.`);
+    return await provisionUncookedConverter(environment, log, hooks);
+  }
+}
+
 async function resolveOrProvision(
   name: "umodel" | "fabcli" | "uncooked" | "modern",
   environment: NodeJS.ProcessEnv,
   log: ProvisionLog,
+  uncookedHooks: UncookedProvisionHooks = {},
 ): Promise<string> {
+  if (name === "uncooked") return resolveOrProvisionUncooked(environment, log, uncookedHooks);
   try {
     const found = await resolveExecutable(name, environment);
     // A PATH umodel is whatever the user happened to install; the 2022 upstream release rejects
@@ -1134,34 +1482,24 @@ async function resolveOrProvision(
     throw new ToolchainError("UNREAL_TOOL_NOT_FOUND", `${found} does not accept -psk; no capable UE Viewer was found.`);
   } catch (error) {
     if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
-    const cached = name === "uncooked"
-      ? join(
-          toolchainCacheDir(environment),
-          "uncooked",
-          "venv",
-          process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
-        )
-      : name === "modern"
-        ? join(toolchainCacheDir(environment), "modern", "bin", process.platform === "win32" ? "ThreeNativeConverter.exe" : "ThreeNativeConverter")
-        : join(
-          toolchainCacheDir(environment),
-          name,
-          process.platform === "win32" ? `${name}.exe` : name,
-        );
+    const cached = name === "modern"
+      ? join(toolchainCacheDir(environment), "modern", "bin", process.platform === "win32" ? "ThreeNativeConverter.exe" : "ThreeNativeConverter")
+      : join(
+        toolchainCacheDir(environment),
+        name,
+        process.platform === "win32" ? `${name}.exe` : name,
+      );
     const marker = name === "umodel"
       ? /UE Viewer/i
       : name === "fabcli"
         ? /fabcli/i
-        : name === "modern"
-          ? new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-          : /gpu instances\/landscapes/;
-    const probe = name === "umodel" ? UMODEL_PROBE : name === "fabcli" ? ["--version"] : name === "modern" ? ["--version"] : ["--help"];
+        : new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const probe = name === "umodel" ? UMODEL_PROBE : ["--version"];
     if (await canRun(cached, probe, marker)) return cached;
     if (!autoInstallEnabled(environment)) throw error;
     if (name === "umodel") return await provisionUmodel(environment, log);
     if (name === "fabcli") return await provisionFabcli(environment, log);
-    if (name === "modern") return await provisionModernConverter(environment, log);
-    return await provisionUncookedConverter(environment, log);
+    return await provisionModernConverter(environment, log);
   }
 }
 
@@ -1216,14 +1554,24 @@ export async function ensureFabcli(
 export async function ensureUncookedConverter(
   environment: NodeJS.ProcessEnv = process.env,
   log: ProvisionLog = silent,
+  hooks: UncookedProvisionHooks = {},
 ): Promise<ExternalTool> {
   assertSupportedHost();
-  const path = await resolveOrProvision("uncooked", environment, log);
+  const path = await resolveOrProvision("uncooked", environment, log, hooks);
   const run = await runBounded(path, ["--help"], { timeoutMs: 30_000 });
-  if (!/UE 4\.27 UAsset Parser/.test(`${run.stdout}${run.stderr}`) || !/gpu instances\/landscapes/.test(`${run.stdout}${run.stderr}`)) {
+  if (!uncookedHelpAccepted(run)) {
     throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected uncooked Unreal converter.`);
   }
-  return { name: "uncooked", path, version: UNCOOKED_CONVERTER.version };
+  // The report records the revision actually read back from the concrete executable, never the
+  // constant: an external tool that somehow still does not match cannot be labelled as current.
+  const revision = await readUncookedRevision(path);
+  if (revision !== UNCOOKED_CONVERTER.version) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `"${path}" does not report the pinned threenative revision ${UNCOOKED_CONVERTER.version}${revision ? ` (it reports ${revision})` : ""}.`,
+    );
+  }
+  return { name: "uncooked", path, version: revision };
 }
 
 export async function ensureModernConverter(
@@ -1237,4 +1585,17 @@ export async function ensureModernConverter(
     throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected modern Unreal converter.`);
   }
   return { name: "modern", path, version: CUE4PARSE_SOURCE.version };
+}
+
+/**
+ * The .NET 10 SDK that builds the modern converter, found without installing one: the host's `dotnet` or the copy the
+ * provisioner cached. A test that compiles against the pinned CUE4Parse source uses it; a missing SDK is a provisioning
+ * failure, so the test refuses rather than installing from inside a test.
+ */
+export async function modernSdkExecutable(environment: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const host = await runBounded("dotnet", ["--version"], { timeoutMs: 30_000, environment: childEnvironment(environment) }).catch(() => undefined);
+  if (host?.code === 0 && /^10\./.test(host.stdout.trim())) return "dotnet";
+  const cached = join(toolchainCacheDir(environment), "modern", "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
+  if (await canRun(cached, ["--version"], /^10\./m)) return cached;
+  throw new ToolchainError("UNREAL_TOOL_NOT_FOUND", "The .NET 10 SDK that builds the modern Unreal converter is missing; run npm run provision:toolchain.");
 }

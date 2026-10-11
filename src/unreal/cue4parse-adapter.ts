@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.67",
+  version: "b4e95441+threenative.71",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -291,6 +291,78 @@ export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
 </Project>
 `;
 
+/**
+ * The engine-content rules the converter and its compiled tests share: the root, the key the pinned provider gives a loose
+ * directory, the exact /Engine/ reference lookup, and the provenance of a loaded body. Written beside Program.cs and compiled
+ * against the pinned CUE4Parse source by tests/unreal-engine-content-compiled.test.ts, so the tests run the shipped code.
+ */
+export const CUE4PARSE_ENGINE_CONTENT = String.raw`using CUE4Parse.FileProvider;
+using CUE4Parse.UE4.Assets;
+
+public static class EngineContent
+{
+    // The configured root, without a trailing separator. It must be an existing directory that is not a filesystem root and holds
+    // no .uproject (a project, not Engine/Content). A link at the root or anywhere under it is refused before anything is read:
+    // links are never followed or skipped, because the provider would read through them and a cache key would miss the bytes.
+    public static string Root(string configured)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(configured));
+        var directory = new DirectoryInfo(root);
+        if (!directory.Exists) throw new DirectoryNotFoundException($"engine content directory not found: {root}");
+        if (directory.Parent is null) throw new InvalidDataException($"engine content root cannot be a filesystem root: {root}");
+        if (directory.LinkTarget is not null) throw new InvalidDataException($"engine content root is a link: {root}; links are refused, not followed");
+        if (directory.GetFiles("*.uproject", SearchOption.TopDirectoryOnly).Length > 0) throw new InvalidDataException($"engine content root holds a .uproject, so it is a project rather than Engine/Content: {root}");
+        var pending = new Stack<DirectoryInfo>();
+        pending.Push(directory);
+        while (pending.Count > 0)
+        {
+            foreach (var entry in pending.Pop().EnumerateFileSystemInfos())
+            {
+                if (entry.LinkTarget is not null) throw new InvalidDataException($"engine content contains a link at {entry.FullName}; links are refused, not followed or skipped");
+                if (entry is DirectoryInfo child) pending.Push(child);
+            }
+        }
+        return root;
+    }
+
+    // The key prefix the pinned provider gives a loose directory: DirectoryInfo.Name, the name it reads, which carries no trailing
+    // separator. Root refuses a .uproject, the only input that would give the provider a different mount.
+    public static string MountPrefix(string root) => new DirectoryInfo(Path.TrimEndingDirectorySeparator(root)).Name + "/";
+
+    // The one key an exact /Engine/<folders>/<name>.<name> reference names under the mount, or false for anything else: an object
+    // name that is not the package's own, a path outside /Engine/, an empty, dot or parent segment, a backslash, a drive-style
+    // segment or a control character. Nothing is matched by basename, so a same-named body elsewhere is never selected.
+    public static bool TryExactReference(string mountPrefix, string reference, out string key, out string objectName)
+    {
+        key = string.Empty;
+        objectName = string.Empty;
+        const string engine = "/Engine/";
+        if (!reference.StartsWith(engine, StringComparison.OrdinalIgnoreCase)) return false;
+        var dot = reference.LastIndexOf('.');
+        if (dot < 0) return false;
+        var packagePath = reference[..dot];
+        objectName = reference[(dot + 1)..];
+        if (objectName.Length == 0 || objectName != packagePath[(packagePath.LastIndexOf('/') + 1)..]) return false;
+        var folders = packagePath[engine.Length..].Split('/');
+        if (folders.Any(folder => folder.Length == 0 || folder == "." || folder == ".." || folder.Contains('\\') || folder.Contains(':') || folder.Any(char.IsControl))) return false;
+        key = mountPrefix + string.Join('/', folders) + ".uasset";
+        return true;
+    }
+
+    // The /Engine/ path of a loaded body's package, when the engine provider loaded that package; otherwise null. Provenance is the
+    // provider that loaded the package (IPackage.Provider), never the path a pack names the body by: a pack-owned package keeps no
+    // engine provenance even under the engine's own name, and a body reached by a nested call into engine content keeps its own.
+    public static string? PackagePath(IPackage? owner, IFileProvider? engineProvider, string? mountPrefix)
+    {
+        if (owner is null || engineProvider is null || mountPrefix is null || !ReferenceEquals(owner.Provider, engineProvider)) return null;
+        // A loaded package is named by its provider key without the extension: "<mount>/Functions/A/B".
+        var name = owner.Name;
+        if (!name.StartsWith(mountPrefix, StringComparison.OrdinalIgnoreCase) || name.Length == mountPrefix.Length) return null;
+        return "/Engine/" + name[mountPrefix.Length..];
+    }
+}
+`;
+
 export const CUE4PARSE_PROGRAM = String.raw`using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -387,6 +459,25 @@ string? olderEngineAttempts = null;
 
 var engineAt = Array.IndexOf(args, "--engine");
 var game = engineAt >= 0 ? ParseGame(args[engineAt + 1]) : DetectGame(root);
+// Engine content is an explicitly configured Engine/Content root and the X.Y version it was cooked for: both or neither.
+// It has its own provider and VersionContainer, so the pack's provider and its graph export loop are unchanged.
+var engineContentAt = Array.IndexOf(args, "--engine-content");
+var engineContentVersionAt = Array.IndexOf(args, "--engine-content-version");
+if ((engineContentAt >= 0) != (engineContentVersionAt >= 0)) throw new ArgumentException("--engine-content and --engine-content-version must be given together");
+DefaultFileProvider? engineProvider = null;
+string? engineContentVersion = null;
+string? engineContentKeyPrefix = null;
+if (engineContentAt >= 0)
+{
+    // Refused before the provider enumerates anything: a link at the root or under it, a filesystem root, or a project.
+    var engineRoot = EngineContent.Root(args[engineContentAt + 1]);
+    engineContentVersion = args[engineContentVersionAt + 1];
+    engineProvider = new DefaultFileProvider(engineRoot, SearchOption.AllDirectories, new VersionContainer(ParseGame(engineContentVersion)), StringComparer.OrdinalIgnoreCase);
+    engineProvider.Initialize();
+    engineProvider.PostMount();
+    // The provider keys a loose directory under its own name, so the Content root's keys begin "Content/".
+    engineContentKeyPrefix = EngineContent.MountPrefix(engineRoot);
+}
 var provider = new DefaultFileProvider(root, SearchOption.AllDirectories, new VersionContainer(game), StringComparer.OrdinalIgnoreCase);
 var mappings = Directory.EnumerateFiles(root, "*.usmap", SearchOption.AllDirectories).ToArray();
 if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length} .usmap files. Keep only the mapping that matches this asset's game/version.");
@@ -516,6 +607,44 @@ static (FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bo
         constant = useConstant ? GraphValue(type.GetProperty("Constant")?.GetValue(input)) : null;
     }
     return (expression, output, mask != 0 ? channels : null, constant, useConstant);
+}
+
+// A Custom node's Inputs array wraps each FExpressionInput in an FStructFallback that also carries the pin's
+// InputName. Returns the named pins in array order, or null with a reason when the layout is raw, a wrapper is
+// unreadable, or a name repeats; an unnamed pin keeps its index as a stable key. The value is the unwrapped
+// FExpressionInput, so its target, OutputIndex and mask survive unchanged.
+static List<(string Name, object Value)>? GraphCustomInputs(bool raw, UScriptArray array, out string? error)
+{
+    if (raw)
+    {
+        error = "Custom Inputs use a raw layout this converter cannot read";
+        return null;
+    }
+    var seen = new HashSet<string>(StringComparer.Ordinal);
+    var pins = new List<(string Name, object Value)>();
+    for (var element = 0; element < array.Properties.Count; element++)
+    {
+        if (array.Properties[element].GenericValue is not FScriptStruct { StructType: FStructFallback wrapper })
+        {
+            error = $"Custom Inputs[{element}] is not a struct wrapper";
+            return null;
+        }
+        var name = GraphText(GraphProperty(wrapper, "InputName")?.Tag?.GenericValue);
+        if (string.IsNullOrEmpty(name)) name = $"Inputs[{element}]";
+        if (!seen.Add(name))
+        {
+            error = $"Custom Inputs has a duplicate pin name {name}";
+            return null;
+        }
+        if (GraphProperty(wrapper, "Input")?.Tag?.GenericValue is not FScriptStruct { StructType: FExpressionInput input })
+        {
+            error = $"Custom Input {name} has no readable input";
+            return null;
+        }
+        pins.Add((name, input));
+    }
+    error = null;
+    return pins;
 }
 
 // Real Unreal reads an input as tagged properties when the package does not record FCoreObjectVersion at all.
@@ -811,6 +940,13 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                                 guids.Add(element.GenericValue is FScriptStruct { StructType: FGuid attributeGuid } ? attributeGuid.ToString() : "");
                             node["attributeTypes"] = guids;
                         }
+                        else if (className == "Custom" && name == "Inputs")
+                        {
+                            // A Custom node's Inputs array wraps each pin's FExpressionInput; name it from its InputName.
+                            var custom = GraphCustomInputs(GraphRawInputs(owner), array, out var customError);
+                            if (custom is null) node["error"] = customError;
+                            else foreach (var (pinName, pinValue) in custom) inputs[pinName] = Pin(pinValue, prefix, callInputs, depth);
+                        }
                         else if (array.Properties.Count > 0 && array.Properties.All(element => GraphIsInput(element.GenericValue)))
                         {
                             for (var element = 0; element < array.Properties.Count; element++)
@@ -929,7 +1065,8 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
     UObject? GraphLoadFunction(FPackageIndex? functionIndex, string? path)
     {
         try { if (functionIndex?.Load<UObject>() is { } direct) return direct; } catch { }
-        if (string.IsNullOrEmpty(path) || path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return null;
+        if (string.IsNullOrEmpty(path)) return null;
+        if (path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return GraphLoadEngineFunction(path);
         var slash = path.LastIndexOf('/');
         var functionName = path[(slash + 1)..];
         var dot = functionName.IndexOf('.');
@@ -948,6 +1085,26 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
             for (var index = 0; index < functionPackage.ExportsLazy.Length; index++)
             {
                 if (DumpExportName(functionPackage, index) == functionName) return functionPackage.ExportsLazy[index].Value;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // The one engine package an exact /Engine/<folders>/<name>.<name> reference names, read from the configured content root.
+    // Nothing is matched by basename and nothing falls back to another mount: the reference must name exactly that package
+    // and object, and the key must exist exactly under the configured root (EngineContent.TryExactReference).
+    UObject? GraphLoadEngineFunction(string path)
+    {
+        if (engineProvider is null || engineContentKeyPrefix is null) return null;
+        if (!EngineContent.TryExactReference(engineContentKeyPrefix, path, out var key, out var objectName)) return null;
+        if (!engineProvider.Files.ContainsKey(key)) return null;
+        try
+        {
+            var enginePackage = engineProvider.LoadPackage(key);
+            for (var index = 0; index < enginePackage.ExportsLazy.Length; index++)
+            {
+                if (DumpExportName(enginePackage, index) == objectName) return enginePackage.ExportsLazy[index].Value;
             }
         }
         catch { }
@@ -1006,6 +1163,11 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         var callPins = (Dictionary<string, object?>) node["inputs"]!;
         // The call stores each wired input and only a guid for the function input it feeds.
         var function = GraphLoadFunction(functionIndex, node["function"] as string);
+        // A body records the configured engine content it came from only when the engine provider loaded its package. The package
+        // that loaded it decides, not the path the call names: a pack may mount its own package under /Engine/.
+        var enginePackage = function is null ? null : EngineContent.PackagePath(function.Owner, engineProvider, engineContentKeyPrefix);
+        if (enginePackage is not null && engineContentVersion is not null)
+            fn["engine"] = new Dictionary<string, object?> { ["version"] = engineContentVersion, ["package"] = enginePackage };
         var inputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
         var outputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
         if (function is not null)
@@ -2998,6 +3160,7 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
         return text;
     }
     var arrays = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+    var kinds = new Dictionary<string, int>(StringComparer.Ordinal);
     var names = new Dictionary<string, string[]>(StringComparer.Ordinal);
     var live = new Dictionary<string, bool[]>(StringComparer.Ordinal);
     var elementTypes = reader.ReadInt32();
@@ -3050,6 +3213,7 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
                     var elementSize = reader.ReadInt32();
                     var elements = reader.ReadInt32();
                     arrays[key] = reader.ReadBytes(checked(elementSize * elements));
+                    kinds[key] = kind;
                 }
                 // The default value is written even for an attribute with no channels, so its size
                 // comes from the attribute type: FVector4f, FVector3f, FVector2f, float, int32, and
@@ -3069,11 +3233,22 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
         throw new InvalidDataException("Mesh description was not fully consumed.");
     float[] Floats(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, float>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
     int[] Ints(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, int>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
+    // A vertex-instance colour is a linear FVector4f (attribute kind 0, 16 bytes), the layout Unreal
+    // writes for MeshAttribute::VertexInstance::Color. Any other stored type would need a reinterpretation
+    // this reader does not do, so it is left absent rather than guessed; absent also means no colour buffer.
+    float[] Colors()
+    {
+        const string key = "VertexInstances[0].Color[0]";
+        return arrays.TryGetValue(key, out var bytes) && kinds.TryGetValue(key, out var kind) && kind == 0
+            ? MemoryMarshal.Cast<byte, float>(bytes).ToArray()
+            : [];
+    }
     return new EditorMesh(
         Floats("Vertices[0].Position[0]"),
         Ints("VertexInstances[0].VertexIndex[0]"),
         Floats("VertexInstances[0].Normal[0]"),
         Floats("VertexInstances[0].TextureCoordinate[0]"),
+        Colors(),
         Ints("Triangles[0].VertexInstanceIndex[0]"),
         Ints("Triangles[0].PolygonGroupIndex[0]"),
         live.TryGetValue("Triangles", out var triangles) ? triangles : [],
@@ -3081,16 +3256,17 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
 }
 
 // Writes the decoded source model with the cooked glTF writer's conventions: centimetres to metres,
-// Unreal's Z-up swapped to glTF's Y-up, and Unreal's triangle order kept (the axis swap and
-// Unreal's left-handedness cancel). Vertex colours and tangents are left out, as the UE Viewer
-// route leaves them out: Megascans vertex colours are wind masks, not tint, and glTF clients
-// generate MikkTSpace tangents when none are given.
+// Unreal's Z-up swapped to glTF's Y-up, and Unreal's triangle order kept (the axis swap and Unreal's
+// left-handedness cancel). Tangents are still left out, so a glTF client generates MikkTSpace tangents.
+// A source model whose MeshDescription carries a per-vertex-instance Color is written as COLOR_0, as the
+// cooked writer does; glTF clients with a material that does not read it would still multiply it into the
+// base colour, so the importer drops COLOR_0 for those sections. Without such an attribute no COLOR_0 is
+// written at all, so nothing is invented for an unpainted mesh.
 static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string name, string target)
 {
-    var builder = new SharpGLTF.Geometry.MeshBuilder<
-        SharpGLTF.Geometry.VertexTypes.VertexPositionNormal,
-        SharpGLTF.Geometry.VertexTypes.VertexTexture1,
-        SharpGLTF.Geometry.VertexTypes.VertexEmpty>(name);
+    // Every vertex instance must have a colour for the attribute to line up with the instance indexing,
+    // so a colour buffer of any other length is treated as absent rather than padded or truncated.
+    var colors = mesh.VertexColors.Length == mesh.InstanceVertices.Length * 4 ? mesh.VertexColors : null;
     var materials = new Dictionary<int, SharpGLTF.Materials.MaterialBuilder>();
     SharpGLTF.Materials.MaterialBuilder Material(int group)
     {
@@ -3100,32 +3276,72 @@ static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string n
         materials[group] = material;
         return material;
     }
-    SharpGLTF.Geometry.VertexBuilder<
-        SharpGLTF.Geometry.VertexTypes.VertexPositionNormal,
-        SharpGLTF.Geometry.VertexTypes.VertexTexture1,
-        SharpGLTF.Geometry.VertexTypes.VertexEmpty> Vertex(int instance)
+    SharpGLTF.Geometry.MeshBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty> Build<TMaterial>(Func<int, System.Numerics.Vector2, TMaterial> materialVertex)
+        where TMaterial : struct, SharpGLTF.Geometry.VertexTypes.IVertexMaterial
     {
-        var vertex = mesh.InstanceVertices[instance];
-        var position = new System.Numerics.Vector3(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 2], mesh.Positions[vertex * 3 + 1]) * 0.01f;
-        var normal = new System.Numerics.Vector3(mesh.Normals[instance * 3], mesh.Normals[instance * 3 + 2], mesh.Normals[instance * 3 + 1]);
-        normal = normal.LengthSquared() > 1e-12f && float.IsFinite(normal.LengthSquared()) ? System.Numerics.Vector3.Normalize(normal) : System.Numerics.Vector3.UnitY;
-        var uv = new System.Numerics.Vector2(mesh.Uv0[instance * 2], mesh.Uv0[instance * 2 + 1]);
-        return new(new SharpGLTF.Geometry.VertexTypes.VertexPositionNormal(position, normal), new SharpGLTF.Geometry.VertexTypes.VertexTexture1(uv));
-    }
-    var triangleCount = mesh.TriangleInstances.Length / 3;
-    for (var triangle = 0; triangle < triangleCount; triangle++)
-    {
-        if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
-        var group = triangle < mesh.TriangleGroups.Length ? mesh.TriangleGroups[triangle] : 0;
-        builder.UsePrimitive(Material(group)).AddTriangle(
-            Vertex(mesh.TriangleInstances[triangle * 3]),
-            Vertex(mesh.TriangleInstances[triangle * 3 + 1]),
-            Vertex(mesh.TriangleInstances[triangle * 3 + 2]));
+        var builder = new SharpGLTF.Geometry.MeshBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty>(name);
+        SharpGLTF.Geometry.VertexBuilder<SharpGLTF.Geometry.VertexTypes.VertexPositionNormal, TMaterial, SharpGLTF.Geometry.VertexTypes.VertexEmpty> Vertex(int instance)
+        {
+            var vertex = mesh.InstanceVertices[instance];
+            var position = new System.Numerics.Vector3(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 2], mesh.Positions[vertex * 3 + 1]) * 0.01f;
+            var normal = new System.Numerics.Vector3(mesh.Normals[instance * 3], mesh.Normals[instance * 3 + 2], mesh.Normals[instance * 3 + 1]);
+            normal = normal.LengthSquared() > 1e-12f && float.IsFinite(normal.LengthSquared()) ? System.Numerics.Vector3.Normalize(normal) : System.Numerics.Vector3.UnitY;
+            var uv = new System.Numerics.Vector2(mesh.Uv0[instance * 2], mesh.Uv0[instance * 2 + 1]);
+            return new(new SharpGLTF.Geometry.VertexTypes.VertexPositionNormal(position, normal), materialVertex(instance, uv));
+        }
+        var triangleCount = mesh.TriangleInstances.Length / 3;
+        for (var triangle = 0; triangle < triangleCount; triangle++)
+        {
+            if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
+            var group = triangle < mesh.TriangleGroups.Length ? mesh.TriangleGroups[triangle] : 0;
+            builder.UsePrimitive(Material(group)).AddTriangle(
+                Vertex(mesh.TriangleInstances[triangle * 3]),
+                Vertex(mesh.TriangleInstances[triangle * 3 + 1]),
+                Vertex(mesh.TriangleInstances[triangle * 3 + 2]));
+        }
+        return builder;
     }
     var scene = new SharpGLTF.Scenes.SceneBuilder();
-    scene.AddRigidMesh(builder, System.Numerics.Matrix4x4.Identity);
+    if (colors is null)
+        scene.AddRigidMesh(Build((instance, uv) => new SharpGLTF.Geometry.VertexTypes.VertexTexture1(uv)), System.Numerics.Matrix4x4.Identity);
+    else
+        scene.AddRigidMesh(Build((instance, uv) => new SharpGLTF.Geometry.VertexTypes.VertexColor1Texture1(EditorVertexColor(colors, instance), uv)), System.Numerics.Matrix4x4.Identity);
     Directory.CreateDirectory(Path.GetDirectoryName(target)!);
     scene.ToGltf2().SaveGLB(target);
+}
+
+// One vertex instance's colour as the value Unreal's shader reads. The MeshDescription stores a linear
+// FVector4f, but the static-mesh build packs it with FLinearColor::ToFColor(true) -- sRGB-encoding RGB
+// (standard .0031308 breakpoint), keeping alpha linear, quantising to a byte -- and VET_Color reads that
+// byte / 255 with no gamma decode (the Platform.ush code applies a channel swizzle only). A glTF COLOR_0
+// of the raw source would make a client read a different colour than Unreal, so the shader value is
+// written instead. UE5.8's ToFColorSRGB takes RGB through a fast LUT, which may differ from this standard
+// sRGB curve by at most one byte; alpha is the same round-to-nearest. A colour index past the buffer would
+// be a malformed mesh; Unreal's default white is used so the whole export does not fail over one bad
+// triangle, and an unpainted mesh writes no COLOR_0 at all.
+static System.Numerics.Vector4 EditorVertexColor(float[] colors, int instance)
+{
+    var at = instance * 4;
+    return at >= 0 && at + 3 < colors.Length
+        ? new System.Numerics.Vector4(SrgbVertexChannel(colors[at]), SrgbVertexChannel(colors[at + 1]), SrgbVertexChannel(colors[at + 2]), LinearVertexChannel(colors[at + 3]))
+        : System.Numerics.Vector4.One;
+}
+
+// The byte Unreal's ToFColor(true) writes for a linear RGB channel, as the normalized value SharpGLTF
+// stores. MathF.Round(..., AwayFromZero) is the modern nearest byte (.5 up); the +0.5 offset makes
+// SharpGLTF's truncating byte encoder land on exactly that byte: floor((byte + 0.5) / 255 * 255) == byte.
+static float SrgbVertexChannel(float value)
+{
+    if (!float.IsFinite(value)) return value;
+    var linear = Math.Clamp(value, 0f, 1f);
+    var srgb = linear <= 0.0031308f ? linear * 12.92f : 1.055f * MathF.Pow(linear, 1f / 2.4f) - 0.055f;
+    return (MathF.Round(srgb * 255f, MidpointRounding.AwayFromZero) + 0.5f) / 255f;
+}
+
+// Alpha stays linear through ToFColor; only the RGB curve is applied.
+static float LinearVertexChannel(float value)
+{
+    return float.IsFinite(value) ? (MathF.Round(Math.Clamp(value, 0f, 1f) * 255f, MidpointRounding.AwayFromZero) + 0.5f) / 255f : value;
 }
 
 // Editor source art is stored the way FTextureSource keeps it, not as a display image. A
@@ -3362,6 +3578,7 @@ static EGame DetectGame(string root)
 
 static EGame ParseGame(string version) => version switch
 {
+    "5.8" => EGame.GAME_UE5_8,
     "5.7" => EGame.GAME_UE5_7,
     "5.6" => EGame.GAME_UE5_6,
     "5.5" => EGame.GAME_UE5_5,
@@ -3448,6 +3665,7 @@ sealed record EditorMesh(
     int[] InstanceVertices,
     float[] Normals,
     float[] Uv0,
+    float[] VertexColors,
     int[] TriangleInstances,
     int[] TriangleGroups,
     bool[] LiveTriangles,

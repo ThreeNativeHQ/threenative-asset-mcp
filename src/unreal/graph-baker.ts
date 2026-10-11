@@ -2,6 +2,7 @@ import { readdir } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import sharp from "sharp";
 import { dumpEngineArg } from "../fab/routes.js";
+import { assertEngineContentDirectory, engineContentFromEnvironment, engineVersionOf, type EngineContentConfig } from "./engine-content.js";
 import { dumpMaterialGraphs } from "./graph-dump.js";
 import type { MaterialGraph } from "./graph-dump.js";
 import {
@@ -11,6 +12,8 @@ import {
   particleDrivenBaseColor,
   graphPathClasses,
   graphPathTextures,
+  proveEmissionZero,
+  type EmissionProof,
   type EmissiveEffect,
   type BakeResult,
   type GraphParameters,
@@ -31,9 +34,13 @@ import type { ExternalTool } from "./toolchain.js";
 
 /** The part of the importer's exported-asset index the baker reads. */
 export interface GraphBakeAssets {
-  /** Texture object name -> PNG written by UE Viewer. */
+  /**
+   * Texture object name -> PNG written by UE Viewer. The binding for a caller that gives no `exportTexture`: a name it
+   * holds uniquely is that texture. It cannot say which package a same-named PNG came from, so it is never consulted
+   * when an exporter is present.
+   */
   readonly png: ReadonlyMap<string, string>;
-  /** Basenames with several physical PNG producers; a sample of one cannot name its exact pixels. */
+  /** Basenames with several physical PNG producers; without an exporter a sample of one is refused, not guessed. */
   readonly ambiguousPng?: ReadonlySet<string> | undefined;
 }
 
@@ -50,6 +57,14 @@ export interface GraphBakeRequest {
    * section carries `COLOR_0`; absent, VertexColor stays unsupported.
    */
   readonly vertexColor?: readonly [number, number, number, number] | undefined;
+  /**
+   * Set by the importer only when every primitive using this section keeps glTF `COLOR_0` (the mesh carries the
+   * colour Unreal's `VertexColor` node reads) and the section's consumer is OPAQUE. It lets the baker accept a graph
+   * whose BaseColor output is the `VertexColor` node's RGB exactly (see `directVertexColorGraph`): the mesh supplies
+   * the colour, so a copied graph with that node lowered to neutral white bakes a residual-factor PNG and the original
+   * `COLOR_0` stays authoritative. Absent, such a graph is unsupported exactly as before.
+   */
+  readonly directVertexColor?: boolean | undefined;
   /**
    * Only classify: report whether the material is an emissive-only effect and never bake. The importer probes a
    * translucent section that already has a base-colour texture, which a plain request would not look at.
@@ -69,6 +84,12 @@ export interface GraphBakeRequest {
   readonly objectRadius?: (() => number | undefined) | undefined;
 }
 
+/** Literal Roughness and Metallic values the graph's own outputs set (see `sourceScalarFactors`). */
+export interface GraphPbrFactors {
+  readonly roughness?: number;
+  readonly metallic?: number;
+}
+
 export type GraphBakeOutcome = BakeResult & {
   /** Present when the material wires only Emissive: no albedo exists in the package (see `emissiveOnlyEffect`). */
   readonly effect?: EmissiveEffect;
@@ -81,12 +102,25 @@ export type GraphBakeOutcome = BakeResult & {
   readonly noAlbedo?: string;
   /**
    * Probe only: whether the BaseColor path reads VertexColor (after static switches). Absent when the graph is unknown,
-   * truncated or unreadable.
+   * truncated or unreadable, and when its switch choices never settle (the active path is then no path at all, so the
+   * importer must not drop a mesh's COLOR_0 on it).
    */
   readonly vertexColorOnBaseColor?: boolean;
   /**
+   * Present when the bake lowered a direct `BaseColor -> VertexColor` graph to neutral white (see
+   * `directVertexColorGraph`): the mesh's `COLOR_0` supplies the colour and the baked PNG is only a residual factor,
+   * not the colour itself. Only set for that proved composition.
+   */
+  readonly vertexColorResidual?: boolean;
+  /**
+   * Present with a `vertexColorResidual` bake when the graph's own Roughness or Metallic output is a literal constant (see
+   * `sourceScalarFactors`). The importer applies them as glTF factors only where no packed metallicRoughness texture is bound.
+   */
+  readonly pbrFactors?: GraphPbrFactors;
+  /**
    * Probe only: the textures the active BaseColor path samples, and whether the instance chain overrides a static
-   * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first.
+   * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first. Absent when that path
+   * has a node the evaluator cannot read, since a bake of it would fail too.
    */
   readonly baseColourTextures?: readonly string[];
   readonly switchOverridden?: boolean;
@@ -94,9 +128,24 @@ export type GraphBakeOutcome = BakeResult & {
   readonly graphMaterial?: string;
   /** The parameters the evaluator saw, after nearest-wins merging over the instance chain. */
   readonly parameters?: GraphParameters;
+  /**
+   * Whether the graph emits no light for this instance (see `proveEmissionZero`). Present whenever the graph itself was read,
+   * on a bake, a probe or an effect alike, so the importer can drop a stale emissive binding or factor on that proof alone.
+   */
+  readonly emissionZero?: EmissionProof;
 };
 
 export type GraphBaker = (request: GraphBakeRequest) => Promise<GraphBakeOutcome>;
+
+/**
+ * One resolvable texture source: the PNG the exporter wrote for the exact package, and the `.props.txt` text of
+ * that same package when the exporter produced one. The props carry the source's own `SRGB` override, so the bake
+ * decodes the pixels of the package the graph names and never a same-named package's metadata.
+ */
+export interface GraphTextureSource {
+  readonly path: string;
+  readonly properties?: string | undefined;
+}
 
 export interface GraphBakerOptions {
   readonly sourceDir: string;
@@ -108,10 +157,20 @@ export interface GraphBakerOptions {
   /** The importer's longest embedded edge; the bake never exceeds 1024 either way. */
   readonly maxTextureSize?: number | undefined;
   /**
-   * Exports one texture package that the mesh export did not carry (colour textures that only a material
-   * function references) and returns the PNG path, or undefined. Tried after `assets.png`.
+   * Resolves one texture the graph samples to its source, or undefined. It is authoritative and consulted before
+   * `assets.png`: when the export returns undefined the bake is refused rather than falling back to a same-named PNG in
+   * the mesh export, which could be another package. The second argument is the full reference the graph or instance
+   * names for that object (`/Game/A/B/T_X.T_X`), absent when the graph proves none, and the exporter must answer only
+   * for that package. A bare string is the PNG path alone (legacy); a `GraphTextureSource` also carries the exact
+   * package's `.props.txt`, so the sRGB decode uses that package's own `SRGB` and never a namesake's. Without an
+   * exporter the caller's `assets.png` map is the binding (see `GraphBakeAssets`).
    */
-  readonly exportTexture?: ((name: string) => Promise<string | undefined>) | undefined;
+  readonly exportTexture?: ((name: string, reference?: string) => Promise<string | GraphTextureSource | undefined>) | undefined;
+  /**
+   * Engine content that supplies the `/Engine/` material functions a pack names. Read from THREENATIVE_ENGINE_CONTENT_DIR
+   * and THREENATIVE_ENGINE_CONTENT_VERSION only when a graph is actually needed; absent means no engine content.
+   */
+  readonly engineContent?: EngineContentConfig | undefined;
   /** Test seam; production runs the converter's `--dump-graphs` mode. */
   readonly dumpGraphs?: typeof dumpMaterialGraphs;
 }
@@ -129,7 +188,7 @@ const STATIC_SWITCH_NOTE = "static switch values taken from the parent's default
  * has to say whether the texture's own `SRGB` property was switched off; UE Viewer writes that into
  * a texture's `.props.txt` when it exports one, and absent properties mean Unreal's default (true).
  */
-function textureIsSrgb(propsText: string | undefined): boolean {
+export function textureIsSrgb(propsText: string | undefined): boolean {
   return !(propsText !== undefined && /^\s*SRGB\s*=\s*false\b/im.test(propsText));
 }
 
@@ -138,6 +197,33 @@ function textureBasename(reference: string): string {
   const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference;
   const afterSlash = quoted.slice(quoted.lastIndexOf("/") + 1);
   return (afterSlash.includes(".") ? afterSlash.slice(afterSlash.lastIndexOf(".") + 1) : afterSlash).trim();
+}
+
+/**
+ * The package a texture reference names, lower-cased and without its object: `Texture2D'/Game/A/T_X.T_X'`,
+ * `/Game/A/T_X.T_X` and `/Game/A/T_X` all give `game/a/t_x`, and so does a props-style `Content/A/T_X`, since the
+ * pack's `Content` folder is the `/Game` mount. A bare object name names no package: undefined.
+ */
+export function texturePackageKey(reference: string): string | undefined {
+  const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference;
+  const slash = quoted.lastIndexOf("/");
+  if (slash < 0) return undefined;
+  const dot = quoted.indexOf(".", slash);
+  const path = (dot < 0 ? quoted : quoted.slice(0, dot)).replace(/^\/+/, "").toLowerCase();
+  return path.startsWith("content/") ? `game/${path.slice("content/".length)}` : path;
+}
+
+/**
+ * The full reference (`Texture2D'/Game/A/T_X.T_X'`) that the nearest-wins merge of `chainParameters` settles on for each
+ * texture parameter, by lower-cased name. It uses the same order, so it names the same value the evaluator sees; the
+ * evaluator reads it back per parameter, which is what makes an override replace a same-named default. A value the props
+ * file gives without a package stays as its object name, which names no package.
+ */
+function chainTextureReferences(chain: readonly PropsFile[]): Map<string, string> {
+  const references = new Map<string, string>();
+  for (const props of chain) for (const entry of props.overrides) mergeFirst(references, entry.name, entry.reference ?? entry.texture);
+  for (const props of chain) for (const entry of props.collected) mergeFirst(references, entry.name, entry.reference ?? entry.texture);
+  return references;
 }
 
 async function listUassetBasenames(root: string): Promise<Set<string>> {
@@ -176,12 +262,18 @@ export function chainParameters(chain: readonly PropsFile[]): GraphParameters {
     for (const entry of props.vectors) mergeFirst(vectors, entry.name, [...entry.value]);
     for (const entry of props.scalars) mergeFirst(scalars, entry.name, entry.value);
   }
-  return { textures, vectors, scalars, switches };
+  // The same nearest-wins merge, keeping each value's full reference so a parameter still names its package.
+  return { textures, textureReferences: chainTextureReferences(chain), vectors, scalars, switches };
 }
 
 function parametersKey(parameters: GraphParameters): string {
   const sorted = <T>(map: ReadonlyMap<string, T>): [string, T][] => [...map].sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify([sorted(parameters.textures), sorted(parameters.vectors), sorted(parameters.scalars), sorted(parameters.switches)]);
+  // Two chains can carry the same object names from different packages, and those bake differently, so the key also holds
+  // each reference by its package identity: `/Game/A/T` and `Content/A/T` are the same package.
+  const references = [...parameters.textureReferences ?? []]
+    .map(([name, reference]): [string, string] => [name, texturePackageKey(reference) ?? reference.toLowerCase()])
+    .sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify([sorted(parameters.textures), references, sorted(parameters.vectors), sorted(parameters.scalars), sorted(parameters.switches)]);
 }
 
 function unavailable(reason: string): GraphBakeOutcome {
@@ -201,6 +293,63 @@ export function graphReadsSurface(graph: MaterialGraph): boolean {
 /** True when the graph reads the mesh's bounding radius (`ObjectRadius`), so a bake depends on the mesh. */
 export function graphReadsObjectRadius(graph: MaterialGraph): boolean {
   return graph.nodes.some((node) => node.class === "ObjectRadius");
+}
+
+/**
+ * The one composition where a `VertexColor` graph is exactly representable without baking the colour: BaseColor is the
+ * `VertexColor` node's output 0 with the RGB channel selection (`[1,1,1,0]`, or a null mask, which the evaluator reads
+ * as RGB for output 0), the graph is neither truncated nor errored, the node is readable, and neither an Opacity nor an
+ * OpacityMask path is wired. No function, Make, arithmetic, swizzle or other general VertexColor use qualifies.
+ */
+export function directVertexColorGraph(graph: MaterialGraph): boolean {
+  // A wired attributes output may make the individual root pins dormant; the dump does not record which mode is active.
+  if (graph.truncated || graph.error || graph.outputs.materialAttributes) return false;
+  const { baseColor, opacity, opacityMask } = graph.outputs;
+  if (!baseColor || opacity || opacityMask) return false;
+  if (baseColor.output !== 0) return false;
+  if (baseColor.mask !== null && !(baseColor.mask[0] === 1 && baseColor.mask[1] === 1 && baseColor.mask[2] === 1 && baseColor.mask[3] === 0)) return false;
+  const node = graph.nodes.find((candidate) => candidate.id === baseColor.node);
+  return node !== undefined && node.class === "VertexColor" && node.error === undefined;
+}
+
+/**
+ * A copy of `graph` whose BaseColor-producing node is a neutral white `Constant3Vector`. The bake of this copy is a
+ * residual factor only; the original graph is left untouched for probes, class reporting and source provenance.
+ */
+export function whiteLoweredGraph(graph: MaterialGraph): MaterialGraph {
+  const target = graph.outputs.baseColor?.node;
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) =>
+      node.id === target ? { id: node.id, class: "Constant3Vector", inputs: {}, constants: { Constant: [1, 1, 1, 0] } } : node,
+    ),
+  };
+}
+
+/**
+ * The literal Roughness and Metallic the graph's own outputs set, for a residual bake. A factor is proved only when its output
+ * pin is output 0 with a null or R-only mask, wired to a readable `Constant` with no wired inputs: an omitted R is that
+ * Constant's default, 0, and a finite R in [0, 1] is taken as written. Anything else gives no factor (an unconnected pin, another
+ * output, a wider mask, a parameter or other node, a malformed or out-of-range value, a truncated or errored graph). Nothing is
+ * guessed, capped or clamped, and the instance's scalar parameters are never read: a graph that does not wire them cannot use them.
+ */
+function sourceScalarFactors(graph: MaterialGraph): GraphPbrFactors | undefined {
+  if (graph.truncated || graph.error) return undefined;
+  const roughness = literalScalarOutput(graph, graph.outputs.roughness);
+  const metallic = literalScalarOutput(graph, graph.outputs.metallic);
+  if (roughness === undefined && metallic === undefined) return undefined;
+  return { ...(roughness === undefined ? {} : { roughness }), ...(metallic === undefined ? {} : { metallic }) };
+}
+
+function literalScalarOutput(graph: MaterialGraph, pin: MaterialGraph["outputs"]["roughness"]): number | undefined {
+  if (!pin || pin.output !== 0) return undefined;
+  if (pin.mask !== null && !(pin.mask[0] === 1 && pin.mask[1] === 0 && pin.mask[2] === 0 && pin.mask[3] === 0)) return undefined;
+  const source = graph.nodes.find((candidate) => candidate.id === pin.node);
+  if (!source || source.class !== "Constant" || source.error !== undefined) return undefined;
+  if (Object.values(source.inputs).some((input) => input !== null)) return undefined;
+  const value = source.constants.R;
+  if (value === undefined) return 0;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
 }
 
 /** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
@@ -242,12 +391,15 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         "Some sections have no base-colour texture; reading the pack's material graphs with CUE4Parse to bake them (the converter and its .NET SDK are installed once on first use; set graphBake:false or THREENATIVE_TOOLCHAIN_AUTOINSTALL=0 to skip).",
       );
       try {
+        const engineContent = options.engineContent ?? engineContentFromEnvironment(environment);
+        if (engineContent) await assertEngineContentDirectory(engineContent);
         const dumped = await dump(options.sourceDir, {
           // The importer carries `UE_4.18`; the converter wants `4.18` and refuses anything else.
           ...(options.engine && dumpEngineArg(options.engine) ? { engine: dumpEngineArg(options.engine)! } : {}),
           environment,
           ...(options.log ? { log: options.log } : {}),
           ...(options.modernConverter ? { converterPath: options.modernConverter.path } : {}),
+          ...(engineContent ? { engineContent } : {}),
         });
         return { graphs: dumped, invalid: dumped.invalid ?? new Map<string, string>() };
       } catch (error) {
@@ -255,8 +407,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       }
     })());
 
-  // Active BaseColor-path texture names per graph and parameter set (probe results).
-  const pathTextures = new Map<string, string[]>();
+  // Active BaseColor-path texture names per graph and parameter set (probe results); undefined when the path is unreadable.
+  const pathTextures = new Map<string, string[] | undefined>();
   // Decoded textures, shared across every section of the import.
   const rasters = new Map<string, Promise<TextureRaster | undefined>>();
   const rasterSizes = new Map<string, number>();
@@ -325,26 +477,35 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     }
     if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);
 
-    const effect = emissiveOnlyEffect(graph);
-    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material };
-    const noAlbedo = noColourOutput(graph);
-    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material };
+    // The emission proof reads the same instance parameters as the bake, so every outcome below carries it.
     const parameters = chainParameters(chain);
+    const emissionZero = proveEmissionZero(graph, parameters);
+    const effect = emissiveOnlyEffect(graph);
+    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material, emissionZero };
+    const noAlbedo = noColourOutput(graph);
+    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material, emissionZero };
     if (request.probe) {
       // Unreal applies a mesh's vertex colours only where the graph reads VertexColor; glTF multiplies COLOR_0 into
       // every base colour. The importer drops COLOR_0 when the BaseColor path does not read it.
       const readable = !graph.truncated && !graph.error;
+      // Textures are reported only for a path that compiles without unsupported nodes. A partial compile reaches textures the
+      // bake never samples (those under an unsupported node), so trusting them would keep or drop a binding on evidence the
+      // bake cannot confirm; the importer then asks for the bake itself.
+      // The cut-out settles a shared switch alongside the colour, so the same graph under a different alpha has a
+      // different active path: the alpha is part of the key, not just of the probe that fills it.
+      const pathKey = `${graph.package}|${parametersKey(parameters)}|alpha:${request.alpha ?? "none"}`;
+      if (readable && !pathTextures.has(pathKey)) pathTextures.set(pathKey, graphPathTextures(graph, parameters, request.alpha));
+      const names = readable ? pathTextures.get(pathKey) : undefined;
+      // Undefined when the switch choices never settle: the classes describe no bake, so the probe must not claim the
+      // path does not read VertexColor (that would drop a mesh's COLOR_0 on an unknown path).
+      const classes = readable ? graphPathClasses(graph, "baseColor", parameters, request.alpha) : undefined;
       return {
         ...unavailable(`${graph.material} has a BaseColor output`),
+        emissionZero,
         ...(readable
           ? {
-              vertexColorOnBaseColor: graphPathClasses(graph, "baseColor", parameters).includes("VertexColor"),
-              baseColourTextures: (pathTextures.get(`${graph.package}|${parametersKey(parameters)}`) ??
-                (() => {
-                  const names = graphPathTextures(graph, parameters);
-                  pathTextures.set(`${graph.package}|${parametersKey(parameters)}`, names);
-                  return names;
-                })()),
+              ...(classes ? { vertexColorOnBaseColor: classes.includes("VertexColor") } : {}),
+              ...(names ? { baseColourTextures: names } : {}),
               switchOverridden: chain.some((props) => props.switchOverrides.length > 0),
             }
           : {}),
@@ -353,7 +514,13 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
 
     const surface = request.surface && graphReadsSurface(graph) ? request.surface() : undefined;
     const objectRadius = request.objectRadius && graphReadsObjectRadius(graph) ? request.objectRadius() : undefined;
-    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}|radius:${objectRadius ?? "none"}`;
+    // A flagged request that names an exactly representable direct VertexColor graph bakes a neutral residual and leaves
+    // the mesh's COLOR_0 to carry the colour: not the same result as the same assets/params asked without the flag, so
+    // the flag is part of the cache key.
+    const residual = request.directVertexColor === true && request.alpha === undefined && directVertexColorGraph(graph);
+    // Unflagged direct-VC graphs and non-direct VC graphs still compile to `unsupported` and are never memoised under
+    // the flagged key.
+    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|dvc:${request.directVertexColor === true ? "1" : "0"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}|radius:${objectRadius ?? "none"}`;
     let perAssets = bakes.get(request.assets);
     if (!perAssets) {
       perAssets = new Map();
@@ -363,43 +530,68 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     if (memo) return memo;
 
     const pending = (async (): Promise<GraphBakeOutcome> => {
-      const ambiguous: string[] = [];
-      const loaded = new Set<string>();
+      const unresolved = new Map<string, string>();
       const result = await bakeGraph({
-        graph: graph!,
+        graph: residual ? whiteLoweredGraph(graph!) : graph!,
         output: "baseColor",
         parameters,
         size,
         allowUvSetFallback: true,
+        ...(engineVersionOf(options.engine) ? { packEngine: engineVersionOf(options.engine)! } : {}),
         // Unreal feeds white to ParticleColor outside a particle emitter.
         particleColor: [1, 1, 1, 1],
         ...(request.alpha ? { alpha: request.alpha } : {}),
         ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
         ...(surface ? { surface } : {}),
         ...(objectRadius !== undefined ? { objectRadius } : {}),
-        loadTexture: async (reference) => {
-          const name = textureBasename(reference);
-          const path = request.assets.png.get(name) ?? (await options.exportTexture?.(name));
-          if (!path) return undefined;
-          if (request.assets.ambiguousPng?.has(name) && !loaded.has(name)) ambiguous.push(name);
-          loaded.add(name);
-          return decode(path, textureIsSrgb(request.readProps(name)));
+        loadTexture: async (objectName, reference) => {
+          const name = textureBasename(objectName);
+          let path: string | undefined;
+          let properties: string | undefined;
+          // The exporter is authoritative: with the full reference it owns the answer, so a same-named PNG the mesh export
+          // happens to carry is never substituted for the package the graph names. Its metadata rides with the source it
+          // selected (never `readProps(name)`, which is a namesake's). Without an exporter the caller's PNG map is the only
+          // binding, and a basename several files share proves no source, so it is refused rather than guessed.
+          if (options.exportTexture) {
+            const source = await options.exportTexture(name, reference);
+            if (typeof source === "string") path = source;
+            else if (source) {
+              path = source.path;
+              properties = source.properties;
+            }
+          } else {
+            path = request.assets.ambiguousPng?.has(name) ? undefined : request.assets.png.get(name);
+            properties = request.readProps(name);
+          }
+          if (!path) {
+            unresolved.set(name, `${name} has no exact source`);
+            return undefined;
+          }
+          return decode(path, textureIsSrgb(properties));
         },
       });
       if (result.status !== "baked") {
         const particle = particleDrivenBaseColor(graph!);
-        return { ...result, graphMaterial: graph!.material, parameters, ...(particle ? { particle } : {}) };
+        // A refused texture is the reason even though the evaluator reports it only as missing: no exact source was chosen.
+        const reason = unresolved.size > 0 ? `${[...unresolved.values()].join("; ")}; no source is selected, so the base colour is not baked` : result.reason;
+        return { ...result, reason, graphMaterial: graph!.material, parameters, emissionZero, ...(particle ? { particle } : {}) };
       }
       const approximations = new Set(result.approximations);
-      for (const name of ambiguous) approximations.add(`texture ${name}: ambiguous exported PNG basename; exact source pixels cannot be selected`);
-      const classes = graphPathClasses(graph!, "baseColor", parameters);
+      // A successful bake comes from a settled pass, so the classes are defined; an empty list is only the safe
+      // fallback for reporting, never a claim that the path has no class.
+      const classes = graphPathClasses(graph!, "baseColor", parameters, request.alpha) ?? [];
       if (classes.includes("StaticSwitchParameter") || classes.includes("StaticBoolParameter")) approximations.add(STATIC_SWITCH_NOTE);
+      // Read from the original graph, not the white-lowered copy that was baked, and cached with the residual it belongs to.
+      const pbrFactors = residual ? sourceScalarFactors(graph!) : undefined;
       const baked: GraphBakeOutcome = {
         ...result,
         approximations: [...approximations].sort(),
         confidence: approximations.size === 0 ? "exact" : "heuristic",
         graphMaterial: graph!.material,
         parameters,
+        emissionZero,
+        ...(residual ? { vertexColorResidual: true } : {}),
+        ...(pbrFactors ? { pbrFactors } : {}),
       };
       bakeBytes += result.png.length;
       return baked;

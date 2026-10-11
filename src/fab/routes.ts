@@ -59,12 +59,12 @@ export function decoderRoute(engine: string): DecoderRoute {
 
 /**
  * The `--engine` value the property dump's ParseGame accepts (`4.18`), or undefined for a version
- * it does not know (4.0-4.27 and 5.0-5.7 are accepted).
+ * it does not know (4.0-4.27 and 5.0-5.8 are accepted).
  */
 export function dumpEngineArg(engine: string): string | undefined {
   const version = parseEngine(engine);
   if (!version) return undefined;
   const known =
-    (version.major === 4 && version.minor <= 27) || (version.major === 5 && version.minor <= 7);
+    (version.major === 4 && version.minor <= 27) || (version.major === 5 && version.minor <= 8);
   return known ? `${version.major}.${version.minor}` : undefined;
 }
