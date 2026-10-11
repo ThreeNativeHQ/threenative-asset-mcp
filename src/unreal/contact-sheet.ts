@@ -11,6 +11,7 @@ import { measureFidelity, withoutFloorShadow, type FidelityMetrics } from "./ren
 import { colourSimilarity, decodeRgba, maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 import { judgeRender, type JudgeStats, type Verdict } from "./visual-judge.js";
 import { applyThumbnailReferenceLighting } from "./thumbnail-lighting.js";
+import { createThumbnailReferenceFloor } from "./thumbnail-floor.js";
 
 const require = createRequire(import.meta.url);
 const THREE_ROOT = dirname(dirname(require.resolve("three")));
@@ -24,8 +25,9 @@ const PANEL = { r: 30, g: 31, b: 36 };
 /**
  * How the sheet's picture (the "AFTER IMPORT" tile) is lit. `neutral` is the flat three.js light the metrics are
  * measured under. `unreal-like` uses UE 4.19.2's three world-space reference directions/intensities, the old approximate
- * hemisphere fill and a grey checkered ground. This hybrid lacks the authored cubemap; the saved editor/config and
- * camera are unknown, and Three shadows differ. The judge's numbers are always measured on the `neutral` render.
+ * hemisphere fill and source floor math over a procedural checker approximation. This hybrid lacks the authored cubemap
+ * and Grid pixels; the saved editor/config and camera are unknown, and Three shadows differ. The judge's numbers are always
+ * measured on the `neutral` render.
  */
 export type PictureLighting = "neutral" | "unreal-like";
 /** The fixed camera every render pass shares (so a change of lighting is the only difference between passes). */
@@ -62,7 +64,7 @@ export interface ContactSheetOptions {
   /**
    * Lighting of the sheet's picture only. `neutral` (default) keeps every existing caller and golden unchanged.
    * `unreal-like` adds a supersampled picture with three UE 4.19.2 reference lights plus approximate hemisphere fill
-   * (authored cubemap absent), and grey ground; the judge's metrics stay on the neutral render.
+   * (authored cubemap absent), and source floor math with a procedural Grid approximation; the judge's metrics stay on the neutral render.
    */
   pictureLighting?: PictureLighting;
   /**
@@ -210,20 +212,7 @@ const size = options.tile;
 const lit = options.lighting === 'unreal-like';
 const shadows = options.shadows !== false;
 const applyThumbnailReferenceLighting = ${applyThumbnailReferenceLighting.toString()};
-// A subtle grey checker like an editor thumbnail's floor: two close greys, never pure white or black.
-const makeChecker = () => {
-  const canvas = document.createElement('canvas');
-  canvas.width = 64; canvas.height = 64;
-  const g = canvas.getContext('2d');
-  g.fillStyle = '#c2c2c2'; g.fillRect(0, 0, 64, 64);
-  g.fillStyle = '#b0b0b0';
-  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) if ((x + y) % 2 === 0) g.fillRect(x * 8, y * 8, 8, 8);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.wrapS = THREE.RepeatWrapping; texture.wrapT = THREE.RepeatWrapping;
-  texture.anisotropy = 4;
-  return texture;
-};
+const createThumbnailReferenceFloor = ${createThumbnailReferenceFloor.toString()};
 try {
   const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
   renderer.setPixelRatio(options.ss);
@@ -233,7 +222,7 @@ try {
   scene.background = new THREE.Color(0x808080);
   let key;
   let referenceRig;
-  let checker;
+  let referenceFloor;
   let groundMaterial;
   if (lit) {
     // Source reference directions/intensities + old approximate hemisphere, not the authored UE cubemap.
@@ -243,8 +232,8 @@ try {
       renderer.shadowMap.enabled = true;
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     }
-    checker = makeChecker();
-    groundMaterial = new THREE.MeshStandardMaterial({ map: checker, roughness: 1, metalness: 0 });
+    referenceFloor = createThumbnailReferenceFloor(THREE);
+    groundMaterial = referenceFloor.material;
   } else {
     scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.2));
     const light = new THREE.DirectionalLight(0xffffff, 2.4);
@@ -293,9 +282,7 @@ try {
         ground.rotation.x = -Math.PI / 2;
         ground.position.set(center.x, box.min.y, center.z);
         ground.receiveShadow = true;
-        // One checker cell per 4*radius of world space, so enlarging the plane keeps the checker's physical scale.
-        const repeat = Math.max(2, Math.round(groundSize / (4 * radius)));
-        checker.repeat.set(repeat, repeat);
+        // The material reads absolute world XZ in metres: its source period never follows object bounds.
         scene.add(ground);
         // Placement follows model bounds, but the three light directions never follow the camera.
         referenceRig.place(center, radius);
@@ -319,6 +306,7 @@ try {
       tiles.push({ ok: false, error: String(error && error.message || error) });
     }
   }
+  if (referenceFloor) referenceFloor.dispose();
   window.__result = { ok: true, tiles, dataUrl: sheet.toDataURL('image/png') };
 } catch (error) {
   window.__result = { ok: false, error: String(error) };
@@ -689,7 +677,7 @@ export async function renderContactSheet(
       : "Each tile: ORIGINAL = Unreal editor thumbnail of that asset | AFTER IMPORT = our GLB, neutral light.";
   const scoreLine =
     pictureLighting === "unreal-like"
-      ? "Current camera; saved editor/config unknown; primary-only PCF shadows. Scores: neutral view."
+      ? "Source floor math; procedural Grid approximation. Current camera; primary-only PCF shadows. Scores: neutral view."
       : "Colour similarity compares object colour only (camera and lighting differ). It is not a match score.";
   const header = withThumbnails ? REFERENCE_BAND : HEADER;
   const caption = (withThumbnails ? CAPTION + 14 : CAPTION) + (!withThumbnails && pictureLighting === "unreal-like" ? 36 : 0);
