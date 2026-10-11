@@ -22,6 +22,7 @@ import {
 import { readPackageCooking, readPackageObjectNames } from "./cooking.js";
 import { decodeMaterialPackage, type SourcePackage } from "./source-material-package.js";
 import { reduceSourceMaterial, sameSourceCoordinates, type SourceMaterial } from "./source-material.js";
+import { promoteRgba16fDataTexture } from "./data-texture-promotion.js";
 import { decodeGroomPayload, groomSidecar, type GroomStrands } from "./grooms.js";
 import { ImportError } from "./errors.js";
 import { extractUnrealFonts } from "./fonts.js";
@@ -242,6 +243,28 @@ export interface ImportedDataAsset {
   readonly sha256: string;
 }
 
+/**
+ * A standalone Texture2D whose source is RGBA16F. The binary holds the stored little-endian half-float R, G, B, A samples,
+ * unchanged, and the manifest names the source package and its hashes. `threenative-asset-mcp/data-texture` loads the pair:
+ * it checks the manifest against the binary before it builds the texture.
+ */
+export interface ImportedDataTexture {
+  readonly name: string;
+  readonly package: string;
+  /** Raw binary, relative to the promoted output directory. */
+  readonly data: string;
+  /** Manifest beside the binary: source identity, layout and hashes. */
+  readonly manifest: string;
+  readonly format: "RGBA16F";
+  readonly threeTexture: "DataTexture";
+  readonly width: number;
+  readonly height: number;
+  readonly bytes: number;
+  readonly sha256: string;
+  /** SHA-256 of the source package file set. A consumer that expects a given source pins this value. */
+  readonly sourceSha256: string;
+}
+
 export interface ImportedTextureStack {
   readonly name: string;
   readonly package: string;
@@ -361,6 +384,7 @@ export interface ImportReport {
     readonly audio: number;
     readonly dataAssets: number;
     readonly textureStacks: number;
+    readonly dataTextures: number;
     readonly fonts: number;
     readonly bitmapFonts: number;
     readonly sprites: number;
@@ -377,6 +401,7 @@ export interface ImportReport {
   readonly audio: readonly ImportedAudio[];
   readonly dataAssets: readonly ImportedDataAsset[];
   readonly textureStacks: readonly ImportedTextureStack[];
+  readonly dataTextures: readonly ImportedDataTexture[];
   readonly fonts: readonly ImportedFont[];
   readonly bitmapFonts: readonly ImportedBitmapFont[];
   readonly sprites: readonly ImportedSprite[];
@@ -586,6 +611,19 @@ export function assertContained(root: string, candidate: string): string {
   }
   return full;
 }
+
+/** An RGBA16F texture the raw route wrote: the isolated run that holds its manifest and binary, and the package's own key. */
+interface DataTextureSource {
+  readonly converterOutput: string;
+  readonly selector: string;
+  /** The PNG failure the raw route answers, as the report states it. */
+  readonly pngFailure: string;
+}
+
+/** The raw route's answer for one package: the texture it wrote, or the failure with the PNG cause first. */
+type RawFallback =
+  | { readonly entry: PackageClassification; readonly reason: string }
+  | { readonly entry: PackageClassification; readonly dataTexture: DataTextureSource };
 
 interface PackageClassification {
   readonly package: string;
@@ -1000,6 +1038,14 @@ export function modernConverterFailureCause(output: { readonly stdout: string; r
   const trimmed = cause?.trim();
   if (!trimmed) return undefined;
   return trimmed.length > 800 ? `${trimmed.slice(0, 800)}…` : trimmed;
+}
+
+/**
+ * The converter's "no decodable pixel data" for this texture, on an RGBA16F source (`sourceFormat=` evidence, with or
+ * without the enum's type prefix). That is the one PNG failure the raw RGBA16F route answers; any other format is not.
+ */
+function isRgba16fPngFailure(cause: string | undefined, name: string): boolean {
+  return cause !== undefined && cause.startsWith(`${name}: no decodable pixel data`) && /sourceFormat=(?:\w+::)?TSF_RGBA16F\b/.test(cause);
 }
 
 /**
@@ -3635,6 +3681,27 @@ export async function importUnrealDirectory(
   // walking meshes when the package basename is unique; duplicate names must be exported into
   // isolated directories or UE Viewer's basename lookup would silently select the first one.
   const textureSources = new Map<string, string>();
+  const dataTextureSources = new Map<string, DataTextureSource>();
+  // The raw route for an RGBA16F texture whose PNG export failed to encode it. Both the UE Viewer path and the modern path
+  // come here, and only for that encoding failure: the caller decides which failures qualify, and this keeps the PNG cause
+  // in front of whatever the raw route says. A run that cannot start is a failure too, with its own message.
+  const rgba16fFallback = async (
+    entry: PackageClassification,
+    outputDir: string,
+    pngFailure: string,
+    run: (outputDir: string) => Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string }>,
+  ): Promise<RawFallback> => {
+    try {
+      const converted = await run(outputDir);
+      if (converted.code !== 0) {
+        const cause = modernConverterFailureCause(converted);
+        return { entry, reason: `${pngFailure} The raw RGBA16F route refused it${cause ? `: ${cause}` : "."}` };
+      }
+      return { entry, dataTexture: { converterOutput: outputDir, selector: entry.selector, pngFailure } };
+    } catch (error) {
+      return { entry, reason: `${pngFailure} The raw RGBA16F route could not run: ${error instanceof Error ? error.message : "unknown error"}` };
+    }
+  };
   const cubemapSources = new Map<string, string>();
   const audioSources = new Map<string, string>();
   const dataSources = new Map<string, string>();
@@ -3666,6 +3733,20 @@ export async function importUnrealDirectory(
     // UE Viewer uses process-global image codecs that can intermittently leave empty PNGs when
     // several exporter processes run together. Keep this narrow phase serial; packaging remains
     // concurrent and deterministic after all source images are complete.
+    // A legacy PNG export that cannot encode a texture is retried once on the raw data route, which exports RGBA16F as
+    // stored. Only a PNG failure earns that retry: a toolchain error or any other failure stays a failure.
+    const rawFallback = (entry: PackageClassification, index: number, pngFailure: string): Promise<RawFallback> =>
+      rgba16fFallback(entry, join(standaloneRaw, `${String(index).padStart(5, "0")}-rgba16f`), pngFailure, async (converterOutput) => {
+        await mkdir(converterOutput, { recursive: true });
+        graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
+        const converter = await graphTextureConverter;
+        // The CUE4Parse route reads a UE4 package as the latest UE4 unless its engine is named: the request's `UE_4.19` selector.
+        const engineArgs = request.engine === undefined ? [] : ["--engine", request.engine.slice("UE_".length)];
+        return runBounded(converter.path, [sourceDir, "--export-dir", converterOutput, "--data-texture", entry.selector, ...engineArgs], {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 16 * 1024 * 1024,
+        });
+      });
     const results = await mapWithConcurrency(texturesNeedingExport, 1, async (entry, index) => {
       const name = basename(entry.package, extname(entry.package));
       const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
@@ -3676,13 +3757,13 @@ export async function importUnrealDirectory(
           maxOutputBytes: 16 * 1024 * 1024,
         });
         if (run.code !== 0) {
-          return { entry, reason: `UE Viewer texture export exited ${run.code}.` };
+          return await rawFallback(entry, index, `UE Viewer texture export exited ${run.code}.`);
         }
         const files = await listFiles(isolated);
         const emitted = files.find(
           (file) => basename(file.path).toLowerCase() === `${name}.png`.toLowerCase(),
         );
-        if (!emitted) return { entry, reason: "UE Viewer recognized Texture2D but produced no PNG." };
+        if (!emitted) return await rawFallback(entry, index, "UE Viewer recognized Texture2D but produced no PNG.");
         // UE Viewer writes the texture's own `.props.txt` beside the PNG; its `SRGB` is the exact source's metadata.
         const propsFile = files.find((file) => basename(file.path).toLowerCase() === `${name}.props.txt`.toLowerCase());
         const properties = propsFile === undefined ? undefined : readMaterialSidecar(propsFile.path);
@@ -3698,6 +3779,8 @@ export async function importUnrealDirectory(
       if ("source" in result) {
         textureSources.set(result.entry.file, result.source);
         standaloneBySource.set(result.entry.file, result.properties === undefined ? { path: result.source } : { path: result.source, properties: result.properties });
+      } else if ("dataTexture" in result) {
+        dataTextureSources.set(result.entry.file, result.dataTexture);
       } else failed.push({ package: result.entry.package, reason: result.reason ?? "Texture export failed." });
     }
   }
@@ -3994,13 +4077,23 @@ export async function importUnrealDirectory(
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
       );
+      // The raw route answers one failure: the converter could not encode this texture as a PNG. That is its own "no decodable
+      // pixel data" for this package, or an exit with no PNG at all. Any other failure is reported as it is, without a retry.
+      const rawRoute = (pngFailure: string): Promise<RawFallback> =>
+        rgba16fFallback(entry, join(modernTextureRoot, `${String(index).padStart(5, "0")}-rgba16f`), pngFailure, (converterOutput) =>
+          runModernConverter(modernConverter!.path, sourceDir, converterOutput, ["--data-texture", entry.selector], {
+            timeoutMs: 1_800_000,
+            maxOutputBytes: 32 * 1024 * 1024,
+          }),
+        );
       if (converted.code !== 0) {
         const cause = modernConverterFailureCause(converted);
-        return { entry, reason: `The modern UE5 texture converter exited ${converted.code}${cause ? `: ${cause}` : "."}` };
+        const reason = `The modern UE5 texture converter exited ${converted.code}${cause ? `: ${cause}` : "."}`;
+        return isRgba16fPngFailure(cause, name) ? await rawRoute(reason) : { entry, reason };
       }
       const exported = await indexExported(isolated);
       const source = exported.png.get(name);
-      if (!source) return { entry, reason: "The modern UE5 texture converter produced no PNG for this package." };
+      if (!source) return await rawRoute("The modern UE5 texture converter produced no PNG for this package.");
       const propsPath = exported.props.get(name);
       const properties = propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
       return { entry, source, exported, ...(properties === undefined ? {} : { properties }) };
@@ -4012,6 +4105,8 @@ export async function importUnrealDirectory(
         assets = mergeExported(assets, result.exported);
         textureSources.set(result.entry.file, result.source);
         standaloneBySource.set(result.entry.file, result.properties === undefined ? { path: result.source } : { path: result.source, properties: result.properties });
+      } else if ("dataTexture" in result) {
+        dataTextureSources.set(result.entry.file, result.dataTexture);
       } else {
         failed.push({ package: result.entry.package, reason: result.reason ?? "Modern texture conversion failed." });
       }
@@ -4389,6 +4484,7 @@ export async function importUnrealDirectory(
   const audio: ImportedAudio[] = [];
   const dataAssets: ImportedDataAsset[] = [];
   const textureStacks: ImportedTextureStack[] = [];
+  const dataTextures: ImportedDataTexture[] = [];
   const fonts: ImportedFont[] = [];
   const bitmapFonts: ImportedBitmapFont[] = [];
   const sprites: ImportedSprite[] = [];
@@ -4842,6 +4938,35 @@ export async function importUnrealDirectory(
       }
     }
     if (textures.length > 0) log(`Promoted ${textures.length} standalone Texture2D PNGs.`);
+
+    // RGBA16F textures the PNG exporters could not encode: the binary and its manifest move together, under the qualified path.
+    for (const entry of texturePackages) {
+      const source = dataTextureSources.get(entry.file);
+      if (!source) continue;
+      const relativeBase = `data-textures/${entry.package.slice(0, -extname(entry.package).length)}`;
+      try {
+        dataTextures.push(await promoteRgba16fDataTexture({
+          converterOutput: source.converterOutput,
+          sourceDir,
+          selector: source.selector,
+          promotionDir: promotion,
+          relativeBase,
+          package: entry.package,
+        }));
+      } catch (error) {
+        failed.push({
+          package: entry.package,
+          reason: `RGBA16F data texture packaging failed (${source.pngFailure}): ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (dataTextures.length > 0) {
+      log(`Promoted ${dataTextures.length} RGBA16F data texture${dataTextures.length === 1 ? "" : "s"}.`);
+      warnings.push(
+        `${dataTextures.length} RGBA16F texture${dataTextures.length === 1 ? " was" : "s were"} kept as raw half-float data, because the PNG exporters cannot encode the format. ` +
+          "Their values are stored, not decoded: no PivotPainter, classifier, source UV, graph or WPO semantics are applied, and no material is bound to them.",
+      );
+    }
 
     for (const entry of cubemapPackages) {
       const source = cubemapSources.get(entry.file);
@@ -5434,13 +5559,14 @@ export async function importUnrealDirectory(
       bitmapFonts.length === 0 &&
       sprites.length === 0 &&
       flipbooks.length === 0 &&
-      strands.length === 0
+      strands.length === 0 &&
+      dataTextures.length === 0
     ) {
       const reasons = failed.slice(0, 5).map((entry) => `${entry.package}: ${entry.reason}`);
       const more = failed.length > reasons.length ? ` (+${failed.length - reasons.length} more)` : "";
       throw new ImportError(
         "UNREAL_EXPORT_EMPTY",
-        "No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene; nothing was promoted." +
+        "No package produced a valid model, texture, RGBA16F data texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene; nothing was promoted." +
           (reasons.length > 0 ? ` Failures — ${reasons.join("; ")}${more}.` : ""),
       );
     }
@@ -5542,6 +5668,7 @@ export async function importUnrealDirectory(
         audio: audio.length,
         dataAssets: dataAssets.length,
         textureStacks: textureStacks.length,
+        dataTextures: dataTextures.length,
         fonts: fonts.length,
         bitmapFonts: bitmapFonts.length,
         sprites: sprites.length,
@@ -5558,6 +5685,7 @@ export async function importUnrealDirectory(
       audio,
       dataAssets,
       textureStacks,
+      dataTextures,
       fonts,
       bitmapFonts,
       sprites,
@@ -5578,7 +5706,7 @@ export async function importUnrealDirectory(
     // The staging PNGs are still on disk here and are removed in `finally`.
     if (request.proofSources) await request.proofSources(proofByGlb, report);
     log(
-      `Promoted ${models.length} model GLB${models.length === 1 ? "" : "s"}, ${textures.length} texture PNG${textures.length === 1 ? "" : "s"}, ${cubemaps.length} cubemap environment map${cubemaps.length === 1 ? "" : "s"}, ${textureStacks.length} multidimensional texture stack${textureStacks.length === 1 ? "" : "s"}, ${standaloneMaterials.length} material asset${standaloneMaterials.length === 1 ? "" : "s"}, ${audio.length} audio file${audio.length === 1 ? "" : "s"}, ${fonts.length} font face${fonts.length === 1 ? "" : "s"}, ${bitmapFonts.length} bitmap font${bitmapFonts.length === 1 ? "" : "s"}, ${sprites.length} sprite GLB${sprites.length === 1 ? "" : "s"}, ${flipbooks.length} flipbook manifest${flipbooks.length === 1 ? "" : "s"}, ${dataAssets.length} data JSON file${dataAssets.length === 1 ? "" : "s"}, and ${scenes.length} scene GLB${scenes.length === 1 ? "" : "s"} to ${outputDir}.`,
+      `Promoted ${models.length} model GLB${models.length === 1 ? "" : "s"}, ${textures.length} texture PNG${textures.length === 1 ? "" : "s"}, ${dataTextures.length} RGBA16F data texture${dataTextures.length === 1 ? "" : "s"}, ${cubemaps.length} cubemap environment map${cubemaps.length === 1 ? "" : "s"}, ${textureStacks.length} multidimensional texture stack${textureStacks.length === 1 ? "" : "s"}, ${standaloneMaterials.length} material asset${standaloneMaterials.length === 1 ? "" : "s"}, ${audio.length} audio file${audio.length === 1 ? "" : "s"}, ${fonts.length} font face${fonts.length === 1 ? "" : "s"}, ${bitmapFonts.length} bitmap font${bitmapFonts.length === 1 ? "" : "s"}, ${sprites.length} sprite GLB${sprites.length === 1 ? "" : "s"}, ${flipbooks.length} flipbook manifest${flipbooks.length === 1 ? "" : "s"}, ${dataAssets.length} data JSON file${dataAssets.length === 1 ? "" : "s"}, and ${scenes.length} scene GLB${scenes.length === 1 ? "" : "s"} to ${outputDir}.`,
     );
     return report;
   } catch (error) {

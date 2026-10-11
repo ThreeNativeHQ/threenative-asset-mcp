@@ -466,6 +466,22 @@ if (exactAt >= 0)
     exactFile = EngineContent.ExactSource(exactKey)
         ?? throw new ArgumentException($"--exact-reference names no engine source: {args[exactAt + 1]}");
 }
+// Data-texture mode: one Texture2D of one package, named by its exact key under the root (the key without .uasset). It writes
+// the stored RGBA16F source bytes beside a manifest, and refuses any source it cannot reproduce exactly.
+var dataTextureAt = Array.IndexOf(args, "--data-texture");
+string? dataTextureSelector = null;
+string? dataTextureKey = null;
+if (dataTextureAt >= 0)
+{
+    if (exactAt >= 0 || filterAt >= 0) throw new ArgumentException("--data-texture cannot be combined with --filter or --exact-reference");
+    if (dumpAt >= 0 || graphAt >= 0) throw new ArgumentException("--data-texture cannot be combined with --dump-properties or --dump-graphs");
+    if (dataTextureAt + 1 >= args.Length) throw new ArgumentException("--data-texture needs a package key");
+    dataTextureSelector = args[dataTextureAt + 1];
+    if (dataTextureSelector.Length == 0 || dataTextureSelector.Contains('\\') || dataTextureSelector.StartsWith('/') ||
+        dataTextureSelector.Split('/').Any(part => part is "" or "." or ".."))
+        throw new ArgumentException($"--data-texture is not a relative package key: {dataTextureSelector}");
+    dataTextureKey = dataTextureSelector + ".uasset";
+}
 // Source-model LODs of a skeletal mesh to export, as indices into its source model array.
 var lodsAt = Array.IndexOf(args, "--lods");
 var requestedLods = lodsAt >= 0
@@ -479,6 +495,8 @@ var requestedLods = lodsAt >= 0
 if (requestedLods.Length == 0) throw new ArgumentException("--lods needs at least one LOD index");
 bool MatchesFilter(string key)
 {
+    // Data-texture mode names one package by its exact key, case and separators included.
+    if (dataTextureKey is not null) return string.Equals(key, dataTextureKey, StringComparison.Ordinal);
     // Exact mode names one package by its key under the root: no suffix or basename can select another package.
     if (exactPackage is not null) return string.Equals(key, exactPackage, StringComparison.OrdinalIgnoreCase);
     if (filter is null) return true;
@@ -544,6 +562,8 @@ if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
+if (dataTextureKey is not null && !provider.Files.Keys.Any(candidate => string.Equals(candidate, dataTextureKey, StringComparison.Ordinal)))
+    throw RefuseRgba16fDataTexture(Path.GetFileName(dataTextureSelector!), $"no package has exactly the key {dataTextureSelector}.uasset under the source root");
 if (dumpAt >= 0)
 {
     var dumpPath = Path.GetFullPath(args[dumpAt + 1]);
@@ -2611,6 +2631,14 @@ foreach (var key in provider.Files.Keys.Where(key =>
             JsonConvert.SerializeObject(descriptor, Formatting.Indented));
         exported++;
     }
+    // Data-texture mode exports only this package's own Texture2D as raw RGBA16F. The PNG exporters below never see it: they
+    // cannot encode the format, so the importer asks for this path after their failure instead.
+    if (dataTextureKey is not null)
+    {
+        ExportRgba16fDataTexture(package, provider, key, output, dataTextureSelector!);
+        exported++;
+        continue;
+    }
     foreach (var texture in package.GetExports().OfType<UTexture2D>().Where(candidate => exactObject is null || candidate.Name == exactObject))
     {
         var session = new ExportSession { MaxDegreeOfParallelism = 1 };
@@ -2869,6 +2897,116 @@ if (materialFailures.Count > 0) throw new InvalidDataException(
     $"{materialFailures.Count + materialFailuresDropped} material(s) could not be imported with their overrides, so the conversion is incomplete:\n" +
     string.Join("\n", materialFailures.Select(entry => $"{entry.Key}: {entry.Value}")) +
     (materialFailuresDropped > 0 ? $"\n... and {materialFailuresDropped} more" : ""));
+
+// Raw RGBA16F source art (TSF_RGBA16F). Unreal stores these samples unfiltered: UE 4.19 Texture.cpp copies the mip without PNG
+// encoding (CanPNGCompress excludes the format), 8 bytes per pixel. The producer keeps those bytes exactly, so nothing is clamped,
+// resized or re-encoded, and a source outside that layout is refused rather than converted. The two records are declared last.
+// The CUE4Parse read: the typed Source struct and the SourceArt bulk, with enum names stripped of their type prefix.
+static Rgba16fSourceArt ReadRgba16fSourceArt(UTexture2D texture)
+{
+    var source = texture.GetOrDefault<FStructFallback?>("Source", null) ?? throw new InvalidDataException("the texture has no typed Source struct");
+    static string EnumName(FStructFallback properties, string name)
+    {
+        var text = properties.GetOrDefault<FName>(name).Text ?? "";
+        return text[(text.LastIndexOf(':') + 1)..];
+    }
+    var bulk = texture.SourceArt ?? throw new InvalidDataException("the texture has no SourceArt bulk data");
+    return new Rgba16fSourceArt(
+        EnumName(source, "Format"),
+        source.GetOrDefault<int>("SizeX"),
+        source.GetOrDefault<int>("SizeY"),
+        source.GetOrDefault<int>("NumSlices"),
+        source.GetOrDefault<int>("NumMips"),
+        source.GetOrDefault<bool>("bPNGCompressed", false),
+        EnumName(source, "CompressionFormat"),
+        texture.SRGB,
+        (long) bulk.Header.ElementCount,
+        bulk.ReadDataOnce());
+}
+// The rules the raw layout must meet. Every refusal names the rule, and nothing is written before all of them pass.
+static Rgba16fDataTexture ValidateRgba16fSourceArt(Rgba16fSourceArt source)
+{
+    if (source.Format != "TSF_RGBA16F") throw new InvalidDataException($"source format {source.Format} is not TSF_RGBA16F");
+    if (source.PngCompressed) throw new InvalidDataException("the source is PNG-compressed; Unreal never compresses RGBA16F, so the raw layout does not apply");
+    if (source.Compression is not ("" or "TSCF_None")) throw new InvalidDataException($"the source uses compression {source.Compression}; only uncompressed raw SourceArt is exported");
+    if (source.Srgb) throw new InvalidDataException("the texture is sRGB; its raw RGBA16F values are linear and must not be decoded");
+    if (source.NumMips != 1) throw new InvalidDataException($"the source holds {source.NumMips} mips; exactly one mip is supported");
+    if (source.NumSlices != 1) throw new InvalidDataException($"the source holds {source.NumSlices} slices; exactly one slice is supported");
+    if (source.SizeX is < 1 or > 65536 || source.SizeY is < 1 or > 65536)
+        throw new InvalidDataException($"source dimensions {source.SizeX}x{source.SizeY} are outside 1 to 65536");
+    var expected = (long) source.SizeX * source.SizeY * 8;
+    if (expected > 1L << 30) throw new InvalidDataException("the RGBA16F source exceeds the 1 GiB limit");
+    if (source.Bytes is null) throw new InvalidDataException("the SourceArt read returned no bytes");
+    if (source.ElementCount != expected || source.Bytes.LongLength != expected)
+        throw new InvalidDataException($"SourceArt read is incomplete or not raw: {source.Bytes.LongLength} bytes, element count {source.ElementCount}; {source.SizeX}x{source.SizeY} RGBA16F is {expected} bytes");
+    for (var offset = 0; offset < source.Bytes.Length; offset += 2)
+    {
+        var sample = BinaryPrimitives.ReadUInt16LittleEndian(source.Bytes.AsSpan(offset, 2));
+        if ((sample & 0x7C00) == 0x7C00)
+            throw new InvalidDataException($"non-finite half-float sample at sample {offset / 2} (pixel {offset / 8}, channel {offset / 2 % 4})");
+    }
+    return new Rgba16fDataTexture(source.SizeX, source.SizeY, source.Bytes);
+}
+// SHA-256 of the package file set: for each present file (.uasset, .uexp, .ubulk, .uptnl, in that order), its "ext size" line and its bytes.
+static string PackageSetSha256(IReadOnlyList<(string Extension, byte[] Bytes)> files)
+{
+    using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+    foreach (var file in files)
+    {
+        hash.AppendData(Encoding.ASCII.GetBytes($"{file.Extension} {file.Bytes.Length}\n"));
+        hash.AppendData(file.Bytes);
+    }
+    return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+}
+// Writes <name>.rgba16f-le and <name>.rgba16f.json. Each file is renamed into place from a temporary sibling.
+static string WriteRgba16fDataTexture(string directory, string name, string packageKey, string objectPath, string packageSha256, Rgba16fDataTexture data, string converter)
+{
+    Directory.CreateDirectory(directory);
+    var binaryName = name + ".rgba16f-le";
+    var binaryPath = Path.Combine(directory, binaryName);
+    var manifestPath = Path.Combine(directory, name + ".rgba16f.json");
+    var dataSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data.Bytes)).ToLowerInvariant();
+    var descriptor = new {
+        format = "threenative-rgba16f-data-texture",
+        version = 1,
+        name,
+        source = new { package = packageKey, @object = name, objectPath, @class = "Texture2D", sourceFormat = "TSF_RGBA16F", sha256 = packageSha256 },
+        data = new {
+            file = binaryName, format = "RGBA16F", layout = "little-endian-half4", width = data.Width, height = data.Height,
+            mips = 1, slices = 1, channels = 4, bytesPerPixel = 8, bytes = data.Bytes.Length, sha256 = dataSha256, srgb = false, colorSpace = "none"
+        },
+        provenance = new { converter, unrealSource = "UE 4.19 Texture.cpp raw SourceArt path: bPNGCompressed false, 8 bytes per pixel" },
+        limits = new[] { "Raw SourceArt bytes only: no PivotPainter, classifier, source UV, graph or WPO semantic decoding is applied." }
+    };
+    File.WriteAllBytes(binaryPath + ".tmp", data.Bytes);
+    File.Move(binaryPath + ".tmp", binaryPath, true);
+    File.WriteAllText(manifestPath + ".tmp", JsonConvert.SerializeObject(descriptor, Formatting.Indented) + "\n");
+    File.Move(manifestPath + ".tmp", manifestPath, true);
+    return manifestPath;
+}
+// Exports the one Texture2D named like the package file. The package file set is read through the provider, by exact key.
+static void ExportRgba16fDataTexture(IPackage package, DefaultFileProvider provider, string key, string output, string selector)
+{
+    var name = Path.GetFileName(selector);
+    var textures = package.GetExports().OfType<UTexture2D>().Where(candidate => candidate.Name == name).ToArray();
+    if (textures.Length != 1) throw RefuseRgba16fDataTexture(name, $"{textures.Length} Texture2D exports are named {name} in {key}; exactly one is needed");
+    var texture = textures[0];
+    var stem = key[..^".uasset".Length];
+    var files = new List<(string Extension, byte[] Bytes)>();
+    foreach (var extension in new[] { ".uasset", ".uexp", ".ubulk", ".uptnl" })
+        if (provider.Files.TryGetValue(stem + extension, out var file)) files.Add((extension, file.Read()));
+    Rgba16fDataTexture data;
+    try { data = ValidateRgba16fSourceArt(ReadRgba16fSourceArt(texture)); }
+    catch (InvalidDataException error) { throw RefuseRgba16fDataTexture(name, error.Message); }
+    var manifest = WriteRgba16fDataTexture(Path.Combine(output, "DataTextures"), name, key, texture.GetPathName(), PackageSetSha256(files), data, "threenative-cue4parse ${CUE4PARSE_SOURCE.version}");
+    Console.WriteLine($"threenative-data-texture {name}: {manifest}");
+}
+// Names the refusal on stderr the way the importer reads texture failures, and returns the exception to throw.
+static Exception RefuseRgba16fDataTexture(string name, string reason)
+{
+    Console.Error.WriteLine($"threenative-texture-failure {name}: {reason}");
+    return new InvalidDataException(reason);
+}
 
 static byte[] EncodeBgre8AsRadiance(byte[] source, int width, int height)
 {
@@ -4051,4 +4189,6 @@ sealed record EditorMesh(
     int[] TriangleGroups,
     bool[] LiveTriangles,
     string[] GroupSlots);
+sealed record Rgba16fSourceArt(string Format, int SizeX, int SizeY, int NumSlices, int NumMips, bool PngCompressed, string Compression, bool Srgb, long ElementCount, byte[]? Bytes);
+sealed record Rgba16fDataTexture(int Width, int Height, byte[] Bytes);
 `;

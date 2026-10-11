@@ -434,6 +434,7 @@ sweep's `--no-graph-bake` uses this to produce a baseline).
 | Uncooked UE5 editor static meshes (source models only, no render data) | LOD0 of the `FMeshDescription` source model is decoded from the package trailer's Oodle payloads, with the cooked glTF writer's axes, scale, and material naming. Verified on Fab's Megascans Common Hazel and European Hornbeam UE5.1 artifacts: triangle counts match the UE4.27 decoder of the same scans exactly |
 | Uncooked UE4.0–4.20 static and skeletal meshes (object versions below 517) | Exported by UE Viewer from the editor source data, with materials, skins, and ActorX clips like cooked packages. Verified on Fab packs from UE4.10 to UE4.20: Modular Building Set (129 meshes), Animal Variety Pack (6 rigged animals, 146 clips), STF Landscape Pro 2.0 (61), Power Plant (65), and a UE4.19 fern pack (38) |
 | Standalone `Texture2D` packages | Collision-free source-relative PNGs under `textures/`; duplicate Unreal basenames are exported independently instead of overwriting one another |
+| `Texture2D` with an `RGBA16F` source | Raw little-endian half-float RGBA binaries and a versioned JSON manifest under `data-textures/`, promoted together under the package's qualified path. Values are stored, not decoded: no PivotPainter, classifier, source UV, graph or WPO semantics, and no material binding. The PNG exporters cannot encode the format, so the importer asks the converter for this route after a legacy PNG export fails; a UE 4.x pack needs its `engine` (`UE_4.19`), since the default detector reads every UE4 package as the latest UE4. Loaded in the browser with `threenative-asset-mcp/data-texture` (see Three.js usage) |
 | `TextureCube` environment maps | Collision-free 2:1 equirectangular PNG or lossless Radiance HDR files under `cubemaps/`; CUE4Parse decodes cooked faces, while editor `TSF_BGRE8` source art retains its lighting range without Unreal Engine |
 | `Texture2DArray`, `TextureCubeArray`, and `VolumeTexture` | Collision-free RGBA8 slice data plus JSON dimensions under `textures3d/`; use `DataArrayTexture` for arrays and `Data3DTexture` for volumes. Cube-array faces remain ordered in groups of six for custom shaders. Floating-point/HDR stacks are rejected rather than reduced to RGBA8 |
 | Standalone `Material` and `MaterialInstanceConstant` packages | One directly loadable `Materials/UnrealMaterialLibrary.glb`; each source-relative swatch name is collision-free, follows parent instances, embeds resolved texture inputs, and applies common base-color/emissive vectors plus roughness/metallic/opacity scalars |
@@ -640,6 +641,26 @@ texture.format = THREE.RGBAFormat;
 texture.type = THREE.UnsignedByteType;
 texture.needsUpdate = true;
 ```
+
+Raw `RGBA16F` textures load through the package's `./data-texture` subpath. The loader
+checks the manifest against the binary (exact length, SHA-256, finite samples) and refuses the
+load, rather than skipping a check, when one cannot run. The source package cannot be fetched
+or re-hashed in a browser, so pin the value the report gives for the texture's source package:
+
+```js
+import { loadRgba16fDataTexture } from "threenative-asset-mcp/data-texture";
+
+const { texture, manifest } = await loadRgba16fDataTexture(
+  new URL(dataTexture.manifest, reportBaseUrl),
+  { expectedSourceSha256: dataTexture.sourceSha256 },
+);
+// texture: THREE.DataTexture, RGBAFormat, HalfFloatType, NoColorSpace, no mipmaps.
+// The stored values are unchanged: negative, HDR, subnormal and alpha bits reach the shader as stored.
+```
+
+`loadRgba16fDataTexture` needs an absolute URL and `crypto.subtle`, so serve the page over
+https or from localhost. Its limit is the import's: the texture holds linear half-float
+samples with no decoding, so a material must decide what they mean.
 
 Installation-only Unreal `BasicShapes/Plane` references are generated locally
 when the asset pack does not contain that mesh. Rectangular area lights are
