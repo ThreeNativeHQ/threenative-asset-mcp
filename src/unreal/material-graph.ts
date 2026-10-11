@@ -77,9 +77,9 @@ export interface BakeRequest {
   /** Square output edge in pixels. Default 1024. */
   size?: number;
   /**
-   * Evaluate a UV set above 0 (a TextureCoordinate's CoordinateIndex, or an unwired sample's or Panner's ConstCoordinate) as UV0 and mark
-   * the bake heuristic instead of refusing it. Off by default: which mesh UV set an index refers to is not in the graph. A malformed index
-   * is refused either way.
+   * Evaluate a UV set above 0 (a TextureCoordinate's CoordinateIndex, or an unwired sample's, Panner's or BumpOffset's ConstCoordinate) as
+   * UV0 and mark the bake heuristic instead of refusing it. Off by default: which mesh UV set an index refers to is not in the graph. A
+   * malformed index is refused either way.
    */
   allowUvSetFallback?: boolean;
   /**
@@ -720,9 +720,9 @@ type SwitchUses = Map<string, SwitchUse>;
 const MAX_UV_CHANNELS = 8;
 
 /**
- * The UV set a TextureCoordinate's CoordinateIndex, or an unwired sample's or Panner's ConstCoordinate, names. Absent is UV0, the engine's default.
- * A present value must be an integer from 0 to MAX_UV_CHANNELS - 1. Anything else is undefined, and the caller refuses it rather than
- * reading it as UV0 or as the nearest set.
+ * The UV set a TextureCoordinate's CoordinateIndex, or an unwired sample's, Panner's or BumpOffset's ConstCoordinate, names. Absent is UV0,
+ * the engine's default. A present value must be an integer from 0 to MAX_UV_CHANNELS - 1. Anything else is undefined, and the caller
+ * refuses it rather than reading it as UV0 or as the nearest set.
  */
 function uvSetIndex(raw: unknown): number | undefined {
   if (raw === undefined) return 0;
@@ -1248,9 +1248,20 @@ class Compiler {
         return this.constant([0.5], 1);
       case "BumpOffset": {
         // Coordinate + (Height - Reference) * HeightRatio * CameraVector.xy: no view vector in a bake, so the coordinate itself.
+        let coordinate: Val | undefined;
+        if (node.inputs.Coordinate) coordinate = this.vec(node.inputs.Coordinate, "BumpOffset.Coordinate");
+        else {
+          // Only an unwired Coordinate reads ConstCoordinate, as the engine's compile does (`TextureCoordinate(ConstCoordinate)`,
+          // MaterialExpressions.cpp, UE 5.8.3). A wired one never does, malformed or not.
+          const uv = uvSetOf(`BumpOffset ${node.id}`, node, "ConstCoordinate");
+          if ("refusal" in uv) return this.markUnavailable(uv.refusal);
+          if (uv.index > 0 && !this.options.allowUvSetFallback) return this.markUnsupported(`TextureCoordinate[${uv.index}]`);
+          if (uv.index > 0) this.approximations.add(`TextureCoordinate[${uv.index}] evaluated as UV0; the mesh UV set ${uv.index} is not in the material`);
+          coordinate = this.defaultUv();
+        }
+        if (!coordinate) return this.markUnavailable(`BumpOffset ${node.id} has no coordinate`);
         this.approximations.add(BUMP_OFFSET_NOTE);
-        const coordinate = node.inputs.Coordinate ? this.vec(node.inputs.Coordinate, "BumpOffset.Coordinate") : this.defaultUv();
-        return coordinate ?? this.markUnavailable(`BumpOffset ${node.id} has no coordinate`);
+        return coordinate;
       }
       case "Fresnel": {
         // BaseReflectFraction + (1 - BaseReflectFraction) * (1 - saturate(dot(Normal, CameraVector)))^Exponent. A bake has no

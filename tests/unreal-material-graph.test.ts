@@ -2577,13 +2577,22 @@ describe("UV set indices: a malformed index is refused on the path that demands 
     expect(await bakeWith(graph)).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
   });
 
-  describe("TextureSample ConstCoordinate, and a UV set the dump found but could not read", () => {
+  describe("TextureSample and BumpOffset ConstCoordinate, and a UV set the dump found but could not read", () => {
     const UNREADABLE_INDEX = "property CoordinateIndex (IntProperty) could not be read";
     const UNREADABLE_CONST = "property ConstCoordinate (IntProperty) could not be read";
     /** T_Grey sampled at the `uv` TextureCoordinate, or with no Coordinates pin when `coords` is null. `constants` are set after parsing, as `sampleAt` does. */
     const sampleOf = (coords: string | null, constants: Raw = {}): MaterialGraph => {
       const graph = makeGraph([textureSample("t", "T_Grey", "Color", coords), ...(coords ? [textureCoordinate(coords)] : [])], pin("t", 0, RGB_MASK));
       Object.assign(graph.nodes.find((n) => n.id === "t")!.constants, constants);
+      return graph;
+    };
+    /** T_Grey sampled through a BumpOffset: its Coordinate is the `uv` TextureCoordinate when `wired`, else unwired and reading `constants`, set after parsing. */
+    const bumpAt = (wired: boolean, constants: Raw = {}): MaterialGraph => {
+      const graph = makeGraph(
+        [textureSample("t", "T_Grey", "Color", "bump"), node("bump", "BumpOffset", { inputs: wired ? { Coordinate: pin("uv") } : {} }), ...(wired ? [textureCoordinate("uv")] : [])],
+        pin("t", 0, RGB_MASK),
+      );
+      Object.assign(graph.nodes.find((n) => n.id === "bump")!.constants, constants);
       return graph;
     };
     /** A switch that takes its A pin (the UV0 sample) and leaves `inactive` on its B pin, which the compile never reaches. */
@@ -2675,6 +2684,62 @@ describe("UV set indices: a malformed index is refused on the path that demands 
       const wired = await pixelsOf(await bakeWith(sampleOf("uv", unreadable)));
       for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(wired(x, y)).toEqual(clean(x, y));
       expect(await bakeWith(switchOver({ ...textureSample("bad", "T_Grey", "Color"), constants: unreadable }))).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+    });
+
+    it("an unwired BumpOffset reads UV0 while ConstCoordinate is absent or 0, the same texels as a sample of UV0", async () => {
+      const uv0 = await pixelsOf(await bakeWith(sampleOf("uv")));
+      for (const constants of [{}, { ConstCoordinate: 0 }]) {
+        const result = await bakeWith(bumpAt(false, constants));
+        expect(result, JSON.stringify(constants)).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+        const pixel = await pixelsOf(result);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(pixel(x, y)).toEqual(uv0(x, y));
+      }
+    });
+
+    it("keeps a valid positive unwired BumpOffset ConstCoordinate strict, and the named UV0 heuristic with the fallback", async () => {
+      const uv0 = await pixelsOf(await bakeWith(sampleOf("uv")));
+      for (const index of [1, 7]) {
+        expect(await bakeWith(bumpAt(false, { ConstCoordinate: index }))).toMatchObject({ status: "unsupported", unsupported: [`TextureCoordinate[${index}]`] });
+        const relaxed = await bakeWith(bumpAt(false, { ConstCoordinate: index }), true);
+        expect(relaxed).toMatchObject({ status: "baked", confidence: "heuristic" });
+        if (relaxed.status === "baked") expect(relaxed.approximations).toContain(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
+        const pixel = await pixelsOf(relaxed);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(pixel(x, y)).toEqual(uv0(x, y));
+      }
+    });
+
+    it("refuses a malformed unwired BumpOffset ConstCoordinate, with or without the fallback", async () => {
+      for (const value of ["1", true, [1], null, Number.NaN, Number.POSITIVE_INFINITY, 1.5, -1, 8]) {
+        for (const fallback of [false, true]) {
+          expect(await bakeWith(bumpAt(false, { ConstCoordinate: value }), fallback), `ConstCoordinate ${String(value)}, fallback ${fallback}`).toMatchObject({
+            status: "unavailable",
+            reason: expect.stringMatching(/^BumpOffset bump has a malformed ConstCoordinate/),
+          });
+        }
+      }
+    });
+
+    it("refuses an unreadable unwired BumpOffset ConstCoordinate, with or without the fallback", async () => {
+      for (const fallback of [false, true]) {
+        expect(await bakeWith(bumpAt(false, { ConstCoordinateError: UNREADABLE_CONST }), fallback)).toMatchObject({
+          status: "unavailable",
+          reason: expect.stringMatching(/^BumpOffset bump has an unreadable ConstCoordinate/),
+        });
+      }
+    });
+
+    it("a wired BumpOffset Coordinate never reads ConstCoordinate, malformed, unreadable or valid positive", async () => {
+      const clean = await pixelsOf(await bakeWith(bumpAt(true)));
+      for (const constants of [{ ConstCoordinate: "1" }, { ConstCoordinate: null }, { ConstCoordinate: 7 }, { ConstCoordinateError: UNREADABLE_CONST }]) {
+        const result = await bakeWith(bumpAt(true, constants));
+        expect(result, JSON.stringify(constants)).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+        const pixel = await pixelsOf(result);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(pixel(x, y)).toEqual(clean(x, y));
+      }
+    });
+
+    it("a malformed unwired ConstCoordinate on a statically inactive BumpOffset does not poison the bake", async () => {
+      expect(await bakeWith(switchOver(node("bad", "BumpOffset", { constants: { ConstCoordinate: "1" } })))).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
     });
 
     it("the Normal probe refuses a malformed or unreadable set it demands, reads a valid positive one, and ignores a wired one", () => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as sourcePackage from "../src/unreal/source-material-package.js";
 import * as sourceMaterial from "../src/unreal/source-material.js";
 import { bool, fields, float, input, materialPackage, parameter, prop, scalarInput, subsetInstance, subsetMaster } from "./helpers/unreal-material-source.js";
+import type { SourceProperty } from "./helpers/unreal-material-source.js";
 
 describe("authored material source subset", () => {
   it("decodes signed exact paths and prunes two switches before reducing AO and scalar roughness", () => {
@@ -144,6 +145,57 @@ describe("authored material source subset", () => {
     expect(sourceMaterial.reduceSourceMaterial(new Map([["/Game/M", sourcePackage.decodeMaterialPackage(opaque, "/Game/M")]]), "/Game/M.M").limitations.join("\n")).toContain("output 24");
     const invalid = materialPackage([{ name: "M", className: "Material", properties: [input("AmbientOcclusion", 2, 0, 1)] }, { name: "Sample", className: "MaterialExpressionTextureSample", properties: [prop("Texture", "ObjectProperty", "/Game/Kit/Packed"), input("Coordinates", 3, undefined, 999)] }, { name: "UV", className: "MaterialExpressionTextureCoordinate", properties: [] }], ["/Game/Kit/Packed"]);
     expect(() => sourceMaterial.reduceSourceMaterial(new Map([["/Game/M", sourcePackage.decodeMaterialPackage(invalid, "/Game/M")]]), "/Game/M.M")).toThrow(/output/i);
+  });
+
+  describe("a sample's UV set: integer 0..7 where the sample selects it, wired Coordinates first", () => {
+    const wired = input("Coordinates", 3);
+    const unreadable = (name: string) => prop(name, "StructProperty", [], { struct: "Uninterpreted" });
+    /** The UV node (export 3) with CoordinateIndex `index` and its default tiling, minus the property named `omit` when given. */
+    const uv = (index: SourceProperty, omit?: string) => [index, prop("UTiling", "FloatProperty", 1), prop("VTiling", "FloatProperty", 1), bool("UnMirrorU", false), bool("UnMirrorV", false)].filter((p) => p.name !== omit);
+    /** AmbientOcclusion sampled by the Sample (export 2) with the `sample` pins, reduced from the package. */
+    const reduce = (sample: SourceProperty[], uvProperties: SourceProperty[]) =>
+      sourceMaterial.reduceSourceMaterial(
+        new Map([["/Game/M", sourcePackage.decodeMaterialPackage(materialPackage([
+          { name: "M", className: "Material", properties: [input("AmbientOcclusion", 2, 0, 1)] },
+          { name: "Sample", className: "MaterialExpressionTextureSample", properties: [prop("Texture", "ObjectProperty", "/Game/Kit/Packed"), ...sample] },
+          { name: "UV", className: "MaterialExpressionTextureCoordinate", properties: uvProperties },
+        ], ["/Game/Kit/Packed"]), "/Game/M")]]),
+        "/Game/M.M",
+      );
+
+    it("reads a wired TextureCoordinate's UV sets 0 and 7 as explicit", () => {
+      for (const index of [0, 7]) expect(reduce([wired], uv(prop("CoordinateIndex", "IntProperty", index))).channels.AmbientOcclusion).toMatchObject({ coordinates: { kind: "explicit", index, u: 1, v: 1 } });
+    });
+
+    it("refuses a wired TextureCoordinate index outside 0..7, as it refuses a negative or fractional one", () => {
+      for (const index of [prop("CoordinateIndex", "IntProperty", 8), prop("CoordinateIndex", "IntProperty", -1), prop("CoordinateIndex", "FloatProperty", 1.5)]) {
+        expect(() => reduce([wired], uv(index))).toThrow("Invalid source UV index");
+      }
+    });
+
+    it("keeps an unreadable or incomplete wired TextureCoordinate unresolved", () => {
+      expect(reduce([wired], uv(unreadable("CoordinateIndex"))).channels.AmbientOcclusion).toMatchObject({ coordinates: { kind: "unresolved", reason: expect.stringContaining("Source UV defaults unresolved") } });
+      expect(reduce([wired], uv(prop("CoordinateIndex", "IntProperty", 2), "UTiling")).channels.AmbientOcclusion).toMatchObject({ coordinates: { kind: "unresolved", reason: expect.stringContaining("Source UV defaults unresolved") } });
+    });
+
+    it("never reads a ConstCoordinate that a wired Coordinates ignores, even an unreadable one", () => {
+      for (const constant of [unreadable("ConstCoordinate"), prop("ConstCoordinate", "IntProperty", 9)]) {
+        expect(reduce([wired, constant], uv(prop("CoordinateIndex", "IntProperty", 2))).channels.AmbientOcclusion).toMatchObject({ coordinates: { kind: "explicit", index: 2, u: 1, v: 1 } });
+      }
+    });
+
+    it("refuses an unreadable Coordinates pin, whatever its ConstCoordinate says", () => {
+      expect(reduce([unreadable("Coordinates"), prop("ConstCoordinate", "IntProperty", 1)], uv(prop("CoordinateIndex", "IntProperty", 0))).channels.AmbientOcclusion).toMatchObject({
+        coordinates: { kind: "unresolved", reason: "Source sampler coordinates unsupported" },
+      });
+    });
+
+    it("reads an unwired sample's ConstCoordinate 7 and refuses 8 or an unreadable one", () => {
+      const unwired = (constant: SourceProperty) => reduce([constant], uv(prop("CoordinateIndex", "IntProperty", 0))).channels.AmbientOcclusion;
+      expect(unwired(prop("ConstCoordinate", "IntProperty", 7))).toMatchObject({ coordinates: { kind: "explicit", index: 7, u: 1, v: 1 } });
+      expect(unwired(prop("ConstCoordinate", "IntProperty", 8))).toMatchObject({ coordinates: { kind: "unresolved" } });
+      expect(unwired(unreadable("ConstCoordinate"))).toMatchObject({ coordinates: { kind: "unresolved", reason: "Source sampler coordinates unsupported" } });
+    });
   });
 
   it("refuses a scalar texture output whose mask selects a conflicting channel", () => {

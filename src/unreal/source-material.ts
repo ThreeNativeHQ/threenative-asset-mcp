@@ -103,7 +103,7 @@ export function reduceSourceMaterial(packages: ReadonlyMap<string, SourcePackage
   const coordinates = (node: SourceExport): SourceCoordinates => {
     const fs = fields(node.properties); const coordinate = fs.get("Coordinates"); const constant = fs.get("ConstCoordinate");
     if (!coordinate && !constant) return { kind: "implicit", samplerClass: node.className };
-    if (coordinate?.unsupported || constant?.unsupported) return { kind: "unresolved", reason: "Source sampler coordinates unsupported" };
+    if (coordinate?.unsupported) return { kind: "unresolved", reason: "Source sampler coordinates unsupported" };
     const edge = input(coordinate?.value);
     if (edge && ref(edge.Expression)!.index !== 0) {
       let uv = nodeFor(edge); const seen = new Set<number>();
@@ -112,12 +112,15 @@ export function reduceSourceMaterial(packages: ReadonlyMap<string, SourcePackage
       const uvFields = fields(uv.properties);
       if (["CoordinateIndex", "UTiling", "VTiling", "UnMirrorU", "UnMirrorV"].some((p) => !uvFields.has(p) || uvFields.get(p)?.unsupported)) return { kind: "unresolved", reason: `Source UV defaults unresolved at ${uv.path}` };
       if (required(uvFields, "UnMirrorU") !== false || required(uvFields, "UnMirrorV") !== false) return { kind: "unresolved", reason: "Source UV unmirror semantics unsupported" };
-      const index = finite(required(uvFields, "CoordinateIndex"), "UV index"); if (!Number.isInteger(index) || index < 0) throw new Error("Invalid source UV index");
+      // The engine has UV channels 0..7; a selected index outside them is invalid, as a negative or fractional one is.
+      const index = finite(required(uvFields, "CoordinateIndex"), "UV index"); if (!Number.isInteger(index) || index < 0 || index > 7) throw new Error("Invalid source UV index");
       return { kind: "explicit", index, u: finite(required(uvFields, "UTiling"), "UV U tiling"), v: finite(required(uvFields, "VTiling"), "UV V tiling") };
     }
+    // An unreadable ConstCoordinate is refused only where it is read: a wired Coordinates never reads it.
+    if (constant?.unsupported) return { kind: "unresolved", reason: "Source sampler coordinates unsupported" };
     // Explicit ConstCoordinate is independent of a class default. Null Coordinates without it
     // is deliberately distinct from both fields being absent.
-    if (constant && typeof constant.value === "number" && Number.isInteger(constant.value) && constant.value >= 0 && !coordinate) return { kind: "explicit", index: constant.value, u: 1, v: 1 };
+    if (constant && typeof constant.value === "number" && Number.isInteger(constant.value) && constant.value >= 0 && constant.value <= 7 && !coordinate) return { kind: "explicit", index: constant.value, u: 1, v: 1 };
     return { kind: "unresolved", reason: "Source sampler effective coordinate/default unresolved" };
   };
   const sample = (node: SourceExport): SourceSample => {
