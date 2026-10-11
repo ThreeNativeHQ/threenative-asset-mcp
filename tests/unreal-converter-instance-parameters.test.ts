@@ -7,9 +7,11 @@ import { describeWithTools } from "./helpers/require-tool.js";
 import {
   buildConverterProgram,
   convertPackages,
+  dumpGraphsOfPackages,
   runMaterialOverrideHarness,
   type ConverterBuild,
   type ConverterRun,
+  type GraphDumpRun,
   type MaterialOverrideHarnessRun,
 } from "./helpers/material-overrides-harness.js";
 import { fields, float, materialPackage, parameter, prop, type SourceProperty } from "./helpers/unreal-material-source.js";
@@ -73,7 +75,7 @@ function resolveInstance(parameters: readonly (readonly [string, string])[]) {
 
 describe("converter: a material instance's texture overrides", () => {
   it("reads the tagged TextureParameterValues too, not only CUE4Parse's typed array (converter 62)", () => {
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.73");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.74");
     const exporter = CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("async Task ExportMaterialAsync"));
     expect(exporter).toContain('instance.GetOrDefault<FStructFallback[]>("TextureParameterValues")');
   });
@@ -157,6 +159,38 @@ describeWithTools(["modern-converter"], "material instance overrides, emitted by
 
   it("refuses the material when a collection is absent and the read did not complete", () => {
     expect(refusal("failed-read-absent")).toContain("did not read completely");
+  });
+
+  it("refuses an absent texture collection the read did not complete for, as the scalar rows are", () => {
+    expect(refusal("texture-failed-read-absent")).toMatch(/TextureParameterValues is absent and the material did not read completely/);
+  });
+
+  it("writes no texture block for an absent collection the read completed", () => {
+    expect(harness().cases["texture-absent-read-completed"]?.text).toBe("");
+  });
+
+  it("refuses a declared texture collection it cannot read, though a typed fallback could hold rows", () => {
+    expect(refusal("texture-declared-unreadable")).toMatch(/TextureParameterValues is present but its rows cannot be read/);
+  });
+
+  it("refuses typed texture rows that have no declared tag to prove their identity", () => {
+    expect(refusal("texture-typed-only")).toContain("no declared tag");
+  });
+
+  it("refuses a texture row whose layer identity cannot be written as a global one", () => {
+    expect(refusal("texture-layer")).toContain("LayerParameter");
+  });
+
+  it("refuses a texture row without an association, rather than admitting its name", () => {
+    expect(refusal("texture-association-missing")).toContain("no Association tag");
+  });
+
+  it("refuses an authored null texture rather than inheriting the parent's without a source proof", () => {
+    expect(refusal("texture-authored-null")).toContain("authored null");
+  });
+
+  it("refuses the texture rows of a material whose read did not complete, though the rows read", () => {
+    expect(refusal("texture-failed-read-present")).toContain("did not read completely");
   });
 
   it("refuses a scalar row without ParameterValue instead of reading it as 0", () => {
@@ -351,5 +385,209 @@ describeWithTools(["modern-converter"], "material export: a refused override fai
     expect(run.code, run.stderr).toBe(0);
     expect(run.files).toContain("Materials/MI_Valid.props.txt");
     expect(parsePropsFile(await readFile(join(run.output, "Materials", "MI_Valid.props.txt"), "utf8")).switchOverrides).toEqual([]);
+  });
+});
+
+// Converter 74: --dump-graphs writes a qualified record for every material instance it loads, beside the Material graphs. A record
+// holds the instance's own overrides (MaterialOverrides.Blocks for scalars, vectors and static switches, its own texture overrides by
+// qualified package and object) and its qualified parent. A flattened CollectedTextureParameters block never enters a record, and a
+// refused instance is recorded as refused with its reason, never dropped.
+const chainMaster = (): Buffer => materialPackage([{ name: "M_Master", className: "Material", properties: [] }]);
+const chainMid = (): Buffer =>
+  materialPackage(
+    [
+      {
+        name: "MI_Mid",
+        className: "MaterialInstanceConstant",
+        properties: [
+          prop("Parent", "ObjectProperty", "/Game/Chain/M_Master"),
+          scalarArray([[info("Roughness"), float("ParameterValue", 0)]]),
+          prop("VectorParameterValues", "ArrayProperty", [[info("Tint"), prop("ParameterValue", "StructProperty", [0, 0.5, 0, 1], { struct: "LinearColor" })]], {
+            inner: "StructProperty",
+            struct: "VectorParameterValue",
+          }),
+          prop("TextureParameterValues", "ArrayProperty", [[info("Albedo"), prop("ParameterValue", "ObjectProperty", "/Game/Textures/T_Keep")]], {
+            inner: "StructProperty",
+            struct: "TextureParameterValue",
+          }),
+          fields("StaticParameters", "StaticParameterSet", [
+            prop("StaticSwitchParameters", "ArrayProperty", [parameter("UseDetail", false, true), parameter("Disabled", true, false)], {
+              inner: "StructProperty",
+              struct: "StaticSwitchParameter",
+            }),
+          ]),
+        ],
+      },
+    ],
+    ["/Game/Chain/M_Master", "/Game/Textures/T_Keep"],
+    { externalClasses: { "/Game/Chain/M_Master": "Material" } },
+  );
+const chainChild = (): Buffer =>
+  materialPackage(
+    [{ name: "MI_Child", className: "MaterialInstanceConstant", properties: [prop("Parent", "ObjectProperty", "/Game/Chain/MI_Mid"), scalarArray([[info("Metal"), float("ParameterValue", 0.5)]])] }],
+    ["/Game/Chain/MI_Mid"],
+    { externalClasses: { "/Game/Chain/MI_Mid": "MaterialInstanceConstant" } },
+  );
+const namesakeInstance = (): Buffer =>
+  materialPackage([{ name: "MI_Mid", className: "MaterialInstanceConstant", properties: [scalarArray([[info("Metal"), float("ParameterValue", 0.9)]])] }]);
+const duplicateInstance = (): Buffer =>
+  materialPackage([{ name: "MI_Dup", className: "MaterialInstanceConstant", properties: [scalarArray([[info("Metal"), float("ParameterValue", 0.1)]])] }]);
+const CHAIN_PACKAGES: Readonly<Record<string, Buffer>> = {
+  "Content/Chain/M_Master.uasset": chainMaster(),
+  "Content/Chain/MI_Mid.uasset": chainMid(),
+  "Content/Chain/MI_Child.uasset": chainChild(),
+  "Content/Chain/MI_Layer.uasset": layerInstance(),
+  "Content/Chain/MI_Unreadable.uasset": unreadableInstance(),
+  "Content/Other/MI_Mid.uasset": namesakeInstance(),
+  "Content/Chain/MI_Dup.uasset": duplicateInstance(),
+  "Mirror/Content/Chain/MI_Dup.uasset": duplicateInstance(),
+};
+
+describeWithTools(["modern-converter"], "instance records from --dump-graphs, emitted by the compiled converter", () => {
+  let directory = "";
+  let build: ConverterBuild | undefined;
+  let dump: GraphDumpRun | undefined;
+
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), "tn-instance-records-"));
+    build = await buildConverterProgram(CUE4PARSE_PROGRAM, CUE4PARSE_ENGINE_CONTENT, join(directory, "build"));
+    if (build.code !== 0) return;
+    dump = await dumpGraphsOfPackages(build, join(directory, "chain"), CHAIN_PACKAGES);
+  }, 900_000);
+
+  afterAll(async () => {
+    if (directory) await rm(directory, { recursive: true, force: true });
+  });
+
+  const dumped = (): GraphDumpRun => {
+    if (!dump) throw new Error("the converter did not run");
+    return dump;
+  };
+  const records = (): Record<string, unknown>[] =>
+    Object.entries(dumped().files)
+      .filter(([name]) => name.endsWith(".instance.json"))
+      .map(([, text]) => JSON.parse(text) as Record<string, unknown>);
+  const recordOf = (object: string, packagePath = `/Game/Chain/${object}`): Record<string, unknown> => {
+    const found = records().filter((record) => record.object === object && record.package === packagePath);
+    if (found.length !== 1) throw new Error(`expected one record for ${packagePath}.${object}, found ${found.length}`);
+    return found[0]!;
+  };
+
+  it("compiles the converter program", () => {
+    expect(build?.code).toBe(0);
+  });
+
+  it("writes the Material graph beside one record for every instance it loads", () => {
+    expect(dumped().code).toBe(0);
+    expect(dumped().files["M_Master.graph.json"]).toBeDefined();
+    expect(records().map((record) => record.object).sort()).toEqual(["MI_Child", "MI_Dup", "MI_Dup", "MI_Layer", "MI_Mid", "MI_Mid", "MI_Unreadable"]);
+  });
+
+  it("records an instance's own scalar zero, vector channels and inherited static switch", () => {
+    const mid = recordOf("MI_Mid");
+    expect(mid).toMatchObject({ kind: "materialInstance", complete: true, parent: { package: "/Game/Chain/M_Master", object: "M_Master" } });
+    const props = parsePropsFile(String(mid.props));
+    expect(props.scalarOverrides).toEqual([{ name: "Roughness", value: 0 }]);
+    expect(props.vectorOverrides).toEqual([{ name: "Tint", value: [0, 0.5, 0, 1] }]);
+    // A disabled row (bOverride false) inherits and writes nothing; the enabled false is kept.
+    expect(props.switchOverrides).toEqual([{ name: "UseDetail", value: false }]);
+  });
+
+  it("qualifies its parent and its own texture override, and never writes a flattened collection", () => {
+    const mid = recordOf("MI_Mid");
+    expect(String(mid.props)).toContain("Parent = Material'/Game/Chain/M_Master.M_Master'");
+    expect(String(mid.props)).not.toContain("CollectedTextureParameters");
+    const props = parsePropsFile(String(mid.props));
+    expect(props.overrides).toEqual([expect.objectContaining({ name: "Albedo", texture: "T_Keep" })]);
+    expect(props.overrides[0]?.reference).toContain("/Game/Textures/T_Keep");
+  });
+
+  it("records a child's own override and its qualified intermediate parent, not the parent's values", () => {
+    const child = recordOf("MI_Child");
+    expect(child).toMatchObject({ complete: true, parent: { package: "/Game/Chain/MI_Mid", object: "MI_Mid" } });
+    const props = parsePropsFile(String(child.props));
+    expect(props.scalarOverrides).toEqual([{ name: "Metal", value: 0.5 }]);
+    expect(props.switchOverrides).toEqual([]);
+    expect(props.overrides).toEqual([]);
+  });
+
+  it("refuses a layer parameter and an unreadable row, each as a refused record with its reason", () => {
+    const layer = recordOf("MI_Layer");
+    expect(layer).toMatchObject({ complete: false, props: null });
+    expect(String(layer.refusal)).toMatch(/only global parameters/);
+    const unreadable = recordOf("MI_Unreadable");
+    expect(unreadable).toMatchObject({ complete: false, props: null });
+    expect(String(unreadable.refusal).length).toBeGreaterThan(0);
+  });
+
+  it("keeps a namesake in another package under its own identity", () => {
+    const namesake = recordOf("MI_Mid", "/Game/Other/MI_Mid");
+    expect(namesake).toMatchObject({ complete: true, parent: null });
+    expect(parsePropsFile(String(namesake.props)).scalarOverrides).toEqual([{ name: "Metal", value: 0.9 }]);
+  });
+
+  it("writes both records of a duplicate identity, for the importer to refuse", () => {
+    const duplicates = records().filter((record) => record.object === "MI_Dup");
+    expect(duplicates).toHaveLength(2);
+    expect(duplicates.map((record) => record.package)).toEqual(["/Game/Chain/MI_Dup", "/Game/Chain/MI_Dup"]);
+  });
+});
+
+// Texture overrides as the record writer reads them. Packages of their own, so the chain fixtures above keep their records.
+const textureArray = (rows: SourceProperty[][]): SourceProperty =>
+  prop("TextureParameterValues", "ArrayProperty", rows, { inner: "StructProperty", struct: "TextureParameterValue" });
+const TEXTURE_PACKAGES: Readonly<Record<string, Buffer>> = {
+  "Content/Textures/MI_Layered.uasset": materialPackage(
+    [{ name: "MI_Layered", className: "MaterialInstanceConstant", properties: [textureArray([[info("Albedo", "LayerParameter", 0), prop("ParameterValue", "ObjectProperty", "/Game/Textures/T_Keep")]])] }],
+    ["/Game/Textures/T_Keep"],
+  ),
+  "Content/Textures/MI_Global.uasset": materialPackage(
+    [{ name: "MI_Global", className: "MaterialInstanceConstant", properties: [textureArray([[info("Albedo"), prop("ParameterValue", "ObjectProperty", "/Game/Textures/T_Keep")]])] }],
+    ["/Game/Textures/T_Keep"],
+  ),
+  "Content/Textures/MI_Unreadable.uasset": materialPackage([
+    { name: "MI_Unreadable", className: "MaterialInstanceConstant", properties: [prop("TextureParameterValues", "NameProperty", "oops")] },
+  ]),
+};
+
+describeWithTools(["modern-converter"], "instance texture overrides, from --dump-graphs by the compiled converter", () => {
+  let directory = "";
+  let dump: GraphDumpRun | undefined;
+
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), "tn-instance-textures-"));
+    const build = await buildConverterProgram(CUE4PARSE_PROGRAM, CUE4PARSE_ENGINE_CONTENT, join(directory, "build"));
+    if (build.code !== 0) return;
+    dump = await dumpGraphsOfPackages(build, join(directory, "textures"), TEXTURE_PACKAGES);
+  }, 900_000);
+
+  afterAll(async () => {
+    if (directory) await rm(directory, { recursive: true, force: true });
+  });
+
+  const recordOf = (object: string): Record<string, unknown> => {
+    if (!dump) throw new Error("the converter did not run");
+    const found = Object.entries(dump.files)
+      .filter(([name]) => name.endsWith(".instance.json"))
+      .map(([, text]) => JSON.parse(text) as Record<string, unknown>)
+      .filter((record) => record.object === object);
+    if (found.length !== 1) throw new Error(`expected one record for ${object}, found ${found.length}`);
+    return found[0]!;
+  };
+
+  it("keeps a global texture override's qualified texture", () => {
+    expect(recordOf("MI_Global")).toMatchObject({ complete: true, props: expect.stringContaining("Texture2D'/Game/Textures/T_Keep.T_Keep'") });
+  });
+
+  it("writes a global texture override's association and index into its block", () => {
+    expect(recordOf("MI_Global").props).toContain("        Association = GlobalParameter\n        Index = -1\n");
+  });
+
+  it("refuses a layered texture override instead of writing it as a global one", () => {
+    expect(recordOf("MI_Layered")).toMatchObject({ complete: false, refusal: expect.stringContaining("LayerParameter") });
+  });
+
+  it("refuses a declared texture collection it cannot read", () => {
+    expect(recordOf("MI_Unreadable")).toMatchObject({ complete: false, refusal: expect.stringContaining("cannot be read") });
   });
 });

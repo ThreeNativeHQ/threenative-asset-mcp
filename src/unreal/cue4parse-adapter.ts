@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.73",
+  version: "b4e95441+threenative.74",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -891,6 +891,11 @@ int DumpMaterialGraphs(string key, string graphDir, HashSet<string> usedFileName
         string className, exportName;
         try { className = DumpExportClass(package, index); exportName = DumpExportName(package, index); }
         catch { continue; }
+        if (className == "MaterialInstanceConstant")
+        {
+            DumpMaterialInstanceRecord(package, index, exportName, graphDir, usedFileNames);
+            continue;
+        }
         if (className != "Material") continue;
         Dictionary<string, object?> document;
         try { document = BuildMaterialGraph(package, package.ExportsLazy[index].Value, exportName); }
@@ -909,6 +914,46 @@ int DumpMaterialGraphs(string key, string graphDir, HashSet<string> usedFileName
         written++;
     }
     return written;
+}
+
+// A UMaterialInstanceConstant a graph dump loads, as one qualified record beside the graphs (converter 74). props holds only the
+// instance's own overrides, in the .props.txt blocks the importer reads: its Parent line, MaterialOverrides.Blocks (scalars, vectors
+// and static switches) and its own TextureParameterValues by qualified package and object. A flattened CollectedTextureParameters
+// block never enters a record. A read that cannot be proven complete is recorded as refused with its reason, never dropped.
+void DumpMaterialInstanceRecord(IPackage package, int index, string exportName, string graphDir, HashSet<string> usedFileNames)
+{
+    var record = new Dictionary<string, object?>
+    {
+        ["format"] = 1, ["kind"] = "materialInstance", ["package"] = DumpGamePath(package.Name), ["object"] = exportName,
+        ["parent"] = null, ["complete"] = false, ["props"] = null, ["refusal"] = null,
+    };
+    try
+    {
+        if (package.ExportsLazy[index].Value is not UMaterialInstanceConstant instance)
+            throw new InvalidDataException($"{exportName} did not deserialize as a material instance");
+        var text = new StringBuilder();
+        if (instance.TryGetValue<FPackageIndex>(out var parent, "Parent") && !parent.IsNull && parent.Name != "None")
+        {
+            var parentPackage = ResolvedPackagePath(package.ResolvePackageIndex(parent));
+            if (parentPackage is null) throw new InvalidDataException($"the parent of {exportName} does not resolve to a qualified package");
+            record["parent"] = new Dictionary<string, object?> { ["package"] = parentPackage, ["object"] = parent.Name };
+            text.AppendLine($"Parent = Material'{parentPackage}.{parent.Name}'");
+        }
+        // The scalar, vector and static switch blocks are MaterialOverrides' own: a layer, an unreadable row or an incomplete read refuses here.
+        text.Append(MaterialOverrides.Blocks(instance, exportName, packageReadFailures));
+        text.Append(MaterialOverrides.Textures(instance, exportName, packageReadFailures, reference => {
+            try { return ResolvedPackagePath(package.ResolvePackageIndex(reference)); } catch { return null; }
+        }));
+        record["complete"] = true;
+        record["props"] = text.ToString();
+    }
+    catch (Exception error)
+    {
+        record["refusal"] = error.Message;
+    }
+    var fileName = exportName;
+    for (var suffix = 2; !usedFileNames.Add(fileName); suffix++) fileName = $"{exportName}__{suffix}";
+    File.WriteAllText(Path.Combine(graphDir, fileName + ".instance.json"), JsonConvert.SerializeObject(record, Formatting.Indented), new UTF8Encoding(false));
 }
 
 Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject material, string materialName)
@@ -3736,6 +3781,40 @@ public static class MaterialOverrides
 
     // A switch row. A row that does not override (Enabled false) writes nothing and inherits the parent's value.
     readonly record struct SwitchRow(ParameterIdentity Identity, bool Enabled, bool Value);
+
+    // The instance's own TextureParameterValues, by qualified package and object: Blocks does not write them. The declared tagged
+    // collection is the only source. Its ParameterInfo carries the association and index that the typed array's flattened Name drops,
+    // so a typed row is never admitted: with no declared tag it cannot prove its identity. A declared collection that cannot be read
+    // refuses, and so does a read that did not complete for the material, since its rows then cannot be taken as the whole set. A row's
+    // identity is admitted as Blocks admits a global one, and its block writes that identity. An authored null texture refuses, since
+    // inheriting the parent's texture for it is not source-proven. qualify gives the package path of a texture reference, or null.
+    public static string Textures(UMaterialInstanceConstant instance, string material, IReadOnlyDictionary<string, string> readFailures, Func<FPackageIndex, string?> qualify)
+    {
+        // Null for an absent collection the read completed for; an absent one the read did not complete for refuses inside Rows.
+        var rows = Rows(instance, "TextureParameterValues", material, readFailures);
+        if (rows is null)
+        {
+            if (instance.TextureParameterValues.Length > 0)
+                throw new Refusal("TextureParameterValues has typed rows but no declared tag, so their association and index are not proven");
+            return "";
+        }
+        if (readFailures.TryGetValue(material, out var failure))
+            throw new Refusal($"TextureParameterValues is present, but the material did not read completely ({failure}), so its rows cannot be taken as the whole set");
+        var text = new StringBuilder();
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var index = 0;
+        foreach (var row in rows)
+        {
+            var identity = Claim(TaggedIdentity(row, "TextureParameterValues"), "TextureParameterValues", names);
+            var value = Required<FPackageIndex>(row, "ParameterValue", "TextureParameterValues");
+            if (value is null) throw new Refusal($"TextureParameterValues row '{identity.Name}' has a ParameterValue that cannot be read");
+            if (value.IsNull) throw new Refusal($"TextureParameterValues row '{identity.Name}' is an authored null texture, and inheriting the parent's texture for it is not source-proven");
+            var package = value.Name == "None" ? null : qualify(value);
+            if (package is null) throw new Refusal($"TextureParameterValues row '{identity.Name}' does not name a qualified texture, so the instance's texture is not known");
+            Block(text, "TextureParameterValues", index++, [$"    ParameterValue = Texture2D'{package}.{value.Name}'", .. Lines(identity)]);
+        }
+        return text.ToString();
+    }
 
     // Everything is read before any text is returned, so a refused material leaves the caller nothing to write.
     public static string Blocks(UMaterialInstance instance, string material, IReadOnlyDictionary<string, string> readFailures)

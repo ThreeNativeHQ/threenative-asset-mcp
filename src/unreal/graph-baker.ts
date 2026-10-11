@@ -3,8 +3,7 @@ import { basename, extname } from "node:path";
 import sharp from "sharp";
 import { dumpEngineArg } from "../fab/routes.js";
 import { assertEngineContentDirectory, engineContentFromEnvironment, engineVersionOf, isEngineReference, type EngineContentConfig } from "./engine-content.js";
-import { dumpMaterialGraphs } from "./graph-dump.js";
-import type { MaterialGraph } from "./graph-dump.js";
+import { canonicalPackage, dumpMaterialGraphs, materialInstanceKey, type MaterialGraph, type MaterialInstanceRecord } from "./graph-dump.js";
 import {
   bakeGraph,
   emissiveOnlyEffect,
@@ -51,6 +50,13 @@ export interface GraphBakeRequest {
   readonly materialName: string;
   /** Unreal object basename; the `.uasset` and `.props.txt` lookup key. */
   readonly lookupName: string;
+  /**
+   * The qualified package the section's material is imported from (`/Game/Dir/Name`), as the mesh's import table names it.
+   * The walk looks the material's own graph up in that package, so a same-named graph of another package is never taken
+   * for it, and a parent with no graph of its own continues from the package its `Parent =` line names. Absent (a legacy
+   * caller), the first link is looked up by name alone, as it always was.
+   */
+  readonly materialPackage?: string | undefined;
   readonly assets: GraphBakeAssets;
   /** Returns the `.props.txt` text for a material (or texture) name, or undefined. */
   readonly readProps: (name: string) => string | undefined;
@@ -376,25 +382,53 @@ function literalScalarOutput(graph: MaterialGraph, pin: MaterialGraph["outputs"]
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
 }
 
-/** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
-function normalisedPackage(path: string): string {
-  return path.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^(?:Game|Content)\//i, "").toLowerCase();
-}
-
 /**
  * The graph of material `name`. The dump keys the first graph of a name by that name and any later one of the same
- * name by its package path, so a plain lookup by name always lands on one arbitrary namesake. With the package the
- * instance's `Parent =` line named, the matching graph is taken wherever it is keyed.
+ * name by its package path, so a plain lookup by name always lands on one arbitrary namesake. Without a package the
+ * lookup is by name, as it always was. With one, only the graph of exactly that package is taken, wherever it is keyed
+ * (`Content/` and `/Game/` are one mount; `/Engine/` and unmounted paths never match the pack's). A miss is a miss, and
+ * two exact matches are refused. The dump already keeps every claimant of a duplicated identity out of `graphs`
+ * (`duplicateGraphs`), so the walk names that reason for it rather than reaching this miss.
  */
 export function graphNamed(graphs: ReadonlyMap<string, MaterialGraph>, name: string, packagePath: string | undefined): MaterialGraph | undefined {
-  const byName = graphs.get(name);
-  if (packagePath === undefined) return byName;
-  const wanted = normalisedPackage(packagePath);
-  if (byName !== undefined && normalisedPackage(byName.package) === wanted) return byName;
+  if (packagePath === undefined) return graphs.get(name);
+  const wanted = canonicalPackage(packagePath);
+  // The dump holds the pack's graphs, all in its /Game mount, so a request outside that mount names none of them.
+  if (!wanted.startsWith("game:")) return undefined;
+  const exact = new Set<MaterialGraph>();
   for (const candidate of graphs.values()) {
-    if (candidate.material === name && normalisedPackage(candidate.package) === wanted) return candidate;
+    if (candidate.material === name && canonicalPackage(candidate.package) === wanted) exact.add(candidate);
   }
-  return byName;
+  return exact.size === 1 ? [...exact][0] : undefined;
+}
+
+type DumpedGraphs = {
+  readonly graphs: ReadonlyMap<string, MaterialGraph>;
+  readonly invalid: ReadonlyMap<string, string>;
+  readonly duplicateGraphs: ReadonlyMap<string, string>;
+  readonly instances: ReadonlyMap<string, MaterialInstanceRecord>;
+  readonly invalidInstances: ReadonlyMap<string, string>;
+};
+
+/**
+ * The link a parent with no exported props stands for: the qualified instance record of exactly `packagePath` and `object`. A record
+ * of the same name in another package is never substituted, and a record that cannot be used says why, so the walk can report it.
+ */
+function recoveredLink(
+  dumped: DumpedGraphs,
+  packagePath: string | undefined,
+  object: string,
+): { readonly link: PropsFile } | { readonly reason: string } {
+  if (packagePath === undefined) return { reason: `${object} has no exported props, and the link naming it names no package, so no instance record matches it` };
+  // The pack's records are all in its /Game mount, so a request outside it (an /Engine/ master, an unmounted path) is never matched to one.
+  if (!canonicalPackage(packagePath).startsWith("game:"))
+    return { reason: `${object} has no exported props and no instance record for ${packagePath}, which is outside the pack's /Game mount` };
+  const key = materialInstanceKey(packagePath, object);
+  const record = dumped.instances.get(key);
+  if (record !== undefined) return { link: parsePropsFile(record.props ?? "") };
+  const invalid = dumped.invalidInstances.get(key);
+  if (invalid !== undefined) return { reason: `${object} has no exported props, and its instance record cannot be used (${invalid})` };
+  return { reason: `${object} has no exported props and no instance record for ${packagePath}` };
 }
 
 /** Returns undefined when graph baking is switched off by the caller (the importer decides that). */
@@ -404,7 +438,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
   const size = Math.max(1, Math.min(options.maxTextureSize ?? MAX_BAKE_SIZE, MAX_BAKE_SIZE));
 
   let packages: Promise<Set<string>> | undefined;
-  let graphs: Promise<{ readonly graphs: ReadonlyMap<string, MaterialGraph>; readonly invalid: ReadonlyMap<string, string> } | { readonly error: string }> | undefined;
+  let graphs: Promise<DumpedGraphs | { readonly error: string }> | undefined;
 
   const sourcePackages = (): Promise<Set<string>> => (packages ??= listUassetBasenames(options.sourceDir).catch(() => new Set<string>()));
   // With THREENATIVE_TOOLCHAIN_AUTOINSTALL=0 the dump resolves an installed converter or throws; either
@@ -425,7 +459,13 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
           ...(options.modernConverter ? { converterPath: options.modernConverter.path } : {}),
           ...(engineContent ? { engineContent } : {}),
         });
-        return { graphs: dumped, invalid: dumped.invalid ?? new Map<string, string>() };
+        return {
+          graphs: dumped,
+          invalid: dumped.invalid ?? new Map<string, string>(),
+          duplicateGraphs: dumped.duplicateGraphs ?? new Map<string, string>(),
+          instances: dumped.instances ?? new Map<string, MaterialInstanceRecord>(),
+          invalidInstances: dumped.invalidInstances ?? new Map<string, string>(),
+        };
       } catch (error) {
         return { error: error instanceof Error ? error.message : String(error) };
       }
@@ -487,19 +527,33 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     let graph: MaterialGraph | undefined;
     const visited = new Set<string>();
     // The package the previous link's `Parent =` line named: when two packages hold a material of one name, it picks the graph.
-    let currentPackage: string | undefined;
+    // The walk opens in the material's own package, so a namesake of another package never stands in for the material itself.
+    let currentPackage: string | undefined = request.materialPackage;
+    // Why the walk stopped short of a graph: the parent's props are not exported and its qualified record cannot stand for them.
+    let unrecovered: string | undefined;
     for (let current: string | undefined = request.lookupName; current && chain.length < MAX_PARENT_DEPTH && !visited.has(current); ) {
       visited.add(current);
+      // The exported props win. Only a parent with none is looked up, by its exact package and object, in the qualified records.
       const text = request.readProps(current);
-      if (text) chain.push(parsePropsFile(text));
+      let link: PropsFile | undefined = text ? parsePropsFile(text) : undefined;
+      // Every link after the material itself is a parent.
+      if (link === undefined && visited.size > 1) {
+        const recovered = recoveredLink(dumped, currentPackage, current);
+        if ("reason" in recovered) unrecovered = recovered.reason;
+        else link = recovered.link;
+      }
+      if (link) chain.push(link);
       graph = graphNamed(byName, current, currentPackage);
       if (graph) break;
+      // Two or more graph files claim this exact identity, so the dump refused every one: the reason is the duplicate, never a namesake.
+      const refused = currentPackage === undefined ? undefined : dumped.duplicateGraphs.get(materialInstanceKey(currentPackage, current));
+      if (refused !== undefined) return unavailable(`graph for ${current} refused (${refused})`);
       const unreadable = dumped.invalid.get(current);
       if (unreadable !== undefined) return unavailable(`graph for ${current} unreadable (${unreadable})`);
-      current = text ? chain[chain.length - 1]!.parent : undefined;
-      currentPackage = text ? chain[chain.length - 1]!.parentPackage : undefined;
+      current = link?.parent;
+      currentPackage = link?.parentPackage;
     }
-    if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);
+    if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents${unrecovered === undefined ? "" : `: ${unrecovered}`}`);
 
     // The emission and normal proofs read the same instance parameters as the bake, so every outcome below carries them.
     const parameters = chainParameters(chain);

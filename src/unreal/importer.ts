@@ -1596,18 +1596,28 @@ function usesVertexColors(root: ReturnType<Document["getRoot"]>, material: Mater
 }
 
 /** Glass, mirror and light sections keep their named PBR fallbacks; no graph bake is attempted for them. */
-/** True when any link of the instance chain starting at `name` overrides a static switch. */
-function chainOverridesSwitch(name: string, readProps: (name: string) => string | undefined): boolean {
+/**
+ * What the exported instance chain from `name` says about static switches. `overridden`: a link overrides one. `incomplete`: a
+ * parent the chain names has no exported props, so the switches it inherits are not in the export; the graph baker reads them
+ * from the qualified instance records, and the caller probes it. `clean`: every link read and none overrides a switch.
+ */
+function chainSwitchEvidence(name: string, readProps: (name: string) => string | undefined): "overridden" | "incomplete" | "clean" {
   const visited = new Set<string>();
-  for (let current: string | undefined = name; current && visited.size < 16 && !visited.has(current); ) {
+  let current: string | undefined = name;
+  // The package the previous link's `Parent =` line named, when it names one.
+  let named: string | undefined;
+  for (let depth = 0; current && visited.size < 16 && !visited.has(current); depth += 1) {
     visited.add(current);
     const text = readProps(current);
-    if (!text) return false;
+    // The material's own props are optional evidence. A parent without props makes the chain incomplete only when the pack could hold
+    // it: an engine master has no qualified record to read, so a probe could not settle its switches either.
+    if (!text) return depth === 0 || (named !== undefined && isEngineReference(named)) ? "clean" : "incomplete";
     const props = parsePropsFile(text);
-    if (props.switchOverrides.length > 0) return true;
+    if (props.switchOverrides.length > 0) return "overridden";
     current = props.parent;
+    named = props.parentPackage;
   }
-  return false;
+  return "clean";
 }
 
 function hasNamedFallback(materialName: string): boolean {
@@ -1684,6 +1694,11 @@ export async function packageGlb(options: {
    * share. Merged over the mesh's own index, so the material's parents still resolve.
    */
   readonly importedMaterialAssets?: ReadonlyMap<string, ExportedAssets> | undefined;
+  /**
+   * The source package of a section, by the section's glTF material name, when the caller knows it exactly (a material library's
+   * sections, each named by its own package path). The graph walk opens there before the lookup-name table; never a basename guess.
+   */
+  readonly sectionMaterialPackages?: ReadonlyMap<string, string> | undefined;
   readonly glbPath: string;
   readonly assets: ExportedAssets;
   readonly maxTextureSize: number | undefined;
@@ -1834,9 +1849,13 @@ export async function packageGlb(options: {
         reason: `${lookupName} has BlendMode ${resolved.sourceBlendMode.slice("BLEND_".length)}: the renderer draws its Emissive only (${resolved.sourceBlendMode === "BLEND_Additive" ? "added to" : "multiplied with"} the scene), so BaseColor is never read and the package has no albedo for it`,
       };
     }
+    // The package the section's own source names (a library section), else the mesh's import table: the graph walk opens there
+    // (see `GraphBakeRequest.materialPackage`).
+    const importedPackage = options.sectionMaterialPackages?.get(name) ?? options.materialPackages?.get(lookupName.toLowerCase());
     const graphRequest = (probe: boolean): GraphBakeRequest => ({
       materialName: material.getName(),
       lookupName,
+      ...(importedPackage !== undefined ? { materialPackage: importedPackage } : {}),
       assets: materialAssets,
       probe,
       // A translucent or masked section keeps its cut-out in the graph's Opacity or OpacityMask pin.
@@ -1901,19 +1920,26 @@ export async function packageGlb(options: {
         };
       }
     }
-    // The flattened `.mat` lists the first texture of each class, which is not the branch a static switch picks: a
-    // winter spruce's trunk, branch and leaf instances all flattened to the bark atlas. When the instance chain overrides
-    // a switch and the graph's active BaseColor path does not sample the bound texture, the binding is stale. It is
-    // replaced only by a bake of that path that succeeds (its cut-out included, through the graph block below). A bake
-    // that fails keeps the flattened binding and reports it unverified: nothing here claims a replacement it did not make.
+    // The flattened `.mat` lists the first texture of each class, which is not the branch the instance's parameters pick: a
+    // winter spruce's trunk, branch and leaf instances all flattened to the bark atlas, and a recovered parent's texture override
+    // moves the active texture with no switch involved. When the probe proves the graph's active BaseColor path does not sample
+    // the bound texture, the binding is stale. It is replaced only by a bake of that path that succeeds (its cut-out included,
+    // through the graph block below). A bake that fails keeps the flattened binding and reports it unverified: nothing here claims
+    // a replacement it did not make.
     let graphReport: ImportedMaterialSection["graph"];
-    if (options.graphBaker && !hasNamedFallback(material.getName()) && chainOverridesSwitch(lookupName, graphRequest(true).readProps)) {
+    const switchEvidence = options.graphBaker && !hasNamedFallback(material.getName()) ? chainSwitchEvidence(lookupName, graphRequest(true).readProps) : "clean";
+    if (options.graphBaker && switchEvidence !== "clean") {
       const staleBase = resolved.bindings.find((binding) => binding.slot === "baseColor" && binding.source !== "graph");
       // Only the primary albedo decides staleness. The secondary texture is the flattened opacity map, which can share a name
       // with a texture the active branch blends into its base colour; that match would keep the wrong albedo.
       const probed = staleBase ? await options.graphBaker(graphRequest(true)) : undefined;
       const active = probed?.baseColourTextures?.map((texture) => texture.toLowerCase());
-      if (staleBase && (!active || !active.includes(staleBase.texture.toLowerCase()))) {
+      // A known active path decides alone, whatever the switches: a bound texture it does not sample is stale, and one it samples stands
+      // with no note. The probe settled that path with the whole chain's parameters (a recovered parent's included), so it proves the
+      // exclusion without any switch override. Only an unknown path is judged by the switches; with none overridden it stands unjudged.
+      const bound = staleBase?.texture.toLowerCase();
+      const stale = bound !== undefined && (active ? !active.includes(bound) : probed?.switchOverridden !== false);
+      if (staleBase && stale) {
         const baked = await options.graphBaker(graphRequest(false));
         if (baked.status === "baked") {
           // texturesUsed lists the base colour's samples only (the cut-out compiles separately), so the same primary test applies.
@@ -1923,7 +1949,7 @@ export async function packageGlb(options: {
               bindings: resolved.bindings.filter((binding) => binding.slot !== "baseColor"),
               limitations: [
                 ...resolved.limitations,
-                `${staleBase.texture} dropped as base colour: the instance's static switches select a graph branch that samples ${baked.texturesUsed.join(", ")}, so the colour is baked from the graph.`,
+                `${staleBase.texture} dropped as base colour: the instance's parameters (static switches and texture overrides, a recovered parent's included) select a graph branch that samples ${baked.texturesUsed.join(", ")}, so the colour is baked from the graph.`,
               ],
             };
           }
@@ -1936,7 +1962,7 @@ export async function packageGlb(options: {
             ...resolved,
             limitations: [
               ...resolved.limitations,
-              `${staleBase.texture} kept as base colour, unverified: the instance's static switches may select a graph branch the flattened .mat does not show, and that branch could not be baked (${baked.reason}).`,
+              `${staleBase.texture} kept as base colour, unverified: the instance's parameters (static switches or texture overrides) may select a graph branch the flattened .mat does not show, and that branch could not be baked (${baked.reason}).`,
             ],
           };
         }
@@ -4679,6 +4705,14 @@ export async function importUnrealDirectory(
             materialAssetsByFile.get(entry.file) ?? assets,
           ]),
         );
+        // Each section's own package, from its file's `Content` folder (the mapping the source reader uses). A file outside one names no
+        // package, so its section keeps the by-name lookup: a basename is never promoted to a package here.
+        const sectionMaterialPackages = new Map(
+          materialEntries.flatMap(({ entry, libraryName }) => {
+            const location = sourceLocation(entry.file);
+            return location ? [[libraryName, location.path] as const] : [];
+          }),
+        );
         const packaged = await packageGlb({
           gltfPath: source,
           glbPath,
@@ -4689,6 +4723,7 @@ export async function importUnrealDirectory(
           copyright,
           materialLookupNames: lookupNames,
           materialAssets: isolatedAssets,
+          sectionMaterialPackages,
           sourceMaterial: (name) => {
             const entry = materialEntries.find((e) => e.libraryName === name)?.entry;
             return entry ? sourceForLibraryFile(entry.file) : undefined;

@@ -525,7 +525,8 @@ async function viewNodeBake(dir: string, name: string, nodes: Record<string, unk
   const graph = materialGraphSchema.parse({
     format: 1,
     material: "M_View",
-    package: `/Game/Pack/${name}`,
+    // The package the instance's Parent line names, so the graph is that master and not a namesake.
+    package: "/Game/Pack/M_View",
     truncated: false,
     nodeCount: nodes.length,
     outputs: { baseColor: { node: outputPin, output: 0, mask: null }, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },

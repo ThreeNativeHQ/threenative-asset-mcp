@@ -2,15 +2,15 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { NodeIO } from "@gltf-transform/core";
+import { Document, NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { describe, expect, it, onTestFinished } from "vitest";
 
-import { chainParameters, createGraphBaker, directVertexColorGraph, parametersKey, type GraphBakeOutcome } from "../src/unreal/graph-baker.js";
+import { chainParameters, createGraphBaker, directVertexColorGraph, graphNamed, parametersKey, type GraphBakeOutcome } from "../src/unreal/graph-baker.js";
 import { canonicalEngineReference } from "../src/unreal/engine-content.js";
 import { parsePropsFile } from "../src/unreal/materials.js";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
-import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
+import { importUnrealDirectory, packageGlb, type ImportReport } from "../src/unreal/importer.js";
 import { writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fixture.js";
 
 async function scratch(prefix: string): Promise<string> {
@@ -1910,5 +1910,763 @@ describe("graph textures that only a material function references", () => {
     expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked" });
     expect(await firstPixel(material.getBaseColorTexture()!.getImage()!)).toEqual(hiddenPixel);
     expect(leftovers.filter((entry) => entry.includes("graph-textures") || entry.includes(".engine-"))).toEqual([]);
+  });
+});
+
+// Converter 74: an intermediate instance whose .props.txt the export does not carry is read from its qualified record. The master's
+// BaseColor is one static switch: branch A samples the flattened texture T_Stale, branch B is a constant green. UseDetail defaults to A.
+function switchedColourGraph(detail = true): MaterialGraph {
+  const nodes: Raw[] = [
+    node("pick", "StaticSwitchParameter", { inputs: { A: pin("sampled"), B: pin("flat") }, parameter: { name: "UseDetail", group: "" }, default: detail }),
+    textured("sampled", "T_Stale"),
+    constant3("flat", [0, 1, 0]),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: output("pick", 0), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+    nodes,
+  });
+}
+// One `StaticParameters` override row as UE Viewer writes it: the value, the parameter and bOverride.
+const switchBlock = (name: string, value: boolean): string =>
+  [
+    "StaticParameters =",
+    "{",
+    "    StaticSwitchParameters[1] =",
+    "    {",
+    "        StaticSwitchParameters[0] =",
+    "        {",
+    `            Value = ${value}`,
+    `            ParameterInfo = { Name=${name} }`,
+    "            bOverride = true",
+    "        }",
+    "    }",
+    "}",
+  ].join("\n");
+// The exported props of the child instance: its Parent line (UE Viewer spelling) and, optionally, its own switch override.
+const childInstanceProps = (parentPath: string, switchValue: boolean | undefined): string =>
+  [`Parent = MaterialInstanceConstant'${parentPath}.MI_Mid'`, ...(switchValue === undefined ? [] : [switchBlock("UseDetail", switchValue)])].join("\n");
+// A record as the converter writes it: the instance's own overrides and its qualified parent, with the matching Parent line.
+const instanceRecord = (object: string, props: string, options: { package?: string; parent?: string | null } = {}): Record<string, unknown> => {
+  const parent = options.parent === undefined ? "M_Master" : options.parent;
+  return {
+    format: 1,
+    kind: "materialInstance",
+    package: `${options.package ?? "/Game/Test"}/${object}`,
+    object,
+    parent: parent === null ? null : { package: `/Game/Test/${parent}`, object: parent },
+    complete: true,
+    props: parent === null ? props : `Parent = Material'/Game/Test/${parent}.${parent}'\n${props}`,
+    refusal: null,
+  };
+};
+const refusedInstance = (object: string): Record<string, unknown> => ({
+  format: 1,
+  kind: "materialInstance",
+  package: `/Game/Test/${object}`,
+  object,
+  parent: { package: "/Game/Test/M_Master", object: "M_Master" },
+  complete: false,
+  props: null,
+  refusal: "ScalarParameterValues row is a LayerParameter parameter, and only global parameters are supported",
+});
+// A fake converter that writes `files` into its --dump-graphs directory and copies `textureFrom/<name>.png` for an --export-dir request.
+async function writeRecordConverter(path: string, files: Record<string, string>, argvLog: string, textureFrom: string): Promise<void> {
+  await writeFile(
+    path,
+    `#!/usr/bin/env node
+"use strict";
+const fs = require("node:fs");
+const { join } = require("node:path");
+const argv = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(argv) + "\\n");
+if (argv.includes("--version")) { process.stdout.write("fake-converter 1\\n"); process.exit(0); }
+const at = argv.indexOf("--dump-graphs");
+if (at >= 0) {
+  for (const [name, text] of Object.entries(${JSON.stringify(files)})) fs.writeFileSync(join(argv[at + 1], name), text);
+  process.exit(0);
+}
+const exportAt = argv.indexOf("--export-dir");
+const filterAt = argv.indexOf("--filter");
+if (exportAt >= 0 && filterAt >= 0) {
+  const name = argv[filterAt + 1].split("/").pop();
+  const source = join(${JSON.stringify(textureFrom)}, name + ".png");
+  if (fs.existsSync(source)) {
+    fs.mkdirSync(join(argv[exportAt + 1], "Textures"), { recursive: true });
+    fs.copyFileSync(source, join(argv[exportAt + 1], "Textures", name + ".png"));
+  }
+}
+process.exit(0);
+`,
+  );
+  await chmod(path, 0o755);
+}
+
+describe("createGraphBaker reads an intermediate parent from its exact qualified record", () => {
+  async function probe(options: { files: Record<string, string>; props: Record<string, string> }) {
+    const root = await scratch("graph-bake-records-");
+    const sourceDir = join(root, "source");
+    await mkdir(join(sourceDir, "Content", "Test"), { recursive: true });
+    await writeFile(join(sourceDir, "Content", "Test", "MI_Child.uasset"), Buffer.alloc(16));
+    const converter = join(root, "converter");
+    await writeRecordConverter(converter, { "M_Master.graph.json": JSON.stringify(switchedColourGraph()), ...options.files }, join(root, "argv.log"), root);
+    const baker = createGraphBaker({
+      sourceDir,
+      maxTextureSize: 8,
+      environment: withoutEngineContent(process.env),
+      modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+    })!;
+    return baker({
+      materialName: "MI_Child_section",
+      lookupName: "MI_Child",
+      assets: { png: new Map() },
+      readProps: (name) => options.props[name],
+      probe: true,
+    });
+  }
+  const recordFiles = (object: string, value: boolean, packageName?: string): Record<string, string> => ({
+    [`${object}.instance.json`]: JSON.stringify(instanceRecord(object, switchBlock("UseDetail", value), packageName === undefined ? {} : { package: packageName })),
+  });
+
+  it("takes the recovered intermediate's switch when the child names none", async () => {
+    const outcome = await probe({ files: recordFiles("MI_Mid", false), props: { MI_Child: childInstanceProps("Content/Test/MI_Mid", undefined) } });
+    expect(outcome).toMatchObject({ switchOverridden: true, baseColourTextures: [] });
+  });
+
+  it("lets the child's own switch value beat the recovered intermediate's", async () => {
+    const outcome = await probe({ files: recordFiles("MI_Mid", false), props: { MI_Child: childInstanceProps("Content/Test/MI_Mid", true) } });
+    expect(outcome).toMatchObject({ switchOverridden: true, baseColourTextures: ["T_Stale"] });
+  });
+
+  it("uses a complete native parent and never consults a record for it", async () => {
+    const outcome = await probe({
+      files: recordFiles("MI_Mid", false),
+      props: {
+        MI_Child: childInstanceProps("Content/Test/MI_Mid", undefined),
+        MI_Mid: `Parent = Material'/Game/Test/M_Master.M_Master'\n${switchBlock("UseDetail", true)}`,
+      },
+    });
+    expect(outcome).toMatchObject({ baseColourTextures: ["T_Stale"] });
+  });
+
+  it("never substitutes a same-named record from another package, and says that no record matches", async () => {
+    const outcome = await probe({ files: recordFiles("MI_Mid", false, "/Game/Other"), props: { MI_Child: childInstanceProps("Content/Test/MI_Mid", undefined) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/MI_Mid.*instance record/) });
+    expect(outcome).not.toHaveProperty("switchOverridden");
+  });
+
+  it("carries the converter's refusal of the intermediate as the reason", async () => {
+    const outcome = await probe({
+      files: { "MI_Mid.instance.json": JSON.stringify(refusedInstance("MI_Mid")) },
+      props: { MI_Child: childInstanceProps("Content/Test/MI_Mid", undefined) },
+    });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/LayerParameter/) });
+  });
+
+  it("carries a malformed record's shape reason rather than a bare 'no dumped graph'", async () => {
+    const outcome = await probe({
+      files: { "MI_Mid.instance.json": JSON.stringify({ format: 1, kind: "materialInstance", package: "/Game/Test/MI_Mid", object: "MI_Mid" }) },
+      props: { MI_Child: childInstanceProps("Content/Test/MI_Mid", undefined) },
+    });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/unexpected shape/) });
+  });
+
+  it("never bakes an /Engine/ parent from a /Game/Engine/ namesake's record", async () => {
+    const outcome = await probe({
+      files: recordFiles("MI_Mid", false, "/Game/Engine/A"),
+      props: { MI_Child: childInstanceProps("/Engine/A/MI_Mid", undefined) },
+    });
+    expect(outcome).not.toHaveProperty("switchOverridden");
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("no instance record for /Engine/A/MI_Mid") });
+  });
+
+  it("never bakes a missing qualified master from a namesake in another mount", async () => {
+    const outcome = await probe({
+      files: { "M_Master.graph.json": JSON.stringify({ ...switchedColourGraph(), package: "/Game/Wrong/M_Master" }) },
+      props: { MI_Child: "Parent = Material'/Game/Required/M_Master.M_Master'" },
+    });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("no instance record for /Game/Required/M_Master") });
+  });
+
+  it("never bakes an unmounted parent from a /Game/ master of the same path", async () => {
+    const outcome = await probe({
+      files: { "M_Master.graph.json": JSON.stringify({ ...switchedColourGraph(), package: "/Game/SoulCave/M_Master" }) },
+      props: { MI_Child: "Parent = Material'SoulCave/M_Master.M_Master'" },
+    });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("no instance record for SoulCave/M_Master") });
+  });
+});
+
+describe("importUnrealDirectory judges a stale flattened base colour through an incomplete chain", () => {
+  // The child's .mat binds the flattened T_Stale; its parent MI_Mid is not in the export, so the child's props alone cannot say which
+  // branch the master's switch takes. Converter 74's records can.
+  async function importChild(options: { childSwitch?: boolean; detail?: boolean; parentPath?: string; files?: Record<string, string> }) {
+    const root = await scratch("graph-bake-child-");
+    const sourceDir = join(root, "source");
+    const content = join(sourceDir, "Content", "Test");
+    const exported = join(root, "exported");
+    const outputDir = join(root, "output");
+    await mkdir(content, { recursive: true });
+    for (const name of ["Mesh", "MI_Child", "M_Master", "T_Stale"]) await writeFile(join(content, `${name}.uasset`), Buffer.alloc(16));
+    await writeMeshFixture(exported, {
+      name: "Mesh",
+      materialName: "MI_Child",
+      mat: "Diffuse=T_Stale\n",
+      props: childInstanceProps(options.parentPath ?? "Content/Test/MI_Mid", options.childSwitch),
+      textures: ["T_Stale"],
+    });
+    await writePng(join(exported, "T_Stale.png"), [200, 120, 60, 255], 4);
+    const umodel = join(root, "umodel");
+    await writeFakeUmodel(umodel, { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
+    const converter = join(root, "converter");
+    await writeRecordConverter(
+      converter,
+      { "M_Master.graph.json": JSON.stringify(switchedColourGraph(options.detail ?? true)), ...(options.files ?? {}) },
+      join(root, "converter.log"),
+      exported,
+    );
+    const report = await importUnrealDirectory({
+      sourceDir,
+      outputDir,
+      onlyPackages: ["Mesh"],
+      concurrency: 1,
+      freeSpaceBytes: 30_000_000_000,
+      environment: { ...withoutEngineContent(process.env), THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache") },
+      umodel: { name: "umodel", path: umodel, version: "fixture" },
+      modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+    });
+    const converterLog = await readFile(join(root, "converter.log"), "utf8").catch(() => "");
+    return { section: report.models[0]!.materials[0]!, dumped: converterLog.includes("--dump-graphs") };
+  }
+
+  it("drops the flattened base colour when the recovered switch takes a branch that does not sample it", async () => {
+    const { section } = await importChild({ files: { "MI_Mid.instance.json": JSON.stringify(instanceRecord("MI_Mid", switchBlock("UseDetail", false))) } });
+    expect(section.limitations.join("\n")).toContain("T_Stale dropped as base colour");
+    expect(section.graph).toMatchObject({ status: "baked" });
+  });
+
+  it("keeps the flattened base colour without any unverified note when the child's own switch takes the branch that samples it", async () => {
+    const { section } = await importChild({
+      childSwitch: true,
+      files: { "MI_Mid.instance.json": JSON.stringify(instanceRecord("MI_Mid", switchBlock("UseDetail", false))) },
+    });
+    expect(section.limitations.join("\n")).not.toContain("T_Stale");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+  });
+
+  it("keeps the flattened base colour, with no note, when the recovered chain overrides no switch and the active branch samples it", async () => {
+    // The master's default branch samples T_Stale, so the flattened binding is the active one whatever the switches say.
+    const { section } = await importChild({ detail: true, files: { "MI_Mid.instance.json": JSON.stringify(instanceRecord("MI_Mid", "")) } });
+    expect(section.limitations.join("\n")).not.toContain("T_Stale");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+  });
+
+  it("drops the flattened base colour when no switch is overridden and the active branch does not sample it", async () => {
+    // Nothing in the recovered chain overrides a switch, but the master's default (detail off) is the active branch and samples no
+    // T_Stale: the flattened binding is wrong without any switch override, so the proven branch replaces it.
+    const { section } = await importChild({ detail: false, files: { "MI_Mid.instance.json": JSON.stringify(instanceRecord("MI_Mid", "")) } });
+    expect(section.limitations.join("\n")).toContain("T_Stale dropped as base colour");
+    expect(section.graph).toMatchObject({ status: "baked" });
+  });
+
+  it("does not probe, or note, a flattened base colour whose parent is an engine master: no pack record could settle it", async () => {
+    const { section, dumped } = await importChild({ parentPath: "/Engine/EngineMaterials/MI_Mid" });
+    expect(dumped).toBe(false);
+    expect(section.limitations.join("\n")).not.toContain("T_Stale");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+  });
+
+  it("keeps a refused intermediate's flattened base colour, explicitly unverified, with the converter's reason", async () => {
+    const { section } = await importChild({ files: { "MI_Mid.instance.json": JSON.stringify(refusedInstance("MI_Mid")) } });
+    expect(section.limitations.join("\n")).toMatch(/T_Stale kept as base colour, unverified/);
+    expect(section.limitations.join("\n")).toContain("LayerParameter");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+  });
+
+  it("keeps the flattened base colour when the qualified master is missing and only a wrong-mount master exists", async () => {
+    const { section } = await importChild({
+      files: {
+        "M_Master.graph.json": JSON.stringify({ ...switchedColourGraph(true), package: "/Game/Wrong/M_Master" }),
+        "MI_Mid.instance.json": JSON.stringify(instanceRecord("MI_Mid", switchBlock("UseDetail", false))),
+      },
+    });
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+  });
+});
+
+// graphNamed takes the graph a qualified request names, or nothing: a namesake of another package or mount is never taken for it.
+describe("graphNamed takes only the graph a qualified request names", () => {
+  const graphAt = (packagePath: string): MaterialGraph => ({ ...masterGraph(), material: "M_Master", package: packagePath });
+
+  it("refuses a qualified miss, rather than the first namesake of another package", () => {
+    expect(graphNamed(new Map([["M_Master", graphAt("/Game/Wrong/M_Master")]]), "M_Master", "/Game/Required/M_Master")).toBeUndefined();
+  });
+
+  it("never takes a namesake across mounts: /Engine/ is not the pack's /Game/Engine/", () => {
+    expect(graphNamed(new Map([["M_Master", graphAt("/Game/Engine/M_Master")]]), "M_Master", "/Engine/M_Master")).toBeUndefined();
+  });
+
+  it("never takes an unmounted package for the /Game/ package of the same path", () => {
+    expect(graphNamed(new Map([["M_Master", graphAt("/Game/SoulCave/M_Master")]]), "M_Master", "SoulCave/M_Master")).toBeUndefined();
+  });
+
+  it("refuses two exact matches rather than choosing one of them", () => {
+    const graphs = new Map([
+      ["M_Master", graphAt("/Game/Required/M_Master")],
+      ["/Game/Required/M_Master", graphAt("/Game/Required/M_Master")],
+    ]);
+    expect(graphNamed(graphs, "M_Master", "/Game/Required/M_Master")).toBeUndefined();
+  });
+
+  it("finds the one exact match under the Content/ alias, past a wrong namesake", () => {
+    const required = graphAt("/Game/Required/M_Master");
+    const graphs = new Map([
+      ["M_Master", graphAt("/Game/Wrong/M_Master")],
+      ["/Game/Required/M_Master", required],
+    ]);
+    expect(graphNamed(graphs, "M_Master", "Content/Required/M_Master")).toBe(required);
+  });
+
+  it("keeps the unqualified lookup by name when the request names no package", () => {
+    const first = graphAt("/Game/Wrong/M_Master");
+    expect(graphNamed(new Map([["M_Master", first]]), "M_Master", undefined)).toBe(first);
+  });
+});
+
+// The walk starts in the material's own package (`GraphBakeRequest.materialPackage`, from the mesh's import table), so a
+// graph of another package that shares the material's name is never the section's colour. Synthetic packages only.
+const namedMaterial = (name: string, packagePath: string, tint: number[]): MaterialGraph => ({
+  ...masterGraph("mask-tint", "T_MasterMask", { package: packagePath, tint }),
+  material: name,
+});
+const correctMasterColour = [encode((10 / 255) * 0.5), encode((10 / 255) * 0.25), encode(10 / 255)];
+const instanceParentLine = "Parent = Material'/Game/Correct/M_Master.M_Master'";
+
+describe("createGraphBaker starts the walk in the material's own package", () => {
+  const namesake = namedMaterial("MI_Child", "/Game/Other/MI_Child", [1, 1, 1, 1]);
+  const correctMaster = namedMaterial("M_Master", "/Game/Correct/M_Master", [0.5, 0.25, 1, 1]);
+  const otherMaster = namedMaterial("M_Master", "/Game/Other/M_Master", [1, 1, 1, 1]);
+  const readProps = (name: string): string | undefined => (name === "MI_Child" ? instanceParentLine : undefined);
+
+  async function fixture() {
+    const root = await scratch("graph-bake-own-package-");
+    const sourceDir = join(root, "source");
+    await mkdir(join(sourceDir, "Content", "Correct"), { recursive: true });
+    await writeFile(join(sourceDir, "Content", "Correct", "MI_Child.uasset"), Buffer.alloc(16));
+    await writePng(join(root, "T_MasterMask.png"), [10, 10, 10, 255], 4);
+    return { sourceDir, assets: { png: new Map([["T_MasterMask", join(root, "T_MasterMask.png")]]) } };
+  }
+
+  it("bakes the section's own master, never a same-named graph of another package", async () => {
+    const { sourceDir, assets } = await fixture();
+    // The namesake is keyed by its name; the second M_Master is keyed by its package, as the dump keys a collision.
+    const dumped = new Map([["MI_Child", namesake], ["M_Master", otherMaster], ["/Game/Correct/M_Master", correctMaster]]);
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => dumped })!;
+    const outcome = await baker({ materialName: "MI_Child_section", lookupName: "MI_Child", materialPackage: "/Game/Correct/MI_Child", assets, readProps });
+    if (outcome.status !== "baked") throw new Error(`expected a bake, got ${JSON.stringify(outcome)}`);
+    expect(outcome.graphMaterial).toBe("M_Master");
+    expect(await firstPixel(outcome.png)).toEqual(correctMasterColour);
+  });
+
+  it("is unavailable, never a namesake, when the section's master is absent from its own package", async () => {
+    const { sourceDir, assets } = await fixture();
+    const dumped = new Map([["MI_Child", namesake], ["M_Master", otherMaster]]);
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => dumped })!;
+    const outcome = await baker({ materialName: "MI_Child_section", lookupName: "MI_Child", materialPackage: "/Game/Correct/MI_Child", assets, readProps });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("/Game/Correct/M_Master") });
+  });
+
+  it("keeps the by-name start for a caller that names no package, when the name is unique", async () => {
+    const { sourceDir, assets } = await fixture();
+    const own = namedMaterial("MI_Child", "/Game/Correct/MI_Child", [0.5, 0.25, 1, 1]);
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => new Map([["MI_Child", own]]) })!;
+    const outcome = await baker({ materialName: "MI_Child_section", lookupName: "MI_Child", assets, readProps: () => undefined });
+    if (outcome.status !== "baked") throw new Error(`expected a bake, got ${JSON.stringify(outcome)}`);
+    expect(outcome.graphMaterial).toBe("MI_Child");
+    expect(await firstPixel(outcome.png)).toEqual(correctMasterColour);
+  });
+});
+
+describe("packageGlb takes a section's graph from the import table's package", () => {
+  // One primitive whose material is `section`, with its `.props.txt` naming the correct master. The caller supplies the dump.
+  async function packSection(options: {
+    readonly dumped: Map<string, MaterialGraph>;
+    readonly section?: string;
+    readonly materialPackages?: ReadonlyMap<string, string>;
+    readonly materialLookupNames?: ReadonlyMap<string, string>;
+  }): Promise<Uint8Array | null> {
+    const root = await scratch("graph-bake-package-own-");
+    const sourceDir = join(root, "source");
+    await mkdir(join(sourceDir, "Content", "Correct"), { recursive: true });
+    await writeFile(join(sourceDir, "Content", "Correct", "MI_Child.uasset"), Buffer.alloc(16));
+    await writePng(join(root, "T_MasterMask.png"), [10, 10, 10, 255], 4);
+    const propsPath = join(root, "MI_Child.props.txt");
+    await writeFile(propsPath, instanceParentLine);
+
+    const document = new Document();
+    const buffer = document.createBuffer();
+    const accessor = (type: "VEC3" | "VEC2" | "SCALAR", array: Float32Array<ArrayBuffer> | Uint16Array<ArrayBuffer>) =>
+      document.createAccessor().setType(type).setArray(array).setBuffer(buffer);
+    const primitive = document
+      .createPrimitive()
+      .setAttribute("POSITION", accessor("VEC3", new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0])))
+      .setAttribute("NORMAL", accessor("VEC3", new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1])))
+      .setAttribute("TEXCOORD_0", accessor("VEC2", new Float32Array([0, 0, 1, 0, 1, 1, 0, 1])))
+      .setIndices(accessor("SCALAR", new Uint16Array([0, 1, 2, 0, 2, 3])))
+      .setMaterial(document.createMaterial(options.section ?? "MI_Child"));
+    document.createScene("Scene").addChild(document.createNode("Mesh").setMesh(document.createMesh("Mesh").addPrimitive(primitive)));
+    const gltfPath = join(root, "Mesh.gltf");
+    await new NodeIO().write(gltfPath, document);
+
+    const glbPath = join(root, "out.glb");
+    await packageGlb({
+      gltfPath,
+      glbPath,
+      keepAllUvSets: false,
+      maxTextureSize: undefined,
+      assets: {
+        gltf: new Map(),
+        psa: new Map(),
+        mat: new Map(),
+        props: new Map([["MI_Child", propsPath]]),
+        png: new Map([["T_MasterMask", join(root, "T_MasterMask.png")]]),
+        audio: new Map(),
+        dna: new Map(),
+      },
+      graphBaker: createGraphBaker({ sourceDir, maxTextureSize: 8, dumpGraphs: async () => options.dumped })!,
+      ...(options.materialPackages ? { materialPackages: options.materialPackages } : {}),
+      ...(options.materialLookupNames ? { materialLookupNames: options.materialLookupNames } : {}),
+    });
+    const [material] = (await new NodeIO().read(glbPath)).getRoot().listMaterials();
+    return material?.getBaseColorTexture()?.getImage() ?? null;
+  }
+
+  it("bakes the import table's master, never a namesake of another package", async () => {
+    const image = await packSection({
+      dumped: new Map([["MI_Child", namedMaterial("MI_Child", "/Game/Other/MI_Child", [1, 1, 1, 1])], ["/Game/Correct/M_Master", namedMaterial("M_Master", "/Game/Correct/M_Master", [0.5, 0.25, 1, 1])]]),
+      materialPackages: new Map([["mi_child", "/Game/Correct/MI_Child"]]),
+    });
+    if (!image) throw new Error("expected a baked base colour on the packed section");
+    expect(await firstPixel(image)).toEqual(correctMasterColour);
+  });
+
+  it("keys the import table by the lookup name a remapped section resolves to, not by the section's own name", async () => {
+    const image = await packSection({
+      section: "Section_A",
+      materialLookupNames: new Map([["Section_A", "MI_Child"]]),
+      dumped: new Map([["MI_Child", namedMaterial("MI_Child", "/Game/Other/MI_Child", [1, 1, 1, 1])], ["/Game/Correct/M_Master", namedMaterial("M_Master", "/Game/Correct/M_Master", [0.5, 0.25, 1, 1])]]),
+      materialPackages: new Map([["mi_child", "/Game/Correct/MI_Child"]]),
+    });
+    if (!image) throw new Error("expected a baked base colour on the packed section");
+    expect(await firstPixel(image)).toEqual(correctMasterColour);
+  });
+
+  it("leaves the section without a base colour, never a namesake, when the import table's master is absent", async () => {
+    const image = await packSection({
+      dumped: new Map([["MI_Child", namedMaterial("MI_Child", "/Game/Other/MI_Child", [1, 1, 1, 1])]]),
+      materialPackages: new Map([["mi_child", "/Game/Correct/MI_Child"]]),
+    });
+    expect(image).toBeNull();
+  });
+
+  it("bakes a unique graph by name when the import table names no package for the section", async () => {
+    const image = await packSection({
+      dumped: new Map([["MI_Child", namedMaterial("MI_Child", "/Game/Correct/MI_Child", [0.5, 0.25, 1, 1])]]),
+      materialPackages: new Map([["other_section", "/Game/Correct/Other"]]),
+    });
+    if (!image) throw new Error("expected a baked base colour on the packed section");
+    expect(await firstPixel(image)).toEqual(correctMasterColour);
+  });
+});
+
+// Exact-identity, stale-probe and material-library regressions. The graphs and records are the converter's own JSON, read by the real dump.
+const graphWith = (nodes: Raw[], baseColor: string, packagePath = "/Game/Test/M_Master", material = "M_Master"): MaterialGraph =>
+  materialGraphSchema.parse({
+    format: 1,
+    material,
+    package: packagePath,
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: pin(baseColor), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+    nodes,
+  });
+// BaseColor = TextureSampleParameter2D "Albedo", defaulting to T_Stale: the parameter a recovered instance overrides with no switch.
+const albedoMaster = (packagePath?: string): MaterialGraph =>
+  graphWith([node("albedo", "TextureSampleParameter2D", { parameter: { name: "Albedo", group: "" }, default: null, texture: "/Game/Test/T_Stale.T_Stale", samplerType: "Color" })], "albedo", packagePath);
+// BaseColor = a constant: the active path samples no texture at all.
+const constantMaster = (rgb: number[], packagePath?: string, material?: string): MaterialGraph => graphWith([constant3("tint", rgb)], "tint", packagePath, material);
+// BaseColor runs through a node class the evaluator does not know, so the active path is unknown.
+const unsupportedMaster = (): MaterialGraph => graphWith([node("probe", "UnsupportedProbeNode")], "probe");
+// A `TextureParameterValues` entry as UE Viewer writes it, or `None` for a value it cannot name.
+const textureParameter = (name: string, texture: string | "None"): string =>
+  [
+    "TextureParameterValues[0] =",
+    "{",
+    "    ParameterInfo = { Name=None }",
+    `    ParameterValue = ${texture === "None" ? "None" : `Texture2D'/Game/Test/${texture}.${texture}'`}`,
+    `    ParameterName = ${name}`,
+    "}",
+  ].join("\n");
+
+// Every graph file that claims one exact identity is refused when the baker reads the dump: no copy, nor a namesake of another
+// package, is baked for it, and the reason names the duplicate. Through the real dump, from the converter's own graph files.
+describe("createGraphBaker refuses an exact identity that two graph files claim", () => {
+  const WRONG_NAMESPACE = namedMaterial("M_Master", "/Game/Other/M_Master", [1, 1, 1, 1]);
+  const FIRST_CLAIM = namedMaterial("M_Master", "/Game/Required/M_Master", [0.2, 0.2, 0.2, 1]);
+  const SECOND_CLAIM = namedMaterial("M_Master", "/Game/Required/M_Master", [0.8, 0.8, 0.8, 1]);
+  const tinted = (rgb: number[]): number[] => rgb.map((channel) => encode((10 / 255) * channel));
+
+  async function bakerOver(files: Record<string, MaterialGraph>) {
+    const root = await scratch("graph-bake-duplicate-identity-");
+    const sourceDir = join(root, "source");
+    await mkdir(join(sourceDir, "Content", "Required"), { recursive: true });
+    await writeFile(join(sourceDir, "Content", "Required", "M_Master.uasset"), Buffer.alloc(16));
+    await writePng(join(root, "T_MasterMask.png"), [10, 10, 10, 255], 4);
+    const converter = join(root, "converter");
+    await writeRecordConverter(converter, Object.fromEntries(Object.entries(files).map(([name, graph]) => [name, JSON.stringify(graph)])), join(root, "argv.log"), root);
+    const baker = createGraphBaker({
+      sourceDir,
+      maxTextureSize: 8,
+      environment: withoutEngineContent(process.env),
+      modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+    })!;
+    const assets = { png: new Map([["T_MasterMask", join(root, "T_MasterMask.png")]]) };
+    const request = (materialPackage: string) => ({ materialName: "M_Master_section", lookupName: "M_Master", materialPackage, assets, readProps: () => undefined });
+    return { baker, request };
+  }
+
+  it("refuses the claimed master when a namesake of another package sorts first, and bakes neither claimant", async () => {
+    // Three files, the namesake first: the second and third claim one identity, and the map used to keep only the last of them.
+    const { baker, request } = await bakerOver({ "a-wrong.graph.json": WRONG_NAMESPACE, "b-exact.graph.json": FIRST_CLAIM, "c-duplicate.graph.json": SECOND_CLAIM });
+    expect(await baker(request("/Game/Required/M_Master"))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringMatching(/duplicate identity: 2 graph files claim \/Game\/Required\/M_Master\.M_Master/),
+    });
+  });
+
+  it("counts a Content/ alias and a case variant as claims of the same identity, under one duplicate reason", async () => {
+    const alias = namedMaterial("M_Master", "/Content/Required/M_Master", [0.5, 0.5, 0.5, 1]);
+    const variant = namedMaterial("M_Master", "/game/required/m_master", [0.6, 0.6, 0.6, 1]);
+    const { baker, request } = await bakerOver({ "a.graph.json": FIRST_CLAIM, "b.graph.json": alias, "c.graph.json": variant });
+    expect(await baker(request("/Game/Required/M_Master"))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringMatching(/duplicate identity: 3 graph files claim/),
+    });
+  });
+
+  it("keeps a same-named master of another namespace bakeable for its own request, beside the refused pair", async () => {
+    const { baker, request } = await bakerOver({ "a.graph.json": WRONG_NAMESPACE, "b.graph.json": FIRST_CLAIM });
+    const other = await baker(request("/Game/Other/M_Master"));
+    const required = await baker(request("/Game/Required/M_Master"));
+    if (other.status !== "baked" || required.status !== "baked") throw new Error(`expected two bakes, got ${JSON.stringify([other, required])}`);
+    expect(await firstPixel(other.png)).toEqual(tinted([1, 1, 1]));
+    expect(await firstPixel(required.png)).toEqual(tinted([0.2, 0.2, 0.2]));
+  });
+
+  it("bakes a single exact graph as before", async () => {
+    const { baker, request } = await bakerOver({ "a.graph.json": FIRST_CLAIM });
+    const outcome = await baker(request("/Game/Required/M_Master"));
+    if (outcome.status !== "baked") throw new Error(`expected a bake, got ${JSON.stringify(outcome)}`);
+    expect(await firstPixel(outcome.png)).toEqual(tinted([0.2, 0.2, 0.2]));
+  });
+
+  it("is unavailable, never a namesake, when the requested namespace holds no graph", async () => {
+    const { baker, request } = await bakerOver({ "a.graph.json": WRONG_NAMESPACE });
+    expect(await baker(request("/Game/Required/M_Master"))).toMatchObject({ status: "unavailable", reason: expect.stringContaining("no dumped graph for M_Master") });
+  });
+});
+
+// The importer's stale probe through packageGlb and the real baker. The section's .mat binds T_Stale and its props name MI_Mid, which has
+// no native export, so the rest of the chain is the converter's record for MI_Mid. The PNG colours tell the sampled branches apart.
+describe("packageGlb judges a flattened base colour by the active path, through a recovered parent", () => {
+  const PIXELS: Record<string, number[]> = { T_Stale: [200, 120, 60], T_Right: [30, 160, 90], T_Native: [240, 220, 20] };
+
+  async function packStale(options: { master: MaterialGraph; childProps?: string; recordProps: string }) {
+    const root = await scratch("graph-bake-stale-package-");
+    const sourceDir = join(root, "source");
+    await mkdir(join(sourceDir, "Content", "Test"), { recursive: true });
+    await writeFile(join(sourceDir, "Content", "Test", "MI_Child.uasset"), Buffer.alloc(16));
+    const png = new Map<string, string>();
+    for (const [name, rgb] of Object.entries(PIXELS)) {
+      await writePng(join(root, `${name}.png`), [...rgb, 255], 4);
+      png.set(name, join(root, `${name}.png`));
+    }
+    const mat = join(root, "MI_Child.mat");
+    await writeFile(mat, "Diffuse=T_Stale\n");
+    const props = join(root, "MI_Child.props.txt");
+    await writeFile(props, options.childProps ?? childInstanceProps("/Game/Test/MI_Mid", undefined));
+    const converter = join(root, "converter");
+    await writeRecordConverter(
+      converter,
+      { "M_Master.graph.json": JSON.stringify(options.master), "MI_Mid.instance.json": JSON.stringify(instanceRecord("MI_Mid", options.recordProps)) },
+      join(root, "argv.log"),
+      root,
+    );
+
+    const document = new Document();
+    const buffer = document.createBuffer();
+    const accessor = (type: "VEC3" | "VEC2" | "SCALAR", array: Float32Array<ArrayBuffer> | Uint16Array<ArrayBuffer>) =>
+      document.createAccessor().setType(type).setArray(array).setBuffer(buffer);
+    const primitive = document
+      .createPrimitive()
+      .setAttribute("POSITION", accessor("VEC3", new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0])))
+      .setAttribute("NORMAL", accessor("VEC3", new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1])))
+      .setAttribute("TEXCOORD_0", accessor("VEC2", new Float32Array([0, 0, 1, 0, 1, 1, 0, 1])))
+      .setIndices(accessor("SCALAR", new Uint16Array([0, 1, 2, 0, 2, 3])))
+      .setMaterial(document.createMaterial("MI_Child"));
+    document.createScene("Scene").addChild(document.createNode("Mesh").setMesh(document.createMesh("Mesh").addPrimitive(primitive)));
+    const gltfPath = join(root, "Mesh.gltf");
+    await new NodeIO().write(gltfPath, document);
+
+    const glbPath = join(root, "out.glb");
+    const packaged = await packageGlb({
+      gltfPath,
+      glbPath,
+      keepAllUvSets: false,
+      maxTextureSize: undefined,
+      assets: { gltf: new Map(), psa: new Map(), mat: new Map([["MI_Child", mat]]), props: new Map([["MI_Child", props]]), png, audio: new Map(), dna: new Map() },
+      graphBaker: createGraphBaker({
+        sourceDir,
+        maxTextureSize: 8,
+        environment: withoutEngineContent(process.env),
+        modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+      })!,
+    });
+    const [material] = (await new NodeIO().read(glbPath)).getRoot().listMaterials();
+    const image = material?.getBaseColorTexture()?.getImage();
+    return { section: packaged.sections[0]!, pixel: image ? await firstPixel(image) : undefined };
+  }
+
+  it("replaces the flattened base colour that a recovered texture override moves, and bakes the override's texture", async () => {
+    const { section, pixel } = await packStale({ master: albedoMaster(), recordProps: textureParameter("Albedo", "T_Right") });
+    expect(section.bindings).not.toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+    expect(section.limitations.join("\n")).toContain("T_Stale dropped as base colour");
+    expect(pixel).toEqual(PIXELS.T_Right);
+  });
+
+  it("bakes the native child's own texture override, not the recovered parent's, when the two disagree", async () => {
+    const { section, pixel } = await packStale({
+      master: albedoMaster(),
+      childProps: `${childInstanceProps("/Game/Test/MI_Mid", undefined)}\n${textureParameter("Albedo", "T_Native")}`,
+      recordProps: textureParameter("Albedo", "T_Right"),
+    });
+    expect(section.limitations.join("\n")).toContain("T_Stale dropped as base colour");
+    expect(section.limitations.join("\n")).toContain("T_Native");
+    expect(pixel).toEqual(PIXELS.T_Native);
+  });
+
+  it("drops the flattened base colour when the active path samples no texture at all", async () => {
+    const { section } = await packStale({ master: constantMaster([0, 1, 0, 1]), recordProps: "" });
+    expect(section.limitations.join("\n")).toContain("T_Stale dropped as base colour");
+  });
+
+  it("drops the flattened base colour when the recovered parent's own switch takes a branch that samples none of it", async () => {
+    const { section } = await packStale({ master: switchedColourGraph(true), recordProps: switchBlock("UseDetail", false) });
+    expect(section.limitations.join("\n")).toContain("T_Stale dropped as base colour");
+  });
+
+  it("keeps the flattened base colour when the recovered parent's texture override is None, which proves nothing", async () => {
+    const { section } = await packStale({ master: albedoMaster(), recordProps: textureParameter("Albedo", "None") });
+    expect(section.limitations.join("\n")).not.toContain("T_Stale");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+  });
+
+  it("keeps the flattened base colour, with no note, when the active path is unknown and no switch is overridden", async () => {
+    const { section } = await packStale({ master: unsupportedMaster(), recordProps: "" });
+    expect(section.limitations.join("\n")).not.toContain("T_Stale");
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+    expect(section.graph).toBeUndefined();
+  });
+
+  it("keeps the flattened base colour unverified, with the unsupported status, when an overridden switch makes the unknown path a bake", async () => {
+    const { section } = await packStale({ master: unsupportedMaster(), childProps: childInstanceProps("/Game/Test/MI_Mid", true), recordProps: "" });
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+    expect(section.limitations.join("\n")).toMatch(/T_Stale kept as base colour, unverified/);
+    expect(section.graph).toMatchObject({ status: "unsupported" });
+  });
+});
+
+// The material library packages each standalone material package on its own. Two packages share the basename MI_Same: each section must
+// take the graph of its own qualified package, never a wrong-root namesake, and the native child's switch must beat the recovered parent's.
+describe("importUnrealDirectory bakes a material-library section from its own qualified package", () => {
+  it("bakes each same-named instance from its own master, never a namesake of another root", async () => {
+    const root = await scratch("graph-bake-library-");
+    const sourceDir = join(root, "source");
+    await mkdir(join(sourceDir, "Content", "Left"), { recursive: true });
+    await mkdir(join(sourceDir, "Content", "Right"), { recursive: true });
+    await writeFile(join(sourceDir, "Content", "Left", "MI_Same.uasset"), Buffer.alloc(16));
+    await writeFile(join(sourceDir, "Content", "Right", "MI_Same.uasset"), Buffer.alloc(16));
+    // The Left master samples T_Stale from its own package: a graph texture is baked only from its exact source package.
+    await writeFile(join(sourceDir, "Content", "Left", "T_Stale.uasset"), Buffer.alloc(16));
+    // UE Viewer exports each duplicate-named package on its own: a stand-in per package, chosen by the package's folder.
+    const leftFixture = join(root, "fixture-left");
+    const rightFixture = join(root, "fixture-right");
+    await mkdir(leftFixture, { recursive: true });
+    await mkdir(rightFixture, { recursive: true });
+    await writeFile(join(leftFixture, "MI_Same.props.txt"), childInstanceProps("/Game/Left/MI_Mid", true));
+    await writeFile(join(rightFixture, "MI_Same.props.txt"), "Parent = Material'/Game/Right/M_Master.M_Master'");
+    await writePng(join(leftFixture, "T_Stale.png"), [200, 120, 60, 255], 4);
+    const classes = { MI_Same: ["MaterialInstanceConstant"] };
+    const leftTool = join(root, "umodel-left");
+    const rightTool = join(root, "umodel-right");
+    await writeFakeUmodel(leftTool, { exportFrom: leftFixture, classes });
+    await writeFakeUmodel(rightTool, { exportFrom: rightFixture, classes });
+    const umodel = join(root, "umodel");
+    await writeFile(
+      umodel,
+      `#!/usr/bin/env node
+"use strict";
+const { spawnSync } = require("node:child_process");
+const argv = process.argv.slice(2);
+const selector = argv.filter((entry) => !entry.startsWith("-")).pop() || "";
+const tool = selector.includes("/Left/") ? ${JSON.stringify(leftTool)} : ${JSON.stringify(rightTool)};
+process.exit(spawnSync(tool, argv, { stdio: "inherit" }).status ?? 1);
+`,
+    );
+    await chmod(umodel, 0o755);
+
+    const midRecord = {
+      format: 1,
+      kind: "materialInstance",
+      package: "/Game/Left/MI_Mid",
+      object: "MI_Mid",
+      parent: { package: "/Game/Left/M_Master", object: "M_Master" },
+      complete: true,
+      props: `Parent = Material'/Game/Left/M_Master.M_Master'\n${switchBlock("UseDetail", false)}`,
+      refusal: null,
+    };
+    const converter = join(root, "converter");
+    await writeRecordConverter(
+      converter,
+      {
+        // The Left master samples T_Stale only when its switch is on; the Right master is a constant; the namesake is a wrong-root UMaterial.
+        "M_Master.graph.json": JSON.stringify({ ...switchedColourGraph(false), package: "/Game/Left/M_Master" }).replace("/Game/Test/T_Stale.T_Stale", "/Game/Left/T_Stale.T_Stale"),
+        "M_Master_right.graph.json": JSON.stringify(constantMaster([0, 0, 1, 1], "/Game/Right/M_Master")),
+        "MI_Same.graph.json": JSON.stringify(constantMaster([1, 0, 0, 1], "/Game/Wrong/MI_Same", "MI_Same")),
+        "MI_Mid.instance.json": JSON.stringify(midRecord),
+      },
+      join(root, "argv.log"),
+      root,
+    );
+
+    const outputDir = join(root, "output");
+    await importUnrealDirectory({
+      sourceDir,
+      outputDir,
+      concurrency: 1,
+      freeSpaceBytes: 30_000_000_000,
+      environment: { ...withoutEngineContent(process.env), THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache") },
+      umodel: { name: "umodel", path: umodel, version: "fixture" },
+      modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+    });
+    const library = await new NodeIO().read(join(outputDir, "Materials", "UnrealMaterialLibrary.glb"));
+    const bases = new Map(library.getRoot().listMaterials().map((material) => [material.getName(), material.getBaseColorTexture()?.getImage() ?? null]));
+    expect([...bases.keys()].sort()).toEqual(["Content/Left/MI_Same", "Content/Right/MI_Same"]);
+    expect(await firstPixel(bases.get("Content/Right/MI_Same")!)).toEqual([0, 0, 255]);
+    expect(await firstPixel(bases.get("Content/Left/MI_Same")!)).toEqual([200, 120, 60]);
   });
 });

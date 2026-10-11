@@ -1,4 +1,4 @@
-import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 
 import { modernSdkExecutable, toolchainCacheDir } from "../../src/unreal/provision.js";
@@ -60,6 +60,16 @@ static class MaterialOverrideHarness
         Run("binary-disabled-inherits", BinaryInstance(Binary("Disabled", false, true)));
         Run("binary-guid", BinaryInstance(Binary("Guided", true, true, new FGuid(1, 2, 3, 4))));
         Run("binary-failed-read", BinaryInstance(Binary("UseDetail", true, false)), failed);
+        RunTextures("texture-failed-read-absent", Instance(), failed);
+        RunTextures("texture-absent-read-completed", Instance(), NoFailures);
+        RunTextures("texture-declared-unreadable", Instance(Tag("TextureParameterValues", new NameProperty(new FName("oops")))), NoFailures);
+        RunTextures("texture-typed-only", TypedOnly(), NoFailures);
+        var authoredNull = Tag("ParameterValue", new ObjectProperty(new FPackageIndex()));
+        RunTextures("texture-layer", Instance(Tag("TextureParameterValues", Rows(Row(Tag("ParameterInfo", Info("Albedo", "LayerParameter", 0)), authoredNull)))), NoFailures);
+        var missingAssociation = Tag("ParameterInfo", Struct(Row(Tag("Name", new NameProperty(new FName("Albedo"))))));
+        RunTextures("texture-association-missing", Instance(Tag("TextureParameterValues", Rows(Row(missingAssociation, authoredNull)))), NoFailures);
+        RunTextures("texture-authored-null", Instance(Tag("TextureParameterValues", Rows(Row(Tag("ParameterInfo", Info("Albedo")), authoredNull)))), NoFailures);
+        RunTextures("texture-failed-read-present", Instance(Tag("TextureParameterValues", Rows(Row(Tag("ParameterInfo", Info("Albedo")), authoredNull)))), failed);
         return 0;
     }
 
@@ -81,6 +91,23 @@ static class MaterialOverrideHarness
         Console.WriteLine(JsonSerializer.Serialize(result));
     }
 
+    static void RunTextures(string name, UMaterialInstance instance, IReadOnlyDictionary<string, string> failures)
+    {
+        var result = new Dictionary<string, string> { ["case"] = name };
+        try
+        {
+            result["text"] = MaterialOverrides.Textures((UMaterialInstanceConstant)instance, "MI_Test", failures, reference => null);
+        }
+        catch (MaterialOverrides.Refusal refusal)
+        {
+            result["refused"] = refusal.Message;
+        }
+        catch (Exception error)
+        {
+            result["error"] = error.ToString();
+        }
+        Console.WriteLine(JsonSerializer.Serialize(result));
+    }
     static FPropertyTag Tag(string name, FPropertyTagType value) => new() { Name = new FName(name), Tag = value };
 
     static FStructFallback Row(params FPropertyTag[] tags) => new(tags.ToList());
@@ -103,6 +130,14 @@ static class MaterialOverrideHarness
     }
 
     static UMaterialInstance Scalars(params FStructFallback[] rows) => Instance(Tag("ScalarParameterValues", Rows(rows)));
+
+    // A typed texture row with no tag behind it: CUE4Parse's flattened view, with no ParameterInfo to prove its identity.
+    static UMaterialInstance TypedOnly()
+    {
+        var instance = new UMaterialInstanceConstant();
+        instance.TextureParameterValues = [new FTextureParameterValue(Row())];
+        return instance;
+    }
 
     static FStructFallback Scalar(string name, float value) =>
         Row(Tag("ParameterValue", new FloatProperty(value)), Tag("ParameterInfo", Info(name)));
@@ -234,6 +269,42 @@ export async function convertPackages(
     environment: childEnvironment(process.env),
   });
   return { code: run.code, stdout: run.stdout, stderr: run.stderr, output, files: await listFiles(output) };
+}
+
+/** One `--dump-graphs` run: every file the converter wrote into its output directory, by name, as text. */
+export interface GraphDumpRun {
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly files: Readonly<Record<string, string>>;
+}
+
+/**
+ * Runs a built converter's `--dump-graphs` mode on `packages` (paths under the source root, `Content/...` for a /Game package,
+ * written exactly as given), as the importer invokes it, and returns the files it wrote.
+ */
+export async function dumpGraphsOfPackages(
+  build: ConverterBuild,
+  caseDirectory: string,
+  packages: Readonly<Record<string, Buffer>>,
+  engine = "4.19",
+): Promise<GraphDumpRun> {
+  const root = join(caseDirectory, "source");
+  const output = join(caseDirectory, "graphs");
+  for (const [path, bytes] of Object.entries(packages)) {
+    const file = join(root, path);
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, bytes);
+  }
+  await mkdir(output, { recursive: true });
+  const run = await runBounded(await modernSdkExecutable(process.env), [build.dll, root, "--dump-graphs", output, "--engine", engine], {
+    timeoutMs: 600_000,
+    maxOutputBytes: 64 * 1024 * 1024,
+    environment: childEnvironment(process.env),
+  });
+  const files: Record<string, string> = {};
+  for (const name of await readdir(output)) files[name] = await readFile(join(output, name), "utf8");
+  return { code: run.code, stdout: run.stdout, stderr: run.stderr, files };
 }
 
 async function compileProject(
