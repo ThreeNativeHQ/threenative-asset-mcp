@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.77",
+  version: "b4e95441+threenative.78",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2944,7 +2944,8 @@ if (materialFailures.Count > 0) throw new InvalidDataException(
 // Raw RGBA16F source art (TSF_RGBA16F). Unreal stores these samples unfiltered: UE 4.19 Texture.cpp copies the mip without PNG
 // encoding (CanPNGCompress excludes the format), 8 bytes per pixel. The producer keeps those bytes exactly, so nothing is clamped,
 // resized or re-encoded, and a source outside that layout is refused rather than converted. The two records are declared last.
-// The CUE4Parse read: the typed Source struct and the SourceArt bulk, with enum names stripped of their type prefix.
+// The CUE4Parse read: the typed Source struct and the SourceArt bulk (the FEditorBulkData payload of a UE 5.1+ package), with enum names
+// stripped of their type prefix.
 static Rgba16fSourceArt ReadRgba16fSourceArt(UTexture2D texture)
 {
     var source = texture.GetOrDefault<FStructFallback?>("Source", null) ?? throw new InvalidDataException("the texture has no typed Source struct");
@@ -2963,7 +2964,19 @@ static Rgba16fSourceArt ReadRgba16fSourceArt(UTexture2D texture)
         if (text.Length == 0) throw new InvalidDataException("the source CompressionFormat is present but not an enum name");
         return text[(text.LastIndexOf(':') + 1)..];
     }
-    var bulk = texture.SourceArt ?? throw new InvalidDataException("the texture has no SourceArt bulk data");
+    // A UE 5.1+ package keeps the source in FEditorBulkData, not SourceArt. With TSCF_None its Oodle-decoded payload is the mip data itself, mip 0
+    // at offset 0 (UE 5.8.3 Texture.cpp FTextureSource::Decompress, CalcMipOffset), so the validation below applies to it unchanged. The recorded
+    // size must equal the size in the buffer header before anything is decoded.
+    static (long, byte[]?) EditorSource(FEditorBulkData editor)
+    {
+        var header = editor.Payload.Header;
+        if (editor.PayloadSize is < 1 or > (1L << 30) || (ulong) editor.PayloadSize != header.TotalRawSize)
+            throw new InvalidDataException($"the editor payload holds {header.TotalRawSize} bytes but its bulk data records {editor.PayloadSize} (1 byte to 1 GiB is read)");
+        return (editor.PayloadSize, DecompressEditorPayload(editor.Payload));
+    }
+    var (elementCount, bytes) = texture.SourceArt is { } bulk ? ((long) bulk.Header.ElementCount, bulk.ReadDataOnce())
+        : texture.EditorData is { } editor ? EditorSource(editor)
+        : throw new InvalidDataException("the texture has no SourceArt bulk data");
     return new Rgba16fSourceArt(
         EnumName(source, "Format"),
         source.GetOrDefault<int>("SizeX"),
@@ -2973,8 +2986,8 @@ static Rgba16fSourceArt ReadRgba16fSourceArt(UTexture2D texture)
         source.GetOrDefault<bool>("bPNGCompressed", false),
         CompressionName(source),
         texture.SRGB,
-        (long) bulk.Header.ElementCount,
-        bulk.ReadDataOnce());
+        elementCount,
+        bytes);
 }
 // The rules the raw layout must meet. Every refusal names the rule, and nothing is written before all of them pass.
 static Rgba16fDataTexture ValidateRgba16fSourceArt(Rgba16fSourceArt source)

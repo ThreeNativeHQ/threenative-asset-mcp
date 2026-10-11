@@ -77,6 +77,46 @@ describeWithTools(["modern-converter"], "RGBA16F SourceArt read from a pinned UT
     expect(outcome).toEqual({ ok: false, reason: "the texture has no SourceArt bulk data" });
   });
 
+  // UE 5.1+ keeps a texture source in FEditorBulkData, never in SourceArt. With TSCF_None the Oodle-decoded payload is the mip data
+  // (UE 5.8.3 Texture.cpp FTextureSource::Decompress), so mip 0 starts at offset 0 and the raw RGBA16F bytes are the whole payload.
+  it("reads the raw source from the editor payload when the texture has no SourceArt, every sample unchanged", async () => {
+    const outcome = await producer.extractTexture({ source: {}, editorData: { payload } });
+    expect(outcome).toEqual({
+      ok: true,
+      format: "TSF_RGBA16F",
+      sizeX: 3,
+      sizeY: 2,
+      numSlices: 1,
+      numMips: 1,
+      pngCompressed: false,
+      compression: "TSCF_None",
+      srgb: false,
+      elementCount: 48,
+      payload: payload.toString("base64"),
+      width: 3,
+      height: 2,
+    });
+  });
+
+  it("refuses a non-finite sample that the editor payload delivers", async () => {
+    const infinite = littleEndian([...SAMPLES.slice(0, 9), 0x7c00, ...SAMPLES.slice(10)]);
+    const outcome = await producer.extractTexture({ source: {}, editorData: { payload: infinite } });
+    expect(outcome).toMatchObject({ ok: false, reason: expect.stringMatching(/non-finite half-float sample at sample 9 \(pixel 2, channel 1\)/) });
+  });
+
+  it.each<[string, TextureCase, RegExp]>([
+    ["a payload size the buffer header contradicts", { source: {}, editorData: { payload, payloadSize: 47 } }, /editor payload holds 48 bytes but its bulk data records 47/],
+    ["an unreadable buffer (header raw size 0)", { source: {}, editorData: { payload, rawSize: 0 } }, /editor payload holds 0 bytes but its bulk data records 48/],
+    ["a payload shorter than the dimensions need", { source: { sizeX: 4 }, editorData: { payload } }, /incomplete or not raw: 48 bytes, element count 48; 4x2 RGBA16F is 64 bytes/],
+    ["an RGBA8 source, which is not reinterpreted", { source: { format: "TSF_RGBA8" }, editorData: { payload } }, /source format TSF_RGBA8 is not TSF_RGBA16F/],
+    ["a PNG-compressed source", { source: { pngCompressed: true }, editorData: { payload } }, /PNG-compressed/],
+    ["a source with two mips", { source: { numMips: 2 }, editorData: { payload } }, /holds 2 mips/],
+    ["an sRGB texture", { source: {}, srgb: true, editorData: { payload } }, /sRGB/],
+  ])("refuses an editor payload with %s", async (_label, change, reason) => {
+    const outcome = await producer.extractTexture(change);
+    expect(outcome).toMatchObject({ ok: false, reason: expect.stringMatching(reason) });
+  });
+
   it("refuses a read whose element count disagrees with the bytes it returns", async () => {
     const outcome = await producer.extractTexture({ source: {}, sourceArt: { payload, elementCount: 47 } });
     expect(outcome).toMatchObject({ ok: false, reason: expect.stringMatching(/SourceArt read is incomplete or not raw: 48 bytes, element count 47/) });

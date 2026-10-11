@@ -68,6 +68,7 @@ const USINGS = `using System.Buffers.Binary;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using CUE4Parse.Compression;
 using CUE4Parse.FileProvider;
 using CUE4Parse.MappingsProvider;
 using CUE4Parse.UE4.Assets;
@@ -76,6 +77,7 @@ using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Assets.Readers;
+using CUE4Parse.UE4.Objects.Core.Compression;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Readers;
@@ -87,8 +89,8 @@ using Newtonsoft.Json.Linq;
 
 // The typed test's half of the harness. It builds the UTexture2D the reader is given from pinned CUE4Parse types: a typed
 // Source struct among the tagged properties, and SourceArt read through FByteBulkData from an inline bulk header. UTexture
-// sets SourceArt and SRGB only while it deserializes, so the test sets those two by reflection. Nothing here is the production
-// reader: ReadRgba16fSourceArt and ValidateRgba16fSourceArt are the extracted functions.
+// sets SourceArt, EditorData and SRGB only while it deserializes, so the test sets those by reflection. Nothing here is the
+// production reader: ReadRgba16fSourceArt, ValidateRgba16fSourceArt and DecompressEditorPayload are the extracted functions.
 const SYNTHETIC_TEXTURE = `
 // A tagged property the reader can look up by name. The value's type is the pinned one (IntProperty, EnumProperty, ...).
 static FPropertyTag SyntheticTag(string name, string propertyType, FPropertyTagType value) =>
@@ -121,6 +123,12 @@ static UTexture2D SyntheticTexture(JObject spec)
         typeof(UTexture).GetProperty(nameof(UTexture.SourceArt), BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
             .GetSetMethod(true)!.Invoke(texture, new object?[] { bulk });
     }
+    if (spec["editorData"] is JObject editor)
+    {
+        var data = SyntheticEditorBulk(Convert.FromBase64String((string)editor["payload"]!), (long)editor["payloadSize"]!, (ulong)editor["rawSize"]!);
+        typeof(UTexture).GetProperty(nameof(UTexture.EditorData), BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .GetSetMethod(true)!.Invoke(texture, new object?[] { data });
+    }
     if ((bool?)spec["srgb"] == true)
         typeof(UTexture).GetProperty(nameof(UTexture.SRGB), BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
             .GetSetMethod(true)!.Invoke(texture, new object?[] { true });
@@ -142,6 +150,30 @@ static FByteBulkData SyntheticBulk(byte[] payload, int elementCount, int sizeOnD
         writer.Write(payload);
     }
     return new FByteBulkData(new FAssetArchive(new FByteArchive("synthetic SourceArt", stream.ToArray(), versions), null));
+}
+// The FEditorBulkData a UE 5.1+ package keeps for a texture source: flags, bulk id, content id, payload size and the payload's offset
+// (56, right after these fields), then an FCompressedBuffer there: the 64-byte big-endian header (Oodle, one block), the block table
+// and the block. UE stores a block verbatim when compression did not shrink it, as here, so the case needs no native Oodle.
+static FEditorBulkData SyntheticEditorBulk(byte[] payload, long payloadSize, ulong rawSize)
+{
+    using var stream = new MemoryStream();
+    using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
+    {
+        writer.Write(0);
+        writer.Write(new byte[16 + 20]);
+        writer.Write(payloadSize);
+        writer.Write(56L);
+        writer.Write(BinaryPrimitives.ReverseEndianness(FCompressedBufferHeader.ExpectedMagic));
+        writer.Write(0u);
+        writer.Write(new byte[] { (byte) FCompressedBufferHeader.EMethod.Oodle, 0, 0, 20 });
+        writer.Write(BinaryPrimitives.ReverseEndianness(1u));
+        writer.Write(BinaryPrimitives.ReverseEndianness(rawSize));
+        writer.Write(BinaryPrimitives.ReverseEndianness((ulong) (64 + 4 + payload.Length)));
+        writer.Write(new byte[32]);
+        writer.Write(BinaryPrimitives.ReverseEndianness((uint) payload.Length));
+        writer.Write(payload);
+    }
+    return new FEditorBulkData(new FAssetArchive(new FByteArchive("synthetic EditorData", stream.ToArray(), new VersionContainer(EGame.GAME_UE5_1)), null));
 }
 `;
 
@@ -252,6 +284,8 @@ export interface TextureCase {
   };
   /** The SourceArt bulk: `payload` is the stored bytes, `elementCount` the count the header declares, `sizeOnDisk` what it reads. */
   readonly sourceArt?: { readonly payload: Buffer; readonly elementCount?: number; readonly sizeOnDisk?: number };
+  /** The UE 5.1+ FEditorBulkData: `payload` is the one verbatim block, `payloadSize` the size the bulk records, `rawSize` the buffer header's. */
+  readonly editorData?: { readonly payload: Buffer; readonly payloadSize?: number; readonly rawSize?: number };
   readonly srgb?: boolean;
 }
 
@@ -307,6 +341,7 @@ export class Rgba16fProducer {
     const declarations = [
       extractCSharp(CUE4PARSE_PROGRAM, "static Rgba16fSourceArt ReadRgba16fSourceArt("),
       extractCSharp(CUE4PARSE_PROGRAM, "static Rgba16fDataTexture ValidateRgba16fSourceArt("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static byte[] DecompressEditorPayload("),
       extractCSharp(CUE4PARSE_PROGRAM, "static string PackageSetSha256("),
       extractCSharp(CUE4PARSE_PROGRAM, "static string WriteRgba16fDataTexture("),
       extractCSharp(CUE4PARSE_PROGRAM, "static string? ExactLooseKey("),
@@ -491,8 +526,13 @@ ${EXPORTLESS_PACKAGE}
       elementCount: input.sourceArt.elementCount ?? input.sourceArt.payload.byteLength,
       sizeOnDisk: input.sourceArt.sizeOnDisk ?? input.sourceArt.payload.byteLength,
     };
+    const editorData = input.editorData === undefined ? undefined : {
+      payload: input.editorData.payload.toString("base64"),
+      payloadSize: input.editorData.payloadSize ?? input.editorData.payload.byteLength,
+      rawSize: input.editorData.rawSize ?? input.editorData.payload.byteLength,
+    };
     const inputPath = join(directory, "input.json");
-    await writeFile(inputPath, JSON.stringify({ texture: { source, sourceArt, srgb: input.srgb ?? false } }));
+    await writeFile(inputPath, JSON.stringify({ texture: { source, sourceArt, editorData, srgb: input.srgb ?? false } }));
     const output = execFileSync(this.sdk, [this.harness, inputPath, join(directory, "out")], {
       env: this.environment(),
       encoding: "utf8",
