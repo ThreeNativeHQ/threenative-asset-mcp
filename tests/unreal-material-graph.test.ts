@@ -2459,6 +2459,125 @@ describe("OpacityMask", () => {
   });
 });
 
+describe("UV set indices: a malformed index is refused on the path that demands it, never read as UV0", () => {
+  const gradient = () => pngOf(4, 4, (x, y) => [40 * x + 10, 60 * y + 5, 77]);
+  const bakeWith = async (graph: MaterialGraph, allowUvSetFallback = false) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({ T_Grey: { png: await gradient(), srgb: true } }).loadTexture, size: 2, allowUvSetFallback });
+  // The schema holds no null or NaN, so these values are set after parsing, the way a corrupt dump would reach the compile.
+  /** T_Grey sampled at the TextureCoordinate `uv`, whose CoordinateIndex is `value`. */
+  const sampleAt = (value: unknown): MaterialGraph => {
+    const graph = makeGraph([textureSample("t", "T_Grey", "Color", "uv"), textureCoordinate("uv")], pin("t", 0, RGB_MASK));
+    (graph.nodes.find((n) => n.id === "uv")!.constants as Record<string, unknown>).CoordinateIndex = value;
+    return graph;
+  };
+  /** T_Grey sampled through an unwired Panner whose ConstCoordinate is `value`. */
+  const pannerAt = (value: unknown): MaterialGraph => {
+    const graph = makeGraph([textureSample("t", "T_Grey", "Color", "pan"), node("pan", "Panner", { constants: { SpeedX: 0.37 } })], pin("t", 0, RGB_MASK));
+    (graph.nodes.find((n) => n.id === "pan")!.constants as Record<string, unknown>).ConstCoordinate = value;
+    return graph;
+  };
+
+  it("refuses each malformed CoordinateIndex, with the node named, whether or not the fallback is on", async () => {
+    // Not an integer from 0 to 7: a string, a boolean, an array, null, NaN, Infinity, a fraction, a negative, and 8, the first index past the engine's channels.
+    for (const value of ["1", true, [1], null, Number.NaN, Number.POSITIVE_INFINITY, 1.5, -1, 8]) {
+      for (const fallback of [false, true]) {
+        expect(await bakeWith(sampleAt(value), fallback), `CoordinateIndex ${String(value)}, fallback ${fallback}`).toMatchObject({
+          status: "unavailable",
+          reason: expect.stringMatching(/^TextureCoordinate uv has a malformed CoordinateIndex/),
+        });
+      }
+    }
+  });
+
+  it("refuses a malformed unwired Panner ConstCoordinate, and keeps the named behaviour of a valid positive set", async () => {
+    for (const value of ["1", null, Number.NaN, 1.5, -1, 8]) {
+      expect(await bakeWith(pannerAt(value), true), `ConstCoordinate ${String(value)}`).toMatchObject({
+        status: "unavailable",
+        reason: expect.stringMatching(/^Panner pan has a malformed ConstCoordinate/),
+      });
+    }
+    expect(await bakeWith(pannerAt(1))).toMatchObject({ status: "unsupported", unsupported: ["TextureCoordinate[1]"] });
+    const relaxed = await bakeWith(pannerAt(1), true);
+    expect(relaxed).toMatchObject({ status: "baked", confidence: "heuristic" });
+    if (relaxed.status === "baked") expect(relaxed.approximations).toContain("TextureCoordinate[1] evaluated as UV0; the mesh UV set 1 is not in the material");
+  });
+
+  it("the BaseColor path probe is unreadable on a malformed set, as the bake is", () => {
+    expect(graphPathTextures(sampleAt("1"))).toBeUndefined();
+    expect(graphPathTextures(pannerAt(null))).toBeUndefined();
+  });
+
+  it("the Normal probe is unknown on a malformed set, and still reads a valid positive one", () => {
+    const normal = (index: string | number) =>
+      normalGraph(
+        [textureSample("n", "T_Normal", "Normal", "uv"), node("uv", "TextureCoordinate", { constants: { UTiling: 1, VTiling: 1, CoordinateIndex: index }, tiling: [1, 1] })],
+        { normal: pin("n") },
+      );
+    expect(graphNormalDependencies(normal("1"), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringMatching(/^TextureCoordinate uv has a malformed CoordinateIndex/),
+    });
+    // A valid positive set stays readable: the probes take the same fallback the importer's bake takes.
+    expect(readNames(graphNormalDependencies(normal(1), params({})))).toEqual(["T_Normal"]);
+  });
+
+  it("a malformed index on the cut-out costs only the cut-out, named, and keeps the colour", async () => {
+    const graph = makeGraph(
+      [textureSample("t", "T_Grey", "Color", "uv"), textureCoordinate("uv"), textureSample("cut", "T_Grey", "Color", "badUv"), node("badUv", "TextureCoordinate", { constants: { UTiling: 1, VTiling: 1, CoordinateIndex: "1" }, tiling: [1, 1] })],
+      pin("t", 0, RGB_MASK),
+      { outputs: { baseColor: pin("t", 0, RGB_MASK), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: pin("cut", 0, RGB_MASK), normal: null, materialAttributes: null } },
+    );
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({ T_Grey: { png: await gradient(), srgb: true } }).loadTexture, size: 2, alpha: "opacityMask" });
+    expect(result).toMatchObject({
+      status: "baked",
+      approximations: expect.arrayContaining([expect.stringMatching(/^opacityMask could not be evaluated \(TextureCoordinate badUv has a malformed CoordinateIndex/)]),
+    });
+  });
+
+  it("keeps the named heuristic for a valid positive set", async () => {
+    for (const index of [1, 7]) {
+      expect(await bakeWith(sampleAt(index))).toMatchObject({ status: "unsupported", unsupported: [`TextureCoordinate[${index}]`] });
+      const relaxed = await bakeWith(sampleAt(index), true);
+      expect(relaxed).toMatchObject({ status: "baked", confidence: "heuristic" });
+      if (relaxed.status === "baked") expect(relaxed.approximations).toContain(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
+    }
+  });
+
+  it("keeps the UV0 pixels: an absent CoordinateIndex and an explicit 0 read the same texels", async () => {
+    const texel = (x: number, y: number): Rgb => [40 * x + 10, 60 * y + 5, 77];
+    const loader = makeLoader({ T_Grey: { png: await pngOf(4, 4, texel), srgb: true } });
+    const absent = makeGraph([textureSample("t", "T_Grey", "Color", "uv"), textureCoordinate("uv")], pin("t", 0, RGB_MASK));
+    for (const graph of [absent, sampleAt(0)]) {
+      const pixel = await pixelsOf(await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 }));
+      for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) expect(pixel(x, y)).toEqual([...texel(x, y)]);
+    }
+  });
+
+  it("a wired Panner Coordinate never reads a malformed ConstCoordinate", async () => {
+    const panned = (extra: Raw) =>
+      makeGraph([textureSample("t", "T_Grey", "Color", "pan"), node("pan", "Panner", { inputs: { Coordinate: pin("uv") }, constants: { SpeedX: 0.37, ...extra } }), textureCoordinate("uv")], pin("t", 0, RGB_MASK));
+    const clean = await pixelsOf(await bakeWith(panned({})));
+    const malformed = await pixelsOf(await bakeWith(panned({ ConstCoordinate: "1" })));
+    for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(malformed(x, y)).toEqual(clean(x, y));
+  });
+
+  it("a malformed index on a statically inactive branch does not poison the bake", async () => {
+    // The switch takes A, the UV0 sample; B samples through a malformed index the compile never reaches.
+    const graph = makeGraph(
+      [
+        withInputs(node("switch", "StaticSwitch", { switchValue: true }), { A: pin("t", 0, RGB_MASK), B: pin("bad", 0, RGB_MASK), Value: pin("flag") }),
+        boolParameter("flag", "UseUv0", true),
+        textureSample("t", "T_Grey", "Color", "uv"),
+        textureCoordinate("uv"),
+        textureSample("bad", "T_Grey", "Color", "badUv"),
+        node("badUv", "TextureCoordinate", { constants: { UTiling: 1, VTiling: 1, CoordinateIndex: "1" }, tiling: [1, 1] }),
+      ],
+      pin("switch", 0, RGB_MASK),
+    );
+    expect(await bakeWith(graph)).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+  });
+});
+
 describe("UV-producing nodes: CustomRotator, UVEdit, UV arithmetic, ConvertFromDiffSpec", () => {
   // Asymmetric 4x4 texture: every texel distinct, so a transposed, mirrored or wrongly rotated bake cannot match.
   const texel = (x: number, y: number): Rgb => [40 * x + 10, 60 * y + 5, 77];
