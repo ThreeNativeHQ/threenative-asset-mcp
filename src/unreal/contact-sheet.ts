@@ -215,6 +215,9 @@ const applyThumbnailReferenceLighting = ${applyThumbnailReferenceLighting.toStri
 const createThumbnailReferenceFloor = ${createThumbnailReferenceFloor.toString()};
 try {
   const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+  // UE4.19 thumbnail defaults enable filmic at exposure 1; Three ACES is an approximation, confined to the picture pass.
+  renderer.toneMapping = lit ? THREE.ACESFilmicToneMapping : THREE.NoToneMapping;
+  renderer.toneMappingExposure = 1;
   renderer.setPixelRatio(options.ss);
   renderer.setSize(size, size);
   renderer.setClearColor(0x808080, 1);
