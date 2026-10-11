@@ -1,7 +1,7 @@
 # PRD-538 — Bake common Unreal material graphs into glTF PBR textures
 
-**Status:** PARTIAL — Phases 1–3 landed (PR #31); AC-1–AC-3 ticked on the live Soul Cave pack.
-**Blocker:** AC-4 needs PRD-537's corpus baseline, which needs João to clear Fab's browser verification (or approve `--assume-licence`); see Blocked on.
+**Status:** ACTIVE — PARTIAL. Phases 1–3 landed (PR #31); AC-1–AC-3 ticked on the live Soul Cave pack. AC-4 is open active work: it needs PRD-537's true corpus baseline, the comparison against it, and the repairs the comparison drives.
+**Blocker:** none — the corpus sweep's licence input is recorded (PRD-537 Decisions, 2026-10-10). What AC-4 still needs is a real baseline and the work it shows; see Remaining work.
 **Priority:** P2 — follows PRD-537. Sections whose colour exists only in the material graph still import grey (AC-1, AC-2); PRD-537's S4 failures will size how much of the library this affects.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new graph-evaluation module (+2), crosses the .NET converter / Node importer boundary (+2); risk override: none
 **Owner:** João
@@ -75,10 +75,22 @@ Each criterion is a checkbox in the phase that delivers it: AC-1 in Phase 1, AC-
 - **The parity scorer exempts `source: "graph"` bindings from S3's foreign-texture check** (a baked texture is derived from several pack textures); the report does not list the textures the bake read, so S3 cannot check them yet.
 - **The section report keeps a mask the PRD-537 path rejected as a base colour next to the graph binding** (`MI_Cave_Rock_Pillar` lists `baseColor=T_Cave_Rock_Pillar_M texture-set` and the graph binding); the GLB carries only the graph one. Pre-existing reporting behaviour, noted rather than changed.
 - PRD filing: filed under `docs/PRDs/BLOCKED/requires-owner-action/` as PARTIAL, because AC-4 waits only on an owner action (`AGENTS.md`).
+- 2026-10-10 (Claude, status correction): the 2026-10-08 filing reason above is superseded, and the file is refiled to `docs/PRDs/` (active). AC-4 needs a **true baseline** (PRD-537's final scorecard over the 37 runnable listings / 86 variants), a **comparison** against it, and the **repairs** that comparison shows — implementation and corpus validation, not only an owner action. Its licence input is recorded (PRD-537 Decisions, 2026-10-10): the owner's browser verdicts of 2026-10-08, saved as a real verdict file for all 37 runnable listing ids, never assumed via `--assume-licence`. No box is ticked or unticked by the move, no criterion is added or relaxed, and the Soul Cave numbers (S4 misses 97 → 12) remain one pack, not the library.
+- 2026-10-10 (Claude, correction, not a history rewrite): the 2026-10-07 "UE source is not reachable" statement in PRD-537 is obsolete — the official source checkout exists at `~/projects/UnrealEngine-5.8.3` (tag `5.8.3-release`, commit `396c9f059903aed5fec78ecd3d437a40c6415368`); 25 content assets were SHA1-verified against it and used as a cross-version heuristic, not as an exact 4.19 verification.
 
-## Blocked on
+## Remaining work
 
-- **AC-4** S4 failures across the PRD-537 corpus fall by at least half from PRD-537's final baseline. proof: `npm run parity:fab -- --corpus library --baseline <PRD-537 scorecard>`. Needs the corpus sweep, which needs the owner to clear Fab's browser verification (or approve `--assume-licence`); see PRD-537 Blocked on. The tooling is done: the scorecard carries the unsupported-node histogram, S4-miss attribution and `--baseline` delta. On the one pack available, S4 misses fell 97 → 12 (−88 %); the next nodes by count are `MatLayerBlend_Tint` (4 sections) and `DepthFade` (3).
+### Active validation and repairs
+
+Corrected 2026-10-10: the single item here was filed as licence-blocked on 2026-10-08. It is not blocked now, because the owner's licence read is recorded for every runnable listing (PRD-537 Decisions, 2026-10-10). AC-4 needs a true corpus baseline, a real comparison against it, and the repairs that comparison shows.
+
+- **AC-4** S4 failures across the PRD-537 corpus fall by at least half from PRD-537's final baseline. proof: `npm run parity:fab -- --corpus library --baseline <PRD-537 scorecard>`. Needs PRD-537's final corpus sweep — the licence input is recorded, so nothing here waits on the owner (see PRD-537 Remaining work) — and then a true baseline, a `--baseline` comparison against it, and the repairs the delta shows. The tooling is done: the scorecard carries the unsupported-node histogram, S4-miss attribution and `--baseline` delta. On the one pack available, S4 misses fell 97 → 12 (−88 %); the next nodes by count are `MatLayerBlend_Tint` (4 sections) and `DepthFade` (3). AC-4 stays unticked until the corpus proves it.
+
+  Corrected 2026-10-10: the licence input this waited on now exists (the owner's browser read of 2026-10-08, recorded for all 37 runnable listing ids; no licence assumed). What remains is active work — run the full 86-variant sweep for a true baseline, compare against it with `--baseline`, and land the repairs the delta shows. The single-pack −88 % is evidence the bake works, not that AC-4 is met. No criterion is relaxed.
+
+### Blocked on the owner
+
+Owner actions that remain, none of them this PRD's AC-4: AC-9's public sandbox derivative push/merge/decline, `npm publish threenative-asset-mcp`, the engine pin bump in `threenative-engine/packages/core`, the Epic `ImageCoreDelta` source-provenance decision, the forest screenshot asset names, and the pending named-exception decisions. See PRD-537 Remaining work.
 
 ## Execution Phases
 
@@ -99,7 +111,7 @@ Each criterion is a checkbox in the phase that delivers it: AC-1 in Phase 1, AC-
 **Verification:** the box above.
 
 #### Phase 3: The library measures the gain
-**Status:** PARTIAL — AC-3 ticked; AC-4 is under Blocked on
+**Status:** PARTIAL — AC-3 ticked; AC-4 is active pending a true corpus baseline (see Remaining work)
 **Files:** `scripts/fab-parity.ts` (unsupported-node histogram), `src/unreal/material-graph.ts` (the top node classes by count).
 - [x] AC-3 [local]: Soul Cave passes S4 (≥ 90 % sections with colour). proof: parity run on Soul Cave — Evidence (2026-10-08): live pack, 203 import sections, 176 expect colour: **164 coloured = 93.2 %** (S4 `ok: true`), up from 79 = 44.9 % before this PRD (misses 97 → 12, −88 %). Graph outcomes: 88 baked (20 exact, 68 heuristic), 10 unsupported (`MatLayerBlend_Tint` 4, `DepthFade` 3, `ParticleColor` 2, one particle material), 33 unavailable (13 no source package, 11 parent graph outside the pack, 4 texture sample without texture, 3 no BaseColor output, 2 other). S3 identity stays at 0 violations over 190 verified sections. Measured with `importUnrealDirectory` + `dumpUnrealProperties` + `scorePack` (the same code `parity:fab` runs), not the CLI.
 
