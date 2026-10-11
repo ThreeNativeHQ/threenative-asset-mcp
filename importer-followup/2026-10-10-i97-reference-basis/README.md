@@ -1,0 +1,5 @@
+Controlled comparison of the original importer97 winter spruce and the same GLB with UE4.19.2-reference normals/tangents from a portable adapter. ROOT inspected the actual comparison. Original images, materials, positions, UVs, colours and indices remain unchanged; this keeps the original stale Bark_N bindings. It is a basis-only diagnostic, not a production import or exact Unreal runtime result.
+
+Neutral judge58.80 to59.69, suspect in both. Density2.22 to2.11; lightness0.630 to0.622. Silhouette XOR0 pixels; the tree remains visibly different from the source thumbnail. Same command/camera/picture configuration; the before sheet reproduces the original97 sheet byte-for-byte on this host. The displayed picture is an approximation; the gray background means checker-floor visibility is being checked separately. Metadata alone does not prove the floor/shadows are visible.
+
+Only authorized derivative comparison JPEGs are published. Source packs, GLBs, texture pixels, source dumps and detailed proof metadata stay local. No fidelity baseline was updated.
