@@ -607,21 +607,34 @@ interface PackageClassification {
   readonly needsModernConverter: boolean;
   /** A texture package whose mip generation setting is `TMGS_NoMipmaps` (see `PackageCooking.noMipmapsHint`). */
   readonly noMipmaps?: boolean;
+  /**
+   * Texture2D exports beside a package-named World. They are not the package's texture, and the native list gives no outer
+   * that would name the object owning them, so they are reported by name and never exported.
+   */
+  readonly auxiliaryTextures?: readonly string[];
   readonly error: string | undefined;
 }
 
 const LIST_LINE = /^\s*\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)\s+(\S+)\s*$/;
 
-export function parseUmodelList(stdout: string): { classes: string[]; objects: string[] } {
+/** One `-list` row. Its object name tells a package's own object (named after the package) from an auxiliary export. */
+export interface UmodelListEntry {
+  readonly className: string;
+  readonly objectName: string;
+}
+
+export function parseUmodelList(stdout: string): { classes: string[]; objects: string[]; entries: UmodelListEntry[] } {
   const classes: string[] = [];
   const objects: string[] = [];
+  const entries: UmodelListEntry[] = [];
   for (const line of stdout.split(/\r?\n/)) {
     const match = LIST_LINE.exec(line);
     if (!match?.[1] || !match[2]) continue;
     classes.push(match[1]);
     objects.push(match[2]);
+    entries.push({ className: match[1], objectName: match[2] });
   }
-  return { classes, objects };
+  return { classes, objects, entries };
 }
 
 async function mapWithConcurrency<T, R>(
@@ -2916,7 +2929,7 @@ export async function importUnrealDirectory(
         [`-path=${sourceDir}`, "-list", entry.selector],
         { timeoutMs: 300_000, maxOutputBytes: 16 * 1024 * 1024 },
       );
-      const { classes } = parseUmodelList(run.stdout);
+      const { classes, entries } = parseUmodelList(run.stdout);
       const cooking = await readPackageCooking(entry.file);
       if (cooking?.materialHint && !classes.some((className) => className === "Material" || className === "MaterialInstanceConstant")) classes.push("Material");
       if (cooking?.levelHint && !classes.includes("Level")) classes.push("Level");
@@ -2931,7 +2944,12 @@ export async function importUnrealDirectory(
       // the package, its classes win: a material instance names Texture2D and carries
       // AssetImportData too, and reading that as a texture drops the material entirely.
       const listed = run.code === 0 && classes.length > 0;
-      const hasTexture = !isMapBuildData && (classes.includes("Texture2D") || (!listed && cooking?.textureHint === true));
+      // A World named after its package is that package's own object, so it decides what the package is. The Texture2D
+      // exports beside it are auxiliaries (see `auxiliaryTextures`), never this package's texture. The match is exact on the
+      // package's own name, so a World with any other name does not claim the package.
+      const ownsWorld = run.code === 0 && entries.some((item) => item.className === "World" && item.objectName === entry.package);
+      const auxiliaryTextures = ownsWorld ? entries.filter((item) => item.className === "Texture2D").map((item) => item.objectName) : [];
+      const hasTexture = !isMapBuildData && !ownsWorld && (classes.includes("Texture2D") || (!listed && cooking?.textureHint === true));
       // MapBuildDataRegistry owns transient reflection-capture cubes that are tied to baked level
       // lighting. They are not standalone environment assets and cannot be meaningfully reused.
       const hasCubemap =
@@ -2984,6 +3002,7 @@ export async function importUnrealDirectory(
         hasGroom,
         needsModernConverter,
         ...(hasTexture && cooking?.noMipmapsHint === true ? { noMipmaps: true } : {}),
+        ...(auxiliaryTextures.length > 0 ? { auxiliaryTextures } : {}),
         error:
           run.code === 0 || needsModernConverter || nonImportableClass !== undefined || hasFont || paperClass !== undefined || cooking?.levelHint === true
             ? undefined
@@ -3019,6 +3038,14 @@ export async function importUnrealDirectory(
   const externalActorEntries = classifiedAll.filter((entry) => isWorldPartitionExternalPackage(entry.package));
   const externalActorFiles = new Set(externalActorEntries.map((entry) => entry.file));
   const classified = classifiedAll.filter((entry) => !externalActorFiles.has(entry.file));
+  // Auxiliaries of a package-named World are never exported, whichever route the level takes, so the report names them.
+  for (const entry of classified) {
+    if (entry.auxiliaryTextures === undefined) continue;
+    const count = entry.auxiliaryTextures.length;
+    warnings.push(
+      `${entry.package} carries ${count} auxiliary Texture2D export${count === 1 ? "" : "s"} (${summarizeClasses(entry.auxiliaryTextures)}) that ${count === 1 ? "is" : "are"} not exported: the native list does not give ${count === 1 ? "its" : "their"} owner, so ownership stays unverified.`,
+    );
+  }
   /** Texture basenames the editor builds no mip chain for; their sampler must not average them either. */
   const noMipmapTextures: ReadonlySet<string> = new Set(
     classified.filter((entry) => entry.noMipmaps === true).map((entry) => basename(entry.package, extname(entry.package))),

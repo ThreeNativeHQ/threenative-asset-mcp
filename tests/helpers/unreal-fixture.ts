@@ -190,8 +190,13 @@ export async function writeMeshFixture(
 export interface FakeUmodelOptions {
   /** Directory whose contents are copied into `-out=` on export. */
   readonly exportFrom?: string;
-  /** `<packageName>` → the class list `-list` reports. */
+  /** `<packageName>` → the class list `-list` reports. Every row takes the package's own name as its object name. */
   readonly classes: Readonly<Record<string, readonly string[]>>;
+  /**
+   * `<packageName>` → the rows `-list` reports as (class, object name) pairs, for a package whose exports are named
+   * differently: a level's package-named World beside its Texture2D auxiliaries. Wins over `classes` for that package.
+   */
+  readonly objects?: Readonly<Record<string, readonly { readonly className: string; readonly objectName: string }[]>>;
   readonly listExitCode?: number;
   readonly exportExitCode?: number;
   readonly version?: string;
@@ -228,10 +233,10 @@ if (argv.includes("-version")) {
 const selector = argv.filter((entry) => !entry.startsWith("-")).pop();
 const target = basename(selector || "").replace(/\.(uasset|umap)$/i, "");
 if (argv.includes("-list")) {
-  const classes = options.classes[target] || [];
+  const rows = (options.objects && options.objects[target]) || (options.classes[target] || []).map((className) => ({ className, objectName: target }));
   process.stdout.write("Found 1 game files (0 skipped) in 1 folders\\n");
-  classes.forEach((className, index) => {
-    process.stdout.write("   " + index + "    1000       10 " + className + " " + target + "\\n");
+  rows.forEach((row, index) => {
+    process.stdout.write("   " + index + "    1000       10 " + row.className + " " + row.objectName + "\\n");
   });
   process.exit(options.listExitCode || 0);
 }
