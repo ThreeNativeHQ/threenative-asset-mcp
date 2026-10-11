@@ -202,6 +202,12 @@ export interface FakeUmodelOptions {
   readonly corruptBuffer?: boolean;
   /** Package basenames UE Viewer recognizes but intentionally emits no files for. */
   readonly emptyExports?: readonly string[];
+  /**
+   * Models UE Viewer's output paths: an absolute `-out=` is copied into a 256-byte buffer with the package folders
+   * appended, and a longer result writes nothing, prints "Error creating file" and exits 0. `./` stays relative to the
+   * working directory. `-out=.` resolves against HOME, so the stand-in refuses it rather than writing there.
+   */
+  readonly nativeOutputPaths?: boolean;
 }
 
 export async function writeFakeUmodel(
@@ -234,7 +240,19 @@ if (argv.includes("-export")) {
   if ((options.emptyExports || []).includes(target)) process.exit(0);
   if (!options.exportFrom) process.exit(0);
   const out = (argv.find((entry) => entry.indexOf("-out=") === 0) || "").slice("-out=".length);
-  const destination = join(out, options.outputSubdirectory || "Group/Package");
+  const subdirectory = options.outputSubdirectory || "Group/Package";
+  if (options.nativeOutputPaths) {
+    if (out === ".") {
+      process.stderr.write("-out=. resolves against HOME\\n");
+      process.exit(3);
+    }
+    const composed = (out === "./" ? "./" : out + "/") + subdirectory;
+    if (composed.length > 255) {
+      process.stdout.write("Error creating file " + composed + "\\n");
+      process.exit(0);
+    }
+  }
+  const destination = join(out, subdirectory);
   fs.mkdirSync(destination, { recursive: true });
   fs.cpSync(options.exportFrom, destination, { recursive: true });
   if (options.corruptBuffer) {

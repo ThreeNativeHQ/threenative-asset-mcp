@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as sourcePackage from "../src/unreal/source-material-package.js";
 import * as sourceMaterial from "../src/unreal/source-material.js";
-import { bool, fields, float, input, materialPackage, parameter, prop, subsetInstance, subsetMaster } from "./helpers/unreal-material-source.js";
+import { bool, fields, float, input, materialPackage, parameter, prop, scalarInput, subsetInstance, subsetMaster } from "./helpers/unreal-material-source.js";
 
 describe("authored material source subset", () => {
   it("decodes signed exact paths and prunes two switches before reducing AO and scalar roughness", () => {
@@ -95,6 +95,48 @@ describe("authored material source subset", () => {
       const bytes = materialPackage([{ name: "M", className: "Material", properties: [input("Roughness", 2, 0, output)] }, { name: "Constant", className: "MaterialExpressionConstant", properties: [float("R", 0.5)] }]);
       expect(() => sourceMaterial.reduceSourceMaterial(new Map([["/Game/M", sourcePackage.decodeMaterialPackage(bytes, "/Game/M")]]), "/Game/M.M")).toThrow(/output/i);
     }
+  });
+
+  it("admits the -1 sentinel of a disconnected input (null expression) and retains the raw index with its masks and tag cursor", () => {
+    const decoded = sourcePackage.decodeMaterialPackage(materialPackage([{ name: "M", className: "Material", properties: [input("Roughness", 0, 2, -1), float("R", 0.5)] }]), "/Game/M");
+    if (decoded.status !== "decoded") throw new Error("Fixture did not decode");
+    const [roughness, r] = decoded.exports[0]!.properties;
+    expect(roughness).toEqual({ name: "Roughness", type: "StructProperty", arrayIndex: 0, value: { Expression: { index: 0, path: null }, OutputIndex: -1, InputName: "None", Mask: 1, MaskR: 0, MaskG: 0, MaskB: 1, MaskA: 0 } });
+    expect(r).toEqual({ name: "R", type: "FloatProperty", arrayIndex: 0, value: 0.5 });
+  });
+
+  it("refuses -1 on a connected expression and every other negative index, including -2 on the null expression", () => {
+    const constant = { name: "Constant", className: "MaterialExpressionConstant", properties: [float("R", 0.5)] };
+    for (const [expression, output] of [[2, -1], [0, -2]] as const) {
+      expect(() => sourcePackage.decodeMaterialPackage(materialPackage([{ name: "M", className: "Material", properties: [input("Roughness", expression, undefined, output)] }, constant]), "/Game/M")).toThrow("Invalid source expression output index");
+    }
+  });
+
+  it("keeps a connected nonnegative output and its masks unchanged", () => {
+    const decoded = sourcePackage.decodeMaterialPackage(materialPackage([{ name: "M", className: "Material", properties: [input("Roughness", 2, 0, 0)] }, { name: "Constant", className: "MaterialExpressionConstant", properties: [float("R", 0.5)] }]), "/Game/M");
+    if (decoded.status !== "decoded") throw new Error("Fixture did not decode");
+    expect(decoded.exports[0]!.properties[0]!.value).toEqual({ Expression: expect.objectContaining({ index: 2, name: "Constant" }), OutputIndex: 0, InputName: "None", Mask: 1, MaskR: 1, MaskG: 0, MaskB: 0, MaskA: 0 });
+  });
+
+  it("reduces a disconnected -1 input as unconnected, never as a selected output", () => {
+    const bytes = materialPackage([{ name: "M", className: "Material", properties: [input("Roughness", 0, undefined, -1)] }]);
+    const result = sourceMaterial.reduceSourceMaterial(new Map([["/Game/M", sourcePackage.decodeMaterialPackage(bytes, "/Game/M")]]), "/Game/M.M");
+    expect(result.channels.Roughness).toBeUndefined();
+    expect(result.limitations.join("\n")).toContain("Source Roughness: Unconnected source input/class default unresolved");
+  });
+
+  it("keeps the constant tail of a disconnected -1 scalar input, which reduces to that constant", () => {
+    const bytes = materialPackage([{ name: "M", className: "Material", properties: [scalarInput("Roughness", 0, -1, 0.25)] }]);
+    const result = sourceMaterial.reduceSourceMaterial(new Map([["/Game/M", sourcePackage.decodeMaterialPackage(bytes, "/Game/M")]]), "/Game/M.M");
+    expect(result.channels.Roughness).toEqual({ kind: "scalar", value: 0.25 });
+  });
+
+  it("admits a disconnected -1 function input inside a function call, which reduces as opaque", () => {
+    const call = { name: "Call", className: "MaterialExpressionMaterialFunctionCall", properties: [prop("FunctionInputs", "ArrayProperty", [[input("Input", 0, undefined, -1), prop("InputName", "NameProperty", "DamageColor")]], { inner: "StructProperty", struct: "FunctionExpressionInput" })] };
+    const bytes = materialPackage([{ name: "M", className: "Material", properties: [input("Roughness", 2)] }, call]);
+    const result = sourceMaterial.reduceSourceMaterial(new Map([["/Game/M", sourcePackage.decodeMaterialPackage(bytes, "/Game/M")]]), "/Game/M.M");
+    expect(result.channels.Roughness).toBeUndefined();
+    expect(result.limitations.join("\n")).toContain("opaque function");
   });
 
   it("retains valid opaque Break output 24 as unsupported and rejects bad UV outputs", () => {

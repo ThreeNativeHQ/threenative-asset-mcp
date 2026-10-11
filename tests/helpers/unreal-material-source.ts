@@ -12,6 +12,7 @@ export const prop = (name: string, type: string, value: unknown, meta: Partial<S
 export const float = (name: string, value: number) => prop(name, "FloatProperty", value);
 export const bool = (name: string, value: boolean) => prop(name, "BoolProperty", value);
 export const input = (name: string, expression: number, channel?: number, outputIndex = 0) => prop(name, "StructProperty", { expression, channel, outputIndex }, { struct: "ExpressionInput" });
+export const scalarInput = (name: string, expression: number, outputIndex = 0, constant?: number) => prop(name, "StructProperty", { expression, outputIndex, constant }, { struct: "ScalarMaterialInput" });
 export const fields = (name: string, struct: string, value: SourceProperty[]) => prop(name, "StructProperty", value, { struct });
 export const parameter = (name: string, value: number | boolean, override = true): SourceProperty[] => [
   fields("ParameterInfo", "MaterialParameterInfo", [prop("Name", "NameProperty", name), prop("Association", "ByteProperty", "GlobalParameter", { enum: "EMaterialParameterAssociation" }), prop("Index", "IntProperty", -1)]),
@@ -46,9 +47,11 @@ export function materialPackage(exports: SourceExport[], external: string[] = []
       case "NameProperty": case "ByteProperty": return fname(p.value as string);
       case "ObjectProperty": return i32(typeof p.value === "string" ? externalRefs[external.indexOf(p.value)]! : p.value as number);
       case "StructProperty": {
-        if (p.struct === "ExpressionInput") {
-          const v = p.value as { expression: number; channel?: number; outputIndex: number };
-          return Buffer.concat([i32(v.expression), i32(v.outputIndex), fname("None"), i32(v.channel === undefined ? 0 : 1), ...[0, 1, 2, 3].map((c) => i32(c === v.channel ? 1 : 0))]);
+        if (p.struct === "ExpressionInput" || p.struct === "ScalarMaterialInput") {
+          const v = p.value as { expression: number; channel?: number; outputIndex: number; constant?: number };
+          // A ScalarMaterialInput appends UseConstant and Constant after the masks; an ExpressionInput has no such tail.
+          const constant = p.struct === "ScalarMaterialInput" ? [i32(v.constant === undefined ? 0 : 1), f32(v.constant ?? 0)] : [];
+          return Buffer.concat([i32(v.expression), i32(v.outputIndex), fname("None"), i32(v.channel === undefined ? 0 : 1), ...[0, 1, 2, 3].map((c) => i32(c === v.channel ? 1 : 0)), ...constant]);
         }
         if (["Vector", "Vector2D", "Vector4", "LinearColor"].includes(p.struct!)) return Buffer.concat((p.value as number[]).map(f32));
         return encodeProperties(p.value as SourceProperty[]);

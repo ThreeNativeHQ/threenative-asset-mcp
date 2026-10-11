@@ -1,7 +1,7 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { copyFile, readdir, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createReadStream, readFileSync, statfs } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -54,11 +54,12 @@ import { viewDependentNodes, type NormalDependencies } from "./material-graph.js
 import { rasteriseSurfaceNormals, type SurfaceNormals, type SurfaceTriangles } from "./surface-normals.js";
 import { readMeshMaterialPackages, remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
+import { runUmodelExport } from "./umodel-export.js";
 
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 100;
+export const IMPORTER_VERSION = 101;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -3217,19 +3218,10 @@ export async function importUnrealDirectory(
       const selector = relative(sourceDir, chosen).split(sep).join("/").slice(0, -extname(chosen).length);
       const viaUmodel = async (): Promise<GraphTextureSource | undefined> => {
         const isolated = nextDirectory();
-        // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the
-        // package's own folders are appended to it. A deep staging path is reached through a short
-        // symlink (removed below); the files still land inside the staging directory.
-        let link: string | undefined;
+        // Exported from inside `isolated` with `-out=./`, so a deep staging path cannot cost the files (runUmodelExport).
         try {
           await mkdir(isolated, { recursive: true });
-          let out = isolated;
-          if (isolated.length > 120) {
-            link = join(tmpdir(), `tn-gt-${randomBytes(6).toString("hex")}`);
-            await symlink(isolated, link);
-            out = link;
-          }
-          const exportRun = await runBounded(umodel.path, [`-path=${sourceDir}`, "-export", "-png", `-out=${out}`, selector], {
+          const exportRun = await runUmodelExport(umodel.path, sourceDir, isolated, ["-png"], selector, {
             timeoutMs: 300_000,
             maxOutputBytes: 32 * 1024 * 1024,
           });
@@ -3243,8 +3235,6 @@ export async function importUnrealDirectory(
         } catch (error) {
           log(`Graph texture ${name}: export failed (${error instanceof Error ? error.message : String(error)}).`);
           return undefined;
-        } finally {
-          if (link) await rm(link, { force: true });
         }
       };
       // UE5 packages are unreadable to UE Viewer: the modern converter decodes the one package into
@@ -3458,11 +3448,10 @@ export async function importUnrealDirectory(
     out: string,
   ): Promise<string | undefined> => {
     const run = () =>
-      runBounded(
-        umodel.path,
-        [`-path=${sourceDir}`, "-export", "-gltf", "-png", "-nooverwrite", `-out=${out}`, entry.selector],
-        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
-      );
+      runUmodelExport(umodel.path, sourceDir, out, ["-gltf", "-png", "-nooverwrite"], entry.selector, {
+        timeoutMs: 1_800_000,
+        maxOutputBytes: 32 * 1024 * 1024,
+      });
     try {
       // UE Viewer occasionally exits non-zero for one package under filesystem pressure even
       // though the same read-only export succeeds immediately afterward. One bounded retry keeps
@@ -3525,11 +3514,10 @@ export async function importUnrealDirectory(
       const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
       await mkdir(isolated, { recursive: true });
       try {
-        const run = await runBounded(
-          umodel.path,
-          [`-path=${sourceDir}`, "-export", "-png", `-out=${isolated}`, entry.selector],
-          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
-        );
+        const run = await runUmodelExport(umodel.path, sourceDir, isolated, ["-png"], entry.selector, {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 32 * 1024 * 1024,
+        });
         if (run.code !== 0) return { entry, reason: `UE Viewer material export exited ${run.code}.` };
         const exported = await indexExported(isolated);
         // UE Viewer intentionally ignores a Material whose graph has no texture parameters.
@@ -3605,11 +3593,10 @@ export async function importUnrealDirectory(
       const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
       await mkdir(isolated, { recursive: true });
       try {
-        const run = await runBounded(
-          umodel.path,
-          [`-path=${sourceDir}`, "-export", "-png", `-out=${isolated}`, entry.selector],
-          { timeoutMs: 1_800_000, maxOutputBytes: 16 * 1024 * 1024 },
-        );
+        const run = await runUmodelExport(umodel.path, sourceDir, isolated, ["-png"], entry.selector, {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 16 * 1024 * 1024,
+        });
         if (run.code !== 0) {
           return { entry, reason: `UE Viewer texture export exited ${run.code}.` };
         }
@@ -3647,11 +3634,10 @@ export async function importUnrealDirectory(
       const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
       await mkdir(isolated, { recursive: true });
       try {
-        const run = await runBounded(
-          umodel.path,
-          [`-path=${sourceDir}`, "-export", "-sounds", `-out=${isolated}`, entry.selector],
-          { timeoutMs: 1_800_000, maxOutputBytes: 16 * 1024 * 1024 },
-        );
+        const run = await runUmodelExport(umodel.path, sourceDir, isolated, ["-sounds"], entry.selector, {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 16 * 1024 * 1024,
+        });
         if (run.code !== 0) return { entry, reason: `UE Viewer sound export exited ${run.code}.` };
         const emitted = (await listFiles(isolated)).find(
           (file) => basename(file.path, extname(file.path)).toLowerCase() === name.toLowerCase() &&
@@ -3680,18 +3666,10 @@ export async function importUnrealDirectory(
     log(`Exporting ${animationPackages.length} standalone animation packages as ActorX PSA…`);
     const animationFailures = await mapWithConcurrency(animationPackages, 1, async (entry) => {
       try {
-        const run = await runBounded(
-          umodel.path,
-          [
-            `-path=${sourceDir}`,
-            "-export",
-            "-psk",
-            "-nooverwrite",
-            `-out=${animationRaw}`,
-            entry.selector,
-          ],
-          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
-        );
+        const run = await runUmodelExport(umodel.path, sourceDir, animationRaw, ["-psk", "-nooverwrite"], entry.selector, {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 32 * 1024 * 1024,
+        });
         if (run.code === 0) return undefined;
         // UE Viewer prints its reason last; without it every failure reads the same.
         const diagnostic = `${run.stdout}\n${run.stderr}`.trim().split(/\r?\n/).filter((line) => line.trim()).at(-1)?.trim();
