@@ -43,6 +43,7 @@ export const graphNodeSchema = z
     class: z.string().min(1),
     // An `Unresolved` node (an expression that failed to load) is emitted with only id, class and error.
     inputs: z.record(z.string(), graphInputSchema.nullable()).default({}),
+    /** A UV set property (`CoordinateIndex`, `ConstCoordinate`) the dump found but could not read is `<name>Error`, never absent: absent is UV0. */
     constants: z.record(z.string(), constantSchema).default({}),
     parameter: z.object({ name: z.string(), group: z.string() }).strict().optional(),
     // GraphValue() also yields a string for a name-valued DefaultValue.

@@ -11,11 +11,12 @@ import { describeWithTools } from "./helpers/require-tool.js";
 
 // A `MaterialExpressionCustom` node's `Inputs` array stores each pin as an `FStructFallback` wrapper whose
 // `InputName` names the pin and whose `Input` holds the FExpressionInput. CUE4Parse has no FCustomInput type
-// at the pinned commit, so the adapter reads the wrapper itself. This compiled test runs the two helpers the dump
-// path calls, `GraphCustomInputs` and then `GraphReadInput`, extracted from the embedded program and compiled against
-// the real CUE4Parse types from the provisioned modern converter, not stubs. Each pin links through a real pinned
-// FPackageIndex, so the expectation reads its Index; the ExpressionName text is set but never read. The link has no
-// package owner because GraphReadInput never resolves one. `Pin`, which loads link targets, is not covered here.
+// at the pinned commit, so the adapter reads the wrapper itself. This compiled test runs the helpers the dump
+// path calls, `GraphCustomInputs` and then `GraphReadInput`, and the constant recorder `GraphRecordConstant`, extracted
+// from the embedded program and compiled against the real CUE4Parse types from the provisioned modern converter, not
+// stubs. Each pin links through a real pinned FPackageIndex, so the expectation reads its Index; the ExpressionName text
+// is set but never read. The link has no package owner because GraphReadInput never resolves one. `Pin`, which loads
+// link targets, is not covered here.
 
 /** Extracts one top-level C# declaration (signature line through its terminator) from the program. */
 function extractCSharp(program: string, signature: string): string {
@@ -58,7 +59,7 @@ function extractCSharp(program: string, signature: string): string {
 
 const CUE4PARSE_BIN = join(toolchainCacheDir(), "modern", "bin");
 
-describeWithTools(["modern-converter"], "Custom node named inputs (compiled from the embedded program)", () => {
+describeWithTools(["modern-converter"], "Converter dump helpers (compiled from the embedded program)", () => {
   let root = "";
   let harness = "";
   let sdk = "";
@@ -79,6 +80,8 @@ describeWithTools(["modern-converter"], "Custom node named inputs (compiled from
     expect(CUE4PARSE_PROGRAM).toContain('className == "Custom" && name == "Inputs"');
     expect(CUE4PARSE_PROGRAM).toContain("Custom Inputs use a raw layout this converter cannot read");
     expect(CUE4PARSE_PROGRAM).toContain("Custom Inputs has a duplicate pin name");
+    // The dump's own call site, which the compiled helper cannot see: an unreadable UV set must reach the recorder.
+    expect(CUE4PARSE_PROGRAM).toContain("GraphRecordConstant(constants, name, property.ArrayIndex, property.PropertyType.Text, value);");
   });
 
   afterAll(async () => {
@@ -104,6 +107,7 @@ describeWithTools(["modern-converter"], "Custom node named inputs (compiled from
       "static List<(string Name, object Value)>? GraphCustomInputs(",
       "static (FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bool UseConstant) GraphReadInput(",
       "static object? GraphValue(",
+      "static void GraphRecordConstant(",
       "static double DumpNum(",
       "static double[] DumpVec(",
       "static FPropertyTag? GraphProperty(",
@@ -166,6 +170,16 @@ if (args[0] == "custom")
         return $"{pin.Name}:{expression?.Index}:{output}:{(mask is null ? "-" : string.Join(",", mask))}";
     })));
 }
+if (args[0] == "constant")
+{
+    // The dump's call for each property the export holds. An absent property makes no call, so it has no entry at all.
+    var constants = new Dictionary<string, object?>();
+    if (args[1] == "read") GraphRecordConstant(constants, "CoordinateIndex", 0, "IntProperty", 3);
+    if (args[1] == "unreadable") GraphRecordConstant(constants, "ConstCoordinate", 0, "IntProperty", null);
+    if (args[1] == "other") GraphRecordConstant(constants, "SpeedX", 0, "FloatProperty", null);
+    Console.WriteLine(string.Join("; ", constants.OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair => $"{pair.Key}={pair.Value}")));
+    return;
+}
 
 static FPropertyTagType InputElement(string name, FExpressionInput input) => new StructProperty(new FScriptStruct(new FStructFallback(new List<FPropertyTag>
 {
@@ -213,5 +227,17 @@ ${functions.join("\n")}
 
   it("refuses a raw Inputs layout rather than guessing", () => {
     expect(run("custom", "raw")).toBe("error Custom Inputs use a raw layout this converter cannot read");
+  });
+
+  // An absent CoordinateIndex or ConstCoordinate is UV0, so a present one the converter cannot read must stay visible as its own
+  // `<name>Error`, or the dump would read the wrong texels. Absent makes no call and so leaves no entry.
+  it("keeps a present UV set it cannot read as <name>Error, distinct from an absent one", () => {
+    expect(run("constant", "read")).toBe("CoordinateIndex=3");
+    expect(run("constant", "unreadable")).toBe("ConstCoordinateError=property ConstCoordinate (IntProperty) could not be read");
+    expect(run("constant", "absent")).toBe("");
+  });
+
+  it("records no error for an unreadable constant outside the UV sets", () => {
+    expect(run("constant", "other")).toBe("");
   });
 });

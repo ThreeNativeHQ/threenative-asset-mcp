@@ -620,6 +620,15 @@ static object? GraphValue(object? value) => value switch
     FScriptStruct script => GraphValue(script.StructType),
     _ => null,
 };
+// A scalar is kept when it reads. A UV set the export holds but cannot be read is not dropped: an absent CoordinateIndex or
+// ConstCoordinate means UV0, so it is kept under the name with an "Error" suffix, and the material graph refuses it only where
+// that set is demanded. Other unreadable scalars are still dropped.
+static void GraphRecordConstant(Dictionary<string, object?> constants, string name, int arrayIndex, string typeName, object? value)
+{
+    var converted = GraphValue(value);
+    if (converted is not null) constants[arrayIndex > 0 ? $"{name}[{arrayIndex}]" : name] = converted;
+    else if (name is "CoordinateIndex" or "ConstCoordinate") constants[name + "Error"] = $"property {name} ({typeName}) could not be read";
+}
 static string GraphEnumName(object? value, string prefix)
 {
     var text = value switch { FName name => name.Text, null => "", _ => value.ToString() ?? "" };
@@ -1059,10 +1068,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                         }
                     }
                     else if (!GraphIgnoredProperties.Contains(name) && !name.StartsWith("MaterialExpression", StringComparison.Ordinal))
-                    {
-                        var converted = GraphValue(value);
-                        if (converted is not null) constants[property.ArrayIndex > 0 ? $"{name}[{property.ArrayIndex}]" : name] = converted;
-                    }
+                        GraphRecordConstant(constants, name, property.ArrayIndex, property.PropertyType.Text, value);
                 }
                 catch (Exception error) { node["error"] = $"{name}: {error.Message}"; }
             }

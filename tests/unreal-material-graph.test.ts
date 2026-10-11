@@ -2576,6 +2576,131 @@ describe("UV set indices: a malformed index is refused on the path that demands 
     );
     expect(await bakeWith(graph)).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
   });
+
+  describe("TextureSample ConstCoordinate, and a UV set the dump found but could not read", () => {
+    const UNREADABLE_INDEX = "property CoordinateIndex (IntProperty) could not be read";
+    const UNREADABLE_CONST = "property ConstCoordinate (IntProperty) could not be read";
+    /** T_Grey sampled at the `uv` TextureCoordinate, or with no Coordinates pin when `coords` is null. `constants` are set after parsing, as `sampleAt` does. */
+    const sampleOf = (coords: string | null, constants: Raw = {}): MaterialGraph => {
+      const graph = makeGraph([textureSample("t", "T_Grey", "Color", coords), ...(coords ? [textureCoordinate(coords)] : [])], pin("t", 0, RGB_MASK));
+      Object.assign(graph.nodes.find((n) => n.id === "t")!.constants, constants);
+      return graph;
+    };
+    /** A switch that takes its A pin (the UV0 sample) and leaves `inactive` on its B pin, which the compile never reaches. */
+    const switchOver = (inactive: Raw): MaterialGraph =>
+      makeGraph(
+        [
+          withInputs(node("switch", "StaticSwitch", { switchValue: true }), { A: pin("t", 0, RGB_MASK), B: pin("bad", 0, RGB_MASK), Value: pin("flag") }),
+          boolParameter("flag", "UseUv0", true),
+          textureSample("t", "T_Grey", "Color", "uv"),
+          textureCoordinate("uv"),
+          inactive,
+        ],
+        pin("switch", 0, RGB_MASK),
+      );
+
+    it("an unwired sample reads UV0 while ConstCoordinate is absent or 0, the same texels", async () => {
+      const texel = (x: number, y: number): Rgb => [40 * x + 10, 60 * y + 5, 77];
+      const loader = makeLoader({ T_Grey: { png: await pngOf(4, 4, texel), srgb: true } });
+      for (const graph of [sampleOf(null), sampleOf(null, { ConstCoordinate: 0 })]) {
+        const pixel = await pixelsOf(await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 }));
+        for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) expect(pixel(x, y)).toEqual([...texel(x, y)]);
+      }
+    });
+
+    it("refuses a malformed unwired ConstCoordinate on either sample class, with or without the fallback", async () => {
+      for (const value of ["1", true, [1], null, Number.NaN, Number.POSITIVE_INFINITY, 1.5, -1, 8]) {
+        for (const fallback of [false, true]) {
+          expect(await bakeWith(sampleOf(null, { ConstCoordinate: value }), fallback), `ConstCoordinate ${String(value)}, fallback ${fallback}`).toMatchObject({
+            status: "unavailable",
+            reason: expect.stringMatching(/^TextureSample t has a malformed ConstCoordinate/),
+          });
+        }
+      }
+      const parameter = makeGraph([textureParameter("t", "Tint", "T_Grey", "Color")], pin("t", 0, RGB_MASK));
+      Object.assign(parameter.nodes[0]!.constants, { ConstCoordinate: "1" });
+      expect(await bakeWith(parameter)).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^TextureSampleParameter2D t has a malformed ConstCoordinate/) });
+    });
+
+    it("keeps a valid positive unwired ConstCoordinate strict, and the named heuristic with the fallback", async () => {
+      for (const index of [1, 7]) {
+        expect(await bakeWith(sampleOf(null, { ConstCoordinate: index }))).toMatchObject({ status: "unsupported", unsupported: [`TextureCoordinate[${index}]`] });
+        const relaxed = await bakeWith(sampleOf(null, { ConstCoordinate: index }), true);
+        expect(relaxed).toMatchObject({ status: "baked", confidence: "heuristic" });
+        if (relaxed.status === "baked") expect(relaxed.approximations).toContain(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
+      }
+    });
+
+    it("a wired Coordinates never reads ConstCoordinate, malformed or valid positive", async () => {
+      const clean = await pixelsOf(await bakeWith(sampleOf("uv")));
+      for (const value of ["1", null, 7]) {
+        const result = await bakeWith(sampleOf("uv", { ConstCoordinate: value }));
+        expect(result, `ConstCoordinate ${String(value)}`).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+        const pixel = await pixelsOf(result);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(pixel(x, y)).toEqual(clean(x, y));
+      }
+    });
+
+    it("a malformed unwired ConstCoordinate on the cut-out costs only the cut-out, named, and only when the cut-out is requested", async () => {
+      const graph = makeGraph([textureSample("t", "T_Grey", "Color"), textureSample("cut", "T_Grey", "Color")], pin("t", 0, RGB_MASK), {
+        outputs: { baseColor: pin("t", 0, RGB_MASK), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: pin("cut", 0, RGB_MASK), normal: null, materialAttributes: null },
+      });
+      Object.assign(graph.nodes.find((n) => n.id === "cut")!.constants, { ConstCoordinate: "1" });
+      const loadTexture = makeLoader({ T_Grey: { png: await gradient(), srgb: true } }).loadTexture;
+      const request = { graph, output: "baseColor" as const, parameters: NO_PARAMETERS, loadTexture, size: 2 };
+      expect(await bakeGraph({ ...request, alpha: "opacityMask" })).toMatchObject({
+        status: "baked",
+        approximations: expect.arrayContaining([expect.stringMatching(/^opacityMask could not be evaluated \(TextureSample cut has a malformed ConstCoordinate/)]),
+      });
+      // Not requested, the cut-out is never compiled, so nothing names its set.
+      expect(await bakeGraph(request)).toMatchObject({ status: "baked", approximations: [] });
+    });
+
+    it("a malformed unwired ConstCoordinate on a statically inactive branch does not poison the bake", async () => {
+      expect(await bakeWith(switchOver({ ...textureSample("bad", "T_Grey", "Color"), constants: { ConstCoordinate: "1" } }))).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+    });
+
+    it("refuses a CoordinateIndex the dump found but could not read, and never reads it as UV0", async () => {
+      const graph = makeGraph([textureSample("t", "T_Grey", "Color", "uv"), { ...textureCoordinate("uv"), constants: { UTiling: 1, VTiling: 1, CoordinateIndexError: UNREADABLE_INDEX } }], pin("t", 0, RGB_MASK));
+      expect(await bakeWith(graph)).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^TextureCoordinate uv has an unreadable CoordinateIndex/) });
+      expect(await bakeWith(graph, true)).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^TextureCoordinate uv has an unreadable CoordinateIndex/) });
+    });
+
+    it("refuses an unreadable ConstCoordinate where a sample or Panner demands it, and costs nothing where none does", async () => {
+      const unreadable = { ConstCoordinateError: UNREADABLE_CONST };
+      expect(await bakeWith(sampleOf(null, unreadable))).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^TextureSample t has an unreadable ConstCoordinate/) });
+      const panner = makeGraph([textureSample("t", "T_Grey", "Color", "pan"), node("pan", "Panner", { constants: { SpeedX: 0.37, ...unreadable } })], pin("t", 0, RGB_MASK));
+      expect(await bakeWith(panner, true)).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^Panner pan has an unreadable ConstCoordinate/) });
+      const clean = await pixelsOf(await bakeWith(sampleOf("uv")));
+      const wired = await pixelsOf(await bakeWith(sampleOf("uv", unreadable)));
+      for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(wired(x, y)).toEqual(clean(x, y));
+      expect(await bakeWith(switchOver({ ...textureSample("bad", "T_Grey", "Color"), constants: unreadable }))).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+    });
+
+    it("the Normal probe refuses a malformed or unreadable set it demands, reads a valid positive one, and ignores a wired one", () => {
+      const normal = (sample: Raw, extra: Raw[] = []) => normalGraph([sample, ...extra], { normal: pin("n") });
+      const unwired = (constants: Raw) => ({ ...textureSample("n", "T_Normal", "Normal"), constants });
+      expect(graphNormalDependencies(normal(unwired({ ConstCoordinate: "1" })), params({}))).toMatchObject({
+        status: "unknown",
+        reason: expect.stringMatching(/^TextureSample n has a malformed ConstCoordinate/),
+      });
+      expect(graphNormalDependencies(normal(unwired({ ConstCoordinateError: UNREADABLE_CONST })), params({}))).toMatchObject({
+        status: "unknown",
+        reason: expect.stringMatching(/^TextureSample n has an unreadable ConstCoordinate/),
+      });
+      expect(readNames(graphNormalDependencies(normal(unwired({ ConstCoordinate: 1 })), params({})))).toEqual(["T_Normal"]);
+      const wired = { ...textureSample("n", "T_Normal", "Normal", "uv"), constants: { ConstCoordinate: "1", ConstCoordinateError: UNREADABLE_CONST } };
+      expect(readNames(graphNormalDependencies(normal(wired, [textureCoordinate("uv")]), params({})))).toEqual(["T_Normal"]);
+    });
+
+    it("the Normal probe refuses an unreadable CoordinateIndex on the coordinates it walks", () => {
+      const unreadable = { ...textureCoordinate("uv"), constants: { UTiling: 1, VTiling: 1, CoordinateIndexError: UNREADABLE_INDEX } };
+      expect(graphNormalDependencies(normalGraph([textureSample("n", "T_Normal", "Normal", "uv"), unreadable], { normal: pin("n") }), params({}))).toMatchObject({
+        status: "unknown",
+        reason: expect.stringMatching(/^TextureCoordinate uv has an unreadable CoordinateIndex/),
+      });
+    });
+  });
 });
 
 describe("UV-producing nodes: CustomRotator, UVEdit, UV arithmetic, ConvertFromDiffSpec", () => {

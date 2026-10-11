@@ -77,8 +77,9 @@ export interface BakeRequest {
   /** Square output edge in pixels. Default 1024. */
   size?: number;
   /**
-   * Evaluate TextureCoordinate nodes with CoordinateIndex > 0 as UV0 and mark the bake heuristic instead of
-   * refusing it. Off by default: which mesh UV set an index refers to is not in the graph. A malformed index is refused either way.
+   * Evaluate a UV set above 0 (a TextureCoordinate's CoordinateIndex, or an unwired sample's or Panner's ConstCoordinate) as UV0 and mark
+   * the bake heuristic instead of refusing it. Off by default: which mesh UV set an index refers to is not in the graph. A malformed index
+   * is refused either way.
    */
   allowUvSetFallback?: boolean;
   /**
@@ -719,7 +720,7 @@ type SwitchUses = Map<string, SwitchUse>;
 const MAX_UV_CHANNELS = 8;
 
 /**
- * The UV set a TextureCoordinate's CoordinateIndex, or an unwired Panner's ConstCoordinate, names. Absent is UV0, the engine's default.
+ * The UV set a TextureCoordinate's CoordinateIndex, or an unwired sample's or Panner's ConstCoordinate, names. Absent is UV0, the engine's default.
  * A present value must be an integer from 0 to MAX_UV_CHANNELS - 1. Anything else is undefined, and the caller refuses it rather than
  * reading it as UV0 or as the nearest set.
  */
@@ -732,6 +733,18 @@ function uvSetIndex(raw: unknown): number | undefined {
 function malformedUvSet(owner: string, field: string, raw: unknown): string {
   const shown = typeof raw === "string" || Array.isArray(raw) ? JSON.stringify(raw) : String(raw);
   return `${owner} has a malformed ${field} (${shown}): expected an integer UV set from 0 to ${MAX_UV_CHANNELS - 1}`;
+}
+
+/**
+ * The UV set a node's `field` names, read where the compile or the Normal walk demands it. The dump keeps a property it found but could not
+ * read as `<field>Error`, because an absent property is the default, UV0. Such a set is refused like a malformed one, never read as UV0.
+ */
+function uvSetOf(owner: string, node: GraphNode, field: "CoordinateIndex" | "ConstCoordinate"): { readonly index: number } | { readonly refusal: string } {
+  const unreadable = node.constants[`${field}Error`];
+  if (unreadable !== undefined) return { refusal: `${owner} has an unreadable ${field}: ${String(unreadable)}` };
+  const raw = node.constants[field];
+  const index = uvSetIndex(raw);
+  return index === undefined ? { refusal: malformedUvSet(owner, field, raw) } : { index };
 }
 
 class Compiler {
@@ -1769,10 +1782,10 @@ class Compiler {
     if (node.inputs.Coordinate) coordinate = this.vec(node.inputs.Coordinate, "Panner.Coordinate");
     else {
       // Only an unwired Coordinate reads ConstCoordinate: a wired one never does, malformed or not.
-      const index = uvSetIndex(node.constants.ConstCoordinate);
-      if (index === undefined) return this.markUnavailable(malformedUvSet(`Panner ${node.id}`, "ConstCoordinate", node.constants.ConstCoordinate));
-      if (index > 0 && !this.options.allowUvSetFallback) return this.markUnsupported(`TextureCoordinate[${index}]`);
-      if (index > 0) this.approximations.add(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
+      const uv = uvSetOf(`Panner ${node.id}`, node, "ConstCoordinate");
+      if ("refusal" in uv) return this.markUnavailable(uv.refusal);
+      if (uv.index > 0 && !this.options.allowUvSetFallback) return this.markUnsupported(`TextureCoordinate[${uv.index}]`);
+      if (uv.index > 0) this.approximations.add(`TextureCoordinate[${uv.index}] evaluated as UV0; the mesh UV set ${uv.index} is not in the material`);
       coordinate = this.defaultUv();
     }
     if (!coordinate) return this.markUnavailable(`Panner ${node.id} has no coordinate`);
@@ -1882,8 +1895,9 @@ class Compiler {
   }
 
   private textureCoordinate(node: GraphNode): Val {
-    const index = uvSetIndex(node.constants.CoordinateIndex);
-    if (index === undefined) return this.markUnavailable(malformedUvSet(`TextureCoordinate ${node.id}`, "CoordinateIndex", node.constants.CoordinateIndex));
+    const uv = uvSetOf(`TextureCoordinate ${node.id}`, node, "CoordinateIndex");
+    if ("refusal" in uv) return this.markUnavailable(uv.refusal);
+    const { index } = uv;
     if (index > 0) {
       if (!this.options.allowUvSetFallback) return this.markUnsupported(`TextureCoordinate[${index}]`);
       this.approximations.add(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
@@ -1929,6 +1943,15 @@ class Compiler {
     if (!reference) this.unboundTextures.add(node.id);
     if (!reference) return this.markUnavailable(`texture sample ${node.id}${parameterName ? ` (parameter "${node.parameter?.name}")` : ""} has no texture`);
 
+    // Unwired, the sample reads the UV set ConstCoordinate names, as the engine's compile does. A wired Coordinates never reads it.
+    if (!node.inputs.Coordinates) {
+      const uv = uvSetOf(`${node.class} ${node.id}`, node, "ConstCoordinate");
+      if ("refusal" in uv) return this.markUnavailable(uv.refusal);
+      if (uv.index > 0) {
+        if (!this.options.allowUvSetFallback) return this.markUnsupported(`TextureCoordinate[${uv.index}]`);
+        this.approximations.add(`TextureCoordinate[${uv.index}] evaluated as UV0; the mesh UV set ${uv.index} is not in the material`);
+      }
+    }
     const coordinates = node.inputs.Coordinates ? this.vec(node.inputs.Coordinates, "TextureSample.Coordinates") : undefined;
     const uvScale = coordinates ? coordinates.uvScale : ([1, 1] as [number, number]);
     const sampler = (node.samplerType ?? "Color").toLowerCase();
@@ -3020,12 +3043,14 @@ class NormalWalk {
         // Parameters and constants name no texture.
         this.expectValue(node, read);
         return;
-      case "TextureCoordinate":
-        // A UV set is judged as the compile judges it, so a malformed one is refused here too. This judges the index alone: the walk
-        // still certifies texture dependencies, not a finite Normal value.
+      case "TextureCoordinate": {
+        // A UV set is judged as the compile judges it, so a malformed or unreadable one is refused here too. This judges the index alone: the
+        // walk still certifies texture dependencies, not a finite Normal value.
         this.expectValue(node, read);
-        if (uvSetIndex(node.constants.CoordinateIndex) === undefined) refuse(malformedUvSet(`TextureCoordinate ${node.id}`, "CoordinateIndex", node.constants.CoordinateIndex));
+        const uv = uvSetOf(`TextureCoordinate ${node.id}`, node, "CoordinateIndex");
+        if ("refusal" in uv) refuse(uv.refusal);
         return;
+      }
       case "Multiply":
       case "Divide":
       case "Add":
@@ -3111,6 +3136,12 @@ class NormalWalk {
     const chained = parameter === undefined ? undefined : (this.parameters.textureReferences?.get(parameter) ?? this.parameters.textures.get(parameter));
     const reference = chained ?? node.texture;
     if (!reference) refuse(`texture sample ${node.id}${parameter === undefined ? "" : ` (parameter "${node.parameter?.name}")`} names no texture`);
+    // Unwired, the sample reads the UV set ConstCoordinate names, as the compile does, so a malformed or unreadable one is refused here too. A
+    // valid set is not judged further, as a TextureCoordinate's is not.
+    if (!node.inputs.Coordinates) {
+      const uv = uvSetOf(`${node.class} ${node.id}`, node, "ConstCoordinate");
+      if ("refusal" in uv) refuse(uv.refusal);
+    }
     const name = textureObjectName(reference);
     const qualified = reference.includes("/") ? reference : undefined;
     this.found.set((qualified ?? name).toLowerCase(), { name, reference: qualified });
