@@ -2,7 +2,7 @@ import { readdir } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import sharp from "sharp";
 import { dumpEngineArg } from "../fab/routes.js";
-import { assertEngineContentDirectory, engineContentFromEnvironment, engineVersionOf, type EngineContentConfig } from "./engine-content.js";
+import { assertEngineContentDirectory, engineContentFromEnvironment, engineVersionOf, isEngineReference, type EngineContentConfig } from "./engine-content.js";
 import { dumpMaterialGraphs } from "./graph-dump.js";
 import type { MaterialGraph } from "./graph-dump.js";
 import {
@@ -145,6 +145,8 @@ export type GraphBaker = (request: GraphBakeRequest) => Promise<GraphBakeOutcome
 export interface GraphTextureSource {
   readonly path: string;
   readonly properties?: string | undefined;
+  /** The engine content an `/Engine/` reference was answered from: its Unreal version and package. Absent for a pack package. */
+  readonly engine?: { readonly version: string; readonly package: string } | undefined;
 }
 
 export interface GraphBakerOptions {
@@ -180,6 +182,16 @@ const MAX_PARENT_DEPTH = 8;
 const RASTER_CACHE_BYTES = 256 * 1024 * 1024;
 const BAKE_CACHE_BYTES = 256 * 1024 * 1024;
 const STATIC_SWITCH_NOTE = "static switch values taken from the parent's defaults";
+
+/**
+ * The note for a texture read from engine content whose version is not the pack's own, or when the pack's version is unknown.
+ * Worded as the function note is (`material-graph.ts`), so both name the content they came from. Undefined when the versions match.
+ */
+function engineTextureNote(name: string, engine: { readonly version: string; readonly package: string }, packEngine: string | undefined): string | undefined {
+  if (packEngine !== undefined && packEngine === engine.version) return undefined;
+  const packNote = packEngine === undefined ? "the pack's Unreal version is unknown" : `the pack is ${packEngine}`;
+  return `${name} read from engine content ${engine.version} (${engine.package}); ${packNote}`;
+}
 
 /**
  * The one place that decides whether a UE Viewer PNG carries sRGB-encoded colour.
@@ -266,12 +278,17 @@ export function chainParameters(chain: readonly PropsFile[]): GraphParameters {
   return { textures, textureReferences: chainTextureReferences(chain), vectors, scalars, switches };
 }
 
-function parametersKey(parameters: GraphParameters): string {
+export function parametersKey(parameters: GraphParameters): string {
   const sorted = <T>(map: ReadonlyMap<string, T>): [string, T][] => [...map].sort(([a], [b]) => a.localeCompare(b));
   // Two chains can carry the same object names from different packages, and those bake differently, so the key also holds
-  // each reference by its package identity: `/Game/A/T` and `Content/A/T` are the same package.
+  // each reference by its package identity: `/Game/A/T` and `Content/A/T` are the same package. A reference that addresses the
+  // engine mount keeps its own spelling instead, class, object, prefix case, padding and all: it is answered by engine content or not at
+  // all, so folding `/Engine/A/T.T` onto `/engine/A/T.T` would let a refusal answer a valid request, or the reverse.
   const references = [...parameters.textureReferences ?? []]
-    .map(([name, reference]): [string, string] => [name, texturePackageKey(reference) ?? reference.toLowerCase()])
+    .map(([name, reference]): [string, string] => [
+      name,
+      isEngineReference(reference) ? reference : texturePackageKey(reference) ?? reference.toLowerCase(),
+    ])
     .sort(([a], [b]) => a.localeCompare(b));
   return JSON.stringify([sorted(parameters.textures), references, sorted(parameters.vectors), sorted(parameters.scalars), sorted(parameters.switches)]);
 }
@@ -531,13 +548,16 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
 
     const pending = (async (): Promise<GraphBakeOutcome> => {
       const unresolved = new Map<string, string>();
+      // Notes for the engine textures this bake actually samples: a texture the graph never reaches is never named.
+      const engineNotes = new Set<string>();
+      const packEngine = engineVersionOf(options.engine);
       const result = await bakeGraph({
         graph: residual ? whiteLoweredGraph(graph!) : graph!,
         output: "baseColor",
         parameters,
         size,
         allowUvSetFallback: true,
-        ...(engineVersionOf(options.engine) ? { packEngine: engineVersionOf(options.engine)! } : {}),
+        ...(packEngine ? { packEngine } : {}),
         // Unreal feeds white to ParticleColor outside a particle emitter.
         particleColor: [1, 1, 1, 1],
         ...(request.alpha ? { alpha: request.alpha } : {}),
@@ -548,6 +568,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
           const name = textureBasename(objectName);
           let path: string | undefined;
           let properties: string | undefined;
+          let engineSource: GraphTextureSource["engine"];
           // The exporter is authoritative: with the full reference it owns the answer, so a same-named PNG the mesh export
           // happens to carry is never substituted for the package the graph names. Its metadata rides with the source it
           // selected (never `readProps(name)`, which is a namesake's). Without an exporter the caller's PNG map is the only
@@ -558,6 +579,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
             else if (source) {
               path = source.path;
               properties = source.properties;
+              engineSource = source.engine;
             }
           } else {
             path = request.assets.ambiguousPng?.has(name) ? undefined : request.assets.png.get(name);
@@ -566,6 +588,10 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
           if (!path) {
             unresolved.set(name, `${name} has no exact source`);
             return undefined;
+          }
+          if (engineSource) {
+            const note = engineTextureNote(name, engineSource, packEngine);
+            if (note) engineNotes.add(note);
           }
           return decode(path, textureIsSrgb(properties));
         },
@@ -577,6 +603,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         return { ...result, reason, graphMaterial: graph!.material, parameters, emissionZero, ...(particle ? { particle } : {}) };
       }
       const approximations = new Set(result.approximations);
+      for (const note of engineNotes) approximations.add(note);
       // A successful bake comes from a settled pass, so the classes are defined; an empty list is only the safe
       // fallback for reporting, never a claim that the path has no class.
       const classes = graphPathClasses(graph!, "baseColor", parameters, request.alpha) ?? [];

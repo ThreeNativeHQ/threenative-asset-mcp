@@ -6,7 +6,8 @@ import { NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { describe, expect, it, onTestFinished } from "vitest";
 
-import { chainParameters, createGraphBaker, directVertexColorGraph } from "../src/unreal/graph-baker.js";
+import { chainParameters, createGraphBaker, directVertexColorGraph, parametersKey, type GraphBakeOutcome } from "../src/unreal/graph-baker.js";
+import { canonicalEngineReference } from "../src/unreal/engine-content.js";
 import { parsePropsFile } from "../src/unreal/materials.js";
 import { materialGraphSchema, type MaterialGraph } from "../src/unreal/graph-dump.js";
 import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
@@ -811,10 +812,123 @@ describe("createGraphBaker", () => {
   });
 });
 
+// A finished bake is cached per exported-asset index. Two chains that differ only in the spelling of an /Engine/ reference
+// must never share that cache: the exact spelling is answered by engine content and any other is not, so a folded key would
+// let whichever baked first answer for the other, in whichever order the two happen to be requested.
+describe("the finished bake cache keeps an /Engine/ reference's own spelling", () => {
+  const VALID = "Texture2D'/Engine/Textures/T_Rock.T_Rock'";
+  // The same package, spelled the way the importer refuses it: the mount prefix in another case, another class, an object that
+  // differs only in case, a malformed shape that still addresses the engine mount, or padding, backslashes and doubled separators.
+  // Each reaches the bake as a real parameter override (the props parser keeps the spelling whole inside its class wrapper), so
+  // none of them can pass for the want of a parse.
+  const REFUSED = [
+    ["another mount case", "Texture2D'/engine/Textures/T_Rock.T_Rock'"],
+    ["another class", "StaticMesh'/Engine/Textures/T_Rock.T_Rock'"],
+    ["an object that differs only in case", "Texture2D'/Engine/Textures/T_Rock.t_rock'"],
+    ["a parent segment", "Texture2D'/Engine/../Textures/T_Rock.T_Rock'"],
+    ["a leading space inside a class wrapper", "Texture2D' /Engine/Textures/T_Rock.T_Rock'"],
+    ["a trailing space inside a class wrapper", "Texture2D'/Engine/Textures/T_Rock.T_Rock '"],
+    ["mixed separators", "/Engine\\Textures/T_Rock.T_Rock"],
+    ["a doubled leading slash", "//Engine/Textures/T_Rock.T_Rock"],
+    ["all backslashes", "\\Engine\\Textures\\T_Rock.T_Rock"],
+    ["all backslashes in a class wrapper", "Texture2D'\\Engine\\Textures\\T_Rock.T_Rock'"],
+    ["a wrong class with backslashes", "StaticMesh'\\Engine\\Textures\\T_Rock.T_Rock'"],
+  ] as const;
+
+  const propsFor = (reference: string): string =>
+    [
+      "Parent = Material3'/Game/Test/M_Master.M_Master'",
+      "TextureParameterValues[0] =",
+      "{",
+      "    ParameterInfo = { Name=None }",
+      `    ParameterValue = ${reference}`,
+      "    ParameterName = Mask",
+      "}",
+    ].join("\n");
+
+  /** One source tree, one exported-asset index and one baker per order, so only the request order differs. */
+  async function fixture(refused: string) {
+    const root = await scratch("graph-bake-engine-key-");
+    const sourceDir = join(root, "source");
+    const content = join(sourceDir, "Content", "Test");
+    await mkdir(content, { recursive: true });
+    for (const name of ["M_Master", "MI_Valid", "MI_Refused"]) await writeFile(join(content, `${name}.uasset`), Buffer.alloc(16));
+    await writePng(join(root, "T_Rock.png"), [80, 160, 240, 255], 4);
+    // The importer's own rule, kept here so the test measures the cache and not a rule of its own: an /Engine/ reference is
+    // answered only when it is an exact texture reference, and a refused spelling is never answered by a pack package.
+    const exportTexture = async (name: string, reference?: string): Promise<{ path: string } | undefined> =>
+      canonicalEngineReference(reference ?? "")?.object === name ? { path: join(root, "T_Rock.png") } : undefined;
+    const assets = { png: new Map<string, string>() };
+    const readProps = (name: string): string | undefined => propsFor(name === "MI_Valid" ? VALID : refused);
+    return { sourceDir, assets, readProps, exportTexture };
+  }
+
+  for (const [label, refused] of REFUSED) {
+    it(`never lets a bake for one spelling of ${label} answer for the other, in either order`, async () => {
+      const root = await fixture(refused);
+      const byOrder = new Map<string, Map<string, GraphBakeOutcome>>();
+      for (const order of [
+        ["MI_Valid", "MI_Refused"],
+        ["MI_Refused", "MI_Valid"],
+      ]) {
+        const baker = createGraphBaker({
+          sourceDir: root.sourceDir,
+          engine: "UE_5.8",
+          maxTextureSize: 4,
+          exportTexture: root.exportTexture,
+          dumpGraphs: async () => new Map([["M_Master", masterGraph()]]),
+        })!;
+        const outcomes = new Map<string, GraphBakeOutcome>();
+        for (const lookupName of order) {
+          outcomes.set(
+            lookupName,
+            await baker({ materialName: `${lookupName}_section`, lookupName, assets: root.assets, readProps: root.readProps }),
+          );
+        }
+        byOrder.set(order.join(" then "), outcomes);
+      }
+      const [validFirst, refusedFirst] = [...byOrder.values()];
+      // Each request gets its own answer, whatever ran first, on one baker and one exported-asset index.
+      expect(validFirst!.get("MI_Valid")?.status, "valid reference").toBe("baked");
+      expect(validFirst!.get("MI_Refused")?.status, "refused reference").toBe("unavailable");
+      // The spelling reached the bake whole, through the props parser, class and quotes included: a case the parser dropped
+      // would leave the master's own default here and pass for the wrong reason.
+      expect(validFirst!.get("MI_Refused")?.parameters?.textureReferences).toEqual(new Map([["mask", refused]]));
+      expect(refusedFirst!.get("MI_Valid")?.status, "valid reference").toBe("baked");
+      expect(refusedFirst!.get("MI_Refused")?.status, "refused reference").toBe("unavailable");
+      // And the answer itself does not depend on the order the two were asked in.
+      expect(refusedFirst!.get("MI_Valid")).toEqual(validFirst!.get("MI_Valid"));
+      expect(refusedFirst!.get("MI_Refused")).toEqual(validFirst!.get("MI_Refused"));
+    });
+  }
+
+  // The cache key holds the spelling itself, so a padded engine reference never shares a bake with the valid bare one.
+  it("keys a padded /Engine/ reference apart from the valid one, so neither can answer for the other", () => {
+    const keyed = (reference: string) =>
+      parametersKey({
+        textures: new Map([["mask", "T_Rock"]]),
+        textureReferences: new Map([["mask", reference]]),
+        vectors: new Map(),
+        scalars: new Map(),
+        switches: new Map(),
+      });
+    expect(keyed(" /Engine/Textures/T_Rock.T_Rock")).not.toBe(keyed("/Engine/Textures/T_Rock.T_Rock"));
+    expect(keyed("/Engine/Textures/T_Rock.T_Rock ")).not.toBe(keyed("/Engine/Textures/T_Rock.T_Rock"));
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------
 // The importer end to end: fake umodel + a fake modern converter that answers `--dump-graphs`.
 
-async function writeFakeConverter(path: string, graph: MaterialGraph, argvLog: string, textureFrom?: string): Promise<void> {
+/** How the fake modern converter answers an exact `/Engine/` export: the PNG it writes, its SRGB flag, or its exit code. */
+interface EngineExportFixture {
+  readonly png: string;
+  readonly srgb?: boolean;
+  readonly writePng?: boolean;
+  readonly exitCode?: number;
+}
+
+async function writeFakeConverter(path: string, graph: MaterialGraph, argvLog: string, textureFrom?: string, engine?: EngineExportFixture): Promise<void> {
   await writeFile(
     path,
     `#!/usr/bin/env node
@@ -831,6 +945,19 @@ if (at >= 0) {
 }
 const exportAt = argv.indexOf("--export-dir");
 const filterAt = argv.indexOf("--filter");
+const exactAt = argv.indexOf("--exact-reference");
+if (exactAt >= 0) {
+  const engine = ${JSON.stringify(engine ?? null)};
+  if (engine && engine.exitCode) process.exit(engine.exitCode);
+  if (engine && engine.writePng !== false) {
+    const dir = join(argv[exportAt + 1], "Textures");
+    const object = argv[exactAt + 1].split(".").pop();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(engine.png, join(dir, object + ".png"));
+    fs.writeFileSync(join(dir, object + ".props.txt"), "SRGB=" + (engine.srgb ? "True" : "False") + "\\n");
+  }
+  process.exit(0);
+}
 if (exportAt >= 0 && filterAt >= 0 && ${JSON.stringify(textureFrom ?? "")}) {
   const name = argv[filterAt + 1].split("/").pop();
   fs.mkdirSync(join(argv[exportAt + 1], "Textures"), { recursive: true });
@@ -899,7 +1026,7 @@ function emissiveProps(options: { collectedEmissive?: readonly number[] | undefi
   return lines.length > 0 ? `\n${lines.join("\n")}` : "";
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean; collectedEmissive?: [number, number, number, number]; switchOverride?: boolean; emissiveTexture?: boolean; inputEmissive?: { factor?: [number, number, number]; texture?: boolean }; inputBaseColorTexture?: boolean; emptyToolchain?: boolean }) {
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean; collectedEmissive?: [number, number, number, number]; switchOverride?: boolean; emissiveTexture?: boolean; inputEmissive?: { factor?: [number, number, number]; texture?: boolean }; inputBaseColorTexture?: boolean; emptyToolchain?: boolean; engine?: { srgb?: boolean; writePng?: boolean; exitCode?: number }; packEngine?: string; packNamesake?: boolean; noInstanceOverrides?: boolean }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -909,7 +1036,7 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   await writeFile(join(content, "Mesh.uasset"), Buffer.alloc(16));
   await writeFile(join(content, "MI_Rock.uasset"), Buffer.alloc(16));
   await writeFile(join(content, "M_Master.uasset"), Buffer.alloc(16));
-  const overrides: [string, string][] = options.hiddenTexture ? [] : [["Mask", "T_InstanceMask"]];
+  const overrides: [string, string][] = options.hiddenTexture || options.noInstanceOverrides ? [] : [["Mask", "T_InstanceMask"]];
   // A packed roughness texture (SpecPower binds the metallicRoughness slot): a constant factor must not multiply into it.
   if (options.packedRoughness) overrides.push(["SpecPower", "T_Spec"]);
   // An Emissive texture the instance binds: the stale-emission case drops it with the factor.
@@ -972,6 +1099,18 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   await writeFile(join(content, "T_MasterMask.uasset"), Buffer.alloc(16));
   await writePng(join(exported, "T_InstanceMask.png"), [200, 100, 50, 255], 4);
   await writePng(join(exported, "T_MasterMask.png"), [10, 10, 10, 255], 4);
+  // A pack package and a same-named PNG the mesh export carried, both called T_Rock: an /Engine/ reference must never pick them.
+  if (options.packNamesake) {
+    await writeFile(join(content, "T_Rock.uasset"), Buffer.alloc(16));
+    await writePng(join(exported, "T_Rock.png"), [200, 100, 50, 255], 4);
+  }
+  // The engine content root the importer keys: a real directory with one body, and the PNG the fake exporter copies.
+  const engineDir = join(root, "engine", "Content");
+  if (options.engine) {
+    await mkdir(join(engineDir, "Textures"), { recursive: true });
+    await writeFile(join(engineDir, "Textures", "T_Rock.uasset"), "engine body");
+    await writePng(join(root, "engine-T_Rock.png"), [80, 160, 240, 255], 4);
+  }
   if (options.packedRoughness) {
     await writeFile(join(content, "T_Spec.uasset"), Buffer.alloc(16));
     await writePng(join(exported, "T_Spec.png"), [128, 128, 128, 255], 4);
@@ -999,7 +1138,13 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   }
   const converter = join(root, "converter");
   const converterLog = join(root, "converter.log");
-  await writeFakeConverter(converter, options.graph, converterLog, options.hiddenTexture && options.hiddenVia && options.hiddenVia !== "umodel" ? join(root, "hidden") : undefined);
+  await writeFakeConverter(
+    converter,
+    options.graph,
+    converterLog,
+    options.hiddenTexture && options.hiddenVia && options.hiddenVia !== "umodel" ? join(root, "hidden") : undefined,
+    options.engine ? { ...options.engine, png: join(root, "engine-T_Rock.png") } : undefined,
+  );
   const report = await importUnrealDirectory({
     sourceDir,
     outputDir,
@@ -1007,8 +1152,9 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     concurrency: 1,
     freeSpaceBytes: 30_000_000_000,
     environment: {
-      ...process.env,
+      ...withoutEngineContent(process.env),
       THREENATIVE_UNREAL_CACHE_DIR: cacheDir,
+      ...(options.engine ? { THREENATIVE_ENGINE_CONTENT_DIR: engineDir, THREENATIVE_ENGINE_CONTENT_VERSION: "5.8" } : {}),
       // An empty toolchain with auto-install off: the graph baker must fail to provision and never download anything.
       ...(options.emptyToolchain ? { THREENATIVE_TOOLCHAIN_AUTOINSTALL: "0", THREENATIVE_TOOLCHAIN_DIR: join(root, "toolchain") } : {}),
     },
@@ -1016,6 +1162,7 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     // No converter injected when the toolchain is empty: the graph baker must resolve-or-fail, never provision.
     ...(options.emptyToolchain ? {} : { modernConverter: { name: "modern", path: converter, version: "fake-converter 1" } }),
     ...(options.graphBake === undefined ? {} : { graphBake: options.graphBake }),
+    ...(options.packEngine ? { engine: options.packEngine } : {}),
   });
   const glb = await new NodeIO().read(join(outputDir, report.models[0]!.glb));
   const onDisk = JSON.parse(await readFile(join(outputDir, "import-report.json"), "utf8")) as ImportReport;
@@ -1023,7 +1170,60 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   const leftovers = await readdir(cacheDir, { recursive: true }).catch(() => [] as string[]);
   const textureExports = (await readFile(textureLog, "utf8").catch(() => "")).split("\n").filter(Boolean);
   const toolchain = await readdir(join(root, "toolchain"), { recursive: true }).catch(() => [] as string[]);
-  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, glb, dumped, leftovers, textureExports, toolchain };
+  return { report, onDisk, material: glb.getRoot().listMaterials()[0]!, glb, dumped, leftovers, textureExports, toolchain, engineDir };
+}
+
+/** The process environment without engine content, so a developer's own engine variables never reach a test's import. */
+function withoutEngineContent(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const copy = { ...environment };
+  delete copy.THREENATIVE_ENGINE_CONTENT_DIR;
+  delete copy.THREENATIVE_ENGINE_CONTENT_VERSION;
+  return copy;
+}
+
+/** Every converter invocation the fake logged, one argv per line. */
+function invocations(log: string): string[][] {
+  return log.split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+}
+
+/** The invocations that asked for an exact `/Engine/` export. */
+function exactExports(log: string): string[][] {
+  return invocations(log).filter((argv) => argv.includes("--exact-reference"));
+}
+
+/** The invocations that asked for a pack package by a selector ending in `name`: the suffix and basename route. */
+function filterExports(log: string, name: string): string[][] {
+  return invocations(log).filter((argv) => {
+    const at = argv.indexOf("--filter");
+    return at >= 0 && argv[at + 1]!.endsWith(name);
+  });
+}
+
+/** M_Master whose BaseColor is one texture sampled as Color, so Unreal's sRGB decode of that texture is what the bake shows. */
+function colourGraph(reference: string, options: { sampled?: boolean } = {}): MaterialGraph {
+  const sampled = options.sampled ?? true;
+  const nodes: Raw[] = [
+    node("tex", "TextureSampleParameter2D", { parameter: { name: "Colour", group: "" }, default: null, texture: reference, samplerType: "Color" }),
+    node("constant", "Constant3Vector", { constants: { Constant: [0.5, 0.25, 1, 1] } }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: {
+      baseColor: pin(sampled ? "tex" : "constant"),
+      roughness: null,
+      metallic: null,
+      emissive: null,
+      opacity: null,
+      opacityMask: null,
+      normal: null,
+      materialAttributes: null,
+    },
+    nodes,
+  });
 }
 
 describe("importUnrealDirectory surface-driven graph bake", () => {
@@ -1334,6 +1534,105 @@ describe("importUnrealDirectory emission proof", () => {
     // Nothing was installed: the toolchain root stayed empty and no .NET/CUE4Parse or converter cache appeared.
     expect(toolchain).toEqual([]);
     expect(leftovers.filter((entry) => /toolchain|dotnet|cue4parse|\.engine-|converter/i.test(entry))).toEqual([]);
+  });
+});
+
+// An /Engine/ texture reference is answered by the configured engine content alone. The pack's namesake and a same-named PNG
+// the mesh export carried never stand in for it, and a reference that is refused or fails is unresolved, with no fallback.
+describe("an /Engine/ texture reference is answered by engine content alone", () => {
+  const ENGINE_T_ROCK = "/Engine/Textures/T_Rock.T_Rock";
+  // The engine PNG (80, 160, 240) decoded linearly, as SRGB=False asks: a Color sample of it bakes back to these bytes.
+  const linearEngine = [encode(80 / 255), encode(160 / 255), encode(240 / 255)];
+
+  it("exports the named package from the configured engine root, decodes it with its own sRGB flag, and never reads the pack's namesake", async () => {
+    const { report, material, dumped, leftovers, engineDir } = await importWithGraph({
+      graph: colourGraph(ENGINE_T_ROCK),
+      noInstanceOverrides: true,
+      packNamesake: true,
+      engine: { srgb: false },
+      packEngine: "UE_5.8",
+    });
+    expect(await firstPixel(material.getBaseColorTexture()!.getImage()!)).toEqual(linearEngine);
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked", confidence: "exact" });
+    expect(exactExports(dumped)).toEqual([[engineDir, "--export-dir", expect.any(String), "--exact-reference", ENGINE_T_ROCK, "--engine", "5.8"]]);
+    expect(filterExports(dumped, "T_Rock")).toEqual([]);
+    expect(leftovers.filter((entry) => entry.includes("graph-textures"))).toEqual([]);
+  });
+
+  it("is unresolved when no engine content is configured, with no fallback to the pack", async () => {
+    const { report, material, dumped } = await importWithGraph({ graph: colourGraph(ENGINE_T_ROCK), noInstanceOverrides: true, packNamesake: true });
+    expect(material.getBaseColorTexture()).toBeNull();
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "unavailable" });
+    expect(exactExports(dumped)).toEqual([]);
+    expect(filterExports(dumped, "T_Rock")).toEqual([]);
+  });
+
+  it.each([
+    ["a failed export", { srgb: false, exitCode: 1 }],
+    ["an export that writes no PNG", { srgb: false, writePng: false }],
+  ])("is unresolved after one attempt on %s, with no retry and no pack fallback", async (_label, engine) => {
+    const { report, material, dumped, engineDir } = await importWithGraph({ graph: colourGraph(ENGINE_T_ROCK), noInstanceOverrides: true, packNamesake: true, engine });
+    expect(material.getBaseColorTexture()).toBeNull();
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "unavailable" });
+    expect(exactExports(dumped)).toEqual([[engineDir, "--export-dir", expect.any(String), "--exact-reference", ENGINE_T_ROCK, "--engine", "5.8"]]);
+    expect(filterExports(dumped, "T_Rock")).toEqual([]);
+  });
+
+  it.each([
+    ["a parent segment", "/Engine/../Game/Test/T_Rock.T_Rock"],
+    ["an object that is not the package's own", "/Engine/Textures/T_Rock.T_Other"],
+    ["an object that differs only in case", "/Engine/Textures/T_Rock.t_rock"],
+    ["a prefix that differs only in case", "/engine/Textures/T_Rock.T_Rock"],
+    ["a class other than Texture2D", "StaticMesh'/Engine/Textures/T_Rock.T_Rock'"],
+    ["no object", "/Engine/Textures/T_Rock"],
+    ["raw leading and trailing whitespace", "  /Engine/Textures/T_Rock.T_Rock  "],
+    ["mixed separators", "/Engine\\Textures/T_Rock.T_Rock"],
+    ["an all-backslash path", "\\Engine\\Textures\\T_Rock.T_Rock"],
+    ["repeated separators", "/Engine//Textures/T_Rock.T_Rock"],
+  ])("refuses %s without asking the converter or the pack", async (_label, reference) => {
+    const { report, material, dumped } = await importWithGraph({ graph: colourGraph(reference), noInstanceOverrides: true, packNamesake: true, engine: { srgb: false } });
+    expect(material.getBaseColorTexture()).toBeNull();
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "unavailable" });
+    expect(exactExports(dumped)).toEqual([]);
+    expect(filterExports(dumped, "T_Rock")).toEqual([]);
+  });
+
+  it("names the engine texture it read only when the pack's version is unknown or another, as the function note does", async () => {
+    const unknown = await importWithGraph({ graph: colourGraph(ENGINE_T_ROCK), noInstanceOverrides: true, engine: { srgb: false } });
+    expect(unknown.report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked", confidence: "heuristic" });
+    expect(unknown.report.models[0]!.materials[0]!.graph!.approximations).toEqual([
+      "T_Rock read from engine content 5.8 (/Engine/Textures/T_Rock); the pack's Unreal version is unknown",
+    ]);
+    expect(await firstPixel(unknown.material.getBaseColorTexture()!.getImage()!)).toEqual(linearEngine);
+    const other = await importWithGraph({ graph: colourGraph(ENGINE_T_ROCK), noInstanceOverrides: true, engine: { srgb: false }, packEngine: "UE_5.7" });
+    expect(other.report.models[0]!.materials[0]!.graph!.approximations).toEqual([
+      "T_Rock read from engine content 5.8 (/Engine/Textures/T_Rock); the pack is 5.7",
+    ]);
+  });
+
+  it("runs the converter once for one package, however its reference is spelt", async () => {
+    const graph = materialGraphSchema.parse({
+      format: 1,
+      material: "M_Master",
+      package: "/Game/Test/M_Master",
+      truncated: false,
+      nodeCount: 3,
+      outputs: { baseColor: pin("mul"), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null },
+      nodes: [
+        node("plain", "TextureSampleParameter2D", { parameter: { name: "Plain", group: "" }, default: null, texture: ENGINE_T_ROCK, samplerType: "Color" }),
+        node("quoted", "TextureSampleParameter2D", { parameter: { name: "Quoted", group: "" }, default: null, texture: `Texture2D'${ENGINE_T_ROCK}'`, samplerType: "Color" }),
+        node("mul", "Multiply", { inputs: { A: pin("plain"), B: pin("quoted") } }),
+      ],
+    });
+    const { material, dumped } = await importWithGraph({ graph, noInstanceOverrides: true, engine: { srgb: false } });
+    expect(material.getBaseColorTexture()).not.toBeNull();
+    expect(exactExports(dumped)).toHaveLength(1);
+  });
+
+  it("exports nothing for an engine texture the bake never samples, so it adds no note", async () => {
+    const { report, dumped } = await importWithGraph({ graph: colourGraph(ENGINE_T_ROCK, { sampled: false }), noInstanceOverrides: true, engine: { srgb: false } });
+    expect(exactExports(dumped)).toEqual([]);
+    expect(report.models[0]!.materials[0]!.graph?.approximations ?? []).toEqual([]);
   });
 });
 

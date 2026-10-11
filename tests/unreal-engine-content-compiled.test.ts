@@ -1,10 +1,10 @@
-import { copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 import { describeWithTools } from "./helpers/require-tool.js";
-import { CUE4PARSE_ENGINE_CONTENT } from "../src/unreal/cue4parse-adapter.js";
+import { CUE4PARSE_ENGINE_CONTENT, CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
 import { dumpMaterialGraphs, type GraphNode, type MaterialGraph } from "../src/unreal/graph-dump.js";
 import { modernSdkExecutable, toolchainCacheDir } from "../src/unreal/provision.js";
 import { childEnvironment, runBounded } from "../src/unreal/toolchain.js";
@@ -147,6 +147,54 @@ async function engineTree(parent?: string): Promise<string> {
   return root;
 }
 
+// The converter program itself, extracted from CUE4PARSE_PROGRAM and compiled against the installed CUE4Parse assembly. This is a
+// compile only: nothing is published, installed or written to the toolchain cache, so the program's C# is checked before a fresh
+// build (which the provisioner makes from the pinned source) exists.
+describeWithTools(["modern-converter"], "converter program, compiled against the installed CUE4Parse", () => {
+  let directory = "";
+  let build: Awaited<ReturnType<typeof runBounded>> | undefined;
+
+  beforeAll(async () => {
+    const sdk = await modernSdkExecutable(process.env);
+    directory = await mkdtemp(join(tmpdir(), "tn-converter-program-"));
+    await mkdir(join(directory, "tmp"), { recursive: true });
+    await writeFile(join(directory, "Program.cs"), CUE4PARSE_PROGRAM);
+    await writeFile(join(directory, "EngineContent.cs"), CUE4PARSE_ENGINE_CONTENT);
+    // Every installed library the program can reach. The runtime's own assemblies come from the SDK, never from the publish folder.
+    const libraries = (await readdir(MODERN_BIN)).filter((file) => file.endsWith(".dll") && !/^(?:System\.|Microsoft\.|ThreeNativeConverter\.)/.test(file));
+    const project = join(directory, "ThreeNativeConverter.csproj");
+    await writeFile(
+      project,
+      `<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseSharedCompilation>false</UseSharedCompilation>
+  </PropertyGroup>
+  <ItemGroup>
+    ${libraries.map((file) => assemblyReference(file.slice(0, -".dll".length))).join("")}
+  </ItemGroup>
+</Project>
+`,
+    );
+    build = await runBounded(sdk, ["build", project, "-c", "Release", "-o", join(directory, "out"), "--nologo", "-nodeReuse:false"], {
+      timeoutMs: 900_000,
+      maxOutputBytes: 64 * 1024 * 1024,
+      environment: buildEnvironment(directory),
+    });
+  }, 900_000);
+
+  afterAll(async () => {
+    if (directory) await rm(directory, { recursive: true, force: true });
+  });
+
+  it("compiles with no error against the installed assembly", () => {
+    expect(build?.code, `${build?.stdout.slice(-4000) ?? ""}${build?.stderr.slice(-4000) ?? ""}`).toBe(0);
+  });
+});
+
 describeWithTools(["modern-converter"], "engine content helper, compiled against the installed CUE4Parse", () => {
   let directory = "";
   let sdk = "";
@@ -261,6 +309,41 @@ describeWithTools(["modern-converter"], "engine content helper, compiled against
       // The key the lookup computes is one the real provider registered for this tree.
       expect(results.get("lookup")).toMatchObject({ ok: true, value: { found: true, key: HEIGHT_LERP_KEY, present: true, objectName: "HeightLerp" } });
     });
+
+    it("refuses two files the provider would key as one, before it has a provider to answer with", async () => {
+      // The pinned provider keys with OrdinalIgnoreCase, so Content/Textures/T_Rock.uasset and Content/textures/T_Rock.uasset
+      // are one key. Only one body could ever be read, and which one depends on the enumeration order, so the root refuses
+      // instead. A payload sidecar collides the same way, so uasset, uexp and ubulk each get their own tree.
+      const cases = (await Promise.all(["uasset", "uexp", "ubulk"].map(async (extension) => {
+        const root = await engineTree();
+        await mkdir(join(root, "Textures"), { recursive: true });
+        await writeFile(join(root, "Textures", `T_Rock.${extension}`), "upper");
+        await mkdir(join(root, "textures"), { recursive: true });
+        await writeFile(join(root, "textures", `T_Rock.${extension}`), "lower");
+        return { id: extension, op: "root" as const, path: root };
+      })));
+      const results = await drive(cases);
+      for (const extension of ["uasset", "uexp", "ubulk"]) {
+        const failure = results.get(extension);
+        expect(failure, `${extension} did not refuse`).toMatchObject({ ok: false, error: expect.stringMatching(/would key as one/) });
+        expect(failure?.error).toContain(join("Textures", `T_Rock.${extension}`));
+        expect(failure?.error).toContain(join("textures", `T_Rock.${extension}`));
+      }
+    });
+
+    it("takes case-distinct folders that hold no provider key in common", async () => {
+      // Nothing here is ambiguous: the two folders differ in case and their packages differ in name, so every provider key the
+      // root would register is unique. Refusing this would reject an ordinary engine tree.
+      const root = await engineTree();
+      await mkdir(join(root, "Textures", "Rock"), { recursive: true });
+      await writeFile(join(root, "Textures", "Rock", "T_Rock.uasset"), "rock");
+      await mkdir(join(root, "textures", "Stone"), { recursive: true });
+      await writeFile(join(root, "textures", "Stone", "T_Stone.uasset"), "stone");
+      await writeFile(join(root, "textures", "readme.txt"), "not a provider file");
+      await writeFile(join(root, "Textures", "readme.txt"), "not a provider file either");
+      const results = await drive([{ id: "distinct", op: "root", path: root }]);
+      expect(results.get("distinct")).toMatchObject({ ok: true, value: root });
+    });
   });
 
   describe("exact qualified lookup", () => {
@@ -301,9 +384,38 @@ describeWithTools(["modern-converter"], "engine content helper, compiled against
       await mkdir(join(root, "Decoy", "Functions", "Engine_MaterialFunctions02", "Texturing"), { recursive: true });
       await writeFile(join(root, "Decoy", "Functions", "Engine_MaterialFunctions02", "Texturing", "HeightLerp.uasset"), "decoy");
       const results = await drive([{ id: "decoy", op: "lookup", path: root, reference: HEIGHT_LERP_REF }]);
-      // The key is computed exactly, so it is absent: the decoy's file is registered but never selected.
-      expect(results.get("decoy")).toMatchObject({ ok: true, value: { found: true, key: HEIGHT_LERP_KEY, present: false } });
-      expect(results.get("decoy")?.value).toMatchObject({ keys: ["Content/Decoy/Functions/Engine_MaterialFunctions02/Texturing/HeightLerp.uasset"] });
+      // The key names no file this root holds, so the reference is refused outright: the decoy's file is registered by the
+      // provider and still never stands in for the package the reference names.
+      expect(results.get("decoy")).toMatchObject({ ok: true, value: { found: false, key: null, present: false } });
+    });
+
+    it("keys a texture reference to its one package, never a nested package that shares its name", async () => {
+      const root = await engineTree();
+      await mkdir(join(root, "Textures"), { recursive: true });
+      await writeFile(join(root, "Textures", "T_Rock.uasset"), "rock");
+      await mkdir(join(root, "Nested", "Textures"), { recursive: true });
+      await writeFile(join(root, "Nested", "Textures", "T_Rock.uasset"), "nested");
+      const results = await drive([
+        { id: "exact", op: "lookup", path: root, reference: "/Engine/Textures/T_Rock.T_Rock" },
+        { id: "absent", op: "lookup", path: root, reference: "/Engine/Textures/T_Missing.T_Missing" },
+      ]);
+      expect(results.get("exact")).toMatchObject({ ok: true, value: { found: true, key: "Content/Textures/T_Rock.uasset", present: true, objectName: "T_Rock" } });
+      expect(results.get("exact")?.value).toMatchObject({ keys: expect.arrayContaining(["Content/Nested/Textures/T_Rock.uasset"]) });
+      expect(results.get("absent")).toMatchObject({ ok: true, value: { found: false, present: false } });
+    });
+
+    it("refuses a canonical reference whose folder the root spells in another case", async () => {
+      // The provider's comparer folds Content/Textures/T_Rock.uasset and Content/textures/T_Rock.uasset into one key, so an
+      // exact reference could name one while reading the other. The spelling the reference gives must be the one that exists.
+      const root = await engineTree();
+      await mkdir(join(root, "textures"), { recursive: true });
+      await writeFile(join(root, "textures", "T_Rock.uasset"), "lower");
+      const results = await drive([
+        { id: "canonical", op: "lookup", path: root, reference: "/Engine/Textures/T_Rock.T_Rock" },
+        { id: "asSpelled", op: "lookup", path: root, reference: "/Engine/textures/T_Rock.T_Rock" },
+      ]);
+      expect(results.get("canonical")).toMatchObject({ ok: true, value: { found: false, present: false } });
+      expect(results.get("asSpelled")).toMatchObject({ ok: true, value: { found: true, present: true, key: "Content/textures/T_Rock.uasset" } });
     });
   });
 

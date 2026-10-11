@@ -69,3 +69,44 @@ async function refuseLinksBelow(directory: string): Promise<void> {
 export function engineVersionOf(engine: string | undefined): string | undefined {
   return /^(?:UE_)?(\d+\.\d+)$/.exec(engine?.trim() ?? "")?.[1];
 }
+
+/** The one `/Engine/` texture package a reference names: its package path, its object, and the spelling that names both. */
+export interface CanonicalEngineReference {
+  readonly package: string;
+  readonly object: string;
+  readonly reference: string;
+}
+
+/**
+ * The exact `/Engine/` package a texture reference names: `/Engine/A/T_X.T_X`, bare or as `Texture2D'/Engine/A/T_X.T_X'`.
+ * Anything else is undefined, and nothing is approximated: a traversal, backslash, drive-style or empty segment; an object that
+ * is not the package's own, or differs from it only in case; a prefix spelled in another case; and any class but Texture2D.
+ */
+export function canonicalEngineReference(reference: string): CanonicalEngineReference | undefined {
+  const quoted = /^\s*([A-Za-z0-9_]+)'(.*)'\s*$/.exec(reference);
+  if (quoted && quoted[1] !== "Texture2D") return undefined;
+  const path = quoted ? quoted[2]! : reference;
+  if (!path.startsWith("/Engine/")) return undefined;
+  const dot = path.lastIndexOf(".");
+  if (dot < 0) return undefined;
+  const object = path.slice(dot + 1);
+  const folders = path.slice("/Engine/".length, dot).split("/");
+  if (object === "" || folders[folders.length - 1] !== object) return undefined;
+  // No folder may be empty, a dot or parent segment, hold a backslash or drive colon, or a control character (as TryExactReference refuses).
+  const unsafe = (folder: string): boolean =>
+    folder === "" || folder === "." || folder === ".." || /[\\:]/.test(folder) || [...folder].some((character) => character < " ");
+  if (folders.some(unsafe)) return undefined;
+  return { package: `/Engine/${folders.join("/")}`, object, reference: path };
+}
+
+/**
+ * Whether a texture reference addresses the `/Engine/` mount in any spelling (`/engine/...`, `StaticMesh'/Engine/...'`), padded
+ * with whitespace, written with backslashes or with doubled separators. Such a reference is answered by engine content or not
+ * at all: a pack package never stands in for one that does not resolve. This test is tolerant; `canonicalEngineReference` alone
+ * decides what resolves, so a tolerated spelling that is not exact resolves to nothing.
+ */
+export function isEngineReference(reference: string): boolean {
+  const quoted = /^\s*[A-Za-z0-9_]+'(.*)'\s*$/.exec(reference);
+  const path = (quoted ? quoted[1]! : reference).trim().replace(/[\\/]+/g, "/");
+  return /^\/engine\//i.test(path);
+}

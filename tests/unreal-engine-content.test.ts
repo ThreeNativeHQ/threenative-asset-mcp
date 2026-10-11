@@ -6,8 +6,10 @@ import {
   ENGINE_CONTENT_DIR_ENV,
   ENGINE_CONTENT_VERSION_ENV,
   assertEngineContentDirectory,
+  canonicalEngineReference,
   engineContentFromEnvironment,
   engineVersionOf,
+  isEngineReference,
 } from "../src/unreal/engine-content.js";
 import { dumpMaterialGraphs, materialGraphSchema } from "../src/unreal/graph-dump.js";
 import { engineContentIdentity, importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
@@ -436,5 +438,55 @@ describe("nested engine bodies", () => {
       `CheapContrast read from engine content 5.8 (${CHEAP_CONTRAST}); the pack is 4.27`,
       `HeightLerp read from engine content 5.8 (${ENGINE_HEIGHT_LERP}); the pack is 4.27`,
     ]);
+  });
+});
+
+describe("exact /Engine/ texture references", () => {
+  const PACKAGE = "/Engine/Textures/T_Rock";
+
+  it("accepts the canonical form, bare or as a Texture2D, and names its package and object", () => {
+    const canonical = { package: PACKAGE, object: "T_Rock", reference: `${PACKAGE}.T_Rock` };
+    expect(canonicalEngineReference(`${PACKAGE}.T_Rock`)).toEqual(canonical);
+    expect(canonicalEngineReference(`Texture2D'${PACKAGE}.T_Rock'`)).toEqual(canonical);
+    expect(canonicalEngineReference("/Engine/Functions/Engine_MaterialFunctions02/Texturing/T_Rock.T_Rock")?.package).toBe(
+      "/Engine/Functions/Engine_MaterialFunctions02/Texturing/T_Rock",
+    );
+  });
+
+  it.each([
+    ["a parent segment", "/Engine/../Game/Test/T_Rock.T_Rock"],
+    ["a current-directory segment", "/Engine/Textures/./T_Rock.T_Rock"],
+    ["a backslash", "/Engine/Textures\\..\\T_Rock.T_Rock"],
+    ["an empty folder segment", "/Engine//Textures/T_Rock.T_Rock"],
+    ["a drive-style segment", "/Engine/C:/Textures/T_Rock.T_Rock"],
+    ["an object that is not the package's own", `${PACKAGE}.T_Other`],
+    ["an object that differs only in case", `${PACKAGE}.t_rock`],
+    ["a prefix that differs only in case", "/engine/Textures/T_Rock.T_Rock"],
+    ["a class other than Texture2D", `StaticMesh'${PACKAGE}.T_Rock'`],
+    ["no object", PACKAGE],
+    ["a bare name", "T_Rock"],
+    ["a Game package", "/Game/Textures/T_Rock.T_Rock"],
+  ])("refuses %s", (_label, reference) => {
+    expect(canonicalEngineReference(reference)).toBeUndefined();
+  });
+
+  it("recognises the Engine mount in any spelling, so a refused reference is never answered by the pack", () => {
+    expect(isEngineReference("/engine/Textures/T_Rock.T_Rock")).toBe(true);
+    expect(isEngineReference(`StaticMesh'${PACKAGE}.T_Rock'`)).toBe(true);
+    expect(isEngineReference("/Game/Engine/T_Rock.T_Rock")).toBe(false);
+    expect(isEngineReference("\\Game\\Engine\\T_Rock.T_Rock")).toBe(false);
+    expect(isEngineReference("T_Rock")).toBe(false);
+  });
+
+  it.each([
+    ["leading whitespace", " /Engine/Textures/T_Rock.T_Rock"],
+    ["trailing whitespace", "/Engine/Textures/T_Rock.T_Rock "],
+    ["backslashes", "\\Engine\\Textures\\T_Rock.T_Rock"],
+    ["mixed separators", "/Engine\\Textures/T_Rock.T_Rock"],
+    ["a doubled leading slash", "//Engine/Textures/T_Rock.T_Rock"],
+    ["a backslashed class wrapper", `StaticMesh'\\Engine\\Textures\\T_Rock.T_Rock'`],
+  ])("classes %s as the Engine mount, and canonicalises none of it", (_label, reference) => {
+    expect(isEngineReference(reference)).toBe(true);
+    expect(canonicalEngineReference(reference)).toBeUndefined();
   });
 });

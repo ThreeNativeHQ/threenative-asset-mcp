@@ -42,7 +42,7 @@ import {
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
 import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphPbrFactors, type GraphTextureSource } from "./graph-baker.js";
-import { assertEngineContentDirectory, engineContentFromEnvironment, type EngineContentConfig } from "./engine-content.js";
+import { assertEngineContentDirectory, canonicalEngineReference, engineContentFromEnvironment, isEngineReference, type EngineContentConfig } from "./engine-content.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
 import {
@@ -3038,11 +3038,70 @@ export async function importUnrealDirectory(
   let graphMounts: string[] | undefined;
   const exportTexture = (name: string, reference?: string): Promise<GraphTextureSource | undefined> => {
     // Two graphs can name different packages of one object name, so an answer belongs to the name and package together.
-    const wanted = reference === undefined ? undefined : texturePackageKey(reference);
+    // An /Engine/ reference keys by its own spelling: the folded package key would make two spellings of it one answer.
+    const engine = reference !== undefined && isEngineReference(reference) ? reference : undefined;
+    const wanted = reference === undefined ? undefined : (engine ?? texturePackageKey(reference));
     const cacheKey = `${name}\0${wanted ?? ""}`;
     const known = exportedTextures.get(cacheKey);
     if (known) return known;
+    const nextDirectory = (): string => join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
+    // The isolated export's own `.props.txt` is the exact source's metadata, never a same-named package's: the sRGB decode then
+    // follows the selector this call resolved. `indexExported` reads it if the exporter wrote one.
+    const indexedSource = async (isolated: string): Promise<GraphTextureSource | undefined> => {
+      const exported = await indexExported(isolated);
+      const path = exported.png.get(name);
+      if (!path) return undefined;
+      const propsPath = exported.props.get(name);
+      const properties = propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
+      return properties === undefined ? { path } : { path, properties };
+    };
+    // PRD-538: an /Engine/ reference is answered by the configured engine content, exactly, or not at all. It never falls back to a
+    // pack package (a namesake, or a same-named PNG the mesh export carried, is another texture). The converter runs once, on the
+    // configured root and version rather than the pack's label, so no version fallback can decode the package under another engine.
+    const exportEngineTexture = async (reference: string): Promise<GraphTextureSource | undefined> => {
+      const canonical = canonicalEngineReference(reference);
+      if (canonical === undefined || canonical.object !== name) {
+        log(`Graph texture ${name}: ${reference} is not an exact /Engine/ texture reference; not exported.`);
+        return undefined;
+      }
+      if (engineContent === undefined || engineContentKey === undefined) {
+        log(`Graph texture ${name}: ${canonical.package} is engine content, and no engine content is configured; not exported.`);
+        return undefined;
+      }
+      // One converter run per engine package. The key carries the engine's own bytes, so another engine's export never answers it.
+      const sourceKey = `engine:${engineContentKey.fingerprint}:${canonical.package}`;
+      const reused = standaloneBySource.get(sourceKey);
+      if (reused !== undefined) return reused;
+      const isolated = nextDirectory();
+      try {
+        graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
+        const converter = await graphTextureConverter;
+        // One run, never runModernConverter's version fallbacks: the configured root and version are the only inputs.
+        const converted = await runBounded(
+          converter.path,
+          [engineContent.dir, "--export-dir", isolated, "--exact-reference", canonical.reference, "--engine", engineContent.version],
+          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        );
+        if (converted.code !== 0) {
+          const cause = modernConverterFailureCause(converted);
+          log(`Graph texture ${name}: the Engine content converter exited ${converted.code}${cause ? `: ${cause}` : "."}`);
+          return undefined;
+        }
+        const source = await indexedSource(isolated);
+        if (!source) {
+          log(`Graph texture ${name}: the Engine content converter wrote no PNG.`);
+          return undefined;
+        }
+        const sourced: GraphTextureSource = { ...source, engine: { version: engineContent.version, package: canonical.package } };
+        standaloneBySource.set(sourceKey, sourced);
+        return sourced;
+      } catch (error) {
+        log(`Graph texture ${name}: Engine content export failed (${error instanceof Error ? error.message : String(error)}).`);
+        return undefined;
+      }
+    };
     const run = textureExports.then(async (): Promise<GraphTextureSource | undefined> => {
+      if (engine !== undefined) return exportEngineTexture(engine);
       if (!textureIndex) {
         textureIndex = new Map();
         for (const file of packages) {
@@ -3087,17 +3146,6 @@ export async function importUnrealDirectory(
       const reused = standaloneBySource.get(chosen);
       if (reused !== undefined) return reused;
       const selector = relative(sourceDir, chosen).split(sep).join("/").slice(0, -extname(chosen).length);
-      const nextDirectory = (): string => join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
-      // The isolated export's own `.props.txt` is the exact source's metadata, never a same-named package's: the sRGB
-      // decode then follows the selector this call resolved. `indexExported` reads it if the exporter wrote one.
-      const indexedSource = async (isolated: string): Promise<GraphTextureSource | undefined> => {
-        const exported = await indexExported(isolated);
-        const path = exported.png.get(name);
-        if (!path) return undefined;
-        const propsPath = exported.props.get(name);
-        const properties = propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
-        return properties === undefined ? { path } : { path, properties };
-      };
       const viaUmodel = async (): Promise<GraphTextureSource | undefined> => {
         const isolated = nextDirectory();
         // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the

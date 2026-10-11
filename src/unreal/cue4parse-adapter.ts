@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.71",
+  version: "b4e95441+threenative.72",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -301,12 +301,33 @@ using CUE4Parse.UE4.Assets;
 
 public static class EngineContent
 {
+    // Every provider-readable file under the root Root last checked, by the key the pinned provider would register for it. The
+    // provider's own comparer is OrdinalIgnoreCase, so a key names its file only when the root spells the two the same way.
+    private static readonly Dictionary<string, string> Sources = new(StringComparer.Ordinal);
+    // The same keys folded to case, which is exactly how the provider reads them: two files under one folded key would leave one
+    // of them unreadable under whichever spelling the enumeration reached first.
+    private static readonly Dictionary<string, string> Folded = new(StringComparer.OrdinalIgnoreCase);
+
+    // The extensions the pinned provider registers as files (GameFile.UeKnownExtensions), so a pair of case-distinct folders is
+    // judged on the package keys it holds and not on an unrelated file that happens to share a name across the two.
+    private static readonly HashSet<string> ProviderFiles = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "uasset", "umap", "upk", "xxx", "udk", "u", "mbamap", "sword", "rbd", "aa3", "ut3", "ut2", "utx", "unr", "umx",
+        "uax", "usx", "ukx", "map", "lm", "s8m", "ccpk", "mo",
+        "uexp", "ubulk", "uptnl", "tfc",
+        "bin", "ini", "uplugin", "upluginmanifest", "locres", "locmeta", "wem", "ewem", "bnk", "pck", "bank", "awb", "acb",
+    };
+
     // The configured root, without a trailing separator. It must be an existing directory that is not a filesystem root and holds
     // no .uproject (a project, not Engine/Content). A link at the root or anywhere under it is refused before anything is read:
     // links are never followed or skipped, because the provider would read through them and a cache key would miss the bytes.
+    // Two files the provider would register under one key are refused here too, before it exists: /Engine/A/T.uasset and an
+    // /Engine/a/T.uasset are one key to a case-insensitive comparer, and only one of them could ever be read.
     public static string Root(string configured)
     {
         var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(configured));
+        Sources.Clear();
+        Folded.Clear();
         var directory = new DirectoryInfo(root);
         if (!directory.Exists) throw new DirectoryNotFoundException($"engine content directory not found: {root}");
         if (directory.Parent is null) throw new InvalidDataException($"engine content root cannot be a filesystem root: {root}");
@@ -314,12 +335,21 @@ public static class EngineContent
         if (directory.GetFiles("*.uproject", SearchOption.TopDirectoryOnly).Length > 0) throw new InvalidDataException($"engine content root holds a .uproject, so it is a project rather than Engine/Content: {root}");
         var pending = new Stack<DirectoryInfo>();
         pending.Push(directory);
+        var mount = MountPrefix(root);
         while (pending.Count > 0)
         {
             foreach (var entry in pending.Pop().EnumerateFileSystemInfos())
             {
                 if (entry.LinkTarget is not null) throw new InvalidDataException($"engine content contains a link at {entry.FullName}; links are refused, not followed or skipped");
-                if (entry is DirectoryInfo child) pending.Push(child);
+                if (entry is DirectoryInfo child) { pending.Push(child); continue; }
+                // The provider reads the extension the way SubstringAfter('.') gives it, without its dot.
+                var extension = Path.GetExtension(entry.Name).TrimStart('.');
+                if (extension.Length == 0 || !ProviderFiles.Contains(extension)) continue;
+                // The key the pinned provider builds: the mount prefix, then the path relative to the root in forward slashes.
+                var key = mount + Path.GetRelativePath(root, entry.FullName).Replace('\\', '/');
+                if (!Folded.TryAdd(key, entry.FullName))
+                    throw new InvalidDataException($"engine content holds files the provider would key as one ({key}): {Folded[key]} and {entry.FullName}; case-distinct packages are refused, not merged");
+                Sources.Add(key, entry.FullName);
             }
         }
         return root;
@@ -332,12 +362,14 @@ public static class EngineContent
     // The one key an exact /Engine/<folders>/<name>.<name> reference names under the mount, or false for anything else: an object
     // name that is not the package's own, a path outside /Engine/, an empty, dot or parent segment, a backslash, a drive-style
     // segment or a control character. Nothing is matched by basename, so a same-named body elsewhere is never selected.
+    // The spelling is ordinal at both ends. A prefix the reference spells /engine/ is not this mount, and a key the root spells
+    // in another case names no file here: the provider's comparer would fold the two and answer a reference with a namesake.
     public static bool TryExactReference(string mountPrefix, string reference, out string key, out string objectName)
     {
         key = string.Empty;
         objectName = string.Empty;
         const string engine = "/Engine/";
-        if (!reference.StartsWith(engine, StringComparison.OrdinalIgnoreCase)) return false;
+        if (!reference.StartsWith(engine, StringComparison.Ordinal)) return false;
         var dot = reference.LastIndexOf('.');
         if (dot < 0) return false;
         var packagePath = reference[..dot];
@@ -345,9 +377,15 @@ public static class EngineContent
         if (objectName.Length == 0 || objectName != packagePath[(packagePath.LastIndexOf('/') + 1)..]) return false;
         var folders = packagePath[engine.Length..].Split('/');
         if (folders.Any(folder => folder.Length == 0 || folder == "." || folder == ".." || folder.Contains('\\') || folder.Contains(':') || folder.Any(char.IsControl))) return false;
-        key = mountPrefix + string.Join('/', folders) + ".uasset";
+        var candidate = mountPrefix + string.Join('/', folders) + ".uasset";
+        if (!Sources.ContainsKey(candidate)) return false;
+        key = candidate;
         return true;
     }
+
+    // The file an exact key names, spelled the way the reference spells it, or null when the root holds only a case-folded
+    // namesake. It is the provider key the root registered, so an exact export never resolves its own path by folding.
+    public static string? ExactSource(string key) => Sources.TryGetValue(key, out var source) ? source : null;
 
     // The /Engine/ path of a loaded body's package, when the engine provider loaded that package; otherwise null. Provenance is the
     // provider that loaded the package (IPackage.Provider), never the path a pack names the body by: a pack-owned package keeps no
@@ -408,6 +446,25 @@ var root = Path.GetFullPath(args[0]);
 var output = dumpAt >= 0 || graphAt >= 0 ? Path.GetFullPath(".") : Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
 var filterAt = Array.IndexOf(args, "--filter");
 var filter = filterAt >= 0 ? args[filterAt + 1] : null;
+// Exact mode: one Engine package, named by its canonical /Engine/ reference under the root (EngineContent.TryExactReference). Only
+// that package's own Texture2D is exported, with the suffix and basename fallbacks off, and its sRGB flag written beside the PNG.
+var exactAt = Array.IndexOf(args, "--exact-reference");
+string? exactPackage = null;
+string? exactObject = null;
+string? exactFile = null;
+if (exactAt >= 0)
+{
+    if (filterAt >= 0) throw new ArgumentException("--exact-reference and --filter cannot be given together");
+    EngineContent.Root(root);
+    if (!EngineContent.TryExactReference(EngineContent.MountPrefix(root), args[exactAt + 1], out var exactKey, out var exactName))
+        throw new ArgumentException($"--exact-reference is not an exact /Engine/ package reference: {args[exactAt + 1]}");
+    exactPackage = exactKey;
+    exactObject = exactName;
+    // The body the key names, at the spelling the reference gave it. A root that holds only /engine/a/T.uasset has already been
+    // refused by TryExactReference, so this is never resolved by folding the key back onto a path.
+    exactFile = EngineContent.ExactSource(exactKey)
+        ?? throw new ArgumentException($"--exact-reference names no engine source: {args[exactAt + 1]}");
+}
 // Source-model LODs of a skeletal mesh to export, as indices into its source model array.
 var lodsAt = Array.IndexOf(args, "--lods");
 var requestedLods = lodsAt >= 0
@@ -421,6 +478,8 @@ var requestedLods = lodsAt >= 0
 if (requestedLods.Length == 0) throw new ArgumentException("--lods needs at least one LOD index");
 bool MatchesFilter(string key)
 {
+    // Exact mode names one package by its key under the root: no suffix or basename can select another package.
+    if (exactPackage is not null) return string.Equals(key, exactPackage, StringComparison.OrdinalIgnoreCase);
     if (filter is null) return true;
     static string Normalize(string value)
     {
@@ -2467,7 +2526,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
             JsonConvert.SerializeObject(descriptor, Formatting.Indented));
         exported++;
     }
-    foreach (var texture in package.GetExports().OfType<UTexture2D>())
+    foreach (var texture in package.GetExports().OfType<UTexture2D>().Where(candidate => exactObject is null || candidate.Name == exactObject))
     {
         var session = new ExportSession { MaxDegreeOfParallelism = 1 };
         session.Add(texture);
@@ -2490,7 +2549,10 @@ foreach (var key in provider.Files.Keys.Where(key =>
             var packageFiles = Directory.EnumerateFiles(root, Path.GetFileNameWithoutExtension(key) + ".uasset", SearchOption.AllDirectories)
                 .Where(candidate => normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
                 .ToArray();
-            var candidates = Directory.EnumerateFiles(root, texture.Name + ".uasset", SearchOption.AllDirectories).ToArray();
+            // Exact mode keeps only the file EngineContent.Root registered for this key, spelled as the reference spells it,
+            // at the path it registered: a case-folded namesake can neither be selected nor take its place.
+            if (exactFile is not null) packageFiles = new[] { exactFile };
+            var candidates = exactFile is not null ? Array.Empty<string>() : Directory.EnumerateFiles(root, texture.Name + ".uasset", SearchOption.AllDirectories).ToArray();
             var textureFile = packageFiles.FirstOrDefault()
                 ?? candidates.FirstOrDefault(candidate =>
                     normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
@@ -2510,6 +2572,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
             }
             await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, texture));
         }
+        // Exact mode writes the texture's own sRGB flag beside its PNG, so the bake decodes it as Unreal does: never a namesake's, never a guess.
+        if (exactObject is not null) await File.WriteAllTextAsync(Path.Combine(output, "Textures", texture.Name + ".props.txt"), $"SRGB={texture.SRGB}\n");
         exported++;
     }
     foreach (var cubemap in package.GetExports().OfType<UTextureCube>())
