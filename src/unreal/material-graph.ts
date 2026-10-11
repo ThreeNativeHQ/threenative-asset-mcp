@@ -2742,7 +2742,7 @@ function judgeSwitch(graph: MaterialGraph, parameters: GraphParameters, options:
 const choiceKey = (choices: SwitchChoices): string => JSON.stringify([...choices].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 
 /** The settled compiles of one graph, or the switches whose choices keep changing (and so cannot be settled). */
-type Settled = { kind: "settled"; pass: Pass } | { kind: "refused"; switches: string[] };
+type Settled = { kind: "settled"; pass: Pass; choices: SwitchChoices } | { kind: "refused"; switches: string[] };
 
 /**
  * Compiles the colour and the requested cut-out under switch choices that agree with the demands those very compiles make.
@@ -2768,7 +2768,7 @@ function settleSwitches(graph: MaterialGraph, parameters: GraphParameters, optio
       const held = choices.get(id) ?? { value: use.stored, flipped: false };
       if (held.value !== target.value || held.flipped !== target.flipped) unsettled.push(use.label);
     }
-    if (unsettled.length === 0) return { kind: "settled", pass };
+    if (unsettled.length === 0) return { kind: "settled", pass, choices };
     const key = choiceKey(next);
     if (seen.has(key)) return { kind: "refused", switches: unsettled };
     seen.add(key);
@@ -2807,6 +2807,366 @@ export function graphPathTextures(graph: MaterialGraph, parameters: GraphParamet
   const compiler = settled.pass.colour;
   if (compiler.unsupported.size > 0 || compiler.unavailable.length > 0) return undefined;
   return [...new Set(compiler.slots.map((slot) => slot.name))];
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Normal dependencies
+
+/** A texture a graph's active Normal reads: its object name, and its full reference when the graph or the instance chain names one. */
+export interface NormalTexture {
+  readonly name: string;
+  readonly reference?: string | undefined;
+}
+
+/**
+ * The textures a graph's active Normal reads (see `graphNormalDependencies`), or why they cannot be proven. `conservative` names the
+ * rules that count a node by every one of its inputs instead of evaluating it.
+ */
+export type NormalDependencies =
+  | { readonly status: "known"; readonly textures: readonly NormalTexture[]; readonly conservative: readonly string[] }
+  | { readonly status: "unknown"; readonly reason: string };
+
+/** A walk met something it cannot follow, so the answer is unknown. Thrown and caught only inside `graphNormalDependencies`. */
+class NormalRefusal extends Error {}
+
+function refuse(reason: string): never {
+  throw new NormalRefusal(reason);
+}
+
+/** What a pin is read for: its plain value, or one named attribute of a MaterialAttributes value. */
+type NormalRead = "value" | { readonly attribute: string };
+
+const readKey = (read: NormalRead): string => (read === "value" ? "value" : `attribute:${read.attribute}`);
+
+/** The engine's FlattenNormal by its object path: the one function the conservative rule stands for. */
+const ENGINE_FLATTEN_NORMAL = "/Engine/Functions/Engine_MaterialFunctions01/Texturing/FlattenNormal.FlattenNormal";
+
+/**
+ * Whether a bodiless call is the engine's FlattenNormal read at its Result, with exactly the Spruce dump's pins: Input0 (the normal) and
+ * Input1 (the flatness), both wired. The rule counts every input, so no other call may take it.
+ */
+function isEngineFlattenNormal(node: GraphNode, output: number): boolean {
+  if (node.function !== ENGINE_FLATTEN_NORMAL || output !== 0 || node.outputNames?.[0] !== "Result") return false;
+  const wired = Object.keys(node.inputs).filter((key) => node.inputs[key] !== null && node.inputs[key] !== undefined).sort();
+  return wired.length === 2 && wired[0] === "Input0" && wired[1] === "Input1";
+}
+
+/**
+ * Walks a graph's Normal from its pins. It follows the wires the graph has, the switch branches the choices select and the body
+ * output a call reads, and it names every texture sample it reaches. Anything else refuses the walk.
+ */
+class NormalWalk {
+  private readonly nodes: ReadonlyMap<string, GraphNode>;
+  private readonly parameters: GraphParameters;
+  private readonly choices: SwitchChoices;
+  private readonly found = new Map<string, NormalTexture>();
+  private readonly rules = new Set<string>();
+  private readonly active = new Set<string>();
+  private readonly done = new Set<string>();
+
+  constructor(graph: MaterialGraph, parameters: GraphParameters, choices: SwitchChoices) {
+    this.nodes = new Map(graph.nodes.map((node) => [node.id, node]));
+    this.parameters = parameters;
+    this.choices = choices;
+  }
+
+  textures(): NormalTexture[] {
+    return [...this.found.values()];
+  }
+
+  conservative(): string[] {
+    return [...this.rules].sort();
+  }
+
+  /** Walks what `input` carries under `read`. An unwired pin is Unreal's default, which names no texture. */
+  visit(input: GraphInput | null | undefined, read: NormalRead): void {
+    if (!input) return;
+    const node = this.nodes.get(input.node);
+    if (!node) refuse(`a pin refers to missing node ${input.node}`);
+    this.node(node, input.output, read);
+  }
+
+  private node(node: GraphNode, output: number, read: NormalRead): void {
+    const key = `${node.id}#${output}#${readKey(read)}`;
+    if (this.done.has(key)) return;
+    if (this.active.has(key)) refuse(`the Normal reads ${node.id} (${node.class}) through itself`);
+    if (this.active.size > MAX_DEPTH) refuse(`the Normal is deeper than ${MAX_DEPTH} nodes`);
+    if (node.error) refuse(`node ${node.id} (${node.class}) could not be read: ${node.error}`);
+    this.active.add(key);
+    try {
+      this.dispatch(node, output, read);
+    } finally {
+      this.active.delete(key);
+    }
+    this.done.add(key);
+  }
+
+  private dispatch(node: GraphNode, output: number, read: NormalRead): void {
+    switch (node.class) {
+      case "TextureSample":
+      case "TextureSampleParameter2D":
+        this.expectValue(node, read);
+        this.sample(node);
+        return;
+      case "ScalarParameter":
+      case "VectorParameter":
+      case "CollectionParameter":
+      case "StaticBoolParameter":
+      case "Constant":
+      case "Constant2Vector":
+      case "Constant3Vector":
+      case "Constant4Vector":
+      case "TextureCoordinate":
+        // Parameters and constants name no texture.
+        this.expectValue(node, read);
+        return;
+      case "Multiply":
+      case "Divide":
+      case "Add":
+      case "Subtract":
+      case "LinearInterpolate":
+      case "Power":
+      case "ComponentMask":
+      case "AppendVector":
+      case "OneMinus":
+      case "Saturate":
+      case "Clamp":
+      case "Abs":
+      case "Frac":
+      case "Min":
+      case "Max":
+      case "DotProduct":
+      case "Normalize":
+      case "ConstantBiasScale":
+      case "SquareRoot":
+        // Arithmetic reads every input it has, so each wired pin counts: a Lerp's A, B and Alpha alike.
+        this.expectValue(node, read);
+        for (const input of Object.values(node.inputs)) this.visit(input, "value");
+        return;
+      case "Reroute":
+      case "NamedRerouteDeclaration":
+      case "NamedRerouteUsage":
+        this.visit(this.required(node, "Input"), read);
+        return;
+      case "StaticSwitch":
+      case "StaticSwitchParameter":
+        this.visit(this.switchBranch(node), read);
+        return;
+      case "FunctionInput":
+        this.functionInput(node, read);
+        return;
+      case "FunctionOutput": {
+        const pins = Object.values(node.inputs).filter((pin): pin is GraphInput => pin !== null && pin !== undefined);
+        if (pins.length === 0) refuse(`function output ${node.id} is not wired`);
+        for (const pin of pins) this.visit(pin, read);
+        return;
+      }
+      case "FunctionCall":
+        this.call(node, output, read);
+        return;
+      case "MakeMaterialAttributes":
+        // A pin is named for its attribute; an unwired one is Unreal's default for it, which names no texture.
+        this.visit(node.inputs[this.attributeOf(node, read)], "value");
+        return;
+      case "SetMaterialAttributes":
+        this.setAttribute(node, this.attributeOf(node, read));
+        return;
+      case "BlendMaterialAttributes": {
+        const attribute = this.attributeOf(node, read);
+        this.visit(this.required(node, "A"), { attribute });
+        this.visit(this.required(node, "B"), { attribute });
+        this.visit(this.required(node, "Alpha"), "value");
+        return;
+      }
+      case "GetMaterialAttributes":
+        this.getAttribute(node, output, read);
+        return;
+      case "BreakMaterialAttributes":
+        this.breakAttribute(node, output, read);
+        return;
+      default:
+        refuse(`${node.class} ${node.id} is not on the Normal's dependency rules`);
+    }
+  }
+
+  /** A texture sample: the reference its parameter settles on in the instance chain, else the node's own. Its coordinates count too. */
+  private sample(node: GraphNode): void {
+    if (node.inputs.TextureObject) refuse(`texture sample ${node.id} takes its texture from a TextureObject pin`);
+    const parameter = node.class === "TextureSampleParameter2D" ? node.parameter?.name.toLowerCase() : undefined;
+    if (node.class === "TextureSampleParameter2D" && parameter === undefined) refuse(`texture parameter ${node.id} has no readable name`);
+    const chained = parameter === undefined ? undefined : (this.parameters.textureReferences?.get(parameter) ?? this.parameters.textures.get(parameter));
+    const reference = chained ?? node.texture;
+    if (!reference) refuse(`texture sample ${node.id}${parameter === undefined ? "" : ` (parameter "${node.parameter?.name}")`} names no texture`);
+    const name = textureObjectName(reference);
+    const qualified = reference.includes("/") ? reference : undefined;
+    this.found.set((qualified ?? name).toLowerCase(), { name, reference: qualified });
+    // The coordinates are a pin of their own, apart from the inputs: a map that only shapes this sample's UVs is still read.
+    for (const input of [...Object.values(node.inputs), node.coordinates]) this.visit(input, "value");
+  }
+
+  /** The pin a static switch passes through: A (or True) when its value is true, else B (or False). */
+  private switchBranch(node: GraphNode): GraphInput {
+    const value = node.class === "StaticSwitchParameter" ? this.parameterSwitch(node) : this.staticSwitch(node);
+    const pin = value ? (node.inputs.A ?? node.inputs.True) : (node.inputs.B ?? node.inputs.False);
+    if (!pin) refuse(`${node.class} ${node.id} has no ${value ? "A (true)" : "B (false)"} input`);
+    return pin;
+  }
+
+  /** A StaticSwitchParameter: the instance's merged override, else the choice the BaseColor and cut-out settled, else its stored value. */
+  private parameterSwitch(node: GraphNode): boolean {
+    const name = node.parameter?.name.toLowerCase();
+    const override = name === undefined ? undefined : this.parameters.switches.get(name);
+    if (override !== undefined) return override;
+    const choice = this.choices.get(node.id);
+    if (choice) return choice.value;
+    const stored = typeof node.default === "boolean" ? node.default : node.switchValue;
+    if (typeof stored !== "boolean") refuse(`static switch ${node.parameter?.name ?? node.id} has no stored value to take`);
+    return stored;
+  }
+
+  /** A StaticSwitch: the value of the StaticBoolParameter it reads, merged as the instance has it, else its stored switch value. */
+  private staticSwitch(node: GraphNode): boolean {
+    const source = node.inputs.Value;
+    if (!source) {
+      if (typeof node.switchValue === "boolean") return node.switchValue;
+      refuse(`static switch ${node.id} has no stored value to take`);
+    }
+    const valueNode = this.nodes.get(source.node);
+    if (!valueNode) refuse(`a pin refers to missing node ${source.node}`);
+    if (valueNode.error) refuse(`node ${valueNode.id} (${valueNode.class}) could not be read: ${valueNode.error}`);
+    if (valueNode.class !== "StaticBoolParameter") refuse(`static switch ${node.id} takes its value from ${valueNode.class}`);
+    // Reading the bool skips the pin compile that picks an output and applies a mask, so refuse a pin that would need either.
+    if (source.output !== 0) refuse(`static switch ${node.id} reads output ${source.output} of ${valueNode.id}, which has one boolean output`);
+    if (source.mask) refuse(`static switch ${node.id} reads a masked value from ${valueNode.id}, which the walk does not apply`);
+    const name = valueNode.parameter?.name.toLowerCase();
+    const override = name === undefined ? undefined : this.parameters.switches.get(name);
+    if (override !== undefined) return override;
+    if (typeof valueNode.default === "boolean") return valueNode.default;
+    refuse(`static bool ${valueNode.parameter?.name ?? valueNode.id} has no stored value to take`);
+  }
+
+  /** A FunctionInput forwards the pin its call feeds it (the dumper swaps its preview for that pin); unwired, it reads a preview default when it has one. */
+  private functionInput(node: GraphNode, read: NormalRead): void {
+    const forwarded = node.inputs.Input ?? node.inputs.Preview;
+    if (forwarded) {
+      this.visit(forwarded, read);
+      return;
+    }
+    if (node.constants.bUsePreviewValueAsDefault !== true) refuse(`function input "${String(node.constants.InputName ?? node.id)}" is not wired and has no preview value`);
+  }
+
+  /**
+   * A function call reads only the output it is asked for: the body node that feeds it, at its first output, as the compile does. With no
+   * readable body, the engine's own FlattenNormal is the one rule: its body is not in the pack, so every input counts (its normal and its
+   * flatness). Only that function, read at Result with exactly Input0 and Input1, qualifies; any other call without a body is unknown.
+   */
+  private call(node: GraphNode, output: number, read: NormalRead): void {
+    const name = functionBaseName(node.function) ?? node.function ?? node.id;
+    if (node.fn?.outputs.some(Boolean)) {
+      const inner = node.fn.outputs[output];
+      if (!inner) refuse(`function ${name} defines no output ${output}`);
+      const innerNode = this.nodes.get(inner);
+      if (!innerNode) refuse(`function ${name} output refers to missing node ${inner}`);
+      this.node(innerNode, 0, read);
+      return;
+    }
+    if (!isEngineFlattenNormal(node, output)) refuse(`function ${name} has no readable body for output ${output}`);
+    this.expectValue(node, read);
+    this.rules.add("FlattenNormal: every input counts as a dependency; its engine body is not evaluated");
+    for (const input of Object.values(node.inputs)) this.visit(input, "value");
+  }
+
+  /** The attribute a MaterialAttributes read asks for; a plain value read there is a malformed graph. */
+  private attributeOf(node: GraphNode, read: NormalRead): string {
+    if (read === "value") refuse(`${node.class} ${node.id} carries attributes, and its value is read`);
+    return read.attribute;
+  }
+
+  /** An attribute read through a node that carries a plain value is a malformed graph. */
+  private expectValue(node: GraphNode, read: NormalRead): void {
+    if (read !== "value") refuse(`${node.class} ${node.id} carries a value, and the ${read.attribute} attribute is read through it`);
+  }
+
+  private required(node: GraphNode, pin: string): GraphInput {
+    const input = node.inputs[pin];
+    if (!input) refuse(`${node.class} ${node.id} has no ${pin} input`);
+    return input;
+  }
+
+  /**
+   * A SetMaterialAttributes: a wired pin that overrides the attribute is read in its place (`Inputs[i]` carries `attributeTypes[i - 1]`, and
+   * `Inputs[0]` the incoming attributes, as the compile reads them). A wired override whose GUID the table does not name might be this
+   * attribute, so the answer is unknown rather than a guess.
+   */
+  private setAttribute(node: GraphNode, attribute: string): void {
+    if (!node.attributeTypes) refuse(`SetMaterialAttributes ${node.id} carries no attributeTypes`);
+    const overrides: GraphInput[] = [];
+    for (const [index, guid] of node.attributeTypes.entries()) {
+      const pin = node.inputs[`Inputs[${index + 1}]`];
+      if (!pin) continue;
+      const named = attributeOfGuid(guid);
+      if (named === undefined) refuse(`SetMaterialAttributes ${node.id} overrides an attribute the table does not name`);
+      if (named === attribute) overrides.push(pin);
+    }
+    if (overrides.length > 0) {
+      for (const pin of overrides) this.visit(pin, "value");
+      return;
+    }
+    // Unwired, the incoming attributes are Unreal's default ones, which name no texture.
+    this.visit(node.inputs["Inputs[0]"], { attribute });
+  }
+
+  /**
+   * A GetMaterialAttributes: output 0 is the attributes themselves when `outputNames[0]` says so, read through as they are. Every other
+   * output is a value: the attribute its type names, offset by that pass-through output.
+   */
+  private getAttribute(node: GraphNode, output: number, read: NormalRead): void {
+    const names = node.outputNames ?? [];
+    const passThrough = names[0] === "MaterialAttributes";
+    if (passThrough && output === 0) {
+      this.visit(node.inputs.MaterialAttributes, { attribute: this.attributeOf(node, read) });
+      return;
+    }
+    this.expectValue(node, read);
+    const guid = node.attributeTypes?.[output - (passThrough ? 1 : 0)];
+    const attribute = (guid === undefined ? undefined : attributeOfGuid(guid)) ?? names[output];
+    if (attribute === undefined) refuse(`GetMaterialAttributes ${node.id} output ${output} names no attribute`);
+    this.visit(node.inputs.MaterialAttributes, { attribute });
+  }
+
+  /** A BreakMaterialAttributes output is one attribute of its source: `outputNames` when given, else the default list. */
+  private breakAttribute(node: GraphNode, output: number, read: NormalRead): void {
+    this.expectValue(node, read);
+    const names = node.outputNames && node.outputNames.length > 0 ? node.outputNames : BREAK_ATTRIBUTES;
+    const attribute = names[output];
+    if (attribute === undefined) refuse(`BreakMaterialAttributes ${node.id} output ${output} names no attribute`);
+    this.visit(node.inputs.MaterialAttributes, { attribute });
+  }
+}
+
+/**
+ * The textures a graph's active Normal reads, which decide whether a flattened normal map is stale. The Normal is read from both places
+ * a graph carries it, the legacy Normal pin and the Normal of its MaterialAttributes pin, since the dump does not say which one the
+ * material uses. Static switches take the choice the BaseColor and cut-out settle (`settleSwitches`), so the Normal follows the branches
+ * the colour follows; a switch they never reach takes its merged override or its stored value. Anything the walk cannot follow (a cycle,
+ * a dangling pin, an unreadable node, a truncated dump, an unknown node or function) makes the answer unknown, never an empty list.
+ */
+export function graphNormalDependencies(graph: MaterialGraph, parameters: GraphParameters = NO_PARAMETERS, alpha?: "opacity" | "opacityMask"): NormalDependencies {
+  if (graph.truncated) return { status: "unknown", reason: `graph ${graph.material} was truncated at ${graph.nodeCount} nodes` };
+  if (graph.error) return { status: "unknown", reason: `graph ${graph.material} could not be dumped: ${graph.error}` };
+  const unreadable = Object.keys(graph.outputConstants).find((key) => /^(normal|materialattributes)error$/i.test(key));
+  if (unreadable) return { status: "unknown", reason: `graph ${graph.material} could not read its ${unreadable} output` };
+  const settled = settleSwitches(graph, parameters, PATH_OPTIONS, alpha);
+  if (settled.kind === "refused") return { status: "unknown", reason: `static switches of ${graph.material} do not settle (${settled.switches.join(", ")})` };
+  const walk = new NormalWalk(graph, parameters, settled.choices);
+  try {
+    if (graph.outputs.normal) walk.visit(graph.outputs.normal, "value");
+    if (graph.outputs.materialAttributes) walk.visit(graph.outputs.materialAttributes, { attribute: "Normal" });
+  } catch (error) {
+    if (error instanceof NormalRefusal) return { status: "unknown", reason: error.message };
+    throw error;
+  }
+  return { status: "known", textures: walk.textures(), conservative: walk.conservative() };
 }
 
 // ---------------------------------------------------------------------------------------------------------

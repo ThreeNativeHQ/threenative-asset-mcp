@@ -5,6 +5,7 @@ import { graphReadsSurface } from "../src/unreal/graph-baker.js";
 import {
   MATERIAL_ATTRIBUTE_GUIDS,
   bakeGraph,
+  graphNormalDependencies,
   graphPathClasses,
   graphPathTextures,
   proveEmissionZero,
@@ -12,6 +13,7 @@ import {
   supportedNodeClasses,
   type BakeResult,
   type GraphParameters,
+  type NormalDependencies,
   type TextureRaster,
 } from "../src/unreal/material-graph.js";
 
@@ -2106,6 +2108,222 @@ describe("a pack-local function body wins over an engine-name handler", () => {
     });
     const graph = makeGraph([call, body(), GREEN], pin("layer", 1, RGB_MASK));
     expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["MatLayerBlend_Standard"] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// graphNormalDependencies: the textures the active Normal reads, which decides whether a flattened normal map is stale.
+
+const normalGraph = (nodes: Raw[], wiring: Raw = {}, extra: Raw = {}): MaterialGraph =>
+  materialGraphSchema.parse({
+    format: 1,
+    material: "M_Normal",
+    package: "/Game/Test/M_Normal",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null, ...wiring },
+    nodes,
+    ...extra,
+  });
+const normalSample = (id: string, texture: string): Raw => node(id, "TextureSample", { texture: `/Game/Test/${texture}.${texture}`, samplerType: "Normal" });
+const normalParameter = (id: string, name: string, texture: string | null): Raw =>
+  node(id, "TextureSampleParameter2D", { parameter: { name, group: "" }, default: null, texture: texture === null ? null : `/Game/Test/${texture}.${texture}`, samplerType: "Normal" });
+const storedSwitch = (id: string, name: string, a: string, b: string, stored: boolean): Raw =>
+  node(id, "StaticSwitchParameter", { inputs: { A: pin(a), B: pin(b) }, parameter: { name, group: "" }, default: stored });
+const normalMake = (id: string, source: string): Raw => node(id, "MakeMaterialAttributes", { inputs: { Normal: pin(source) } });
+const readNames = (dependencies: NormalDependencies) => (dependencies.status === "known" ? dependencies.textures.map((texture) => texture.name) : dependencies.reason);
+const FLATTEN_NORMAL = "/Engine/Functions/Engine_MaterialFunctions01/Texturing/FlattenNormal.FlattenNormal";
+
+describe("graphNormalDependencies", () => {
+  // A static switch picks the leaf normal or the bark normal the flattened .mat lists first.
+  const branchSwitch = (stored: boolean, extra: Raw = {}) =>
+    normalGraph(
+      [normalSample("leaf", "T_LeafNormal"), normalSample("bark", "T_BarkNormal"), storedSwitch("branch", "Branch", "leaf", "bark", stored), normalMake("make", "branch")],
+      { materialAttributes: pin("make") },
+      extra,
+    );
+
+  it("reads the branch a stored switch takes, so the other branch's bark map is not a dependency", () => {
+    expect(readNames(graphNormalDependencies(branchSwitch(true), params({})))).toEqual(["T_LeafNormal"]);
+    expect(readNames(graphNormalDependencies(branchSwitch(false), params({})))).toEqual(["T_BarkNormal"]);
+  });
+
+  it("takes the instance's merged switch override over the stored value", () => {
+    expect(readNames(graphNormalDependencies(branchSwitch(true), params({ switches: { branch: false } })))).toEqual(["T_BarkNormal"]);
+  });
+
+  it("follows the branch the BaseColor settled when the colour flips the same switch", () => {
+    // Its unbound A branch would make the normal unknown; the choice the colour settles (B) is the branch both read.
+    const graph = normalGraph(
+      [storedSwitch("flip", "Flip", "unbound", "albedo", true), normalParameter("unbound", "BaseTexture", null), normalSample("albedo", "T_Albedo"), normalMake("make", "flip")],
+      { baseColor: pin("flip"), materialAttributes: pin("make") },
+    );
+    expect(readNames(graphNormalDependencies(graph, params({})))).toEqual(["T_Albedo"]);
+  });
+
+  it("keeps a bark map that only a lerp's alpha, or a FlattenNormal's flatness input, reads", () => {
+    const lerp = normalGraph(
+      [normalSample("leaf", "T_LeafNormal"), normalSample("bark", "T_BarkNormal"), node("blend", "LinearInterpolate", { inputs: { A: pin("leaf"), B: pin("leaf"), Alpha: pin("bark") } })],
+      { normal: pin("blend") },
+    );
+    expect(readNames(graphNormalDependencies(lerp, params({})))).toEqual(["T_LeafNormal", "T_BarkNormal"]);
+    const flatten = normalGraph(
+      [
+        normalSample("leaf", "T_LeafNormal"),
+        normalSample("bark", "T_BarkNormal"),
+        node("flatten", "FunctionCall", { function: FLATTEN_NORMAL, inputs: { Input0: pin("leaf"), Input1: pin("bark") }, outputNames: ["Result"] }),
+      ],
+      { normal: pin("flatten") },
+    );
+    const dependencies = graphNormalDependencies(flatten, params({}));
+    expect(readNames(dependencies)).toEqual(["T_LeafNormal", "T_BarkNormal"]);
+    expect(dependencies).toMatchObject({ conservative: [expect.stringContaining("FlattenNormal")] });
+  });
+
+  it("counts a FlattenNormal call's inputs only as the engine function's Result with exactly Input0 and Input1", () => {
+    const official = { function: FLATTEN_NORMAL, inputs: { Input0: pin("leaf"), Input1: pin("bark") }, outputNames: ["Result"] };
+    const flatten = (output: number, call: Raw) =>
+      normalGraph([normalSample("leaf", "T_LeafNormal"), normalSample("bark", "T_BarkNormal"), node("flatten", "FunctionCall", call)], { normal: pin("flatten", output) });
+    expect(readNames(graphNormalDependencies(flatten(0, official), params({})))).toEqual(["T_LeafNormal", "T_BarkNormal"]);
+    // A same-named function in a pack has no body in the dump and is not the engine's: unknown, never an empty dependency list.
+    expect(graphNormalDependencies(flatten(0, { ...official, function: "/Game/Custom/FlattenNormal" }), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("no readable body"),
+    });
+    expect(graphNormalDependencies(flatten(0, { ...official, function: "/Game/Custom/FlattenNormal", inputs: {} }), params({}))).toMatchObject({ status: "unknown" });
+    expect(graphNormalDependencies(flatten(1, official), params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("output 1") });
+    expect(graphNormalDependencies(flatten(0, { ...official, outputNames: ["Other"] }), params({}))).toMatchObject({ status: "unknown" });
+    expect(graphNormalDependencies(flatten(0, { ...official, inputs: { Input0: pin("leaf") } }), params({}))).toMatchObject({ status: "unknown" });
+    expect(graphNormalDependencies(flatten(0, { ...official, inputs: { ...official.inputs, Input2: pin("leaf") } }), params({}))).toMatchObject({ status: "unknown" });
+  });
+
+  it("is unknown for a FlattenNormal call whose body is missing and whose emitter recorded an error", () => {
+    // The real emitter's shape for an engine function it could not load: the error boundary refuses the node before any rule runs.
+    const graph = normalGraph(
+      [
+        normalSample("leaf", "T_LeafNormal"),
+        normalSample("bark", "T_BarkNormal"),
+        node("flatten", "FunctionCall", {
+          function: FLATTEN_NORMAL,
+          inputs: { Input0: pin("leaf"), Input1: pin("bark") },
+          outputNames: ["Result"],
+          error: "engine content is missing: FlattenNormal has no body in the pack",
+        }),
+      ],
+      { normal: pin("flatten") },
+    );
+    expect(graphNormalDependencies(graph, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("engine content is missing") });
+  });
+
+  it("follows a function body only for the output the normal reads", () => {
+    const body = (output: number) =>
+      normalGraph(
+        [normalSample("leaf", "T_LeafNormal"), normalSample("bark", "T_BarkNormal"), node("pick", "FunctionCall", { function: "/Game/Test/MF_Pick.MF_Pick", inputs: {}, fn: { inputs: {}, outputs: ["leaf", "bark"], output: "leaf" } })],
+        { normal: pin("pick", output) },
+      );
+    expect(readNames(graphNormalDependencies(body(0), params({})))).toEqual(["T_LeafNormal"]);
+    expect(readNames(graphNormalDependencies(body(1), params({})))).toEqual(["T_BarkNormal"]);
+  });
+
+  it("reads a map that only shapes another sample's coordinates, so it is a dependency", () => {
+    // The leaf sample's UVs come from the bark map's sample: a separate pin from its inputs, which the walk must follow too.
+    const graph = normalGraph(
+      [normalSample("bark", "T_BarkNormal"), node("leaf", "TextureSample", { texture: "/Game/Test/T_LeafNormal.T_LeafNormal", samplerType: "Normal", coordinates: pin("bark") })],
+      { normal: pin("leaf") },
+    );
+    expect(readNames(graphNormalDependencies(graph, params({})))).toEqual(["T_LeafNormal", "T_BarkNormal"]);
+  });
+
+  it("names a texture in another package by its basename and its full reference", () => {
+    const graph = normalGraph([node("other", "TextureSample", { texture: "/Game/Other/T_BarkNormal.T_BarkNormal", samplerType: "Normal" })], { normal: pin("other") });
+    expect(graphNormalDependencies(graph, params({}))).toEqual({
+      status: "known",
+      textures: [{ name: "T_BarkNormal", reference: "/Game/Other/T_BarkNormal.T_BarkNormal" }],
+      conservative: [],
+    });
+  });
+
+  it("takes the nearest instance reference of a texture parameter over the graph's default", () => {
+    const graph = normalGraph([normalParameter("leaf", "Leaf", "T_LeafNormal")], { normal: pin("leaf") });
+    const instance = { ...params({}), textureReferences: new Map([["leaf", "/Game/Instance/T_Override.T_Override"]]) };
+    expect(graphNormalDependencies(graph, instance)).toEqual({
+      status: "known",
+      textures: [{ name: "T_Override", reference: "/Game/Instance/T_Override.T_Override" }],
+      conservative: [],
+    });
+  });
+
+  it("reads no texture when the graph wires no normal", () => {
+    expect(graphNormalDependencies(normalGraph([], {}), params({}))).toEqual({ status: "known", textures: [], conservative: [] });
+  });
+
+  it("is unknown, never empty, for a truncated graph, an unreadable node or an unreadable Normal output", () => {
+    expect(graphNormalDependencies(normalGraph([normalSample("leaf", "T_LeafNormal")], { normal: pin("leaf") }, { truncated: true }), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("truncated"),
+    });
+    expect(graphNormalDependencies(normalGraph([{ ...normalSample("leaf", "T_LeafNormal"), error: "could not load" }], { normal: pin("leaf") }), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("could not be read"),
+    });
+    expect(graphNormalDependencies(normalGraph([normalSample("leaf", "T_LeafNormal")], { normal: pin("leaf") }, { outputConstants: { normalError: "could not read" } }), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("normalError"),
+    });
+  });
+
+  it("is unknown for a cycle, a dangling pin, an unknown node or an unresolved function on the normal path", () => {
+    const cycle = normalGraph([node("ra", "Reroute", { inputs: { Input: pin("rb") } }), node("rb", "Reroute", { inputs: { Input: pin("ra") } })], { normal: pin("ra") });
+    expect(graphNormalDependencies(cycle, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("through itself") });
+    const dangling = normalGraph([normalMake("make", "ghost")], { materialAttributes: pin("make") });
+    expect(graphNormalDependencies(dangling, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("missing node ghost") });
+    const unknownNode = normalGraph([node("fresnel", "Fresnel")], { normal: pin("fresnel") });
+    expect(graphNormalDependencies(unknownNode, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("Fresnel") });
+    const unresolved = normalGraph([node("call", "FunctionCall", { function: "/Game/Test/MF_Missing.MF_Missing", inputs: {} })], { normal: pin("call") });
+    expect(graphNormalDependencies(unresolved, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("MF_Missing") });
+  });
+
+  it("is unknown when a texture parameter names no texture or a switch stores no value", () => {
+    const unnamed = normalGraph([normalParameter("leaf", "Leaf", null)], { normal: pin("leaf") });
+    expect(graphNormalDependencies(unnamed, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("names no texture") });
+    const unstored = normalGraph(
+      [node("sw", "StaticSwitchParameter", { inputs: { A: pin("leaf"), B: pin("leaf") }, parameter: { name: "Sw", group: "" } }), normalSample("leaf", "T_LeafNormal")],
+      { normal: pin("sw") },
+    );
+    expect(graphNormalDependencies(unstored, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("no stored value") });
+  });
+
+  it("is unknown for a static switch whose StaticBoolParameter could not be read, though its stored default is true", () => {
+    // The bool's stored default survives its read error. Neither that default nor an explicit override may pick a branch past the error.
+    const graph = normalGraph(
+      [
+        normalSample("leaf", "T_LeafNormal"),
+        normalSample("bark", "T_BarkNormal"),
+        node("flag", "StaticBoolParameter", { parameter: { name: "UseLeaf", group: "" }, default: true, error: "could not load" }),
+        node("sw", "StaticSwitch", { inputs: { A: pin("leaf"), B: pin("bark"), Value: pin("flag") } }),
+      ],
+      { normal: pin("sw") },
+    );
+    expect(graphNormalDependencies(graph, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("could not be read") });
+    expect(graphNormalDependencies(graph, params({ switches: { useleaf: false } }))).toMatchObject({ status: "unknown", reason: expect.stringContaining("could not be read") });
+  });
+
+  it.each([
+    ["a non-zero output of its StaticBoolParameter", { ...pin("flag"), output: 1 }, "output 1"],
+    ["a masked StaticBoolParameter pin", pin("flag", 0, RGB_MASK), "masked value"],
+  ])("is unknown for a static switch that reads %s, with or without an explicit override", (_label, value, reason) => {
+    // The walk reads the bool's stored default past the pin, so an output or mask the pin carries must refuse, override or not.
+    const graph = normalGraph(
+      [
+        normalSample("leaf", "T_LeafNormal"),
+        normalSample("bark", "T_BarkNormal"),
+        node("flag", "StaticBoolParameter", { parameter: { name: "UseLeaf", group: "" }, default: true }),
+        node("sw", "StaticSwitch", { inputs: { A: pin("leaf"), B: pin("bark"), Value: value } }),
+      ],
+      { normal: pin("sw") },
+    );
+    expect(graphNormalDependencies(graph, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining(reason) });
+    expect(graphNormalDependencies(graph, params({ switches: { useleaf: false } }))).toMatchObject({ status: "unknown", reason: expect.stringContaining(reason) });
   });
 });
 

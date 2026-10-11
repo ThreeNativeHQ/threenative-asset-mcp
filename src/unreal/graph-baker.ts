@@ -11,12 +11,14 @@ import {
   noColourOutput,
   particleDrivenBaseColor,
   graphPathClasses,
+  graphNormalDependencies,
   graphPathTextures,
   proveEmissionZero,
   type EmissionProof,
   type EmissiveEffect,
   type BakeResult,
   type GraphParameters,
+  type NormalDependencies,
   type TextureRaster,
 } from "./material-graph.js";
 import { parsePropsFile, type PropsFile } from "./materials.js";
@@ -133,6 +135,11 @@ export type GraphBakeOutcome = BakeResult & {
    * on a bake, a probe or an effect alike, so the importer can drop a stale emissive binding or factor on that proof alone.
    */
   readonly emissionZero?: EmissionProof;
+  /**
+   * Present whenever the graph itself was read, on a bake, a probe or an effect alike: the textures its active Normal reads (see
+   * `graphNormalDependencies`), so the importer can drop a flattened normal map the graph proves stale on that proof alone.
+   */
+  readonly normalDependencies?: NormalDependencies;
 };
 
 export type GraphBaker = (request: GraphBakeRequest) => Promise<GraphBakeOutcome>;
@@ -494,13 +501,14 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     }
     if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);
 
-    // The emission proof reads the same instance parameters as the bake, so every outcome below carries it.
+    // The emission and normal proofs read the same instance parameters as the bake, so every outcome below carries them.
     const parameters = chainParameters(chain);
     const emissionZero = proveEmissionZero(graph, parameters);
+    const normalDependencies = graphNormalDependencies(graph, parameters, request.alpha);
     const effect = emissiveOnlyEffect(graph);
-    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material, emissionZero };
+    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material, emissionZero, normalDependencies };
     const noAlbedo = noColourOutput(graph);
-    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material, emissionZero };
+    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material, emissionZero, normalDependencies };
     if (request.probe) {
       // Unreal applies a mesh's vertex colours only where the graph reads VertexColor; glTF multiplies COLOR_0 into
       // every base colour. The importer drops COLOR_0 when the BaseColor path does not read it.
@@ -519,6 +527,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       return {
         ...unavailable(`${graph.material} has a BaseColor output`),
         emissionZero,
+        normalDependencies,
         ...(readable
           ? {
               ...(classes ? { vertexColorOnBaseColor: classes.includes("VertexColor") } : {}),
@@ -600,7 +609,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         const particle = particleDrivenBaseColor(graph!);
         // A refused texture is the reason even though the evaluator reports it only as missing: no exact source was chosen.
         const reason = unresolved.size > 0 ? `${[...unresolved.values()].join("; ")}; no source is selected, so the base colour is not baked` : result.reason;
-        return { ...result, reason, graphMaterial: graph!.material, parameters, emissionZero, ...(particle ? { particle } : {}) };
+        return { ...result, reason, graphMaterial: graph!.material, parameters, emissionZero, normalDependencies, ...(particle ? { particle } : {}) };
       }
       const approximations = new Set(result.approximations);
       for (const note of engineNotes) approximations.add(note);
@@ -617,6 +626,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         graphMaterial: graph!.material,
         parameters,
         emissionZero,
+        normalDependencies,
         ...(residual ? { vertexColorResidual: true } : {}),
         ...(pbrFactors ? { pbrFactors } : {}),
       };

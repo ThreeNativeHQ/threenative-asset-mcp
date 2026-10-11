@@ -1026,7 +1026,7 @@ function emissiveProps(options: { collectedEmissive?: readonly number[] | undefi
   return lines.length > 0 ? `\n${lines.join("\n")}` : "";
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean; collectedEmissive?: [number, number, number, number]; switchOverride?: boolean; emissiveTexture?: boolean; inputEmissive?: { factor?: [number, number, number]; texture?: boolean }; inputBaseColorTexture?: boolean; emptyToolchain?: boolean; engine?: { srgb?: boolean; writePng?: boolean; exitCode?: number }; packEngine?: string; packNamesake?: boolean; noInstanceOverrides?: boolean }) {
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean; collectedEmissive?: [number, number, number, number]; switchOverride?: boolean; emissiveTexture?: boolean; inputEmissive?: { factor?: [number, number, number]; texture?: boolean }; inputBaseColorTexture?: boolean; emptyToolchain?: boolean; engine?: { srgb?: boolean; writePng?: boolean; exitCode?: number }; packEngine?: string; packNamesake?: boolean; noInstanceOverrides?: boolean; normalTexture?: string; inputNormalTexture?: string }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -1041,6 +1041,8 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   if (options.packedRoughness) overrides.push(["SpecPower", "T_Spec"]);
   // An Emissive texture the instance binds: the stale-emission case drops it with the factor.
   if (options.emissiveTexture) overrides.push(["Emissive", "T_InstanceGlow"]);
+  // The flattened normal map: an instance texture the resolver binds to the normal slot, which the graph may or may not read.
+  if (options.normalTexture) overrides.push(["Normal", options.normalTexture]);
   // The exporter binds nothing to MI_Rock: its colour exists only in the graph.
   await writeMeshFixture(exported, {
     name: "Mesh",
@@ -1053,8 +1055,8 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
       }) + emissiveProps({ collectedEmissive: options.collectedEmissive, switchOverride: options.switchOverride }),
     textures: [],
   });
-  if (options.inputEmissive || options.inputBaseColorTexture) {
-    // The converter can leave a base-colour or emissive texture, or an emissive factor, on the input glTF material, which the
+  if (options.inputEmissive || options.inputBaseColorTexture || options.inputNormalTexture !== undefined) {
+    // The converter can leave a base-colour, normal or emissive texture, or an emissive factor, on the input glTF material, which the
     // .mat/.props the resolver reads never mentions. The graph proof must preserve the base colour and handle the emission.
     const io = new NodeIO();
     const document = await io.read(join(exported, "Mesh.gltf"));
@@ -1075,6 +1077,9 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     if (options.inputEmissive?.factor) inputMaterial.setEmissiveFactor([...options.inputEmissive.factor]);
     if (options.inputEmissive?.texture) {
       inputMaterial.setEmissiveTexture(document.createTexture("T_InputGlow").setImage(new Uint8Array(await solidPng([255, 200, 80]))).setMimeType("image/png"));
+    }
+    if (options.inputNormalTexture !== undefined) {
+      inputMaterial.setNormalTexture(document.createTexture(options.inputNormalTexture).setImage(new Uint8Array(await solidPng([128, 128, 255]))).setMimeType("image/png"));
     }
     await io.write(join(exported, "Mesh.gltf"), document);
   }
@@ -1118,6 +1123,10 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
   if (options.emissiveTexture) {
     await writeFile(join(content, "T_InstanceGlow.uasset"), Buffer.alloc(16));
     await writePng(join(exported, "T_InstanceGlow.png"), [255, 200, 80, 255], 4);
+  }
+  if (options.normalTexture) {
+    await writeFile(join(content, `${options.normalTexture}.uasset`), Buffer.alloc(16));
+    await writePng(join(exported, `${options.normalTexture}.png`), [128, 128, 255, 255], 4);
   }
   const umodel = join(root, "umodel");
   const textureLog = join(root, "texture-exports.log");
@@ -1422,6 +1431,147 @@ describe("importUnrealDirectory graph bake", () => {
  * (stored default `switchStored`) between a glow and a zero constant. `glowOnly` wires the glow straight in instead, and
  * `equalBounds` wires a SmoothStep of two equal parameters, which has no defined GPU result and so no zero proof.
  */
+/**
+ * A master whose Normal is the node the test names: the leaf map its own parameter samples (not the bark map the flattened binding
+ * names), the bark map itself, or a node the evaluator cannot follow. BaseColor is the instance's mask, or a node no bake can read.
+ */
+function normalMaster(normal: "leaf" | "bark" | "camera", baseColor: "mask" | "unbakeable" = "mask"): MaterialGraph {
+  const nodes: Raw[] = [
+    node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: "/Game/Test/T_MasterMask.T_MasterMask", samplerType: "Color" }),
+    node("leaf", "TextureSampleParameter2D", { parameter: { name: "LeafNormal", group: "" }, default: null, texture: "/Game/Test/T_LeafNormal.T_LeafNormal", samplerType: "Normal" }),
+    node("bark", "TextureSample", { texture: "/Game/Test/T_BarkNormal.T_BarkNormal", samplerType: "Normal" }),
+    node("camera", "CameraVectorWS"),
+    node("unbakeable", "CameraVectorWS"),
+    node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin(baseColor), Normal: pin(normal) } }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: pin("make") },
+    outputConstants: {},
+    nodes,
+  });
+}
+
+/**
+ * normalMaster's Normal as a static switch: A the leaf map, B the bark map, and Value the StaticBoolParameter UseLeaf (default true) read
+ * through `value`. `flag` is merged over that parameter node.
+ */
+function switchedNormalMaster(value: Raw, flag: Raw = {}): MaterialGraph {
+  const nodes: Raw[] = [
+    node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: "/Game/Test/T_MasterMask.T_MasterMask", samplerType: "Color" }),
+    node("leaf", "TextureSampleParameter2D", { parameter: { name: "LeafNormal", group: "" }, default: null, texture: "/Game/Test/T_LeafNormal.T_LeafNormal", samplerType: "Normal" }),
+    node("bark", "TextureSample", { texture: "/Game/Test/T_BarkNormal.T_BarkNormal", samplerType: "Normal" }),
+    node("flag", "StaticBoolParameter", { parameter: { name: "UseLeaf", group: "" }, default: true, ...flag }),
+    node("sw", "StaticSwitch", { inputs: { A: pin("leaf"), B: pin("bark"), Value: value } }),
+    node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("mask"), Normal: pin("sw") } }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: pin("make") },
+    outputConstants: {},
+    nodes,
+  });
+}
+
+describe("a flattened normal map the graph's active Normal does not read", () => {
+  it("is omitted from the GLTF and the report, and the other textures and geometry match the import that keeps it", async () => {
+    const kept = await importWithGraph({ graph: normalMaster("bark"), normalTexture: "T_BarkNormal" });
+    const stale = await importWithGraph({ graph: normalMaster("leaf"), normalTexture: "T_BarkNormal" });
+    expect(kept.material.getNormalTexture()).not.toBeNull();
+    expect(stale.material.getNormalTexture()).toBeNull();
+    const limitations = stale.report.models[0]!.materials[0]!.limitations.join("\n");
+    expect(limitations).toContain("T_BarkNormal is a stale flattened normal, omitted");
+    expect(limitations).toContain("authored normal composition is not reconstructed");
+    expect(stale.onDisk.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_BarkNormal is a stale flattened normal, omitted");
+    expect(stale.glb.getRoot().listTextures()).toHaveLength(kept.glb.getRoot().listTextures().length - 1);
+    expect(stale.material.getBaseColorTexture()?.getImage()).toEqual(kept.material.getBaseColorTexture()?.getImage());
+    const positions = (glb: typeof kept.glb) => glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!.getAttribute("POSITION")!.getArray();
+    expect(positions(stale.glb)).toEqual(positions(kept.glb));
+  });
+
+  it("is decided by the probe even when the BaseColor does not bake", async () => {
+    const stale = await importWithGraph({ graph: normalMaster("leaf", "unbakeable"), normalTexture: "T_BarkNormal" });
+    expect(stale.material.getNormalTexture()).toBeNull();
+    expect(stale.report.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_BarkNormal is a stale flattened normal, omitted");
+  });
+
+  it("keeps a flattened normal map the graph reads, with no limitation about it", async () => {
+    const kept = await importWithGraph({ graph: normalMaster("bark"), normalTexture: "T_BarkNormal" });
+    expect(kept.material.getNormalTexture()).not.toBeNull();
+    expect(kept.report.models[0]!.materials[0]!.limitations.join("\n")).not.toContain("T_BarkNormal");
+  });
+
+  it("keeps a flattened normal map the graph cannot prove, and says it is unverified", async () => {
+    const unknown = await importWithGraph({ graph: normalMaster("camera"), normalTexture: "T_BarkNormal" });
+    expect(unknown.material.getNormalTexture()).not.toBeNull();
+    expect(unknown.report.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_BarkNormal kept as the normal map, unverified:");
+  });
+
+  it("keeps a flattened normal map when a static switch's StaticBoolParameter could not be read, though its default is true", async () => {
+    const unknown = await importWithGraph({ graph: switchedNormalMaster(pin("flag"), { error: "could not load" }), normalTexture: "T_BarkNormal" });
+    expect(unknown.material.getNormalTexture()).not.toBeNull();
+    expect(unknown.report.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_BarkNormal kept as the normal map, unverified:");
+  });
+
+  it.each([
+    ["a non-zero output of its StaticBoolParameter", { ...pin("flag"), output: 1 }],
+    ["a masked StaticBoolParameter pin", pin("flag", [1, 1, 1, 0])],
+  ])("keeps a flattened normal map when a static switch reads %s, and says it is unverified", async (_label, value) => {
+    const unknown = await importWithGraph({ graph: switchedNormalMaster(value), normalTexture: "T_BarkNormal" });
+    expect(unknown.material.getNormalTexture()).not.toBeNull();
+    expect(unknown.report.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_BarkNormal kept as the normal map, unverified:");
+  });
+});
+
+describe("the input glTF normal map beside a flattened normal the graph does not read", () => {
+  // The flattened Bark binding is stale (the graph's Normal reads only the leaf map). The input glTF material's own normal map is judged
+  // on its own identity: it is never cleared just because the binding is stale.
+  it("keeps an input map the graph reads, drops only the stale binding, and leaves the rest of the import unchanged", async () => {
+    const reference = await importWithGraph({ graph: normalMaster("leaf"), inputNormalTexture: "T_LeafNormal" });
+    const stale = await importWithGraph({ graph: normalMaster("leaf"), normalTexture: "T_BarkNormal", inputNormalTexture: "T_LeafNormal" });
+    // The final normal slot holds the input map: the stale binding is not attached to it after the input map is kept.
+    expect(stale.material.getNormalTexture()?.getName()).toBe("T_LeafNormal");
+    expect(stale.material.getNormalTexture()?.getImage()).toEqual(reference.material.getNormalTexture()?.getImage());
+    const limitations = stale.report.models[0]!.materials[0]!.limitations.join("\n");
+    expect(limitations).toContain("T_BarkNormal is a stale flattened normal, omitted");
+    expect(limitations).toContain("the section keeps its input glTF normal map");
+    expect(limitations).not.toContain("so the section has no normal map");
+    expect(limitations).toContain("T_LeafNormal kept as the input normal map");
+    expect(limitations).toContain("matched by basename only");
+    expect(stale.onDisk.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_BarkNormal is a stale flattened normal, omitted");
+    expect(stale.glb.getRoot().listTextures()).toHaveLength(reference.glb.getRoot().listTextures().length);
+    expect(stale.material.getBaseColorTexture()?.getImage()).toEqual(reference.material.getBaseColorTexture()?.getImage());
+    const positions = (glb: typeof reference.glb) => glb.getRoot().listMeshes()[0]!.listPrimitives()[0]!.getAttribute("POSITION")!.getArray();
+    expect(positions(stale.glb)).toEqual(positions(reference.glb));
+  });
+
+  it("clears an input map whose identity is the stale binding the graph does not read", async () => {
+    const stale = await importWithGraph({ graph: normalMaster("leaf"), normalTexture: "T_BarkNormal", inputNormalTexture: "T_BarkNormal" });
+    expect(stale.material.getNormalTexture()).toBeNull();
+    expect(stale.report.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_BarkNormal is a stale flattened normal, omitted");
+  });
+
+  it("keeps an input map with no source name, and says it is unverified", async () => {
+    const unnamed = await importWithGraph({ graph: normalMaster("leaf"), normalTexture: "T_BarkNormal", inputNormalTexture: "" });
+    expect(unnamed.material.getNormalTexture()).not.toBeNull();
+    expect(unnamed.report.models[0]!.materials[0]!.limitations.join("\n")).toContain("kept as the normal map, unverified:");
+  });
+
+  it("keeps an input map whose name matches neither a read texture nor the dropped binding, and says it is unverified", async () => {
+    const other = await importWithGraph({ graph: normalMaster("leaf"), normalTexture: "T_BarkNormal", inputNormalTexture: "T_OtherNormal" });
+    expect(other.material.getNormalTexture()?.getName()).toBe("T_OtherNormal");
+    expect(other.report.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_OtherNormal kept as the normal map, unverified: it matches neither");
+  });
+});
+
 function emissionMaster(options: { switchStored?: boolean; glowOnly?: boolean; truncated?: boolean; equalBounds?: boolean } = {}): MaterialGraph {
   const stored = options.switchStored ?? false;
   const nodes: Raw[] = [

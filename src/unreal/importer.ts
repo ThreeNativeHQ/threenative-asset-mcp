@@ -50,7 +50,7 @@ import {
   type ImportedScene,
   parseUnrealSceneSource,
 } from "./scenes.js";
-import { viewDependentNodes } from "./material-graph.js";
+import { viewDependentNodes, type NormalDependencies } from "./material-graph.js";
 import { rasteriseSurfaceNormals, type SurfaceNormals, type SurfaceTriangles } from "./surface-normals.js";
 import { readMeshMaterialPackages, remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
@@ -58,7 +58,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 97;
+export const IMPORTER_VERSION = 98;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1614,6 +1614,42 @@ function hasNamedFallback(materialName: string): boolean {
   return lower.includes("glass") || lower.includes("mirror") || /(?:^|_)light(?:_|$)/.test(lower);
 }
 
+/**
+ * Whether the graph's active Normal proves the flattened normal maps stale: a known proof that names none of them (a namesake in another
+ * package counts as the same texture). The input glTF material's own normal map is judged on its own identity (`inputNormalVerdict`).
+ */
+function normalProvenStale(proof: NormalDependencies | undefined, flattened: readonly string[]): boolean {
+  if (proof?.status !== "known" || flattened.length === 0) return false;
+  return flattened.every((name) => proof.textures.every((texture) => texture.name.toLowerCase() !== name.toLowerCase()));
+}
+
+/** The basename of a glTF texture's name or URI, without its image extension: the only part of a source name the match uses. */
+function textureBaseName(value: string | null | undefined): string {
+  return (value ?? "").split(/[\\/]/).pop()!.replace(/\.(png|jpe?g|tga|dds|webp|bmp)$/i, "");
+}
+
+/**
+ * The input glTF material's own normal map, judged on its identity (its name and URI, by basename) against the graph's active Normal
+ * and the flattened normal the proof dropped (`dropped`). A known proof that reads no texture clears it. A name the graph reads keeps
+ * it, matched by basename only. The name of a dropped flattened normal clears it, since that texture is proved absent. Any other name,
+ * or none, keeps it unverified.
+ */
+function inputNormalVerdict(proof: NormalDependencies | undefined, names: readonly string[], dropped: readonly string[]): { readonly cleared: boolean; readonly note: string } {
+  const identities = names.map(textureBaseName).filter((name) => name !== "");
+  const label = identities[0] ?? "The input glTF normal";
+  if (proof?.status !== "known") return { cleared: false, note: `${label} kept as the normal map, unverified: ${proof?.reason ?? "the graph's active Normal was not read"}.` };
+  if (proof.textures.length === 0) return { cleared: true, note: `${label} is omitted: the graph's active Normal reads no texture.` };
+  const reads = proof.textures.map((texture) => texture.name).join(", ");
+  const lower = identities.map((identity) => identity.toLowerCase());
+  if (proof.textures.some((texture) => lower.includes(texture.name.toLowerCase()))) {
+    return { cleared: false, note: `${label} kept as the input normal map: the graph's active Normal reads a texture of that name (matched by basename only, so a namesake in another package would match too).` };
+  }
+  if (dropped.some((name) => lower.includes(name.toLowerCase()))) {
+    return { cleared: true, note: `${label} is omitted with the stale flattened normal: the graph's active Normal reads ${reads}.` };
+  }
+  return { cleared: false, note: `${label} kept as the normal map, unverified: it matches neither a texture the graph's active Normal reads (${reads}) nor the dropped flattened normal.` };
+}
+
 export async function packageGlb(options: {
   readonly gltfPath: string;
   /** The mesh package's material imports, object name (lower case) -> package path; see `scopeMaterialFiles`. */
@@ -1961,6 +1997,39 @@ export async function packageGlb(options: {
         material.setEmissiveFactor([0, 0, 0]);
         material.setEmissiveTexture(null);
       }
+    }
+
+    // The flattened `.mat` normal map is the first normal texture of its class, and a switch-driven material does not always read it: a
+    // foliage material's branch and leaf instances can all flatten to the bark normal. The graph's active Normal proves it stale only when
+    // the textures it reads name none of it (`normalDependencies`). That proof drops the binding; an unknown proof keeps the map and says it
+    // is unverified. The input glTF material's own normal map is judged on its identity (`inputNormalVerdict`), so a stale binding does not
+    // take a valid input map with it. An input map is judged only when no flattened normal stays attached to the normal slot.
+    const flattenedNormals = resolved.bindings.filter((binding) => binding.slot === "normal").map((binding) => binding.texture);
+    const inputNormal = material.getNormalTexture();
+    if ((flattenedNormals.length > 0 || inputNormal !== null) && options.graphBaker && !hasNamedFallback(material.getName())) {
+      const proof = (await options.graphBaker(graphRequest(true))).normalDependencies;
+      const stale = normalProvenStale(proof, flattenedNormals) ? flattenedNormals : [];
+      const attached = flattenedNormals.length > 0 && stale.length === 0;
+      const input = inputNormal !== null && !attached ? inputNormalVerdict(proof, [inputNormal.getName(), inputNormal.getURI()], stale) : undefined;
+      if (input?.cleared) material.setNormalTexture(null);
+      if (stale.length > 0) {
+        const reads = proof?.status === "known" && proof.textures.length > 0 ? proof.textures.map((texture) => texture.name).join(", ") : "no texture";
+        const kept = input !== undefined && !input.cleared ? "; the section keeps its input glTF normal map" : ", so the section has no normal map";
+        resolved = {
+          ...resolved,
+          bindings: resolved.bindings.filter((binding) => binding.slot !== "normal"),
+          limitations: [
+            ...resolved.limitations,
+            `${stale.join(", ")} is a stale flattened normal, omitted: the graph's active Normal reads ${reads}. The authored normal composition is not reconstructed${kept}.`,
+          ],
+        };
+      } else if (flattenedNormals.length > 0 && proof?.status === "unknown") {
+        resolved = {
+          ...resolved,
+          limitations: [...resolved.limitations, `${flattenedNormals.join(", ")} kept as the normal map, unverified: ${proof.reason}.`],
+        };
+      }
+      if (input) resolved = { ...resolved, limitations: [...resolved.limitations, input.note] };
     }
 
     const ordered = [...resolved.bindings].sort(
