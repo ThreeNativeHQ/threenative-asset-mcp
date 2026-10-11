@@ -7,6 +7,14 @@ export interface ThumbnailGridSource {
   readonly bytesSha256: string;
 }
 
+/** Decoded RGBA8 pixels of a caller's Grid, row-major with the top row first, and their provenance. Never fetched here. */
+export interface ThumbnailSourceGrid {
+  readonly width: number;
+  readonly height: number;
+  readonly rgba: Uint8Array;
+  readonly source: ThumbnailGridSource;
+}
+
 /** Absolute glTF metres map to UE (X,Y,Z) centimetres as (x,z,y)*100. */
 export function thumbnailFloorInputs(x: number, z: number, cameraY: number): { coarse: [number, number]; fine: [number, number]; fade: number } {
   const coarse: [number, number] = [x * 100 / 256, z * 100 / 256];
@@ -36,8 +44,15 @@ export function createThumbnailReferenceFloor(
   THREE: typeof Three,
   supplied?: { readonly texture: Three.Texture; readonly source: ThumbnailGridSource },
 ): { material: Three.MeshStandardMaterial; source?: ThumbnailGridSource; limitations: string[]; dispose: () => void } {
-  if (supplied && (!supplied.source.reference || !supplied.source.engine || !/^[a-f0-9]{64}$/i.test(supplied.source.bytesSha256))) {
-    throw new Error("source Grid needs a reference, engine and SHA-256 provenance");
+  let provenance: ThumbnailGridSource | undefined;
+  if (supplied) {
+    // Each field is checked as a string: a one-element array of a digest would pass the regex test by stringifying.
+    const { reference, engine, bytesSha256 } = (supplied.source ?? {}) as Partial<ThumbnailGridSource>;
+    if (typeof reference !== "string" || !reference || typeof engine !== "string" || !engine || typeof bytesSha256 !== "string" || !/^[a-f0-9]{64}$/i.test(bytesSha256)) {
+      throw new Error("source Grid needs a reference, engine and SHA-256 provenance");
+    }
+    // Only the declared fields: a spread would carry any extra key (an array, say) into the floor's record.
+    provenance = { reference, engine, bytesSha256 };
   }
   // A plain two-by-two checker, generated independently; the raster resolution is a portable sampling choice, not source pixels.
   let texture = supplied?.texture;
@@ -82,6 +97,6 @@ export function createThumbnailReferenceFloor(
     "floor plane geometry and placement approximate EditorPlane; saved thumbnail editor/config unknown",
     ...(supplied ? [] : ["procedural checker replaces licensed Grid: an approximation without its authored edge pixels"]),
   ];
-  material.userData.thumbnailFloor = { engine: "4.19.2", ...(supplied ? { source: { ...supplied.source } } : {}), limitations };
-  return { material, ...(supplied ? { source: { ...supplied.source } } : {}), limitations, dispose() { material.dispose(); if (!supplied) texture.dispose(); } };
+  material.userData.thumbnailFloor = { engine: "4.19.2", ...(provenance ? { source: { ...provenance } } : {}), limitations };
+  return { material, ...(provenance ? { source: { ...provenance } } : {}), limitations, dispose() { material.dispose(); if (!supplied) texture.dispose(); } };
 }

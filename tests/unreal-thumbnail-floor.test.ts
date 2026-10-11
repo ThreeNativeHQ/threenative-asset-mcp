@@ -45,4 +45,24 @@ describe("UE 4.19.2 source thumbnail floor", () => {
     floor.dispose();
     texture.dispose();
   });
+
+  it("keeps only the three provenance fields of a supplied Grid, so an extra array never reaches the floor's record", () => {
+    const texture = new THREE.DataTexture(new Uint8Array([128, 128, 128, 255]), 1, 1);
+    const source = { reference: "/Engine/EngineMaterials/Grid.Grid", engine: "4.19.2", bytesSha256: "a".repeat(64), extraRgba: new Uint8Array(4) };
+    const floor = createThumbnailReferenceFloor(THREE, { texture, source });
+    expect(floor.source).toEqual({ reference: "/Engine/EngineMaterials/Grid.Grid", engine: "4.19.2", bytesSha256: "a".repeat(64) });
+    expect(floor.material.userData.thumbnailFloor.source).toEqual(floor.source);
+    floor.dispose();
+    texture.dispose();
+  });
+
+  it.each([
+    ["a reference that is an array", { reference: ["/Engine/EngineMaterials/Grid.Grid"] }],
+    ["a SHA-256 array that stringifies to a digest", { bytesSha256: ["a".repeat(64)] }],
+  ])("refuses a supplied Grid with %s before creating the floor", (_label, override) => {
+    const texture = new THREE.DataTexture(new Uint8Array([128, 128, 128, 255]), 1, 1);
+    const source = { reference: "/Engine/EngineMaterials/Grid.Grid", engine: "4.19.2", bytesSha256: "a".repeat(64), ...override };
+    expect(() => createThumbnailReferenceFloor(THREE, { texture, source: source as never })).toThrow(/SHA-256 provenance/);
+    texture.dispose();
+  });
 });

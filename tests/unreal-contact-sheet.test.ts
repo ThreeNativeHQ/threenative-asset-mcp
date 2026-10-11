@@ -5,9 +5,10 @@ import { join } from "node:path";
 
 import { Document, NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
-import { describe, expect, it, onTestFinished } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 
-import { colouredGlbKeys, renderContactSheet, renderTiles } from "../src/unreal/contact-sheet.js";
+import { colouredGlbKeys, PICTURE_RENDERER, renderContactSheet, renderTiles, type RenderedTiles } from "../src/unreal/contact-sheet.js";
+import type { ThumbnailSourceGrid } from "../src/unreal/thumbnail-floor.js";
 import type { ThumbnailSourceRadiance } from "../src/unreal/thumbnail-lighting.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
@@ -148,6 +149,121 @@ function meanAbsDiff(a: { readonly data: Uint8Array }, b: { readonly data: Uint8
   return sum / ((a.data.length / 4) * 3);
 }
 
+const GRID_SIZE = 8;
+const GRID_SOURCE = { reference: "synthetic/quadrant-grid", engine: "synthetic", bytesSha256: "d".repeat(64) };
+
+/** Synthetic RGBA8 Grid, never a real asset: red 255 in the top-left 4x4 texels, the +X+Z quadrant of each 2.56 m period. */
+function quadrantGrid(): Uint8Array {
+  const rgba = new Uint8Array(GRID_SIZE * GRID_SIZE * 4);
+  for (let row = 0; row < GRID_SIZE; row++) {
+    for (let column = 0; column < GRID_SIZE; column++) {
+      const value = row < 4 && column < 4 ? 255 : 0;
+      rgba.set([value, value, value, 255], (row * GRID_SIZE + column) * 4);
+    }
+  }
+  return rgba;
+}
+
+function gridDigest(rgba: Uint8Array): string {
+  return createHash("sha256").update(rgba).digest("hex");
+}
+
+function pixelLuma(tile: { readonly data: Uint8Array }, index: number): number {
+  return 0.2126 * tile.data[index * 4]! + 0.7152 * tile.data[index * 4 + 1]! + 0.0722 * tile.data[index * 4 + 2]!;
+}
+
+function unitVector(v: readonly number[]): number[] {
+  const length = Math.hypot(...v);
+  return v.map((c) => c / length);
+}
+
+function crossProduct(a: readonly number[], b: readonly number[]): number[] {
+  return [a[1]! * b[2]! - a[2]! * b[1]!, a[2]! * b[0]! - a[0]! * b[2]!, a[0]! * b[1]! - a[1]! * b[0]!];
+}
+
+/** Whether the segment from `from` to `to` enters the unit cube [-0.5, 0.5]^3 before it reaches `to` (slab test). */
+function segmentHitsCube(from: readonly number[], to: readonly number[]): boolean {
+  let enter = 0;
+  let exit = 1;
+  for (let axis = 0; axis < 3; axis++) {
+    const d = to[axis]! - from[axis]!;
+    if (Math.abs(d) < 1e-12) {
+      if (from[axis]! < -0.5 || from[axis]! > 0.5) return false;
+      continue;
+    }
+    const a = (-0.5 - from[axis]!) / d;
+    const b = (0.5 - from[axis]!) / d;
+    enter = Math.max(enter, Math.min(a, b));
+    exit = Math.min(exit, Math.max(a, b));
+    if (enter > exit) return false;
+  }
+  return enter <= exit && enter < 1 && exit > 0;
+}
+
+/**
+ * The floor point (x, z) each pixel of a `tile`-pixel render of the unit cube at the origin sees; null where the ray misses the
+ * floor (y = -0.5) or the cube hides it. An independent pinhole model of the picture camera as its contract states it (vertical
+ * field 40 degrees, direction (1, 0.75, 1.2), distance = radius / sin(field / 2) * 1.05). No renderer code is used.
+ */
+function floorSeenBy(tile: number): ([number, number] | null)[] {
+  const half = (40 * Math.PI) / 360;
+  const toward = unitVector([1, 0.75, 1.2]);
+  const distance = ((Math.sqrt(3) / 2) / Math.sin(half)) * 1.05;
+  const eye = toward.map((c) => c * distance);
+  const forward = toward.map((c) => -c);
+  const right = unitVector(crossProduct(forward, [0, 1, 0]));
+  const up = crossProduct(right, forward);
+  const seen: ([number, number] | null)[] = [];
+  for (let row = 0; row < tile; row++) {
+    for (let column = 0; column < tile; column++) {
+      const sx = (2 * (column + 0.5)) / tile - 1;
+      const sy = 1 - (2 * (row + 0.5)) / tile;
+      const ray = forward.map((c, i) => c + Math.tan(half) * (sx * right[i]! + sy * up[i]!));
+      if (ray[1]! >= 0) {
+        seen.push(null);
+        continue;
+      }
+      const s = (-0.5 - eye[1]!) / ray[1]!;
+      const point = eye.map((c, i) => c + s * ray[i]!);
+      seen.push(segmentHitsCube(eye, point) ? null : [point[0]!, point[2]!]);
+    }
+  }
+  return seen;
+}
+
+/**
+ * Mean luma of the floor pixels grouped by the Grid phase their floor point sits in: an axis is bright in [0, 1.28) of its
+ * 2.56 m period and dark in [1.28, 2.56); 0.2 m margins at each seam are left out.
+ */
+function phaseMeans(
+  tile: { readonly data: Uint8Array },
+  seen: readonly ([number, number] | null)[],
+): Record<"bothBright" | "xDark" | "zDark" | "bothDark", { mean: number; count: number }> {
+  const phase = (v: number) => ((v % 2.56) + 2.56) % 2.56;
+  const axis = (v: number): boolean | undefined => {
+    const p = phase(v);
+    if (p >= 0.2 && p <= 1.08) return true;
+    if (p >= 1.48 && p <= 2.36) return false;
+    return undefined;
+  };
+  const groups = { bothBright: [] as number[], xDark: [] as number[], zDark: [] as number[], bothDark: [] as number[] };
+  seen.forEach((point, index) => {
+    if (point === null) return;
+    const bx = axis(point[0]);
+    const bz = axis(point[1]);
+    if (bx === undefined || bz === undefined) return;
+    const key = bx ? (bz ? "bothBright" : "zDark") : bz ? "xDark" : "bothDark";
+    groups[key].push(pixelLuma(tile, index));
+  });
+  const summarise = (values: number[]) => ({ mean: values.reduce((sum, v) => sum + v, 0) / Math.max(1, values.length), count: values.length });
+  return {
+    bothBright: summarise(groups.bothBright),
+    xDark: summarise(groups.xDark),
+    zDark: summarise(groups.zDark),
+    bothDark: summarise(groups.bothDark),
+  };
+}
+
 describe("unreal source environment refusal", () => {
   const valid = () => ({ width: RADIANCE.width, height: RADIANCE.height, rgb: syntheticSky(0, 4), source: SOURCE });
   const refusals: [string, () => unknown, RegExp][] = [
@@ -173,6 +289,39 @@ describe("unreal source environment refusal", () => {
     await expect(renderTiles({ glbPaths: [], sourceEnvironment })).rejects.toThrow(message);
     await expect(renderContactSheet({ glbPaths: [], outPath: out, title: "Refused", sourceEnvironment })).rejects.toThrow(message);
     await expect(stat(out)).rejects.toThrow();
+  });
+});
+
+describe("unreal source Grid refusal", () => {
+  const valid = (): ThumbnailSourceGrid => ({ width: GRID_SIZE, height: GRID_SIZE, rgba: quadrantGrid(), source: GRID_SOURCE });
+  const refusals: [string, () => unknown, RegExp][] = [
+    ["a plain array instead of a Uint8Array", () => ({ ...valid(), rgba: Array.from(quadrantGrid()) }), /must be a Uint8Array/],
+    ["a Uint8ClampedArray with the same bytes", () => ({ ...valid(), rgba: new Uint8ClampedArray(quadrantGrid()) }), /must be a Uint8Array/],
+    ["a Float32Array of the Grid's element count", () => ({ ...valid(), rgba: new Float32Array(GRID_SIZE * GRID_SIZE) }), /must be a Uint8Array/],
+    ["one byte short of width*height*4", () => ({ ...valid(), rgba: quadrantGrid().subarray(1) }), /exactly width\*height\*4/],
+    ["a zero width", () => ({ ...valid(), width: 0 }), /positive whole dimensions/],
+    ["a fractional height", () => ({ ...valid(), height: 8.5 }), /positive whole dimensions/],
+    ["a missing source", () => ({ ...valid(), source: undefined }), /provenance/],
+    ["an empty reference", () => ({ ...valid(), source: { ...GRID_SOURCE, reference: "" } }), /provenance/],
+    ["a reference that is an array", () => ({ ...valid(), source: { ...GRID_SOURCE, reference: [GRID_SOURCE.reference] } }), /provenance/],
+    ["a malformed SHA-256", () => ({ ...valid(), source: { ...GRID_SOURCE, bytesSha256: "not-a-digest" } }), /provenance/],
+    ["a SHA-256 array that stringifies to a digest", () => ({ ...valid(), source: { ...GRID_SOURCE, bytesSha256: [GRID_SOURCE.bytesSha256] } }), /provenance/],
+  ];
+
+  it.each(refusals)("refuses %s before any file is read, under either picture lighting, and writes no sheet", async (_label, make, message) => {
+    const dir = await scratch();
+    const out = join(dir, "sheet.jpg");
+    const sourceGrid = make() as ThumbnailSourceGrid;
+    await expect(renderTiles({ glbPaths: [], sourceGrid })).rejects.toThrow(message);
+    await expect(renderTiles({ glbPaths: [], sourceGrid, lighting: "unreal-like" })).rejects.toThrow(message);
+    await expect(renderContactSheet({ glbPaths: [], outPath: out, title: "Refused", sourceGrid })).rejects.toThrow(message);
+    await expect(stat(out)).rejects.toThrow();
+  });
+});
+
+describe("unreal picture renderer contract", () => {
+  it("pins the lit picture to ACES filmic at exposure 1 with a literal gate, not a copy of the page's code", () => {
+    expect(PICTURE_RENDERER).toEqual({ toneMapping: "ACESFilmicToneMapping", toneMappingExposure: 1 });
   });
 });
 
@@ -435,9 +584,12 @@ describeWithTools(["chromium"], "unreal source environment", () => {
     const sourceEnvironment = { ...RADIANCE, rgb: syntheticSky(0, 4), source: SOURCE };
 
     const plain = await renderTiles({ glbPaths: [red], tile: 128 });
-    const supplied = await renderTiles({ glbPaths: [red], tile: 128, sourceEnvironment });
+    // Both inputs at once: neutral lighting ignores them, but a malformed one would still be refused (see the refusal table).
+    const sourceGrid: ThumbnailSourceGrid = { width: GRID_SIZE, height: GRID_SIZE, rgba: quadrantGrid(), source: GRID_SOURCE };
+    const supplied = await renderTiles({ glbPaths: [red], tile: 128, sourceEnvironment, sourceGrid });
     expect(supplied.png.equals(plain.png)).toBe(true);
     expect(supplied.sourceEnvironment).toBeUndefined();
+    expect(supplied.sourceGrid).toBeUndefined();
 
     const plainSheet = await renderContactSheet({ glbPaths: [red], outPath: join(dir, "plain.jpg"), title: "Neutral", tile: 128 });
     const suppliedSheet = await renderContactSheet({
@@ -446,9 +598,11 @@ describeWithTools(["chromium"], "unreal source environment", () => {
       title: "Neutral",
       tile: 128,
       sourceEnvironment,
+      sourceGrid,
     });
     expect(suppliedSheet.judge).toEqual(plainSheet.judge);
     expect(suppliedSheet.sourceEnvironment).toBeUndefined();
+    expect(suppliedSheet.sourceGrid).toBeUndefined();
     expect((await readFile(join(dir, "supplied.jpg"))).equals(await readFile(join(dir, "plain.jpg")))).toBe(true);
   });
 
@@ -472,8 +626,11 @@ describeWithTools(["chromium"], "unreal source environment", () => {
       tile: 128,
       pictureLighting: "unreal-like",
       sourceEnvironment,
+      sourceGrid: { width: GRID_SIZE, height: GRID_SIZE, rgba: quadrantGrid(), source: GRID_SOURCE },
     });
     expect(plain.sourceEnvironment).toBeUndefined();
+    expect(plain.sourceGrid).toBeUndefined();
+    expect(lit.sourceGrid).toMatchObject({ source: GRID_SOURCE, width: GRID_SIZE, height: GRID_SIZE });
     expect(lit.judge).toEqual(plain.judge);
     expect(lit.sourceEnvironment).toMatchObject({
       source: SOURCE,
@@ -524,4 +681,134 @@ describeWithTools(["chromium"], "unreal source environment", () => {
     });
     expect(sheet.sourceEnvironment?.source).toEqual(SOURCE);
   });
+});
+
+/**
+ * A tall thin box standing on the floor. The unit cube's cast shadow falls behind it from this camera (the light and the camera
+ * are nearly aligned), so the PCF control needs a shadow that clears its own silhouette.
+ */
+async function writePillar(path: string, height: number): Promise<void> {
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const half = [0.15, height / 2, 0.15];
+  const centre = [0, height / 2, 0];
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const indices: number[] = [];
+  for (let axis = 0; axis < 3; axis++) {
+    for (const sign of [-1, 1]) {
+      const n = [0, 0, 0];
+      n[axis] = sign;
+      const u = [0, 0, 0];
+      u[(axis + 1) % 3] = 1;
+      const v = [n[1]! * u[2]! - n[2]! * u[1]!, n[2]! * u[0]! - n[0]! * u[2]!, n[0]! * u[1]! - n[1]! * u[0]!];
+      const base = positions.length / 3;
+      for (const [a, b] of [[-1, -1], [1, -1], [1, 1], [-1, 1]] as const) {
+        for (let k = 0; k < 3; k++) positions.push(centre[k]! + half[k]! * (n[k]! + a * u[k]! + b * v[k]!));
+        normals.push(...n);
+      }
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  }
+  const material = document.createMaterial("pillar").setBaseColorFactor([0.8, 0.8, 0.8, 1]).setMetallicFactor(0).setRoughnessFactor(1);
+  const primitive = document
+    .createPrimitive()
+    .setAttribute("POSITION", document.createAccessor().setType("VEC3").setArray(new Float32Array(positions)).setBuffer(buffer))
+    .setAttribute("NORMAL", document.createAccessor().setType("VEC3").setArray(new Float32Array(normals)).setBuffer(buffer))
+    .setIndices(document.createAccessor().setType("SCALAR").setArray(new Uint16Array(indices)).setBuffer(buffer))
+    .setMaterial(material);
+  document.createScene().addChild(document.createNode("pillar").setMesh(document.createMesh("pillar").addPrimitive(primitive)));
+  await new NodeIO().write(path, document);
+}
+
+describeWithTools(["chromium"], "unreal source Grid", () => {
+  const TILE = 256;
+  let dir = "";
+  let cube = "";
+  let pillar = "";
+  let lit: RenderedTiles;
+  let procedural: RenderedTiles;
+  let shadowOn: RenderedTiles;
+  let shadowOff: RenderedTiles;
+  const picture = () => ({
+    glbPaths: [cube],
+    tile: TILE,
+    lighting: "unreal-like" as const,
+    sourceEnvironment: { ...RADIANCE, rgb: syntheticSky(0, 4), source: SOURCE },
+  });
+  const grid = (): ThumbnailSourceGrid => ({ width: GRID_SIZE, height: GRID_SIZE, rgba: quadrantGrid(), source: GRID_SOURCE });
+
+  // One browser per configuration, shared by the assertions below. The same HDR radiance lights all three.
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "tn-contact-sheet-grid-"));
+    cube = join(dir, "SM_Cube.glb");
+    await writeCube(cube, [0.8, 0.8, 0.8]);
+    pillar = join(dir, "SM_Pillar.glb");
+    await writePillar(pillar, 3);
+    lit = await renderTiles({ ...picture(), sourceGrid: grid() });
+    procedural = await renderTiles(picture());
+    shadowOn = await renderTiles({ ...picture(), glbPaths: [pillar], sourceGrid: grid() });
+    shadowOff = await renderTiles({ ...picture(), glbPaths: [pillar], sourceGrid: grid(), shadows: false });
+  }, 240_000);
+  afterAll(() => rm(dir, { recursive: true, force: true }));
+
+  it("maps the Grid by world X and Z at the fixed camera: only the +X+Z phase of each period is bright", () => {
+    const groups = phaseMeans(lit.tiles[0]!, floorSeenBy(TILE));
+    // The Grid's own contrast is about 9% here and reverses under the procedural checker, so the margin sits well inside it.
+    const dark = [groups.xDark, groups.zDark, groups.bothDark];
+    const darkMean = dark.reduce((sum, g) => sum + g.mean * g.count, 0) / dark.reduce((sum, g) => sum + g.count, 0);
+    expect(groups.bothBright.count).toBeGreaterThan(500);
+    expect(groups.bothBright.mean).toBeGreaterThan(groups.xDark.mean * 1.05);
+    expect(groups.bothBright.mean).toBeGreaterThan(groups.zDark.mean * 1.05);
+    expect(groups.bothBright.mean).toBeGreaterThan(darkMean * 1.05);
+  });
+
+  it("repeats the Grid every 2.56 m: the bright phase beyond the first period matches the whole bright phase", () => {
+    const seen = floorSeenBy(TILE);
+    const beyond = phaseMeans(lit.tiles[0]!, seen.map((p) => (p !== null && p[0] <= -1.28 ? p : null)));
+    const all = phaseMeans(lit.tiles[0]!, seen);
+    expect(beyond.bothBright.count).toBeGreaterThan(200);
+    expect(Math.abs(beyond.bothBright.mean - all.bothBright.mean)).toBeLessThan(0.05 * all.bothBright.mean);
+  });
+
+  it("applies the Grid to the floor and reports it with its digest and approximations, and reports nothing without one", () => {
+    expect(meanAbsDiff(lit.tiles[0]!, procedural.tiles[0]!)).toBeGreaterThan(2);
+    expect(lit.sourceGrid).toEqual({
+      source: GRID_SOURCE,
+      width: GRID_SIZE,
+      height: GRID_SIZE,
+      rgbaSha256: gridDigest(quadrantGrid()),
+      limitations: expect.arrayContaining([expect.stringMatching(/BRDF/), expect.stringMatching(/filtering/), expect.stringMatching(/EditorPlane/)]),
+    });
+    expect(lit.sourceGrid!.limitations.join(" ")).not.toMatch(/procedural/);
+    // HDR and Grid together: both reports describe the same picture.
+    expect(lit.sourceEnvironment).toBeDefined();
+    expect(procedural.sourceGrid).toBeUndefined();
+  });
+
+  it("keeps the PCF cast shadow control live under the Grid: shadows on darken part of the floor and never brighten it", () => {
+    // Measured here: about 1,350 of 65,536 pixels darken by more than 8 luma with shadows on, and none brighten.
+    let darkened = 0;
+    let brightened = 0;
+    for (let i = 0; i < TILE * TILE; i++) {
+      const change = pixelLuma(shadowOn.tiles[0]!, i) - pixelLuma(shadowOff.tiles[0]!, i);
+      if (change < -8) darkened++;
+      if (change > 8) brightened++;
+    }
+    expect(darkened).toBeGreaterThan(500);
+    expect(brightened).toBe(0);
+  });
+
+  it("reads the caller's Grid before the browser starts: editing its bytes or provenance afterwards changes neither picture nor report", async () => {
+    const rgba = quadrantGrid();
+    const source = { ...GRID_SOURCE, extraRgba: new Uint8Array(4) };
+    const input = { width: GRID_SIZE, height: GRID_SIZE, rgba, source, radiance: new Float32Array(3) } as unknown as ThumbnailSourceGrid;
+    const pending = renderTiles({ ...picture(), sourceGrid: input });
+    rgba.fill(0);
+    source.reference = "mutated/after-call";
+    const after = await pending;
+    expect(after.png.equals(lit.png)).toBe(true);
+    expect(after.sourceGrid).toEqual(lit.sourceGrid);
+    expect(JSON.stringify(after.sourceGrid)).not.toMatch(/extra|mutated/);
+  }, 120_000);
 });
