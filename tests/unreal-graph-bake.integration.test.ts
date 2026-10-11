@@ -928,7 +928,13 @@ interface EngineExportFixture {
   readonly exitCode?: number;
 }
 
-async function writeFakeConverter(path: string, graph: MaterialGraph, argvLog: string, textureFrom?: string, engine?: EngineExportFixture): Promise<void> {
+/** A `--dump-graphs` run the fake refuses under one `--engine` profile: a profile mismatch, or with `unrelated` a failure that is not one. */
+interface DumpFailureFixture {
+  readonly engine: string;
+  readonly unrelated?: boolean;
+}
+
+async function writeFakeConverter(path: string, graph: MaterialGraph, argvLog: string, textureFrom?: string, engine?: EngineExportFixture, dumpFailure?: DumpFailureFixture): Promise<void> {
   await writeFile(
     path,
     `#!/usr/bin/env node
@@ -940,6 +946,12 @@ fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(argv) + "\\n");
 if (argv.includes("--version")) { process.stdout.write("fake-converter 1\\n"); process.exit(0); }
 const at = argv.indexOf("--dump-graphs");
 if (at >= 0) {
+  const failure = ${JSON.stringify(dumpFailure ?? null)};
+  const engineAt = argv.indexOf("--engine");
+  if (failure && engineAt >= 0 && argv[engineAt + 1] === failure.engine) {
+    process.stderr.write((failure.unrelated ? "fatal: the graph writer reached an unexpected end of stream" : "ParserException: Invalid FString length while decoding an unversioned package") + "\\n");
+    process.exit(1);
+  }
   fs.writeFileSync(join(argv[at + 1], ${JSON.stringify(`${graph.material}.graph.json`)}), ${JSON.stringify(JSON.stringify(graph))});
   process.exit(0);
 }
@@ -1026,7 +1038,7 @@ function emissiveProps(options: { collectedEmissive?: readonly number[] | undefi
   return lines.length > 0 ? `\n${lines.join("\n")}` : "";
 }
 
-async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean; collectedEmissive?: [number, number, number, number]; switchOverride?: boolean; emissiveTexture?: boolean; inputEmissive?: { factor?: [number, number, number]; texture?: boolean }; inputBaseColorTexture?: boolean; emptyToolchain?: boolean; engine?: { srgb?: boolean; writePng?: boolean; exitCode?: number }; packEngine?: string; packNamesake?: boolean; noInstanceOverrides?: boolean; normalTexture?: string; inputNormalTexture?: string }) {
+async function importWithGraph(options: { graph: MaterialGraph; graphBake?: boolean; hiddenTexture?: boolean; hiddenVia?: "umodel" | "converter" | "modern-header"; vertexColors?: boolean; normal?: [number, number, number]; instanceScalars?: [string, number][]; instanceTint?: [number, number, number, number]; packedRoughness?: boolean; collectedEmissive?: [number, number, number, number]; switchOverride?: boolean; emissiveTexture?: boolean; inputEmissive?: { factor?: [number, number, number]; texture?: boolean }; inputBaseColorTexture?: boolean; emptyToolchain?: boolean; engine?: { srgb?: boolean; writePng?: boolean; exitCode?: number }; packEngine?: string; packNamesake?: boolean; noInstanceOverrides?: boolean; normalTexture?: string; inputNormalTexture?: string; formatHint?: string; dumpFailure?: DumpFailureFixture }) {
   const root = await scratch("graph-bake-import-");
   const sourceDir = join(root, "source");
   const content = join(sourceDir, "Content", "Test");
@@ -1153,6 +1165,7 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     converterLog,
     options.hiddenTexture && options.hiddenVia && options.hiddenVia !== "umodel" ? join(root, "hidden") : undefined,
     options.engine ? { ...options.engine, png: join(root, "engine-T_Rock.png") } : undefined,
+    options.dumpFailure,
   );
   const report = await importUnrealDirectory({
     sourceDir,
@@ -1172,6 +1185,7 @@ async function importWithGraph(options: { graph: MaterialGraph; graphBake?: bool
     ...(options.emptyToolchain ? {} : { modernConverter: { name: "modern", path: converter, version: "fake-converter 1" } }),
     ...(options.graphBake === undefined ? {} : { graphBake: options.graphBake }),
     ...(options.packEngine ? { engine: options.packEngine } : {}),
+    ...(options.formatHint === undefined ? {} : { formatHint: options.formatHint }),
   });
   const glb = await new NodeIO().read(join(outputDir, report.models[0]!.glb));
   const onDisk = JSON.parse(await readFile(join(outputDir, "import-report.json"), "utf8")) as ImportReport;
@@ -1768,6 +1782,20 @@ describe("an /Engine/ texture reference is answered by engine content alone", ()
     expect(leftovers.filter((entry) => entry.includes("graph-textures"))).toEqual([]);
   });
 
+  it("keeps the engine content export on its configured version, never the pack's format hint", async () => {
+    const { report, dumped, engineDir } = await importWithGraph({
+      graph: colourGraph(ENGINE_T_ROCK),
+      noInstanceOverrides: true,
+      packNamesake: true,
+      engine: { srgb: false },
+      packEngine: "UE_5.8",
+      formatHint: "UE_5.1",
+    });
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked", confidence: "exact" });
+    // The engine root has its own version, so its one run names that version and no hinted profile.
+    expect(exactExports(dumped)).toEqual([[engineDir, "--export-dir", expect.any(String), "--exact-reference", ENGINE_T_ROCK, "--engine", "5.8"]]);
+  });
+
   it("is unresolved when no engine content is configured, with no fallback to the pack", async () => {
     const { report, material, dumped } = await importWithGraph({ graph: colourGraph(ENGINE_T_ROCK), noInstanceOverrides: true, packNamesake: true });
     expect(material.getBaseColorTexture()).toBeNull();
@@ -1910,6 +1938,73 @@ describe("graph textures that only a material function references", () => {
     expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked" });
     expect(await firstPixel(material.getBaseColorTexture()!.getImage()!)).toEqual(hiddenPixel);
     expect(leftovers.filter((entry) => entry.includes("graph-textures") || entry.includes(".engine-"))).toEqual([]);
+  });
+
+  it("importer: the graph's own texture export and the graph dump both run first under the format hint", async () => {
+    const { report, material, dumped, leftovers } = await importWithGraph({
+      graph: masterGraph("mask-tint", "T_Hidden"),
+      hiddenTexture: true,
+      hiddenVia: "modern-header",
+      formatHint: "UE_5.1",
+    });
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked" });
+    expect(await firstPixel(material.getBaseColorTexture()!.getImage()!)).toEqual(hiddenPixel);
+    const runs = invocations(dumped);
+    const dump = runs.filter((argv) => argv.includes("--dump-graphs"));
+    expect(dump).toHaveLength(1);
+    expect(dump[0]![dump[0]!.indexOf("--engine") + 1]).toBe("5.1");
+    const exported = runs.filter((argv) => argv.includes("--filter") && argv[argv.indexOf("--filter") + 1]!.endsWith("T_Hidden"));
+    expect(exported.map((argv) => (argv.includes("--engine") ? argv[argv.indexOf("--engine") + 1] : "auto"))).toEqual(["5.1"]);
+    expect(leftovers.filter((entry) => entry.includes("graph-textures") || entry.includes(".engine-"))).toEqual([]);
+  });
+});
+
+describe("the graph dump under a format hint", () => {
+  const hidden = { graph: masterGraph("mask-tint", "T_Hidden"), hiddenTexture: true, hiddenVia: "modern-header" } as const;
+  /** The `--engine` of every graph dump run, in order, `auto` for a run given none. */
+  const dumpEngines = (dumped: string): string[] =>
+    invocations(dumped)
+      .filter((argv) => argv.includes("--dump-graphs"))
+      .map((argv) => (argv.includes("--engine") ? argv[argv.indexOf("--engine") + 1]! : "auto"));
+  const dumpOption = (dumped: string, flag: string): string | undefined => {
+    const argv = invocations(dumped).find((run) => run.includes("--dump-graphs"));
+    return argv?.[argv.indexOf(flag) + 1];
+  };
+
+  it("answers a profile mismatch of the hinted dump with the unhinted run it made before hints existed", async () => {
+    const { report, dumped } = await importWithGraph({ ...hidden, formatHint: "UE_5.1", dumpFailure: { engine: "5.1" } });
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "baked" });
+    expect(dumpEngines(dumped)).toEqual(["5.1", "auto"]);
+  });
+
+  it("does not retry a dump failure that is not a profile mismatch", async () => {
+    const { report, dumped } = await importWithGraph({ ...hidden, formatHint: "UE_5.1", dumpFailure: { engine: "5.1", unrelated: true } });
+    expect(report.models[0]!.materials[0]!.graph).toMatchObject({ status: "unavailable" });
+    expect(dumpEngines(dumped)).toEqual(["5.1"]);
+  });
+
+  it("keeps the one unhinted run when the hint is missing or names no fallback profile", async () => {
+    for (const formatHint of [undefined, "UE_4.18", "UE_5.8", "not-an-engine"]) {
+      const { dumped } = await importWithGraph({ ...hidden, ...(formatHint === undefined ? {} : { formatHint }) });
+      expect(dumpEngines(dumped), String(formatHint)).toEqual(["auto"]);
+    }
+  });
+
+  it("keeps the request's own engine, which the hint does not override", async () => {
+    const { dumped } = await importWithGraph({ ...hidden, packEngine: "UE_5.4", formatHint: "UE_5.1" });
+    expect(dumpEngines(dumped)).toEqual(["5.4"]);
+  });
+
+  it("hands the engine content version beside the hinted profile, never as it and never replaced by it", async () => {
+    const reference = "/Engine/Textures/T_Rock.T_Rock";
+    const options = { graph: colourGraph(reference), noInstanceOverrides: true, packNamesake: true, engine: { srgb: false } } as const;
+    const hinted = await importWithGraph({ ...options, formatHint: "UE_5.1" });
+    expect(dumpEngines(hinted.dumped)).toEqual(["5.1"]);
+    expect(dumpOption(hinted.dumped, "--engine-content-version")).toBe("5.8");
+    expect(exactExports(hinted.dumped)).toEqual([[hinted.engineDir, "--export-dir", expect.any(String), "--exact-reference", reference, "--engine", "5.8"]]);
+    const plain = await importWithGraph(options);
+    expect(dumpEngines(plain.dumped)).toEqual(["auto"]);
+    expect(dumpOption(plain.dumped, "--engine-content-version")).toBe("5.8");
   });
 });
 

@@ -7,14 +7,14 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { FabCli, FabCliError, featuredImageUrl, preferredPlatform } from "../src/fab/fabcli.js";
 import { classifyLicenses } from "../src/fab/license.js";
-import { importUnrealDirectory } from "../src/unreal/importer.js";
+import { importUnrealDirectory, type ImportUnrealRequest } from "../src/unreal/importer.js";
 import { isFatalHandlerError, licencesReader } from "../src/unreal/parity-run.js";
 import {
   createFabImportAssetHandler,
   createFabListOwnedHandler,
   requirePermittedLicense,
 } from "../src/tools/import-unreal.js";
-import { writeFakeFabCli, writeFakeUmodel, writeMeshFixture } from "./helpers/unreal-fixture.js";
+import { writeEngineProfileConverter, writeFakeFabCli, writeFakeUmodel, writeMeshFixture } from "./helpers/unreal-fixture.js";
 
 const LISTING = "75f42402-40bb-4a1b-b557-18e2c9604273";
 const temporaryDirectories: string[] = [];
@@ -67,6 +67,9 @@ async function harness(options: {
   readonly umodelClasses?: Readonly<Record<string, readonly string[]>>;
   /** artifactId → engines; each artifact gets its own pack, marked with its id. */
   readonly artifactPacks?: Readonly<Record<string, readonly string[]>>;
+  /** Fails the UE Viewer listing, which is how a UE 5 package reaches the modern converter. */
+  readonly umodelListExitCode?: number;
+  readonly importDirectory?: typeof importUnrealDirectory;
 } = {}): Promise<Harness> {
   const root = await temporaryDirectory();
 
@@ -89,6 +92,7 @@ async function harness(options: {
     exportFrom: exported,
     classes: options.umodelClasses ?? { SM_Rock: ["StaticMesh"] },
     outputSubdirectory: "Game",
+    ...(options.umodelListExitCode === undefined ? {} : { listExitCode: options.umodelListExitCode }),
   });
 
   const catalog: { artifactId: string; engineVersions: string[]; dir: string }[] = [];
@@ -132,6 +136,7 @@ async function harness(options: {
     outputDir: join(root, "game", "assets", "fab", LISTING),
     handler: createFabImportAssetHandler({
       environment,
+      ...(options.importDirectory === undefined ? {} : { importDirectory: options.importDirectory }),
       readLicenses: async () => {
         if (options.licenseError) throw new Error("network down");
         return options.licenses ?? ["personal", "professional"];
@@ -593,6 +598,80 @@ describe("Fab import safety", () => {
         await readFile(join(test.outputDir, "import-report.json"), "utf8"),
       ) as { warnings: string[] };
       expect(report.warnings.join("\n")).not.toMatch(/Chose artifact/);
+    });
+
+    it("hands a single artifact's oldest engine to the importer as its format hint, without narrowing FabCLI", async () => {
+      // A UE 5 static mesh whose UE Viewer listing fails, so the modern converter owns its decode.
+      const requests: ImportUnrealRequest[] = [];
+      let converter = "";
+      const test = await harness({
+        formats: [
+          {
+            assetFormatType: { code: "unreal-engine" },
+            versions: [{ artifactId: "PackSingle", engineVersions: ["UE_5.1", "UE_5.4"], targetPlatforms: ["Windows"] }],
+          },
+        ],
+        umodelListExitCode: 1,
+        importDirectory: (request) => {
+          requests.push(request);
+          return importUnrealDirectory({
+            ...request,
+            modernConverter: { name: "modern", path: converter, version: "Test format hint" },
+          });
+        },
+      });
+      const header = Buffer.alloc(32);
+      header.writeUInt32LE(0x9e2a83c1, 0);
+      header.writeInt32LE(-9, 4);
+      await writeFile(
+        join(test.root, "pack-source", "Content", "Game", "SM_Rock.uasset"),
+        Buffer.concat([header, Buffer.from("StaticMesh\0Default__StaticMesh\0")]),
+      );
+      const fixture = join(test.root, "profile-static.glb");
+      await new NodeIO().write(fixture, await new NodeIO().read(join(test.root, "exported", "SM_Rock.gltf")));
+      const argvLog = join(test.root, "modern-argv.log");
+      converter = await writeEngineProfileConverter(join(test.root, "modern-converter"), {
+        argvLog,
+        succeedOn: "5.1",
+        outputs: [{ path: "Meshes/SM_Rock.glb", fixture }],
+      });
+
+      const result = await test.handler({
+        listingIdOrUrl: LISTING,
+        outputDir: test.outputDir,
+        acceptFabEula: true,
+      });
+      if ("isError" in result) throw new Error(JSON.stringify(result));
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.engine).toBeUndefined();
+      expect(requests[0]?.formatHint).toBe("UE_5.1");
+      const download = (await test.invocations()).find((argv) => argv[0] === "download");
+      expect(download).toEqual(["download", LISTING, "--output", expect.any(String)]);
+      const runs = (await readFile(argvLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
+      expect(runs.map((argv) => argv[argv.indexOf("--engine") + 1])).toEqual(["5.1"]);
+    });
+
+    it("hands the chosen artifact's oldest engine to the importer however the artifact was chosen", async () => {
+      const requests: ImportUnrealRequest[] = [];
+      const test = await harness({
+        formats: OVERLAPPING,
+        importDirectory: (request) => {
+          requests.push(request);
+          return importUnrealDirectory(request);
+        },
+      });
+      const cases = [
+        { name: "route-choice", input: {}, hint: "UE_5.0" },
+        { name: "artifact-id", input: { artifactId: "PackOld" }, hint: "UE_4.18" },
+        { name: "artifact-id-over-engine", input: { artifactId: "PackNew", engine: "UE_4.18" }, hint: "UE_5.0" },
+        { name: "explicit-engine", input: { engine: "UE_4.18" }, hint: "UE_4.18" },
+      ];
+      for (const { name, input } of cases) {
+        const result = await test.handler({ listingIdOrUrl: LISTING, outputDir: join(test.outputDir, name), acceptFabEula: true, ...input });
+        if ("isError" in result) throw new Error(JSON.stringify(result));
+      }
+      expect(requests.map((request) => request.formatHint)).toEqual(cases.map((entry) => entry.hint));
     });
 
     it("names the available artifacts when the id is absent", async () => {

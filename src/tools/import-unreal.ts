@@ -637,6 +637,9 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
           );
         }
       }
+      // The format hint is the selected artifact's oldest engine, even when FabCLI was not narrowed to it: a guess at
+      // the format that the importer tries first and falls back from on a mismatch. The download request is unchanged.
+      const formatHint = oldestEngine(selected.engineVersions);
       const stagingDir = join(fabDownloadRoot(environment), listingId, selected.artifactId);
       await mkdir(stagingDir, { recursive: true });
 
@@ -697,6 +700,7 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
         outputDir,
         listingId,
         engine,
+        formatHint,
         sourceKind: "fab-listing",
         onlyPackages: input.packages,
         authenticatedDownload: true,

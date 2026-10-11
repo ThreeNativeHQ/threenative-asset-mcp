@@ -25,6 +25,7 @@ import { reduceSourceMaterial, sameSourceCoordinates, type SourceMaterial } from
 import { promoteRgba16fDataTexture } from "./data-texture-promotion.js";
 import { decodeGroomPayload, groomSidecar, type GroomStrands } from "./grooms.js";
 import { ImportError } from "./errors.js";
+import { dumpEngineArg } from "../fab/routes.js";
 import { extractUnrealFonts } from "./fonts.js";
 import { parseOfflineFontDescriptor, writeOfflineFont } from "./bitmap-fonts.js";
 import {
@@ -43,6 +44,7 @@ import {
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
 import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphPbrFactors, type GraphTextureSource } from "./graph-baker.js";
+import { dumpMaterialGraphs } from "./graph-dump.js";
 import { assertEngineContentDirectory, canonicalEngineReference, engineContentFromEnvironment, isEngineReference, type EngineContentConfig } from "./engine-content.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
@@ -435,6 +437,13 @@ export interface ImportUnrealRequest {
   readonly outputDir: string;
   readonly listingId?: string | undefined;
   readonly engine?: string | undefined;
+  /**
+   * The `UE_x.y` a Fab artifact's packages are read as: its oldest listed engine, a guess at the format rather than the
+   * saved tag. Every modern converter decode of the pack, graph dump included, tries it first when it names a fallback
+   * profile, and the cache key carries that profile. An `engine` the request names still wins on the routes that take one.
+   * Engine content keeps its own configured version.
+   */
+  readonly formatHint?: string | undefined;
   readonly sourceKind?: "local-directory" | "fab-listing";
   readonly authenticatedDownload?: boolean;
   readonly fabcliVersion?: string | undefined;
@@ -1026,6 +1035,31 @@ function isEngineProfileMismatch(output: string): boolean {
 }
 
 /**
+ * The `--engine` profile a `UE_x.y` format hint names, when it is one of the modern converter's fallback profiles. The selector is
+ * parsed as every other one is (`dumpEngineArg`), so a padded hint is the hint it names and a malformed one is no hint at all.
+ */
+function modernHintProfile(formatHint: string | undefined): string | undefined {
+  const profile = formatHint === undefined ? undefined : dumpEngineArg(formatHint);
+  return profile !== undefined && (MODERN_ENGINE_FALLBACKS as readonly string[]).includes(profile) ? profile : undefined;
+}
+
+/**
+ * The graph dump under a format hint: the hinted profile first, then the one unhinted run the dump made before hints existed, and
+ * only after a profile mismatch. An engine the request names is the one profile the dump runs, and the hint does not override it.
+ */
+function dumpGraphsUnderHint(profile: string): typeof dumpMaterialGraphs {
+  return async (sourceDir, options = {}) => {
+    if (options.engine !== undefined) return dumpMaterialGraphs(sourceDir, options);
+    try {
+      return await dumpMaterialGraphs(sourceDir, { ...options, engine: profile });
+    } catch (error) {
+      if (!isEngineProfileMismatch(error instanceof Error ? error.message : String(error))) throw error;
+      return dumpMaterialGraphs(sourceDir, options);
+    }
+  };
+}
+
+/**
  * The converter explains a texture it could not write on stderr (`threenative-texture-failure
  * <name>: <reason>; <evidence>`), ahead of the generic "no output" exception. Surfacing that line
  * turns a bare exit code into a stated pack limitation, such as pixel data that is not in the pack.
@@ -1104,8 +1138,10 @@ async function runModernConverter(
   outputDir: string,
   tailArgs: readonly string[],
   limits: { readonly timeoutMs: number; readonly maxOutputBytes: number },
+  hintProfile?: string,
 ) {
-  const attempts: (typeof MODERN_ENGINE_FALLBACKS[number] | undefined)[] = [undefined, ...MODERN_ENGINE_FALLBACKS];
+  // The hinted profile goes first, and the Set drops the repeat the fallbacks would otherwise run again.
+  const attempts = [...new Set<string | undefined>([hintProfile, undefined, ...MODERN_ENGINE_FALLBACKS])];
   let last: Awaited<ReturnType<typeof runBounded>> | undefined;
   for (const engine of attempts) {
     const attempt = `${outputDir}.engine-${engine ?? "auto"}`;
@@ -2846,6 +2882,9 @@ export async function importUnrealDirectory(
   // Read only when graph baking can use it; without it the key is the one it was before engine content existed.
   const engineContent = request.graphBake !== false ? engineContentFromEnvironment(environment) : undefined;
   const engineContentKey = engineContent ? await engineContentIdentity(engineContent) : undefined;
+  // The format hint picks the profile every modern decode tries first, so a supported one is part of the identity. A missing or
+  // unsupported hint is no hint at all: its key is the one it had before the hint existed.
+  const formatProfile = modernHintProfile(request.formatHint);
   const cacheKey = createHash("sha256")
     .update(
       JSON.stringify({
@@ -2860,6 +2899,7 @@ export async function importUnrealDirectory(
         only: request.onlyPackages ? [...request.onlyPackages].sort() : null,
         lods: lodsArg ?? null,
         ...(engineContentKey ? { engineContent: engineContentKey } : {}),
+        ...(formatProfile ? { formatProfile } : {}),
         uncookedConverter: request.uncookedConverter?.version ?? null,
         modernConverter: request.modernConverter?.version ?? null,
       }),
@@ -3371,7 +3411,7 @@ export async function importUnrealDirectory(
           const converted = await runModernConverter(converter.path, sourceDir, isolated, ["--filter", selector], {
             timeoutMs: 1_800_000,
             maxOutputBytes: 32 * 1024 * 1024,
-          });
+          }, formatProfile);
           if (converted.code !== 0) {
             const cause = modernConverterFailureCause(converted);
             log(`Graph texture ${name}: the modern converter exited ${converted.code}${cause ? `: ${cause}` : "."}`);
@@ -3404,6 +3444,7 @@ export async function importUnrealDirectory(
     modernConverter: request.modernConverter,
     maxTextureSize: request.maxTextureSize,
     engineContent,
+    ...(formatProfile ? { dumpGraphs: dumpGraphsUnderHint(formatProfile) } : {}),
   });
   const soundPackages = classified.filter((entry) => entry.hasSound && !entry.error);
   const dataPackages = classified.filter((entry) => entry.dataClass !== undefined && !entry.error);
@@ -3740,12 +3781,16 @@ export async function importUnrealDirectory(
         await mkdir(converterOutput, { recursive: true });
         graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
         const converter = await graphTextureConverter;
+        const limits = { timeoutMs: 1_800_000, maxOutputBytes: 16 * 1024 * 1024 };
+        // With no engine named, a hint that names a fallback profile is tried first and the fallbacks follow, as on the other modern
+        // decodes. An engine the request names is the one profile this route runs, and the hint does not override it. With neither,
+        // the single run is unchanged.
+        if (request.engine === undefined && formatProfile !== undefined) {
+          return runModernConverter(converter.path, sourceDir, converterOutput, ["--data-texture", entry.selector], limits, formatProfile);
+        }
         // The CUE4Parse route reads a UE4 package as the latest UE4 unless its engine is named: the request's `UE_4.19` selector.
         const engineArgs = request.engine === undefined ? [] : ["--engine", request.engine.slice("UE_".length)];
-        return runBounded(converter.path, [sourceDir, "--export-dir", converterOutput, "--data-texture", entry.selector, ...engineArgs], {
-          timeoutMs: 1_800_000,
-          maxOutputBytes: 16 * 1024 * 1024,
-        });
+        return runBounded(converter.path, [sourceDir, "--export-dir", converterOutput, "--data-texture", entry.selector, ...engineArgs], limits);
       });
     const results = await mapWithConcurrency(texturesNeedingExport, 1, async (entry, index) => {
       const name = basename(entry.package, extname(entry.package));
@@ -3978,7 +4023,7 @@ export async function importUnrealDirectory(
     const converted = await runModernConverter(modernConverter.path, sourceDir, modernRaw, args, {
       timeoutMs: 1_800_000,
       maxOutputBytes: 64 * 1024 * 1024,
-    });
+    }, formatProfile);
     if (converted.code !== 0) {
       // A static mesh old enough for UE Viewer never needed the modern converter, so one
       // converter crash must not take a mesh UE Viewer can read down with it. That fallback is only
@@ -4020,7 +4065,7 @@ export async function importUnrealDirectory(
         const run = await runModernConverter(modernConverter!.path, sourceDir, isolated, ["--filter", entry.selector], {
           timeoutMs: 1_800_000,
           maxOutputBytes: 64 * 1024 * 1024,
-        });
+        }, formatProfile);
         const glb = run.code === 0 ? (await indexGlbs(isolated)).get(basename(entry.package, extname(entry.package))) : undefined;
         isolatedMeshGlbs.set(entry.file, glb);
       });
@@ -4076,6 +4121,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       // The raw route answers one failure: the converter could not encode this texture as a PNG. That is its own "no decodable
       // pixel data" for this package, or an exit with no PNG at all. Any other failure is reported as it is, without a retry.
@@ -4084,7 +4130,7 @@ export async function importUnrealDirectory(
           runModernConverter(modernConverter!.path, sourceDir, converterOutput, ["--data-texture", entry.selector], {
             timeoutMs: 1_800_000,
             maxOutputBytes: 32 * 1024 * 1024,
-          }),
+          }, formatProfile),
         );
       if (converted.code !== 0) {
         const cause = modernConverterFailureCause(converted);
@@ -4131,6 +4177,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, spriteDescriptors: [] as string[], modelSources: [] as { name: string; glb: string }[], reason: `The modern level converter exited ${converted.code}.` };
       const emitted = await listFiles(isolated);
@@ -4171,6 +4218,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 },
+        formatProfile,
       );
       // A logic-only Blueprint (event graph, no mesh or light components) converts to nothing;
       // the converter says so explicitly, and that is content with nothing to place, not a failure.
@@ -4216,6 +4264,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, reason: `The modern Material converter exited ${converted.code}.` };
       const exported = await indexExported(isolated);
@@ -4266,6 +4315,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, reason: `The modern UE5 sound converter exited ${converted.code}.` };
       const exported = await indexExported(isolated);
@@ -4299,6 +4349,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, reason: `The TextureCube converter exited ${converted.code}.` };
       const source = (await listFiles(isolated)).find((file) =>
@@ -4332,6 +4383,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) {
         const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));
@@ -4367,6 +4419,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) {
         const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));
@@ -4402,6 +4455,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, reason: `The offline font converter exited ${converted.code}.` };
       const descriptor = (await listFiles(isolated)).find((file) =>
@@ -4429,6 +4483,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) {
         const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));

@@ -399,3 +399,49 @@ process.exit(70);
   await writeFile(path, script);
   await chmod(path, 0o755);
 }
+
+/**
+ * A modern converter stub for the engine-profile tests. Every run appends its argv (one JSON array per
+ * line) to `argvLog`. A run whose `--engine` is one of `succeedOn` (`auto` names a run with none) copies
+ * each of `outputs` into its export directory; any other run leaves a partial file behind and fails the
+ * way a profile mismatch does, or with an unrelated error when `unrelated` is set.
+ */
+export async function writeEngineProfileConverter(
+  file: string,
+  options: {
+    readonly argvLog: string;
+    readonly succeedOn: string | readonly string[];
+    /** Copied into the export directory at `path`, relative to it, when the run succeeds. */
+    readonly outputs: readonly { readonly path: string; readonly fixture: string }[];
+    readonly unrelated?: boolean;
+  },
+): Promise<string> {
+  const failure = options.unrelated
+    ? "fatal: the export writer reached an unexpected end of stream"
+    : "ParserException: Invalid FString length while decoding an unversioned package";
+  const succeedOn = typeof options.succeedOn === "string" ? [options.succeedOn] : options.succeedOn;
+  await writeFile(
+    file,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const argv = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(options.argvLog)}, JSON.stringify(argv) + "\\n");
+const engineAt = argv.indexOf("--engine");
+const engine = engineAt >= 0 ? argv[engineAt + 1] : "auto";
+const out = argv[argv.indexOf("--export-dir") + 1];
+fs.mkdirSync(out, { recursive: true });
+if (!${JSON.stringify(succeedOn)}.includes(engine)) {
+  fs.writeFileSync(path.join(out, "partial-output-must-not-promote.txt"), engine);
+  console.error(${JSON.stringify(failure)});
+  process.exit(1);
+}
+for (const output of ${JSON.stringify(options.outputs)}) {
+  fs.mkdirSync(path.dirname(path.join(out, output.path)), { recursive: true });
+  fs.copyFileSync(output.fixture, path.join(out, output.path));
+}
+`,
+  );
+  await chmod(file, 0o755);
+  return file;
+}
