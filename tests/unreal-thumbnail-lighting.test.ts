@@ -35,6 +35,19 @@ describe("UE 4.19.2 thumbnail reference lighting", () => {
     expect(rig.limitations.join(" ")).toMatch(/hemisphere.*cubemap/i);
   });
 
+  it("pins the primary's shadow map to 1024 at bias -0.0005, leaves the other lights at Three's defaults, and casts nothing when shadows are off", () => {
+    const rig = applyThumbnailReferenceLighting(THREE, new THREE.Scene(), { shadows: true });
+    const fresh = new THREE.DirectionalLight().shadow;
+    expect(rig.primary.shadow.mapSize.toArray()).toEqual([1024, 1024]);
+    expect(rig.primary.shadow.bias).toBe(-0.0005);
+    for (const light of rig.lights.filter((light) => light !== rig.primary)) {
+      expect(light.shadow.mapSize.toArray()).toEqual(fresh.mapSize.toArray());
+      expect(light.shadow.bias).toBe(fresh.bias);
+    }
+    const unshadowed = applyThumbnailReferenceLighting(THREE, new THREE.Scene(), { shadows: false });
+    expect(unshadowed.lights.map((light) => light.castShadow)).toEqual([false, false, false]);
+  });
+
   it("uses a supplied decoded environment without inventing a sky colour or changing the texture", () => {
     const scene = new THREE.Scene();
     const environment = new THREE.DataTexture(new Float32Array([2.18, 0.13, 0.16, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType);

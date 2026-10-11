@@ -40,10 +40,10 @@ export type PictureLighting = "neutral" | "unreal-like";
 /** The fixed camera every render pass shares (so a change of lighting is the only difference between passes). */
 export const PICTURE_CAMERA = Object.freeze({ fov: 40, direction: [1, 0.75, 1.2] as const, fit: 1.05 });
 /**
- * Renderer state of every `unreal-like` picture pass: UE 4.19 filmic at exposure 1, approximated by Three's ACES. The page reads
- * these values, so a test that pins them pins the picture itself.
+ * Renderer state of every `unreal-like` picture pass: UE 4.19 filmic at exposure 1, approximated by Three's ACES, and the primary's
+ * requested PCFSoftShadowMap (Three 0.185.1 renders this as PCFShadowMap). The page consumes these configured values.
  */
-export const PICTURE_RENDERER = Object.freeze({ toneMapping: "ACESFilmicToneMapping", toneMappingExposure: 1 });
+export const PICTURE_RENDERER = Object.freeze({ toneMapping: "ACESFilmicToneMapping", toneMappingExposure: 1, shadowMapType: "PCFSoftShadowMap" });
 /**
  * Revision of the `unreal-like` picture contract: its lights, camera, tone mapping, floor and source handling. Bump it whenever
  * one of those changes, so a stored picture is never taken for one this renderer would draw (`preview-reference-workflow.ts`).
@@ -425,7 +425,7 @@ try {
     key = referenceRig.primary;
     if (shadows) {
       renderer.shadowMap.enabled = true;
-      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.shadowMap.type = THREE[options.renderer.shadowMapType];
     }
     if (options.grid) {
       // The Grid bytes come from their own fixed endpoint. The floor helper does the sRGB, repeat and filter setup; the caller owns the texture.
