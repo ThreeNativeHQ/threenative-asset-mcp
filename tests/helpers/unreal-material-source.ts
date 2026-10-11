@@ -72,7 +72,9 @@ export function materialPackage(exports: SourceExport[], external: string[] = []
     ...(p.type === "ArrayProperty" ? [fname(p.inner!)] : []), Buffer.from([0]), body,
   ]);
   const encodeProperties = (properties: SourceProperty[]) => Buffer.concat([...properties.map((p) => encodeTag(p, encodeValue(p))), fname("None")]);
-  const bodies = exports.map((e) => encodeProperties(e.properties));
+  // Every UE4 export ends its tags with a 32-bit ObjectGuid flag (CUE4Parse's UObject.Deserialize reads it for each non-default
+  // object). Without it the read runs one int past the body, which CUE4Parse logs as a failed read of the whole material.
+  const bodies = exports.map((e) => Buffer.concat([encodeProperties(e.properties), Buffer.alloc(4)]));
   const importTable = Buffer.concat(imports.map((r) => Buffer.concat([fname("/Script/Engine"), fname(r.className), i32(r.outer), fname(r.name)])));
   exports.forEach((e) => fname(e.name));
   const summary = (nameOffset: number, importOffset: number, exportOffset: number, headerSize: number) => Buffer.concat([

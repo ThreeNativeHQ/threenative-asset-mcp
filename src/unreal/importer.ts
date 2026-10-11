@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Root, type Texture } from "@gltf-transform/core";
+import { BufferUtils, Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Root, type Texture } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsSpecular, KHRMaterialsUnlit } from "@gltf-transform/extensions";
 import { attachPsaAnimations, parsePsa, type PsaFile } from "./psa.js";
 
@@ -59,7 +59,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 101;
+export const IMPORTER_VERSION = 102;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1651,6 +1651,30 @@ function inputNormalVerdict(proof: NormalDependencies | undefined, names: readon
   return { cleared: false, note: `${label} kept as the normal map, unverified: it matches neither a texture the graph's active Normal reads (${reads}) nor the dropped flattened normal.` };
 }
 
+/**
+ * Embeds an identical texture once. The importer keys a file-backed texture by its absolute source path, so the same PNG
+ * exported into two isolated folders became two images. glTF-Transform's `dedup` compares bytes and MIME type (names only
+ * under `keepUniqueNames`) but never extras or extensions, so this keeps a narrow index per document: a texture merges only
+ * into a texture with the same name, MIME type and extras, no extensions, and byte-equal content. Only textures move;
+ * TextureInfo samplers, texCoords and factors stay with their materials.
+ */
+function embedIdenticalTextures(document: Document): void {
+  const firstByKey = new Map<string, Texture>();
+  const duplicates: [duplicate: Texture, survivor: Texture][] = [];
+  for (const texture of document.getRoot().listTextures()) {
+    const image = texture.getImage();
+    if (!image || texture.listExtensions().length > 0) continue;
+    const key = [texture.getName(), texture.getMimeType(), JSON.stringify(texture.getExtras()), createHash("sha256").update(image).digest("hex")].join("\0");
+    const first = firstByKey.get(key);
+    if (!first) firstByKey.set(key, texture);
+    else if (BufferUtils.equals(first.getImage()!, image)) duplicates.push([texture, first]);
+  }
+  for (const [duplicate, survivor] of duplicates) {
+    for (const parent of duplicate.listParents()) if (parent.propertyType !== "Root") parent.swap(duplicate, survivor);
+    duplicate.dispose();
+  }
+}
+
 export async function packageGlb(options: {
   readonly gltfPath: string;
   /** The mesh package's material imports, object name (lower case) -> package path; see `scopeMaterialFiles`. */
@@ -2392,6 +2416,7 @@ export async function packageGlb(options: {
     }
   }
 
+  embedIdenticalTextures(document);
   await mkdir(dirname(options.glbPath), { recursive: true });
   await io.write(options.glbPath, document);
 

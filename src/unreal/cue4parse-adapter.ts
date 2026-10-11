@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.72",
+  version: "b4e95441+threenative.73",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -413,6 +413,7 @@ using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Exports.Material;
+using CUE4Parse.UE4.Assets.Exports.Material.Parameters;
 using CUE4Parse.UE4.Assets.Exports.Sound;
 using CUE4Parse.UE4.Assets.Exports.Engine;
 using CUE4Parse.UE4.Assets.Exports.Engine.Font;
@@ -1567,6 +1568,9 @@ Exception? lastLoadError = null;
 var textureFailures = new List<string>();
 var selectedExportTypes = new HashSet<string>(StringComparer.Ordinal);
 var exportedMaterials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+// Refused materials by qualified identity. Bounded: the first 64 are kept, and later refusals are counted. Either fails the conversion.
+var materialFailures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+var materialFailuresDropped = 0;
 // Materials/<name>.mat and .props.txt per sidecar name -> the package that owns it (see MaterialSidecarName).
 var materialSidecarOwners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var exportedSprites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1707,6 +1711,19 @@ async Task WriteMeshMaterialPackagesAsync(string meshName, IEnumerable<FPackageI
     await File.WriteAllTextAsync(Path.Combine(output, "Meshes", meshName + ".materials.json"), JsonConvert.SerializeObject(known2));
 }
 
+// A refused material is recorded by its identity and fails the conversion at completion. The reason is flattened and bounded like
+// a mesh failure, so a long CUE4Parse message cannot grow the report.
+void RecordMaterialFailure(string identity, string reason)
+{
+    if (!materialFailures.ContainsKey(identity) && materialFailures.Count >= 64)
+    {
+        materialFailuresDropped++;
+        return;
+    }
+    var flat = string.Join(' ', reason.Split(new[] { '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    materialFailures[identity] = flat.Length <= 500 ? flat : flat[..500];
+}
+
 async Task ExportMaterialAsync(string initialName, string? initialPath = null)
 {
     var pending = new Queue<(string Name, string? Path)>();
@@ -1772,7 +1789,6 @@ async Task ExportMaterialAsync(string initialName, string? initialPath = null)
         var materialDirectory = Path.Combine(output, "Materials");
         Directory.CreateDirectory(materialDirectory);
         var mat = string.Join("\n", references.Select((entry, index) => $"Other[{index}]={entry.Texture}")) + "\n";
-        await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".mat"), mat);
         var props = new StringBuilder();
         // The parent's package path lets the importer pick between same-named parents.
         if (parentName.Length > 0) props.AppendLine($"Parent = Material'{(parentPath is null ? parentName : parentPath)}.{parentSidecar}'");
@@ -1800,7 +1816,25 @@ async Task ExportMaterialAsync(string initialName, string? initialPath = null)
             props.AppendLine("    }");
         }
         props.AppendLine("}");
-        await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".props.txt"), props.ToString());
+        // The overrides are read before either sidecar is written. A refused material writes neither, but it is recorded by its
+        // identity, so the conversion fails at completion. Its textures are still extracted below, as the rest of the output is.
+        var identity = $"{GamePackagePath(materialKey)}.{material.Name}";
+        string? refusal = null;
+        if (material is UMaterialInstance overridden)
+        {
+            try { props.Append(MaterialOverrides.Blocks(overridden, material.Name, packageReadFailures)); }
+            catch (MaterialOverrides.Refusal error) { refusal = error.Message; }
+        }
+        if (refusal is null)
+        {
+            await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".mat"), mat);
+            await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".props.txt"), props.ToString());
+        }
+        else
+        {
+            Console.Error.WriteLine($"material overrides refused {material.Name}: {refusal}");
+            RecordMaterialFailure(identity, refusal);
+        }
 
         foreach (var textureName in references.Select(entry => entry.Texture).Distinct(StringComparer.OrdinalIgnoreCase))
         {
@@ -2778,6 +2812,13 @@ if (exported == 0 && mappingRequired) throw new InvalidDataException("This cooke
 if (exported == 0 && lastLoadError is not null) throw new InvalidDataException("CUE4Parse could not decode the selected Unreal package.", lastLoadError);
 if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
 
+// A refused material fails the conversion even when a mesh or texture in the same package exported: the output is incomplete, and a
+// successful sibling cannot publish it as whole.
+if (materialFailures.Count > 0) throw new InvalidDataException(
+    $"{materialFailures.Count + materialFailuresDropped} material(s) could not be imported with their overrides, so the conversion is incomplete:\n" +
+    string.Join("\n", materialFailures.Select(entry => $"{entry.Key}: {entry.Value}")) +
+    (materialFailuresDropped > 0 ? $"\n... and {materialFailuresDropped} more" : ""));
+
 static byte[] EncodeBgre8AsRadiance(byte[] source, int width, int height)
 {
     if (width <= 0 || height <= 0 || width != height * 2 || (long) width * height * 4 != source.Length)
@@ -3681,6 +3722,197 @@ static EGame ParseGame(string version) => version switch
     "4.0" => EGame.GAME_UE4_0,
     _ => throw new ArgumentException($"unsupported --engine version {version}")
 };
+
+// The instance's own overrides, written as .props.txt blocks. A row is written only when CUE4Parse read it whole: a tagged row must
+// carry the tags it needs, and a binary row must come from a material whose read raised no logged failure. Presence is the tag
+// list: a missing tag is never read as 0, false or a default colour. The typed views of a tagged set are not used: GetParams
+// flattens the parent's values into the instance, and GetOrDefault cannot tell an absent field from a zero one.
+public static class MaterialOverrides
+{
+    public sealed class Refusal(string message) : Exception(message);
+
+    // A parameter as the blocks name it. Association and Index are null when the source did not hold them; Guid is null when zero.
+    sealed record ParameterIdentity(string Name, string? Association, int? Index, string? Guid);
+
+    // A switch row. A row that does not override (Enabled false) writes nothing and inherits the parent's value.
+    readonly record struct SwitchRow(ParameterIdentity Identity, bool Enabled, bool Value);
+
+    // Everything is read before any text is returned, so a refused material leaves the caller nothing to write.
+    public static string Blocks(UMaterialInstance instance, string material, IReadOnlyDictionary<string, string> readFailures)
+    {
+        var scalars = Rows(instance, "ScalarParameterValues", material, readFailures) ?? Array.Empty<FStructFallback>();
+        var vectors = Rows(instance, "VectorParameterValues", material, readFailures) ?? Array.Empty<FStructFallback>();
+        var switches = SwitchRows(instance, material, readFailures);
+        var text = new StringBuilder();
+
+        var scalarNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var index = 0;
+        foreach (var row in scalars)
+        {
+            var identity = Claim(TaggedIdentity(row, "ScalarParameterValues"), "ScalarParameterValues", scalarNames);
+            var value = Required<float>(row, "ParameterValue", "ScalarParameterValues");
+            if (!float.IsFinite(value)) throw new Refusal($"ScalarParameterValues row '{identity.Name}' has a non-finite ParameterValue");
+            Block(text, "ScalarParameterValues", index++, [$"    ParameterValue = {Number(value)}", .. Lines(identity)]);
+        }
+
+        var vectorNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        index = 0;
+        foreach (var row in vectors)
+        {
+            var identity = Claim(TaggedIdentity(row, "VectorParameterValues"), "VectorParameterValues", vectorNames);
+            var color = Required<FLinearColor>(row, "ParameterValue", "VectorParameterValues");
+            if (!float.IsFinite(color.R) || !float.IsFinite(color.G) || !float.IsFinite(color.B) || !float.IsFinite(color.A))
+                throw new Refusal($"VectorParameterValues row '{identity.Name}' has a non-finite channel");
+            var value = $"{{R={Number(color.R)},G={Number(color.G)},B={Number(color.B)},A={Number(color.A)}}}";
+            Block(text, "VectorParameterValues", index++, [$"    ParameterValue = {value}", .. Lines(identity)]);
+        }
+
+        // Every row claims its identity, enabled or not, so a disabled row cannot share a name with an override.
+        var switchNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        index = 0;
+        foreach (var row in switches)
+        {
+            Claim(row.Identity, "StaticSwitchParameters", switchNames);
+            // bOverride = false inherits the parent's value, so the row writes nothing.
+            if (!row.Enabled) continue;
+            Block(text, "StaticSwitchParameters", index++, [$"    Value = {(row.Value ? "true" : "false")}", "    bOverride = true", .. Lines(row.Identity)]);
+        }
+        return text.ToString();
+    }
+
+    // The switch rows the instance overrides with. A tagged set (StaticParameters, else its runtime copy) is read tag by tag, so its
+    // presence is the evidence. A binary set carries no tags, and a read that stopped early leaves a short list that looks whole, so
+    // it is trusted only when the material's read raised no logged failure.
+    static List<SwitchRow> SwitchRows(UMaterialInstance instance, string material, IReadOnlyDictionary<string, string> readFailures)
+    {
+        var field = Has(instance, "StaticParameters") ? "StaticParameters" : Has(instance, "StaticParametersRuntime") ? "StaticParametersRuntime" : null;
+        if (field is not null)
+        {
+            if (!instance.TryGetValue<FStructFallback>(out var set, field)) throw new Refusal($"{field} is present but cannot be read");
+            return (Rows(set, "StaticSwitchParameters", material, readFailures) ?? Array.Empty<FStructFallback>()).Select(TaggedSwitch).ToList();
+        }
+        if (readFailures.TryGetValue(material, out var failure))
+            throw new Refusal($"its static switches are read from the binary StaticParameters, and the material did not read completely ({failure})");
+        return (instance.StaticParameters?.StaticSwitchParameters ?? Array.Empty<FStaticSwitchParameter>()).Select(BinarySwitch).ToList();
+    }
+
+    static SwitchRow TaggedSwitch(FStructFallback row)
+    {
+        var identity = TaggedIdentity(row, "StaticSwitchParameters");
+        var enabled = Required<bool>(row, "bOverride", "StaticSwitchParameters");
+        // A row that inherits needs no value, so its Value tag is required only when it overrides.
+        return new SwitchRow(identity, enabled, enabled && Required<bool>(row, "Value", "StaticSwitchParameters"));
+    }
+
+    // A row CUE4Parse read from the binary archive. The archive reads a bare name and sets the index to -1, and the parameterless
+    // FMaterialParameterInfo it runs on sets the association to global. Layer parameters did not exist in this format.
+    static SwitchRow BinarySwitch(FStaticSwitchParameter row)
+    {
+        if (row is null) throw new Refusal("StaticSwitchParameters has a row that could not be read");
+        var info = row.ParameterInfo ?? throw new Refusal("StaticSwitchParameters row has no ParameterInfo, so its name is not known");
+        if (info.Association != EMaterialParameterAssociation.GlobalParameter)
+            throw new Refusal($"StaticSwitchParameters row is a {info.Association} parameter, and only global parameters are supported");
+        if (info.Index != -1) throw new Refusal("StaticSwitchParameters row has a layer index, which only layer parameters use");
+        var identity = new ParameterIdentity(Admit(info.Name.Text ?? "", "StaticSwitchParameters"), info.Association.ToString(), info.Index, ExpressionGuid(row.ExpressionGuid));
+        return new SwitchRow(identity, row.bOverride, row.Value);
+    }
+
+    // The parameter a tagged row overrides. The association is required: an absent one would read as the enum's first member, a layer.
+    // The index and the expression GUID are written only when their tags hold them, never as defaults.
+    static ParameterIdentity TaggedIdentity(FStructFallback row, string owner)
+    {
+        if (row is null) throw new Refusal($"{owner} has a row that could not be read");
+        string name;
+        string? association = null;
+        int? index = null;
+        if (Has(row, "ParameterInfo"))
+        {
+            var info = Required<FStructFallback>(row, "ParameterInfo", owner);
+            var value = Required<EMaterialParameterAssociation>(info, "Association", owner);
+            if (value != EMaterialParameterAssociation.GlobalParameter)
+                throw new Refusal($"{owner} row is a {value} parameter, and only global parameters are supported");
+            if (Has(info, "Index"))
+            {
+                index = Required<int>(info, "Index", owner);
+                if (index != -1) throw new Refusal($"{owner} row has a layer index, which only layer parameters use");
+            }
+            association = value.ToString();
+            name = Required<FName>(info, "Name", owner).Text ?? "";
+        }
+        else
+        {
+            // Legacy rows predate layer parameters and name the parameter directly, so they carry no association or index to write.
+            name = Required<FName>(row, "ParameterName", owner).Text ?? "";
+        }
+        var guid = Has(row, "ExpressionGUID") ? ExpressionGuid(Required<FGuid>(row, "ExpressionGUID", owner)) : null;
+        return new ParameterIdentity(Admit(name, owner), association, index, guid);
+    }
+
+    static string Admit(string name, string owner)
+    {
+        if (name is "" or "None" || name != name.Trim() || name.IndexOfAny(new[] { '{', '}', '\r', '\n' }) >= 0)
+            throw new Refusal($"{owner} row names '{name}', which the .props.txt blocks cannot carry");
+        return name;
+    }
+
+    // Rows claim a parameter by its identity: name, association and index. Two claims on one identity are a collision.
+    static ParameterIdentity Claim(ParameterIdentity identity, string owner, HashSet<string> claimed)
+    {
+        if (!claimed.Add($"{identity.Association}|{identity.Index}|{identity.Name}"))
+            throw new Refusal($"{owner} has two rows named '{identity.Name}', so their identity collides");
+        return identity;
+    }
+
+    // An absent GUID reads as zero, which is also how a binary row without one reads, so a zero GUID is left out rather than written.
+    static string? ExpressionGuid(FGuid guid) =>
+        guid.A == 0 && guid.B == 0 && guid.C == 0 && guid.D == 0 ? null : guid.ToString();
+
+    // The parameter's own block fields. Only what the source held is written: an absent index or GUID is not invented.
+    static IEnumerable<string> Lines(ParameterIdentity identity)
+    {
+        yield return "    ParameterInfo =";
+        yield return "    {";
+        yield return $"        Name = {identity.Name}";
+        if (identity.Association is not null) yield return $"        Association = {identity.Association}";
+        if (identity.Index is not null) yield return $"        Index = {identity.Index}";
+        yield return "    }";
+        if (identity.Guid is not null) yield return $"    ExpressionGUID = {identity.Guid}";
+    }
+
+    // Present is the array, empty included. Absent means no override only when the read completed. The only completion evidence
+    // read here is CUE4Parse's logged read failure for this export, keyed by its name; a list cut short without a logged failure
+    // cannot be detected from the converter.
+    static FStructFallback[]? Rows(AbstractPropertyHolder holder, string field, string material, IReadOnlyDictionary<string, string> readFailures)
+    {
+        if (Has(holder, field))
+        {
+            if (holder.TryGetValue<FStructFallback[]>(out var rows, field)) return rows ?? Array.Empty<FStructFallback>();
+            throw new Refusal($"{field} is present but its rows cannot be read");
+        }
+        if (readFailures.TryGetValue(material, out var failure))
+            throw new Refusal($"{field} is absent and the material did not read completely ({failure})");
+        return null;
+    }
+
+    static bool Has(AbstractPropertyHolder holder, string field) => holder.Properties.Any(tag => tag.Name.Text == field);
+
+    static T Required<T>(AbstractPropertyHolder holder, string field, string owner)
+    {
+        if (!Has(holder, field)) throw new Refusal($"{owner} row has no {field} tag, so its value is not known");
+        if (!holder.TryGetValue<T>(out var value, field)) throw new Refusal($"{owner} row's {field} tag cannot be read as {typeof(T).Name}");
+        return value;
+    }
+
+    static void Block(StringBuilder text, string collection, int index, IEnumerable<string> fields)
+    {
+        text.AppendLine($"{collection}[{index}] =");
+        text.AppendLine("{");
+        foreach (var field in fields) text.AppendLine(field);
+        text.AppendLine("}");
+    }
+
+    static string Number(float value) => value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+}
 
 public sealed class PackageReadFailureSink(Dictionary<string, string> failures) : Serilog.Core.ILogEventSink
 {
