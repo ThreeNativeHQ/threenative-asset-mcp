@@ -2757,6 +2757,162 @@ describe("standard math nodes and engine utility functions seen on real BaseColo
   });
 });
 
+describe("Distance: the length of A - B over the components both operands keep", () => {
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  const constant2 = (id: string, rg: [number, number]): Raw => node(id, "Constant2Vector", { constants: { R: rg[0], G: rg[1] } });
+  const constant4 = (id: string, values: number[]): Raw => node(id, "Constant4Vector", { constants: { Constant: values } });
+  const distance = (a: ReturnType<typeof pin>, b: ReturnType<typeof pin>): Raw => node("d", "Distance", { inputs: { A: a, B: b } });
+  /** The grey every channel of a scalar BaseColor encodes to. */
+  const grey = (linear: number) => [encode(linear), encode(linear), encode(linear)];
+
+  it("is the absolute difference of two scalars, whichever operand is larger", async () => {
+    const difference = (a: number, b: number) => bake(makeGraph([distance(pin("a"), pin("b")), scalar("a", a), scalar("b", b)], pin("d")));
+    expect((await pixelsOf(await difference(0.75, 0.25)))(0, 0)).toEqual(grey(0.5));
+    expect((await pixelsOf(await difference(0.25, 0.75)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("takes the length of a signed 3-4-5 difference, the same whichever operand is first", async () => {
+    // (0.3, -0.4, 0) has length 0.5: a negative component squares to the same as a positive one.
+    const signed = (a: Rgb, b: Rgb) => bake(makeGraph([distance(pin("a", 0, RGB_MASK), pin("b", 0, RGB_MASK)), constant3("a", a), constant3("b", b)], pin("d")));
+    expect((await pixelsOf(await signed([0.3, -0.4, 0], [0, 0, 0])))(0, 0)).toEqual(grey(0.5));
+    expect((await pixelsOf(await signed([0, 0, 0], [0.3, -0.4, 0])))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("counts every active component of a 2- or 4-component operand", async () => {
+    const two = bake(makeGraph([distance(pin("a"), pin("b")), constant2("a", [0.3, 0.4]), constant2("b", [0, 0])], pin("d")));
+    expect((await pixelsOf(await two))(0, 0)).toEqual(grey(0.5));
+    // sqrt(0.1² + 0.2² + 0.2² + 0.4²) is 0.5; the first three components alone would give 0.3.
+    const four = bake(makeGraph([distance(pin("a"), pin("b")), constant4("a", [0.1, 0.2, 0.2, 0.4]), constant4("b", [0, 0, 0, 0])], pin("d")));
+    expect((await pixelsOf(await four))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("broadcasts a scalar over the components of the other operand, in either order", async () => {
+    // (0.5 - 0.2, 0.5 - 0.5, 0.5 - 0.8) = (0.3, 0, -0.3), so the length is sqrt(0.18).
+    const scalarFirst = makeGraph([distance(pin("s"), pin("v", 0, RGB_MASK)), scalar("s", 0.5), constant3("v", [0.2, 0.5, 0.8])], pin("d"));
+    const vectorFirst = makeGraph([distance(pin("v", 0, RGB_MASK), pin("s")), scalar("s", 0.5), constant3("v", [0.2, 0.5, 0.8])], pin("d"));
+    expect((await pixelsOf(await bake(scalarFirst)))(0, 0)).toEqual(grey(Math.sqrt(0.18)));
+    expect((await pixelsOf(await bake(vectorFirst)))(0, 0)).toEqual(grey(Math.sqrt(0.18)));
+  });
+
+  it("reads only the components an input mask keeps", async () => {
+    // Masked to RG the operands are (0.3, 0.4) and (0, 0); the 0.9s past them are not part of the distance.
+    const masked = makeGraph([distance(pin("a", 0, [1, 1, 0, 0]), pin("b", 0, [1, 1, 0, 0])), constant4("a", [0.3, 0.4, 0.9, 0.9]), constant4("b", [0, 0, 0.9, 0])], pin("d"));
+    expect((await pixelsOf(await bake(masked)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("refuses unequal non-scalar widths in either order instead of padding the shorter operand", async () => {
+    const operands = [constant2("two", [0.3, 0.4]), constant3("three", [0, 0, 0])];
+    expect(await bake(makeGraph([distance(pin("two"), pin("three")), ...operands], pin("d")))).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Distance") });
+    expect(await bake(makeGraph([distance(pin("three"), pin("two")), ...operands], pin("d")))).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Distance") });
+  });
+
+  it("refuses an unwired operand instead of reading it as 0", async () => {
+    expect(await bake(makeGraph([node("d", "Distance", { inputs: { A: pin("a") } }), scalar("a", 0.5)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("missing an input"),
+    });
+    expect(await bake(makeGraph([node("d", "Distance", { inputs: { B: pin("b") } }), scalar("b", 0.5)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("missing an input"),
+    });
+  });
+
+  it("refuses an attributes or texture-object operand, an operand that could not be read, and an output other than 0", async () => {
+    const attributes = [node("m", "MakeMaterialAttributes", { inputs: { BaseColor: pin("c") } }), constant3("c", [1, 1, 1])];
+    expect(await bake(makeGraph([distance(pin("m"), pin("b")), ...attributes, scalar("b", 0.5)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("MaterialAttributes"),
+    });
+    const texture = node("t", "TextureObject", { texture: "/Game/Test/T_Object.T_Object" });
+    expect(await bake(makeGraph([distance(pin("t"), pin("b")), texture, scalar("b", 0.5)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("texture object"),
+    });
+    const unreadable = node("a", "Constant", { constants: { R: 0.75 }, error: "could not be read" });
+    expect(await bake(makeGraph([distance(pin("a"), pin("b")), unreadable, scalar("b", 0.25)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("could not be read"),
+    });
+    expect(await bake(makeGraph([distance(pin("a"), pin("b")), scalar("a", 0.75), scalar("b", 0.25)], pin("d", 1)))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("Distance"),
+    });
+  });
+
+  it("refuses an active difference that overflows float64, and ignores a nonfinite lane its mask drops", async () => {
+    // 1e200 - (-1e200) squares past the float64 range, so the result is refused rather than written out as a colour.
+    expect(await bake(makeGraph([distance(pin("a"), pin("b")), scalar("a", 1e200), scalar("b", -1e200)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("not finite"),
+    });
+    // The sum's fourth lane overflows to Infinity, but the RGB mask drops it: the distance is sqrt(0.3² + 0.4²) = 0.5.
+    const sum = node("sum", "Add", { inputs: { A: pin("x"), B: pin("y") } });
+    const dropped = makeGraph(
+      [distance(pin("sum", 0, RGB_MASK), pin("zero", 0, RGB_MASK)), sum, constant4("x", [0.3, 0.4, 0, 1e308]), constant4("y", [0, 0, 0, 1e308]), constant3("zero", [0, 0, 0])],
+      pin("d"),
+    );
+    expect((await pixelsOf(await bake(dropped)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("bakes through both operands, and the BaseColor path names both textures", async () => {
+    // Texture A is flat 128 (linear 0.2159 on every channel) and B is black, so the distance is sqrt(3) times A.
+    const textures = { T_AlbedoA: { png: await flat([128, 128, 128])(), srgb: true }, T_AlbedoB: { png: await flat([0, 0, 0])(), srgb: true } };
+    const graph = makeGraph([distance(pin("ta", 0, RGB_MASK), pin("tb", 0, RGB_MASK)), textureSample("ta", "T_AlbedoA"), textureSample("tb", "T_AlbedoB")], pin("d"));
+    const loader = makeLoader(textures);
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 2 });
+    expect((await pixelsOf(result))(0, 0)).toEqual(grey(Math.sqrt(3) * decode(128)));
+    expect(loader.requested).toEqual(expect.arrayContaining(["T_AlbedoA", "T_AlbedoB"]));
+    expect(graphPathClasses(graph, "baseColor")).toEqual(expect.arrayContaining(["Distance", "TextureSample"]));
+    expect(graphPathTextures(graph, NO_PARAMETERS)).toEqual(expect.arrayContaining(["T_AlbedoA", "T_AlbedoB"]));
+  });
+
+  it("follows both operands in the Normal walk, and refuses an output other than 0", () => {
+    const normalNodes = [distance(pin("na"), pin("nb")), normalSample("na", "T_NormalA"), normalSample("nb", "T_NormalB")];
+    const dependencies = graphNormalDependencies(normalGraph(normalNodes, { normal: pin("d") }), params({}));
+    expect(dependencies.status).toBe("known");
+    expect(readNames(dependencies)).toEqual(expect.arrayContaining(["T_NormalA", "T_NormalB"]));
+    expect(graphNormalDependencies(normalGraph(normalNodes, { normal: pin("d", 1) }), params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("Distance") });
+  });
+
+  it.each([
+    ["a missing A", [node("d", "Distance", { inputs: { B: pin("b") } }), scalar("b", 0.5)]],
+    ["a missing B", [node("d", "Distance", { inputs: { A: pin("a") } }), scalar("a", 0.5)]],
+    ["unequal widths, float2 then float3", [distance(pin("two"), pin("three")), constant2("two", [0.3, 0.4]), constant3("three", [0, 0, 0])]],
+    ["unequal widths, float3 then float2", [distance(pin("three"), pin("two")), constant2("two", [0.3, 0.4]), constant3("three", [0, 0, 0])]],
+    ["a mask that leaves 3 components against a float2", [distance(pin("four", 0, RGB_MASK), pin("two")), constant4("four", [0.3, 0.4, 0.5, 0]), constant2("two", [0, 0])]],
+    ["an attributes operand", [distance(pin("m"), pin("b")), node("m", "MakeMaterialAttributes", { inputs: { BaseColor: pin("c") } }), constant3("c", [1, 1, 1]), scalar("b", 0.5)]],
+    ["a texture-object operand", [distance(pin("t"), pin("b")), node("t", "TextureObject", { texture: "/Game/Test/T_Object.T_Object" }), scalar("b", 0.5)]],
+    ["an unreadable operand", [distance(pin("a"), pin("b")), node("a", "Constant", { constants: { R: 0.75 }, error: "could not be read" }), scalar("b", 0.25)]],
+  ])("refuses %s in the Normal walk, as the compile refuses the same Distance", async (_label, nodes) => {
+    expect(graphNormalDependencies(normalGraph(nodes, { normal: pin("d") }), params({}))).toMatchObject({ status: "unknown" });
+    expect(await bake(makeGraph(nodes, pin("d")))).toMatchObject({ status: "unavailable" });
+  });
+
+  it("follows a masked operand at the width its mask leaves", async () => {
+    // The RG of the four-component operand is a float2, so it pairs with the float2 and both the walk and the bake take it.
+    const nodes = [distance(pin("four", 0, [1, 1, 0, 0]), pin("two")), constant4("four", [0.3, 0.4, 0.9, 0.9]), constant2("two", [0, 0])];
+    expect(graphNormalDependencies(normalGraph(nodes, { normal: pin("d") }), params({}))).toEqual({ status: "known", textures: [], conservative: [] });
+    expect(await bake(makeGraph(nodes, pin("d")))).toMatchObject({ status: "baked" });
+  });
+
+  it("refuses a Normal Distance with an operand the compile cannot evaluate, since that operand's width is unknown", async () => {
+    // A collection parameter with no readable default is unsupported and reads as one scalar, so the pair could still be a width mismatch.
+    const nodes = [
+      distance(pin("cp"), pin("b")),
+      node("cp", "CollectionParameter", { parameter: { name: "Width", group: "" }, default: null, collection: "/Game/Test/MPC_Test.MPC_Test" }),
+      scalar("b", 0.5),
+    ];
+    expect(graphNormalDependencies(normalGraph(nodes, { normal: pin("d") }), params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("cannot evaluate") });
+    expect(await bake(makeGraph(nodes, pin("d")))).toMatchObject({ status: "unsupported", unsupported: ["CollectionParameter"] });
+  });
+
+  it("is a supported node class", () => {
+    expect(supportedNodeClasses()).toContain("Distance");
+  });
+});
+
 describe("per-instance and engine utility nodes of layered cliff materials", () => {
   const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
     bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 4 });

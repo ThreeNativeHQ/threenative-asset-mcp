@@ -1531,6 +1531,65 @@ describe("a flattened normal map the graph's active Normal does not read", () =>
   });
 });
 
+/**
+ * masterGraph's mask-tint BaseColor, a graph-only colour that bakes, beside a Normal that is one Distance wired by `inputs`. `extra` adds the
+ * constants or masked pins it reads, over the leaf and bark maps normalMaster names. The Normal is read from the attributes pin.
+ */
+function distanceNormalMaster(inputs: Raw, extra: Raw[] = []): MaterialGraph {
+  const nodes: Raw[] = [
+    node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: "/Game/Test/T_MasterMask.T_MasterMask", samplerType: "Masks" }),
+    node("tint", "Constant3Vector", { constants: { Constant: [0.5, 0.25, 1, 1] } }),
+    node("mul", "Multiply", { inputs: { A: pin("mask", [1, 1, 1, 0]), B: pin("tint") } }),
+    node("leaf", "TextureSampleParameter2D", { parameter: { name: "LeafNormal", group: "" }, default: null, texture: "/Game/Test/T_LeafNormal.T_LeafNormal", samplerType: "Normal" }),
+    node("bark", "TextureSample", { texture: "/Game/Test/T_BarkNormal.T_BarkNormal", samplerType: "Normal" }),
+    ...extra,
+    node("d", "Distance", { inputs }),
+    node("make", "MakeMaterialAttributes", { inputs: { Normal: pin("d") } }),
+  ];
+  return materialGraphSchema.parse({
+    format: 1,
+    material: "M_Master",
+    package: "/Game/Test/M_Master",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: pin("mul"), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: pin("make") },
+    outputConstants: {},
+    nodes,
+  });
+}
+
+describe("a flattened normal map under a Normal Distance the compile refuses", () => {
+  const two = node("two", "Constant2Vector", { constants: { R: 0.3, G: 0.4 } });
+  const three = constant3("three", [0, 0, 0]);
+  const four = node("four", "Constant4Vector", { constants: { Constant: [0.3, 0.4, 0.5, 0] } });
+
+  // The BaseColor still bakes, and the bark map is kept as unverified: a Distance the compile refuses proves nothing about the Normal.
+  it.each([
+    ["a missing B", { A: pin("two") }, [two]],
+    ["a float2 and a float3", { A: pin("two"), B: pin("three") }, [two, three]],
+    ["a float4 masked to 3 components against a float2", { A: pin("four", [1, 1, 1, 0]), B: pin("two") }, [four, two]],
+  ])("keeps the flattened normal map as unverified under %s, and bakes the BaseColor", async (_label, inputs, extra) => {
+    const { material, report } = await importWithGraph({ graph: distanceNormalMaster(inputs, extra), normalTexture: "T_BarkNormal" });
+    const section = report.models[0]!.materials[0]!;
+    expect(section.graph).toMatchObject({ status: "baked" });
+    expect(material.getNormalTexture()).not.toBeNull();
+    expect(section.limitations.join("\n")).toContain("T_BarkNormal kept as the normal map, unverified:");
+    expect(section.limitations.join("\n")).not.toContain("is a stale flattened normal");
+  });
+
+  it("keeps the bark map under a valid Distance that reads it, with no limitation", async () => {
+    const kept = await importWithGraph({ graph: distanceNormalMaster({ A: pin("bark", [1, 1, 1, 0]), B: pin("three") }, [three]), normalTexture: "T_BarkNormal" });
+    expect(kept.material.getNormalTexture()).not.toBeNull();
+    expect(kept.report.models[0]!.materials[0]!.limitations.join("\n")).not.toContain("T_BarkNormal");
+  });
+
+  it("omits the bark map as stale under a valid Distance that reads only the leaf map", async () => {
+    const stale = await importWithGraph({ graph: distanceNormalMaster({ A: pin("leaf", [1, 1, 1, 0]), B: pin("three") }, [three]), normalTexture: "T_BarkNormal" });
+    expect(stale.material.getNormalTexture()).toBeNull();
+    expect(stale.report.models[0]!.materials[0]!.limitations.join("\n")).toContain("T_BarkNormal is a stale flattened normal, omitted");
+  });
+});
+
 describe("the input glTF normal map beside a flattened normal the graph does not read", () => {
   // The flattened Bark binding is stale (the graph's Normal reads only the leaf map). The input glTF material's own normal map is judged
   // on its own identity: it is never cleared just because the binding is stale.

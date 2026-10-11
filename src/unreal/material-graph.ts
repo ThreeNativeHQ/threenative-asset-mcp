@@ -164,6 +164,7 @@ const SUPPORTED_NODE_CLASSES = [
   "Min",
   "Max",
   "DotProduct",
+  "Distance",
   "Normalize",
   "ConstantBiasScale",
   "SphereMask",
@@ -1357,6 +1358,8 @@ class Compiler {
         return this.binary(this.operand(node, "A", "ConstA", 0), this.operand(node, "B", "ConstB", 1), (x, y) => (x > y ? x : y));
       case "DotProduct":
         return this.dotProduct(node);
+      case "Distance":
+        return this.distance(node, output);
       case "Normalize":
         return this.normalize(node);
       case "ConstantBiasScale": {
@@ -1593,6 +1596,55 @@ class Compiler {
       let sum = 0;
       for (let index = 0; index < n; index++) sum += r[a.reg + index * sa]! * r[b.reg + index * sb]!;
       r[o] = r[o + 1] = r[o + 2] = r[o + 3] = sum;
+    });
+  }
+
+  /**
+   * The operands a Distance takes, by the rules its compile applies and the Normal walk checks against (`NormalWalk.validateDistance`),
+   * so the two cannot disagree: both pins are required, each a plain value (not MaterialAttributes, not a texture object), and their
+   * widths after each pin's mask are equal or one of them is a scalar. Returns the operands, or the reason the node is refused.
+   */
+  distanceOperands(node: GraphNode): { readonly a: Val; readonly b: Val } | { readonly refusal: string } {
+    const operand = (pinName: "A" | "B"): Val | string => {
+      const compiled = this.pin(node.inputs[pinName]);
+      if (!compiled) return `Distance ${node.id} is missing an input: ${pinName}`;
+      if (compiled.kind === "attr") return `Distance.${pinName} received a MaterialAttributes value`;
+      if (compiled.kind === "tex") return `Distance.${pinName} received a texture object, not a value`;
+      return compiled;
+    };
+    const a = operand("A");
+    const b = operand("B");
+    if (typeof a === "string") return { refusal: a };
+    if (typeof b === "string") return { refusal: b };
+    if (a.n !== b.n && a.n !== 1 && b.n !== 1) return { refusal: `Distance ${node.id} joins a ${a.n}- and a ${b.n}-component input; only equal widths or a scalar broadcast are defined` };
+    return { a, b };
+  }
+
+  /**
+   * Distance(A, B) = |A - B|: the length of the difference over the components the two operands keep. A scalar operand
+   * repeats over the other's components; two non-scalar operands must have the same width. Both pins are read, with no
+   * constant defaults, and the node gives one scalar. The bake sums in float64, so it makes no claim to match a GPU's float32.
+   */
+  private distance(node: GraphNode, output: number): Compiled {
+    if (output !== 0) return this.markUnavailable(`Distance ${node.id} has one output, not output ${output}`);
+    const operands = this.distanceOperands(node);
+    if ("refusal" in operands) return this.markUnavailable(operands.refusal);
+    const { a, b } = operands;
+    // Only the active components are read: lanes past an operand's width are padding, not values.
+    const n = a.n === 1 ? b.n : a.n;
+    const sa = a.n === 1 ? 0 : 1;
+    const sb = b.n === 1 ? 0 : 1;
+    const refusal = `Distance ${node.id}: the difference of its active components is not finite (float64 overflow or a nonfinite input)`;
+    return this.emit([a, b], 1, (o) => (r) => {
+      let sum = 0;
+      for (let index = 0; index < n; index++) {
+        const difference = r[a.reg + index * sa]! - r[b.reg + index * sb]!;
+        sum += difference * difference;
+      }
+      const length = Math.sqrt(sum);
+      if (!Number.isFinite(length) && !this.runtimeRefusals.includes(refusal)) this.runtimeRefusals.push(refusal);
+      // One scalar: lane 0 holds the value and the other lanes stay unused, as for every one-component result.
+      r[o] = length;
     });
   }
 
@@ -2820,7 +2872,8 @@ export interface NormalTexture {
 
 /**
  * The textures a graph's active Normal reads (see `graphNormalDependencies`), or why they cannot be proven. `conservative` names the
- * rules that count a node by every one of its inputs instead of evaluating it.
+ * rules that count a node by every one of its inputs instead of evaluating it. This certifies texture dependencies only; it does not
+ * establish a finite Normal value or reconstruct authored normal composition. Bake-time numerical refusals remain separate.
  */
 export type NormalDependencies =
   | { readonly status: "known"; readonly textures: readonly NormalTexture[]; readonly conservative: readonly string[] }
@@ -2856,6 +2909,7 @@ function isEngineFlattenNormal(node: GraphNode, output: number): boolean {
  * output a call reads, and it names every texture sample it reaches. Anything else refuses the walk.
  */
 class NormalWalk {
+  private readonly graph: MaterialGraph;
   private readonly nodes: ReadonlyMap<string, GraphNode>;
   private readonly parameters: GraphParameters;
   private readonly choices: SwitchChoices;
@@ -2865,6 +2919,7 @@ class NormalWalk {
   private readonly done = new Set<string>();
 
   constructor(graph: MaterialGraph, parameters: GraphParameters, choices: SwitchChoices) {
+    this.graph = graph;
     this.nodes = new Map(graph.nodes.map((node) => [node.id, node]));
     this.parameters = parameters;
     this.choices = choices;
@@ -2941,6 +2996,11 @@ class NormalWalk {
       case "SquareRoot":
         // Arithmetic reads every input it has, so each wired pin counts: a Lerp's A, B and Alpha alike.
         this.expectValue(node, read);
+        for (const input of Object.values(node.inputs)) this.visit(input, "value");
+        return;
+      case "Distance":
+        this.expectValue(node, read);
+        this.validateDistance(node, output);
         for (const input of Object.values(node.inputs)) this.visit(input, "value");
         return;
       case "Reroute":
@@ -3091,6 +3151,22 @@ class NormalWalk {
     const input = node.inputs[pin];
     if (!input) refuse(`${node.class} ${node.id} has no ${pin} input`);
     return input;
+  }
+
+  /**
+   * A Distance the walk follows is one the compile takes: its one output, and operands `distanceOperands` accepts, each evaluated by the
+   * compile. An operand the compile cannot evaluate has a width it cannot give (it reads as one scalar), so it makes the Normal unknown
+   * too. A missing pin or a width the compile refuses never becomes a known Normal with no texture.
+   */
+  private validateDistance(node: GraphNode, output: number): void {
+    // Its one output is the value: a pin on any other index is not one this node computes, so the walk cannot follow it.
+    if (output !== 0) refuse(`Distance ${node.id} has one output, not output ${output}`);
+    // A trial compile of this Distance's operands alone, so the marks it records belong to them.
+    const trial = new Compiler(this.graph, this.parameters, PATH_OPTIONS, this.choices);
+    const operands = trial.distanceOperands(node);
+    if ("refusal" in operands) refuse(operands.refusal);
+    if (trial.unsupported.size > 0) refuse(`Distance ${node.id} reads ${[...trial.unsupported].sort().join(", ")}, which the compile cannot evaluate, so its width is unknown`);
+    if (trial.unavailable.length > 0) refuse(trial.unavailable.join("; "));
   }
 
   /**
