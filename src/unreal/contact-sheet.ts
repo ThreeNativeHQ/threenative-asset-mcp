@@ -10,6 +10,7 @@ import { createBrowserTempDir } from "../browser-temp.js";
 import { measureFidelity, withoutFloorShadow, type FidelityMetrics } from "./render-fidelity.js";
 import { colourSimilarity, decodeRgba, maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 import { judgeRender, type JudgeStats, type Verdict } from "./visual-judge.js";
+import { applyThumbnailReferenceLighting } from "./thumbnail-lighting.js";
 
 const require = createRequire(import.meta.url);
 const THREE_ROOT = dirname(dirname(require.resolve("three")));
@@ -22,9 +23,9 @@ const PANEL = { r: 30, g: 31, b: 36 };
 
 /**
  * How the sheet's picture (the "AFTER IMPORT" tile) is lit. `neutral` is the flat three.js light the metrics are
- * measured under. `unreal-like` adds a daylight key, a restrained sky fill and a grey checkered ground that catches a
- * cast shadow, approximating the look of an Unreal editor thumbnail. It is a picture-only approximation: the camera,
- * lighting and ground are not the editor's, so the judge's numbers are always measured on the `neutral` render.
+ * measured under. `unreal-like` uses UE 4.19.2's three world-space reference directions/intensities, the old approximate
+ * hemisphere fill and a grey checkered ground. This hybrid lacks the authored cubemap; the saved editor/config and
+ * camera are unknown, and Three shadows differ. The judge's numbers are always measured on the `neutral` render.
  */
 export type PictureLighting = "neutral" | "unreal-like";
 /** The fixed camera every render pass shares (so a change of lighting is the only difference between passes). */
@@ -60,8 +61,8 @@ export interface ContactSheetOptions {
   dumpTilesDir?: string;
   /**
    * Lighting of the sheet's picture only. `neutral` (default) keeps every existing caller and golden unchanged.
-   * `unreal-like` adds an extra supersampled pass with a daylight key, a sky fill and a grey checkered ground for
-   * the picture; the judge's metrics stay on the neutral render.
+   * `unreal-like` adds a supersampled picture with three UE 4.19.2 reference lights plus approximate hemisphere fill
+   * (authored cubemap absent), and grey ground; the judge's metrics stay on the neutral render.
    */
   pictureLighting?: PictureLighting;
   /**
@@ -208,6 +209,7 @@ const options = ${payload};
 const size = options.tile;
 const lit = options.lighting === 'unreal-like';
 const shadows = options.shadows !== false;
+const applyThumbnailReferenceLighting = ${applyThumbnailReferenceLighting.toString()};
 // A subtle grey checker like an editor thumbnail's floor: two close greys, never pure white or black.
 const makeChecker = () => {
   const canvas = document.createElement('canvas');
@@ -230,21 +232,17 @@ try {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x808080);
   let key;
+  let referenceRig;
   let checker;
   let groundMaterial;
   if (lit) {
-    // Unreal-style approximation: a restrained sky fill and one daylight key that casts a shadow. No hinted engine values.
-    // The shadows flag is a deterministic test control (default on); off leaves the fill, key and ground identical.
-    scene.add(new THREE.HemisphereLight(0xc2d4ea, 0x3c3c3c, 0.9));
-    key = new THREE.DirectionalLight(0xfff3e2, 2.2);
+    // Source reference directions/intensities + old approximate hemisphere, not the authored UE cubemap.
+    referenceRig = applyThumbnailReferenceLighting(THREE, scene, { shadows });
+    key = referenceRig.primary;
     if (shadows) {
       renderer.shadowMap.enabled = true;
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-      key.castShadow = true;
-      key.shadow.mapSize.set(1024, 1024);
-      key.shadow.bias = -0.0005;
     }
-    scene.add(key); scene.add(key.target);
     checker = makeChecker();
     groundMaterial = new THREE.MeshStandardMaterial({ map: checker, roughness: 1, metalness: 0 });
   } else {
@@ -299,18 +297,8 @@ try {
         const repeat = Math.max(2, Math.round(groundSize / (4 * radius)));
         checker.repeat.set(repeat, repeat);
         scene.add(ground);
-        // Daylight key about 40 degrees up, 75 degrees off the camera's azimuth on the other side (negative), so the
-        // cast shadow falls to the left, as in the Unreal reference.
-        const azimuth = Math.atan2(direction.z, direction.x) - (75 * Math.PI) / 180;
-        const elevation = (40 * Math.PI) / 180;
-        const toLight = new THREE.Vector3(
-          Math.cos(elevation) * Math.cos(azimuth),
-          Math.sin(elevation),
-          Math.cos(elevation) * Math.sin(azimuth),
-        );
-        key.position.copy(center).addScaledVector(toLight, radius * 8);
-        key.target.position.copy(center);
-        key.target.updateMatrixWorld();
+        // Placement follows model bounds, but the three light directions never follow the camera.
+        referenceRig.place(center, radius);
         if (shadows) {
           const shadowCamera = key.shadow.camera;
           const half = radius * 3;
@@ -697,11 +685,11 @@ export async function renderContactSheet(
 
   const afterImportLine =
     pictureLighting === "unreal-like"
-      ? "Each tile: ORIGINAL = Unreal editor thumbnail | AFTER IMPORT = Unreal-style picture approximation."
+      ? "AFTER IMPORT: UE4.19.2 lights + approximate hemisphere; no authored cubemap."
       : "Each tile: ORIGINAL = Unreal editor thumbnail of that asset | AFTER IMPORT = our GLB, neutral light.";
   const scoreLine =
     pictureLighting === "unreal-like"
-      ? "Camera and lighting differ from the editor; colour scores are measured in the neutral view."
+      ? "Current camera; saved editor/config unknown; primary-only PCF shadows. Scores: neutral view."
       : "Colour similarity compares object colour only (camera and lighting differ). It is not a match score.";
   const header = withThumbnails ? REFERENCE_BAND : HEADER;
   const caption = (withThumbnails ? CAPTION + 14 : CAPTION) + (!withThumbnails && pictureLighting === "unreal-like" ? 36 : 0);
@@ -800,8 +788,8 @@ export async function renderContactSheet(
   if (!withThumbnails && pictureLighting === "unreal-like") {
     const noteWidth = Math.floor(width / 6.6);
     svg.push(
-      text(10, bottom + 108, 12, "#9a9aaa", clip("AFTER IMPORT = our GLB, an Unreal-style picture approximation.", noteWidth)),
-      text(10, bottom + 124, 12, "#9a9aaa", clip("Camera and lighting differ; scores are measured in the neutral view.", noteWidth)),
+      text(10, bottom + 108, 12, "#9a9aaa", clip("UE4.19.2 lights + approximate hemisphere; no authored cubemap.", noteWidth)),
+      text(10, bottom + 124, 12, "#9a9aaa", clip("Current camera; editor/config unknown; primary-only PCF. Scores: neutral.", noteWidth)),
     );
   }
 
