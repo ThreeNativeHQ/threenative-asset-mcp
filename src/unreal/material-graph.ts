@@ -38,6 +38,13 @@ export interface GraphParameters {
    * told apart. Optional: a caller that only has object names leaves it out and the evaluator falls back to `textures`.
    */
   textureReferences?: ReadonlyMap<string, string> | undefined;
+  /**
+   * Texture parameter name (lower-case) -> why its texture is unknown: the nearest instance override is `None`, which UE Viewer writes for
+   * a texture it cannot name, and no exact qualified record proves one. Such a parameter has no entry in `textures` or `textureReferences`,
+   * and it shadows the ancestors' overrides, the instances' defaults and the node's own default, so a sample of it refuses on the path
+   * that reads it instead of inheriting any of them. Absent when no instance leaves a texture unknown.
+   */
+  unresolvedTextures?: ReadonlyMap<string, string> | undefined;
   vectors: ReadonlyMap<string, [number, number, number, number]>;
   scalars: ReadonlyMap<string, number>;
   switches: ReadonlyMap<string, boolean>;
@@ -528,6 +535,8 @@ interface TexRef {
   kind: "tex";
   reference: string | null;
   samplerType: string;
+  /** Set on a texture parameter the instance chain leaves unknown: the reason, never an unbound texture (see `GraphParameters`). */
+  unresolved?: string | undefined;
 }
 type Compiled = Val | Attrs | TexRef;
 
@@ -727,6 +736,8 @@ class Compiler {
   private readonly nodes = new Map<string, GraphNode>();
   /** Texture parameters this compile reached that the instance chain does not bind (and the graph gives no texture). */
   readonly unboundTextures = new Set<string>();
+  /** Why each texture sample this compile reached is unknown (see `GraphParameters.unresolvedTextures`). Unavailable, never unbound. */
+  readonly unresolvedSamples = new Set<string>();
   constructor(
     private readonly graph: MaterialGraph,
     private readonly parameters: GraphParameters,
@@ -826,6 +837,12 @@ class Compiler {
   private markUnavailable(reason: string): Val {
     if (!this.unavailable.includes(reason)) this.unavailable.push(reason);
     return this.constant([0], 1);
+  }
+
+  /** A sample of a texture the chain leaves unknown: unavailable on this path, and never counted as unbound, which would flip a switch. */
+  private unresolvedSample(reason: string): Val {
+    this.unresolvedSamples.add(reason);
+    return this.markUnavailable(reason);
   }
 
   // -- pins -----------------------------------------------------------------------------------------------
@@ -1229,6 +1246,9 @@ class Compiler {
         return { kind: "tex", reference: node.texture ?? null, samplerType: node.samplerType ?? "Color" };
       case "TextureObjectParameter": {
         const parameter = node.parameter?.name.toLowerCase();
+        // An unknown texture is handed on as one: the sample that reads it refuses, rather than taking the node's own texture.
+        const unresolved = parameter ? this.parameters.unresolvedTextures?.get(parameter) : undefined;
+        if (unresolved !== undefined) return { kind: "tex", reference: null, samplerType: node.samplerType ?? "Color", unresolved };
         // The chain's full reference keeps the package; a plain object name is the fallback when the caller gave none.
         const override = (parameter ? this.parameters.textureReferences?.get(parameter) : undefined)
           ?? (parameter ? this.parameters.textures.get(parameter) : undefined);
@@ -1871,6 +1891,9 @@ class Compiler {
     const cached = this.textureRegisters.get(node.id);
     if (cached) return cached;
     const parameterName = node.class === "TextureSampleParameter2D" && node.parameter ? node.parameter.name.toLowerCase() : undefined;
+    // An unknown parameter is refused before any lookup, so neither the node's own texture nor an ancestor's can answer for it.
+    const unresolved = parameterName ? this.parameters.unresolvedTextures?.get(parameterName) : undefined;
+    if (unresolved !== undefined) return this.unresolvedSample(unresolved);
     // The chain's full reference for the parameter keeps the package; the plain object name is the fallback when the
     // caller gave none. This is what lets an override replace a same-named default instead of reading the default.
     const qualified = parameterName ? this.parameters.textureReferences?.get(parameterName) : undefined;
@@ -1879,6 +1902,7 @@ class Compiler {
     // preview, e.g. DefaultDiffuse), and a TextureObjectParameter there honours the instance's override.
     if (!reference && node.inputs.TextureObject) {
       const object = this.texture(node.inputs.TextureObject, `${node.class}.TextureObject`);
+      if (object?.unresolved !== undefined) return this.unresolvedSample(object.unresolved);
       reference = object?.reference ?? undefined;
     } else reference ??= node.texture ?? undefined;
     if (!reference) this.unboundTextures.add(node.id);
@@ -2658,6 +2682,7 @@ class Compiler {
   /** The average colour (RGBA, the coarsest mip) of the texture object on `pinName`, for engine functions whose sampling follows world position or time. */
   private textureMean(node: GraphNode, pinName: string, name: string): Compiled {
     const object = this.texture(node.inputs[pinName], `${name}.${pinName}`);
+    if (object?.unresolved !== undefined) return this.unresolvedSample(object.unresolved);
     if (!object) return this.markUnavailable(`${name} ${node.id} has no texture object`);
     if (!object.reference) {
       this.unboundTextures.add(node.id);
@@ -3054,6 +3079,9 @@ class NormalWalk {
     if (node.inputs.TextureObject) refuse(`texture sample ${node.id} takes its texture from a TextureObject pin`);
     const parameter = node.class === "TextureSampleParameter2D" ? node.parameter?.name.toLowerCase() : undefined;
     if (node.class === "TextureSampleParameter2D" && parameter === undefined) refuse(`texture parameter ${node.id} has no readable name`);
+    // An unknown parameter names no texture this walk can follow, so the Normal is unknown; the node's own texture is never read for it.
+    const unresolved = parameter === undefined ? undefined : this.parameters.unresolvedTextures?.get(parameter);
+    if (unresolved !== undefined) refuse(unresolved);
     const chained = parameter === undefined ? undefined : (this.parameters.textureReferences?.get(parameter) ?? this.parameters.textures.get(parameter));
     const reference = chained ?? node.texture;
     if (!reference) refuse(`texture sample ${node.id}${parameter === undefined ? "" : ` (parameter "${node.parameter?.name}")`} names no texture`);
@@ -3517,6 +3545,9 @@ export async function bakeGraph(request: BakeRequest): Promise<BakeResult> {
   if (compiler.unavailable.length > 0 || !value) {
     return { status: "unavailable", reason: compiler.unavailable.length > 0 ? compiler.unavailable.join("; ") : `graph ${graph.material} has no readable BaseColor path` };
   }
+  // A cut-out that reads an unknown texture cannot be left out as an approximation: the bake would keep its opacity opaque with no
+  // evidence for it, so the whole bake is refused (the colour alone is never baked as if the cut-out were settled).
+  if (cut && cut.compiler.unresolvedSamples.size > 0) return { status: "unavailable", reason: [...cut.compiler.unresolvedSamples].join("; ") };
 
   const out = Buffer.alloc(size * size * 4);
   const sums = [0, 0, 0];

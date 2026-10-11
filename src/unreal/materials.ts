@@ -120,6 +120,11 @@ export interface PropsFile {
    * It still replaces whatever an ancestor bound to that parameter.
    */
   readonly unresolvedOverrides: readonly string[];
+  /**
+   * Names (lower-case) of the `TextureParameterValues` entries whose `ParameterInfo` names a non-global association (a layer or
+   * blend parameter). An instance record proves only a global parameter's texture, so these are never recovered from one.
+   */
+  readonly nonGlobalTextures: readonly string[];
   readonly scalars: readonly ScalarParameter[];
   readonly scalarOverrides: readonly ScalarParameter[];
   readonly vectors: readonly VectorParameter[];
@@ -205,6 +210,7 @@ export function parsePropsFile(text: string): PropsFile {
 
   const overrides: CollectedTextureParameter[] = [];
   const unresolvedOverrides: string[] = [];
+  const nonGlobalTextures: string[] = [];
   const scalars: ScalarParameter[] = [];
   const scalarOverrides: ScalarParameter[] = [];
   const vectors: VectorParameter[] = [];
@@ -289,6 +295,8 @@ export function parsePropsFile(text: string): PropsFile {
     const name = readName(block);
     const value = /ParameterValue\s*=\s*([^\r\n}]+)/.exec(block)?.[1] ?? "";
     const texture = objectName(value);
+    const association = /\bAssociation\s*=\s*(\w+)/.exec(block)?.[1];
+    if (name && association !== undefined && association !== "GlobalParameter") nonGlobalTextures.push(name.trim().toLowerCase());
     if (name && texture) overrides.push({ name, texture, reference: value.trim() });
     else if (name && /ParameterValue\s*=\s*None\b/.test(block)) unresolvedOverrides.push(name);
   }
@@ -359,9 +367,11 @@ export function parsePropsFile(text: string): PropsFile {
     collected,
     // The modern converter writes an instance's own overrides as `CollectedTextureParameters`
     // (a MaterialInstance has no expression nodes, so the collected block IS its overrides; on a
-    // root Material it is the defaults). A real `TextureParameterValues` block wins; never both.
-    overrides: parent !== undefined && overrides.length === 0 ? [...collected] : overrides,
+    // root Material it is the defaults). A real `TextureParameterValues` block wins; never both,
+    // and a block whose entries are all `None` is a real block too (its collected defaults stay defaults).
+    overrides: parent !== undefined && overrides.length === 0 && unresolvedOverrides.length === 0 ? [...collected] : overrides,
     unresolvedOverrides,
+    nonGlobalTextures,
     scalars,
     scalarOverrides,
     vectors,

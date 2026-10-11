@@ -20,7 +20,7 @@ import {
   type NormalDependencies,
   type TextureRaster,
 } from "./material-graph.js";
-import { parsePropsFile, type PropsFile } from "./materials.js";
+import { parsePropsFile, type CollectedTextureParameter, type PropsFile } from "./materials.js";
 import { surfaceKey, type SurfaceNormals } from "./surface-normals.js";
 import type { ExternalTool } from "./toolchain.js";
 
@@ -238,19 +238,6 @@ export function texturePackageKey(reference: string): string | undefined {
   return path.startsWith("content/") ? `game/${path.slice("content/".length)}` : path;
 }
 
-/**
- * The full reference (`Texture2D'/Game/A/T_X.T_X'`) that the nearest-wins merge of `chainParameters` settles on for each
- * texture parameter, by lower-cased name. It uses the same order, so it names the same value the evaluator sees; the
- * evaluator reads it back per parameter, which is what makes an override replace a same-named default. A value the props
- * file gives without a package stays as its object name, which names no package.
- */
-function chainTextureReferences(chain: readonly PropsFile[]): Map<string, string> {
-  const references = new Map<string, string>();
-  for (const props of chain) for (const entry of props.overrides) mergeFirst(references, entry.name, entry.reference ?? entry.texture);
-  for (const props of chain) for (const entry of props.collected) mergeFirst(references, entry.name, entry.reference ?? entry.texture);
-  return references;
-}
-
 async function listUassetBasenames(root: string): Promise<Set<string>> {
   const names = new Set<string>();
   const entries = await readdir(root, { recursive: true });
@@ -266,29 +253,58 @@ function mergeFirst<T>(target: Map<string, T>, key: string, value: T): void {
 }
 
 /**
- * Parameters for an instance chain, nearest wins. Overrides (`TextureParameterValues`,
- * `VectorParameterValues`, `ScalarParameterValues`) of every level beat any default; defaults
- * (`Collected*`) then fill in from the instance upwards. The evaluator fills the rest from the
- * graph's own node defaults.
+ * Parameters for an instance chain, nearest wins. Overrides (`TextureParameterValues`, `VectorParameterValues`,
+ * `ScalarParameterValues`) of every level beat any default; defaults (`Collected*`) then fill in from the instance upwards. The
+ * evaluator fills the rest from the graph's own node defaults.
+ *
+ * A texture parameter settles once, at the nearest level that overrides it, and the settling entry gives both its object name and
+ * its full reference (`Texture2D'/Game/A/T_X.T_X'`, which keeps the package), so the two maps can never disagree. A `None` in a native
+ * link (`unresolvedOverrides`) settles the parameter as unknown instead (`unresolvedTextures`): UE Viewer wrote it for a texture it
+ * cannot name, so no ancestor's override, no default and no node default may stand in for it. `reasons` names, per unresolved
+ * parameter, why it is unknown. A record's own `None` is never passed in here: it is an authored null that overrides nothing.
  */
-export function chainParameters(chain: readonly PropsFile[]): GraphParameters {
+export function chainParameters(chain: readonly PropsFile[], reasons?: ReadonlyMap<string, string>): GraphParameters {
   const textures = new Map<string, string>();
+  const textureReferences = new Map<string, string>();
+  const unresolvedTextures = new Map<string, string>();
   const vectors = new Map<string, [number, number, number, number]>();
   const scalars = new Map<string, number>();
   const switches = new Map<string, boolean>();
+  const settled = new Set<string>();
+  const settleTexture = (name: string, texture: string, reference: string | undefined): void => {
+    const key = name.trim().toLowerCase();
+    if (settled.has(key)) return;
+    settled.add(key);
+    textures.set(key, texture);
+    textureReferences.set(key, reference ?? texture);
+  };
+  const settleUnresolved = (name: string): void => {
+    const key = name.trim().toLowerCase();
+    if (settled.has(key)) return;
+    settled.add(key);
+    unresolvedTextures.set(key, reasons?.get(key) ?? `${name} is a texture override the exporter could not name (None), so its texture is unknown`);
+  };
   for (const props of chain) {
     for (const entry of props.switchOverrides) mergeFirst(switches, entry.name, entry.value);
-    for (const entry of props.overrides) mergeFirst(textures, entry.name, entry.texture);
+    for (const entry of props.overrides) settleTexture(entry.name, entry.texture, entry.reference);
+    // After this level's known overrides, so a `None` beside a known override of the same name never shadows it.
+    for (const name of props.unresolvedOverrides) settleUnresolved(name);
     for (const entry of props.vectorOverrides) mergeFirst(vectors, entry.name, [...entry.value]);
     for (const entry of props.scalarOverrides) mergeFirst(scalars, entry.name, entry.value);
   }
   for (const props of chain) {
-    for (const entry of props.collected) mergeFirst(textures, entry.name, entry.texture);
+    for (const entry of props.collected) settleTexture(entry.name, entry.texture, entry.reference);
     for (const entry of props.vectors) mergeFirst(vectors, entry.name, [...entry.value]);
     for (const entry of props.scalars) mergeFirst(scalars, entry.name, entry.value);
   }
-  // The same nearest-wins merge, keeping each value's full reference so a parameter still names its package.
-  return { textures, textureReferences: chainTextureReferences(chain), vectors, scalars, switches };
+  return {
+    textures,
+    textureReferences,
+    ...(unresolvedTextures.size > 0 ? { unresolvedTextures } : {}),
+    vectors,
+    scalars,
+    switches,
+  };
 }
 
 export function parametersKey(parameters: GraphParameters): string {
@@ -303,7 +319,16 @@ export function parametersKey(parameters: GraphParameters): string {
       isEngineReference(reference) ? reference : texturePackageKey(reference) ?? reference.toLowerCase(),
     ])
     .sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify([sorted(parameters.textures), references, sorted(parameters.vectors), sorted(parameters.scalars), sorted(parameters.switches)]);
+  // An unknown texture is part of the key too: a bake that read the ancestor's or the node's texture has the same textures and
+  // references as one whose parameter is unknown, and it must never answer for it.
+  return JSON.stringify([
+    sorted(parameters.textures),
+    references,
+    sorted(parameters.vectors),
+    sorted(parameters.scalars),
+    sorted(parameters.switches),
+    sorted(parameters.unresolvedTextures ?? new Map<string, string>()),
+  ]);
 }
 
 function unavailable(reason: string): GraphBakeOutcome {
@@ -431,6 +456,74 @@ function recoveredLink(
   return { reason: `${object} has no exported props and no instance record for ${packagePath}` };
 }
 
+/** A texture reference that names its package and its object (`Texture2D'/Game/A/T_X.T_X'`, `/Engine/A/T_X.T_X`), never a bare name. */
+function namesPackageAndObject(reference: string): boolean {
+  const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference.trim();
+  return texturePackageKey(quoted) !== undefined && /\/[^/]+\.[^/]+$/.test(quoted);
+}
+
+/**
+ * The override that proves a link's `None` texture for `name`, or why it stays unknown. The proof is the usable record of exactly the
+ * link's own identity (`packagePath` and `object`, canonical and never a basename), and it must give the parameter an override of its own
+ * that names a package and an object. A non-global parameter is never proven, and neither is a request that names no package.
+ */
+function provenTexture(
+  dumped: DumpedGraphs,
+  link: PropsFile,
+  name: string,
+  packagePath: string | undefined,
+  object: string,
+): { readonly override: CollectedTextureParameter } | { readonly reason: string } {
+  const key = name.trim().toLowerCase();
+  const lead = `${name} is an unresolved texture override of ${object} (the exporter named no texture for it), and`;
+  if (packagePath === undefined) return { reason: `${lead} the request names no package, so no instance record can prove it` };
+  if (link.nonGlobalTextures.includes(key)) return { reason: `${lead} it is not a global parameter, the only kind an instance record proves` };
+  const identity = materialInstanceKey(packagePath, object);
+  const record = dumped.instances.get(identity);
+  if (record === undefined) {
+    const invalid = dumped.invalidInstances.get(identity);
+    return { reason: `${lead} ${invalid === undefined ? `no instance record for ${packagePath} proves it` : `its instance record cannot be used (${invalid})`}` };
+  }
+  const own = parsePropsFile(record.props ?? "");
+  if (own.nonGlobalTextures.includes(key)) return { reason: `${lead} the instance record's override is not a global parameter` };
+  const entry = own.overrides.find((candidate) => candidate.name.trim().toLowerCase() === key);
+  if (entry === undefined) return { reason: `${lead} the instance record names no texture for it` };
+  if (!namesPackageAndObject(entry.reference ?? entry.texture)) return { reason: `${lead} the instance record names no qualified texture for it` };
+  return { override: entry };
+}
+
+/**
+ * A native link's own `None` texture overrides, each recovered only where `provenTexture` proves it. A known override the link already
+ * gives the parameter settles it first, so a `None` beside it stays as it is. Returns the link with the proven overrides added as known
+ * textures, and the reason each override that stays unknown is unknown.
+ */
+function recoverUnresolvedTextures(
+  dumped: DumpedGraphs,
+  link: PropsFile,
+  packagePath: string | undefined,
+  object: string,
+): { readonly link: PropsFile; readonly reasons: ReadonlyMap<string, string> } {
+  const reasons = new Map<string, string>();
+  if (link.unresolvedOverrides.length === 0) return { link, reasons };
+  const recovered: CollectedTextureParameter[] = [];
+  const remaining: string[] = [];
+  for (const name of link.unresolvedOverrides) {
+    const key = name.trim().toLowerCase();
+    if (link.overrides.some((override) => override.name.trim().toLowerCase() === key)) {
+      remaining.push(name);
+      continue;
+    }
+    const proof = provenTexture(dumped, link, name, packagePath, object);
+    if ("override" in proof) recovered.push(proof.override);
+    else {
+      remaining.push(name);
+      reasons.set(key, proof.reason);
+    }
+  }
+  if (recovered.length === 0) return { link, reasons };
+  return { link: { ...link, overrides: [...link.overrides, ...recovered], unresolvedOverrides: remaining }, reasons };
+}
+
 /** Returns undefined when graph baking is switched off by the caller (the importer decides that). */
 export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undefined {
   const dump = options.dumpGraphs ?? dumpMaterialGraphs;
@@ -531,6 +624,8 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     let currentPackage: string | undefined = request.materialPackage;
     // Why the walk stopped short of a graph: the parent's props are not exported and its qualified record cannot stand for them.
     let unrecovered: string | undefined;
+    // Why each texture a link leaves unknown is unknown, by lower-case name. The nearest link's reason stands.
+    const unresolvedReasons = new Map<string, string>();
     for (let current: string | undefined = request.lookupName; current && chain.length < MAX_PARENT_DEPTH && !visited.has(current); ) {
       visited.add(current);
       // The exported props win. Only a parent with none is looked up, by its exact package and object, in the qualified records.
@@ -540,7 +635,14 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
       if (link === undefined && visited.size > 1) {
         const recovered = recoveredLink(dumped, currentPackage, current);
         if ("reason" in recovered) unrecovered = recovered.reason;
-        else link = recovered.link;
+        // A record's own `None` is an authored null, and a null instance texture is no value: the renderer falls through to the parent
+        // (`RenderThread_GetParameterValue` in `MaterialInstanceSupport.h`), so it overrides nothing here and the parent's value stands.
+        else link = { ...recovered.link, unresolvedOverrides: [] };
+      } else if (link) {
+        // A native `None` is recovered from this identity's own record only where that record proves it; the rest keeps its reason.
+        const native = recoverUnresolvedTextures(dumped, link, currentPackage, current);
+        link = native.link;
+        for (const [key, reason] of native.reasons) if (!unresolvedReasons.has(key)) unresolvedReasons.set(key, reason);
       }
       if (link) chain.push(link);
       graph = graphNamed(byName, current, currentPackage);
@@ -556,7 +658,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents${unrecovered === undefined ? "" : `: ${unrecovered}`}`);
 
     // The emission and normal proofs read the same instance parameters as the bake, so every outcome below carries them.
-    const parameters = chainParameters(chain);
+    const parameters = chainParameters(chain, unresolvedReasons);
     const emissionZero = proveEmissionZero(graph, parameters);
     const normalDependencies = graphNormalDependencies(graph, parameters, request.alpha);
     const effect = emissiveOnlyEffect(graph);

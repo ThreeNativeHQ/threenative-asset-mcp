@@ -2588,6 +2588,16 @@ describe("packageGlb judges a flattened base colour by the active path, through 
     expect(section.limitations.join("\n")).toMatch(/T_Stale kept as base colour, unverified/);
     expect(section.graph).toMatchObject({ status: "unsupported" });
   });
+
+  it("keeps the flattened base colour unverified, and names the None it cannot read, when the child's own switch makes that None the active path", async () => {
+    const { section } = await packStale({
+      master: albedoMaster(),
+      childProps: `${childInstanceProps("/Game/Test/MI_Mid", true)}\n${textureParameter("Albedo", "None")}`,
+      recordProps: "",
+    });
+    expect(section.bindings).toContainEqual(expect.objectContaining({ slot: "baseColor", texture: "T_Stale" }));
+    expect(section.limitations.join("\n")).toMatch(/T_Stale kept as base colour, unverified: .*Albedo/);
+  });
 });
 
 // The material library packages each standalone material package on its own. Two packages share the basename MI_Same: each section must
@@ -2668,5 +2678,337 @@ process.exit(spawnSync(tool, argv, { stdio: "inherit" }).status ?? 1);
     expect([...bases.keys()].sort()).toEqual(["Content/Left/MI_Same", "Content/Right/MI_Same"]);
     expect(await firstPixel(bases.get("Content/Right/MI_Same")!)).toEqual([0, 0, 255]);
     expect(await firstPixel(bases.get("Content/Left/MI_Same")!)).toEqual([200, 120, 60]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// An unresolved native texture override (UE Viewer writes `None` for a texture it cannot name, so the exporter lost it) shadows what
+// it replaces. It is recovered only from the same identity's complete qualified record, and only where that record names the
+// parameter with a qualified texture. Fixtures are synthetic; the record shapes follow the converter's (`ParameterInfo` carries
+// `Association = GlobalParameter`).
+describe("an unresolved native texture override (None) shadows what it replaces, and is recovered only from its exact record", () => {
+  // Each synthetic texture is a uniform 4x4 PNG, so a bake's first pixel is the colour it sampled.
+  const PIXELS: Record<string, number[]> = {
+    T_Master: [40, 80, 120],
+    T_Other: [10, 10, 10],
+    T_Mid: [200, 30, 30],
+    T_Child: [30, 200, 30],
+    T_Native: [60, 60, 200],
+    T_Engine: [120, 240, 60],
+  };
+  const ENGINE_TEXTURE = "Texture2D'/Engine/EngineMaterials/T_Engine.T_Engine'";
+  const MASTER_PARENT = "Material'/Game/Test/M_Master.M_Master'";
+  const instanceParent = (object: string): string => `MaterialInstanceConstant'/Game/Test/${object}.${object}'`;
+  const nativeProps = (parent: string, ...blocks: string[]): string => [`Parent = ${parent}`, ...blocks].join("\n");
+  const nativeScalar = (name: string, value: number): string =>
+    ["ScalarParameterValues[0] =", "{", `    ParameterInfo = { Name=${name} }`, `    ParameterValue = ${value}`, "}"].join("\n");
+  // A record's override as the converter writes it: the value, then the parameter with its association.
+  const recordTexture = (name: string, value: string, association = "GlobalParameter"): string =>
+    [
+      "TextureParameterValues[0] =",
+      "{",
+      `    ParameterValue = ${value}`,
+      "    ParameterInfo =",
+      "    {",
+      `        Name = ${name}`,
+      `        Association = ${association}`,
+      "        Index = -1",
+      "    }",
+      "}",
+    ].join("\n");
+  const recordScalar = (name: string, value: number): string =>
+    ["ScalarParameterValues[0] =", "{", `    ParameterValue = ${value}`, "    ParameterInfo =", "    {", `        Name = ${name}`, "        Association = GlobalParameter", "        Index = -1", "    }", "}"].join("\n");
+  const collectedTexture = (name: string, texture: string): string =>
+    ["CollectedTextureParameters[1] =", "{", "    CollectedTextureParameters[0] =", "    {", `        Texture = Texture2D'/Game/Test/${texture}.${texture}'`, `        Name = ${name}`, "        Group = None", "    }", "}"].join("\n");
+
+  const textureParam = (id: string, name: string, texture: string): Raw =>
+    node(id, "TextureSampleParameter2D", { parameter: { name, group: "" }, default: null, texture: `/Game/Test/${texture}.${texture}`, samplerType: "Color" });
+  const scalarParam = (id: string, name: string, value: number): Raw => node(id, "ScalarParameter", { parameter: { name, group: "" }, default: value });
+  function masterWith(nodes: Raw[], colour: string, extra: { readonly opacityMask?: string; readonly normal?: string } = {}): MaterialGraph {
+    return materialGraphSchema.parse({
+      format: 1,
+      material: "M_Master",
+      package: "/Game/Test/M_Master",
+      truncated: false,
+      nodeCount: nodes.length,
+      outputs: {
+        baseColor: output(colour, 0),
+        roughness: null,
+        metallic: null,
+        emissive: null,
+        opacity: null,
+        opacityMask: extra.opacityMask === undefined ? null : output(extra.opacityMask, 0),
+        normal: extra.normal === undefined ? null : output(extra.normal, 0),
+        materialAttributes: null,
+      },
+      nodes,
+    });
+  }
+  // BaseColor = the Mask texture parameter, whose node default is T_Master.
+  const maskMaster = (): MaterialGraph => masterWith([textureParam("mask", "Mask", "T_Master")], "mask");
+  // BaseColor = Mask x Brightness (a scalar parameter, default 1).
+  const brightMaster = (): MaterialGraph =>
+    masterWith(
+      [textureParam("mask", "Mask", "T_Master"), scalarParam("brightness", "Brightness", 1), node("mul", "Multiply", { inputs: { A: pin("mask"), B: pin("brightness") } })],
+      "mul",
+    );
+  // BaseColor = UseDetail ? Mask : Other, a static switch whose true branch samples Mask and whose false branch samples Other.
+  const switchMaster = (): MaterialGraph =>
+    masterWith(
+      [
+        node("pick", "StaticSwitchParameter", { inputs: { A: pin("mask"), B: pin("other") }, parameter: { name: "UseDetail", group: "" }, default: true }),
+        textureParam("mask", "Mask", "T_Master"),
+        textureParam("other", "Other", "T_Other"),
+      ],
+      "pick",
+    );
+  // A flat grey BaseColor; the Normal is the Normal texture parameter (node default T_Master).
+  const normalMaster = (): MaterialGraph => masterWith([constant3("tint", [0.5, 0.5, 0.5]), textureParam("normal", "Normal", "T_Master")], "tint", { normal: "normal" });
+  // A flat grey BaseColor; the opacity mask is the Mask texture parameter.
+  const cutoutMaster = (): MaterialGraph => masterWith([constant3("tint", [0.5, 0.5, 0.5]), textureParam("mask", "Mask", "T_Master")], "tint", { opacityMask: "mask" });
+
+  // A baker over the real dump: the fake converter writes the master graph and `files` (instance records) for it. The exporter is the
+  // production shape: it answers only for the exact package a reference names, and the engine texture only with engine content.
+  async function unresolvedBaker(master: MaterialGraph, files: Record<string, string> = {}, options: { readonly engine?: boolean } = {}) {
+    const root = await scratch("graph-bake-unresolved-");
+    const sourceDir = join(root, "source");
+    await mkdir(join(sourceDir, "Content", "Test"), { recursive: true });
+    for (const object of ["MI_Child", "MI_Mid", "MI_A", "MI_B"]) await writeFile(join(sourceDir, "Content", "Test", `${object}.uasset`), Buffer.alloc(16));
+    const packages = new Map<string, string>();
+    for (const [name, rgb] of Object.entries(PIXELS)) {
+      const png = join(root, `${name}.png`);
+      await writePng(png, [...rgb, 255], 4);
+      packages.set(name.startsWith("T_Engine") ? `/Engine/EngineMaterials/${name}` : `/Game/Test/${name}`, png);
+    }
+    if (options.engine === false) packages.delete("/Engine/EngineMaterials/T_Engine");
+    const converter = join(root, "converter");
+    await writeRecordConverter(converter, { "M_Master.graph.json": JSON.stringify(master), ...files }, join(root, "argv.log"), root);
+    const assets = { png: new Map<string, string>() };
+    const baker = createGraphBaker({
+      sourceDir,
+      maxTextureSize: 8,
+      environment: withoutEngineContent(process.env),
+      modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
+      exportTexture: async (_name, reference) => {
+        const path = reference === undefined ? undefined : (/'([^']+)'/.exec(reference)?.[1] ?? reference);
+        const dot = path === undefined ? -1 : path.lastIndexOf(".");
+        return path === undefined || dot < 0 ? undefined : packages.get(path.slice(0, dot));
+      },
+    })!;
+    return {
+      bake: (request: {
+        readonly lookupName: string;
+        readonly props: Record<string, string>;
+        readonly materialPackage?: string | undefined;
+        readonly probe?: boolean;
+        readonly alpha?: "opacityMask";
+      }) =>
+        baker({
+          materialName: `${request.lookupName}_section`,
+          lookupName: request.lookupName,
+          materialPackage: "materialPackage" in request ? request.materialPackage : `/Game/Test/${request.lookupName}`,
+          assets,
+          readProps: (name) => request.props[name],
+          ...(request.probe ? { probe: true } : {}),
+          ...(request.alpha ? { alpha: request.alpha } : {}),
+        }),
+    };
+  }
+  async function bakedPixel(outcome: GraphBakeOutcome): Promise<number[]> {
+    if (outcome.status !== "baked") throw new Error(`not baked: ${outcome.status}: ${outcome.reason}`);
+    return firstPixel(outcome.png);
+  }
+
+  it("refuses an active None that would otherwise inherit the ancestor's override", async () => {
+    const { bake } = await unresolvedBaker(maskMaster());
+    const outcome = await bake({
+      lookupName: "MI_Child",
+      props: { MI_Child: nativeProps(instanceParent("MI_Mid"), textureParameter("Mask", "None")), MI_Mid: nativeProps(MASTER_PARENT, textureParameter("Mask", "T_Mid")) },
+    });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Mask") });
+  });
+
+  it("refuses an active None that would otherwise fall back to the graph's own default texture", async () => {
+    const { bake } = await unresolvedBaker(maskMaster());
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Mask") });
+  });
+
+  it("bakes when the static switch takes a branch that does not sample the None texture", async () => {
+    const { bake } = await unresolvedBaker(switchMaster());
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, switchBlock("UseDetail", true), textureParameter("Other", "None")) } });
+    expect(outcome).toMatchObject({ status: "baked", texturesUsed: ["T_Master"] });
+    expect(await bakedPixel(outcome)).toEqual(PIXELS.T_Master);
+  });
+
+  it("refuses when the static switch takes the branch that samples the None texture", async () => {
+    const { bake } = await unresolvedBaker(switchMaster());
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, switchBlock("UseDetail", true), textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Mask") });
+  });
+
+  it("bakes the nearer instance's own texture over an ancestor's None", async () => {
+    const { bake } = await unresolvedBaker(maskMaster());
+    const outcome = await bake({
+      lookupName: "MI_Child",
+      props: { MI_Child: nativeProps(instanceParent("MI_Mid"), textureParameter("Mask", "T_Child")), MI_Mid: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) },
+    });
+    expect(await bakedPixel(outcome)).toEqual(PIXELS.T_Child);
+  });
+
+  it("recovers the None from the child's exact qualified record, and keeps the native scalar over anything the record says", async () => {
+    const record = instanceRecord("MI_Child", `${recordTexture("Mask", ENGINE_TEXTURE)}\n${recordScalar("Brightness", 1)}`);
+    const { bake } = await unresolvedBaker(brightMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None"), nativeScalar("Brightness", 2500)) } });
+    expect(outcome).toMatchObject({ status: "baked", texturesUsed: ["T_Engine"] });
+    expect(outcome.parameters?.textureReferences?.get("mask")).toBe(ENGINE_TEXTURE);
+    expect(outcome.parameters?.scalars.get("brightness")).toBe(2500);
+    // 2500 times any texel clamps to white: the native scalar, not the record's 1, is the one the bake multiplies by.
+    expect(await bakedPixel(outcome)).toEqual([255, 255, 255]);
+  });
+
+  it("keeps the native instance's own known texture over the record's texture for the same parameter", async () => {
+    const record = instanceRecord("MI_Child", recordTexture("Mask", ENGINE_TEXTURE));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "T_Native")) } });
+    expect(outcome).toMatchObject({ status: "baked", texturesUsed: ["T_Native"] });
+    expect(await bakedPixel(outcome)).toEqual(PIXELS.T_Native);
+  });
+
+  it("never recovers from a record of another package that carries the same object name", async () => {
+    const record = instanceRecord("MI_Child", recordTexture("Mask", ENGINE_TEXTURE), { package: "/Game/Other" });
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("no instance record for /Game/Test/MI_Child") });
+  });
+
+  it("never recovers from an identity that two records claim", async () => {
+    const record = JSON.stringify(instanceRecord("MI_Child", recordTexture("Mask", ENGINE_TEXTURE)));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": record, "MI_Child_copy.instance.json": record });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/duplicate identity/) });
+  });
+
+  it("never recovers from a record the converter refused", async () => {
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(refusedInstance("MI_Child")) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/LayerParameter/) });
+  });
+
+  it("never recovers a texture the record binds to a layer rather than globally", async () => {
+    const record = instanceRecord("MI_Child", recordTexture("Mask", ENGINE_TEXTURE, "LayerParameter"));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/not a global parameter/) });
+  });
+
+  it("never recovers a native None that is itself a layer parameter, even from a global record entry", async () => {
+    const layerNone = [
+      "TextureParameterValues[0] =",
+      "{",
+      "    ParameterValue = None",
+      "    ParameterInfo =",
+      "    {",
+      "        Name = Mask",
+      "        Association = LayerParameter",
+      "        Index = 0",
+      "    }",
+      "}",
+    ].join("\n");
+    const record = instanceRecord("MI_Child", recordTexture("Mask", ENGINE_TEXTURE));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, layerNone) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/not a global parameter/) });
+  });
+
+  it("never recovers from a record that names None, an authored null, for the parameter", async () => {
+    const record = instanceRecord("MI_Child", recordTexture("Mask", "None"));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/names no (qualified )?texture/) });
+  });
+
+  it("lets a parent record's own None, an authored null, fall through to the texture above it, as the renderer does", async () => {
+    const record = instanceRecord("MI_Mid", recordTexture("Mask", "None"));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Mid.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(instanceParent("MI_Mid")) } });
+    expect(outcome).toMatchObject({ status: "baked", texturesUsed: ["T_Master"] });
+    expect(await bakedPixel(outcome)).toEqual(PIXELS.T_Master);
+  });
+
+  it("never recovers a texture the record names without its package", async () => {
+    const record = instanceRecord("MI_Child", recordTexture("Mask", "Texture2D'T_Engine'"));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/no qualified texture/) });
+  });
+
+  it("never recovers for a legacy request that names no package", async () => {
+    const record = instanceRecord("MI_Child", recordTexture("Mask", ENGINE_TEXTURE));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", materialPackage: undefined, props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/names no package/) });
+  });
+
+  it("leaves a recovered engine texture unavailable, and says so, when no engine content answers for it", async () => {
+    const record = instanceRecord("MI_Child", recordTexture("Mask", ENGINE_TEXTURE));
+    const { bake } = await unresolvedBaker(maskMaster(), { "MI_Child.instance.json": JSON.stringify(record) }, { engine: false });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("T_Engine has no exact source") });
+  });
+
+  it("never answers an unresolved request from a positive bake of another instance of the same graph", async () => {
+    const { bake } = await unresolvedBaker(maskMaster());
+    const positive = await bake({ lookupName: "MI_A", props: { MI_A: nativeProps(MASTER_PARENT) } });
+    expect(await bakedPixel(positive)).toEqual(PIXELS.T_Master);
+    const unresolved = await bake({ lookupName: "MI_B", props: { MI_B: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(unresolved).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Mask") });
+  });
+
+  it("probes an active None as unknown: the probe names no base-colour texture, and no switch is claimed overridden", async () => {
+    const { bake } = await unresolvedBaker(maskMaster());
+    const outcome = await bake({ lookupName: "MI_Child", probe: true, props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).not.toHaveProperty("baseColourTextures");
+    expect(outcome).toMatchObject({ switchOverridden: false });
+  });
+
+  it("refuses the whole bake when the cut-out path samples a None texture, rather than keeping the colour opaque", async () => {
+    const { bake } = await unresolvedBaker(cutoutMaster());
+    const outcome = await bake({ lookupName: "MI_Child", alpha: "opacityMask", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Mask", "None")) } });
+    expect(outcome).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Mask") });
+  });
+
+  it("reports the Normal unknown, never a list without its texture, when the Normal's texture is None", async () => {
+    const { bake } = await unresolvedBaker(normalMaster());
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Normal", "None")) } });
+    expect(outcome.normalDependencies).toMatchObject({ status: "unknown", reason: expect.stringContaining("Normal") });
+  });
+
+  it("reads the engine normal a qualified record gives a None Normal", async () => {
+    const flat = "Texture2D'/Engine/EngineMaterials/BaseFlattenNormalMap.BaseFlattenNormalMap'";
+    const record = instanceRecord("MI_Child", recordTexture("Normal", flat));
+    const { bake } = await unresolvedBaker(normalMaster(), { "MI_Child.instance.json": JSON.stringify(record) });
+    const outcome = await bake({ lookupName: "MI_Child", props: { MI_Child: nativeProps(MASTER_PARENT, textureParameter("Normal", "None")) } });
+    expect(outcome.normalDependencies).toMatchObject({ status: "known", textures: [{ name: "BaseFlattenNormalMap", reference: flat }] });
+  });
+
+  it("gives the nearer None the whole texture parameter: no ancestor's default, object name or reference survives it", () => {
+    const parameters = chainParameters([parsePropsFile(textureParameter("Mask", "None")), parsePropsFile(collectedTexture("Mask", "T_Master"))]);
+    expect(parameters.textures.has("mask")).toBe(false);
+    expect(parameters.textureReferences?.has("mask")).toBe(false);
+    expect(parameters.unresolvedTextures?.has("mask")).toBe(true);
+  });
+
+  it("keeps a nearer known override over an ancestor's None, in both the object name and the reference", () => {
+    const parameters = chainParameters([parsePropsFile(textureParameter("Mask", "T_Child")), parsePropsFile(textureParameter("Mask", "None"))]);
+    expect(parameters.textures.get("mask")).toBe("T_Child");
+    expect(parameters.textureReferences?.get("mask")).toBe("Texture2D'/Game/Test/T_Child.T_Child'");
+    expect(parameters.unresolvedTextures?.has("mask") ?? false).toBe(false);
+  });
+
+  it("keys an unresolved parameter apart from an absent one, so neither answers for the other", () => {
+    const absent = chainParameters([parsePropsFile("")]);
+    const unresolved = chainParameters([parsePropsFile(textureParameter("Mask", "None"))]);
+    expect(parametersKey(unresolved)).not.toBe(parametersKey(absent));
   });
 });
