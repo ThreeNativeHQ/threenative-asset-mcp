@@ -75,7 +75,7 @@ function resolveInstance(parameters: readonly (readonly [string, string])[]) {
 
 describe("converter: a material instance's texture overrides", () => {
   it("reads the tagged TextureParameterValues too, not only CUE4Parse's typed array (converter 62)", () => {
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.76");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.77");
     const exporter = CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("async Task ExportMaterialAsync"));
     expect(exporter).toContain('instance.GetOrDefault<FStructFallback[]>("TextureParameterValues")');
   });
@@ -385,6 +385,77 @@ describeWithTools(["modern-converter"], "material export: a refused override fai
     expect(run.code, run.stderr).toBe(0);
     expect(run.files).toContain("Materials/MI_Valid.props.txt");
     expect(parsePropsFile(await readFile(join(run.output, "Materials", "MI_Valid.props.txt"), "utf8")).switchOverrides).toEqual([]);
+  });
+});
+
+// Converter 77. A package saved by UE4 lists every custom version it used, so a UE5 version missing from its list names a field its
+// engine never wrote. With --engine 5.1 CUE4Parse guessed both UE5 versions from the game and read the two cached-data bools of every
+// such package: the first as 0, the second as the 77 below ("Invalid bool value"). A package that lists them still has both bools.
+const UE5_MAIN = [0x697dd581, 0xe64f41ab, 0xaa4a51ec, 0xbeb7b628];
+const UE5_RELEASE = [0xd89b5e42, 0x24bd4d46, 0x8412aca8, 0xdf641779];
+// The gate values: MaterialSavedCachedData in FUE5MainStreamObjectVersion, MaterialInterfaceSavedCachedData in FUE5ReleaseStreamObjectVersion.
+const UE5_LISTED = [{ guid: UE5_MAIN, version: 36 }, { guid: UE5_RELEASE, version: 14 }];
+const savedByUe4 = (name: string, roughness: number, listed: boolean, bools: number[]): Buffer =>
+  materialPackage(
+    [{ name, className: "MaterialInstanceConstant", properties: [scalarArray([[info("Roughness"), float("ParameterValue", roughness)]])], trailing: bools }],
+    [],
+    { customVersions: listed ? UE5_LISTED : [] },
+  );
+const absentPackage = (name: string): Buffer => savedByUe4(name, 0.25, false, [0, 77]);
+const listedPackage = (name: string): Buffer => savedByUe4(name, 0.75, true, [0, 0]);
+// The converter loads packages in the host's directory-listing order, which is not alphabetical. Both cases keep the same two paths in
+// the same creation order and swap the packages, so whichever path the host lists first, each load order happens once.
+const CUSTOM_VERSION_CASES: Readonly<Record<string, Readonly<Record<string, Buffer>>>> = {
+  "absent-at-x": { "Game/Materials/MI_X.uasset": absentPackage("MI_X"), "Game/Materials/MI_Y.uasset": listedPackage("MI_Y") },
+  "listed-at-x": { "Game/Materials/MI_X.uasset": listedPackage("MI_X"), "Game/Materials/MI_Y.uasset": absentPackage("MI_Y") },
+  "listed-invalid": { "Game/Materials/MI_Listed77.uasset": savedByUe4("MI_Listed77", 0.5, true, [0, 77]) },
+};
+
+describeWithTools(["modern-converter"], "material export: a UE4 package that lists no UE5 custom version", () => {
+  let directory = "";
+  let build: ConverterBuild | undefined;
+  const runs: Record<string, ConverterRun> = {};
+
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), "tn-custom-versions-"));
+    build = await buildConverterProgram(CUE4PARSE_PROGRAM, CUE4PARSE_ENGINE_CONTENT, join(directory, "build"));
+    if (build.code !== 0) return;
+    for (const [name, packages] of Object.entries(CUSTOM_VERSION_CASES)) runs[name] = await convertPackages(build, join(directory, name), packages, "5.1");
+  }, 900_000);
+
+  afterAll(async () => {
+    if (directory) await rm(directory, { recursive: true, force: true });
+  });
+
+  const runFor = (name: string): ConverterRun => {
+    const result = runs[name];
+    if (!result) throw new Error(`${name} did not run; the build exited ${build?.code}: ${build?.output ?? ""}`);
+    return result;
+  };
+  const roughness = async (run: ConverterRun, asset: string) =>
+    parsePropsFile(await readFile(join(run.output, "Materials", `${asset}.props.txt`), "utf8")).scalarOverrides;
+
+  it("compiles the converter program", () => {
+    expect(build?.code, build?.output).toBe(0);
+  });
+
+  it.each([
+    ["absent-at-x", "MI_X", "MI_Y"],
+    ["listed-at-x", "MI_Y", "MI_X"],
+  ])("reads each package by its own custom versions in one root (%s)", async (name, absent, listed) => {
+    const run = runFor(name);
+    expect(run.code, run.stderr).toBe(0);
+    expect(run.stderr + run.stdout).not.toContain("Invalid bool value");
+    expect(await roughness(run, absent)).toEqual([{ name: "Roughness", value: 0.25 }]);
+    expect(await roughness(run, listed)).toEqual([{ name: "Roughness", value: 0.75 }]);
+  });
+
+  it("still reads both bools of a package that lists the versions, so a 77 there is refused", () => {
+    const run = runFor("listed-invalid");
+    expect(run.code).not.toBe(0);
+    expect(run.stderr).toContain("/Game/Materials/MI_Listed77.MI_Listed77");
+    expect(run.stderr).toContain("Invalid bool value (77)");
+    expect(run.files).not.toContain("Materials/MI_Listed77.props.txt");
   });
 });
 

@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.76",
+  version: "b4e95441+threenative.77",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -273,6 +273,48 @@ index 10bfc73..b1d220e 100644
                  }
              }
  
+diff --git a/CUE4Parse/UE4/Versions/VersionUtils.cs b/CUE4Parse/UE4/Versions/VersionUtils.cs
+--- a/CUE4Parse/UE4/Versions/VersionUtils.cs
++++ b/CUE4Parse/UE4/Versions/VersionUtils.cs
+@@ -27,4 +27,14 @@ public static class VersionUtils
+
+         return -1; // Determine by game
+     }
++
++    // A package saved by UE4 lists every custom version it used, so a GUID missing from its non-empty container names a field its
++    // engine never wrote. CustomVer reports -1 for it and the callers then guess from --engine, which can open a UE5-only field.
++    public static bool IsAbsentInUe4Package(this FArchive Ar, FGuid key)
++    {
++        var summary = (Ar as FAssetArchive)?.Owner?.Summary;
++        return summary is { bUnversioned: false, CustomVersionContainer: { Versions.Length: > 0 } versions } &&
++               summary.FileVersionUE.FileVersionUE5 == 0 &&
++               versions.GetVersion(key) == -1;
++    }
+ }
+diff --git a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
+--- a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
++++ b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
+@@ -395,6 +395,8 @@ public static class FUE5MainStreamObjectVersion
+         var ver = Ar.CustomVer(GUID);
+         if (ver >= 0)
+             return (Type) ver;
++        if (Ar.IsAbsentInUe4Package(GUID))
++            return Type.BeforeCustomVersionWasAdded;
+
+         return Ar.Game switch
+         {
+diff --git a/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs b/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs
+--- a/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs
++++ b/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs
+@@ -227,6 +227,8 @@ public static class FUE5ReleaseStreamObjectVersion
+         var ver = Ar.CustomVer(GUID);
+         if (ver >= 0)
+             return (Type) ver;
++        if (Ar.IsAbsentInUe4Package(GUID))
++            return Type.BeforeCustomVersionWasAdded;
+
+         return Ar.Game switch
+         {
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
