@@ -77,7 +77,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 115;
+export const IMPORTER_VERSION = 116;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -3060,6 +3060,36 @@ export function meshGeometryScale(
   return geometryScaleFor(fromMeshDescription ? "converter" : "umodel", fromMeshDescription ? 0.01 : 1, buildScale);
 }
 
+/**
+ * Records the mesh a clip attached to, keyed by clip name. The value is the mesh identity, not the clip
+ * name: all LODs of one mesh share the base name, so they collapse to one rig.
+ */
+export function recordAttachedPsa(
+  byModel: Map<string, Set<string>>,
+  meshName: string,
+  clips: readonly string[],
+): void {
+  for (const clip of clips) {
+    const models = byModel.get(clip.toLowerCase()) ?? new Set<string>();
+    models.add(meshName);
+    byModel.set(clip.toLowerCase(), models);
+  }
+}
+
+/**
+ * A clip that attached to more than one mesh by bone name alone may have crossed from its real
+ * skeleton to a rig that merely shares bone names; surface it instead of shipping it twice.
+ */
+export function duplicateBoneNameWarnings(byModel: ReadonlyMap<string, ReadonlySet<string>>): string[] {
+  const warnings: string[] = [];
+  for (const [clip, models] of byModel) {
+    if (models.size > 1) {
+      warnings.push(`Animation clip "${clip}" attached to ${models.size} skeletal models by bone name (${[...models].join(", ")}); a duplicate bone-name rig may have received a clip that belongs to another skeleton.`);
+    }
+  }
+  return warnings;
+}
+
 export async function importUnrealDirectory(
   request: ImportUnrealRequest,
 ): Promise<ImportReport> {
@@ -5155,13 +5185,8 @@ export async function importUnrealDirectory(
           saturatedUvs += packaged.saturatedUvs;
           repairedMorphDeltas += packaged.repairedMorphDeltas;
           conflictingMorphDeltas += packaged.conflictingMorphDeltas;
-          for (const name of packaged.attachedPsa) {
-            attachedPsa.add(name);
-            const models = attachedPsaByModel.get(name.toLowerCase()) ?? new Set<string>();
-            // LODs of one mesh are one rig, so the base mesh name groups them.
-            models.add(name);
-            attachedPsaByModel.set(name.toLowerCase(), models);
-          }
+          recordAttachedPsa(attachedPsaByModel, name, packaged.attachedPsa);
+          for (const clip of packaged.attachedPsa) attachedPsa.add(clip);
           for (const name of packaged.existingPsa) existingPsa.add(name);
           for (const name of packaged.incompatiblePsa) incompatiblePsa.add(name);
           const validated = await validateGlb(glbPath);
@@ -5518,11 +5543,7 @@ export async function importUnrealDirectory(
     }
     // A funny clip landing on two rigs by bone name alone may have crossed from its real skeleton to a rig
     // that merely shares bone names; surface it instead of silently shipping it twice.
-    for (const [clip, models] of attachedPsaByModel) {
-      if (models.size > 1) {
-        warnings.push(`Animation clip "${clip}" attached to ${models.size} skeletal models by bone name (${[...models].join(", ")}); a duplicate bone-name rig may have received a clip that belongs to another skeleton.`);
-      }
-    }
+    for (const warning of duplicateBoneNameWarnings(attachedPsaByModel)) warnings.push(warning);
     if (incompatiblePsa.size > 0) {
       warnings.push(
         `${incompatiblePsa.size} ActorX animation clip${incompatiblePsa.size === 1 ? " was" : "s were"} not attached to at least one skeletal model because fewer than 80% of bone names matched.`,

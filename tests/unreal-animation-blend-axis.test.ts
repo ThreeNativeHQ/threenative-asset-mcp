@@ -70,7 +70,8 @@ describeWithTools(["modern-converter"], "converter blend-space axis code (compil
 
   it("keeps its axis, typed-array and notify helpers in the embedded program", () => {
     expect(CUE4PARSE_PROGRAM).toContain("static Dictionary<string, object?> BlendAxis(FBlendParameter? typed, FStructFallback? raw)");
-    expect(CUE4PARSE_PROGRAM).toContain('["gridNum"] = present("GridNum") ? (typed?.GridNum ?? 0) : 4,');
+    expect(CUE4PARSE_PROGRAM).toContain('["gridNum"] = omitted("GridNum") ? 4 : (typed?.GridNum ?? 0),');
+    expect(CUE4PARSE_PROGRAM).toContain("static FStructFallback[] ArrayElements(AbstractPropertyHolder holder, string name)");
     expect(CUE4PARSE_PROGRAM).toContain("static (string ClassName, string Kind) NotifyClassNames(");
   });
 
@@ -94,11 +95,14 @@ describeWithTools(["modern-converter"], "converter blend-space axis code (compil
     const functions = [
       "static Dictionary<string, object?> BlendAxis(FBlendParameter? typed, FStructFallback? raw)",
       "static double DumpNum(float value)",
+      "static bool StructBool(FStructFallback? data, string field, out bool value)",
+      "static FStructFallback[] ArrayElements(AbstractPropertyHolder holder, string name)",
       "static (string ClassName, string Kind) NotifyClassNames(string? objectClass, string? objectName, string? stateClass)",
     ].map((signature) => extractCSharp(CUE4PARSE_PROGRAM, signature));
     await writeFile(
       join(project, "Program.cs"),
-      `using CUE4Parse.UE4.Assets.Objects;
+      `using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.Engine.Animation;
 using CUE4Parse.UE4.Objects.UObject;
@@ -106,16 +110,25 @@ using CUE4Parse.UE4.Objects.UObject;
 if (args[0] == "axis")
 {
     // Three axes with unequal values, a middle one whose Max and GridNum the serializer omitted, and an
-    // unversioned axis with no raw tag at all.
+    // unversioned axis with no raw tag at all whose typed values must survive untouched by any default.
     var a0 = BlendAxis(Typed(Axis("Speed", -90f, 90f, 2, true, true)), Axis("Speed", -90f, 90f, 2, true, true));
     var a1 = BlendAxis(Typed(Axis("Yaw", null, null, null, null, null)), Axis("Yaw", null, null, null, null, null));
-    var a2 = BlendAxis(new FBlendParameter(), null);
+    var a2 = BlendAxis(Typed(Axis("Lean", -45f, 45f, 8, true, false)), null);
     Console.WriteLine(string.Join("|", Fmt(a0), Fmt(a1), Fmt(a2)));
 }
 if (args[0] == "typed-wins")
 {
     // The raw tag disagrees with the typed array; the typed fixed array is the source of the values.
     Console.WriteLine(Fmt(BlendAxis(Typed(Axis("Speed", 5f, 5f, 5, false, false)), Axis("Speed", -90f, -90f, 9, true, true))));
+}
+if (args[0] == "samples")
+{
+    // A dynamic SampleData TArray: one ArrayProperty at ArrayIndex 0 holding two elements, the second
+    // mirrored. The per-ArrayIndex read can never reach element 1; the array-element read does.
+    var holder = SampleHolder(false, true);
+    var elements = ArrayElements(holder, "SampleData");
+    var staleSecond = StaticFixedArrayElement(holder, "SampleData", 1);
+    Console.WriteLine($"{elements.Length},{Mirror(elements[0])},{Mirror(elements[1])},{staleSecond is null}");
 }
 if (args[0] == "notify")
 {
@@ -152,6 +165,34 @@ static FStructFallback Axis(string displayName, float? min, float? max, int? gri
 
 static FBlendParameter Typed(FStructFallback raw) => new(raw);
 
+static FStructFallback Sample(bool mirror) => new(
+    mirror ? new List<FPropertyTag> { Tag("bMirror", "BoolProperty", new BoolProperty(true)) } : new List<FPropertyTag>());
+
+static FStructFallback SampleHolder(bool first, bool second)
+{
+    var elements = new List<FPropertyTagType>
+    {
+        new StructProperty(new FScriptStruct(Sample(first))),
+        new StructProperty(new FScriptStruct(Sample(second))),
+    };
+    return new FStructFallback(new List<FPropertyTag>
+    {
+        Tag("SampleData", "ArrayProperty", new ArrayProperty(new UScriptArray(elements, "StructProperty"))),
+    });
+}
+
+static bool Mirror(FStructFallback data) => StructBool(data, "bMirror", out var mirror) && mirror;
+
+// The pre-fix read: an element matches by the property's ArrayIndex, which for a dynamic TArray is
+// always 0, so element 1 is never reached.
+static FStructFallback? StaticFixedArrayElement(AbstractPropertyHolder holder, string name, int index)
+{
+    foreach (var property in holder.Properties)
+        if (property.Name.Text == name && property.ArrayIndex == index)
+            return property.Tag?.GetValue(typeof(FStructFallback)) as FStructFallback;
+    return null;
+}
+
 ${functions.join("\n")}
 `,
     );
@@ -171,12 +212,16 @@ ${functions.join("\n")}
   const run = (...args: string[]): string =>
     execFileSync(sdk, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
 
-  it("keeps each typed axis separate and restores an omitted Max and GridNum", () => {
-    expect(run("axis")).toBe("Speed,-90,90,2,True,True|Yaw,0,100,4,False,False|None,0,100,4,False,False");
+  it("keeps each typed axis separate, restores an omitted Max and GridNum, and keeps a typed-only axis intact", () => {
+    expect(run("axis")).toBe("Speed,-90,90,2,True,True|Yaw,0,100,4,False,False|Lean,-45,45,8,True,False");
   });
 
   it("takes the actual field values from the typed array, not the raw tag", () => {
     expect(run("typed-wins")).toBe("Speed,5,5,5,False,False");
+  });
+
+  it("reads a dynamic SampleData array by element so the second element's bMirror survives", () => {
+    expect(run("samples")).toBe("2,False,True,True");
   });
 
   it("derives a notify's class and kind from the resolved class, marking Blueprint behaviour", () => {

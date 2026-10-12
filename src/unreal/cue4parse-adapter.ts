@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.81",
+  version: "b4e95441+threenative.82",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2313,6 +2313,18 @@ static FStructFallback? FixedArrayElement(UObject holder, string name, int index
     return null;
 }
 
+// The raw elements of a dynamic struct TArray (SampleData is one). Unlike a fixed array, whose raw tag
+// is one property per index, the whole TArray is one ArrayProperty at ArrayIndex 0, so a per-index
+// FixedArrayElement read never reaches element 1 and reads the array as a struct at 0. Here the array's
+// own tag yields every element.
+static FStructFallback[] ArrayElements(AbstractPropertyHolder holder, string name)
+{
+    foreach (var property in holder.Properties)
+        if (property.Name.Text == name && property.Tag?.GetValue(typeof(FStructFallback[])) is FStructFallback[] elements)
+            return elements;
+    return [];
+}
+
 static FStructFallback? StructProperty(UObject holder, string name)
 {
     FStructFallback? found = null;
@@ -2346,21 +2358,22 @@ static string StructText(FStructFallback? data, string field)
 }
 
 // One blend-space axis. UBlendSpaceBase.BlendParameters is the typed fixed array and holds the actual
-// values. A field the serializer omitted has no raw tag, and CUE4Parse's FBlendParameter(FStructFallback)
-// then returns default(T) instead of the struct's default, so that field alone takes the Unreal default
-// (Min 0, Max 100, GridNum 4, DisplayName "None", the two flags false). When no raw tag exists at all
-// (an unversioned package) the typed read is the only source and is used as stored.
+// values. When the raw tag exists it says which fields the serializer wrote, and
+// CUE4Parse's FBlendParameter(FStructFallback) then leaves an omitted field at default(T) instead of the
+// struct's default, so that field alone takes the Unreal default (Min 0, Max 100, GridNum 4,
+// DisplayName "None", the two flags false). When no raw tag exists at all (an unversioned package) the
+// typed read is the only source, so every typed value is used as stored rather than replaced by defaults.
 static Dictionary<string, object?> BlendAxis(FBlendParameter? typed, FStructFallback? raw)
 {
-    bool present(string field) => raw is not null && raw.Properties.Exists(property => property.Name.Text == field);
+    bool omitted(string field) => raw is not null && !raw.Properties.Exists(property => property.Name.Text == field);
     return new Dictionary<string, object?>
     {
-        ["displayName"] = present("DisplayName") ? (typed?.DisplayName ?? "") : "None",
-        ["min"] = present("Min") ? DumpNum(typed?.Min ?? 0f) : 0d,
-        ["max"] = present("Max") ? DumpNum(typed?.Max ?? 0f) : 100d,
-        ["gridNum"] = present("GridNum") ? (typed?.GridNum ?? 0) : 4,
-        ["snapToGrid"] = present("bSnapToGrid") && (typed?.bSnapToGrid ?? false),
-        ["wrapInput"] = present("bWrapInput") && (typed?.bWrapInput ?? false),
+        ["displayName"] = omitted("DisplayName") ? "None" : (typed?.DisplayName ?? ""),
+        ["min"] = omitted("Min") ? 0d : DumpNum(typed?.Min ?? 0f),
+        ["max"] = omitted("Max") ? 100d : DumpNum(typed?.Max ?? 0f),
+        ["gridNum"] = omitted("GridNum") ? 4 : (typed?.GridNum ?? 0),
+        ["snapToGrid"] = omitted("bSnapToGrid") ? false : (typed?.bSnapToGrid ?? false),
+        ["wrapInput"] = omitted("bWrapInput") ? false : (typed?.bWrapInput ?? false),
     };
 }
 
@@ -2595,12 +2608,14 @@ void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
         }
         var samples = new List<object>();
         var sampleData = space.SampleData ?? [];
+        // The pinned reader's FBlendSample exposes only Animation, SampleValue and RateScale, so bMirror
+        // is read from the dynamic SampleData TArray's own raw elements rather than dropped. The typed
+        // sample still carries Animation/SampleValue/RateScale.
+        var rawSamples = ArrayElements(space, "SampleData");
         for (var index = 0; index < sampleData.Length; index++)
         {
             var sample = sampleData[index];
-            // The pinned reader's FBlendSample exposes only Animation, SampleValue and RateScale, so
-            // bMirror is read from the sample's own raw element rather than dropped.
-            var rawSample = FixedArrayElement(space, "SampleData", index);
+            var rawSample = index < rawSamples.Length ? rawSamples[index] : null;
             samples.Add(new Dictionary<string, object?>
             {
                 ["animation"] = AnimationReferenceName(sample.Animation),

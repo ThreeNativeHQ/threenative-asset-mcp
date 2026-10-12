@@ -369,6 +369,7 @@ function pageHtml(
   litFailureProbe: readonly number[],
   environment: SourceEnvironmentSnapshot | undefined,
   grid: SourceGridSnapshot | undefined,
+  sampling: readonly (TileSampling | undefined)[] | undefined,
 ): string {
   // Only dimensions and provenance are serialized; `<` is escaped so caller-supplied strings cannot close the script.
   const payload = JSON.stringify({
@@ -383,6 +384,7 @@ function pageHtml(
     environment: environment === undefined ? null : { width: environment.width, height: environment.height, source: environment.source },
     renderer: PICTURE_RENDERER,
     grid: grid === undefined ? null : { width: grid.width, height: grid.height, source: grid.source },
+    sampling: sampling === undefined ? null : sampling.map((entry) => (entry === undefined ? null : { clip: entry.clip, time: entry.timeSeconds })),
   }).replace(/</g, "\\u003c");
   return `<!doctype html><html><body>
 <script type="importmap">{"imports":{"three":"/three.module.js","three/addons/":"/jsm/"}}</script>
@@ -462,10 +464,12 @@ try {
   });
   for (let i = 0; i < options.count; i++) {
     let ground;
+    let model;
+    let mixer = null;
     try {
       if (lit && options.litFailureProbe.includes(i)) throw new Error('lit failure probe');
       const gltf = await Promise.race([loader.loadAsync('/glb/' + i + '.glb'), timeout(30000)]);
-      const model = gltf.scene;
+      model = gltf.scene;
       scene.add(model);
       model.updateMatrixWorld(true);
       const box = new THREE.Box3().setFromObject(model);
@@ -500,13 +504,32 @@ try {
           key.shadow.normalBias = radius * 0.01;
         }
       }
+      // The camera and light rig are already framed on the unsampled model, so a sampled tile keeps that
+      // rest framing. A requested clip that cannot be applied fails the tile; it never renders bind pose.
+      const requested = options.sampling ? options.sampling[i] : null;
+      if (requested) {
+        let skinned = false;
+        model.traverse((o) => { if (o.isSkinnedMesh) skinned = true; });
+        if (!skinned) throw new Error('sampling needs a skinned mesh: ' + requested.clip);
+        const matches = (gltf.animations || []).filter((c) => c.name === requested.clip);
+        if (matches.length === 0) throw new Error('sampling clip not found: ' + requested.clip);
+        if (matches.length > 1) throw new Error('sampling clip ambiguous: ' + requested.clip);
+        if (typeof requested.time !== 'number' || !isFinite(requested.time) || requested.time < 0) throw new Error('sampling time invalid: ' + requested.time);
+        mixer = new THREE.AnimationMixer(model);
+        mixer.clipAction(matches[0]).play();
+        mixer.setTime(requested.time);
+        model.updateMatrixWorld(true);
+      }
       renderer.render(scene, camera);
       context.drawImage(renderer.domElement, (i % options.columns) * size, Math.floor(i / options.columns) * size, size, size);
+      if (mixer) { mixer.stopAllAction(); mixer.uncacheRoot(model); }
       if (ground) { scene.remove(ground); ground.geometry.dispose(); }
       scene.remove(model); dispose(model);
       tiles.push({ ok: true });
     } catch (error) {
+      if (mixer && model) { mixer.stopAllAction(); mixer.uncacheRoot(model); }
       if (ground) { scene.remove(ground); ground.geometry.dispose(); }
+      if (model) { scene.remove(model); dispose(model); }
       tiles.push({ ok: false, error: String(error && error.message || error) });
     }
   }
@@ -533,9 +556,21 @@ function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1))}…`;
 }
 
+/**
+ * One tile's animation frame: pose the model with `clip` at `timeSeconds` before rendering, with the
+ * camera framed from the rest pose. A missing or ambiguous clip, an invalid time, or a model with no
+ * skin fails that tile rather than silently rendering the bind pose.
+ */
+export interface TileSampling {
+  readonly clip: string;
+  readonly timeSeconds: number;
+}
+
 interface RenderedGrid {
   png: Buffer;
   rendered: boolean[];
+  /** Why a tile did not render, aligned with `rendered`; undefined where it rendered. */
+  failures: (string | undefined)[];
   /** Present only when the lit pass was given a source environment and applied it. */
   environment?: AppliedSourceEnvironment;
   /** Present only when the lit pass was given a source Grid and applied it. */
@@ -560,8 +595,10 @@ async function renderGrid(
   environment?: SourceEnvironmentSnapshot,
   /** Validated Grid pixels for the lit pass only; served from their own fixed path, never embedded in the page. */
   grid?: SourceGridSnapshot,
+  /** Per-tile clip sampling; a requested tile is posed by an AnimationMixer before its render. */
+  sampling?: readonly (TileSampling | undefined)[],
 ): Promise<RenderedGrid> {
-  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample, lighting, shadows, litFailureProbe, environment, grid), "utf8");
+  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample, lighting, shadows, litFailureProbe, environment, grid, sampling), "utf8");
   const server = createServer((request, response) => {
     const url = (request.url ?? "/").split("?")[0]!;
     const glb = /^\/glb\/(\d+)\.glb$/.exec(url);
@@ -621,7 +658,7 @@ async function renderGrid(
     );
     const raw = (await page.evaluate(
       () => (window as unknown as { __result: unknown }).__result,
-    )) as { ok: boolean; error?: string; tiles?: { ok: boolean }[]; dataUrl?: string; environment?: AppliedSourceEnvironment; grid?: AppliedSourceGrid };
+    )) as { ok: boolean; error?: string; tiles?: { ok: boolean; error?: string }[]; dataUrl?: string; environment?: AppliedSourceEnvironment; grid?: AppliedSourceGrid };
     if (!raw.ok || raw.dataUrl === undefined) {
       throw new Error(`contact sheet render failed: ${raw.error ?? pageErrors.join("; ")}`);
     }
@@ -634,6 +671,7 @@ async function renderGrid(
     return {
       png: Buffer.from(raw.dataUrl.split(",")[1] ?? "", "base64"),
       rendered: (raw.tiles ?? []).map((entry) => entry.ok),
+      failures: (raw.tiles ?? []).map((entry) => (entry.ok ? undefined : entry.error)),
       ...(raw.environment !== undefined ? { environment: raw.environment } : {}),
       ...(raw.grid !== undefined ? { grid: raw.grid } : {}),
     };
@@ -651,6 +689,8 @@ export interface RenderedTiles {
   tiles: RgbaImage[];
   /** Whether each input rendered a model. */
   rendered: boolean[];
+  /** Why a tile did not render, aligned with `tiles`; present only when `sampling` was requested. */
+  failures?: (string | undefined)[];
   /** Present only when a supplied source environment lit these tiles. */
   sourceEnvironment?: SourceEnvironmentReport;
   /** Present only when a supplied source Grid was applied to these tiles' floor. */
@@ -678,6 +718,12 @@ export async function renderTiles(options: {
   readonly sourceEnvironment?: ThumbnailSourceRadiance;
   /** Grid for the `unreal-like` floor in place of the procedural checker; see `ContactSheetOptions.sourceGrid`. */
   readonly sourceGrid?: ThumbnailSourceGrid;
+  /**
+   * Per-tile animation frame, aligned with `glbPaths`. A requested tile poses the model with `clip` at
+   * `timeSeconds`, framed from the rest pose, before rendering. A missing or ambiguous clip, an invalid
+   * time, or a model with no skin fails that tile (see `failures`); it never falls back to bind pose.
+   */
+  readonly sampling?: readonly (TileSampling | undefined)[];
 }): Promise<RenderedTiles> {
   const tile = Math.max(16, Math.round(options.tile ?? 160));
   const paths = options.glbPaths;
@@ -705,12 +751,15 @@ export async function renderTiles(options: {
     [],
     lighting === "unreal-like" ? environment : undefined,
     lighting === "unreal-like" ? sourceGrid : undefined,
+    options.sampling,
   );
   const decoded = await decodeRgba(grid.png);
   return {
     png: grid.png,
     rendered: grid.rendered,
     tiles: paths.map((_, index) => cutTile(decoded, tile, index % columns, Math.floor(index / columns))),
+    // Kept off the result unless sampling asked for it, so a static call's result shape is unchanged.
+    ...(options.sampling === undefined ? {} : { failures: grid.failures }),
     ...(environment !== undefined && grid.environment !== undefined
       ? { sourceEnvironment: describeSourceEnvironment(environment, grid.environment) }
       : {}),
