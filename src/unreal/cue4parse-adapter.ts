@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.84",
+  version: "b4e95441+threenative.85",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3046,7 +3046,14 @@ foreach (var key in provider.Files.Keys.Where(key =>
         if (mesh.Skeleton?.Load<USkeleton>() is { } skeleton)
             foreach (var socketIndex in skeleton.Sockets)
                 if (socketIndex?.Load<USkeletalMeshSocket>() is { } socket) skeletalSockets.Add(GpSocket(socket, "skeleton"));
-        if (mesh.PhysicsAsset is { IsNull: false } physicsIndex) physicsAssetRef = physicsIndex.Load<UPhysicsAsset>()?.Name ?? physicsIndex.Name;
+        // Name the physics asset by its own package selector, not its bare asset name: two folders
+        // can hold a same-named asset and a bare name would attach the wrong one. Fall back to the bare
+        // name only when the resolved owner package is unavailable (the importer then reports ambiguity).
+        if (mesh.PhysicsAsset is { IsNull: false } physicsIndex)
+        {
+            var physicsObject = physicsIndex.Load<UPhysicsAsset>();
+            physicsAssetRef = physicsObject?.Owner?.Name is { Length: > 0 } owner ? GameplaySelector(owner) : physicsObject?.Name ?? physicsIndex.Name;
+        }
     }
     foreach (var mesh in package.GetExports().OfType<UStaticMesh>())
     {
@@ -3070,7 +3077,11 @@ foreach (var key in provider.Files.Keys.Where(key =>
     }
     foreach (var cue in package.GetExports().OfType<USoundCue>())
     {
-        await File.WriteAllTextAsync(Path.Combine(output, "Audio", cue.Name + ".cue.json"), JsonConvert.SerializeObject(GpCue(cue), Formatting.Indented));
+        // Key the raw sidecar by the cue's full package selector so two same-named cues in different
+        // folders never overwrite one file. The importer reads this back and promotes collision-free.
+        var cueTarget = Path.Combine(output, "Audio", GameplaySelector(key), cue.Name + ".cue.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(cueTarget)!);
+        await File.WriteAllTextAsync(cueTarget, JsonConvert.SerializeObject(GpCue(cue), Formatting.Indented));
         exported++;
     }
 }

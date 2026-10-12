@@ -75,6 +75,16 @@ describeWithTools(["modern-converter"], "Converter gameplay-data helpers (compil
     expect(CUE4PARSE_PROGRAM).not.toMatch(/\.SoundWave\b/);
   });
 
+  it("keys a raw cue sidecar by its full package selector, not a flat name", () => {
+    // A flat `Audio/<cue>.cue.json` lets two same-named cues in different folders overwrite one file.
+    expect(CUE4PARSE_PROGRAM).toContain('Path.Combine(output, "Audio", GameplaySelector(key), cue.Name + ".cue.json")');
+  });
+
+  it("names a mesh's physics asset by its own package selector, not a bare name", () => {
+    // A bare name cannot tell two same-named physics assets in different folders apart.
+    expect(CUE4PARSE_PROGRAM).toContain("physicsObject?.Owner?.Name is { Length: > 0 } owner ? GameplaySelector(owner)");
+  });
+
   afterAll(async () => {
     if (root) await rm(root, { recursive: true, force: true });
   });

@@ -677,6 +677,28 @@ export function cueWaveObjectName(assetPath: string | undefined): string | undef
   return name.length > 0 ? name : undefined;
 }
 
+/**
+ * The full source package selector a WavePlayer leaf or an exported SoundWave names, for a
+ * collision-free lookup: an object path like `/Game/Audio/SW_A.SW_A` and an imported package like
+ * `Content/Audio/SW_A` both normalize to `audio/sw_a`. Two same-named waves in different folders
+ * keep distinct selectors, so a leaf can never silently bind the wrong one.
+ */
+export function wavePackageSelector(assetPath: string | undefined): string | undefined {
+  if (!assetPath) return undefined;
+  let path = assetPath.replace(/\\/g, "/").toLowerCase();
+  const slash = path.lastIndexOf("/");
+  const dot = path.lastIndexOf(".");
+  if (dot > slash) path = path.slice(0, dot);
+  const content = path.indexOf("/content/");
+  if (path.startsWith("/game/")) path = path.slice("/game/".length);
+  else if (path.startsWith("game/")) path = path.slice("game/".length);
+  else if (content >= 0) path = path.slice(content + "/content/".length);
+  else if (path.startsWith("/content/")) path = path.slice("/content/".length);
+  else if (path.startsWith("content/")) path = path.slice("content/".length);
+  else if (path.startsWith("/")) path = path.slice(1);
+  return path.length > 0 ? path : undefined;
+}
+
 /** Every wave object name a cue's graph references, in walk order. */
 export function cueWaveLeaves(cue: RawCue): string[] {
   const names: string[] = [];
@@ -692,13 +714,34 @@ export function cueWaveLeaves(cue: RawCue): string[] {
   return names;
 }
 
+/** Every wave leaf a cue's graph resolved to an exported file, in walk order. */
+export function resolvedCueWaveLeaves(cue: RawCue): string[] {
+  const names: string[] = [];
+  const walk = (node: RawCueNode): void => {
+    if (typeof node.params?.waveExport === "string") {
+      const wave = node.params.wave;
+      const name = cueWaveObjectName(typeof wave === "string" ? wave : undefined);
+      if (name) names.push(name);
+    }
+    for (const child of node.children ?? []) walk(child);
+  };
+  if (cue.root) walk(cue.root);
+  return names;
+}
+
 /**
  * Rewrites every WavePlayer leaf's soft path to the exported audio file it resolves to, given an
- * index of exported audio name -> promoted path. A leaf whose wave no exported file matches is left
- * as the soft path and named in `missing`, so the caller reports it rather than emitting a dead
- * reference. The original `wave` soft path is always kept beside `waveExport`.
+ * index of full source package selector -> promoted path (plus a unique-basename fallback). The
+ * full selector is tried first, so a same-named wave in another folder never binds the wrong file;
+ * the bare name is only a fallback, and a name in `ambiguous` is reported rather than guessed at.
+ * A leaf whose wave no exported file matches is left as the soft path and named in `missing`. The
+ * original `wave` soft path is always kept beside `waveExport`.
  */
-export function resolveCueWaves(cue: RawCue, audio: ReadonlyMap<string, string>): { readonly cue: RawCue; readonly missing: readonly string[] } {
+export function resolveCueWaves(
+  cue: RawCue,
+  audio: ReadonlyMap<string, string>,
+  ambiguous: ReadonlySet<string> = new Set(),
+): { readonly cue: RawCue; readonly missing: readonly string[] } {
   const missing: string[] = [];
   const seen = new Set<string>();
   const rewrite = (node: RawCueNode): RawCueNode => {
@@ -706,7 +749,12 @@ export function resolveCueWaves(cue: RawCue, audio: ReadonlyMap<string, string>)
     let params = node.params;
     if (typeof wave === "string") {
       const name = cueWaveObjectName(wave);
-      const exported = name === undefined ? undefined : audio.get(name) ?? audio.get(name.toLowerCase());
+      const selector = wavePackageSelector(wave);
+      let exported = selector === undefined ? undefined : audio.get(selector);
+      if (exported === undefined && name !== undefined) {
+        const lower = name.toLowerCase();
+        if (!ambiguous.has(lower)) exported = audio.get(name) ?? audio.get(lower);
+      }
       if (name !== undefined && exported !== undefined) {
         params = { ...node.params, waveExport: exported };
       } else if (name !== undefined && !seen.has(name.toLowerCase())) {

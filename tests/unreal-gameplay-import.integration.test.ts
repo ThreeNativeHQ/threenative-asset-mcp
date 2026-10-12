@@ -1,4 +1,5 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -6,7 +7,7 @@ import { Document, NodeIO } from "@gltf-transform/core";
 import { describe, expect, it, onTestFinished } from "vitest";
 
 import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
-import { writeFakeUmodel, writeMeshFixture } from "./helpers/unreal-fixture.js";
+import { writeFakeUmodel, writeMeshFixture, writeWavFixture } from "./helpers/unreal-fixture.js";
 
 // PRD-582: the public import path. A UE4 package that holds a socket, a static collision, a
 // PhysicsAsset or a SoundCue is routed to the CUE4Parse adapter (UE Viewer cannot decode those
@@ -359,5 +360,153 @@ describe("gameplay data through the public import path", () => {
     expect(promoted.bodies[0]!.bone).toBe("hand_r");
     expect(promoted.bodies[0]!.shapes[0]!.radius).toBeCloseTo(0.1, 6);
     expect(report.failed.some((entry) => entry.package.includes("PA_Hero"))).toBe(false);
+  });
+
+  it("attaches the physics asset a full package selector names, not a same-named one in another folder", async () => {
+    const glb = await mkdtemp(join(tmpdir(), "asset-mcp-skg-"));
+    onTestFinished(() => rm(glb, { recursive: true, force: true }));
+    const glbPath = join(glb, "SK_Hero.glb");
+    await skinnedGlb(glbPath);
+    const { report, outputDir } = await runImport(
+      {
+        "Chars/SK_Hero": ["SkeletalMesh", "Skeleton", "SkeletalMeshSocket"],
+        "Chars/PA_Hero": ["PhysicsAsset"],
+        "Props/PA_Hero": ["PhysicsAsset"],
+      },
+      () => ({
+        "": {
+          "Meshes/SK_Hero.glb": glbPath,
+          "Gameplay/Content/Chars/SK_Hero.json": `text:${JSON.stringify({
+            version: 1,
+            package: "Content/Chars/SK_Hero",
+            physicsAssetRef: "Content/Chars/PA_Hero",
+          })}`,
+          "Gameplay/Content/Chars/PA_Hero.json": `text:${JSON.stringify({
+            version: 1,
+            package: "Content/Chars/PA_Hero",
+            physics: {
+              asset: "PA_Hero",
+              bodies: [{ bone: "hand_r", shapes: [{ type: "sphere", center: [100, 0, 0], radius: 10 }] }],
+              constraints: [],
+              collisionDisabledPairs: [],
+            },
+          })}`,
+          "Gameplay/Content/Props/PA_Hero.json": `text:${JSON.stringify({
+            version: 1,
+            package: "Content/Props/PA_Hero",
+            physics: {
+              asset: "PA_Hero",
+              bodies: [
+                { bone: "hand_r", shapes: [{ type: "sphere", center: [100, 0, 0], radius: 999 }] },
+                { bone: "spine_01", shapes: [] },
+              ],
+              constraints: [],
+              collisionDisabledPairs: [],
+            },
+          })}`,
+        },
+      }),
+    );
+    const model = report.models.find((candidate) => candidate.name === "SK_Hero");
+    expect(model, `failed: ${JSON.stringify(report.failed)}`).toBeDefined();
+    // The Chars asset has one body; the same-named Props asset has two. Selecting either arbitrarily
+    // would show the wrong count.
+    expect(model!.physics).toMatchObject({ asset: "PA_Hero", bodies: 1 });
+    expect(report.counts.physicsAssets).toBe(2);
+    const propsSidecar = JSON.parse(await readFile(join(outputDir, "Physics/Content/Props/PA_Hero.json"), "utf8")) as { bodies: unknown[] };
+    expect(propsSidecar.bodies).toHaveLength(2);
+  });
+
+  it("reports a bare physics-asset reference that matches two same-named assets as unresolved", async () => {
+    const glb = await mkdtemp(join(tmpdir(), "asset-mcp-skg-"));
+    onTestFinished(() => rm(glb, { recursive: true, force: true }));
+    const glbPath = join(glb, "SK_Hero.glb");
+    await skinnedGlb(glbPath);
+    const { report } = await runImport(
+      {
+        "Chars/SK_Hero": ["SkeletalMesh", "Skeleton", "SkeletalMeshSocket"],
+        "Chars/PA_Hero": ["PhysicsAsset"],
+        "Props/PA_Hero": ["PhysicsAsset"],
+      },
+      () => ({
+        "": {
+          "Meshes/SK_Hero.glb": glbPath,
+          "Gameplay/Content/Chars/SK_Hero.json": `text:${JSON.stringify({
+            version: 1,
+            package: "Content/Chars/SK_Hero",
+            physicsAssetRef: "PA_Hero",
+          })}`,
+          "Gameplay/Content/Chars/PA_Hero.json": `text:${JSON.stringify({
+            version: 1,
+            package: "Content/Chars/PA_Hero",
+            physics: { asset: "PA_Hero", bodies: [{ bone: "hand_r", shapes: [] }], constraints: [], collisionDisabledPairs: [] },
+          })}`,
+          "Gameplay/Content/Props/PA_Hero.json": `text:${JSON.stringify({
+            version: 1,
+            package: "Content/Props/PA_Hero",
+            physics: { asset: "PA_Hero", bodies: [{ bone: "hand_r", shapes: [] }], constraints: [], collisionDisabledPairs: [] },
+          })}`,
+        },
+      }),
+    );
+    const model = report.models.find((candidate) => candidate.name === "SK_Hero");
+    expect(model, `failed: ${JSON.stringify(report.failed)}`).toBeDefined();
+    // A bare legacy reference that is not unique is never resolved arbitrarily.
+    expect(model!.physics).toBeUndefined();
+    expect(report.counts.physicsAssets).toBe(2);
+    expect(report.warnings.some((warning) => warning.includes("matches more than one PhysicsAsset"))).toBe(true);
+    expect(report.failed.some((entry) => entry.package.includes("SK_Hero"))).toBe(false);
+  });
+
+  it("promotes same-named SoundCues from two folders without overwriting either", async () => {
+    const { report, outputDir } = await runImport(
+      { "Audio/A/SC_Footstep": ["SoundCue"], "Audio/B/SC_Footstep": ["SoundCue"] },
+      () => ({
+        "": {
+          "Audio/Content/Audio/A/SC_Footstep/SC_Footstep.cue.json": `text:${JSON.stringify({ name: "SC_Footstep", volume: 1, pitch: 1, root: null })}`,
+          "Audio/Content/Audio/B/SC_Footstep/SC_Footstep.cue.json": `text:${JSON.stringify({ name: "SC_Footstep", volume: 0.5, pitch: 1, root: null })}`,
+        },
+      }),
+    );
+    expect(report.counts.soundCues).toBe(2);
+    const files = report.soundCues.map((cue) => cue.file);
+    expect(new Set(files).size).toBe(2);
+    for (const cue of report.soundCues) expect(existsSync(join(outputDir, cue.file))).toBe(true);
+    expect(report.skipped.some((entry) => entry.package.includes("SC_Footstep"))).toBe(false);
+  });
+
+  it("resolves a cue wave to the SoundWave its full package selector names, not a same-named one", async () => {
+    const exported = await mkdtemp(join(tmpdir(), "asset-mcp-wave-export-"));
+    onTestFinished(() => rm(exported, { recursive: true, force: true }));
+    await writeWavFixture(join(exported, "SW_Hit.wav"));
+    const { report, outputDir } = await runImport(
+      {
+        "Audio/A/SW_Hit": ["SoundWave"],
+        "Audio/B/SW_Hit": ["SoundWave"],
+        "Audio/Cues/SC_Foot": ["SoundCue"],
+      },
+      () => ({
+        "": {
+          "Audio/Content/Audio/Cues/SC_Foot/SC_Foot.cue.json": `text:${JSON.stringify({
+            name: "SC_Foot",
+            root: {
+              type: "USoundNodeRandom",
+              children: [
+                { type: "USoundNodeWavePlayer", params: { wave: "/Game/Audio/A/SW_Hit.SW_Hit" } },
+                { type: "USoundNodeWavePlayer", params: { wave: "/Game/Audio/C/SW_Hit.SW_Hit" } },
+              ],
+            },
+          })}`,
+        },
+      }),
+      exported,
+    );
+    expect(report.counts.soundCues).toBe(1);
+    const cue = report.soundCues[0]!;
+    // Both exported waves share the bare name SW_Hit, so only the full selector resolves a leaf.
+    expect(cue.missingWaves).toEqual(["SW_Hit"]);
+    const promoted = JSON.parse(await readFile(join(outputDir, cue.file), "utf8")) as { root: { children: { params: Record<string, unknown> }[] } };
+    expect(promoted.root.children[0]!.params.waveExport).toBe("audio/Content/Audio/A/SW_Hit.wav");
+    expect(promoted.root.children[1]!.params.waveExport).toBeUndefined();
   });
 });

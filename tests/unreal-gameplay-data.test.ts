@@ -17,6 +17,7 @@ import {
   rotatorToUeQuaternion,
   ueQuaternionToGltf,
   ueVectorToGltf,
+  wavePackageSelector,
   type RawSocket,
 } from "../src/unreal/gameplay-data.js";
 
@@ -389,5 +390,53 @@ describe("gameplay data: SoundCue", () => {
     const children = resolved.root!.children!;
     expect(children[0]!.params).toMatchObject({ wave: "/Game/Audio/SW_A.SW_A", waveExport: "audio/Content/SW_A.wav" });
     expect(children[1]!.params).not.toHaveProperty("waveExport");
+  });
+
+  it("normalizes a wave soft path and an imported package to one full selector", () => {
+    expect(wavePackageSelector("/Game/Audio/SW_Footstep.SW_Footstep")).toBe("audio/sw_footstep");
+    expect(wavePackageSelector("Content/Audio/SW_Footstep.uasset")).toBe("audio/sw_footstep");
+    expect(wavePackageSelector("/Game/Audio/SW_Footstep")).toBe("audio/sw_footstep");
+    expect(wavePackageSelector(undefined)).toBeUndefined();
+  });
+
+  it("resolves a wave by its full selector before a bare name, so a same-named wave never binds the wrong file", () => {
+    const cue = parseCueSidecar(
+      JSON.stringify({
+        name: "SC_Foot",
+        root: {
+          type: "USoundNodeRandom",
+          children: [
+            { type: "USoundNodeWavePlayer", params: { wave: "/Game/Audio/A/SW_Hit.SW_Hit" } },
+            { type: "USoundNodeWavePlayer", params: { wave: "/Game/Audio/B/SW_Hit.SW_Hit" } },
+          ],
+        },
+      }),
+    );
+    const index = new Map([
+      ["audio/a/sw_hit", "audio/Content/Audio/A/SW_Hit.wav"],
+      ["audio/b/sw_hit", "audio/Content/Audio/B/SW_Hit.wav"],
+    ]);
+    const { cue: resolved, missing } = resolveCueWaves(cue, index);
+    expect(missing).toEqual([]);
+    const children = resolved.root!.children!;
+    expect(children[0]!.params!.waveExport).toBe("audio/Content/Audio/A/SW_Hit.wav");
+    expect(children[1]!.params!.waveExport).toBe("audio/Content/Audio/B/SW_Hit.wav");
+  });
+
+  it("reports an ambiguous bare wave name instead of guessing at one of two same-named waves", () => {
+    const cue = parseCueSidecar(
+      JSON.stringify({
+        name: "SC_Foot",
+        root: { type: "USoundNodeWavePlayer", params: { wave: "/Game/Audio/Unknown/SW_Hit.SW_Hit" } },
+      }),
+    );
+    // Only a bare fallback is available, and it is ambiguous: report it, never bind either file.
+    const { cue: resolved, missing } = resolveCueWaves(
+      cue,
+      new Map([["sw_hit", "audio/Content/Audio/A/SW_Hit.wav"]]),
+      new Set(["sw_hit"]),
+    );
+    expect(missing).toEqual(["SW_Hit"]);
+    expect(resolved.root!.params).not.toHaveProperty("waveExport");
   });
 });
