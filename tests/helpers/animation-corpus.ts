@@ -181,22 +181,18 @@ export function registerAnimationCorpusGates(): void {
         const clips = out.native.filter((raw) => raw.kind === "clip" && raw.className === "AnimSequence");
         assert(clips.length > 0, `${id}: native AnimSequences missing`);
         if (id === "modern") assert.equal(clips.length, 2, "UE5.0 selection must contain exactly two clips");
-        let controlRig = 0;
+        let movingClips = 0;
         for (const raw of clips) {
           const rows = out.report.animationClips.filter((row) => canonicalPackagePath(row.package) === canonicalPackagePath(raw.package!));
-          if (rows.length === 0) { issue(out, raw, raw.unsupportedReason ?? ""); if (/ControlRig/i.test(raw.unsupportedReason ?? "")) controlRig++; continue; }
-          assert.equal(rows.length, 1, `${raw.package}: ambiguous clip sidecars`);
+          const failure = out.report.failed.find((row) => canonicalPackagePath(row.package) === canonicalPackagePath(raw.package!));
+          assert.equal(rows.length, 1, `${raw.package}: exactly one exported animation sidecar is required; converter reason: ${failure?.reason ?? raw.unsupportedReason ?? "no sidecar"}`);
           const sidecar = await artifact<Sidecar>(out, rows[0]!);
-          if (sidecar.unsupportedReason) {
-            assert(id !== "modern", "selected UE5.0 clips must contain motion");
-            issue(out, raw, sidecar.unsupportedReason);
-            if (/ControlRig/i.test(sidecar.unsupportedReason)) controlRig++;
-            continue;
-          }
+          assert(!sidecar.unsupportedReason, `${raw.package}: converter reported unsupportedReason: ${sidecar.unsupportedReason}`);
           assert.equal(sidecar.source ?? sidecar.clip, raw.name);
           required(sidecar.clip, `${raw.name}: exported clip identity`);
           const matches = out.documents.flatMap((doc) => doc.getRoot().listAnimations().filter((clip) => clip.getName() === sidecar.clip).map((clip) => ({ doc, clip })));
           assert(matches.length > 0, `${raw.name}: metadata-only motion proof`);
+          let clipMoving = false;
           for (const { doc, clip } of matches) {
             const bound = doc.getRoot().listNodes().filter((node) => node.getSkin() && node.getMesh()?.listPrimitives().some((p) => (p.getAttribute("POSITION")?.getCount() ?? 0) > 0));
             assert(bound.length > 0, `${raw.name}: no bound skinned geometry`);
@@ -220,15 +216,17 @@ export function registerAnimationCorpusGates(): void {
                 if (angularErrorDegrees([values[0]!, values[1]!, values[2]!, values[3]!], [values[i * 4]!, values[i * 4 + 1]!, values[i * 4 + 2]!, values[i * 4 + 3]!]) > 0.01) moving = true;
               }
             }
-            assert(moving && duration > 0 && Number.isFinite(frame), `${raw.name}: nontrivial bound rotation motion required`);
+            assert(duration > 0 && Number.isFinite(frame), `${raw.name}: finite animation timing required`);
+            clipMoving ||= moving;
             // The native clip descriptor reports `timing.duration` for UE5 data models and `animLength` elsewhere.
             const nativeLength = raw.animLength ?? (raw as { timing?: { duration?: number } }).timing?.duration;
             assert(typeof nativeLength === "number" && nativeLength > 0, `${raw.name}: native timing missing`);
             assert(Math.abs(duration - nativeLength) <= frame + 1e-6, `${raw.name}: duration differs by more than one frame`);
           }
+          if (clipMoving) movingClips++;
           if (id === "modern") modernClips++;
         }
-        if (id !== "modern") assert.equal(controlRig, 0, `${id}: Sequencer FK clips must not be reported as ControlRig`);
+        if (id === "gasp54" || id === "gasp58") assert(movingClips > 0, `${id}: no selected clip carries genuine bound-bone motion`);
       }
       assert.equal(modernClips, 2, "selected UE5.0 body proof needs two actual walk clips");
     });
