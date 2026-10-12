@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.85",
+  version: "b4e95441+threenative.85-gameplay",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3079,7 +3079,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
     {
         // Key the raw sidecar by the cue's full package selector so two same-named cues in different
         // folders never overwrite one file. The importer reads this back and promotes collision-free.
-        var cueTarget = Path.Combine(output, "Audio", GameplaySelector(key), cue.Name + ".cue.json");
+        var cueTarget = GpCueTarget(output, GameplaySelector(key), cue.Name);
         Directory.CreateDirectory(Path.GetDirectoryName(cueTarget)!);
         await File.WriteAllTextAsync(cueTarget, JsonConvert.SerializeObject(GpCue(cue), Formatting.Indented));
         exported++;
@@ -4690,6 +4690,11 @@ string GameplaySelector(string key)
     if (relative.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)) return relative[..^".umap".Length];
     return relative;
 }
+
+// The raw SoundCue sidecar path. The package selector is a path segment, so two same-named cues in
+// different folders never overwrite one file. Factor it out so the compiled regression can call it.
+static string GpCueTarget(string output, string selector, string name) =>
+    Path.Combine(output, "Audio", selector, name + ".cue.json");
 
 // The instance's own overrides, written as .props.txt blocks. A row is written only when CUE4Parse read it whole: a tagged row must
 // carry the tags it needs, and a binary row must come from a material whose read raised no logged failure. Presence is the tag

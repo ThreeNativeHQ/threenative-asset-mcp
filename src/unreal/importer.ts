@@ -4854,15 +4854,22 @@ export async function importUnrealDirectory(
   // that matches more than one asset is reported unresolved rather than resolved arbitrarily.
   const normalizePackageSelector = (value: string): string =>
     value.replace(/\\/g, "/").replace(/\.uasset$/i, "").replace(/^\/+/, "").toLowerCase();
-  const physicsBySelector = new Map<string, RawPhysics>();
-  const physicsByAssetName = new Map<string, RawPhysics | "ambiguous">();
-  for (const path of modernGameplaySidecars.values()) {
+  // Each entry keeps the source package identity beside the asset, so a mesh can reference the
+  // selected package (not just its basename) when two folders hold a same-named PhysicsAsset.
+  interface SelectedPhysics {
+    readonly selector: string;
+    readonly physics: RawPhysics;
+  }
+  const physicsBySelector = new Map<string, SelectedPhysics>();
+  const physicsByAssetName = new Map<string, SelectedPhysics | "ambiguous">();
+  for (const [selector, path] of modernGameplaySidecars) {
     try {
       const parsed = parseGameplaySidecar(await readFile(path, "utf8"));
       if (!parsed.physics) continue;
-      if (parsed.package) physicsBySelector.set(normalizePackageSelector(parsed.package), parsed.physics);
+      const selected: SelectedPhysics = { selector: parsed.package ?? selector, physics: parsed.physics };
+      if (parsed.package) physicsBySelector.set(normalizePackageSelector(parsed.package), selected);
       const assetKey = parsed.physics.asset.toLowerCase();
-      physicsByAssetName.set(assetKey, physicsByAssetName.has(assetKey) ? "ambiguous" : parsed.physics);
+      physicsByAssetName.set(assetKey, physicsByAssetName.has(assetKey) ? "ambiguous" : selected);
     } catch {
       // An unreadable sidecar is reported when a mesh asks for it; it is not a physics asset here.
     }
@@ -4943,8 +4950,14 @@ export async function importUnrealDirectory(
           else if (byName) rawPhysics = byName;
         }
         if (rawPhysics) {
-          const converted = convertPhysics(rawPhysics, gameplayScale);
-          if (converted) gameplayPhysics = { asset: rawPhysics.asset, physics: converted };
+          const converted = convertPhysics(rawPhysics.physics, gameplayScale);
+          if (converted) {
+            // When another PhysicsAsset in this import shares the basename, reference the selected
+            // source package so the GLB extras and the model report are unambiguous. A unique bare
+            // name keeps its old form for backward compatibility.
+            const shared = physicsByAssetName.get(rawPhysics.physics.asset.toLowerCase()) === "ambiguous";
+            gameplayPhysics = { asset: shared ? rawPhysics.selector : rawPhysics.physics.asset, physics: converted };
+          }
         } else if (ambiguousBareName) {
           // A bare legacy reference that matches two assets is never resolved arbitrarily.
           warnings.push(`${name}: the mesh references physics asset ${reference} by bare name, which matches more than one PhysicsAsset sidecar in this import, so it is left unresolved; name the asset's package to disambiguate.`);
@@ -5094,7 +5107,10 @@ export async function importUnrealDirectory(
     const cuePackageSelectors = new Set<string>();
     for (const cue of modernCueSidecars.values()) {
       cuePackageSelectors.add(cue.selector.toLowerCase());
-      cuePackageSelectors.add(cue.name.toLowerCase());
+      // Only a truly flat legacy sidecar (its selector is its bare name) may stand in for the package.
+      // A new sidecar keyed by a full selector must not let a same-named package in another folder be
+      // reported converted when it emitted nothing.
+      if (cue.selector.toLowerCase() === cue.name.toLowerCase()) cuePackageSelectors.add(cue.name.toLowerCase());
     }
     for (const [key, { selector, package: packagePath }] of gameplaySelectors) {
       if (meshSelectors.has(key)) continue;
@@ -5563,6 +5579,11 @@ export async function importUnrealDirectory(
     // PRD-582: every SoundCue the adapter decoded, validated and promoted. Each WavePlayer leaf is
     // rewritten to the exported audio file it names, or reported when no exported wave matched it.
     if (modernCueSidecars.size > 0) {
+      // The cue sidecar names a package selector, not its catalogue identity. Resolve it to the
+      // classified entry's package path (with `.uasset`, like every other report) so a consumer can
+      // tie the cue back to its source. Fall back to the sidecar selector only when nothing classified.
+      const cueSourcePackage = (selector: string): string =>
+        classified.find((candidate) => candidate.selector.toLowerCase() === selector.toLowerCase())?.package ?? selector;
       // A leaf resolves by its full source package selector first, so a same-named wave in another
       // folder never binds the wrong file. A bare name is a fallback only when it is unique; a
       // duplicate bare name is reported unresolved instead of guessed at.
@@ -5600,7 +5621,7 @@ export async function importUnrealDirectory(
           await writeFile(output, body);
           soundCues.push({
             name: cue.name,
-            package: sidecar.selector,
+            package: cueSourcePackage(sidecar.selector),
             file: relative,
             bytes: Buffer.byteLength(body),
             sha256: createHash("sha256").update(body).digest("hex"),
@@ -5611,7 +5632,7 @@ export async function importUnrealDirectory(
             warnings.push(`${cue.name}: WavePlayer names ${wave}, which no exported SoundWave in this import matched; the soft asset path is kept and the wave is reported as missing.`);
           }
         } catch (error) {
-          failed.push({ package: `Audio/${sidecar.selector}/${sidecar.name}`, reason: `SoundCue packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
+          failed.push({ package: cueSourcePackage(sidecar.selector), reason: `SoundCue packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
         }
       }
       if (soundCues.length > 0) log(`Promoted ${soundCues.length} SoundCue graph${soundCues.length === 1 ? "" : "s"}.`);

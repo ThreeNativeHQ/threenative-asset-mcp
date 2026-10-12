@@ -76,8 +76,9 @@ describeWithTools(["modern-converter"], "Converter gameplay-data helpers (compil
   });
 
   it("keys a raw cue sidecar by its full package selector, not a flat name", () => {
-    // A flat `Audio/<cue>.cue.json` lets two same-named cues in different folders overwrite one file.
-    expect(CUE4PARSE_PROGRAM).toContain('Path.Combine(output, "Audio", GameplaySelector(key), cue.Name + ".cue.json")');
+    // The write routes through GpCueTarget; the compiled regression below proves the helper keeps two
+    // same-named cues in different folders apart. The call site must use the helper, not a flat path.
+    expect(CUE4PARSE_PROGRAM).toContain("GpCueTarget(output, GameplaySelector(key), cue.Name)");
   });
 
   it("names a mesh's physics asset by its own package selector, not a bare name", () => {
@@ -125,6 +126,7 @@ describeWithTools(["modern-converter"], "Converter gameplay-data helpers (compil
       "static object GpStaticSocket(",
       "static object GpCueNode(",
       "static object GpCue(",
+      "static string GpCueTarget(",
     ].map((signature) => extractCSharp(CUE4PARSE_PROGRAM, signature));
     await writeFile(
       join(project, "Program.cs"),
@@ -256,6 +258,27 @@ if (args[0] == "legacy-body")
     var body = new TestBody("hand_r");
     Console.WriteLine(JsonConvert.SerializeObject(new { bodies = GpBodySetups(asset).Length, body = GpBody(body) }));
 }
+if (args[0] == "cue-target")
+{
+    // Two same-named cues in different folders must land in distinct files. A helper that flattened
+    // the name would return one path, so the second write would overwrite the first.
+    var targetRoot = args[1];
+    var first = GpCueTarget(targetRoot, "Content/Audio/A/SC_Footstep", "SC_Footstep");
+    var second = GpCueTarget(targetRoot, "Content/Audio/B/SC_Footstep", "SC_Footstep");
+    Directory.CreateDirectory(Path.GetDirectoryName(first)!);
+    Directory.CreateDirectory(Path.GetDirectoryName(second)!);
+    File.WriteAllText(first, "first-cue");
+    File.WriteAllText(second, "second-cue");
+    Console.WriteLine(JsonConvert.SerializeObject(new
+    {
+        first,
+        second,
+        distinct = !string.Equals(first, second, StringComparison.Ordinal),
+        firstContent = File.ReadAllText(first),
+        secondContent = File.ReadAllText(second),
+        bothExist = File.Exists(first) && File.Exists(second),
+    }));
+}
 
 ${functions.join("\n")}
 
@@ -317,6 +340,22 @@ class TestBody : UBodySetup
     const node = JSON.parse(run("cue")) as { type: string; params: { wave: string } };
     expect(node.type).toBe("USoundNodeWavePlayer");
     expect(node.params.wave).toBe("/Game/Audio/SW_Footstep.SW_Footstep");
+  });
+
+  it("keeps two same-named cues in different folders in distinct surviving files", () => {
+    const result = JSON.parse(run("cue-target", join(root, "cue-target"))) as {
+      first: string;
+      second: string;
+      distinct: boolean;
+      firstContent: string;
+      secondContent: string;
+      bothExist: boolean;
+    };
+    // A helper that flattened the name would return one path; the two files would be one, so the
+    // second write would overwrite the first and the contents would match.
+    expect(result.distinct).toBe(true);
+    expect(result.bothExist).toBe(true);
+    expect(result.firstContent).not.toBe(result.secondContent);
   });
 
   it("rebuilds Unreal's native constraint defaults when the saved profile omits them", () => {

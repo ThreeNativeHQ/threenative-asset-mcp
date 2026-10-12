@@ -436,15 +436,15 @@ if (!corpusDir) {
 
 // PRD-582 gameplay gates over the real corpus. The five matrix slices are required: when
 // FAB_FEATURE_CORPUS_DIR is set, an absent one is a failure, never an empty success. Each slice is
-// imported once through the public `importUnrealDirectory` with the immutable `threenative.85`
+// imported once through the public `importUnrealDirectory` with the immutable `threenative.85-gameplay`
 // converter snapshot; the shared root toolchain binary is mutable and is never used. Output stays
 // under the owner's cache so an import can be inspected, and each output is removed first so a stale
 // report can never satisfy a gate. Licensed names never appear below: a model is located by its
 // reported characteristics, and its socket, bone and wave names are compared only at runtime.
 
-const CONVERTER_85 = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "converter-85", "ThreeNativeConverter");
+const CONVERTER_85_GAMEPLAY = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "converter-85-gameplay", "ThreeNativeConverter");
 // A distinct owned output, so the earlier snapshot's evidence is preserved rather than overwritten.
-const FINAL_IMPORT_DIR = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "final-imports-85");
+const FINAL_IMPORT_DIR = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "final-imports-85-gameplay");
 
 function runConverter(file: string, args: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -469,17 +469,17 @@ if (corpusDir) {
     const imported = new Map<string, { readonly report: ImportReport; readonly outputDir: string }>();
 
     beforeAll(async () => {
-      // The override lets an operator point the gate at their own 85 build; it must still report 85.
-      const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim() || CONVERTER_85;
+      // The override lets an operator point the gate at their own 85-gameplay build; it must still report it.
+      const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim() || CONVERTER_85_GAMEPLAY;
       const versionLine = (await runConverter(converterPath, ["--version"]))
         .trim()
         .split("\n")
         .map((line) => line.trim())
         .filter((line) => line.length > 0)
         .pop();
-      const versionMatch = versionLine === undefined ? null : /threenative\.(\d+)\b/.exec(versionLine);
-      if (versionMatch?.[1] !== "85") {
-        throw new Error(`the gameplay gate needs the immutable converter-85 snapshot, but ${converterPath} reports "${versionLine ?? ""}"`);
+      const versionMatch = versionLine === undefined ? null : /threenative\.([0-9]+(?:-gameplay)?)\b/.exec(versionLine);
+      if (versionMatch?.[1] !== "85-gameplay") {
+        throw new Error(`the gameplay gate needs the immutable converter-85-gameplay snapshot, but ${converterPath} reports "${versionLine ?? ""}"`);
       }
       const version = versionLine!.split(/\s+/).slice(1).join(" ") || versionLine!;
 

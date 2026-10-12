@@ -409,10 +409,16 @@ describe("gameplay data through the public import path", () => {
     );
     const model = report.models.find((candidate) => candidate.name === "SK_Hero");
     expect(model, `failed: ${JSON.stringify(report.failed)}`).toBeDefined();
-    // The Chars asset has one body; the same-named Props asset has two. Selecting either arbitrarily
-    // would show the wrong count.
-    expect(model!.physics).toMatchObject({ asset: "PA_Hero", bodies: 1 });
+    // The selected asset's basename is shared, so the reference must name its source package. Selecting
+    // either arbitrarily would show the wrong body count.
+    expect(model!.physics).toMatchObject({ asset: "Content/Chars/PA_Hero", bodies: 1 });
+    const document = await new NodeIO().read(join(outputDir, model!.glb));
+    const meshNode = document.getRoot().listNodes().find((node) => node.getMesh() !== null)!;
+    expect(meshNode.getExtras().unrealPhysicsAsset).toBe("Content/Chars/PA_Hero");
     expect(report.counts.physicsAssets).toBe(2);
+    // The package the GLB names has its own promoted sidecar, with the selected asset's one body.
+    const charsSidecar = JSON.parse(await readFile(join(outputDir, "Physics/Content/Chars/PA_Hero.json"), "utf8")) as { bodies: unknown[] };
+    expect(charsSidecar.bodies).toHaveLength(1);
     const propsSidecar = JSON.parse(await readFile(join(outputDir, "Physics/Content/Props/PA_Hero.json"), "utf8")) as { bodies: unknown[] };
     expect(propsSidecar.bodies).toHaveLength(2);
   });
@@ -473,6 +479,25 @@ describe("gameplay data through the public import path", () => {
     expect(new Set(files).size).toBe(2);
     for (const cue of report.soundCues) expect(existsSync(join(outputDir, cue.file))).toBe(true);
     expect(report.skipped.some((entry) => entry.package.includes("SC_Footstep"))).toBe(false);
+  });
+
+  it("does not let a converted full-selector cue claim a same-named package that emitted nothing", async () => {
+    const { report } = await runImport(
+      { "Audio/A/SC_Footstep": ["SoundCue"], "Audio/B/SC_Footstep": ["SoundCue"] },
+      () => ({
+        "": {
+          // Only folder A's cue decoded; B produced no sidecar at all.
+          "Audio/Content/Audio/A/SC_Footstep/SC_Footstep.cue.json": `text:${JSON.stringify({ name: "SC_Footstep", volume: 1, pitch: 1, root: null })}`,
+        },
+      }),
+    );
+    // The converted cue names its actual source package (with `.uasset`), not a manufactured `Audio/` path.
+    expect(report.soundCues).toHaveLength(1);
+    expect(report.soundCues[0]!.package).toBe("Content/Audio/A/SC_Footstep.uasset");
+    // B shares the basename but produced nothing, so a new full-selector cue must not silently claim it.
+    expect(report.skipped.some((entry) => entry.package.includes("Audio/B/SC_Footstep"))).toBe(true);
+    expect(report.failed.some((entry) => entry.package.includes("SC_Footstep"))).toBe(false);
+    expect(report.skipped.some((entry) => entry.package.includes("Audio/A/SC_Footstep"))).toBe(false);
   });
 
   it("resolves a cue wave to the SoundWave its full package selector names, not a same-named one", async () => {
