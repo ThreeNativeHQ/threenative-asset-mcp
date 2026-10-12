@@ -60,6 +60,7 @@ describeWithTools(["modern-converter"], "UE5 Sequencer channel evaluator", () =>
     );
     const declarations = [
       extractCSharp(CUE4PARSE_PROGRAM, "static bool EvaluateSequencerChannel("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static bool SampleSequencerChannel("),
       extractRecord(CUE4PARSE_PROGRAM, "sealed record SequencerKey("),
       extractRecord(CUE4PARSE_PROGRAM, "sealed record SequencerChannelData("),
     ].join("\n");
@@ -70,11 +71,16 @@ using CUE4Parse.UE4.Objects.Engine.Curves;
 
 SequencerKey Key(float value, ERichCurveInterpMode interp, ERichCurveTangentMode tangent = ERichCurveTangentMode.RCTM_Auto, float arrive = 0, float leave = 0, float arriveWeight = 0, float leaveWeight = 0, ERichCurveTangentWeightMode weightMode = ERichCurveTangentWeightMode.RCTWM_WeightedNone) =>
     new(value, arrive, leave, arriveWeight, leaveWeight, interp, tangent, weightMode);
-SequencerChannelData Channel(int[] times, SequencerKey[] values, ERichCurveExtrapolation pre = ERichCurveExtrapolation.RCCE_Constant, ERichCurveExtrapolation post = ERichCurveExtrapolation.RCCE_Constant, bool hasDefault = false, float defaultValue = 0) =>
-    new(times, values, pre, post, 30, 1, hasDefault, defaultValue);
+SequencerChannelData Channel(int[] times, SequencerKey[] values, ERichCurveExtrapolation pre = ERichCurveExtrapolation.RCCE_Constant, ERichCurveExtrapolation post = ERichCurveExtrapolation.RCCE_Constant, int tickNumerator = 30, int tickDenominator = 1, bool hasDefault = false, float defaultValue = 0) =>
+    new(times, values, pre, post, tickNumerator, tickDenominator, hasDefault, defaultValue);
 float Sample(SequencerChannelData channel, double time)
 {
     if (!EvaluateSequencerChannel(channel, time, out var value, out var reason)) throw new Exception(reason.Length == 0 ? "channel was not evaluable" : reason);
+    return value;
+}
+float SampleFrame(SequencerChannelData channel, int frame, int numberOfKeys, int displayNumerator, int displayDenominator)
+{
+    if (!SampleSequencerChannel(channel, frame, numberOfKeys, displayNumerator, displayDenominator, out var value, out var reason)) throw new Exception(reason.Length == 0 ? "channel was not evaluable" : reason);
     return value;
 }
 
@@ -86,7 +92,9 @@ var cubicBreak = Channel(new[] { 0, 10 }, new[] { Key(0, ERichCurveInterpMode.RC
 var weighted = Channel(new[] { 0, 10 }, new[] { Key(0, ERichCurveInterpMode.RCIM_Cubic, leave: 2, leaveWeight: 0.5f, weightMode: ERichCurveTangentWeightMode.RCTWM_WeightedLeave), Key(10, ERichCurveInterpMode.RCIM_Cubic, arrive: -1, arriveWeight: 0.25f, weightMode: ERichCurveTangentWeightMode.RCTWM_WeightedArrive) });
 var extrapolated = Channel(new[] { 0, 10 }, new[] { Key(0, ERichCurveInterpMode.RCIM_Linear), Key(10, ERichCurveInterpMode.RCIM_Linear) }, ERichCurveExtrapolation.RCCE_Linear, ERichCurveExtrapolation.RCCE_Linear);
 var defaults = Channel(Array.Empty<int>(), Array.Empty<SequencerKey>(), hasDefault: true, defaultValue: 4);
-var samples = new[] { Sample(constant, 5), Sample(constant, 10), Sample(linear, 2.5), Sample(cubicAuto, 5), Sample(cubicUser, 5), Sample(cubicBreak, 5), Sample(weighted, 5), Sample(extrapolated, -5), Sample(extrapolated, 15), Sample(defaults, 4) };
+var defaultAndKeys = Channel(new[] { 0, 1, 2 }, new[] { Key(10, ERichCurveInterpMode.RCIM_Linear), Key(20, ERichCurveInterpMode.RCIM_Linear), Key(30, ERichCurveInterpMode.RCIM_Linear) }, hasDefault: true, defaultValue: 99);
+var unequalRates = Channel(new[] { 0, 4 }, new[] { Key(0, ERichCurveInterpMode.RCIM_Linear), Key(10, ERichCurveInterpMode.RCIM_Linear) }, tickNumerator: 48);
+var samples = new[] { Sample(constant, 5), Sample(constant, 10), Sample(linear, 2.5), Sample(cubicAuto, 5), Sample(cubicUser, 5), Sample(cubicBreak, 5), Sample(weighted, 5), Sample(extrapolated, -5), Sample(extrapolated, 15), Sample(defaults, 4), SampleFrame(defaultAndKeys, 1, 3, 30, 1), SampleFrame(defaultAndKeys, 1, 3, 24, 1), SampleFrame(unequalRates, 1, 3, 24, 1) };
 Console.WriteLine(string.Join(",", samples.Select(value => value.ToString("R", CultureInfo.InvariantCulture))));
 var invalid = Channel(new[] { 0, 10 }, new[] { Key(0, (ERichCurveInterpMode)99), Key(1, ERichCurveInterpMode.RCIM_Linear) });
 EvaluateSequencerChannel(invalid, 5, out _, out var invalidReason);
@@ -138,6 +146,13 @@ ${declarations}
     expect(values[7]).toBeCloseTo(-5, 5);
     expect(values[8]).toBeCloseTo(15, 5);
     expect(values[9]).toBe(4);
+    expect(values[10]).toBe(20);
+    expect(values[11]).toBe(99);
+    expect(values[12]).toBeCloseTo(5, 5);
     expect(invalidReason).toMatch(/unsupported interpolation mode 99/);
+  });
+
+  it("guards the absolute Sequencer export from legacy additive accumulation", () => {
+    expect(CUE4PARSE_PROGRAM).toMatch(/sequencerModel is not null[\s\S]{0,5000}AAT_None/);
   });
 });

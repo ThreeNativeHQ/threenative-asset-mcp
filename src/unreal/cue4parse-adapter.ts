@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.5",
+  version: "b4e95441+threenative.584.6",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3212,6 +3212,51 @@ static bool EvaluateSequencerChannel(SequencerChannelData channel, double inputT
     return true;
 }
 
+// AnimSequencerDataModel samples a display frame in each channel's MovieScene tick resolution. At an
+// integer tick ExtractTransform uses uniform key values (and only uses a default when there are no keys);
+// at a fractional tick EvaluateToTransform uses the default before evaluating keys. Keep that branch
+// separate from the generic channel evaluator so keyed channels are not discarded wholesale.
+static bool SampleSequencerChannel(SequencerChannelData channel, int displayFrame, int numberOfKeys, int displayRateNumerator, int displayRateDenominator, out float result, out string reason)
+{
+    result = 0f;
+    reason = "";
+    var values = channel.Values ?? [];
+    if (values.Length == 0 && !channel.HasDefaultValue) return false;
+    if (displayRateNumerator <= 0 || displayRateDenominator <= 0 || channel.TickRateNumerator <= 0 || channel.TickRateDenominator <= 0)
+    {
+        reason = $"channel sample rate is invalid (display {displayRateNumerator}/{displayRateDenominator}, tick {channel.TickRateNumerator}/{channel.TickRateDenominator})";
+        return false;
+    }
+    var tickTime = displayFrame * (double) channel.TickRateNumerator * displayRateDenominator /
+        (displayRateNumerator * (double) channel.TickRateDenominator);
+    var nearestTick = Math.Round(tickTime);
+    var integerTick = Math.Abs(tickTime - nearestTick) <= 1e-6;
+    if (integerTick)
+    {
+        if (values.Length == 0)
+        {
+            result = channel.DefaultValue;
+            return true;
+        }
+        if (values.Length == numberOfKeys)
+        {
+            if (nearestTick < 0 || nearestTick >= values.Length)
+            {
+                reason = $"uniform channel key index {nearestTick} is outside {values.Length} values";
+                return false;
+            }
+            result = values[(int) nearestTick].Value;
+            return true;
+        }
+    }
+    else if (channel.HasDefaultValue)
+    {
+        result = channel.DefaultValue;
+        return true;
+    }
+    return EvaluateSequencerChannel(channel, tickTime, out result, out reason);
+}
+
 static bool TrySequencerChannel(FMovieSceneChannel<float> channel, out SequencerChannelData data, out string reason)
 {
     reason = "";
@@ -3408,17 +3453,17 @@ static bool PopulateFromSequencerDataModel(UAnimSequence sequence, UObject model
             var scaleValue = new[] { 1f, 1f, 1f };
             for (var component = 0; component < 3; component++)
             {
-                if (!EvaluateSequencerChannel(translationData[component], frame, out var translationValue, out channelReason))
+                if (!SampleSequencerChannel(translationData[component], frame, numberOfKeys, numerator, denominator, out var translationValue, out channelReason))
                 {
                     if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} translation channel {component} {channelReason}"; return false; }
                 }
                 else location[component] = translationValue;
-                if (!EvaluateSequencerChannel(rotationData[component], frame, out var rotationValue, out channelReason))
+                if (!SampleSequencerChannel(rotationData[component], frame, numberOfKeys, numerator, denominator, out var rotationValue, out channelReason))
                 {
                     if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} rotation channel {component} {channelReason}"; return false; }
                 }
                 else euler[component] = rotationValue;
-                if (!EvaluateSequencerChannel(scaleData[component], frame, out var scaleComponent, out channelReason))
+                if (!SampleSequencerChannel(scaleData[component], frame, numberOfKeys, numerator, denominator, out var scaleComponent, out channelReason))
                 {
                     if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} scale channel {component} {channelReason}"; return false; }
                 }
@@ -3624,13 +3669,22 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
                 return 0;
             }
             if (sequencerTiming is not null) document["timing"] = sequencerTiming;
-            if (sequence.IsValidAdditive() && sequence.RefPoseSeq?.Load<UAnimSequence>() is { } referenceSequence && referenceSequence.Owner is { } referencePackage && ExactSequencerDataModel(referenceSequence, referencePackage) is not null &&
-                !PopulateFromDataModel(referenceSequence, referencePackage, out var referenceReason, out _))
-                throw new InvalidDataException($"the additive reference clip could not be read from its Sequencer model: {referenceReason}");
-            using (var writer = new FArchiveWriter())
+            // PopulateFromSequencerDataModel reconstructs absolute bone transforms. The legacy ActorX
+            // converter treats AdditiveAnimType as authored deltas and adds the base pose again, so only
+            // this reconstructed route temporarily disables that conversion; compressed routes retain it.
+            var originalAdditiveType = sequence.AdditiveAnimType;
+            sequence.AdditiveAnimType = EAdditiveAnimationType.AAT_None;
+            try
             {
-                new ActorXAnim(sequence.ConvertAnims(), 0).Save(writer);
-                WriteAnimationBytes(packagePath, name, ".psa", writer.GetBuffer());
+                using (var writer = new FArchiveWriter())
+                {
+                    new ActorXAnim(sequence.ConvertAnims(), 0).Save(writer);
+                    WriteAnimationBytes(packagePath, name, ".psa", writer.GetBuffer());
+                }
+            }
+            finally
+            {
+                sequence.AdditiveAnimType = originalAdditiveType;
             }
             WriteAnimationJson(packagePath, name + ".clip", document);
             return 1;
