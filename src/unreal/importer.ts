@@ -1195,6 +1195,23 @@ async function indexGlbs(root: string): Promise<Map<string, string>> {
   return glbs;
 }
 
+function indexMeshLodGlbs(glbs: ReadonlyMap<string, string>, name: string): Map<number, string> {
+  const lods = new Map<number, string>();
+  const base = name.toLowerCase();
+  for (const [stem, path] of glbs) {
+    const lower = stem.toLowerCase();
+    if (lower === base) {
+      lods.set(0, path);
+      continue;
+    }
+    const prefix = `${base}_lod`;
+    if (!lower.startsWith(prefix)) continue;
+    const lod = Number(lower.slice(prefix.length));
+    if (Number.isInteger(lod) && lod >= 0) lods.set(lod, path);
+  }
+  return lods;
+}
+
 /**
  * The adapter's `Gameplay/<selector>.json` sidecars, by lower-cased selector (the package path
  * without its extension, the same `entry.selector` the importer uses). PRD-582.
@@ -1345,6 +1362,53 @@ export function sharedBasenames<T extends { readonly package: string }>(entries:
 }
 
 export { gamePackageKey };
+
+interface ModernMeshLodMetadata {
+  readonly lod: number;
+  readonly status: "payload" | "generated" | "unreadable";
+  readonly reason?: string;
+}
+
+interface ModernMeshMetadata {
+  readonly buildScale3D?: readonly [number, number, number];
+  readonly lods: readonly ModernMeshLodMetadata[];
+}
+
+async function readConverterMeshMetadata(path: string): Promise<ModernMeshMetadata | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const raw = parsed as Record<string, unknown>;
+    if (raw.format !== "threenative-static-mesh-metadata" || raw.version !== 1 || !Array.isArray(raw.lods)) return undefined;
+    const scale = raw.buildScale3D;
+    const buildScale3D = Array.isArray(scale) && scale.length === 3 && scale.every((value) => typeof value === "number" && Number.isFinite(value) && value > 0)
+      ? [scale[0] as number, scale[1] as number, scale[2] as number] as const
+      : undefined;
+    const lods: ModernMeshLodMetadata[] = [];
+    for (const item of raw.lods) {
+      if (typeof item !== "object" || item === null) continue;
+      const row = item as Record<string, unknown>;
+      const lod = row.lod;
+      const status = row.status;
+      if (typeof lod !== "number" || !Number.isInteger(lod) || lod < 0 || (status !== "payload" && status !== "generated" && status !== "unreadable")) continue;
+      lods.push({ lod, status, ...(typeof row.reason === "string" ? { reason: row.reason } : {}) });
+    }
+    return { ...(buildScale3D === undefined ? {} : { buildScale3D }), lods };
+  } catch {
+    return undefined;
+  }
+}
+
+async function indexMeshMetadata(root: string): Promise<Map<string, ModernMeshMetadata>> {
+  const metadata = new Map<string, ModernMeshMetadata>();
+  for (const file of await listFiles(join(root, "Meshes")).catch(() => [])) {
+    if (!file.path.toLowerCase().endsWith(".metadata.json")) continue;
+    const name = basename(file.path, ".metadata.json");
+    const parsed = await readConverterMeshMetadata(file.path);
+    if (parsed) metadata.set(name, parsed);
+  }
+  return metadata;
+}
 
 /** The modern converter's `<mesh>.materials.json` (slot material name -> package path), lower-cased; undefined without one. */
 async function readConverterMaterialPackages(path: string): Promise<ReadonlyMap<string, string> | undefined> {
@@ -4356,12 +4420,15 @@ export async function importUnrealDirectory(
   let uncookedGlbs = new Map<string, string>();
   let modernConverter: ExternalTool | undefined;
   let modernGlbs = new Map<string, string>();
+  let modernMeshMetadata = new Map<string, ModernMeshMetadata>();
   let modernGroomPayloads = new Map<string, string[]>();
   /** The adapter's PRD-582 sidecars, by selector and cue name. */
   let modernGameplaySidecars = new Map<string, string>();
   let modernCueSidecars = new Map<string, CueSidecar>();
   /** Mesh packages whose basename another routed package shares, decoded on their own: entry file -> GLB (undefined: failed). */
   const isolatedMeshGlbs = new Map<string, string | undefined>();
+  const isolatedMeshLodGlbs = new Map<string, Map<number, string>>();
+  const isolatedMeshMetadata = new Map<string, ModernMeshMetadata | undefined>();
   /** Meshes UE Viewer exported after the modern converter failed on them. */
   const recoveredByUmodel = new Set<string>();
   /** Why a mesh the modern converter ran on still has no GLB, by package basename. */
@@ -4491,6 +4558,7 @@ export async function importUnrealDirectory(
       );
     } else {
       modernGlbs = await indexGlbs(modernRaw);
+      modernMeshMetadata = await indexMeshMetadata(modernRaw);
       modernGroomPayloads = await indexGroomPayloads(modernRaw);
       modernGameplaySidecars = await indexGameplaySidecars(modernRaw);
       modernCueSidecars = await indexCueSidecars(modernRaw);
@@ -4501,12 +4569,18 @@ export async function importUnrealDirectory(
       await mapWithConcurrency(duplicates, 1, async (entry, index) => {
         const isolated = join(staging, "modern-duplicates", String(index).padStart(5, "0"));
         await mkdir(dirname(isolated), { recursive: true });
-        const run = await runModernConverter(modernConverter!.path, sourceDir, isolated, ["--filter", entry.selector], {
+        const isolatedArgs = ["--filter", entry.selector];
+        if (lodsArg) isolatedArgs.push("--lods", lodsArg);
+        const run = await runModernConverter(modernConverter!.path, sourceDir, isolated, isolatedArgs, {
           timeoutMs: 1_800_000,
           maxOutputBytes: 64 * 1024 * 1024,
         }, formatProfile);
-        const glb = run.code === 0 ? (await indexGlbs(isolated)).get(basename(entry.package, extname(entry.package))) : undefined;
+        const name = basename(entry.package, extname(entry.package));
+        const glbs = run.code === 0 ? await indexGlbs(isolated) : new Map<string, string>();
+        const glb = glbs.get(name);
         isolatedMeshGlbs.set(entry.file, glb);
+        isolatedMeshLodGlbs.set(entry.file, indexMeshLodGlbs(glbs, name));
+        isolatedMeshMetadata.set(entry.file, run.code === 0 ? await readConverterMeshMetadata(join(isolated, "Meshes", `${name}.metadata.json`)) : undefined);
       });
       // Only a package decoded for its geometry earns this warning; a metadata-only package writes a
       // sidecar and no GLB, so UE Viewer is still the route that rendered it.
@@ -5292,6 +5366,12 @@ export async function importUnrealDirectory(
       const name = basename(entry.package, extname(entry.package));
       const fromMeshDescription = uncookedNames.has(name);
       const fromModernConverter = modernNames.has(name);
+      const modernMetadata = fromModernConverter
+        ? isolatedMeshGlbs.has(entry.file)
+          ? isolatedMeshMetadata.get(entry.file)
+          : modernMeshMetadata.get(name)
+        : undefined;
+      const isolatedLodGlbs = isolatedMeshGlbs.has(entry.file) ? isolatedMeshLodGlbs.get(entry.file) ?? new Map<number, string>() : undefined;
       const defaultPath = isolatedMeshGlbs.has(entry.file)
         ? isolatedMeshGlbs.get(entry.file)
         : fromMeshDescription
@@ -5305,11 +5385,24 @@ export async function importUnrealDirectory(
       const lodPaths: { lod: number; path: string }[] = [];
       if (fromModernConverter && lodsArg !== undefined) {
         for (const lod of requestedLods) {
-          const path = lod === 0 ? defaultPath : modernGlbs.get(`${name}_LOD${lod}`);
+          const path = isolatedLodGlbs
+            ? isolatedLodGlbs.get(lod)
+            : lod === 0 ? defaultPath : modernGlbs.get(`${name}_LOD${lod}`);
           if (path) lodPaths.push({ lod, path });
         }
       } else if (defaultPath) {
         lodPaths.push({ lod: 0, path: defaultPath });
+      }
+      if (fromModernConverter && lodsArg !== undefined && modernMetadata) {
+        for (const lod of requestedLods) {
+          if (lodPaths.some(candidate => candidate.lod === lod)) continue;
+          const disposition = modernMetadata.lods.find(candidate => candidate.lod === lod);
+          if (disposition?.status === "generated") {
+            warnings.push(`${name}_LOD${lod}: ${disposition.reason ?? "generated by Unreal at build time; not decoded"}.`);
+          } else if (disposition?.status === "unreadable") {
+            warnings.push(`${name}_LOD${lod}: ${disposition.reason ?? "the source payload could not be decoded"}.`);
+          }
+        }
       }
       if (lodPaths.length === 0) {
         failed.push({
@@ -5328,9 +5421,11 @@ export async function importUnrealDirectory(
       }
       const dnaSource = fromModernConverter ? assets.dna.get(name) : undefined;
       // UE Viewer's raw mesh is not multiplied by the source model's BuildScale3D; Unreal's render data is.
-      // Every static route decodes the raw source model (UE Viewer's raw mesh, the MeshDescription and CUE4Parse editor
-      // decoders), which Unreal multiplies by BuildScale3D when it builds the render data.
-      const buildScale = entry.meshKind !== "skeletal" ? await readPackageBuildScale3D(entry.file) : undefined;
+      // Modern UE5 packages carry the authoritative value from CUE4Parse's SourceModels metadata; the byte scanner
+      // remains for the UE4/uncooked routes where UE Viewer or the old converter has no typed metadata.
+      const buildScale = fromModernConverter
+        ? modernMetadata?.buildScale3D
+        : entry.meshKind !== "skeletal" ? await readPackageBuildScale3D(entry.file) : undefined;
       if (buildScale && buildScale.some((factor) => factor !== 1)) {
         warnings.push(`${name}: the source mesh carries BuildScale3D (${buildScale.join(", ")}); the decoded source geometry was scaled by it${new Set(buildScale).size > 1 ? " (non-uniform: normals are not adjusted)" : ""}.`);
       }

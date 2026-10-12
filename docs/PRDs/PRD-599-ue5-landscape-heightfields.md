@@ -1,6 +1,6 @@
 # PRD-599 — UE5 landscape heightfields in levels
 
-**Status:** IN PROGRESS — review dispatch repair complete; parent fresh gates, independent review and CI pending
+**Status:** IN PROGRESS — final union integrated; parent fresh gates, final independent review and CI pending
 **Priority:** P2 — terrain export implemented; parent owns the comparison sheet and final repository gates.
 **Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `src/unreal/scenes.ts`), new module; risk override: none.
 **Owner:** PRD-599 repair lane; parent owns orchestration
@@ -32,8 +32,8 @@ only to PNG. Engine headers to confirm the UE5 fields (tracked, not checked out)
 
 - [x] AC-1 [local]: A real UE5 level with a landscape imports with a terrain mesh whose height range and footprint match the landscape actor's bounds stored in the package, within 1%. proof: real-pack gate in `tests/fab-feature-corpus.test.ts` — Evidence: `.584.9.1` / importer 122, 2026-10-12: native and actual public importer GLB gates pass for all 51 components from the same eight-file stage; node-world POSITION bounds within 1%, zero terrain omissions, `reused: false`, pinned provenance.
 - [x] AC-2 [local]: A synthetic UE5 heightmap (known BGRA8 and `TSCF_UEDELTA` pixels) decodes to the expected heights. proof: red-to-green test beside `tests/unreal-converter-ue5-sources.test.ts` — Evidence: `.584.9.2` shares `TryDecodeLandscapeSourcePixels` between the actual texture reader and compiled synthetic harness. Raw BGRA8 and encoded UEDELTA both dispatch through it and assert the same known heights, normals, subsection atlas boundaries and mip-0 byte count; the public GLB nonuniform/mirrored normal regression remains. Disabling only its production UEDELTA branch compiles but fails the expected height assertion (-252.64844 vs -18.6953125), while raw passes; restored focused suites pass. Unsupported compression, PNG flag and truncated payload refusals are asserted.
-- [x] AC-3 [local]: Before/after terrain sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected actual before/after terrain and attached [PR52 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/52#issuecomment-6133268228). Same bounded eight-file stage, .584.8.1 blank terrain before and .584.9.1 public51-component GLB after. Production neutral renderer unchanged; existing fallback material, no layer-weight fidelity claim. Owner-only Drive permissions read back. Recipe and input/output SHA-256: raw/parent599-sheet.{mts,json}.
-- [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent normal-provisioner rebuild and all four gates pass on implementation7a04068: typecheck0.9s; default suite2,720 passed/17 skipped81.1s; leak gate clean89.6s; packed MCP15/15 in15.4s. Logs raw/parent599-final91-{typecheck,test,leaks,smoke}.log. These remain evidence for the prior implementation; parent must rerun all four and the real gate on `.584.9.2`.
+- [x] AC-3 [local]: Before/after terrain sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected actual before/after terrain and attached [PR52 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/52#issuecomment-6133268228). Same bounded eight-file stage, .584.8.1 blank terrain before and .584.9.1 public51-component GLB after. Production neutral renderer unchanged; existing fallback material, no layer-weight fidelity claim. Direct native PNG attachment is on the same PR52 comment. Recipe and input/output SHA-256: raw/parent599-sheet.{mts,json}.
+- [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent normal-provisioner rebuild and all four gates pass on implementation7a04068: typecheck0.9s; default suite2,720 passed/17 skipped81.1s; leak gate clean89.6s; packed MCP15/15 in15.4s. Logs raw/parent599-final91-{typecheck,test,leaks,smoke}.log. These remain evidence for the prior implementation; parent must rerun all four and the real gate on final union `.584.9.3`.
 
 ## Decisions
 
@@ -95,7 +95,7 @@ launcher now executes the converter DLL using the existing read-only SDK directl
 **Verification:** AC-1, AC-2.
 
 #### Phase 3: Evidence, ledger and gates
-**Status:** PENDING — parent refresh after `.584.9.2` review repair
+**Status:** PENDING — parent refresh after final union `.584.9.3`
 **Files:** `docs/unreal-format-support.md` row "Landscape, UE5", `README.md` import table.
 **Verification:** AC-3, AC-4.
 
@@ -106,3 +106,9 @@ launcher now executes the converter DLL using the existing read-only SDK directl
 - `.584.9.2` review repair: 142 focused tests passed across four suites (41.25 s); typecheck and diff checks passed. Normal provisioner rebuilt only the private PRD-599 cache; the existing launcher outside `modern/bin` reports `.584.9.2`. No build or test process remains active. An initial overlapping rebuild/test launch hit a missing-bin cache window; the final test run followed the completed rebuild.
 - Parent completed AC-3 and AC-4 on `.584.9.1`; final `.584.9.2` evidence is pending.
 - Review repair logs: `raw/599-review-repair-mutation-red.log`, `raw/599-review-repair-green.log`, `raw/599-review-repair-typecheck.log`, `raw/599-review-repair-native-build.log`. Private `index92.json` preserves the same source hashes and uses fresh output paths; the native/public real gate remains for the parent.
+
+## Final union integration
+
+Ordinary merge of frozen `4516d29e0b10042b651ba52cfd1fdf7ff0bdf822` retains full PRD-597 source-model LOD/cooked BuildScale fixes, PRD-598 full provider mount guard and completed PRDs, plus PRD-599 shared `TryDecodeLandscapeSourcePixels` dispatch and `LandscapeLocalNormals` absolute world-scale compensation. Converter is `.584.9.3`; unreleased importer remains 122. Only the private PRD-599 converter cache is rebuilt; the outside-bin launcher is retained. Private `index93.json` preserves the same eight source packages and hashes with fresh `parent-native-58493` / `parent-public-58493` output paths. Fresh terrain proof, all four repository gates, final review 2/2 and CI remain parent-owned and pending; no final approval is claimed.
+
+Final union verification: private normal-provisioner rebuild passed and the retained outside-bin launcher reports `b4e95441+threenative.584.9.3`; typecheck and diff checks passed. Corrected default-worker `CI=true` focused run passed 353 tests across 11 files, with one existing opt-in suite skipped (44.06 s): the 337 union guards plus public scene coverage, retaining the dispatch and nonuniform/mirrored-normal guards. An initial run passed 290 but failed 59 compiled harness tests because its executable override pointed outside `modern/bin`, so harness assembly lookup used the launcher directory; rerunning with the private bin executable resolved this without code changes. The real-proof index still uses the retained launcher. No final-tag real terrain, all-four-gates, CI or final-review approval is claimed. Build and test command sessions have exited.
