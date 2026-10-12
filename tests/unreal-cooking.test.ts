@@ -271,6 +271,14 @@ function lengthPrefixed(value: string, encoding: "utf8" | "utf16le"): Buffer {
 }
 
 describe("gameReferencesInHead", () => {
+  it.each(["utf8", "utf16le"] as const)("finds multiple references in one %s string and its following string", (encoding) => {
+    const head = Buffer.concat([
+      lengthPrefixed("/Game/A.Mesh /Game/B.Mesh", encoding),
+      lengthPrefixed("/Game/C.Mesh", encoding),
+    ]);
+    expect(gameReferencesInHead(head)).toEqual(["/Game/A", "/Game/B", "/Game/C"]);
+  });
+
   it("keeps a hyphen and a Unicode letter in a full package path (UTF-8)", () => {
     const head = Buffer.concat([Buffer.alloc(3), lengthPrefixed("/Game/Pack/My-Mesh_Ünïcode", "utf8")]);
     expect(gameReferencesInHead(head)).toContain("/Game/Pack/My-Mesh_Ünïcode");

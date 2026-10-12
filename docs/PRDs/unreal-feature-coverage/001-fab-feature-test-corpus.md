@@ -120,3 +120,5 @@ An empty cell is a recorded gap, not a hidden one. Fill it only when a small pac
 - `compare-full` imports both trees and diffs the per-package results in `import-report.json`.
 
 **Verification:** AC-2 to AC-6.
+
+Local delivery check (2026-10-12): all six slices pass the public `verify --record` command at 230.1 MiB. Importer version 114 invalidates results made before the shared UE4 header-reader correction. With an isolated converter-79 toolchain, typecheck/build pass, the default-worker leak gate passes 2,472 tests (6 skipped) with no temporary leftovers, and packed-MCP smoke passes 15 tests. Fresh full-versus-slice comparisons and final screenshot publication are still pending; the earlier shared-toolchain full run is excluded from proof.

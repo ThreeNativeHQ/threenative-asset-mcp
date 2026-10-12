@@ -208,7 +208,7 @@ function gameReferenceCandidates(buffer: Buffer, prefix: Buffer, encoding: "utf8
     if (start === -1) break;
     const end = encoding === "utf16le" ? utf16Terminator(buffer, start) : buffer.indexOf(0, start);
     candidates.push(buffer.subarray(start, end === -1 ? buffer.length : end).toString(encoding));
-    from = start + prefix.length;
+    from = (end === -1 ? buffer.length : end) + (encoding === "utf16le" ? 2 : 1);
   }
   return candidates;
 }
