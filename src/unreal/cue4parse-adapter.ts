@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.7.3",
+  version: "b4e95441+threenative.584.8.4",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -855,6 +855,41 @@ if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
+static string SourceRelativePackagePath(string key)
+{
+    return key.Replace('\\', '/');
+}
+static bool IsExternalActorForLevel(string actorKey, string levelKey)
+{
+    var actor = SourceRelativePackagePath(actorKey);
+    var level = SourceRelativePackagePath(levelKey);
+    const string marker = "__ExternalActors__/";
+    var markerAt = actor.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+    if (markerAt < 0 || (markerAt > 0 && actor[markerAt - 1] != '/') || !actor.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) return false;
+    var actorPath = actor[(markerAt + marker.Length)..].Split('/', StringSplitOptions.RemoveEmptyEntries);
+    if (actorPath.Length < 4) return false;
+    var mapPath = actor[..markerAt] + string.Join('/', actorPath.Take(actorPath.Length - 3));
+    var levelPath = level.EndsWith(".umap", StringComparison.OrdinalIgnoreCase) ? level[..^5] : level;
+    return string.Equals(mapPath, levelPath, StringComparison.OrdinalIgnoreCase);
+}
+IEnumerable<UObject> ActorsForLevel(string levelKey, ULevel level, List<object> omittedActors)
+{
+    foreach (var actorIndex in level.Actors ?? [])
+        if (actorIndex?.Load<UObject>() is { } actor) yield return actor;
+    IEnumerable<AActor> LoadExternalActorPackage(string actorKey)
+    {
+        try { return provider.LoadPackage(actorKey).GetExports().OfType<AActor>().ToArray(); }
+        catch (Exception error)
+        {
+            var reason = $"external actor package could not be loaded: {error.Message}";
+            omittedActors.Add(new { actor = SourceRelativePackagePath(actorKey), component = "package", sourceClass = "ExternalActorPackage", reason });
+            Console.Error.WriteLine($"external actor package skipped {actorKey}: {error.Message}");
+            return [];
+        }
+    }
+    foreach (var actorKey in provider.Files.Keys.Where(key => IsExternalActorForLevel(key, levelKey)))
+        foreach (var actor in LoadExternalActorPackage(actorKey)) yield return actor;
+}
 // The provider mounts a loose directory under its top-level .uproject stem when one is present, else its
 // name. Compute that mount once from the same selection and reuse it for every gameplay selector below, so
 // a full project whose folder name differs from its .uproject stem still yields root-relative selectors.
@@ -2405,6 +2440,51 @@ static float[]? ReadStaticMeshBuildScale(UStaticMesh mesh)
         : null;
 }
 
+static (uint Flags, byte[] ContentHash, long PayloadSize, long? PayloadOffset)? ReadStaticMeshBulkHeader(byte[] bytes, int exportAt, long validPos, AbstractUePackage package, VersionContainer versions)
+{
+    try
+    {
+        using var archive = new FAssetArchive(new FByteArchive("static-mesh-bulk-object", bytes, versions), package);
+        if (exportAt < 0 || validPos > bytes.Length || exportAt >= validPos) return null;
+        archive.Position = exportAt;
+        new UObject().Deserialize(archive, validPos);
+        // FEditorBulkData serializes flags, GUID, FSHAHash (20 bytes), size, then an optional inline offset.
+        if (archive.Position > validPos - 48) return null;
+        var flags = archive.Read<uint>();
+        archive.Read<FGuid>();
+        var contentHash = archive.ReadBytes(20);
+        var payloadSize = archive.Read<long>();
+        long? payloadOffset = null;
+        if ((flags & (1u | 512u | 1024u)) == 0)
+        {
+            if (archive.Position > validPos - 8) return null;
+            payloadOffset = archive.Read<long>();
+        }
+        return (flags, contentHash, payloadSize, payloadOffset);
+    }
+    catch { return null; }
+}
+
+static EditorMesh? ReadUniqueLegacyLod0(byte[] bytes, int cachedTriangles, out string refusal)
+{
+    refusal = "legacy LOD0 requires a positive cached triangle count";
+    if (cachedTriangles <= 0) return null;
+    var candidates = new List<EditorMesh>();
+    foreach (var (at, _) in ScanEditorPayloads(bytes))
+    {
+        try
+        {
+            using var archive = new FByteArchive("legacy-lod0", bytes);
+            archive.Position = at;
+            candidates.Add(ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)), cachedTriangles));
+        }
+        catch { }
+    }
+    refusal = candidates.Count > 1 ? "ambiguous legacy LOD0: multiple readable MeshDescription payloads without bulk identity"
+        : "legacy LOD0 payload does not match the cached triangle count";
+    return candidates.Count == 1 && candidates[0].LiveTriangles.Count(live => live) == cachedTriangles ? candidates[0] : null;
+}
+
 static byte[]? ReadStaticMeshSourcePayload(FPackageIndex? reference)
 {
     if (reference is null || reference.IsNull || reference.ResolvedObject is not { } resolved || resolved.Package is not Package package || resolved.ExportIndex < 0 || resolved.ExportIndex >= package.ExportMap.Length)
@@ -2414,29 +2494,21 @@ static byte[]? ReadStaticMeshSourcePayload(FPackageIndex? reference)
         return null;
     var bytes = file.Read();
     var export = package.ExportMap[resolved.ExportIndex];
-    if (export.SerialOffset < 0 || export.SerialOffset > bytes.Length - 56) return null;
+    if (export.SerialOffset < 0 || export.SerialOffset >= bytes.Length) return null;
     var exportAt = checked((int)export.SerialOffset);
-    var flags = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(exportAt, 4));
-    var hashAt = exportAt + 20;
-    var hashLength = 32;
-    var sizeAt = exportAt + 52;
-    var payloadSize = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt, 8));
-    // UE5.1+ serializes FIoHash as 32 bytes; older editor packages used the 20-byte hash directly.
-    if (payloadSize < 0 || payloadSize > 1_073_741_824L)
-    {
-        hashLength = 20;
-        sizeAt = exportAt + 40;
-        if (export.SerialSize < 49 || sizeAt > bytes.Length - 8) return null;
-        payloadSize = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt, 8));
-    }
-    if (payloadSize <= 0 || hashAt > bytes.Length - hashLength) return null;
-    var contentHash = bytes.AsSpan(hashAt, hashLength);
+    var decodedHeader = ReadStaticMeshBulkHeader(bytes, exportAt, export.SerialOffset + export.SerialSize, package, provider.Versions);
+    if (decodedHeader is not { } header) return null;
+    var flags = header.Flags;
+    var payloadSize = header.PayloadSize;
+    if (payloadSize <= 0 || payloadSize > 1_073_741_824L) return null;
+    var contentHash = header.ContentHash.AsSpan();
     long payloadAt = -1;
     // UE5.1 editor packages mark this record as a legacy-file reference even though the compressed
     // payload is indexed by the package trailer. Prefer that exact hash lookup whenever a trailer
     // exists; only fall back to the inline offset for older non-virtualized records.
     var trailerAt = package.Summary.PayloadTocOffset;
-    if (trailerAt > 0 && trailerAt <= bytes.Length - 28)
+    if (trailerAt > 0 && trailerAt <= bytes.Length - 28 &&
+        BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(checked((int)trailerAt), 8)) == 0xd1c43b2e80a5f697UL)
     {
         var trailer = checked((int)trailerAt);
         var version = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(trailer + 8, 4));
@@ -2459,8 +2531,8 @@ static byte[]? ReadStaticMeshSourcePayload(FPackageIndex? reference)
             cursor += entrySize;
         }
     }
-    if (payloadAt < 0 && (flags & 1u) == 0 && sizeAt + 16 <= bytes.Length)
-        payloadAt = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt + 8, 8));
+    if (payloadAt < 0 && (flags & 1u) == 0 && header.PayloadOffset is { } inlineOffset)
+        payloadAt = inlineOffset;
     if (payloadAt < 0 || payloadAt > bytes.Length - 64) return null;
     try
     {
@@ -2525,16 +2597,29 @@ bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials,
     foreach (var (lod, sourceModel) in sourceModels.Select((sourceModel, lod) => (lod, sourceModel)))
     {
         var payload = ReadStaticMeshSourcePayload(sourceModel.GetOrDefault<FPackageIndex>("StaticMeshDescriptionBulkData"));
-        if (payload is null)
+        EditorMesh? legacyMesh = null;
+        string? legacyRefusal = null;
+        if (payload is null && lod == 0 && sourceModel.GetOrDefault<FPackageIndex>("StaticMeshDescriptionBulkData") is not { IsNull: false })
+            legacyMesh = ReadUniqueLegacyLod0(file.Read(), (int)sourceModel.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount"), out legacyRefusal);
+        if (payload is null && legacyMesh is null)
         {
-            lodMetadata.Add(new StaticMeshLodMetadata(lod, "generated", "generated by Unreal at build time; not decoded"));
+            if (lod == 0)
+            {
+                var reference = sourceModel.GetOrDefault<FPackageIndex>("StaticMeshDescriptionBulkData");
+                var reason = reference is { IsNull: false }
+                    ? "LOD0 bulk reference has no readable payload"
+                    : legacyRefusal ?? "LOD0 has no readable source payload";
+                lodMetadata.Add(new StaticMeshLodMetadata(lod, "unreadable", reason));
+                assetLookupDiagnostics[mesh.Name] = reason;
+            }
+            else lodMetadata.Add(new StaticMeshLodMetadata(lod, "generated", "generated by Unreal at build time; not decoded"));
             continue;
         }
         EditorMesh editorMesh;
         try
         {
             var cached = (int)sourceModel.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount");
-            editorMesh = ReadMeshDescription(payload, cached);
+            editorMesh = legacyMesh ?? ReadMeshDescription(payload!, cached);
         }
         catch (Exception error)
         {
@@ -3479,7 +3564,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
     foreach (var world in package.GetExports().OfType<UWorld>())
     {
         var level = world.PersistentLevel.Load<ULevel>();
-        if (level?.Actors is null) continue;
+        if (level is null) continue;
         PropertyUtil.SearchPropertyInTemplate = true;
         var actors = new List<object>();
         var texts = new List<object>();
@@ -3489,10 +3574,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
         var blueprintComponents = 0;
         var hasCamera = false;
         double cameraX = 0, cameraY = 0, cameraZ = 0, cameraPitch = 0, cameraYaw = 0, cameraRoll = 0;
-        foreach (var actorIndex in level.Actors)
+        foreach (var actor in ActorsForLevel(key, level, omittedActors))
         {
-            var actor = actorIndex?.Load<UObject>();
-            if (actor is null) continue;
             var componentReferences = new List<FPackageIndex?> {
                 actor.GetOrDefault<FPackageIndex?>("RootComponent"),
                 actor.GetOrDefault<FPackageIndex?>("RenderComponent"),
@@ -3637,7 +3720,9 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 if (!staticMesh.IsNull)
                 {
                     meshName = staticMesh.Name;
-                    if ((staticMesh.Load<UStaticMesh>() ?? LoadAssetByName<UStaticMesh>(staticMesh.Name)) is { } loadedStaticMesh) await ExportStaticMeshAsync(loadedStaticMesh);
+                    if ((staticMesh.Load<UStaticMesh>() ?? LoadAssetByName<UStaticMesh>(staticMesh.Name)) is not { } loadedStaticMesh || !await ExportStaticMeshAsync(loadedStaticMesh))
+                        omittedActors.Add(new { actor = actorName, component = component.Name, sourceClass = component.ExportType,
+                            reason = "static mesh " + staticMesh.Name + " could not be decoded: " + meshFailures.GetValueOrDefault(staticMesh.Name, assetLookupDiagnostics.GetValueOrDefault(staticMesh.Name, "mesh package could not be loaded")) });
                 }
                 else if (!skeletalMesh.IsNull)
                 {
@@ -3776,7 +3861,9 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     if (!staticMesh.IsNull)
                     {
                         meshName = staticMesh.Name;
-                        if ((staticMesh.Load<UStaticMesh>() ?? LoadAssetByName<UStaticMesh>(staticMesh.Name)) is { } loadedStaticMesh) await ExportStaticMeshAsync(loadedStaticMesh);
+                        if ((staticMesh.Load<UStaticMesh>() ?? LoadAssetByName<UStaticMesh>(staticMesh.Name)) is not { } loadedStaticMesh || !await ExportStaticMeshAsync(loadedStaticMesh))
+                        omittedActors.Add(new { actor = prefabName, component = component.Name, sourceClass = component.ExportType,
+                            reason = "static mesh " + staticMesh.Name + " could not be decoded: " + meshFailures.GetValueOrDefault(staticMesh.Name, assetLookupDiagnostics.GetValueOrDefault(staticMesh.Name, "mesh package could not be loaded")) });
                     }
                     else if (!skeletalMesh.IsNull)
                     {
@@ -4846,20 +4933,18 @@ static byte[] EncodeSourcePixels(byte[] pixels, int width, int height, string fo
     }
 }
 
-// The LOD0 source model of an uncooked UE5 StaticMesh. Its package trailer holds one
-// FMeshDescription payload per source-model LOD, so the largest raw payload that parses is LOD0.
-// Every other payload in a StaticMesh package is also a mesh description, so ranking by the
-// header's raw size decompresses only what is kept.
+// With no SourceModels metadata, accept only one readable description; size is not LOD identity.
 static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal, int cachedTriangles = 0)
 {
     refusal = null;
+    var readings = new List<EditorMesh>();
     foreach (var (at, _) in ScanEditorPayloads(bytes))
     {
         try
         {
             using var archive = new FByteArchive("editor-payload", bytes);
             archive.Position = at;
-            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)), cachedTriangles);
+            readings.Add(ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)), cachedTriangles));
         }
         catch (NotSupportedException error)
         {
@@ -4871,7 +4956,8 @@ static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal,
             // Not a mesh description; try the next largest payload.
         }
     }
-    return null;
+    if (readings.Count > 1) refusal = "ambiguous legacy LOD0: multiple readable MeshDescription payloads without bulk identity";
+    return readings.Count == 1 ? readings[0] : null;
 }
 
 // Every plausible FCompressedBuffer in a package, largest raw size first. The 0xb7 0x75 0x63 0x62

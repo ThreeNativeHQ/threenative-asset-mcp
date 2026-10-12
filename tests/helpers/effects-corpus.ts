@@ -574,13 +574,13 @@ async function importSlice(sliceDir: string, label: string, cleanups: (() => Pro
     );
   }
   const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim();
-  if (!converterPath) throw new Error("PRD-584 corpus requires THREENATIVE_MODERN_UNREAL_CONVERTER_PATH pointing to the fresh private 584.7.3 executable");
+  if (!converterPath) throw new Error("PRD-584 corpus requires THREENATIVE_MODERN_UNREAL_CONVERTER_PATH pointing to the fresh private 584.8.4 executable");
   const environment = { ...childEnvironment(process.env), DOTNET_GCHeapHardLimit: "0x40000000" };
   const versionRun = await runBounded(converterPath, ["--version"], { timeoutMs: 30_000, environment });
   expect(versionRun.code, versionRun.stderr).toBe(0);
   // The executable prints "threenative-cue4parse <version>"; only that exact anchored prefix is removed.
   const version = versionRun.stdout.trim().replace(/^threenative-cue4parse /, "");
-  expect(version, "executed private converter identity").toBe("b4e95441+threenative.584.7.3");
+  expect(version, "executed private converter identity").toBe("b4e95441+threenative.584.8.4");
   expect(version).toBe(CUE4PARSE_SOURCE.version);
   const root = await mkdtemp(join(tmpdir(), `effects-corpus-${label}-`));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
@@ -597,7 +597,7 @@ async function importSlice(sliceDir: string, label: string, cleanups: (() => Pro
     environment: { ...environment, THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache") },
   });
   expect(report.reused, "fresh corpus output").toBe(false);
-  expect(report.importer.version, "current public importer").toBe(120);
+  expect(report.importer.version, "current public importer").toBe(121);
   expect(report.toolchain.modernConverter, "public import used the executed private converter").toBe(version);
   const dumpPath = join(root, "effects-dump.json");
   const dumped = await runBounded(converterPath, [sliceDir, "--dump-effects", dumpPath, "--engine", slice.engine.replace(/^UE_/, "")], {

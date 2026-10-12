@@ -4,7 +4,7 @@ Single place to track which Unreal 4 and Unreal 5 formats the importer supports,
 and which are missing. `README.md` ("Unreal import support") links here. Update this file in the same
 commit as any importer, converter or adapter change that moves a row.
 
-Last audited: 2026-10-12, `IMPORTER_VERSION` 120 (`src/unreal/importer.ts`). Evidence comes from the
+Last audited: 2026-10-12, `IMPORTER_VERSION` 121 (`src/unreal/importer.ts`). Evidence comes from the
 README import table, `src/unreal/`, `tests/`, and the engine headers in `~/projects/UnrealEngine-5.8.3`
 (tag `5.8.3-release`, `Engine/Source/Runtime/Engine/Classes`, file names only).
 
@@ -107,7 +107,7 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | `LandscapeComponent` heightfields | UE4 editor | Implemented | indexed terrain mesh | Compressed BGRA8 heightmaps only. |
 | Landscape, UE5 | UE5 | **Missing** | none | The importer lists `LandscapeComponent` as unsupported when standalone. The UE5 level export writes an empty `landscapes` list (PRD-599). |
 | Landscape layer weights and `LandscapeLayerInfoObject` | any | **Missing** | none | |
-| World Partition external actors (`__ExternalActors__`) | UE5 | Reported | none | Skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/unreal-external-actors.test.ts`); the UE5 level export reads `PersistentLevel.Actors` only, so a World Partition level has no actors (PRD-598). |
+| World Partition external actors (`__ExternalActors__`) | UE5 | **Verified** | level scene GLB | Real-pack gate imports all three probe-confirmed supported actor components at stored transforms; compiled association preserves provider mount identity and excludes cross-mount, same-basename/different-prefix and `__ExternalObjects__` packages; fresh `.584.8.4` native/public real-pack proof passes with three meshes and three nodes; final repository gates pending parent, while unimported maps remain skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/fab-feature-corpus.test.ts`, `tests/unreal-external-actors.test.ts`, PRD-598). |
 | Level streaming, sublevels, HLOD proxies | any | Implemented | partial | `tests/unreal-hlod-proxy.test.ts`, `tests/unreal-level-gate.test.ts`. |
 | `DecalActor` and decal components | any | **Missing** | none | |
 | Volumes (post-process, audio, blocking) | any | **Missing** | none | |
@@ -177,7 +177,7 @@ CUE4Parse decodes every class in PRD-582 and PRD-583 on UE4 and UE5. UE Viewer d
 |---|---|
 | [PRD-596](PRDs/PRD-596-ue5-sequencer-animation-clips.md) | UE 5.4+ `AnimSequence` clips stored in the Sequencer/FK Control Rig data model (P1) |
 | [PRD-597](PRDs/done/PRD-597-ue5-static-mesh-lods-and-build-scale.md) | UE5 static mesh LOD1+ and UE 5.4+ `BuildScale3D` |
-| [PRD-598](PRDs/PRD-598-ue5-world-partition-external-actors.md) | World Partition external actors placed in their level |
+| [PRD-598](PRDs/done/PRD-598-ue5-world-partition-external-actors.md) | World Partition external actors placed in their level |
 | [PRD-599](PRDs/PRD-599-ue5-landscape-heightfields.md) | UE5 landscape heightfields in levels (after PRD-598) |
 
 Visual parity of the existing formats stays with PRD-537 and PRD-538 (corpus sweep and baseline).
