@@ -163,7 +163,7 @@ process.exit(0);
   ).toBe(true);
 });
 
-it.each([{ secondExported: false, foreign: false, foreignRig: false }, { secondExported: true, foreign: false, foreignRig: false }, { secondExported: true, foreign: true, foreignRig: false }, { secondExported: false, foreign: false, foreignRig: true }])("keeps nested clip capabilities distinct across every LOD ($secondExported, foreign: $foreign, foreignRig: $foreignRig)", async ({ secondExported, foreign, foreignRig }) => {
+it.each([{ secondExported: false, foreign: false, foreignRig: false }, { secondExported: true, foreign: false, foreignRig: false }, { secondExported: true, foreign: true, foreignRig: false }, { secondExported: false, foreign: false, foreignRig: true }, { secondExported: true, foreign: false, foreignRig: false, legacyOnly: true }])("keeps nested clip capabilities distinct across every LOD ($secondExported, foreign: $foreign, foreignRig: $foreignRig, legacyOnly: $legacyOnly)", async ({ secondExported, foreign, foreignRig, legacyOnly = false }) => {
   const directory = await mkdtemp(join(tmpdir(), "tn-animation-capability-"));
   onTestFinished(() => rm(directory, { recursive: true, force: true }));
   const sourceDir = join(directory, "source");
@@ -188,13 +188,13 @@ it.each([{ secondExported: false, foreign: false, foreignRig: false }, { secondE
   const psa = join(directory, "Walk.psa");
   await writePsaFixture(psa, { animation: "Walk" });
   const classes = { Hero: foreign ? ["SkeletalMesh", "SkeletalMeshSocket"] : ["SkeletalMesh"], HeroB: ["SkeletalMesh"], Walk: ["AnimSequence"], Ref: ["BlendSpace"] };
-  for (const relative of ["Characters/Hero", ...(foreignRig ? ["Characters/HeroB"] : []), "A/Walk", "B/Walk", "Logic/A/Ref", "Logic/B/Ref"]) {
+  for (const relative of ["Characters/Hero", ...(foreignRig ? ["Characters/HeroB"] : []), "A/Walk", "B/Walk", ...(legacyOnly ? [] : ["Logic/A/Ref", "Logic/B/Ref"])]) {
     await mkdir(join(sourceDir, "Content", relative, ".."), { recursive: true });
     const header = Buffer.alloc(24);
     header.writeUInt32LE(0x9e2a83c1, 0);
-    header.writeInt32LE(relative.endsWith("Walk") ? -8 : -7, 4);
+    header.writeInt32LE(relative.endsWith("Walk") && !legacyOnly ? -8 : -7, 4);
     header.writeInt32LE(864, 8);
-    header.writeInt32LE(522, 12);
+    header.writeInt32LE(legacyOnly ? 516 : 522, 12);
     header.writeInt32LE(1004, 16);
     await writeFile(join(sourceDir, "Content", `${relative}.uasset`), header);
   }
@@ -237,6 +237,11 @@ if (args.includes("--animations")) {
     const failures = report.failed.filter((entry) => entry.package === "/Game/B/Walk");
     expect(failures).toHaveLength(1);
     expect(failures[0]!.reason).toMatch(/skeleton package .* differs/);
+  }
+  if (legacyOnly) {
+    expect(report.animationLogic).toEqual([]);
+    expect(report.animationClips).toHaveLength(2);
+    return;
   }
   for (const folder of ["A", "B"]) {
     const descriptor = report.animationLogic.find((asset) => asset.package === `/Game/Logic/${folder}/Ref`)!;

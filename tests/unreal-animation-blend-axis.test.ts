@@ -117,6 +117,7 @@ if (args[0] == "curve-name")
     Console.WriteLine(new FFloatCurve(legacy).CurveName.Text);
     legacy.Properties.Add(Tag("CurveName", "NameProperty", new NameProperty(new FName("modernName"))));
     Console.WriteLine(new FFloatCurve(legacy).CurveName.Text);
+    Console.WriteLine(new FFloatCurve(new FStructFallback(new List<FPropertyTag>())).CurveName.Text);
     legacy.Properties.RemoveAt(legacy.Properties.Count - 1);
     legacy.Properties.Add(Tag("CurveName", "NameProperty", new NameProperty(new FName("None"))));
     Console.WriteLine(new FFloatCurve(legacy).CurveName.Text);
@@ -235,7 +236,7 @@ ${functions.join("\n")}
     execFileSync(sdk, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
 
   it("reads legacy SmartName curve identities while keeping an explicit modern CurveName", () => {
-    expect(run("curve-name").split("\n")).toEqual(["blendOrient1", "modernName", "None"]);
+    expect(run("curve-name").split("\n")).toEqual(["blendOrient1", "modernName", "None", "None"]);
   });
 
   it("preserves authored model curve keys ahead of reduced runtime curves and retains the UE4 raw fallback", () => {

@@ -1,3 +1,4 @@
+import { registerAnimationCorpusGates } from "./helpers/animation-corpus.js";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -659,3 +660,5 @@ if (corpusDir) {
     });
   });
 }
+
+registerAnimationCorpusGates();

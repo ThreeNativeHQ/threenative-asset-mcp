@@ -3460,13 +3460,13 @@ export async function importUnrealDirectory(
     )).filter((file): file is string => file !== undefined),
   );
   const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error && !hlodProxyFiles.has(entry.file));
-  // UE4 clips stay on UE Viewer's ActorX PSA route. UE5 clips and every blend space, aim offset, montage
-  // and composite take the CUE4Parse adapter's animation route instead (PRD-583).
+  // UE4 clips retain UE Viewer's ActorX PSA route. All clips also request CUE4Parse sidecars, even
+  // without a logic asset in the pack, so legacy notifies and authored curves reach the public output.
   const legacyAnimationPackages = classified.filter(
     (entry) => entry.hasAnimation && !entry.hasAnimationLogic && !entry.needsModernConverter && !entry.error,
   );
   const modernAnimationPackages = classified.filter(
-    (entry) => !entry.error && (entry.hasAnimationLogic || (entry.hasAnimation && entry.needsModernConverter)),
+    (entry) => !entry.error && (entry.hasAnimationLogic || entry.hasAnimation),
   );
   // A Texture2D export nested in an offline UFont is its glyph atlas, not a standalone texture
   // asset. It is promoted with metrics below so it cannot produce a duplicate false failure.
