@@ -187,8 +187,8 @@ it.each([{ secondExported: false, foreign: false, foreignRig: false }, { secondE
   }
   const psa = join(directory, "Walk.psa");
   await writePsaFixture(psa, { animation: "Walk" });
-  const classes = { Hero: foreign ? ["SkeletalMesh", "SkeletalMeshSocket"] : ["SkeletalMesh"], HeroB: ["SkeletalMesh"], Walk: ["AnimSequence"], Ref_A: ["BlendSpace"], Ref_B: ["BlendSpace"] };
-  for (const relative of ["Characters/Hero", ...(foreignRig ? ["Characters/HeroB"] : []), "A/Walk", "B/Walk", "Logic/Ref_A", "Logic/Ref_B"]) {
+  const classes = { Hero: foreign ? ["SkeletalMesh", "SkeletalMeshSocket"] : ["SkeletalMesh"], HeroB: ["SkeletalMesh"], Walk: ["AnimSequence"], Ref: ["BlendSpace"] };
+  for (const relative of ["Characters/Hero", ...(foreignRig ? ["Characters/HeroB"] : []), "A/Walk", "B/Walk", "Logic/A/Ref", "Logic/B/Ref"]) {
     await mkdir(join(sourceDir, "Content", relative, ".."), { recursive: true });
     const header = Buffer.alloc(24);
     header.writeUInt32LE(0x9e2a83c1, 0);
@@ -210,7 +210,7 @@ if (args.includes("--animations")) {
   for (const folder of ["A", "B"]) {
     write("Animation/" + folder + "/Walk/Walk.clip.json", {format:"threenative-unreal-animation",version:1,kind:"clip",name:"Walk",package:"/Game/" + folder + "/Walk",className:"AnimSequence",skeleton: folder === "B" && ${foreign} ? "/Game/B/Skeleton" : "/Game/Characters/Skeleton"});
     if (folder === "A" || ${secondExported}) fs.copyFileSync(${JSON.stringify(psa)}, join(out,"Animation",folder,"Walk","Walk.psa"));
-    write("Animation/Logic/Ref_" + folder + "/Ref_" + folder + ".json", {format:"threenative-unreal-animation",version:1,kind:"blendSpace",name:"Ref_"+folder,package:"/Game/Logic/Ref_"+folder,className:"BlendSpace1D",axes:[],samples:[{animation:"/Game/"+folder+"/Walk.Walk",sampleValue:[0,0,0]}]});
+    write("Animation/Logic/" + folder + "/Ref/Ref.json", {format:"threenative-unreal-animation",version:1,kind:"blendSpace",name:"Ref",package:"/Game/Logic/"+folder+"/Ref",className:"BlendSpace1D",axes:[],samples:[{animation:"/Game/"+folder+"/Walk.Walk",sampleValue:[0,0,0]}]});
   }
 } else {
   write("Gameplay/Content/Characters/Hero.json", {version:1,package:"Content/Characters/Hero",skeletonRef:"/Game/Characters/Skeleton"});
@@ -239,7 +239,8 @@ if (args.includes("--animations")) {
     expect(failures[0]!.reason).toMatch(/skeleton package .* differs/);
   }
   for (const folder of ["A", "B"]) {
-    const descriptor = report.animationLogic.find((asset) => asset.package === `/Game/Logic/Ref_${folder}`)!;
+    const descriptor = report.animationLogic.find((asset) => asset.package === `/Game/Logic/${folder}/Ref`)!;
+    if (folder === "A") expect(descriptor.unresolvedClips).toEqual([]);
     const value = JSON.parse(await readFile(join(outputDir, descriptor.json), "utf8"));
     const sidecar = report.animationClips.find((asset) => asset.package === `/Game/${folder}/Walk`)!;
     const clip = JSON.parse(await readFile(join(outputDir, sidecar.json), "utf8"));

@@ -5666,7 +5666,7 @@ export async function importUnrealDirectory(
         sha256: createHash("sha256").update(json).digest("hex"),
         resolvedClips: [...new Set(resolvedClips)],
         unresolvedClips: animationResult.unresolved
-          .filter((issue) => issue.asset === asset.name)
+          .filter((issue) => issue.asset === asset.name && canonicalPackagePath(issue.package) === canonicalPackagePath(asset.package))
           .map((issue) => ({ clip: issue.clip, reason: issue.reason })),
       });
     }
