@@ -36,7 +36,7 @@ compiled converter gate.
 
 ## Remaining work
 
-- Integrated `.584.8.2` fresh real-pack proof, all four repository gates and final-head CI are pending parent execution. Earlier `.584.8.1` evidence below remains prior-head evidence; there is no external input blocker.
+- Repaired `.584.8.3` fresh World Partition and Hornbeam gates pass. Parent still owns all four final-head repository gates, CI and delivery. Earlier `.584.8.1` and `.584.8.2` repository evidence remains prior-head evidence; there is no external input blocker.
 
 ## Integration Ledger
 
@@ -99,3 +99,27 @@ The second independent review requested changes only to the stale proof command 
 Ordinary merge of published PR-50 head `a5908767c4358d07f739254f101d7ad2c27be224` preserves PRD-597 source-model LODs, tagged BuildScale3D and cooked-render no-double-scale behavior alongside PRD-598 external actors and full provider mount ownership. Both original completed PRDs and the other planning PRDs are retained. Converter pin is `b4e95441+threenative.584.8.2` because the `.584.8.1` cache lacks PRD-597 code; importer remains `121`. Build uses only the PRD-598 converter cache with the existing shared SDK. Prior real-pack and repository evidence remains `.584.8.1` evidence; fresh final-tag real proof, all four gates and CI belong to the parent and are pending.
 
 Integration verification: the own-cache converter build passed and reports `.584.8.2`; `npm run typecheck` passed. Focused runs with default workers and `CI=true` passed 337 tests across 11 files (one existing opt-in real-editor test skipped): converter/static mesh, UE5 sources, instance parameters, graph dump, external actors, texture decode, editor mesh/build scale and importer integration/duplicate-package routes. Compiled production cooked bounds and full-mount actor ownership both passed. `git diff --check` passed. No fresh final-tag real-pack gate, full-suite, leak gate, packed-MCP or CI result is claimed here.
+
+## Legacy LOD0 integration repair plan (2026-10-12)
+
+Complexity: 2 → LOW; risk override: none. Repair the integrated static-mesh reader, preserve exact per-LOD identity and cooked scaling, prove synthetic missing-reference/ambiguity behavior and fresh native/public WP counts. Parent owns full repository gates and CI. Actual local source-model dumps show exact LOD0 bulk references on both omitted meshes; their export begins with UObject tagged properties, then flags 0x40, and their legacy TOC has no modern trailer magic. The old reader interpreted the FName index as flags and interpreted the legacy TOC as a modern trailer. Source-backed exact inline references restore three native mesh exports; public and synthetic proof completed below.
+
+## Legacy LOD0 integration repair result
+
+**Integration:** repaired locally; parent final-head repository gates and CI pending.
+**Release:** Unreleased — converter `b4e95441+threenative.584.8.3`; importer remains `121`.
+
+The actual 28-file source stage disproves the initial missing-reference hypothesis. Both omitted meshes have separate, exact LOD0 bulk UObject references, with flags `0x40`, nonzero raw payload sizes and inline offsets pointing to valid compressed MeshDescriptions. Their older TOC starts with version/count rather than the modern trailer tag. The old reader read the odd `None` FName index as flags (incorrectly setting the virtualized bit), then returned from modern trailer validation before trying the referenced inline offset. The unaffected mesh uses the modern trailer layout. Private property dumps, exact export bytes, candidate offsets and live triangle counts are in `raw/598-probe{,-bulk}.log`; licensed identifiers remain outside the repository.
+
+The repair deserializes the actual UObject preamble before reading bulk flags and parses a modern trailer only when its source-defined header tag matches. Exact hash/offset selection remains the primary route. A SourceModel without a bulk identity can emit LOD0 only when exactly one readable payload matches a positive cached triangle count; multiple readable payloads are refused regardless of size. Higher generated LODs never receive LOD0 geometry. The older no-SourceModels route also refuses multiple readable payloads. Missing LOD0 is `unreadable` with a reason, and failed scene/prefab mesh components become named omissions. Cooked scaling, requested modern per-LOD selection and external actor association stay intact.
+
+Official reference, same local `5.8.3-release` commit recorded above: `Engine/Source/Runtime/CoreUObject/Private/Serialization/EditorBulkData.cpp:1043-1055` serializes flags, bulk GUID, content identity and size; `Engine/Source/Runtime/CoreUObject/Public/UObject/PackageTrailer.h:502` defines header tag `0xD1C43B2E80A5F697`. `Engine/Source/Runtime/Engine/Private/StaticMeshSourceData.cpp:392-427` separately confirms that genuinely legacy SourceModels may serialize their MeshDescription inline rather than through a bulk UObject. Pinned CUE4Parse `UObject.Deserialize` reads the tagged properties and optional object GUID; the repair uses that shipped parser rather than assuming a preamble length.
+
+Verification on `.584.8.3`:
+
+- Synthetic old-exporter RED: the SourceModels-present/no-reference test fails because no GLB is emitted (asserted success true, actual false), not from a timeout or harness error. Candidate GREEN: all 5 static-mesh tests pass in 6.53s, exercising the shipped exporter, actual compressed-payload/MeshDescription readers, decoded native GLB and public importer relay; ambiguity is named and generated LOD1 emits no copied geometry. The serialized odd-None-index fixture verifies flags `64`. Logs: `raw/598-legacy-red.log`, `raw/598-legacy-final-green.log`.
+- Focused default-worker run: 167 tests pass across 6 files in 44.87s (static meshes, UE5 source readers, external actors, instance parameters, graph dump and texture decode). Log: `raw/598-release83-focused.log`. The public legacy assertion added afterward is covered by the final 5-test run above.
+- Fresh real WP gate: 3/3 pass in 7.86s, using index `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index83.json` and new `final83/` outputs. All 3 native mesh GLBs and all 3 public models/scene nodes are restored; the gate checks every stored actor world transform and exact map ownership. Log: `raw/598-release83-real-wp.log`.
+- Modern Hornbeam LOD guard: 1/1 passes in 49.29s, with unchanged triangle counts 115,674 / 41,543 / 15,076 for requested LOD0/1/2. Log: `raw/598-release83-hornbeam.log`. Typecheck, JavaScript build and whitespace checks pass. Converter publish used only the existing PRD-598 source/bin cache and read the shared SDK; no other lane was edited.
+
+No full-suite, leak-gate, packed-MCP or final CI pass is claimed for this repair. Those remain the parent's delivery checks. All lane builds and real runs are finished and released for parent use; this checkout stays available for the active PR-51 delivery.

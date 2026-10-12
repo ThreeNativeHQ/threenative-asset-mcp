@@ -15,6 +15,8 @@ import { describeWithTools } from "./helpers/require-tool.js";
 import { compileProject, type ConverterBuild } from "./helpers/material-overrides-harness.js";
 import { extractCSharp } from "./helpers/rgba16f-producer.js";
 
+import { meshDescription } from "./helpers/static-mesh-description-fixture.js";
+
 const STATIC_SCALE_HELPER = extractCSharp(CUE4PARSE_PROGRAM, "static float[]? ReadStaticMeshBuildScale(UStaticMesh mesh)");
 
 const HARNESS = `using System.Reflection;
@@ -201,14 +203,75 @@ sealed class SyntheticPositionBuffer : FPositionVertexBuffer
 }
 `;
 
+const EDITOR_SOURCE = CUE4PARSE_PROGRAM.replace(/^\s*\/\/.*$/gm, "");
+const EDITOR_FUNCTIONS = [
+  "static uint? ReadStaticMeshBulkFlags(", "static EditorMesh? ReadUniqueLegacyLod0(",
+  "static byte[]? ReadStaticMeshSourcePayload(", "bool ExportEditorStaticMesh(",
+  "static EditorMesh? ReadLargestMeshDescription(", "static List<(int At, ulong RawSize)> ScanEditorPayloads(",
+  "static byte[] DecompressEditorPayload(", "static EditorMesh ReadMeshDescription(",
+  "static EditorMesh ReadMeshDescriptionInEitherLayout(", "static void CheckActiveUvChannels(",
+  "static EditorMesh ReadMeshDescriptionLayout(", "static void WriteEditorMeshGlb(",
+  "static System.Numerics.Vector4 EditorVertexColor(", "static float SrgbVertexChannel(", "static float LinearVertexChannel(",
+].map(signature => extractCSharp(EDITOR_SOURCE, signature)).join("\n");
+const EDITOR_RECORD = CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("sealed record EditorMesh("));
+const EDITOR_HARNESS = HARNESS
+  .replace("using System.Reflection;", `using System.Reflection;
+using System.Buffers.Binary;
+using System.Text;
+using System.Runtime.InteropServices;
+using CUE4Parse.Compression;
+using CUE4Parse.UE4.Objects.Core.Compression;`)
+  .replace(/bool ExportEditorStaticMesh\(UStaticMesh mesh, FStaticMaterial\[\] materials, out StaticMeshMetadata\? metadata\)\n\{ throw new Exception\("unexpected editor fallback"\); \}/,
+    `var provider = new FixtureProvider();\n${EDITOR_FUNCTIONS}`)
+  .replace('if (args[0] == "scale")', `if (args[0] == "legacy")
+{
+    output = args[2];
+    Directory.CreateDirectory(Path.Combine(output, "Meshes"));
+    var mesh = TaggedScaleMesh(EGame.GAME_UE5_5, 1);
+    var source = mesh.GetOrDefault<FStructFallback[]>("SourceModels")[0];
+    source.Properties.Add(new FPropertyTag { Name = new FName("CacheMeshDescriptionTrianglesCount"), Tag = new UInt32Property(1) });
+    mesh.Properties.Single(property => property.Name.Text == "SourceModels").Tag = new ArrayProperty(new UScriptArray(new List<FPropertyTagType> {
+        new StructProperty(new FScriptStruct(source)), new StructProperty(new FScriptStruct(new FStructFallback(new List<FPropertyTag>()))) }, "StructProperty"));
+    requestedLods = new[] { 0, 1 };
+    provider.Files[mesh.Name + ".uasset"] = new FixtureFile(File.ReadAllBytes(args[1]));
+    var success = ExportEditorStaticMesh(mesh, Array.Empty<FStaticMaterial>(), out var metadata);
+    if (success) await WriteMeshMetadataAsync(mesh.Name, metadata);
+    Console.WriteLine(JsonSerializer.Serialize(new { success, metadata, reason = assetLookupDiagnostics.GetValueOrDefault(mesh.Name) }));
+}
+else if (args[0] == "flags")
+{
+    var bytes = new byte[68];
+    BinaryPrimitives.WriteInt32LittleEndian(bytes, 1); // odd None index, previously mistaken for virtualized flags
+    BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(12), 64);
+    var flags = ReadStaticMeshBulkFlags(bytes, 0, bytes.Length, new SyntheticPackage(new[] { "Unused", "None" }), new VersionContainer(EGame.GAME_UE5_3));
+    Console.WriteLine(JsonSerializer.Serialize(new { flags }));
+}
+else if (args[0] == "scale")`)
+  + `\n${EDITOR_RECORD.slice(0, EDITOR_RECORD.indexOf(");") + 2)}
+${extractCSharp(CUE4PARSE_PROGRAM, "sealed class EditorVertexComparer")}
+sealed class FixtureProvider { public Dictionary<string, FixtureFile> Files = new(); }
+sealed class FixtureFile(byte[] bytes) { public long Size => bytes.Length; public byte[] Read() => bytes; }
+`;
+
+function compressedMesh(): Buffer {
+  const raw = meshDescription(["SlotA"], false);
+  const header = Buffer.alloc(64);
+  header.writeUInt32BE(0xb7756362, 0);
+  header.writeBigUInt64BE(BigInt(raw.length), 16);
+  header.writeBigUInt64BE(BigInt(raw.length + 64), 24);
+  return Buffer.concat([header, raw]);
+}
+
 describeWithTools(["modern-converter"], "native UE5 static mesh source and cooked LOD fixtures", () => {
   let root = "";
   let build: ConverterBuild;
   let sdk = "";
+  let editorBuild: ConverterBuild;
 
   beforeAll(async () => {
     root = await mkdtemp(join(tmpdir(), "tn-native-static-mesh-"));
     sdk = await modernSdkExecutable(process.env);
+    editorBuild = await compileProject(join(root, "editor-build"), "EditorStaticMeshFixture", { "Program.cs": EDITOR_HARNESS });
     build = await compileProject(join(root, "build"), "StaticMeshFixture", { "Program.cs": HARNESS });
   }, 900_000);
 
@@ -224,6 +287,60 @@ describeWithTools(["modern-converter"], "native UE5 static mesh source and cooke
     });
     return result;
   }
+
+  it("reads bulk flags after serialized UObject properties rather than the odd None name index", async () => {
+    expect(editorBuild.code, editorBuild.output).toBe(0);
+    const result = await runBounded(sdk, [editorBuild.dll, "flags"], { timeoutMs: 30_000, environment: childEnvironment(process.env) });
+    expect(result.code, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).flags).toBe(64);
+  });
+
+  it("exports a positively identified legacy LOD0 with SourceModels present and no modern reference, refusing ambiguity", async () => {
+    expect(editorBuild.code, editorBuild.output).toBe(0);
+    for (const ambiguous of [false, true]) {
+      const input = join(root, ambiguous ? "ambiguous.bin" : "legacy.bin");
+      await writeFile(input, ambiguous ? Buffer.concat([compressedMesh(), compressedMesh()]) : compressedMesh());
+      const output = join(root, ambiguous ? "ambiguous-output" : "legacy-output");
+      const result = await runBounded(sdk, [editorBuild.dll, "legacy", input, output], { timeoutMs: 30_000, environment: childEnvironment(process.env) });
+      expect(result.code, result.stderr).toBe(0);
+      const value = JSON.parse(result.stdout);
+      expect(value.success).toBe(!ambiguous);
+      expect(value.metadata.Lods[1].Status).toBe("generated");
+      expect(await readdir(join(output, "Meshes"))).not.toContain("Synthetic_GAME_UE5_5_LOD1.glb");
+      if (ambiguous) expect(value.reason).toContain("ambiguous legacy LOD0");
+      else {
+        const document = await new NodeIO().read(join(output, "Meshes", "Synthetic_GAME_UE5_5.glb"));
+        expect(document.getRoot().listMeshes()).toHaveLength(1);
+        const sourceDir = join(root, "legacy-public-source");
+        await mkdir(sourceDir, { recursive: true });
+        const header = Buffer.alloc(32);
+        header.writeUInt32LE(0x9e2a83c1, 0);
+        header.writeInt32LE(-8, 4);
+        header.writeInt32LE(1009, 12);
+        await writeFile(join(sourceDir, "Synthetic_GAME_UE5_5.uasset"), Buffer.concat([header, Buffer.from("StaticMesh\0Default__StaticMesh\0")]));
+        const umodel = join(root, "legacy-public-umodel");
+        await writeFakeUmodel(umodel, { classes: {}, listExitCode: 1 });
+        const converter = join(root, "legacy-public-relay");
+        await writeFile(converter, `#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+const out = argv[argv.indexOf("--export-dir") + 1];
+fs.mkdirSync(out, { recursive: true });
+fs.cpSync(${JSON.stringify(output)}, out, { recursive: true });
+`);
+        await chmod(converter, 0o755);
+        const report = await importUnrealDirectory({
+          sourceDir, outputDir: join(root, "legacy-public-output"), lods: [0, 1], graphBake: false,
+          freeSpaceBytes: 30_000_000_000,
+          environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: join(root, "legacy-public-cache") },
+          umodel: { name: "umodel", path: umodel, version: "fixture" },
+          modernConverter: { name: "modern", path: converter, version: "native-output relay" },
+        });
+        expect(report.models.map(model => model.glb)).toEqual(["Models/Synthetic_GAME_UE5_5.glb"]);
+        expect(report.failed).toEqual([]);
+      }
+    }
+  });
 
   it("decodes serialized complete-type-name SourceModels and FVector doubles under UE5.4 and UE5.5 versions", async () => {
     expect(build.code, build.output).toBe(0);
