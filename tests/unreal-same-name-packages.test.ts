@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -45,7 +45,7 @@ async function triangle(path: string, height: number, material: string): Promise
  * Materials/<name>.mat per object name (the last package wins), a `--filter <relative path>` run writes only that package.
  * `outputs` maps a relative package path (or "" for the unfiltered run) to the files it writes.
  */
-async function fakeConverter(path: string, outputs: Record<string, Record<string, string>>): Promise<void> {
+async function fakeConverter(path: string, outputs: Record<string, Record<string, string>>, argvLog?: string): Promise<void> {
   await writeFile(
     path,
     `#!/usr/bin/env node
@@ -57,6 +57,7 @@ const out = argv[argv.indexOf("--export-dir") + 1];
 const at = argv.indexOf("--filter");
 const filter = at >= 0 ? argv[at + 1].replace(/^Content\\//, "") : "";
 const outputs = ${JSON.stringify(outputs)};
+${argvLog === undefined ? "" : `fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify({ filter, argv }) + "\\n");`}
 for (const [target, source] of Object.entries(outputs[filter] || {})) {
   fs.mkdirSync(dirname(join(out, target)), { recursive: true });
   if (source.startsWith("text:")) fs.writeFileSync(join(out, target), source.slice(5));
@@ -67,7 +68,7 @@ for (const [target, source] of Object.entries(outputs[filter] || {})) {
   await chmod(path, 0o755);
 }
 
-async function runImport(root: string, packages: Record<string, readonly string[]>, outputs: Record<string, Record<string, string>>) {
+async function runImport(root: string, packages: Record<string, readonly string[]>, outputs: Record<string, Record<string, string>>, argvLog?: string, lods?: readonly number[]) {
   const sourceDir = join(root, "source");
   const classes: Record<string, string[]> = {};
   for (const [relative, names] of Object.entries(packages)) {
@@ -78,7 +79,7 @@ async function runImport(root: string, packages: Record<string, readonly string[
   const umodel = join(root, "umodel");
   await writeFakeUmodel(umodel, { classes, listExitCode: 1 });
   const converter = join(root, "converter");
-  await fakeConverter(converter, outputs);
+  await fakeConverter(converter, outputs, argvLog);
   const outputDir = join(root, "output");
   const report = await importUnrealDirectory({
     sourceDir,
@@ -89,6 +90,7 @@ async function runImport(root: string, packages: Record<string, readonly string[
     environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache"), THREENATIVE_TOOLCHAIN_DIR: join(root, "toolchain") },
     umodel: { name: "umodel", path: umodel, version: "fixture" },
     modernConverter: { name: "modern", path: converter, version: "fake-modern 1" },
+    ...(lods === undefined ? {} : { lods }),
   });
   return { report, outputDir };
 }
@@ -127,6 +129,49 @@ describe("same-named UE5 packages", () => {
     expect(byPackage.get("Content/A/SM_Dup.uasset")?.boundsMetres[1]).toBe(1);
     expect(byPackage.get("Content/B/SM_Dup.uasset")?.boundsMetres[1]).toBe(3);
     expect(new Set(report.models.map((model) => model.glb)).size).toBe(2);
+  });
+
+  it.each([undefined, "text:{}"])("keeps requested LODs and missing/invalid metadata isolated (%s)", async (aMetadata) => {
+    const root = await scratch();
+    const a0 = join(root, "a0.glb");
+    const a1 = join(root, "a1.glb");
+    const b0 = join(root, "b0.glb");
+    const b1 = join(root, "b1.glb");
+    await triangle(a0, 1, "M_A");
+    await triangle(a1, 0.5, "M_A");
+    await triangle(b0, 3, "M_B");
+    await triangle(b1, 1.5, "M_B");
+    const argvLog = join(root, "modern-argv.jsonl");
+    const { report, outputDir } = await runImport(root, { "A/SM_Dup": MESH, "B/SM_Dup": MESH }, {
+      "": {
+        "Meshes/SM_Dup.glb": b0,
+        "Meshes/SM_Dup_LOD1.glb": b1,
+        "Meshes/SM_Dup.metadata.json": `text:${JSON.stringify({ format: "threenative-static-mesh-metadata", version: 1, buildScale3D: [9, 9, 9], lods: [{ lod: 0, status: "payload" }, { lod: 1, status: "payload" }] })}`,
+      },
+      "A/SM_Dup": {
+        "Meshes/SM_Dup.glb": a0,
+        "Meshes/SM_Dup_LOD1.glb": a1,
+        ...(aMetadata ? { "Meshes/SM_Dup.metadata.json": aMetadata } : {}),
+      },
+      "B/SM_Dup": {
+        "Meshes/SM_Dup.glb": b0,
+        "Meshes/SM_Dup_LOD1.glb": b1,
+        "Meshes/SM_Dup.metadata.json": `text:${JSON.stringify({ format: "threenative-static-mesh-metadata", version: 1, buildScale3D: [2, 2, 2], lods: [{ lod: 0, status: "payload" }, { lod: 1, status: "payload" }] })}`,
+      },
+    }, argvLog, [0, 1]);
+    const height = async (path: string): Promise<number> => {
+      const document = await new NodeIO().read(join(outputDir, path));
+      return document.getRoot().listMeshes()[0]!.listPrimitives()[0]!.getAttribute("POSITION")!.getMax([0, 0, 0])[1]!;
+    };
+    expect(await height("Models/A/SM_Dup_LOD1.glb")).toBe(0.5);
+    expect(await height("Models/A/SM_Dup.glb")).toBe(1);
+    expect(await height("Models/B/SM_Dup.glb")).toBe(6);
+    expect(await height("Models/B/SM_Dup_LOD1.glb")).toBe(3);
+    const invocations = (await readFile(argvLog, "utf8")).trim().split("\n").map(line => JSON.parse(line) as { filter: string; argv: string[] });
+    expect(invocations.filter(({ filter }) => filter !== "").map(({ argv }) => argv.slice(argv.indexOf("--filter")))).toEqual([
+      ["--filter", "Content/A/SM_Dup", "--lods", "0,1"],
+      ["--filter", "Content/B/SM_Dup", "--lods", "0,1"],
+    ]);
   });
 
   it("binds the material instance from the package the mesh names, not the one the shared run wrote", async () => {

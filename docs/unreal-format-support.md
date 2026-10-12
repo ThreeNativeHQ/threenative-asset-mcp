@@ -4,7 +4,7 @@ Single place to track which Unreal 4 and Unreal 5 formats the importer supports,
 and which are missing. `README.md` ("Unreal import support") links here. Update this file in the same
 commit as any importer, converter or adapter change that moves a row.
 
-Last audited: 2026-10-12, `IMPORTER_VERSION` 117 (`src/unreal/importer.ts`). Evidence comes from the
+Last audited: 2026-10-12, `IMPORTER_VERSION` 120 (`src/unreal/importer.ts`). Evidence comes from the
 README import table, `src/unreal/`, `tests/`, and the engine headers in `~/projects/UnrealEngine-5.8.3`
 (tag `5.8.3-release`, `Engine/Source/Runtime/Engine/Classes`, file names only).
 
@@ -39,12 +39,11 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | Cooked `StaticMesh` | UE4 | Implemented | GLB, LOD sections | No named pack for the cooked route. |
 | Uncooked `StaticMesh` below object version 517 | UE4.0–4.20 | **Verified** | GLB | Modular Building Set (129), STF Landscape Pro 2.0 (61), Power Plant (65), UE4.19 fern pack (38) |
 | Uncooked `StaticMesh` (`FMeshDescription`) | UE4.21–4.27 | **Verified** | GLB, cm to m | Office Pack Vol.1 (47 of 47) |
-| Uncooked `StaticMesh` editor source (LOD0 only) | UE5.1 | **Verified** | GLB | Megascans Common Hazel and European Hornbeam. Triangle counts match the UE4.27 decoder. |
+| Uncooked `StaticMesh` editor source | UE5.1 | **Verified** | GLB per requested payload-backed LOD | Megascans European Hornbeam: LOD0/1/2 emitted as 115,674/41,543/15,076 triangles; generated-at-build-time LODs are reported, not faked. |
 | Cooked `StaticMesh` | UE5.5 | **Verified** | GLB | README names UE5.5 cooked static geometry. |
-| `StaticMesh` LOD1 and higher from editor source | UE5 | **Missing** | none | Only LOD0 is decoded. |
+| `StaticMesh` LOD1 and higher from editor source | UE5 | **Verified** | `Models/<name>_LOD<n>.glb` | `lods: [0, 1, 2]` on the local European Hornbeam UE5.1 artifact emits each payload-backed source model; the importer names every promoted LOD. The native synthetic cooked fixture also proves `EMeshQuality.All` writes a distinct lower-triangle LOD1 payload. |
 | `StaticMesh` with Nanite data and no fallback mesh | UE5 | Reported | none | Reported honestly, no geometry. |
-| `StaticMesh` BuildScale3D | UE5.0–5.3 | Implemented | scaled GLB | `readBuildScale3D` reads legacy -7 and -8 headers (`tests/unreal-palms-paragon.test.ts`, synthetic). No real pack named. |
-| `StaticMesh` BuildScale3D | UE5.4+ | **Missing** | none | The UE 5.4 property-tag layout and the UE 5.5 legacy -9 header are not read (PRD-597). |
+| `StaticMesh` BuildScale3D | UE5 | Implemented | scaled GLB | CUE4Parse emits `SourceModels[0].BuildSettings.BuildScale3D` metadata for editor source geometry; cooked render buffers already include the scale and emit null; the native pinned fixture reads tagged values for UE5.4 tag 1012 and UE5.5 legacy -9, while importer wiring proves consumption. The byte scanner remains for UE4/UE Viewer routes. |
 | `SkeletalMesh`, skinned | UE4.0–4.20 | **Verified** | skinned GLB | Animal Variety Pack (6 rigged animals, 146 clips) |
 | `SkeletalMesh`, cooked | UE4 | Implemented | skinned GLB | Joints, weights and inverse-bind matrices preserved. |
 | `SkeletalMesh`, editor source | UE5 | **Verified** | skinned GLB | README: "UE5 editor skeletal geometry". |
@@ -119,8 +118,8 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 
 | Class / format | Engine | Status | Output | Evidence or gap |
 |---|---|---|---|---|
-| `NiagaraSystem`, `NiagaraEmitter` | UE5 | Verified (descriptor) | `Effects/<system>-<hash>.niagara.json` | Real bounded `asset_import_unreal` run over `vtol-5.4` writes all 3 systems (converter current `b4e95441+threenative.584.4`, importer 117; re-run 2026-10-12 against the executed private `.584.4` binary by the corpus gate `PRD-584 real corpus acceptance` > `niagara`, which passed on the VTOL 5.4 pack). `buildNiagaraDescriptor` (`src/unreal/effects-schema.ts`) reads the typed path and decodes `RapidIterationParameters`. The `<hash>` is the first 16 hex digits of SHA-256 over the canonical package-and-object key (`gamePackageKey`), so two same-basename systems in different folders never share a file. UE Viewer cannot list UE5 Niagara packages, so `cooking.ts` `EFFECT_CLASS_HINTS` names the class from the name table. The AC-4 level `omittedActors` pointer remains. |
-| Cascade `ParticleSystem` (and `ParticleModule*`) | UE4 | Verified (descriptor) | `Effects/<system>-<hash>.cascade.json` | Real bounded `asset_import_unreal` run over `soul-cave-4.18` writes `Effects/P_flyingPaper-<hash>.cascade.json` (1 emitter, `M_paper`, lifetime 3..5; converter current `b4e95441+threenative.584.4`, re-run 2026-10-12 against the executed private `.584.4` binary by the corpus gates `cascade` and `cascade-distributions` on the Soul: Cave 4.18 pack). AC-2 enumerates 17 dual-form distributions (14 within 1% at 16 samples, 3 particle-parameters reported unresolved). Descriptor is data only; no runtime plays it. The AC-4 level pointer and the AC-6 leak/smoke gates remain. |
+| `NiagaraSystem`, `NiagaraEmitter` | UE5 | Verified (descriptor) | `Effects/<system>-<hash>.niagara.json` | Real bounded `asset_import_unreal` run over `vtol-5.4` writes all 3 systems (historical PRD-584 corpus evidence; current versions are recorded above). `buildNiagaraDescriptor` (`src/unreal/effects-schema.ts`) reads the typed path and decodes `RapidIterationParameters`. The `<hash>` is the first 16 hex digits of SHA-256 over the canonical package-and-object key (`gamePackageKey`), so two same-basename systems in different folders never share a file. UE Viewer cannot list UE5 Niagara packages, so `cooking.ts` `EFFECT_CLASS_HINTS` names the class from the name table. The AC-4 level `omittedActors` pointer remains. |
+| Cascade `ParticleSystem` (and `ParticleModule*`) | UE4 | Verified (descriptor) | `Effects/<system>-<hash>.cascade.json` | Real bounded `asset_import_unreal` run over `soul-cave-4.18` writes `Effects/P_flyingPaper-<hash>.cascade.json` (1 emitter, `M_paper`, lifetime 3..5; historical PRD-584 corpus evidence; current versions are recorded above). AC-2 enumerates 17 dual-form distributions (14 within 1% at 16 samples, 3 particle-parameters reported unresolved). Descriptor is data only; no runtime plays it. The AC-4 level pointer and the AC-6 leak/smoke gates remain. |
 | Effect materials (translucent or additive particle materials) | any | Implemented | PBR approximation | `tests/unreal-effect-materials.test.ts`. 40 Paragon particle materials remain unbaked. |
 
 ## 5. Audio
@@ -177,7 +176,7 @@ CUE4Parse decodes every class in PRD-582 and PRD-583 on UE4 and UE5. UE Viewer d
 | PRD | Covers |
 |---|---|
 | [PRD-596](PRDs/PRD-596-ue5-sequencer-animation-clips.md) | UE 5.4+ `AnimSequence` clips stored in the Sequencer/FK Control Rig data model (P1) |
-| [PRD-597](PRDs/PRD-597-ue5-static-mesh-lods-and-build-scale.md) | UE5 static mesh LOD1+ and UE 5.4+ `BuildScale3D` |
+| [PRD-597](PRDs/done/PRD-597-ue5-static-mesh-lods-and-build-scale.md) | UE5 static mesh LOD1+ and UE 5.4+ `BuildScale3D` |
 | [PRD-598](PRDs/PRD-598-ue5-world-partition-external-actors.md) | World Partition external actors placed in their level |
 | [PRD-599](PRDs/PRD-599-ue5-landscape-heightfields.md) | UE5 landscape heightfields in levels (after PRD-598) |
 
