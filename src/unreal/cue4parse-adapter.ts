@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.85-animation",
+  version: "b4e95441+threenative.86-animation",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2625,16 +2625,31 @@ static List<Dictionary<string, object?>> CurveList(IEnumerable<FFloatCurve?> cur
     return records;
 }
 
-// The 5.6+ editor sequence keeps its curves and sync markers on a separate AnimationDataModel export,
-// reached through a data-model property when the sequence names one, else the only such export. This
-// fallback is for metadata only; bone tracks are read from the exact conventional model (ExactDataModel).
-static UObject? DataModelExport(IPackage package, UObject sequence)
+// The sequence keeps its curves, notifies and sync markers on a separate data-model export. Resolve it
+// only from an exact reference the clip itself carries (its DataModel object pointer or its
+// DataModelInterface script-interface), or from a model whose Outer is this exact sequence. This reader
+// takes metadata only, so any data-model class is accepted here (the conventional UAnimDataModel or a
+// Sequencer/ControlRig UAnimationSequencerDataModel); bone tracks still come from ExactDataModel. Never
+// fall back to the first "DataModel"-named export in the package: that misattributes one asset's
+// metadata to another. More than one model owned by the clip is ambiguous and reported, not guessed.
+static UObject? DataModelExport(IPackage package, UObject sequence, out string ambiguity)
 {
+    ambiguity = "";
     if (sequence.TryGetValue<FPackageIndex>(out var modelIndex, "DataModel", "AnimationDataModel", "SequencerDataModel") && modelIndex is { IsNull: false })
     {
         try { if (modelIndex.Load<UObject>() is { } model) return model; } catch { }
     }
-    return package.GetExports().FirstOrDefault(export => export.ExportType.Contains("DataModel", StringComparison.OrdinalIgnoreCase));
+    else if (sequence.TryGetValue<FScriptInterface>(out var reference, "DataModelInterface") && reference.Object is { IsNull: false })
+    {
+        try { if (reference.Object.Load<UObject>() is { } model) return model; } catch { }
+    }
+    var owned = package.GetExports().Where(export =>
+        export.ExportType.Contains("DataModel", StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(export.Outer?.Name.Text, sequence.Name, StringComparison.Ordinal)).ToArray();
+    if (owned.Length == 1) return owned[0];
+    if (owned.Length > 1)
+        ambiguity = $"the clip has {owned.Length} data-model exports whose Outer is the clip; refusing to choose one";
+    return null;
 }
 
 // The conventional UAnimDataModel (UE5.0-5.5 editor bone tracks) for this exact clip. It is the object
@@ -2732,19 +2747,37 @@ bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string 
         return false;
     }
     // FrameRate is an FFrameRate tagged as a struct property; StructProperty unwraps the FScriptStruct
-    // wrapper the pinned reader puts around it before reading the rational fields.
+    // wrapper the pinned reader puts around it before reading the rational fields. A tagged struct omits
+    // a property equal to its native default: Numerator defaults to 0 and Denominator to 1. So an omitted
+    // Denominator is the default 1 (never a guess), while an omitted Numerator is the default 0 and
+    // cannot name a rate. An explicit zero or negative value is a malformed serialized rate, not a
+    // default, so it is rejected with its own precise reason instead of being coerced to 1.
     var frameRate = StructProperty(model, "FrameRate");
-    var numerator = 0;
-    var denominator = 0;
-    if (frameRate is not null && StructNumber(frameRate, "Numerator", out var rateNumerator)) numerator = (int) rateNumerator;
-    if (frameRate is not null && StructNumber(frameRate, "Denominator", out var rateDenominator)) denominator = (int) rateDenominator;
-    // FFrameRate's denominator default is 1, and a tagged struct omits a property equal to its default,
-    // so an omitted denominator is 1 rather than the invalid 0 the fallback leaves behind.
-    if (numerator > 0 && denominator <= 0) denominator = 1;
-    if (numerator <= 0 || denominator <= 0)
+    if (frameRate is null)
     {
-        reason = "the clip's data model carries no valid FrameRate";
+        reason = "the clip's data model carries no FrameRate";
         return false;
+    }
+    if (!StructNumber(frameRate, "Numerator", out var rateNumerator))
+    {
+        reason = "the clip's data model FrameRate carries no Numerator";
+        return false;
+    }
+    var numerator = (int) rateNumerator;
+    if (numerator <= 0)
+    {
+        reason = $"the clip's data model FrameRate has a non-positive Numerator {rateNumerator}";
+        return false;
+    }
+    var denominator = 1;
+    if (StructNumber(frameRate, "Denominator", out var rateDenominator))
+    {
+        if ((int) rateDenominator <= 0)
+        {
+            reason = $"the clip's data model FrameRate has a non-positive Denominator {rateDenominator}";
+            return false;
+        }
+        denominator = (int) rateDenominator;
     }
     var duration = numberOfFrames * (double) denominator / numerator;
     // The model's own PlayLength must agree with NumberOfFrames at the rational rate to within a frame,
@@ -2837,10 +2870,11 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
     };
     try
     {
-        var dataModel = DataModelExport(package, sequence);
+        var dataModel = DataModelExport(package, sequence, out var dataModelAmbiguity);
         document["notifies"] = NotifyRecords(sequence, sequence.Notifies, dataModel);
         document["curves"] = CurveRecords(sequence, dataModel, ExactDataModel(sequence, package));
         document["syncMarkers"] = SyncMarkerRecords(sequence, dataModel);
+        if (dataModelAmbiguity.Length > 0) document["dataModelAmbiguity"] = dataModelAmbiguity;
         var hasRaw = sequence.RawAnimationData is { Length: > 0 };
         var modelReason = "";
         if (!hasRaw && sequence.CompressedDataStructure is null)

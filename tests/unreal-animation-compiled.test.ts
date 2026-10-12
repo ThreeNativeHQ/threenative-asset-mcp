@@ -119,6 +119,20 @@ describeWithTools(["modern-converter"], "converter animation code, compiled agai
         expect(String(document.unsupportedReason)).toMatch(/bone tracks|ControlRig|compressed/i);
       }
     }
+    // Each timed clip sidecar and its PSA must agree, so the reader's timing is tied to the bytes written:
+    // the sidecar's key count is the PSA frame count, the PSA rate is the model's rational rate, and the
+    // PSA's endpoint (its last key) lands on the model's duration within a frame.
+    for (const document of documents) {
+      if (document.kind !== "clip" || document.timing === undefined) continue;
+      const timing = document.timing as { frames: number; keys: number; rateNumerator: number; rateDenominator: number; duration: number };
+      const psaName = `${String(document.name)}.psa`;
+      if (!files.includes(psaName)) continue;
+      const psa = parsePsa(await readFile(join(animation, psaName)));
+      const sequence = psa.sequences[0]!;
+      expect(sequence.frames).toBe(timing.keys);
+      expect(sequence.rate).toBeCloseTo(timing.rateNumerator / timing.rateDenominator, 6);
+      expect((sequence.frames - 1) / sequence.rate).toBeCloseTo(timing.duration, 4);
+    }
     // A UE4-era proof pack (raw editor tracks) must produce real ActorX clips. Static poses are
     // legitimate, so this scopes the moving proof to one known fixture: at least one exported clip
     // must carry a bone track whose quaternion varies over time (the raw FRawAnimSequenceTrack read
@@ -144,5 +158,37 @@ describeWithTools(["modern-converter"], "converter animation code, compiled agai
       }
     }
     expect(moving.length, "no exported clip carried a bone track with a varying rotation").toBeGreaterThan(0);
+    // The known conventional-model proof is identified by its own timing shape, not by a hardcoded clip
+    // name: its model reports NumberOfFrames 82 / NumberOfKeys 83 at 30/1, so the PSA must carry 83 keys
+    // per track at 30 fps and sample the endpoint at 82/30 = 2.733333 s, with 354 bones and 52 rotating.
+    // A general proof pack that carries no such clip skips this block.
+    const known = documents.find((document) =>
+      document.kind === "clip" && document.timing !== undefined &&
+      (document.timing as { frames: number }).frames === 82);
+    if (known !== undefined) {
+      const timing = known.timing as { frames: number; keys: number; rateNumerator: number; rateDenominator: number; duration: number };
+      expect(timing.keys).toBe(83);
+      expect(timing.rateNumerator).toBe(30);
+      expect(timing.rateDenominator).toBe(1);
+      expect(timing.duration).toBeCloseTo(2.733333, 5);
+      const psaName = `${String(known.name)}.psa`;
+      expect(files).toContain(psaName);
+      const psa = parsePsa(await readFile(join(animation, psaName)));
+      expect(psa.sequences.length).toBe(1);
+      const sequence = psa.sequences[0]!;
+      expect(sequence.rate).toBe(30);
+      expect(sequence.frames).toBe(83);
+      expect(sequence.tracks.length).toBe(354);
+      const rotating = sequence.tracks.filter((track) => {
+        if (track.rotations.length < 8) return false;
+        let maxDelta = 0;
+        for (let i = 4; i < track.rotations.length; i += 4) {
+          const delta = Math.abs(track.rotations[i]! - track.rotations[i - 4]!) + Math.abs(track.rotations[i + 1]! - track.rotations[i - 3]!) + Math.abs(track.rotations[i + 2]! - track.rotations[i - 2]!) + Math.abs(track.rotations[i + 3]! - track.rotations[i - 1]!);
+          maxDelta = Math.max(maxDelta, delta);
+        }
+        return maxDelta > 1e-4;
+      }).length;
+      expect(rotating).toBe(52);
+    }
   });
 });
