@@ -1,9 +1,11 @@
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { NodeIO } from "@gltf-transform/core";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   assertNoSymlinks,
@@ -25,7 +27,7 @@ import {
   type SlicePlan,
 } from "../scripts/fab-slice.js";
 import { packageHeaderSize, readExactly, readPackageHeaderRegion, type PositionedReader } from "../src/unreal/cooking.js";
-import { ImportError, importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
+import { IMPORTER_VERSION, ImportError, importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
 import { primaryClassFixture } from "./helpers/uasset-fixture.js";
 
 describe("fab-slice dependency closure", () => {
@@ -429,5 +431,210 @@ if (!corpusDir) {
         }
       }
     }, 1_800_000);
+  });
+}
+
+// PRD-582 gameplay gates over the real corpus. The five matrix slices are required: when
+// FAB_FEATURE_CORPUS_DIR is set, an absent one is a failure, never an empty success. Each slice is
+// imported once through the public `importUnrealDirectory` with the immutable `threenative.83`
+// converter snapshot; the shared root toolchain binary is mutable and is never used. Output stays
+// under the owner's cache so an import can be inspected, and each output is removed first so a stale
+// report can never satisfy a gate. Licensed names never appear below: a model is located by its
+// reported characteristics, and its socket, bone and wave names are compared only at runtime.
+
+const CONVERTER_83 = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "converter-83", "ThreeNativeConverter");
+const FINAL_IMPORT_DIR = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "final-imports");
+
+function runConverter(file: string, args: readonly string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, [...args], { maxBuffer: 1 << 20 }, (error, stdout) => (error ? reject(error) : resolve(String(stdout))));
+  });
+}
+
+interface CueNode {
+  readonly type: string;
+  readonly params?: Record<string, unknown>;
+  readonly children?: readonly CueNode[];
+}
+
+if (corpusDir) {
+  const corpusRoot = corpusDir;
+  describe("feature corpus gameplay gates (FAB_FEATURE_CORPUS_DIR, local-only)", () => {
+    const imported = new Map<string, { readonly report: ImportReport; readonly outputDir: string }>();
+
+    beforeAll(async () => {
+      // The override lets an operator point the gate at their own 83 build; it must still report 83.
+      const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim() || CONVERTER_83;
+      const versionLine = (await runConverter(converterPath, ["--version"]))
+        .trim()
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .pop();
+      const versionMatch = versionLine === undefined ? null : /threenative\.(\d+)\b/.exec(versionLine);
+      if (versionMatch?.[1] !== "83") {
+        throw new Error(`the gameplay gate needs the immutable converter-83 snapshot, but ${converterPath} reports "${versionLine ?? ""}"`);
+      }
+      const version = versionLine!.split(/\s+/).slice(1).join(" ") || versionLine!;
+
+      const present = new Set(SLICES.filter((slice) => existsSync(join(corpusRoot, slice.id))).map((slice) => slice.id));
+      const missing = missingRequiredSlices(SLICES, present);
+      if (missing.length > 0) {
+        throw new Error(
+          `FAB_FEATURE_CORPUS_DIR is set, so every required matrix slice must be present; missing: ${missing.map((slice) => slice.id).join(", ")}`,
+        );
+      }
+
+      for (const slice of SLICES.filter((entry) => !entry.optional)) {
+        const sourceDir = join(corpusRoot, slice.id);
+        const outputDir = join(FINAL_IMPORT_DIR, slice.id);
+        // Force a fresh import: a report from an earlier importer would otherwise be reused.
+        await rm(outputDir, { recursive: true, force: true });
+        const report = await importFreshOutput(sourceDir, outputDir, (source, output) =>
+          importUnrealDirectory({
+            sourceDir: source,
+            outputDir: output,
+            sourceKind: "local-directory",
+            engine: slice.engine,
+            formatHint: slice.engine,
+            graphBake: false,
+            concurrency: 1,
+            modernConverter: { name: "modern", path: converterPath, version },
+            environment: { ...process.env, THREENATIVE_MODERN_UNREAL_CONVERTER_PATH: converterPath },
+            log: () => {},
+          }),
+        );
+        expect(report.reused, `${slice.id} must be imported fresh, not served from a cache`).toBe(false);
+        expect(report.importer.version).toBe(IMPORTER_VERSION);
+        expect(report.toolchain.modernConverter).toBe(version);
+        imported.set(slice.id, { report, outputDir });
+      }
+    }, 900_000);
+
+    function slice(id: string): { readonly report: ImportReport; readonly outputDir: string } {
+      const entry = imported.get(id);
+      if (!entry) throw new Error(`${id} was not imported`);
+      return entry;
+    }
+
+    async function skinJoints(outputDir: string, glb: string): Promise<Set<string>> {
+      const document = await new NodeIO().read(join(outputDir, glb));
+      return new Set(document.getRoot().listSkins().flatMap((skin) => skin.listJoints().map((joint) => joint.getName())));
+    }
+
+    it("sockets: every socket:* node hangs under its named skin joint and the source counts match", async () => {
+      const { report, outputDir } = slice("game-anim-5.8");
+      // One skeletal mesh reports a socket bone the exported skin lacks; four others attach.
+      const withMissingBone = report.models.filter((model) => (model.missingBones?.length ?? 0) > 0);
+      expect(withMissingBone).toHaveLength(1);
+      const mannequin = withMissingBone[0]!;
+      expect(mannequin.kind).toBe("skeletal");
+      expect(mannequin.sockets).toHaveLength(4);
+      expect(mannequin.missingBones).toHaveLength(1);
+      // The mesh with the most sockets carries twelve; converter 83 decodes its own socket list.
+      const shoe = report.models.reduce((widest, model) =>
+        (model.sockets?.length ?? 0) > (widest.sockets?.length ?? 0) ? model : widest,
+      );
+      expect(shoe.sockets).toHaveLength(12);
+      expect(shoe.missingBones ?? []).toHaveLength(0);
+
+      for (const [model, attached, sourceTotal] of [
+        [mannequin, 4, 5],
+        [shoe, 12, 12],
+      ] as const) {
+        const document = await new NodeIO().read(join(outputDir, model.glb));
+        const joints = new Set(document.getRoot().listSkins().flatMap((skin) => skin.listJoints().map((joint) => joint.getName())));
+        expect(joints.size).toBeGreaterThan(0);
+        const socketNodes = document.getRoot().listNodes().filter((node) => node.getName().startsWith("socket:"));
+        expect(socketNodes).toHaveLength(attached);
+        expect(socketNodes.length + (model.missingBones?.length ?? 0)).toBe(sourceTotal);
+        expect(socketNodes.map((node) => node.getName().slice("socket:".length)).sort()).toEqual([...(model.sockets ?? [])].sort());
+        for (const node of socketNodes) {
+          const parent = node.getParentNode();
+          expect(parent, `${node.getName()} has no parent joint`).not.toBeNull();
+          expect(parent!.getName()).toBe((node.getExtras() as { unrealSocket?: { bone?: string } }).unrealSocket?.bone);
+          expect(joints.has(parent!.getName())).toBe(true);
+        }
+      }
+    });
+
+    it("physics: sidecar counts match the verified source and every body bone resolves in the linked skin", async () => {
+      const expected = new Map<string, readonly (readonly [number, number])[]>([
+        ["anim-starter-4.4", [[23, 22]]],
+        ["stickman-4.22", [[14, 13]]],
+        ["game-anim-5.8", [[23, 22], [6, 1], [2, 0]]],
+      ]);
+      // The two slices with no skeletal physics asset stay empty (VTOL carries none).
+      expect(slice("soul-cave-4.18").report.physicsAssets).toHaveLength(0);
+      expect(slice("vtol-5.4").report.physicsAssets).toHaveLength(0);
+
+      const byCounts = (a: readonly number[], b: readonly number[]): number => a[0]! - b[0]! || a[1]! - b[1]!;
+      for (const [id, counts] of expected) {
+        const { report, outputDir } = slice(id);
+        const fromFiles: [number, number][] = [];
+        for (const asset of report.physicsAssets) {
+          const file = join(outputDir, asset.file);
+          expect(existsSync(file), `${asset.file} must exist`).toBe(true);
+          expect(report.failed.some((row) => row.package === asset.package)).toBe(false);
+          expect(report.skipped.some((row) => row.package === asset.package)).toBe(false);
+          // The count comes from the sidecar file, not the report's own summary.
+          const parsed = JSON.parse(await readFile(file, "utf8")) as { bodies: { bone: string }[]; constraints: unknown[] };
+          fromFiles.push([parsed.bodies.length, parsed.constraints.length]);
+          const linked = report.models.filter((model) => model.physics?.asset === asset.name);
+          expect(linked.length, `${asset.name} must be linked to a skinned mesh`).toBeGreaterThan(0);
+          for (const model of linked) {
+            expect(model.physics?.missingBodies ?? 0, `${asset.name} must have no missing sub-export`).toBe(0);
+            expect(model.physics?.missingConstraints ?? 0, `${asset.name} must have no missing sub-export`).toBe(0);
+            const joints = await skinJoints(outputDir, model.glb);
+            for (const body of parsed.bodies) {
+              const resolved = joints.has(body.bone) || (model.physics?.missingBones ?? []).includes(body.bone);
+              expect(resolved, `${body.bone} resolves to no joint and is not reported missing`).toBe(true);
+            }
+          }
+        }
+        const wanted = [...counts].map((count) => [...count]).sort(byCounts);
+        expect(fromFiles.sort(byCounts)).toEqual(wanted);
+        expect(report.physicsAssets.map((asset) => [asset.bodies, asset.constraints]).sort(byCounts)).toEqual(wanted);
+      }
+    });
+
+    it("soundcue: every WavePlayer leaf resolves to exported audio and the leaf counts match", async () => {
+      const expected = new Map<string, number>([
+        ["soul-cave-4.18", 8],
+        ["game-anim-5.8", 4],
+      ]);
+      for (const [id, leafCount] of expected) {
+        const { report, outputDir } = slice(id);
+        expect(report.soundCues.length, `${id} must decode its SoundCue graph`).toBe(1);
+        const cue = report.soundCues[0]!;
+        const file = join(outputDir, cue.file);
+        expect(existsSync(file), `${cue.file} must exist`).toBe(true);
+        expect(report.failed.some((row) => row.package === cue.package)).toBe(false);
+        expect(report.skipped.some((row) => row.package === cue.package)).toBe(false);
+        const parsed = JSON.parse(await readFile(file, "utf8")) as { root: CueNode | null };
+        const leaves: CueNode[] = [];
+        const collect = (node: CueNode | null | undefined): void => {
+          if (!node) return;
+          if (typeof node.params?.wave === "string") leaves.push(node);
+          for (const child of node.children ?? []) collect(child);
+        };
+        collect(parsed.root);
+        expect(leaves).toHaveLength(leafCount);
+        expect(cue.waves).toHaveLength(leafCount);
+        expect(cue.missingWaves).toHaveLength(0);
+        for (const leaf of leaves) {
+          const wave = leaf.params!.wave as string;
+          const exported = leaf.params!.waveExport;
+          if (typeof exported === "string") {
+            expect(existsSync(join(outputDir, exported)), `${wave} must point at an exported wave`).toBe(true);
+          } else {
+            expect(cue.missingWaves).toContain(wave);
+          }
+        }
+      }
+      for (const id of ["anim-starter-4.4", "stickman-4.22", "vtol-5.4"]) {
+        expect(slice(id).report.soundCues).toHaveLength(0);
+      }
+    });
   });
 }
