@@ -7,6 +7,8 @@ import { afterAll, describe, expect, it } from "vitest";
 import { effectDescriptorRelativePath, effectsDumpSchema, type EffectsDump } from "../../src/unreal/effects-dump.js";
 import { SLICES } from "../../scripts/fab-slice.js";
 import { importUnrealDirectory } from "../../src/unreal/importer.js";
+import { CUE4PARSE_SOURCE } from "../../src/unreal/cue4parse-adapter.js";
+import { childEnvironment, runBounded } from "../../src/unreal/toolchain.js";
 import {
   crossCheckDistribution,
   crossCheckParticleParameterDefault,
@@ -47,14 +49,13 @@ export function registerEffectsCorpusTests(corpusDir: string | undefined): void 
     it("cascade (AC-1): raw emitter count, renderer and material match, and every unmapped module is named", async () => {
       const { outputDir, report, dump } = await runImport(soulDir, "soul-cave-4.18");
       const packages = dump.packages as unknown as DumpPackage[];
-      const systems = packages.filter((pkg) => pkg.exports.some((entry) => entry.class === "ParticleSystem"));
+      const systems = packages.flatMap((pkg) => pkg.exports.filter((entry) => entry.class === "ParticleSystem").map((system) => ({ pkg, system })));
       expect(systems.length, "raw Cascade packages found in the dump").toBeGreaterThanOrEqual(1);
 
       const cascadeDescriptors = report.effects.filter((effect) => effect.descriptor.endsWith(".cascade.json"));
       expect(cascadeDescriptors.length, "cascade descriptors written").toBe(systems.length);
 
-      for (const pkg of systems) {
-        const system = pkg.exports.find((entry) => entry.class === "ParticleSystem")!;
+      for (const { pkg, system } of systems) {
         const relative = effectDescriptorRelativePath({ package: pkg.path!, system: system.name }, "cascade");
         const written = report.effects.find((effect) => effect.descriptor === relative);
         expect(written?.package, "canonical source identity").toBe(pkg.path);
@@ -99,7 +100,7 @@ export function registerEffectsCorpusTests(corpusDir: string | undefined): void 
           }
         }
       }
-    }, 900_000);
+    }, 180_000);
 
     it("cascade-distributions (AC-2): every dual Distribution+Table agrees in 16 samples, or is an unbaked particle parameter", async () => {
       const { dump } = await runImport(soulDir, "soul-cave-4.18");
@@ -151,17 +152,16 @@ export function registerEffectsCorpusTests(corpusDir: string | undefined): void 
       expect(agree, "baked dual distributions agreeing within 1%").toBe(14);
       expect(dynamic, "unbaked particle-parameter dual distributions").toBe(3);
       expect(worst, "worst relative error over agreeing dual distributions").toBeLessThanOrEqual(0.01);
-    }, 900_000);
+    }, 180_000);
 
     it("niagara (AC-3): exactly three systems, canonical identity, renderer/material/SimTarget and mapped inputs from the raw dump", async () => {
       const { outputDir, report, dump } = await runImport(vtolDir, "vtol-5.4");
       const packages = dump.packages as unknown as DumpPackage[];
-      const systems = packages.filter((pkg) => pkg.exports.some((entry) => entry.class === "NiagaraSystem"));
+      const systems = packages.flatMap((pkg) => pkg.exports.filter((entry) => entry.class === "NiagaraSystem").map((system) => ({ pkg, system })));
       expect(systems.length, "raw Niagara systems in the dump").toBe(3);
       expect(report.effects.filter((effect) => effect.descriptor.endsWith(".niagara.json")).length, "niagara descriptors written").toBe(3);
 
-      for (const pkg of systems) {
-        const system = pkg.exports.find((entry) => entry.class === "NiagaraSystem")!;
+      for (const { pkg, system } of systems) {
         const relative = effectDescriptorRelativePath({ package: pkg.path!, system: system.name }, "niagara");
         const written = report.effects.find((effect) => effect.descriptor === relative);
         expect(written?.package, "canonical source identity").toBe(pkg.path);
@@ -253,7 +253,7 @@ export function registerEffectsCorpusTests(corpusDir: string | undefined): void 
           assertMappedInputs(descriptorEmitter, store, prefix);
         }
       }
-    }, 900_000);
+    }, 180_000);
   });
 }
 
@@ -564,6 +564,14 @@ async function importSlice(sliceDir: string, label: string, cleanups: (() => Pro
       `PRD-584 corpus slice "${label}" is missing at ${sliceDir}; the corpus directory is set but the slice is not present`,
     );
   }
+  const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim();
+  if (!converterPath) throw new Error("PRD-584 corpus requires THREENATIVE_MODERN_UNREAL_CONVERTER_PATH pointing to the fresh private 584.4 executable");
+  const environment = { ...childEnvironment(process.env), DOTNET_GCHeapHardLimit: "0x40000000" };
+  const versionRun = await runBounded(converterPath, ["--version"], { timeoutMs: 30_000, environment });
+  expect(versionRun.code, versionRun.stderr).toBe(0);
+  const version = versionRun.stdout.trim();
+  expect(version, "executed private converter identity").toBe("b4e95441+threenative.584.4");
+  expect(version).toBe(CUE4PARSE_SOURCE.version);
   const root = await mkdtemp(join(tmpdir(), `effects-corpus-${label}-`));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const outputDir = join(root, "output");
@@ -574,11 +582,19 @@ async function importSlice(sliceDir: string, label: string, cleanups: (() => Pro
     engine: slice.engine,
     formatHint: slice.engine,
     graphBake: false,
+    modernConverter: { name: "modern", path: converterPath, version },
     concurrency: 1,
-    environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache") },
+    environment: { ...environment, THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache") },
   });
   expect(report.reused, "fresh corpus output").toBe(false);
-  const dump = effectsDumpSchema.parse(JSON.parse(await readFile(join(outputDir, "effects-dump.json"), "utf8")));
+  expect(report.importer.version, "current public importer").toBe(117);
+  expect(report.toolchain.modernConverter, "public import used the executed private converter").toBe(version);
+  const dumpPath = join(root, "effects-dump.json");
+  const dumped = await runBounded(converterPath, [sliceDir, "--dump-effects", dumpPath, "--engine", slice.engine], {
+    cwd: root, timeoutMs: 30_000, maxOutputBytes: 64 * 1024 * 1024, environment,
+  });
+  expect(dumped.code, `${dumped.stdout}\n${dumped.stderr}`).toBe(0);
+  const dump = effectsDumpSchema.parse(JSON.parse(await readFile(dumpPath, "utf8")));
   expect(dump.errors ?? [], "all effect packages decoded").toEqual([]);
   return { outputDir, report, dump };
 }

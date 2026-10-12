@@ -206,7 +206,9 @@ export interface ConverterRun {
   readonly files: readonly string[];
 }
 
-const MODERN_BIN = join(toolchainCacheDir(process.env), "modern", "bin");
+const MODERN_BIN = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim()
+  ? dirname(process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH.trim())
+  : join(toolchainCacheDir(process.env), "modern", "bin");
 
 /**
  * Compiles `program` (the converter's own C#) together with the harness against the installed CUE4Parse assemblies, then runs

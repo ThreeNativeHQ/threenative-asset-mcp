@@ -5091,7 +5091,8 @@ export async function importUnrealDirectory(
   // Cascade and Niagara descriptors (PRD-584): the tagged dump is mapped to portable JSON under Effects/.
   // A package only leaves the skipped list when its descriptor is written and validated.
   if (effectPackages.length > 0) {
-    const converter = request.modernConverter ?? (await ensureModernConverter(environment, log));
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const converter = modernConverter;
     const dumpPath = join(staging, "effects-dump.json");
     const attempts = [...new Set<string | undefined>([formatProfile, undefined, ...MODERN_ENGINE_FALLBACKS])];
     let dumped: { readonly stdout: string; readonly stderr: string; readonly code: number } | undefined;
@@ -5115,7 +5116,6 @@ export async function importUnrealDirectory(
       }
     }
     if (parsed !== undefined) {
-      await copyFile(dumpPath, join(promotion, "effects-dump.json"));
       const result = await writeUnrealEffects(parsed, promotion);
       const written = result.written;
       // Match on the canonical package key, never a raw basename: two packages that share a system name
