@@ -71,6 +71,8 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
 
 ## Fab and Unreal imports
 
+- **Format ledger:** `docs/unreal-format-support.md` lists supported, verified and missing Unreal formats. Keep it current; the update rules are in `CLAUDE.md`.
+
 - **Local official engine reference:** `/home/joao/projects/UnrealEngine-5.8.3`, tag
   `5.8.3-release`, commit `396c9f059903aed5fec78ecd3d437a40c6415368`. This is a shallow,
   blob-filtered sparse clone made through authenticated `gh`; expand the sparse paths when needed.

@@ -391,6 +391,9 @@ it out of process. Modern UE5 packages rejected by UE Viewer use a pinned,
 out-of-process CUE4Parse adapter. Set `THREENATIVE_TOOLCHAIN_AUTOINSTALL=0` to
 require manually installed tools instead.
 
+**Supported, verified and missing formats:** [`docs/unreal-format-support.md`](docs/unreal-format-support.md)
+is the tracking ledger for every Unreal 4 and 5 class, with its status, evidence and gaps.
+
 ### Fab login for owned packs
 
 `fab_import_asset` and `fab_list_owned` read your Fab library through
