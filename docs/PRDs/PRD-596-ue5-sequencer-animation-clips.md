@@ -1,6 +1,6 @@
 # PRD-596 — UE 5.4+ animation clips from the Sequencer data model
 
-**Status:** INPROGRESS — real current corpus passes; final gates, read-only review and PR delivery remain; only AC-2 requires owner input
+**Status:** INPROGRESS — real current corpus passes; final read-only review and CI delivery remain; only AC-2 requires owner input
 **Priority:** P1 — UE5.4+ FK Sequencer clips now import with bound motion; independent AC-2 pose comparison remains open.
 **Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, a new evaluator), new module; risk override: none.
 **Owner:** PRD-596 lane; parent owns final gates and sheet inspection
@@ -54,8 +54,8 @@ Risk: euler order and tangent semantics give a plausible but wrong pose. The dif
 - [ ] AC-2 [local]: A Sequencer-model clip matches an independent decode of the same clip within 0.5° per bone per frame. proof: differential gate beside `clip-differential` (`tests/helpers/animation-corpus.ts:252`) — Evidence: blocked on independent owner reference; authenticated library survey found no transition pair. See the owner-action section below. Remains unchecked.
 - [x] AC-3 [local]: Each channel interpolation mode (constant, linear, cubic auto, cubic user, cubic break, weighted) evaluates to the engine's formula on synthetic keys, and an unsupported mode reports its reason. proof: `THREENATIVE_TOOLCHAIN_DIR=/tmp/prd596-toolchain npx vitest run tests/unreal-sequencer-channels.test.ts` — Evidence: all five compiled shipped-helper tests pass on `.584.6.3`: constant/linear/cubic/weighted/extrapolated formulas, scene-rate sampling, fractional whole-transform quaternion blend, omitted-denominator defaults with explicit invalid-rate rejection, and additive base-pose protection/restoration on success and failure. Red/green and deliberate Euler-blend mutation logs remain local under `raw/rates596-*` and `raw/parent596-rate-default-*`.
 - [x] AC-4 [local]: The `game-anim-5.4` slice imports its seed clip the same way. proof: same gate as AC-1 over `gasp54` — Evidence: the same strict gate passed all325 selected native UE5.4 AnimSequences against325 public sidecars and8 model GLBs, requiring bound geometry, valid timing and genuine motion across the selection. The fresh public replay selected every prior clip and model while excluding unrelated standalone audio promotion; no animation was removed to make the gate pass.
-- [ ] AC-5 [local]: Before/after sheet of one 5.8 clip on the mannequin (several frames) is attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent rendered and inspected final `.584.6.3` sheets against pre-review `.584.5` at0.000/0.040/0.050s with the production neutral renderer and consistent rest-pose camera. Moving sheet shows genuine motion; additive-integrity sheet shows detached old output versus intact fixed pose. The moving foot can reach the fixed camera boundary. Private PNGs are uploaded outside the repo; PR comment attachment remains pending.
-- [ ] AC-6 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent final four-gate run on `5cc6ddc` is in progress; typecheck and default suite2,698 passed/16 skipped are green. Leak and packed-MCP receipts remain pending.
+- [x] AC-5 [local]: Before/after sheet of one 5.8 clip on the mannequin (several frames) is attached to the PR and inspected by eye. proof: PR comment link — Evidence: final `.584.6.3` moving and additive-integrity sheets rendered with the production neutral renderer, inspected by the parent and attached in [PR49 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/49#issuecomment-6132085569). Before is pre-review `.584.5`, after is final `.584.6.3`, at0.000/0.040/0.050s. The same rest-pose camera is retained; a moving foot can reach its boundary. Licensed PNGs are private owner-only Drive files outside the repo.
+- [x] AC-6 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent ran all four on implementation `5cc6ddc` (later changes are prose only), `.584.6.3` / importer119: typecheck0.7s, default suite2,698 passed/16 skipped83.6s, clean leak gate91.5s, packed MCP15/15 in11.6s. Logs: `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent596-final-{typecheck,test,leaks,smoke}.log`.
 
 ## Integration Ledger
 
@@ -119,7 +119,7 @@ Final comparison sheets are private owner-only Drive files, rendered from the fi
 [additive integrity](https://drive.google.com/file/d/1WW5DF-dAPNcghHvPSy84TP0hbH-1gJuQ/view?usp=drivesdk).
 Before means pre-review `.584.5`, after means `.584.6.3`; neither row substitutes a bind pose for the requested
 clip. Both use the same neutral renderer and rest-pose camera. A moving foot reaches the camera boundary;
-this presentation limit does not change the numeric motion gate. PR comment attachment remains pending.
+this presentation limit does not change the numeric motion gate. PR attachment is recorded under AC-5.
 
 ## Owner action remaining for AC-2
 
@@ -150,19 +150,19 @@ AC-2 remains unchecked until this independent comparison passes.
 ## Execution Phases
 
 #### Phase 1: Layout and channel evaluator
-**Status:** INPROGRESS — real current corpus passes; final gates, read-only review and PR delivery remain; only AC-2 requires owner input
+**Status:** INPROGRESS — real current corpus passes; final read-only review and CI delivery remain; only AC-2 requires owner input
 **Files:** new evaluator inside `src/unreal/cue4parse-adapter.ts` (the C# program is embedded there); `tests/unreal-sequencer-channels.test.ts`.
 **Implementation:** Expand the sparse checkout with the paths in Context. Record the layout facts under Decisions. Implement channel evaluation and the Euler-to-quaternion step. Find the AC-2 reference pair (owner's library via `fab_list_owned`).
 **Verification:** AC-3.
 
 #### Phase 2: Converter and importer route
-**Status:** INPROGRESS — real current corpus passes; final gates, read-only review and PR delivery remain; only AC-2 requires owner input
+**Status:** INPROGRESS — real current corpus passes; final read-only review and CI delivery remain; only AC-2 requires owner input
 **Files:** `src/unreal/cue4parse-adapter.ts` (`ExportClip`, `UnsupportedReason`), `src/unreal/importer.ts` (version), `tests/helpers/animation-corpus.ts` (invert the ControlRig assertion, add the differential gate).
 **Implementation:** Route a Sequencer-model clip through the evaluator into `RawAnimationData`. Keep the sidecar. Bump versions.
 **Verification:** AC-1, AC-2, AC-4.
 
 #### Phase 3: Evidence and ledger
-**Status:** INPROGRESS — real current corpus passes; final gates, read-only review and PR delivery remain; only AC-2 requires owner input
+**Status:** INPROGRESS — real current corpus passes; final read-only review and CI delivery remain; only AC-2 requires owner input
 **Files:** `docs/unreal-format-support.md`, `README.md` import table.
 **Implementation:** Sheets, ledger row, and README are updated with importer/converter provenance and local proof paths; formal corpus replay, PR attachment, and final gates remain parent-owned.
 **Verification:** AC-5, AC-6.
