@@ -221,8 +221,10 @@ export function registerAnimationCorpusGates(): void {
               }
             }
             assert(moving && duration > 0 && Number.isFinite(frame), `${raw.name}: nontrivial bound rotation motion required`);
-            assert(typeof raw.animLength === "number" && raw.animLength > 0, `${raw.name}: native timing missing`);
-            assert(Math.abs(duration - raw.animLength) <= frame + 1e-6, `${raw.name}: duration differs by more than one frame`);
+            // The native clip descriptor reports `timing.duration` for UE5 data models and `animLength` elsewhere.
+            const nativeLength = raw.animLength ?? (raw as { timing?: { duration?: number } }).timing?.duration;
+            assert(typeof nativeLength === "number" && nativeLength > 0, `${raw.name}: native timing missing`);
+            assert(Math.abs(duration - nativeLength) <= frame + 1e-6, `${raw.name}: duration differs by more than one frame`);
           }
           if (id === "modern") modernClips++;
         }
