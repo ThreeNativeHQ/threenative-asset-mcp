@@ -1,7 +1,7 @@
 # PRD-596 — UE 5.4+ animation clips from the Sequencer data model
 
-**Status:** IN PROGRESS
-**Priority:** P1 — implementation committed in `b1d6011`; public-import evidence exists, with acceptance proof and parent inspection still pending.
+**Status:** BLOCKED — AC-2 requires an owner-supplied independent reference decode
+**Priority:** P1 — implementation is committed in `70f2233`; direct public-import and visual evidence are local, with formal corpus replay, final repository gates and PR attachment owned by the parent.
 **Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, a new evaluator), new module; risk override: none.
 **Owner:** PRD-596 lane; parent owns final gates and sheet inspection
 **Depends on:** None
@@ -28,8 +28,9 @@ Facts already established:
   `Engine/Plugins/Animation/ControlRig/Source/ControlRig/{Public,Private}/Sequencer/MovieSceneControlRigParameter{Section,Track}.{h,cpp}`,
   `Engine/Source/Runtime/MovieScene/Public/Channels/MovieScene{Float,Double}Channel.h`. Source facts are recorded under Decisions.
 - Real inputs: slices `game-anim-5.8` (required) and `game-anim-5.4` (optional) in `scripts/fab-slice.ts:66,125`.
-  The gate `ue5-clips` (`tests/helpers/animation-corpus.ts:176`, assertion at :231) previously **required** a ControlRig
-  unsupported reason in both; `b1d6011` inverts that assertion.
+  The gate `ue5-clips` (`tests/helpers/animation-corpus.ts:176`) now requires one sidecar and one actual GLB
+  animation per selected clip, finite sampler timing, bound skinned geometry, no unsupported reason, and genuine
+  motion in both UE5.4 and UE5.8 fixtures; it reports the exact converter failure when a sidecar is absent.
 
 ## Solution
 
@@ -49,23 +50,25 @@ Risk: euler order and tangent semantics give a plausible but wrong pose. The dif
 
 ## Acceptance Criteria
 
-- [ ] AC-1 [local]: Importing the `game-anim-5.8` slice through `asset_import_unreal` exports its seed clips as GLB animations with moving bones, and the report lists no ControlRig reason for them. proof: `PRD583_ANIMATION_PROOF=/absolute/path/current-prd583-proof.json npx vitest run tests/fab-feature-corpus.test.ts -t ue5-clips` with the gate's ControlRig assertion inverted — Evidence: partial; [public 5.8 log](/home/joao/.cache/agent-dumps/prd-596-ue5-sequencer/raw/public-import58.log) records importer 118 / converter `b4e95441+threenative.584.5`, 8 models, 7 animation sidecars and 27 failed entries. Counts alone do not prove moving GLB bones; parent must run the current proof-index corpus gate and inspect failures.
+- [ ] AC-1 [local]: Importing the `game-anim-5.8` slice through `asset_import_unreal` exports its seed clips as GLB animations with moving bones, and the report lists no ControlRig reason for them. proof: `PRD583_ANIMATION_PROOF=/absolute/path/current-prd583-proof.json npx vitest run tests/fab-feature-corpus.test.ts -t ue5-clips` — Evidence: direct `.584.6` proof is recorded in [repair596-real-proof.json](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-real-proof.json): 8 model GLBs, 7 clip sidecars, finite timing, bound clip geometry, and 3 moving GLB clip associations (2 unique moving clip identities). The strict corpus replay remains pending because no current `PRD583_ANIMATION_PROOF` index exists in the bounded inputs.
 - [ ] AC-2 [local]: A Sequencer-model clip matches an independent decode of the same clip within 0.5° per bone per frame. proof: differential gate beside `clip-differential` (`tests/helpers/animation-corpus.ts:236`) — Evidence: blocked on independent owner reference; authenticated library survey found no transition pair. See the owner-action section below. Remains unchecked.
-- [x] AC-3 [local]: Each channel interpolation mode (constant, linear, cubic auto, cubic user, cubic break, weighted) evaluates to the engine's formula on synthetic keys, and an unsupported mode reports its reason. proof: `npx vitest run tests/unreal-sequencer-channels.test.ts` — Evidence: [scoped test log](/home/joao/.cache/agent-dumps/prd-596-ue5-sequencer/raw/sequencer-target-tests.log), exit 0 recorded by the worker: this suite plus compiled-converter and animation-import integration suites, 3 files passed, 9 tests passed / 1 skipped. Baseline-red evidence was not inspected in this bookkeeping pass.
-- [ ] AC-4 [local]: The `game-anim-5.4` slice imports its seed clip the same way. proof: same gate as AC-1 over `gasp54` — Evidence: partial; [public 5.4 log](/home/joao/.cache/agent-dumps/prd-596-ue5-sequencer/raw/public-import54.log) records 2 models, 3 animation sidecars and 4 failed entries, same version pins. Parent corpus proof remains pending; sidecar counts alone are insufficient.
-- [ ] AC-5 [local]: Before/after sheet of one 5.8 clip on the mannequin (several frames) is attached to the PR and inspected by eye. proof: PR comment link — Evidence: two generated after-only sheets listed below; no before sheet, PR attachment or eye inspection established in this pass. Parent inspection pending.
+- [x] AC-3 [local]: Each channel interpolation mode (constant, linear, cubic auto, cubic user, cubic break, weighted) evaluates to the engine's formula on synthetic keys, and an unsupported mode reports its reason. proof: `npx vitest run tests/unreal-sequencer-channels.test.ts` — Evidence: red baseline in [repair596-red-sequencer.log](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-red-sequencer.log) and green fixed run in [repair596-green-channels.log](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-green-channels.log); the green run passed 2 tests covering generic formulas, keyed/default integer and fractional branches, and unequal display/tick rates.
+- [ ] AC-4 [local]: The `game-anim-5.4` slice imports its seed clip the same way. proof: same gate as AC-1 over `gasp54` — Evidence: direct `.584.6` proof is recorded in [repair596-real-proof.json](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-real-proof.json): an existing bounded owned-slice expansion produced 8 model GLBs, 325 clip sidecars, 324 bound clips and 321 moving clip associations with finite timing. The strict corpus replay remains pending because no current `PRD583_ANIMATION_PROOF` index exists in the bounded inputs.
+- [ ] AC-5 [local]: Before/after sheet of one 5.8 clip on the mannequin (several frames) is attached to the PR and inspected by eye. proof: PR comment link — Evidence: local before/fixed-after sheet [repair596-before-after-moving-58.png](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-before-after-moving-58.png) and static additive-integrity sheet [repair596-static-additive-integrity-58.png](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-static-additive-integrity-58.png) were rendered with the production renderer and inspected locally. The before side is the pre-fix broken additive output, not a claim that the feature was previously supported; parent must attach and inspect the sheet in the PR.
 - [ ] AC-6 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent is running all four gates on the delivery head; no duplicate run or final-head pass claimed here.
 
 ## Integration Ledger
 
 | Capability | Reachable consumer/trigger | Replaces / disposition | Evidence |
 |---|---|---|---|
-| UE5 Sequencer-model clips | `asset_import_unreal` → `importUnrealDirectory` → CUE4Parse `ExportClip` (`cue4parse-adapter.ts:3037`) → PSA → `attachPsaAnimations` (`src/unreal/psa.ts:294`) | `UnsupportedReason` stays only for a non-FK model | AC-1, AC-4 |
+| UE5 Sequencer-model clips | `asset_import_unreal` → `importUnrealDirectory` → CUE4Parse `ExportClip` (`cue4parse-adapter.ts:3512, 3669`) → PSA → `attachPsaAnimations` (`src/unreal/psa.ts:294`) | `UnsupportedReason` stays only for a non-FK model | AC-1, AC-4 |
 
 ## Decisions
 
 - 2026-10-12 (Claude): AC-2 reference source. First choice: a Fab listing that ships the same clips in a ≤ 5.1 artifact (conventional model, already Verified) and a ≥ 5.2 artifact (Sequencer model); compare the two exports. If no such pair is in the owner's library, use the engine's own evaluation exported once by the owner from the editor (then AC-2 moves under Blocked on with that owner action). Do not compare the evaluator with itself.
 - 2026-10-12 (Claude): bump the converter build tag and `IMPORTER_VERSION`; update the four tests that pin `CUE4PARSE_SOURCE.version` and the ledger rows `AnimSequence` UE5.0–5.5 / UE5.6+ in `docs/unreal-format-support.md`.
+- 2026-10-12 (repair): `AnimSequencerDataModel.cpp:1522–1524` converts display-rate sample frames into MovieScene tick resolution. The adapter keeps generic interpolation in `EvaluateSequencerChannel` and adds source-shaped sampling at `cue4parse-adapter.ts:3219–3267`: integer ticks use keyed values and only use the default with zero keys; fractional ticks let the default win before keyed evaluation. The unequal-rate and keyed/default branches are red-to-green tested.
+- 2026-10-12 (repair): reconstructed Sequencer FK tracks are absolute transforms. Pinned CUE4Parse `AnimConverter.cs:272` would classify an additive sequence and `FPoseBone.cs:27` would add the base translation again, so `cue4parse-adapter.ts:3669–3687` temporarily sets `AdditiveAnimType` to `AAT_None` only around the reconstructed route's `ConvertAnims()`/PSA write and restores it in `finally`; compressed/non-Sequencer routes retain their additive behavior. The previous reference-clip reconstruction was removed because it was unnecessary for absolute data.
 
 ## Recorded source facts
 
@@ -80,22 +83,18 @@ Paths below are relative to that checkout; exact ranges were inspected for this 
 
 ## Local evidence and parent handoff
 
-Public report JSONs (local licensed evidence; not committed):
-[/tmp/prd596-public-import-54/import-report.json](/tmp/prd596-public-import-54/import-report.json) and
-[/tmp/prd596-public-import-58/import-report.json](/tmp/prd596-public-import-58/import-report.json).
-Their `animationClips` entries describe sidecars; the public logs' animation counts must not be presented as a moving-bone proof.
-No current `PRD583_ANIMATION_PROOF` index was located in the bounded task pointers.
-The baseline slice log is empty and supplies no before-import proof.
+Public report JSONs and GLBs are local licensed evidence under
+`/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-public-import-{54-moving-b,58}`; the compact proof summary is
+[repair596-real-proof.json](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-real-proof.json). The 5.4 moving proof used
+the existing bounded slice machinery against the already-owned local artifact; no new download or full-library census was used.
+No current `PRD583_ANIMATION_PROOF` index was located in the bounded task inputs, so the formal corpus replay is not claimed.
 
-Generated sheets for parent visual inspection:
-[/tmp/prd596-animation-sheet.png](/tmp/prd596-animation-sheet.png) (108069 bytes) and
-[/tmp/prd596-animation-sheet-left.png](/tmp/prd596-animation-sheet-left.png) (70780 bytes).
-Worker render commands in `~/.cache/agent-dumps/prd-596-ue5-sequencer/log.md:41–42` use
-`/tmp/prd596-public-import-58/Models/SKM_UEFN_Mannequin.glb`, base and left lean pose clips,
-at 0, 0.1, 0.2 and 1/3 seconds. Each corresponding render log reports four successful tiles and no failures.
-These are after-only renders; neither sheet was inspected by eye during this document pass.
-The parent must establish a before comparison, inspect the pictures, attach the evidence to the PR,
-and finish corpus proof and repository gates before relocating this original PRD to `BLOCKED/requires-owner-action/`.
+Generated local sheets for parent visual inspection:
+[repair596-before-after-moving-58.png](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-before-after-moving-58.png) and
+[repair596-static-additive-integrity-58.png](/home/joao/.cache/agent-dumps/prd-596-599/raw/repair596-static-additive-integrity-58.png).
+They use the production renderer at three frames. The first compares the pre-fix `.584.5` output with the fixed `.584.6`
+output on one moving 5.8 mannequin clip; the second shows the static/additive regression before and after. Both were locally
+inspected; the parent must attach the moving sheet to the PR and complete the final corpus/gate checks.
 
 ## Owner action remaining for AC-2
 
@@ -126,19 +125,19 @@ AC-2 remains unchecked until this independent comparison passes.
 ## Execution Phases
 
 #### Phase 1: Layout and channel evaluator
-**Status:** IMPLEMENTED — scoped green test evidence recorded; independent pose proof remains open.
+**Status:** IMPLEMENTED — scoped red-to-green test evidence recorded; independent pose proof remains open.
 **Files:** new evaluator inside `src/unreal/cue4parse-adapter.ts` (the C# program is embedded there); `tests/unreal-sequencer-channels.test.ts`.
 **Implementation:** Expand the sparse checkout with the paths in Context. Record the layout facts under Decisions. Implement channel evaluation and the Euler-to-quaternion step. Find the AC-2 reference pair (owner's library via `fab_list_owned`).
 **Verification:** AC-3.
 
 #### Phase 2: Converter and importer route
-**Status:** IMPLEMENTED — public import evidence partial; AC-1/AC-4 parent proof pending, AC-2 owner input pending.
+**Status:** IMPLEMENTED — direct 5.8/5.4 public GLB proofs recorded; formal corpus replay and AC-2 owner input remain pending.
 **Files:** `src/unreal/cue4parse-adapter.ts` (`ExportClip`, `UnsupportedReason`), `src/unreal/importer.ts` (version), `tests/helpers/animation-corpus.ts` (invert the ControlRig assertion, add the differential gate).
 **Implementation:** Route a Sequencer-model clip through the evaluator into `RawAnimationData`. Keep the sidecar. Bump versions.
 **Verification:** AC-1, AC-2, AC-4.
 
 #### Phase 3: Evidence and ledger
-**Status:** IN PROGRESS — ledger implementation committed; before/after inspection, PR attachment and final-head gates pending.
+**Status:** IMPLEMENTED — ledger, README, local before/after sheet and additive-integrity sheet updated; PR attachment and final-head gates remain parent-owned.
 **Files:** `docs/unreal-format-support.md`, `README.md` import table.
-**Implementation:** Sheets, ledger rows to Verified with pack, engine version, `IMPORTER_VERSION` and date.
+**Implementation:** Sheets, ledger row, and README are updated with importer/converter provenance and local proof paths; formal corpus replay, PR attachment, and final gates remain parent-owned.
 **Verification:** AC-5, AC-6.
