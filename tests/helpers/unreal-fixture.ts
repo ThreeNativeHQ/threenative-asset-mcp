@@ -303,6 +303,8 @@ const options = ${JSON.stringify(options)};
 if (argv.includes("--version")) { process.stdout.write("fake-converter 1\\n"); process.exit(0); }
 const exportAt = argv.indexOf("--export-dir");
 const filterAt = argv.indexOf("--filter");
+// A real converter always creates its output directory, even for an unfiltered run that writes nothing.
+if (exportAt >= 0) fs.mkdirSync(argv[exportAt + 1], { recursive: true });
 if (exportAt >= 0 && filterAt >= 0) {
   const target = basename(argv[filterAt + 1]);
   if ((options.emptyExports || []).includes(target)) {

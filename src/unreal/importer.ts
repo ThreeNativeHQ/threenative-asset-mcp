@@ -8,6 +8,19 @@ import { promisify } from "node:util";
 import { BufferUtils, Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Root, type Texture } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsSpecular, KHRMaterialsUnlit } from "@gltf-transform/extensions";
 import { attachPsaAnimations, parsePsa, type PsaFile } from "./psa.js";
+import {
+  attachGameplayData,
+  convertPhysics,
+  cueWaveLeaves,
+  parseCueSidecar,
+  parseGameplaySidecar,
+  resolveCueWaves,
+  type AttachedGameplay,
+  type ConvertedCollision,
+  type ConvertedPhysics,
+  type RawGameplaySidecar,
+  type RawPhysics,
+} from "./gameplay-data.js";
 
 import {
   type MaterialTextureBinding,
@@ -185,6 +198,21 @@ export interface ImportedModel {
   readonly materials: readonly ImportedMaterialSection[];
   /** The embedded DNA asset promoted beside the GLB, for a MetaHuman skeletal mesh. */
   readonly dna?: { readonly path: string; readonly bytes: number; readonly sha256: string };
+  /** PRD-582 socket node names attached under the joints (or the mesh node for a static socket). */
+  readonly sockets?: readonly string[];
+  /** Socket bones no joint matched; reported, never dropped silently. */
+  readonly missingBones?: readonly string[];
+  /** Static simple collision attached to the mesh node's extras and written to `Collision/<mesh>.json`. */
+  readonly collision?: ConvertedCollision;
+  /** The linked PhysicsAsset, written to `Physics/<asset>.json` and referenced from the mesh node. */
+  readonly physics?: {
+    readonly asset: string;
+    readonly bodies: number;
+    readonly constraints: number;
+    readonly missingBones: readonly string[];
+    readonly missingBodies?: number;
+    readonly missingConstraints?: number;
+  };
 }
 
 export interface ImportedTexture {
@@ -233,6 +261,33 @@ export interface ImportedAudio {
   readonly durationSeconds: number | undefined;
   readonly channels: number | undefined;
   readonly sampleRate: number | undefined;
+}
+
+/** One SoundCue graph promoted beside the audio it plays (PRD-582). */
+export interface ImportedSoundCue {
+  readonly name: string;
+  readonly package: string;
+  /** Collision-free path to the cue JSON, relative to the output directory. */
+  readonly file: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  /** Exported audio file names the cue's WavePlayer leaves resolved to. */
+  readonly waves: readonly string[];
+  /** WavePlayer leaves whose wave no exported audio file matched. */
+  readonly missingWaves: readonly string[];
+}
+
+/** One PhysicsAsset promoted to a metre-scale sidecar (PRD-582). */
+export interface ImportedPhysicsAsset {
+  readonly name: string;
+  readonly package: string;
+  readonly file: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly bodies: number;
+  readonly constraints: number;
+  /** Bodies whose bone a linked skinned mesh does not name, from `CollisionDisableTable`-free bodies. */
+  readonly missingBones: readonly string[];
 }
 
 export interface ImportedDataAsset {
@@ -393,6 +448,8 @@ export interface ImportReport {
     readonly flipbooks: number;
     readonly scenes: number;
     readonly strands: number;
+    readonly soundCues: number;
+    readonly physicsAssets: number;
     readonly skipped: number;
     readonly failed: number;
   };
@@ -410,6 +467,8 @@ export interface ImportReport {
   readonly flipbooks: readonly ImportedFlipbook[];
   readonly scenes: readonly ImportedScene[];
   readonly strands: readonly ImportedGroom[];
+  readonly soundCues: readonly ImportedSoundCue[];
+  readonly physicsAssets: readonly ImportedPhysicsAsset[];
   readonly skipped: readonly { readonly package: string; readonly reason: string }[];
   readonly failed: readonly { readonly package: string; readonly reason: string }[];
   readonly materialCoverage: {
@@ -521,6 +580,28 @@ const DATA_ASSET_CLASSES = new Set([
   "CurveVector",
   "CurveLinearColor",
 ]);
+
+/**
+ * Classes PRD-582 extracts that UE Viewer cannot decode, so a package that holds one routes to
+ * CUE4Parse for every engine version. `BodySetup`/`SkeletalBodySetup` are deliberately absent here: every
+ * static mesh and PhysicsAsset lists them, and forcing those packages to CUE4Parse would replace the
+ * verified UE Viewer route for ordinary UE4 meshes. Their data is instead taken through
+ * `GAMEPLAY_METADATA_CLASSES`, which adds the package to the converter input without moving its geometry.
+ */
+const GAMEPLAY_CLASSES = new Set([
+  "SkeletalMeshSocket",
+  "StaticMeshSocket",
+  "PhysicsAsset",
+  "SoundCue",
+]);
+
+/**
+ * Classes whose gameplay data lives inside a normal mesh package, not a package of its own. The mesh keeps
+ * its verified UE Viewer / MeshDescription geometry route; only its `BodySetup` collision, sockets or
+ * cross-package PhysicsAsset/Skeleton reference goes to CUE4Parse (PRD-582). `SkeletalBodySetup` and
+ * `SkeletalMesh` are named because a skeletal mesh resolves its PhysicsAsset and Skeleton across packages.
+ */
+const GAMEPLAY_METADATA_CLASSES = new Set(["BodySetup", "SkeletalBodySetup", "SkeletalMesh"]);
 
 const TEXTURE_STACK_CLASSES = new Set(["Texture2DArray", "TextureCubeArray", "VolumeTexture"]);
 
@@ -651,6 +732,15 @@ interface PackageClassification {
   readonly hasBlueprintPrefab: boolean;
   readonly paperClass: "PaperSprite" | "PaperFlipbook" | "PaperTileMap" | "PaperTileSet" | undefined;
   readonly hasGroom: boolean;
+  /** Sockets, static simple collision, a PhysicsAsset or a SoundCue: decoded by CUE4Parse for every engine version. */
+  readonly hasGameplay: boolean;
+  /**
+   * Gameplay metadata only CUE4Parse can read, either from a package of its own (`hasGameplay`) or from a
+   * normal mesh whose `BodySetup`/`SkeletalBodySetup` or cross-package PhysicsAsset/Skeleton reference
+   * carries it. A metadata-only package joins the converter input for its sidecar but keeps its verified
+   * geometry route, so it is never added to `needsModernConverter` for geometry.
+   */
+  readonly hasGameplayMetadata: boolean;
   readonly needsModernConverter: boolean;
   /** A texture package whose mip generation setting is `TMGS_NoMipmaps` (see `PackageCooking.noMipmapsHint`). */
   readonly noMipmaps?: boolean;
@@ -1025,6 +1115,32 @@ async function indexGlbs(root: string): Promise<Map<string, string>> {
     if (name.toLowerCase().endsWith(".glb")) glbs.set(name.slice(0, -4), file.path);
   }
   return glbs;
+}
+
+/**
+ * The adapter's `Gameplay/<selector>.json` sidecars, by lower-cased selector (the package path
+ * without its extension, the same `entry.selector` the importer uses). PRD-582.
+ */
+async function indexGameplaySidecars(root: string): Promise<Map<string, string>> {
+  const sidecars = new Map<string, string>();
+  const gameplayRoot = join(root, "Gameplay");
+  for (const file of await listFiles(gameplayRoot).catch(() => [])) {
+    if (!file.path.toLowerCase().endsWith(".json")) continue;
+    const selector = relative(gameplayRoot, file.path).split(sep).join("/").slice(0, -".json".length);
+    sidecars.set(selector.toLowerCase(), file.path);
+  }
+  return sidecars;
+}
+
+/** The adapter's `Audio/<cue>.cue.json` sidecars, by lower-cased cue name. PRD-582. */
+async function indexCueSidecars(root: string): Promise<Map<string, string>> {
+  const cues = new Map<string, string>();
+  for (const file of await listFiles(join(root, "Audio")).catch(() => [])) {
+    const name = basename(file.path);
+    if (!name.toLowerCase().endsWith(".cue.json")) continue;
+    cues.set(name.slice(0, -".cue.json".length).toLowerCase(), file.path);
+  }
+  return cues;
 }
 
 /** Raw GroomAsset editor payloads by asset name, largest first: only one of a package's compressed
@@ -1498,6 +1614,8 @@ export interface PackagedModel {
   readonly repairedMorphDeltas: number;
   /** Co-located vertices whose morph deltas disagreed in a way no single value could repair. */
   readonly conflictingMorphDeltas: number;
+  /** PRD-582 sockets, collision and physics reference attached to this document, when one was supplied. */
+  readonly gameplay?: AttachedGameplay;
 }
 
 /** Two co-located vertices are the same source vertex when their positions agree to this far. */
@@ -1829,6 +1947,18 @@ export async function packageGlb(options: {
   readonly geometryScale?: number | readonly [number, number, number];
   /** Standalone ActorX animations exported by UE Viewer and matched to this model's joints. */
   readonly psaFiles?: readonly PsaFile[];
+  /**
+   * PRD-582 gameplay data for this package: the adapter's `Gameplay/<selector>.json`, plus the linked
+   * PhysicsAsset when the mesh names one. Attached to the document as socket nodes, collision extras
+   * and a physics-asset reference before the GLB is written.
+   */
+  readonly gameplay?: { readonly data: RawGameplaySidecar; readonly physics?: { readonly asset: string; readonly physics: ConvertedPhysics } } | undefined;
+  /**
+   * The factor gameplay data is converted by. The CUE4Parse adapter writes centimetres, while the
+   * GLB it writes beside them is already metres, so this is 0.01 even when the mesh's own
+   * `geometryScale` is 1.
+   */
+  readonly gameplayScale?: number | readonly [number, number, number];
   /** Unique library material name -> Unreal object basename used for sidecar lookup. */
   readonly materialLookupNames?: ReadonlyMap<string, string>;
   /** Per-material isolated exports, required when two packages share an object basename. */
@@ -1849,6 +1979,13 @@ export async function packageGlb(options: {
   const document = await io.read(options.gltfPath);
   const root = document.getRoot();
   const psa = attachPsaAnimations(document, options.psaFiles ?? []);
+  const gameplay = options.gameplay
+    ? attachGameplayData(document, options.gameplay.data, {
+        meshName: basename(options.glbPath, ".glb"),
+        geometryScale: options.gameplayScale ?? options.geometryScale ?? 1,
+        ...(options.gameplay.physics === undefined ? {} : { physics: options.gameplay.physics }),
+      })
+    : undefined;
   // A provenance record that lives only in a sibling report is one `cp` away from being lost.
   // ThreeNative's own asset health check reads this field, so an imported asset that cannot say
   // where it came from is reported as unknown rather than quietly assumed fine.
@@ -2588,6 +2725,7 @@ export async function packageGlb(options: {
     saturatedUvs,
     repairedMorphDeltas,
     conflictingMorphDeltas,
+    ...(gameplay === undefined ? {} : { gameplay }),
   };
 }
 
@@ -3028,6 +3166,8 @@ export async function importUnrealDirectory(
         hasBlueprintPrefab: false,
         paperClass: undefined,
         hasGroom: false,
+        hasGameplay: false,
+        hasGameplayMetadata: false,
         needsModernConverter: false,
         error: unsupported,
       };
@@ -3081,11 +3221,19 @@ export async function importUnrealDirectory(
       const hasGroom = classes.includes("GroomAsset") || cooking?.groomHint === true;
       const modernHeader = cooking.legacyFileVersion !== undefined && cooking.legacyFileVersion <= -8;
       const hasBlueprintPrefab = classes.includes("BlueprintGeneratedClass") || cooking?.blueprintPrefabHint === true;
-      const needsModernConverter = modernHeader && (
+      // PRD-582 classes are decoded only by CUE4Parse, so a package that holds one forces the modern route whatever
+      // the engine version (a UE4 socket package would otherwise be handled by UE Viewer, which cannot read them).
+      const hasGameplay = classes.some((className) => GAMEPLAY_CLASSES.has(className));
+      // A normal mesh carries gameplay metadata (BodySetup collision, or a cross-package PhysicsAsset or
+      // Skeleton reference) that only CUE4Parse reads. It joins the converter input for that sidecar, but
+      // not `needsModernConverter`, so its geometry keeps the verified UE Viewer / MeshDescription route.
+      const hasGameplayMetadata =
+        hasGameplay || classes.some((className) => GAMEPLAY_METADATA_CLASSES.has(className));
+      const needsModernConverter = hasGameplay || (modernHeader && (
         hasMaterial ||
         hasBlueprintPrefab ||
         (run.code !== 0 && (meshKind !== undefined || hasTexture || hasCubemap || hasSound || dataClass !== undefined || textureStackClass !== undefined || hasGroom))
-      );
+      ));
       // UE Viewer cannot list UE5 packages at all; when the name table shows an editor-only class
       // with nothing to import, report that class instead of a listing failure.
       const nonImportableClass = run.code !== 0 && !needsModernConverter ? cooking?.nonImportableClassHint : undefined;
@@ -3109,6 +3257,8 @@ export async function importUnrealDirectory(
         hasBlueprintPrefab,
         paperClass,
         hasGroom,
+        hasGameplay,
+        hasGameplayMetadata,
         needsModernConverter,
         ...(hasTexture && cooking?.noMipmapsHint === true ? { noMipmaps: true } : {}),
         ...(auxiliaryTextures.length > 0 ? { auxiliaryTextures } : {}),
@@ -3135,6 +3285,8 @@ export async function importUnrealDirectory(
         hasBlueprintPrefab: false,
         paperClass: undefined,
         hasGroom: false,
+        hasGameplay: false,
+        hasGameplayMetadata: false,
         needsModernConverter: false,
         error: error instanceof ToolchainError ? error.message : "UE Viewer failed to list the package.",
       };
@@ -3476,6 +3628,9 @@ export async function importUnrealDirectory(
   const offlineFontPackages = fontPackages.filter((entry) => entry.classes.includes("Font") && entry.classes.includes("Texture2D"));
   const paperPackages = classified.filter((entry) => entry.paperClass !== undefined && !entry.error);
   const groomPackages = classified.filter((entry) => entry.hasGroom && !entry.error);
+  // Sockets, static simple collision, PhysicsAsset and SoundCue packages (PRD-582). They route to CUE4Parse for every
+  // engine version; a mesh package that also holds sockets or collision is already covered by the mesh classification.
+  const gameplayPackages = classified.filter((entry) => entry.hasGameplay && !entry.error);
   const levelCandidates = classified.filter(
     (entry) =>
       entry.file.toLowerCase().endsWith(".umap") &&
@@ -3539,6 +3694,7 @@ export async function importUnrealDirectory(
       (entry.hasFont && !entry.error) ||
       (entry.paperClass !== undefined && !entry.error) ||
       (entry.hasGroom && !entry.error) ||
+      (entry.hasGameplay && !entry.error) ||
       prefabFiles.has(entry.file) ||
       mapFiles.has(entry.file)
     ) continue;
@@ -3575,6 +3731,7 @@ export async function importUnrealDirectory(
     && fontPackages.length === 0
     && paperPackages.length === 0
     && groomPackages.length === 0
+    && gameplayPackages.length === 0
   ) {
     const animationOnly = animationPackages.length > 0
       ? ` Found ${animationPackages.length} animation package${animationPackages.length === 1 ? "" : "s"}, but no compatible SkeletalMesh to receive those tracks.`
@@ -3593,6 +3750,7 @@ export async function importUnrealDirectory(
     package: entry.package,
     ...(await readPackageCooking(entry.file)),
   }));
+  const cookingFiles = new Set(cooking.map(({ entry }) => entry.file));
   const modernPackages = [
     ...cooking.filter(
       ({ entry, state, fileVersionUE4 }) =>
@@ -3606,7 +3764,29 @@ export async function importUnrealDirectory(
       package: entry.package,
       ...(await readPackageCooking(entry.file)),
     }))),
+    // Gameplay-only packages (a skeleton's sockets, a PhysicsAsset, a SoundCue) are not meshes but the same converter
+    // run writes their Gameplay/*.json and Audio/*.cue.json. A mesh package already in the run is not repeated.
+    ...(await mapWithConcurrency(
+      gameplayPackages.filter((entry) => !cookingFiles.has(entry.file)),
+      concurrency,
+      async (entry) => ({
+        entry,
+        package: entry.package,
+        ...(await readPackageCooking(entry.file)),
+      }),
+    )),
   ];
+  // PRD-582: a mesh whose gameplay metadata (BodySetup, a PhysicsAsset/Skeleton reference) only CUE4Parse
+  // reads. It joins the converter input for its sidecar, but is deliberately kept out of `modernPackages`
+  // so its geometry still comes from the verified UE Viewer / MeshDescription route.
+  const modernMetadataPackages = cooking.filter(
+    ({ entry, state, fileVersionUE4 }) =>
+      entry.hasGameplayMetadata &&
+      !entry.needsModernConverter &&
+      !(entry.meshKind === "skeletal" && state === "uncooked" && uncookedMeshRoute("skeletal", fileVersionUE4) === "modern"),
+  );
+  const converterInputCount = modernPackages.length + modernMetadataPackages.length;
+  const converterInputPackages = [...modernPackages, ...modernMetadataPackages];
   const modernTexturePackages = texturePackages.filter((entry) => entry.needsModernConverter);
   const modernMaterialPackages = materialPackages.filter((entry) => entry.needsModernConverter);
   const modernSoundPackages = soundPackages.filter((entry) => entry.needsModernConverter);
@@ -3946,6 +4126,9 @@ export async function importUnrealDirectory(
   let modernConverter: ExternalTool | undefined;
   let modernGlbs = new Map<string, string>();
   let modernGroomPayloads = new Map<string, string[]>();
+  /** The adapter's PRD-582 sidecars, by selector and cue name. */
+  let modernGameplaySidecars = new Map<string, string>();
+  let modernCueSidecars = new Map<string, string>();
   /** Mesh packages whose basename another routed package shares, decoded on their own: entry file -> GLB (undefined: failed). */
   const isolatedMeshGlbs = new Map<string, string | undefined>();
   /** Meshes UE Viewer exported after the modern converter failed on them. */
@@ -4033,7 +4216,7 @@ export async function importUnrealDirectory(
     }
   }
   const uncookedNames = new Set(uncookedMeshDescription.map((entry) => basename(entry.package, extname(entry.package))));
-  const modernAssetCount = modernPackages.length;
+  const modernAssetCount = converterInputCount;
   if (modernAssetCount > 0) {
     modernConverter = request.modernConverter ?? (await ensureModernConverter(environment, log));
     const modernRaw = join(staging, "modern");
@@ -4062,10 +4245,10 @@ export async function importUnrealDirectory(
         reason: await exportMeshWithUmodel(entry, raw),
       }));
       const incomplete = retried.find((result) => result.reason !== undefined);
-      if (retryable.length !== modernPackages.length || incomplete) {
+      if (retryable.length !== converterInputCount || incomplete) {
         throw new ToolchainError(
           "UNREAL_TOOL_FAILED",
-          `The modern UE5 asset converter exited ${converted.code}; no partial output was promoted. ${describeModernFailure(converted.stderr, modernPackages)}`,
+          `The modern UE5 asset converter exited ${converted.code}; no partial output was promoted. ${describeModernFailure(converted.stderr, converterInputPackages)}`,
         );
       }
       for (const result of retried) {
@@ -4078,6 +4261,8 @@ export async function importUnrealDirectory(
     } else {
       modernGlbs = await indexGlbs(modernRaw);
       modernGroomPayloads = await indexGroomPayloads(modernRaw);
+      modernGameplaySidecars = await indexGameplaySidecars(modernRaw);
+      modernCueSidecars = await indexCueSidecars(modernRaw);
       assets = mergeExported(assets, await indexExported(modernRaw));
       // Same-named mesh packages share Meshes/<name>.glb in one run; each is decoded again on its own, filtered by
       // its relative path.
@@ -4092,9 +4277,13 @@ export async function importUnrealDirectory(
         const glb = run.code === 0 ? (await indexGlbs(isolated)).get(basename(entry.package, extname(entry.package))) : undefined;
         isolatedMeshGlbs.set(entry.file, glb);
       });
-      warnings.push(
-        `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
-      );
+      // Only a package decoded for its geometry earns this warning; a metadata-only package writes a
+      // sidecar and no GLB, so UE Viewer is still the route that rendered it.
+      if (modernPackages.length > 0) {
+        warnings.push(
+          `Decoded ${modernPackages.length} requested modern UE5 asset package${modernPackages.length === 1 ? "" : "s"} without Unreal Engine.`,
+        );
+      }
       // The converter exits zero when it wrote other packages, so a mesh it could not read is
       // only visible as a missing GLB. Name its cause, and give UE Viewer the chance to read it.
       const converterCauses = parseModernMeshFailures(converted.stderr);
@@ -4614,6 +4803,42 @@ export async function importUnrealDirectory(
     return found;
   };
 
+  // PRD-582: the adapter's per-package gameplay sidecars. A selector is read and validated once, so
+  // one malformed sidecar is reported once rather than per LOD. The physics assets are indexed by name
+  // across every sidecar, so a skeletal mesh resolves the asset its own package points at.
+  const gameplayCache = new Map<string, RawGameplaySidecar | null>();
+  const readGameplay = async (selector: string): Promise<RawGameplaySidecar | undefined> => {
+    const key = selector.toLowerCase();
+    if (gameplayCache.has(key)) return gameplayCache.get(key) ?? undefined;
+    const path = modernGameplaySidecars.get(key);
+    if (path === undefined) {
+      gameplayCache.set(key, null);
+      return undefined;
+    }
+    try {
+      const parsed = parseGameplaySidecar(await readFile(path, "utf8"));
+      gameplayCache.set(key, parsed);
+      return parsed;
+    } catch (error) {
+      gameplayCache.set(key, null);
+      failed.push({ package: selector, reason: `Unreal gameplay data could not be read: ${error instanceof Error ? error.message : "unknown error"}` });
+      return undefined;
+    }
+  };
+  const physicsByAsset = new Map<string, RawPhysics>();
+  for (const path of modernGameplaySidecars.values()) {
+    try {
+      const parsed = parseGameplaySidecar(await readFile(path, "utf8"));
+      if (parsed.physics) physicsByAsset.set(parsed.physics.asset.toLowerCase(), parsed.physics);
+    } catch {
+      // An unreadable sidecar is reported when a mesh asks for it; it is not a physics asset here.
+    }
+  }
+  const meshSelectors = new Set(assetMeshPackages.map((entry) => entry.selector.toLowerCase()));
+  const collisionSidecars: { readonly selector: string; readonly collision: ConvertedCollision }[] = [];
+  const physicsAssets: ImportedPhysicsAsset[] = [];
+  const soundCues: ImportedSoundCue[] = [];
+
   try {
     for (const entry of assetMeshPackages) {
       const name = basename(entry.package, extname(entry.package));
@@ -4667,6 +4892,25 @@ export async function importUnrealDirectory(
         ? await readConverterMaterialPackages(join(dirname(defaultPath), `${name}.materials.json`))
         : await readMeshMaterialPackages(entry.file);
       const importedMaterialAssets = isolatedMaterialsFor(materialPackages);
+      const geometryScale = geometryScaleFor(fromMeshDescription || fromModernConverter ? "converter" : "umodel", fromMeshDescription ? 0.01 : 1, buildScale);
+      // The adapter writes gameplay data in Unreal centimetres with the source model's raw values, beside a
+      // GLB the geometry scale has already put in metres. Gameplay must carry the same conversion, so it
+      // uses the mesh's own BuildScale3D (in the gameplay module's glTF (x, z, y) basis) times the
+      // centimetre-to-metre unit, never a bare 0.01 that would drop a scaled mesh's collision.
+      const gameplayScale = geometryScaleFor("umodel", 0.01, buildScale);
+      const gameplayRaw = modernGameplaySidecars.has(entry.selector.toLowerCase()) ? await readGameplay(entry.selector) : undefined;
+      let gameplayPhysics: { readonly asset: string; readonly physics: ConvertedPhysics } | undefined;
+      if (gameplayRaw?.physicsAssetRef) {
+        const rawPhysics = physicsByAsset.get(gameplayRaw.physicsAssetRef.toLowerCase());
+        if (rawPhysics) {
+          const converted = convertPhysics(rawPhysics, gameplayScale);
+          if (converted) gameplayPhysics = { asset: gameplayRaw.physicsAssetRef, physics: converted };
+        } else {
+          // The mesh points at a PhysicsAsset no sidecar in this import decoded: name it rather than
+          // leaving the reference silently unresolved.
+          warnings.push(`${name}: the mesh references physics asset ${gameplayRaw.physicsAssetRef}, but no PhysicsAsset sidecar in this import matched it, so its bodies and constraints are missing.`);
+        }
+      }
       for (const { lod, path: gltfPath } of lodPaths) {
         // A name another package shares keeps its package folders, or the two would overwrite one Models/<name>.glb.
         const modelStem = isolatedMeshGlbs.has(entry.file)
@@ -4688,8 +4932,12 @@ export async function importUnrealDirectory(
             imageCache,
             copyright,
             sidecars,
-            geometryScale: geometryScaleFor(fromMeshDescription || fromModernConverter ? "converter" : "umodel", fromMeshDescription ? 0.01 : 1, buildScale),
+            geometryScale,
+            gameplayScale,
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
+            ...(lod === 0 && gameplayRaw
+              ? { gameplay: { data: gameplayRaw, ...(gameplayPhysics === undefined ? {} : { physics: gameplayPhysics }) } }
+              : {}),
             sourceMaterial: sourceForMesh(entry.file),
             graphBaker,
             noMipmapTextures,
@@ -4711,6 +4959,7 @@ export async function importUnrealDirectory(
               transforms[binding.transform] = (transforms[binding.transform] ?? 0) + 1;
             }
           }
+          const attached = packaged.gameplay;
           const model: ImportedModel = {
             name: lod === 0 ? name : `${name}_LOD${lod}`,
             package: entry.package,
@@ -4726,7 +4975,33 @@ export async function importUnrealDirectory(
             animations: packaged.animations,
             boundsMetres: packaged.bounds,
             materials: packaged.sections,
+            ...(attached === undefined
+              ? {}
+              : {
+                  sockets: attached.sockets,
+                  missingBones: attached.missingBones,
+                  ...(attached.collision === undefined ? {} : { collision: attached.collision }),
+                  ...(gameplayPhysics === undefined
+                    ? {}
+                    : {
+                        physics: {
+                          asset: gameplayPhysics.asset,
+                          bodies: gameplayPhysics.physics.bodies.length,
+                          constraints: gameplayPhysics.physics.constraints.length,
+                          missingBones: attached.physicsMissingBones,
+                          ...(gameplayPhysics.physics.missingBodies === undefined ? {} : { missingBodies: gameplayPhysics.physics.missingBodies }),
+                          ...(gameplayPhysics.physics.missingConstraints === undefined ? {} : { missingConstraints: gameplayPhysics.physics.missingConstraints }),
+                        },
+                      }),
+                }),
           };
+          if (lod === 0 && attached?.collision) collisionSidecars.push({ selector: entry.selector, collision: attached.collision });
+          if (attached && attached.missingBones.length > 0) {
+            warnings.push(`${name}: ${attached.missingBones.length} socket bone${attached.missingBones.length === 1 ? "" : "s"} no joint matched (${attached.missingBones.join(", ")}); those sockets were not attached.`);
+          }
+          if (gameplayPhysics && attached && attached.physicsMissingBones.length > 0) {
+            warnings.push(`${name}: the physics asset ${gameplayPhysics.asset} names ${attached.physicsMissingBones.length} bone${attached.physicsMissingBones.length === 1 ? "" : "s"} this mesh does not have (${attached.physicsMissingBones.join(", ")}).`);
+          }
           // The DNA belongs to the mesh, not to one LOD, so it rides with LOD0.
           let dna: ImportedModel["dna"];
           if (lod === 0 && dnaSource) {
@@ -4749,6 +5024,65 @@ export async function importUnrealDirectory(
             reason: error instanceof Error ? error.message : "GLB packaging failed.",
           });
         }
+      }
+    }
+
+    // PRD-582: gameplay packages with no render mesh, chiefly a PhysicsAsset. Its sidecar carries the
+    // bodies and constraints; the linked mesh, packaged above, references the asset by name. A package
+    // whose sidecar is absent is reported, not dropped. This is also what lets a descriptor-only import
+    // succeed: a pack of only a physics asset or a SoundCue still promotes output.
+    for (const entry of gameplayPackages) {
+      if (meshSelectors.has(entry.selector.toLowerCase())) continue;
+      const raw = await readGameplay(entry.selector);
+      if (!raw) {
+        // A SoundCue-only package has no `Gameplay/` sidecar; its graph was already promoted from
+        // `modernCueSidecars`. Report it skipped only when no cue claimed it, so a descriptor-only
+        // import never lists a package it actually converted.
+        const cueName = basename(entry.package, extname(entry.package)).toLowerCase();
+        if (modernCueSidecars.has(cueName)) continue;
+        skipped.push({
+          package: entry.package,
+          reason: "Gameplay package produced no Gameplay sidecar; it holds no socket, collision, physics asset or SoundCue this build decoded.",
+        });
+        continue;
+      }
+      if (!raw.physics) continue;
+      try {
+        // The adapter writes centimetres; the sidecar is metre-scale like the mesh it links to.
+        const converted = convertPhysics(raw.physics, 0.01);
+        if (!converted) continue;
+        const relativePhysics = `Physics/${entry.selector}.json`;
+        const output = assertContained(promotion, relativePhysics);
+        await mkdir(dirname(output), { recursive: true });
+        const body = `${JSON.stringify(converted, null, 2)}\n`;
+        await writeFile(output, body);
+        physicsAssets.push({
+          name: converted.asset,
+          package: entry.package,
+          file: relativePhysics,
+          bytes: Buffer.byteLength(body),
+          sha256: createHash("sha256").update(body).digest("hex"),
+          bodies: converted.bodies.length,
+          constraints: converted.constraints.length,
+          missingBones: [],
+        });
+        if (converted.missingBodies) warnings.push(`${converted.asset}: ${converted.missingBodies} body sub-export${converted.missingBodies === 1 ? "" : "s"} could not be loaded and were omitted.`);
+        if (converted.missingConstraints) warnings.push(`${converted.asset}: ${converted.missingConstraints} constraint sub-export${converted.missingConstraints === 1 ? "" : "s"} could not be loaded and were omitted.`);
+      } catch (error) {
+        failed.push({ package: entry.package, reason: `Physics asset packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
+      }
+    }
+
+    // Static simple collision is a property of the mesh package itself, so it is promoted as a
+    // metre-scale sidecar beside the mesh GLB (the mesh node also carries it in `extras.unrealCollision`).
+    for (const { selector, collision } of collisionSidecars) {
+      try {
+        const relative = `Collision/${selector}.json`;
+        const output = assertContained(promotion, relative);
+        await mkdir(dirname(output), { recursive: true });
+        await writeFile(output, `${JSON.stringify(collision, null, 2)}\n`);
+      } catch (error) {
+        failed.push({ package: selector, reason: `Collision sidecar packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
       }
     }
 
@@ -5155,6 +5489,43 @@ export async function importUnrealDirectory(
       }
     }
     if (audio.length > 0) log(`Promoted ${audio.length} standalone SoundWave audio file${audio.length === 1 ? "" : "s"}.`);
+
+    // PRD-582: every SoundCue the adapter decoded, validated and promoted. Each WavePlayer leaf is
+    // rewritten to the exported audio file it names, or reported when no exported wave matched it.
+    if (modernCueSidecars.size > 0) {
+      const audioExportIndex = new Map<string, string>();
+      for (const file of audio) {
+        audioExportIndex.set(file.name, file.file);
+        audioExportIndex.set(file.name.toLowerCase(), file.file);
+      }
+      for (const path of modernCueSidecars.values()) {
+        try {
+          const cue = parseCueSidecar(await readFile(path, "utf8"));
+          const { cue: resolved, missing } = resolveCueWaves(cue, audioExportIndex);
+          const relative = `Audio/${cue.name}.cue.json`;
+          const output = assertContained(promotion, relative);
+          await mkdir(dirname(output), { recursive: true });
+          const body = `${JSON.stringify(resolved, null, 2)}\n`;
+          await writeFile(output, body);
+          const waves = cueWaveLeaves(resolved).filter((name) => audioExportIndex.has(name) || audioExportIndex.has(name.toLowerCase()));
+          soundCues.push({
+            name: cue.name,
+            package: `Audio/${cue.name}`,
+            file: relative,
+            bytes: Buffer.byteLength(body),
+            sha256: createHash("sha256").update(body).digest("hex"),
+            waves,
+            missingWaves: missing,
+          });
+          for (const wave of missing) {
+            warnings.push(`${cue.name}: WavePlayer names ${wave}, which no exported SoundWave in this import matched; the soft asset path is kept and the wave is reported as missing.`);
+          }
+        } catch (error) {
+          failed.push({ package: `Audio/${basename(path)}`, reason: `SoundCue packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
+        }
+      }
+      if (soundCues.length > 0) log(`Promoted ${soundCues.length} SoundCue graph${soundCues.length === 1 ? "" : "s"}.`);
+    }
 
     for (const entry of dataPackages) {
       const source = dataSources.get(entry.file);
@@ -5646,7 +6017,9 @@ export async function importUnrealDirectory(
       sprites.length === 0 &&
       flipbooks.length === 0 &&
       strands.length === 0 &&
-      dataTextures.length === 0
+      dataTextures.length === 0 &&
+      soundCues.length === 0 &&
+      physicsAssets.length === 0
     ) {
       const reasons = failed.slice(0, 5).map((entry) => `${entry.package}: ${entry.reason}`);
       const more = failed.length > reasons.length ? ` (+${failed.length - reasons.length} more)` : "";
@@ -5761,6 +6134,8 @@ export async function importUnrealDirectory(
         flipbooks: flipbooks.length,
         scenes: scenes.length,
         strands: strands.length,
+        soundCues: soundCues.length,
+        physicsAssets: physicsAssets.length,
         skipped: skipped.length,
         failed: failed.length,
       },
@@ -5778,6 +6153,8 @@ export async function importUnrealDirectory(
       flipbooks,
       scenes,
       strands,
+      soundCues,
+      physicsAssets,
       skipped,
       failed,
       materialCoverage: coverage,
