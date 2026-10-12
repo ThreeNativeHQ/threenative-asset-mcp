@@ -65,6 +65,10 @@ describeWithTools(["modern-converter"], "UE5 Sequencer channel evaluator", () =>
       extractCSharp(CUE4PARSE_PROGRAM, "static CAnimSet ConvertAbsoluteSequencerAnimation("),
       extractCSharp(CUE4PARSE_PROGRAM, "static bool EvaluateSequencerChannel("),
       extractCSharp(CUE4PARSE_PROGRAM, "static bool SampleSequencerChannel("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static bool SampleSequencerTransform("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static bool SequencerFrameRate("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static FStructFallback? StructProperty("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static bool StructNumber("),
       extractRecord(CUE4PARSE_PROGRAM, "sealed record SequencerKey("),
       extractRecord(CUE4PARSE_PROGRAM, "sealed record SequencerChannelData("),
     ].join("\n");
@@ -77,6 +81,8 @@ using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Objects.Core.Math;
+using CUE4Parse.UE4.Objects.Core.Misc;
+using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse_Conversion.Animations;
 using CUE4Parse_Conversion.Writers.ActorX.Structs.Animations;
@@ -156,11 +162,16 @@ float Sample(SequencerChannelData channel, double time)
     if (!EvaluateSequencerChannel(channel, time, out var value, out var reason)) throw new Exception(reason.Length == 0 ? "channel was not evaluable" : reason);
     return value;
 }
-float SampleFrame(SequencerChannelData channel, int frame, int numberOfKeys, int displayNumerator, int displayDenominator)
+FTransform SampleTransform(SequencerChannelData[] translation, SequencerChannelData[] rotation, SequencerChannelData[] scale, int frame, int numberOfKeys, int displayNumerator = 30, int displayDenominator = 1, int sceneNumerator = 30, int sceneDenominator = 1)
 {
-    if (!SampleSequencerChannel(channel, frame, numberOfKeys, displayNumerator, displayDenominator, out var value, out var reason)) throw new Exception(reason.Length == 0 ? "channel was not evaluable" : reason);
+    if (!SampleSequencerTransform(translation, rotation, scale, frame, numberOfKeys, displayNumerator, displayDenominator, sceneNumerator, sceneDenominator, out var value, out var reason)) throw new Exception(reason);
     return value;
 }
+var empty = Channel(Array.Empty<int>(), Array.Empty<SequencerKey>());
+SequencerChannelData[] Vector(SequencerChannelData x) => new[] { x, empty, empty };
+var emptyVector = Vector(empty);
+float SampleFrame(SequencerChannelData channel, int frame, int numberOfKeys, int displayNumerator, int displayDenominator, int sceneNumerator = 30, int sceneDenominator = 1) =>
+    SampleTransform(Vector(channel), emptyVector, emptyVector, frame, numberOfKeys, displayNumerator, displayDenominator, sceneNumerator, sceneDenominator).Translation.X;
 
 var constant = Channel(new[] { 0, 10 }, new[] { Key(3, ERichCurveInterpMode.RCIM_Constant), Key(7, ERichCurveInterpMode.RCIM_Linear) });
 var linear = Channel(new[] { 0, 10 }, new[] { Key(0, ERichCurveInterpMode.RCIM_Linear), Key(10, ERichCurveInterpMode.RCIM_Linear) });
@@ -172,7 +183,50 @@ var extrapolated = Channel(new[] { 0, 10 }, new[] { Key(0, ERichCurveInterpMode.
 var defaults = Channel(Array.Empty<int>(), Array.Empty<SequencerKey>(), hasDefault: true, defaultValue: 4);
 var defaultAndKeys = Channel(new[] { 0, 1, 2 }, new[] { Key(10, ERichCurveInterpMode.RCIM_Linear), Key(20, ERichCurveInterpMode.RCIM_Linear), Key(30, ERichCurveInterpMode.RCIM_Linear) }, hasDefault: true, defaultValue: 99);
 var unequalRates = Channel(new[] { 0, 4 }, new[] { Key(0, ERichCurveInterpMode.RCIM_Linear), Key(10, ERichCurveInterpMode.RCIM_Linear) }, tickNumerator: 48);
-var samples = new[] { Sample(constant, 5), Sample(constant, 10), Sample(linear, 2.5), Sample(cubicAuto, 5), Sample(cubicUser, 5), Sample(cubicBreak, 5), Sample(weighted, 5), Sample(extrapolated, -5), Sample(extrapolated, 15), Sample(defaults, 4), SampleFrame(defaultAndKeys, 1, 3, 30, 1), SampleFrame(defaultAndKeys, 1, 3, 24, 1), SampleFrame(unequalRates, 1, 3, 24, 1) };
+if (args.Contains("--scene-rate"))
+{
+    var stale = Channel(Enumerable.Range(0, 85).ToArray(), Enumerable.Range(0, 85).Select(i => Key(i, ERichCurveInterpMode.RCIM_Linear)).ToArray(), tickNumerator: 24000);
+    Console.WriteLine(SampleFrame(stale, 1, 85, 30, 1, 30, 1));
+    return;
+}
+if (args.Contains("--transform"))
+{
+    void Check(float actual, float expected, string label) {
+        if (!float.IsFinite(actual) || MathF.Abs(actual - expected) > 0.00001f) throw new Exception($"{label}: expected {expected}, got {actual}");
+    }
+    var turn = Channel(new[] { 0, 1 }, new[] { Key(0, ERichCurveInterpMode.RCIM_Linear), Key(90, ERichCurveInterpMode.RCIM_Linear) }, tickNumerator: 24000);
+    var transform = SampleTransform(emptyVector, new[] { turn, turn, empty }, emptyVector, 1, 3, 60, 1);
+    // CUE Normalize uses approximate InvSqrt; compare orientation independently of its length.
+    var q = transform.Rotation;
+    q = q * (1f / MathF.Sqrt(q | q));
+    Check(q.X, -1f / MathF.Sqrt(12), "fractional roll/pitch quaternion X");
+    Check(q.Y, -1f / MathF.Sqrt(12), "fractional roll/pitch quaternion Y");
+    Check(q.Z, -1f / MathF.Sqrt(12), "fractional roll/pitch quaternion Z");
+    Check(q.W, MathF.Sqrt(3) / 2, "fractional roll/pitch quaternion W");
+    var eulerLerp = new FRotator(45, 0, 45).Quaternion();
+    if (MathF.Abs(transform.Rotation.Z - eulerLerp.Z) < 0.1f) throw new Exception("Euler interpolation was not distinguished");
+    var crossing = Channel(new[] { 0, 1 }, new[] { Key(170, ERichCurveInterpMode.RCIM_Linear), Key(-170, ERichCurveInterpMode.RCIM_Linear) });
+    var shortest = SampleTransform(emptyVector, new[] { empty, empty, crossing }, emptyVector, 1, 3, 60, 1);
+    var shortestQ = shortest.Rotation;
+    shortestQ = shortestQ * (1f / MathF.Sqrt(shortestQ | shortestQ));
+    Check(MathF.Abs(shortestQ.Z), 1, "shortest hemisphere");
+    Check(shortestQ.W, 0, "shortest hemisphere W");
+    var stepped = Channel(new[] { 0, 1 }, new[] { Key(0, ERichCurveInterpMode.RCIM_Constant), Key(10, ERichCurveInterpMode.RCIM_Linear) });
+    var whole = SampleTransform(Vector(stepped), emptyVector, Vector(stepped), 1, 3, 60, 1);
+    Check(whole.Translation.X, 5, "floor/ceil translation blend");
+    Check(whole.Scale3D.X, 5, "floor/ceil scale blend");
+    Check(whole.Scale3D.Y, 1, "empty scale stays identity");
+    Check(SampleFrame(defaultAndKeys, 1, 3, 30, 1), 20, "integer keyed default");
+    Check(SampleFrame(defaultAndKeys, 1, 5, 30, 1), 20, "integer nonuniform keyed default");
+    Check(SampleFrame(defaultAndKeys, 1, 3, 60, 1), 99, "fractional keyed default");
+    Check(SampleFrame(unequalRates, 1, 3, 24, 1, 48), 5, "unequal scene/display rates");
+    Check(SampleFrame(unequalRates, 1, 3, 24, 1, 96, 2), 5, "rational scene rate");
+    if (SampleSequencerTransform(emptyVector, emptyVector, emptyVector, 1, 3, 30, 1, 0, 1, out _, out var invalidRate) || !invalidRate.Contains("scene tick 0/1")) throw new Exception("Invalid scene rate was accepted");
+    if (SequencerFrameRate(new UObject(), "TickResolution", out _, out _, out var missingRate) || missingRate != "the clip's MovieScene carries no TickResolution") throw new Exception("Missing scene rate must be reported exactly");
+    Console.WriteLine("whole-transform sampling passed");
+    return;
+}
+var samples = new[] { Sample(constant, 5), Sample(constant, 10), Sample(linear, 2.5), Sample(cubicAuto, 5), Sample(cubicUser, 5), Sample(cubicBreak, 5), Sample(weighted, 5), Sample(extrapolated, -5), Sample(extrapolated, 15), Sample(defaults, 4), SampleFrame(defaultAndKeys, 1, 3, 30, 1), SampleFrame(defaultAndKeys, 1, 3, 24, 1), SampleFrame(unequalRates, 1, 3, 24, 1, 48) };
 Console.WriteLine(string.Join(",", samples.Select(value => value.ToString("R", CultureInfo.InvariantCulture))));
 var invalid = Channel(new[] { 0, 10 }, new[] { Key(0, (ERichCurveInterpMode)99), Key(1, ERichCurveInterpMode.RCIM_Linear) });
 EvaluateSequencerChannel(invalid, 5, out _, out var invalidReason);
@@ -246,6 +300,14 @@ sealed class SkeletonExport(IPackage package) : ResolvedObject(package, 0) {
     expect(values[11]).toBe(99);
     expect(values[12]).toBeCloseTo(5, 5);
     expect(invalidReason).toMatch(/unsupported interpolation mode 99/);
+  });
+
+  it("samples uniform FK keys with the scene rate despite a stale channel rate", () => {
+    expect(Number(execFileSync(sdk, [runner, "--scene-rate"], { encoding: "utf8" }).trim())).toBe(1);
+  });
+
+  it("blends fractional whole transforms and preserves integer/default sampling", () => {
+    expect(execFileSync(sdk, [runner, "--transform"], { encoding: "utf8" }).trim()).toBe("whole-transform sampling passed");
   });
 
   it("guards the absolute Sequencer export from legacy additive accumulation", () => {

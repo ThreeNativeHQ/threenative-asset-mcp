@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.6.1",
+  version: "b4e95441+threenative.584.6.2",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3212,49 +3212,92 @@ static bool EvaluateSequencerChannel(SequencerChannelData channel, double inputT
     return true;
 }
 
-// AnimSequencerDataModel samples a display frame in each channel's MovieScene tick resolution. At an
-// integer tick ExtractTransform uses uniform key values (and only uses a default when there are no keys);
-// at a fractional tick EvaluateToTransform uses the default before evaluating keys. Keep that branch
-// separate from the generic channel evaluator so keyed channels are not discarded wholesale.
-static bool SampleSequencerChannel(SequencerChannelData channel, int displayFrame, int numberOfKeys, int displayRateNumerator, int displayRateDenominator, out float result, out string reason)
+// AnimSequencerDataModel.cpp:1645-1703: integer extraction indexes uniform keys;
+// fractional endpoint evaluation gives defaults precedence and evaluates nonuniform keys.
+static bool SampleSequencerChannel(SequencerChannelData channel, int tickFrame, int numberOfKeys, bool evaluateEndpoint, out float result, out string reason)
 {
     result = 0f;
     reason = "";
     var values = channel.Values ?? [];
     if (values.Length == 0 && !channel.HasDefaultValue) return false;
-    if (displayRateNumerator <= 0 || displayRateDenominator <= 0 || channel.TickRateNumerator <= 0 || channel.TickRateDenominator <= 0)
-    {
-        reason = $"channel sample rate is invalid (display {displayRateNumerator}/{displayRateDenominator}, tick {channel.TickRateNumerator}/{channel.TickRateDenominator})";
-        return false;
-    }
-    var tickTime = displayFrame * (double) channel.TickRateNumerator * displayRateDenominator /
-        (displayRateNumerator * (double) channel.TickRateDenominator);
-    var nearestTick = Math.Round(tickTime);
-    var integerTick = Math.Abs(tickTime - nearestTick) <= 1e-6;
-    if (integerTick)
-    {
-        if (values.Length == 0)
-        {
-            result = channel.DefaultValue;
-            return true;
-        }
-        if (values.Length == numberOfKeys)
-        {
-            if (nearestTick < 0 || nearestTick >= values.Length)
-            {
-                reason = $"uniform channel key index {nearestTick} is outside {values.Length} values";
-                return false;
-            }
-            result = values[(int) nearestTick].Value;
-            return true;
-        }
-    }
-    else if (channel.HasDefaultValue)
+    if (channel.HasDefaultValue && (values.Length == 0 || evaluateEndpoint))
     {
         result = channel.DefaultValue;
         return true;
     }
-    return EvaluateSequencerChannel(channel, tickTime, out result, out reason);
+    if (!evaluateEndpoint && values.Length == numberOfKeys)
+    {
+        if (tickFrame < 0 || tickFrame >= values.Length)
+        {
+            reason = $"uniform channel key index {tickFrame} is outside {values.Length} values";
+            return false;
+        }
+        result = values[tickFrame].Value;
+        return true;
+    }
+    return EvaluateSequencerChannel(channel, tickFrame, out result, out reason);
+}
+
+// Bone time uses MovieScene TickResolution, not the channel rate (engine :1524).
+// Fractional ticks blend whole transforms, not Euler components (engine :1708-1721).
+static bool SampleSequencerTransform(SequencerChannelData[] translation, SequencerChannelData[] rotation, SequencerChannelData[] scale, int displayFrame, int numberOfKeys, int displayRateNumerator, int displayRateDenominator, int sceneRateNumerator, int sceneRateDenominator, out FTransform result, out string reason)
+{
+    result = FTransform.Identity;
+    reason = "";
+    if (displayRateNumerator <= 0 || displayRateDenominator <= 0 || sceneRateNumerator <= 0 || sceneRateDenominator <= 0)
+    {
+        reason = $"transform sample rate is invalid (display {displayRateNumerator}/{displayRateDenominator}, scene tick {sceneRateNumerator}/{sceneRateDenominator})";
+        return false;
+    }
+    var tickTime = displayFrame * (double) sceneRateNumerator * displayRateDenominator /
+        (displayRateNumerator * (double) sceneRateDenominator);
+    var floor = Math.Floor(tickTime);
+    if (floor < int.MinValue || floor >= int.MaxValue)
+    {
+        reason = $"transform sample tick {tickTime} is outside the supported frame range";
+        return false;
+    }
+    var alpha = (float) (tickTime - floor);
+    var fractional = alpha > 1e-8f; // FMath::IsNearlyZero's float tolerance.
+    string sampleReason = "";
+    bool SampleAt(int tickFrame, out FTransform transform)
+    {
+        transform = FTransform.Identity;
+        var location = new[] { 0f, 0f, 0f };
+        var euler = new[] { 0f, 0f, 0f };
+        var scaleValue = new[] { 1f, 1f, 1f };
+        var channels = new[] { translation, rotation, scale };
+        var targets = new[] { location, euler, scaleValue };
+        var names = new[] { "translation", "rotation", "scale" };
+        for (var group = 0; group < 3; group++)
+        {
+            for (var component = 0; component < 3; component++)
+            {
+                if (SampleSequencerChannel(channels[group][component], tickFrame, numberOfKeys, fractional, out var value, out var channelReason))
+                    targets[group][component] = value;
+                else if (channelReason.Length > 0)
+                {
+                    sampleReason = $"{names[group]} channel {component} {channelReason}";
+                    return false;
+                }
+            }
+        }
+        var quaternion = new FRotator(euler[1], euler[2], euler[0]).Quaternion();
+        quaternion.Normalize();
+        transform = new FTransform(quaternion, new FVector(location[0], location[1], location[2]), new FVector(scaleValue[0], scaleValue[1], scaleValue[2]));
+        return true;
+    }
+    if (!SampleAt((int) floor, out var from)) { reason = sampleReason; return false; }
+    result = from;
+    if (!fractional) return true;
+    if (!SampleAt((int) floor + 1, out var to)) { reason = sampleReason; return false; }
+    if (alpha <= 0.00001f) return true;
+    if (alpha >= 1f - 0.00001f) { result = to; return true; }
+    // FTransform::Blend and CUE FQuat::FastLerp both choose the shortest hemisphere.
+    var blendedRotation = FQuat.FastLerp(from.Rotation, to.Rotation, alpha);
+    blendedRotation.Normalize();
+    result = new FTransform(blendedRotation, from.Translation * (1f - alpha) + to.Translation * alpha, from.Scale3D * (1f - alpha) + to.Scale3D * alpha);
+    return true;
 }
 
 static bool TrySequencerChannel(FMovieSceneChannel<float> channel, out SequencerChannelData data, out string reason)
@@ -3287,34 +3330,39 @@ static bool TrySequencerChannel(FMovieSceneChannel<float> channel, out Sequencer
     return true;
 }
 
-static bool SequencerFrameRate(AbstractPropertyHolder movieScene, out int numerator, out int denominator, out string reason)
+static bool SequencerFrameRate(AbstractPropertyHolder movieScene, string property, out int numerator, out int denominator, out string reason)
 {
     reason = "";
     numerator = 0;
-    denominator = 1;
-    if (movieScene.TryGetValue<FFrameRate>(out var typed, "DisplayRate"))
+    denominator = 0;
+    if (movieScene.TryGetValue<FFrameRate>(out var typed, property))
     {
         numerator = typed.Numerator;
-        denominator = typed.Denominator == 0 ? 1 : typed.Denominator;
+        denominator = typed.Denominator;
     }
-    else if (StructProperty(movieScene, "DisplayRate") is { } fallback)
+    else if (StructProperty(movieScene, property) is { } fallback)
     {
         if (!StructNumber(fallback, "Numerator", out var rawNumerator))
         {
-            reason = "the clip's MovieScene DisplayRate carries no Numerator";
+            reason = $"the clip's MovieScene {property} carries no Numerator";
             return false;
         }
         numerator = (int) rawNumerator;
-        if (StructNumber(fallback, "Denominator", out var rawDenominator)) denominator = (int) rawDenominator;
+        if (!StructNumber(fallback, "Denominator", out var rawDenominator))
+        {
+            reason = $"the clip's MovieScene {property} carries no Denominator";
+            return false;
+        }
+        denominator = (int) rawDenominator;
     }
     else
     {
-        reason = "the clip's MovieScene carries no DisplayRate";
+        reason = $"the clip's MovieScene carries no {property}";
         return false;
     }
     if (numerator <= 0 || denominator <= 0)
     {
-        reason = $"the clip's MovieScene DisplayRate is invalid ({numerator}/{denominator})";
+        reason = $"the clip's MovieScene {property} is invalid ({numerator}/{denominator})";
         return false;
     }
     return true;
@@ -3338,7 +3386,8 @@ static bool PopulateFromSequencerDataModel(UAnimSequence sequence, UObject model
         reason = "the clip's AnimationSequencerDataModel carries no MovieScene";
         return false;
     }
-    if (!SequencerFrameRate(movieScene, out var numerator, out var denominator, out reason)) return false;
+    if (!SequencerFrameRate(movieScene, "DisplayRate", out var numerator, out var denominator, out reason)) return false;
+    if (!SequencerFrameRate(movieScene, "TickResolution", out var sceneNumerator, out var sceneDenominator, out reason)) return false;
     if (!movieScene.TryGetValue<FMovieSceneFrameRange>(out var playbackRange, "PlaybackRange") || playbackRange.Value.UpperBound.Type == ERangeBoundTypes.Open)
     {
         reason = "the clip's MovieScene PlaybackRange has no finite upper bound";
@@ -3448,32 +3497,14 @@ static bool PopulateFromSequencerDataModel(UAnimSequence sequence, UObject model
         var scales = new FVector[numberOfKeys];
         for (var frame = 0; frame < numberOfKeys; frame++)
         {
-            var location = new[] { 0f, 0f, 0f };
-            var euler = new[] { 0f, 0f, 0f };
-            var scaleValue = new[] { 1f, 1f, 1f };
-            for (var component = 0; component < 3; component++)
+            if (!SampleSequencerTransform(translationData, rotationData, scaleData, frame, numberOfKeys, numerator, denominator, sceneNumerator, sceneDenominator, out var transform, out channelReason))
             {
-                if (!SampleSequencerChannel(translationData[component], frame, numberOfKeys, numerator, denominator, out var translationValue, out channelReason))
-                {
-                    if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} translation channel {component} {channelReason}"; return false; }
-                }
-                else location[component] = translationValue;
-                if (!SampleSequencerChannel(rotationData[component], frame, numberOfKeys, numerator, denominator, out var rotationValue, out channelReason))
-                {
-                    if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} rotation channel {component} {channelReason}"; return false; }
-                }
-                else euler[component] = rotationValue;
-                if (!SampleSequencerChannel(scaleData[component], frame, numberOfKeys, numerator, denominator, out var scaleComponent, out channelReason))
-                {
-                    if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} scale channel {component} {channelReason}"; return false; }
-                }
-                else scaleValue[component] = scaleComponent;
+                reason = $"the FKControlRig parameter {parameterText} {channelReason}";
+                return false;
             }
-            var quaternion = new FRotator(euler[1], euler[2], euler[0]).Quaternion();
-            quaternion.Normalize();
-            positions[frame] = new FVector(location[0], location[1], location[2]);
-            rotations[frame] = quaternion;
-            scales[frame] = new FVector(scaleValue[0], scaleValue[1], scaleValue[2]);
+            positions[frame] = transform.Translation;
+            rotations[frame] = transform.Rotation;
+            scales[frame] = transform.Scale3D;
         }
         seen[boneIndex] = true;
         data.Add(new FRawAnimSequenceTrack(positions, rotations, scales));
