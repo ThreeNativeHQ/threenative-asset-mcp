@@ -1,62 +1,80 @@
 # PRD-598 — UE5 World Partition external actors in levels
 
-**Status:** NOT STARTED
-**Priority:** P2 — AC-1..AC-3 open: a World Partition level imports with none of its actors, and PRD-599 (landscape) cannot start without them.
-**Complexity:** 2 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`); risk override: none.
-**Owner:** unassigned
+**Status:** IN PROGRESS
+**Priority:** P2 — AC-1 and AC-2 have local real-pack evidence; AC-3 and AC-4 remain open on the parent’s final head.
+**Complexity:** 2 (LOW) — importer, adapter, format ledger, and focused real gates; risk override: licensed evidence remains local-only.
+**Owner:** lane-598; parent owns final sheet and delivery
 **Depends on:** None
 
 ## Context
 
 A World Partition level keeps each actor in its own package under `__ExternalActors__/<map path>/…`
-(`__ExternalObjects__` for other objects). Today the importer skips every such package up front
-(`src/unreal/importer.ts:3440-3445`) with `WORLD_PARTITION_EXTERNAL_REASON` (`importer.ts:604`, reported at
-:3869). The UE5 level export walks only `world.PersistentLevel.Actors` (`src/unreal/cue4parse-adapter.ts:3313,3324`),
-so a WP level comes out with no actors. The ledger row "World Partition external actors — Implemented, merged into
-the level" (`docs/unreal-format-support.md`) is wrong; `tests/unreal-external-actors.test.ts:20-50` tests the skip.
+(`__ExternalObjects__` for other objects). The importer now associates those packages with the imported map
+(`src/unreal/importer.ts:614-634,3892-3894`) and the UE5 level export loads matching runtime `AActor` exports
+(`src/unreal/cue4parse-adapter.ts:858-895,3362`). Packages owned by maps outside the import remain skipped with
+`WORLD_PARTITION_EXTERNAL_REASON`; matching package-load failures are named in the scene omission list.
 
-The per-actor export (meshes, lights, cameras, Paper2D, Blueprint components; :3328-3344, output :3373-3509) already
-exists. Only the actor list is missing.
+The per-actor export (meshes, lights, cameras, Paper2D, Blueprint components; `src/unreal/cue4parse-adapter.ts:3364-3555`)
+already exists. The missing actor discovery, exact map association, and failure accounting are now covered by the
+compiled converter gate.
 
 ## Solution
 
-1. When the converter exports a UE5 level, also load the external actor packages under
-   `__ExternalActors__/<that map's path>/` and pass their actors through the same per-actor export.
+1. When the converter exports a UE5 level, load external actor packages under the exact
+   `__ExternalActors__/<that map's path>/` and pass their `AActor` exports through the same per-actor export.
 2. The importer stops skipping external actor packages that belong to a level being imported. It still skips
    (with the same reason) packages whose map is not in the import.
-3. Correct the ledger row in this PRD's first commit (Reported: skipped), then move it when AC-1 passes.
+3. Correct the ledger row after the real gate passes; it is now **Verified** in `docs/unreal-format-support.md`.
+4. Keep load failures in the native scene JSON as named omissions instead of silently reducing actor coverage.
 
 ## Acceptance Criteria
 
-- [ ] AC-1 [local]: A real UE5 World Partition level imports with its external actors placed: the scene GLB holds one node per external actor that carries a supported component, at the transform the package stores. proof: real-pack gate in `tests/fab-feature-corpus.test.ts` on the pack chosen in Phase 1 — Evidence: pending.
-- [ ] AC-2 [local]: External actor packages of a map that is not imported stay skipped with `WORLD_PARTITION_EXTERNAL_REASON`. proof: `npx vitest run tests/unreal-external-actors.test.ts` (extended) — Evidence: pending.
+- [x] AC-1 [local]: A real UE5 World Partition level imports with its external actors placed: the scene GLB holds one node per external actor that carries a supported component, at the transform the package stores. proof: opt-in real-pack gate in `tests/fab-feature-corpus.test.ts` — Evidence: private proof index `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index.json`; native scene JSON has 3 probe-confirmed actors, public output has 3/3 resolved actors, one mesh node per actor with decoded POSITION data, and GLB world matrices matching the native transforms.
+- [x] AC-2 [local]: External actor packages of a map that is not imported stay skipped with `WORLD_PARTITION_EXTERNAL_REASON`. proof: `npx vitest run tests/unreal-external-actors.test.ts --maxWorkers=1` (extended) — Evidence: 3 passed; the real compiled association fixture also rejects same-basename/different-prefix and `__ExternalObjects__` packages.
 - [ ] AC-3 [local]: Before/after level sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: pending.
 - [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: pending.
 
 ## Blocked on
 
-- A real UE5 World Partition pack in the owner's library. Phase 1 searches the owned listings (`fab_list_owned`, artifact file lists) for `__ExternalActors__`; if none exists, AC-1 is unreachable — unblocked by João naming or acquiring one.
+- AC-3 parent-owned before/after sheet inspection and AC-4 rerun on the integrated final head. The Phase 1 real input is unblocked and remains local-only.
 
 ## Integration Ledger
 
 | Capability | Reachable consumer/trigger | Replaces / disposition | Evidence |
 |---|---|---|---|
-| WP external actors | `asset_import_unreal` → UE5 level route (`importer.ts:4705-4745`) → CUE4Parse level export (`cue4parse-adapter.ts:3311`) | Up-front skip stays only for maps not imported | AC-1, AC-2 |
+| WP external actors | `asset_import_unreal` → UE5 level route (`src/unreal/importer.ts:4729-4762`) → CUE4Parse level export (`src/unreal/cue4parse-adapter.ts:3349-3362`) | Up-front skip stays only for maps not imported | AC-1/AC-2 real gate evidence recorded below |
 
 ## Execution Phases
 
 #### Phase 1: Find the pack and fix the ledger
-**Status:** NOT STARTED
+**Status:** DONE
 **Files:** `docs/unreal-format-support.md`; a slice entry in `scripts/fab-slice.ts`.
 **Implementation:** Search the owned listings for a UE5 WP level (prefer a small one). Add a slice. Correct the ledger row.
-**Verification:** slice builds with `scripts/fab-slice.ts`.
+**Verification:** `npx --no-install tsx scripts/fab-slice.ts list` passed; the selected local artifact is `MedievalGame_5.3` and its exact local real fixture is recorded outside the repository.
 
 #### Phase 2: Load external actors with their level
-**Status:** NOT STARTED
-**Files:** `src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `tests/unreal-external-actors.test.ts`.
+**Status:** DONE
+**Files:** `src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `tests/unreal-external-actors.test.ts`, `tests/fab-feature-corpus.test.ts`.
 **Implementation:** As in Solution 1–2. Bump converter tag and `IMPORTER_VERSION`.
-**Verification:** AC-1, AC-2.
+**Verification:** converter `b4e95441+threenative.584.8`, importer `121`; focused real gate and external-actor tests pass.
 
 #### Phase 3: Evidence and gates
-**Status:** NOT STARTED
+**Status:** IN PROGRESS
 **Verification:** AC-3, AC-4; ledger row to Verified.
+
+## Source-backed implementation facts
+
+- `src/unreal/cue4parse-adapter.ts:2-6` pins the rebuilt converter; `src/unreal/importer.ts:82` records importer version 121.
+- `src/unreal/importer.ts:614-634` derives the owning `.umap` from the external-actor path; `:3462-3467` removes external packages from standalone classification; `:3892-3894` retains only unimported-map skips with `WORLD_PARTITION_EXTERNAL_REASON`.
+- `src/unreal/cue4parse-adapter.ts:858-876` normalizes provider keys and compares the full map path; `:878-895` enumerates `AActor` runtime exports and records named package-load omissions; `:3349-3362` feeds them into level reconstruction.
+- `tests/fab-feature-corpus.test.ts:797-840` runs both the direct native converter and public importer; `:842-895` compares all 3 probe records, native JSON transforms, decoded GLB nodes/geometry, and global matrices, with a compiled association fixture.
+- `tests/unreal-external-actors.test.ts:27-38,40-70` covers same-basename/different-prefix ownership and the public unimported-map skip reason.
+
+## Local real evidence
+
+- Source stage: `/home/joao/.cache/threenative-asset-mcp/prd598-real-stage-Zt2Wd8` — 28 hashed files: the selected `.umap`, 3 probe-confirmed external actor packages, and the 24-file dependency closure.
+- Native output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/native-output/Scenes/MedievalVillage_P_WP.scene-source.json`.
+- Public output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/public-output` (`import-report.json`, scene GLB, scene manifest); report source hash `sha256:9a0bee37c32cff152f8c9634577fd538e47dd51f8e22c561ac10cf91cf31b331`.
+- Association output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/association-output/Scenes/MedievalVillage_P_WP.scene-source.json`; 3 valid actors remain while same-basename/different-prefix and external-object distractors are excluded, and the deliberately corrupt matching package is an `ExternalActorPackage` omission with a named load reason.
+- Fresh focused evidence: `PRD598_REAL_WP_PROOF_INDEX=/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index.json npx vitest run tests/fab-feature-corpus.test.ts --maxWorkers=1` → 35 passed, 9 expected skips; `npx vitest run tests/unreal-external-actors.test.ts --maxWorkers=1` → 3 passed.
+- Parent reports prior repository gates and PR #50 CI green; AC-4 stays open here until those gates run on the integrated final head, and AC-3 stays parent-owned.

@@ -875,21 +875,23 @@ static bool IsExternalActorForLevel(string actorKey, string levelKey)
     if (levelPath.StartsWith("Content/", StringComparison.OrdinalIgnoreCase)) levelPath = levelPath[8..];
     return string.Equals(mapPath, levelPath, StringComparison.OrdinalIgnoreCase);
 }
-IEnumerable<UObject> ActorsForLevel(string levelKey, ULevel level)
+IEnumerable<UObject> ActorsForLevel(string levelKey, ULevel level, List<object> omittedActors)
 {
     foreach (var actorIndex in level.Actors ?? [])
         if (actorIndex?.Load<UObject>() is { } actor) yield return actor;
-    foreach (var actorKey in provider.Files.Keys.Where(key => IsExternalActorForLevel(key, levelKey)))
+    IEnumerable<AActor> LoadExternalActorPackage(string actorKey)
     {
-        IPackage package;
-        try { package = provider.LoadPackage(actorKey); }
+        try { return provider.LoadPackage(actorKey).GetExports().OfType<AActor>().ToArray(); }
         catch (Exception error)
         {
+            var reason = $"external actor package could not be loaded: {error.Message}";
+            omittedActors.Add(new { actor = SourceRelativePackagePath(actorKey), component = "package", sourceClass = "ExternalActorPackage", reason });
             Console.Error.WriteLine($"external actor package skipped {actorKey}: {error.Message}");
-            continue;
+            return [];
         }
-        foreach (var actor in package.GetExports().OfType<AActor>()) yield return actor;
     }
+    foreach (var actorKey in provider.Files.Keys.Where(key => IsExternalActorForLevel(key, levelKey)))
+        foreach (var actor in LoadExternalActorPackage(actorKey)) yield return actor;
 }
 // The provider mounts a loose directory under its top-level .uproject stem when one is present, else its
 // name. Compute that mount once from the same selection and reuse it for every gameplay selector below, so
@@ -3357,7 +3359,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
         var blueprintComponents = 0;
         var hasCamera = false;
         double cameraX = 0, cameraY = 0, cameraZ = 0, cameraPitch = 0, cameraYaw = 0, cameraRoll = 0;
-        foreach (var actor in ActorsForLevel(key, level))
+        foreach (var actor in ActorsForLevel(key, level, omittedActors))
         {
             var componentReferences = new List<FPackageIndex?> {
                 actor.GetOrDefault<FPackageIndex?>("RootComponent"),

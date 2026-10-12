@@ -2,7 +2,6 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
 import {
   importUnrealDirectory,
   isWorldPartitionExternalPackage,
@@ -28,17 +27,14 @@ describe("World Partition external packages", () => {
   it("associates actor packages with their map and leaves unrelated maps skipped", () => {
     const actor = "Content/__ExternalActors__/Maps/Imported/00/FH/actor.uasset";
     const otherActor = "Content/__ExternalActors__/Maps/Other/00/FH/actor.uasset";
+    const sameBasenameDifferentPrefix = "Content/__ExternalActors__/Other/Maps/Imported/00/FH/actor.uasset";
     const object = "Content/__ExternalObjects__/Maps/Imported/00/FH/object.uasset";
     expect(worldPartitionExternalActorMap(actor)).toBe("Content/Maps/Imported.umap");
     expect(shouldSkipWorldPartitionExternalPackage(actor, ["Content/Maps/Imported.umap"])).toBe(false);
     expect(shouldSkipWorldPartitionExternalPackage(otherActor, ["Content/Maps/Imported.umap"])).toBe(true);
+    expect(worldPartitionExternalActorMap(sameBasenameDifferentPrefix)).toBe("Content/Other/Maps/Imported.umap");
+    expect(shouldSkipWorldPartitionExternalPackage(sameBasenameDifferentPrefix, ["Content/Maps/Imported.umap"])).toBe(true);
     expect(shouldSkipWorldPartitionExternalPackage(object, ["Content/Maps/Imported.umap"])).toBe(true);
-  });
-
-  it("loads actors from the selected map's __ExternalActors__ packages", () => {
-    expect(CUE4PARSE_PROGRAM).toContain("__ExternalActors__");
-    expect(CUE4PARSE_PROGRAM).toContain("package.GetExports().OfType<AActor>()");
-    expect(CUE4PARSE_PROGRAM).toContain("IsExternalActorForLevel");
   });
 
   it("skips external actor packages instead of failing them as meshes", async () => {
@@ -48,7 +44,7 @@ describe("World Partition external packages", () => {
     const fixture = join(directory, "fixture");
     const outputDir = join(directory, "output");
     const meshes = join(sourceDir, "Content", "Meshes");
-    const actors = join(sourceDir, "Content", "__ExternalActors__", "Pack", "0", "23");
+    const actors = join(sourceDir, "Content", "__ExternalActors__", "Maps", "NotImported", "00", "23");
     await mkdir(meshes, { recursive: true });
     await mkdir(actors, { recursive: true });
     await writeFile(join(meshes, "SM_Car.uasset"), Buffer.alloc(16));
@@ -68,7 +64,7 @@ describe("World Partition external packages", () => {
     expect(report.models.map((m) => m.name)).toEqual(["SM_Car"]);
     expect(report.failed).toEqual([]);
     expect(report.skipped).toEqual([
-      { package: "Content/__ExternalActors__/Pack/0/23/abc123hash.uasset", reason: WORLD_PARTITION_EXTERNAL_REASON },
+      { package: "Content/__ExternalActors__/Maps/NotImported/00/23/abc123hash.uasset", reason: WORLD_PARTITION_EXTERNAL_REASON },
     ]);
     expect(WORLD_PARTITION_EXTERNAL_REASON).toBe("World Partition external actor/object package (level data, not an asset)");
   });

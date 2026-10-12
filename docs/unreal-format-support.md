@@ -108,7 +108,7 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | `LandscapeComponent` heightfields | UE4 editor | Implemented | indexed terrain mesh | Compressed BGRA8 heightmaps only. |
 | Landscape, UE5 | UE5 | **Missing** | none | The importer lists `LandscapeComponent` as unsupported when standalone. The UE5 level export writes an empty `landscapes` list (PRD-599). |
 | Landscape layer weights and `LandscapeLayerInfoObject` | any | **Missing** | none | |
-| World Partition external actors (`__ExternalActors__`) | UE5 | Reported | level scene GLB (real-pack verification pending) | The selected level export loads matching `__ExternalActors__` packages; packages belonging to maps outside the import remain skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/unreal-external-actors.test.ts`, PRD-598). |
+| World Partition external actors (`__ExternalActors__`) | UE5 | **Verified** | level scene GLB | Real-pack gate imports all three probe-confirmed supported actor components at stored transforms; compiled association excludes same-basename/different-prefix and `__ExternalObjects__` packages, while unimported maps remain skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/fab-feature-corpus.test.ts`, `tests/unreal-external-actors.test.ts`, PRD-598). |
 | Level streaming, sublevels, HLOD proxies | any | Implemented | partial | `tests/unreal-hlod-proxy.test.ts`, `tests/unreal-level-gate.test.ts`. |
 | `DecalActor` and decal components | any | **Missing** | none | |
 | Volumes (post-process, audio, blocking) | any | **Missing** | none | |

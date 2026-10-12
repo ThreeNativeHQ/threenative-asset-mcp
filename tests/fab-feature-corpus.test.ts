@@ -1,10 +1,11 @@
 import { registerAnimationCorpusGates } from "./helpers/animation-corpus.js";
 import { registerEffectsCorpusTests } from "./helpers/effects-corpus.js";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { NodeIO } from "@gltf-transform/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -28,8 +29,10 @@ import {
   type ScannedPackage,
   type SlicePlan,
 } from "../scripts/fab-slice.js";
+import { CUE4PARSE_SOURCE } from "../src/unreal/cue4parse-adapter.js";
 import { packageHeaderSize, readExactly, readPackageHeaderRegion, type PositionedReader } from "../src/unreal/cooking.js";
 import { IMPORTER_VERSION, ImportError, importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
+import { unrealTransformToGltfMatrix } from "../src/unreal/scenes.js";
 import { primaryClassFixture } from "./helpers/uasset-fixture.js";
 
 describe("fab-slice dependency closure", () => {
@@ -664,3 +667,231 @@ if (corpusDir) {
 
 registerAnimationCorpusGates();
 registerEffectsCorpusTests(process.env.FAB_FEATURE_CORPUS_DIR);
+
+interface RealWorldPartitionProofFile {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+interface RealWorldPartitionProofIndex {
+  readonly sourceDir: string;
+  readonly outputDir: string;
+  readonly nativeOutputDir: string;
+  readonly nativeSceneJson: string;
+  readonly associationSourceDir: string;
+  readonly associationOutputDir: string;
+  readonly associationSceneJson: string;
+  readonly actorProbePath: string;
+  readonly mapPackage: string;
+  readonly engine: string;
+  readonly converterPath: string;
+  readonly converterVersion: string;
+  readonly umodelPath: string;
+  readonly umodelVersion: string;
+  readonly sourceFiles: readonly RealWorldPartitionProofFile[];
+  readonly associationFiles: readonly RealWorldPartitionProofFile[];
+  readonly sourceHash?: string;
+}
+
+interface RealWorldPartitionVector {
+  readonly X: number;
+  readonly Y: number;
+  readonly Z: number;
+}
+
+interface RealWorldPartitionRotation {
+  readonly Pitch: number;
+  readonly Yaw: number;
+  readonly Roll: number;
+}
+
+interface RealWorldPartitionProbeComponent {
+  readonly name: string;
+  readonly actorIndex: number;
+  readonly storedRelativeLocation: RealWorldPartitionVector;
+  readonly storedRelativeRotation: RealWorldPartitionRotation;
+  readonly storedRelativeScale3D: RealWorldPartitionVector | null;
+  readonly staticMeshReferencePath: string;
+}
+
+interface RealWorldPartitionProbeRecord {
+  readonly actors: readonly { readonly index: number; readonly name: string }[];
+  readonly components: readonly RealWorldPartitionProbeComponent[];
+}
+
+interface RealWorldPartitionProbe {
+  readonly selected: readonly RealWorldPartitionProbeRecord[];
+}
+
+interface RealWorldPartitionSceneActor {
+  readonly name: string;
+  readonly meshName: string;
+  readonly location: { readonly x: number; readonly y: number; readonly z: number };
+  readonly rotation: { readonly pitch: number; readonly yaw: number; readonly roll: number };
+  readonly scale: { readonly x: number; readonly y: number; readonly z: number };
+}
+
+interface RealWorldPartitionScene {
+  readonly actors: readonly RealWorldPartitionSceneActor[];
+  readonly omittedActors?: readonly { readonly actor: string; readonly component: string; readonly sourceClass: string; readonly reason: string }[];
+}
+
+function readJson<T>(path: string): Promise<T> {
+  return readFile(path, "utf8").then((text) => JSON.parse(text) as T);
+}
+
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+async function assertProofFiles(root: string, files: readonly RealWorldPartitionProofFile[]): Promise<void> {
+  for (const entry of files) {
+    const bytes = await readFile(join(root, entry.path));
+    expect(bytes.length, `${entry.path}: source byte count changed`).toBe(entry.bytes);
+    expect(sha256(bytes), `${entry.path}: source hash changed`).toBe(entry.sha256);
+  }
+}
+
+function runTool(file: string, args: readonly string[]): Promise<{ readonly stdout: string; readonly stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(file, [...args], { maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`${file} ${args.join(" ")} exited ${error.code ?? " with an error"}:\n${stderr}\n${stdout}`));
+        return;
+      }
+      resolve({ stdout: String(stdout), stderr: String(stderr) });
+    });
+  });
+}
+
+function closeToVector(actual: { readonly x: number; readonly y: number; readonly z: number }, expected: RealWorldPartitionVector, label: string): void {
+  expect(actual.x, `${label}.x`).toBeCloseTo(expected.X, 3);
+  expect(actual.y, `${label}.y`).toBeCloseTo(expected.Y, 3);
+  expect(actual.z, `${label}.z`).toBeCloseTo(expected.Z, 3);
+}
+
+function closeToRotation(
+  actual: { readonly pitch: number; readonly yaw: number; readonly roll: number },
+  expected: RealWorldPartitionRotation,
+  label: string,
+): void {
+  expect(actual.pitch, `${label}.pitch`).toBeCloseTo(expected.Pitch, 3);
+  expect(actual.yaw, `${label}.yaw`).toBeCloseTo(expected.Yaw, 3);
+  expect(actual.roll, `${label}.roll`).toBeCloseTo(expected.Roll, 3);
+}
+
+const realWorldPartitionProofPath = process.env.PRD598_REAL_WP_PROOF_INDEX?.trim();
+if (!realWorldPartitionProofPath) {
+  describe("PRD-598 real World Partition gate (skipped)", () => {
+    it.skip("PRD598_REAL_WP_PROOF_INDEX is not set; licensed real-pack evidence is local-only", () => {});
+  });
+} else {
+  describe("PRD-598 real World Partition gate (local-only)", () => {
+    let proof: RealWorldPartitionProofIndex;
+    let probe: RealWorldPartitionProbe;
+    let native: RealWorldPartitionScene;
+    let association: RealWorldPartitionScene;
+    let report: ImportReport;
+
+    beforeAll(async () => {
+      proof = await readJson<RealWorldPartitionProofIndex>(realWorldPartitionProofPath);
+      probe = await readJson<RealWorldPartitionProbe>(proof.actorProbePath);
+      expect(proof.converterVersion).toBe(CUE4PARSE_SOURCE.version);
+      expect(proof.sourceFiles).toHaveLength(28);
+      expect(proof.associationFiles.length).toBeGreaterThan(proof.sourceFiles.length);
+      await assertProofFiles(proof.sourceDir, proof.sourceFiles);
+      await assertProofFiles(proof.associationSourceDir, proof.associationFiles);
+      expect(probe.selected).toHaveLength(3);
+
+      const converterVersion = await runTool(proof.converterPath, ["--version"]);
+      expect(`${converterVersion.stdout}\n${converterVersion.stderr}`).toContain(proof.converterVersion);
+      const umodelVersion = await runTool(proof.umodelPath, ["-version"]);
+      expect(`${umodelVersion.stdout}\n${umodelVersion.stderr}`).toContain("UE Viewer");
+
+      await rm(proof.nativeOutputDir, { recursive: true, force: true });
+      await mkdir(proof.nativeOutputDir, { recursive: true });
+      await runTool(proof.converterPath, [proof.sourceDir, "--export-dir", proof.nativeOutputDir, "--filter", proof.mapPackage]);
+      native = await readJson<RealWorldPartitionScene>(proof.nativeSceneJson);
+
+      await rm(proof.associationOutputDir, { recursive: true, force: true });
+      await mkdir(proof.associationOutputDir, { recursive: true });
+      await runTool(proof.converterPath, [proof.associationSourceDir, "--export-dir", proof.associationOutputDir, "--filter", proof.mapPackage]);
+      association = await readJson<RealWorldPartitionScene>(proof.associationSceneJson);
+
+      report = await importFreshOutput(proof.sourceDir, proof.outputDir, (sourceDir, outputDir) =>
+        importUnrealDirectory({
+          sourceDir,
+          outputDir,
+          sourceKind: "local-directory",
+          engine: proof.engine,
+          formatHint: proof.engine,
+          // Importer package selection is intentionally basename-based; the converter filter below is path-based.
+          onlyPackages: [basename(proof.mapPackage, ".umap")],
+          graphBake: false,
+          concurrency: 1,
+          umodel: { name: "umodel", path: proof.umodelPath, version: proof.umodelVersion },
+          modernConverter: { name: "modern", path: proof.converterPath, version: proof.converterVersion },
+          environment: { ...process.env, THREENATIVE_MODERN_UNREAL_CONVERTER_PATH: proof.converterPath },
+          log: () => {},
+        }),
+      );
+      expect(report.source.sourceHash).toBe(proof.sourceHash);
+    }, 900_000);
+
+    it("retains all probe-confirmed actor components and their native transforms", () => {
+      const expected = probe.selected.flatMap((record) => record.components.map((component) => {
+        const actor = record.actors.find((candidate) => candidate.index === component.actorIndex);
+        if (!actor) throw new Error(`probe component ${component.name} has no actor ${component.actorIndex}`);
+        return { name: `${actor.name}/${component.name}`, component };
+      }));
+      expect(expected).toHaveLength(3);
+      expect(native.actors).toHaveLength(expected.length);
+      expect(new Set(native.actors.map((actor) => actor.name))).toEqual(new Set(expected.map((actor) => actor.name)));
+      for (const { name, component } of expected) {
+        const actor = native.actors.find((candidate) => candidate.name === name);
+        expect(actor, `native actor ${name}`).toBeDefined();
+        closeToVector(actor!.location, component.storedRelativeLocation, `${name}.location`);
+        closeToRotation(actor!.rotation, component.storedRelativeRotation, `${name}.rotation`);
+        // Null means the package omitted scale; identity is the engine default, not a stored probe value.
+        closeToVector(actor!.scale, component.storedRelativeScale3D ?? { X: 1, Y: 1, Z: 1 }, `${name}.scale`);
+      }
+    });
+
+    it("uses compiled map association instead of loading same-basename or external-object distractors", () => {
+      expect(association.actors.map((actor) => actor.name).sort()).toEqual(native.actors.map((actor) => actor.name).sort());
+      expect(association.actors).toHaveLength(native.actors.length);
+      const loadFailure = association.omittedActors?.find((entry) => entry.sourceClass === "ExternalActorPackage");
+      expect(loadFailure?.actor).toContain("__ExternalActors__");
+      expect(loadFailure?.reason).toMatch(/could not be loaded/i);
+    });
+
+    it("publishes one decoded mesh node per actor and preserves global transforms", async () => {
+      expect(report.importer.version).toBe(IMPORTER_VERSION);
+      expect(report.toolchain.modernConverter).toBe(proof.converterVersion);
+      expect(report.counts.scenes).toBe(1);
+      expect(report.failed.find((entry) => entry.package === proof.mapPackage)).toBeUndefined();
+      const imported = report.scenes[0];
+      expect(imported).toMatchObject({ actors: 3, resolvedActors: 3, unresolvedMeshes: [] });
+      expect(imported).toBeDefined();
+
+      const manifest = await readJson<{ readonly actors: readonly (RealWorldPartitionSceneActor & { readonly matrix: readonly number[] })[] }>(join(proof.outputDir, imported!.manifest));
+      const document = await new NodeIO().read(join(proof.outputDir, imported!.glb));
+      const nodes = document.getRoot().listNodes().filter((node) => node.getMesh() !== null);
+      expect(nodes.map((node) => node.getName()).sort()).toEqual(native.actors.map((actor) => actor.name).sort());
+      for (const node of nodes) {
+        const positionCount = node.getMesh()!.listPrimitives().reduce((count, primitive) => count + (primitive.getAttribute("POSITION")?.getCount() ?? 0), 0);
+        expect(positionCount, `${node.getName()}: decoded mesh geometry`).toBeGreaterThan(0);
+        const nativeActor = native.actors.find((actor) => actor.name === node.getName())!;
+        const matrix = unrealTransformToGltfMatrix(nativeActor.location, nativeActor.rotation, nativeActor.scale);
+        const world = node.getWorldMatrix();
+        const manifestActor = manifest.actors.find((actor) => actor.name === node.getName());
+        expect(manifestActor).toBeDefined();
+        for (let index = 0; index < 16; index += 1) {
+          expect(world[index], `${node.getName()}: global matrix ${index}`).toBeCloseTo(matrix[index]!, 4);
+          expect(world[index], `${node.getName()}: manifest matrix ${index}`).toBeCloseTo(manifestActor!.matrix[index]!, 4);
+        }
+      }
+    });
+  });
+}
