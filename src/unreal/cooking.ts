@@ -140,6 +140,9 @@ export async function readPackageClasses(file: string, candidates: readonly stri
 }
 
 const GAME_PREFIX = "/Game/";
+/** The two byte encodings Unreal writes a string in, so the raw header can be searched for a start. */
+const GAME_PREFIX_UTF8 = Buffer.from(GAME_PREFIX, "utf8");
+const GAME_PREFIX_UTF16LE = Buffer.from(GAME_PREFIX, "utf16le");
 
 /**
  * A character that can appear inside a `/Game/...` reference: a path separator, an ASCII letter, digit,
@@ -174,6 +177,43 @@ function scanGameReferences(text: string): string[] {
 }
 
 /**
+ * The first byte offset of a UTF-16LE `\0` terminator at or after `start`, stepping two bytes at a
+ * time from the start of the string. A UTF-16LE string is a run of two-byte code units, so only the
+ * units on that stride are its characters; stepping by one would let a zero high byte inside a
+ * neighbouring code unit end the string early.
+ */
+function utf16Terminator(buffer: Buffer, start: number): number {
+  for (let offset = start; offset + 1 < buffer.length; offset += 2) {
+    if (buffer[offset] === 0 && buffer[offset + 1] === 0) return offset;
+  }
+  return buffer.length;
+}
+
+/**
+ * Every NUL-terminated string in `head` that starts with the encoded `/Game/` prefix. Unreal writes a
+ * string's bytes contiguously and terminates it with a zero, so a match of the prefix begins a real
+ * string; only the bounded bytes up to the terminator are decoded, never the arbitrary-binary header
+ * around it. Decoding the whole header instead allocates a string over bytes that are not text and
+ * aborts the native process on some packages.
+ *
+ * `indexOf` finds the prefix at any byte offset, so scanning the UTF-8 prefix and the UTF-16LE prefix
+ * covers both encodings and every alignment without a second whole-buffer decode. A malformed match
+ * decodes to replacement characters and is discarded by the path scan, so it never crashes.
+ */
+function gameReferenceCandidates(buffer: Buffer, prefix: Buffer, encoding: "utf8" | "utf16le"): string[] {
+  const candidates: string[] = [];
+  let from = 0;
+  for (;;) {
+    const start = buffer.indexOf(prefix, from);
+    if (start === -1) break;
+    const end = encoding === "utf16le" ? utf16Terminator(buffer, start) : buffer.indexOf(0, start);
+    candidates.push(buffer.subarray(start, end === -1 ? buffer.length : end).toString(encoding));
+    from = start + prefix.length;
+  }
+  return candidates;
+}
+
+/**
  * The `/Game/...` source package paths named in a package's import/name tables. A package that
  * references a material, texture or skeleton names that package's path, so these are the edges of the
  * dependency graph a slice must close over. Engine (`/Engine/...`) and script references are excluded:
@@ -181,13 +221,17 @@ function scanGameReferences(text: string): string[] {
  * the same set as its canonical form.
  *
  * Unreal serializes a string as UTF-8 when it is ANSI and as UTF-16LE otherwise, at any byte offset, so
- * this scans the UTF-8 decode and both UTF-16LE alignments. A path is read by its legal characters
- * rather than a fixed class, so a hyphen or a Unicode letter never truncates it.
+ * this scans the raw bytes for both encodings' `/Game/` prefix and decodes only the bounded string that
+ * follows. A path is read by its legal characters rather than a fixed class, so a hyphen or a Unicode
+ * letter never truncates it.
  */
 export function gameReferencesInHead(head: Buffer): string[] {
   const refs = new Set<string>();
-  for (const text of [head.toString("utf8"), head.toString("utf16le"), head.subarray(1).toString("utf16le")]) {
-    for (const ref of scanGameReferences(text)) refs.add(ref);
+  for (const candidate of [
+    ...gameReferenceCandidates(head, GAME_PREFIX_UTF8, "utf8"),
+    ...gameReferenceCandidates(head, GAME_PREFIX_UTF16LE, "utf16le"),
+  ]) {
+    for (const ref of scanGameReferences(candidate)) refs.add(ref);
   }
   return [...refs];
 }

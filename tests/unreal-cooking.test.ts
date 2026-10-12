@@ -290,4 +290,21 @@ describe("gameReferencesInHead", () => {
     const head = Buffer.from("/Engine/Foo/Bar\0/Script/Engine\0/Game/A/T_Albedo\0", "latin1");
     expect(gameReferencesInHead(head)).toEqual(["/Game/A/T_Albedo"]);
   });
+
+  it("reads NUL-terminated refs out of a long invalid-binary head at odd offsets without decoding it whole", () => {
+    // Bytes that are not text and include lone surrogate halves if decoded as UTF-16LE: a whole-head
+    // decode would materialize a huge malformed string (and, on some packages, abort the process).
+    const noise = Buffer.alloc(64 * 1024);
+    for (let index = 0; index < noise.length; index += 1) noise[index] = (index * 131 + 17) & 0xff;
+    const asciiRef = Buffer.from("/Game/Pack/Ascii-Mesh\0", "utf8");
+    const utf16Ref = Buffer.from("/Game/Pack/Utf16_Mesh\0", "utf16le");
+    const head = Buffer.concat([
+      noise.subarray(0, 3), // odd offset for the UTF-8 ref
+      asciiRef,
+      noise.subarray(0, 2), // odd offset for the UTF-16LE ref
+      utf16Ref,
+      noise.subarray(0, noise.length - asciiRef.length - utf16Ref.length - 5),
+    ]);
+    expect(gameReferencesInHead(head)).toEqual(["/Game/Pack/Ascii-Mesh", "/Game/Pack/Utf16_Mesh"]);
+  });
 });

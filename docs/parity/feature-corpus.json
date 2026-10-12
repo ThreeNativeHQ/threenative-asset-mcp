@@ -43,6 +43,27 @@
       ]
     },
     {
+      "id": "game-anim-5.4",
+      "listingId": "880e319a-a59e-4ed2-b268-b32dac7fa016",
+      "artifactId": "GameAnimationSample_5.4",
+      "engine": "UE_5.4",
+      "route": "cue4parse",
+      "targetClasses": [
+        "AnimSequence",
+        "SkeletalMesh",
+        "Skeleton"
+      ],
+      "classCounts": {
+        "AnimSequence": 4,
+        "SkeletalMesh": 2,
+        "Skeleton": 9
+      },
+      "packages": 14,
+      "bytes": 11351325,
+      "packageDigest": "sha256:3a710cf979c3166e43f844600fc001486d66d3db5268621d3096daacb01c72f9",
+      "gaps": []
+    },
+    {
       "id": "game-anim-5.8",
       "listingId": "880e319a-a59e-4ed2-b268-b32dac7fa016",
       "artifactId": "GameAnimationSample_5.8",
