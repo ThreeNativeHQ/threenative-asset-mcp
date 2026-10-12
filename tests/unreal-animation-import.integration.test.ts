@@ -163,7 +163,7 @@ process.exit(0);
   ).toBe(true);
 });
 
-it.each([{ secondExported: false, foreign: false }, { secondExported: true, foreign: false }, { secondExported: true, foreign: true }])("keeps nested clip capabilities distinct across every LOD ($secondExported, foreign: $foreign)", async ({ secondExported, foreign }) => {
+it.each([{ secondExported: false, foreign: false, foreignRig: false }, { secondExported: true, foreign: false, foreignRig: false }, { secondExported: true, foreign: true, foreignRig: false }, { secondExported: false, foreign: false, foreignRig: true }])("keeps nested clip capabilities distinct across every LOD ($secondExported, foreign: $foreign, foreignRig: $foreignRig)", async ({ secondExported, foreign, foreignRig }) => {
   const directory = await mkdtemp(join(tmpdir(), "tn-animation-capability-"));
   onTestFinished(() => rm(directory, { recursive: true, force: true }));
   const sourceDir = join(directory, "source");
@@ -180,14 +180,15 @@ it.each([{ secondExported: false, foreign: false }, { secondExported: true, fore
   document.createScene().addChild(root).addChild(document.createNode("Hero")
     .setMesh(document.createMesh().addPrimitive(primitive)).setSkin(document.createSkin().addJoint(root)));
   await new NodeIO().write(join(fixtureDir, "Hero.gltf"), document);
+  if (foreignRig) await new NodeIO().write(join(fixtureDir, "HeroB.gltf"), document);
   if (foreign) {
     await new NodeIO().write(join(fixtureDir, "Hero.glb"), document);
     await new NodeIO().write(join(fixtureDir, "Hero_LOD1.glb"), document);
   }
   const psa = join(directory, "Walk.psa");
   await writePsaFixture(psa, { animation: "Walk" });
-  const classes = { Hero: foreign ? ["SkeletalMesh", "SkeletalMeshSocket"] : ["SkeletalMesh"], Walk: ["AnimSequence"], Ref_A: ["BlendSpace"], Ref_B: ["BlendSpace"] };
-  for (const relative of ["Characters/Hero", "A/Walk", "B/Walk", "Logic/Ref_A", "Logic/Ref_B"]) {
+  const classes = { Hero: foreign ? ["SkeletalMesh", "SkeletalMeshSocket"] : ["SkeletalMesh"], HeroB: ["SkeletalMesh"], Walk: ["AnimSequence"], Ref_A: ["BlendSpace"], Ref_B: ["BlendSpace"] };
+  for (const relative of ["Characters/Hero", ...(foreignRig ? ["Characters/HeroB"] : []), "A/Walk", "B/Walk", "Logic/Ref_A", "Logic/Ref_B"]) {
     await mkdir(join(sourceDir, "Content", relative, ".."), { recursive: true });
     const header = Buffer.alloc(24);
     header.writeUInt32LE(0x9e2a83c1, 0);
@@ -198,7 +199,7 @@ it.each([{ secondExported: false, foreign: false }, { secondExported: true, fore
     await writeFile(join(sourceDir, "Content", `${relative}.uasset`), header);
   }
   const umodel = join(directory, "umodel");
-  await writeFakeUmodel(umodel, { classes, exportFromByPackage: { Hero: fixtureDir } });
+  await writeFakeUmodel(umodel, { classes, exportFromByPackage: { Hero: fixtureDir, HeroB: fixtureDir } });
   const modern = join(directory, "modern");
   await writeFile(modern, `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -213,6 +214,7 @@ if (args.includes("--animations")) {
   }
 } else {
   write("Gameplay/Content/Characters/Hero.json", {version:1,package:"Content/Characters/Hero",skeletonRef:"/Game/Characters/Skeleton"});
+  if (${foreignRig}) write("Gameplay/Content/Characters/HeroB.json", {version:1,package:"Content/Characters/HeroB",skeletonRef:"/Game/B/Skeleton"});
   if (${foreign}) {
     fs.mkdirSync(join(out,"Meshes"),{recursive:true});
     for (const name of ["Hero", "Hero_LOD1"]) fs.copyFileSync(join(${JSON.stringify(fixtureDir)},name+".glb"),join(out,"Meshes",name+".glb"));
@@ -224,13 +226,18 @@ if (args.includes("--animations")) {
     ...(foreign ? { lods: [0, 1] } : {}),
     freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: umodel, version: "fixture" },
     modernConverter: { name: "modern", path: modern, version: "fixture" } });
-  expect(report.models).toHaveLength(foreign ? 2 : 1);
+  expect(report.models).toHaveLength(foreign || foreignRig ? 2 : 1);
   for (const model of report.models) {
     const glb = await new NodeIO().read(join(outputDir, model.glb));
     const names = glb.getRoot().listAnimations().map((animation) => animation.getName());
-    expect(names).toEqual(secondExported && !foreign ? ["Walk", "B_Walk_Walk"] : ["Walk"]);
+    expect(names).toEqual(foreignRig && model.name === "HeroB" ? [] : secondExported && !foreign ? ["Walk", "B_Walk_Walk"] : ["Walk"]);
   }
-  if (foreign) expect(report.failed.some((entry) => entry.package === "/Game/B/Walk" && /skeleton package .* differs/.test(entry.reason))).toBe(true);
+  if (foreignRig) expect(report.failed.filter((entry) => entry.package === "/Game/A/Walk")).toEqual([]);
+  if (foreign) {
+    const failures = report.failed.filter((entry) => entry.package === "/Game/B/Walk");
+    expect(failures).toHaveLength(1);
+    expect(failures[0]!.reason).toMatch(/skeleton package .* differs/);
+  }
   for (const folder of ["A", "B"]) {
     const descriptor = report.animationLogic.find((asset) => asset.package === `/Game/Logic/Ref_${folder}`)!;
     const value = JSON.parse(await readFile(join(outputDir, descriptor.json), "utf8"));

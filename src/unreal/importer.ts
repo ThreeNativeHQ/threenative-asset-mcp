@@ -5714,8 +5714,14 @@ export async function importUnrealDirectory(
         });
       }
     }
+    const reportedUnresolvedPsa = new Set<string>();
     for (const clip of unresolvedPsa) {
-      failed.push({ package: clip.package ?? clip.name, reason: `ActorX PSA clip "${clip.name}" was not attached: ${clip.reason}.` });
+      const resolved = clip.package === undefined ? resolveAnimationPackage(clip.name) : undefined;
+      const packagePath = clip.package ?? (resolved && "canonical" in resolved ? resolved.canonical : clip.name);
+      const identity = identityKey(packagePath, clip.name);
+      if (exportedClipIdentities.has(identity) || reportedUnresolvedPsa.has(identity)) continue;
+      reportedUnresolvedPsa.add(identity);
+      failed.push({ package: packagePath, reason: `ActorX PSA clip "${clip.name}" was not attached: ${clip.reason}.` });
     }
     // A funny clip landing on two rigs by bone name alone may have crossed from its real skeleton to a rig
     // that merely shares bone names; surface it instead of silently shipping it twice.
