@@ -436,14 +436,15 @@ if (!corpusDir) {
 
 // PRD-582 gameplay gates over the real corpus. The five matrix slices are required: when
 // FAB_FEATURE_CORPUS_DIR is set, an absent one is a failure, never an empty success. Each slice is
-// imported once through the public `importUnrealDirectory` with the immutable `threenative.83`
+// imported once through the public `importUnrealDirectory` with the immutable `threenative.84`
 // converter snapshot; the shared root toolchain binary is mutable and is never used. Output stays
 // under the owner's cache so an import can be inspected, and each output is removed first so a stale
 // report can never satisfy a gate. Licensed names never appear below: a model is located by its
 // reported characteristics, and its socket, bone and wave names are compared only at runtime.
 
-const CONVERTER_83 = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "converter-83", "ThreeNativeConverter");
-const FINAL_IMPORT_DIR = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "final-imports");
+const CONVERTER_84 = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "converter-84", "ThreeNativeConverter");
+// A distinct owned output, so the earlier snapshot's evidence is preserved rather than overwritten.
+const FINAL_IMPORT_DIR = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "final-imports-84");
 
 function runConverter(file: string, args: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -457,14 +458,19 @@ interface CueNode {
   readonly children?: readonly CueNode[];
 }
 
+interface ConstraintBasis {
+  readonly primaryAxis: readonly [number, number, number];
+  readonly secondaryAxis: readonly [number, number, number];
+}
+
 if (corpusDir) {
   const corpusRoot = corpusDir;
   describe("feature corpus gameplay gates (FAB_FEATURE_CORPUS_DIR, local-only)", () => {
     const imported = new Map<string, { readonly report: ImportReport; readonly outputDir: string }>();
 
     beforeAll(async () => {
-      // The override lets an operator point the gate at their own 83 build; it must still report 83.
-      const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim() || CONVERTER_83;
+      // The override lets an operator point the gate at their own 84 build; it must still report 84.
+      const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim() || CONVERTER_84;
       const versionLine = (await runConverter(converterPath, ["--version"]))
         .trim()
         .split("\n")
@@ -472,8 +478,8 @@ if (corpusDir) {
         .filter((line) => line.length > 0)
         .pop();
       const versionMatch = versionLine === undefined ? null : /threenative\.(\d+)\b/.exec(versionLine);
-      if (versionMatch?.[1] !== "83") {
-        throw new Error(`the gameplay gate needs the immutable converter-83 snapshot, but ${converterPath} reports "${versionLine ?? ""}"`);
+      if (versionMatch?.[1] !== "84") {
+        throw new Error(`the gameplay gate needs the immutable converter-84 snapshot, but ${converterPath} reports "${versionLine ?? ""}"`);
       }
       const version = versionLine!.split(/\s+/).slice(1).join(" ") || versionLine!;
 
@@ -531,7 +537,7 @@ if (corpusDir) {
       expect(mannequin.kind).toBe("skeletal");
       expect(mannequin.sockets).toHaveLength(4);
       expect(mannequin.missingBones).toHaveLength(1);
-      // The mesh with the most sockets carries twelve; converter 83 decodes its own socket list.
+      // The mesh with the most sockets carries twelve; converter 84 decodes its own socket list.
       const shoe = report.models.reduce((widest, model) =>
         (model.sockets?.length ?? 0) > (widest.sockets?.length ?? 0) ? model : widest,
       );
@@ -578,8 +584,23 @@ if (corpusDir) {
           expect(report.failed.some((row) => row.package === asset.package)).toBe(false);
           expect(report.skipped.some((row) => row.package === asset.package)).toBe(false);
           // The count comes from the sidecar file, not the report's own summary.
-          const parsed = JSON.parse(await readFile(file, "utf8")) as { bodies: { bone: string }[]; constraints: unknown[] };
+          const parsed = JSON.parse(await readFile(file, "utf8")) as {
+            bodies: { bone: string }[];
+            constraints: { childFrame: ConstraintBasis; parentFrame: ConstraintBasis }[];
+          };
           fromFiles.push([parsed.bodies.length, parsed.constraints.length]);
+          // Every frame is a unit, orthogonal, non-zero basis. A zero axis (an omitted Unreal tag read
+          // as zero) normalizes to a zero vector and fails here, so the native axis defaults are pinned.
+          for (const constraint of parsed.constraints) {
+            for (const frame of [constraint.childFrame, constraint.parentFrame]) {
+              const primary = frame.primaryAxis;
+              const secondary = frame.secondaryAxis;
+              expect(Math.hypot(...primary), `${asset.name} frame primary axis is not unit length`).toBeCloseTo(1, 5);
+              expect(Math.hypot(...secondary), `${asset.name} frame secondary axis is not unit length`).toBeCloseTo(1, 5);
+              const dot = primary[0] * secondary[0] + primary[1] * secondary[1] + primary[2] * secondary[2];
+              expect(Math.abs(dot), `${asset.name} frame axes are not orthogonal`).toBeLessThan(1e-4);
+            }
+          }
           const linked = report.models.filter((model) => model.physics?.asset === asset.name);
           expect(linked.length, `${asset.name} must be linked to a skinned mesh`).toBeGreaterThan(0);
           for (const model of linked) {

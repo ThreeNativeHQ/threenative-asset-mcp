@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.83",
+  version: "b4e95441+threenative.84",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -368,6 +368,30 @@ index c9628ca..c54a734 100644
          MaxForce = fallback.GetOrDefault<float>(nameof(MaxForce));
          bEnablePositionDrive = fallback.GetOrDefault<bool>(nameof(bEnablePositionDrive));
          bEnableVelocityDrive = fallback.GetOrDefault<bool>(nameof(bEnableVelocityDrive));
+diff --git a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintInstance.cs b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintInstance.cs
+--- a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintInstance.cs
++++ b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintInstance.cs
+@@ -32,12 +32,16 @@ public class FConstraintInstance
+         ConstraintBone2 = fallback.GetOrDefault<FName>(nameof(ConstraintBone2));
+ 
+         Pos1 = fallback.GetOrDefault<FVector>(nameof(Pos1));
+-        PriAxis1 = fallback.GetOrDefault<FVector>(nameof(PriAxis1));
+-        SecAxis1 = fallback.GetOrDefault<FVector>(nameof(SecAxis1));
++        // FConstraintInstance's native constructor (ConstraintInstance.cpp) sets each frame to the
++        // identity basis: primary axis unit X, secondary axis unit Y. Unreal omits a tag whose value
++        // equals that native default, so an absent axis tag must supply the unit vector rather than
++        // the zero vector. A tagged value is still read as saved, so explicit axes are preserved.
++        PriAxis1 = fallback.GetOrDefault(nameof(PriAxis1), new FVector(1f, 0f, 0f));
++        SecAxis1 = fallback.GetOrDefault(nameof(SecAxis1), new FVector(0f, 1f, 0f));
+ 
+         Pos2 = fallback.GetOrDefault<FVector>(nameof(Pos2));
+-        PriAxis2 = fallback.GetOrDefault<FVector>(nameof(PriAxis2));
+-        SecAxis2 = fallback.GetOrDefault<FVector>(nameof(SecAxis2));
++        PriAxis2 = fallback.GetOrDefault(nameof(PriAxis2), new FVector(1f, 0f, 0f));
++        SecAxis2 = fallback.GetOrDefault(nameof(SecAxis2), new FVector(0f, 1f, 0f));
+ 
+         AngularRotationOffset = fallback.GetOrDefault<FRotator>(nameof(AngularRotationOffset));
+         bScaleLinearLimits = fallback.GetOrDefault(nameof(bScaleLinearLimits), true);
 diff --git a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
 --- a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
 +++ b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
@@ -4430,12 +4454,15 @@ static object GpFrame(FVector location, FVector primary, FVector secondary) => n
     ["location"] = GpVec(location), ["primaryAxis"] = GpVec(primary), ["secondaryAxis"] = GpVec(secondary),
 };
 
-static object? GpDamping(UBodySetup body)
+static object GpDamping(UBodySetup body)
 {
-    if (!body.TryGetValue<FStructFallback>(out var instance, "DefaultInstance") || instance is null) return null;
     // FBodyInstance's constructor defaults LinearDamping to 0.01 (BodyInstance.cpp) and AngularDamping to 0.
     // Unreal omits a tagged property whose value equals the native default, so an absent LinearDamping tag
-    // means 0.01, not the CUE4Parse fallback 0.
+    // means 0.01, not the CUE4Parse fallback 0. A body whose whole DefaultInstance tag is absent still
+    // carries those native defaults, so read an empty fallback rather than reporting no damping at all.
+    var instance = body.TryGetValue<FStructFallback>(out var value, "DefaultInstance") && value is not null
+        ? value
+        : new FStructFallback();
     return new Dictionary<string, object?>
     {
         ["linear"] = instance.GetOrDefault("LinearDamping", 0.01f),
@@ -4542,7 +4569,7 @@ static object GpBody(UBodySetup body)
         ["traceFlag"] = body.GetOrDefault<ECollisionTraceFlag>("CollisionTraceFlag").ToString(),
         ["shapes"] = GpAggShapes(body.AggGeom),
     };
-    if (GpDamping(body) is { } damping) entry["damping"] = damping;
+    entry["damping"] = GpDamping(body);
     return entry;
 }
 

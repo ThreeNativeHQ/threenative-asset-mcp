@@ -100,7 +100,7 @@ describeWithTools(["modern-converter"], "Converter gameplay-data helpers (compil
       "static List<object> GpAggShapes(",
       "static object GpCollision(",
       "static object GpFrame(",
-      "static object? GpDamping(",
+      "static object GpDamping(",
       "static FConstraintDrive GpDefaultDrive(",
       "static FLinearConstraint GpDefaultLinear(",
       "static FConeConstraint GpDefaultCone(",
@@ -177,6 +177,18 @@ if (args[0] == "constraint")
     }));
     Console.WriteLine(JsonConvert.SerializeObject(GpConstraint(instance)));
 }
+if (args[0] == "axes")
+{
+    // Unreal omits PriAxis/SecAxis tags whose value equals the native identity basis (ConstraintInstance.cpp),
+    // so CUE4Parse must supply unit X/Y rather than the zero vector; an explicit saved axis survives.
+    var omitted = new FConstraintInstance(new FStructFallback(new List<FPropertyTag>()));
+    var explicitAxes = new FConstraintInstance(new FStructFallback(new List<FPropertyTag>
+    {
+        new(new FName("PriAxis1"), new FName("StructProperty"), 0, 0, null, false, null, new StructProperty(new FScriptStruct(new FVector(0, 0, 1)))),
+        new(new FName("SecAxis2"), new FName("StructProperty"), 0, 0, null, false, null, new StructProperty(new FScriptStruct(new FVector(1, 0, 0)))),
+    }));
+    Console.WriteLine(JsonConvert.SerializeObject(new { omitted = GpConstraint(omitted), explicitAxes = GpConstraint(explicitAxes) }));
+}
 if (args[0] == "partial")
 {
     // Partial structs: a nested struct exists but the tag whose value equals the native default was
@@ -216,13 +228,15 @@ if (args[0] == "partial")
 if (args[0] == "damping")
 {
     // Body damping follows the same presence policy: an omitted LinearDamping tag is FBodyInstance's
-    // native 0.01, an explicit zero stays zero.
+    // native 0.01, an explicit zero stays zero, and a body whose whole DefaultInstance tag is omitted
+    // still reports the native 0.01/0 rather than no damping.
     var absent = new TestBody(null, new FStructFallback());
+    var wholeOmitted = new TestBody(null);
     var explicitZero = new TestBody(null, new FStructFallback(new List<FPropertyTag>
     {
         new(new FName("LinearDamping"), new FName("FloatProperty"), 0, 0, null, false, null, new FloatProperty(0)),
     }));
-    Console.WriteLine(JsonConvert.SerializeObject(new { absent = GpDamping(absent), explicitZero = GpDamping(explicitZero) }));
+    Console.WriteLine(JsonConvert.SerializeObject(new { absent = GpDamping(absent), wholeOmitted = GpDamping(wholeOmitted), explicitZero = GpDamping(explicitZero) }));
 }
 if (args[0] == "legacy-body")
 {
@@ -326,6 +340,21 @@ class TestBody : UBodySetup
     expect(constraint.drives.angular.mode).toBe("SLERP");
   });
 
+  it("supplies native unit axes for an omitted constraint frame and keeps an explicit axis", () => {
+    const frame = (value: unknown): { primaryAxis: number[]; secondaryAxis: number[] } =>
+      value as { primaryAxis: number[]; secondaryAxis: number[] };
+    const axes = JSON.parse(run("axes")) as { omitted: { childFrame: unknown; parentFrame: unknown }; explicitAxes: { childFrame: unknown; parentFrame: unknown } };
+    // ConstraintInstance.cpp sets both frames to unit X / unit Y; an omitted tag must not read zero.
+    expect(frame(axes.omitted.childFrame).primaryAxis).toEqual([1, 0, 0]);
+    expect(frame(axes.omitted.childFrame).secondaryAxis).toEqual([0, 1, 0]);
+    expect(frame(axes.omitted.parentFrame).primaryAxis).toEqual([1, 0, 0]);
+    expect(frame(axes.omitted.parentFrame).secondaryAxis).toEqual([0, 1, 0]);
+    // An explicit saved axis survives, and the constraint's other omitted axes still default.
+    expect(frame(axes.explicitAxes.childFrame).primaryAxis).toEqual([0, 0, 1]);
+    expect(frame(axes.explicitAxes.childFrame).secondaryAxis).toEqual([0, 1, 0]);
+    expect(frame(axes.explicitAxes.parentFrame).secondaryAxis).toEqual([1, 0, 0]);
+  });
+
   it("fills a partial struct's native defaults and keeps an explicit zero", () => {
     const partial = JSON.parse(run("partial")) as {
       drive: { stiffness: number; damping: number; positionDrive: boolean };
@@ -362,13 +391,17 @@ class TestBody : UBodySetup
     expect(legacy.body.shapes).toEqual([]);
   });
 
-  it("keeps body damping presence-based", () => {
+  it("keeps body damping presence-based, including a whole omitted DefaultInstance", () => {
     const damping = JSON.parse(run("damping")) as {
       absent: { linear: number; angular: number };
+      wholeOmitted: { linear: number; angular: number };
       explicitZero: { linear: number; angular: number };
     };
     // FBodyInstance's native LinearDamping is 0.01 when the tag is omitted...
     expect(damping.absent.linear).toBeCloseTo(0.01, 6);
+    // ...a body whose whole DefaultInstance tag is omitted still reads the native 0.01 / 0...
+    expect(damping.wholeOmitted.linear).toBeCloseTo(0.01, 6);
+    expect(damping.wholeOmitted.angular).toBe(0);
     // ...but an explicit saved zero stays zero.
     expect(damping.explicitZero.linear).toBe(0);
   });
