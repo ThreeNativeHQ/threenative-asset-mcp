@@ -131,7 +131,7 @@ describe("same-named UE5 packages", () => {
     expect(new Set(report.models.map((model) => model.glb)).size).toBe(2);
   });
 
-  it("keeps requested LODs isolated for two same-named modern meshes", async () => {
+  it.each([undefined, "text:{}"])("keeps requested LODs and missing/invalid metadata isolated (%s)", async (aMetadata) => {
     const root = await scratch();
     const a0 = join(root, "a0.glb");
     const a1 = join(root, "a1.glb");
@@ -151,16 +151,22 @@ describe("same-named UE5 packages", () => {
       "A/SM_Dup": {
         "Meshes/SM_Dup.glb": a0,
         "Meshes/SM_Dup_LOD1.glb": a1,
-        "Meshes/SM_Dup.metadata.json": `text:${JSON.stringify({ format: "threenative-static-mesh-metadata", version: 1, buildScale3D: [1, 1, 1], lods: [{ lod: 0, status: "payload" }, { lod: 1, status: "payload" }] })}`,
+        ...(aMetadata ? { "Meshes/SM_Dup.metadata.json": aMetadata } : {}),
       },
-      "B/SM_Dup": { "Meshes/SM_Dup.glb": b0, "Meshes/SM_Dup_LOD1.glb": b1 },
+      "B/SM_Dup": {
+        "Meshes/SM_Dup.glb": b0,
+        "Meshes/SM_Dup_LOD1.glb": b1,
+        "Meshes/SM_Dup.metadata.json": `text:${JSON.stringify({ format: "threenative-static-mesh-metadata", version: 1, buildScale3D: [2, 2, 2], lods: [{ lod: 0, status: "payload" }, { lod: 1, status: "payload" }] })}`,
+      },
     }, argvLog, [0, 1]);
     const height = async (path: string): Promise<number> => {
       const document = await new NodeIO().read(join(outputDir, path));
       return document.getRoot().listMeshes()[0]!.listPrimitives()[0]!.getAttribute("POSITION")!.getMax([0, 0, 0])[1]!;
     };
     expect(await height("Models/A/SM_Dup_LOD1.glb")).toBe(0.5);
-    expect(await height("Models/B/SM_Dup_LOD1.glb")).toBe(1.5);
+    expect(await height("Models/A/SM_Dup.glb")).toBe(1);
+    expect(await height("Models/B/SM_Dup.glb")).toBe(6);
+    expect(await height("Models/B/SM_Dup_LOD1.glb")).toBe(3);
     const invocations = (await readFile(argvLog, "utf8")).trim().split("\n").map(line => JSON.parse(line) as { filter: string; argv: string[] });
     expect(invocations.filter(({ filter }) => filter !== "").map(({ argv }) => argv.slice(argv.indexOf("--filter")))).toEqual([
       ["--filter", "Content/A/SM_Dup", "--lods", "0,1"],

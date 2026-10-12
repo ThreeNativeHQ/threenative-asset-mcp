@@ -5343,7 +5343,7 @@ export async function importUnrealDirectory(
       const fromMeshDescription = uncookedNames.has(name);
       const fromModernConverter = modernNames.has(name);
       const modernMetadata = fromModernConverter
-        ? isolatedMeshMetadata.has(entry.file)
+        ? isolatedMeshGlbs.has(entry.file)
           ? isolatedMeshMetadata.get(entry.file)
           : modernMeshMetadata.get(name)
         : undefined;
