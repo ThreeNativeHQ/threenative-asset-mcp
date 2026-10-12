@@ -305,7 +305,7 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
   });
 
   it("reads trailer-backed landscape source payloads through the pinned CUE4Parse fixes", () => {
-    expect(CUE4PARSE_PROGRAM).toContain("b4e95441+threenative.584.9.3");
+    expect(CUE4PARSE_PROGRAM).toContain("b4e95441+threenative.584.9.4");
     expect(CUE4PARSE_PROGRAM).toContain("LandscapeComponents");
     expect(CUE4PARSE_PROGRAM).toContain("TryReadLandscapeSourcePixels");
     expect(CUE4PARSE_PROGRAM).toContain("DecodeLandscapeHeightfield");
