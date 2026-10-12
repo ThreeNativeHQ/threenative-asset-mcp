@@ -447,6 +447,7 @@ interface RealLandscapeProofFile {
 
 interface RealLandscapeProofIndex {
   readonly sourceDir: string;
+  readonly publicOutputDir: string;
   readonly nativeOutputDir: string;
   readonly nativeSceneJson: string;
   readonly schemaPath: string;
@@ -607,6 +608,7 @@ if (!realLandscapeProofPath) {
     let proof: RealLandscapeProofIndex;
     let scene: RealLandscapeScene;
     let schema: RealLandscapeSchema;
+    let report: ImportReport;
 
     beforeAll(async () => {
       proof = await readJson<RealLandscapeProofIndex>(realLandscapeProofPath);
@@ -619,7 +621,38 @@ if (!realLandscapeProofPath) {
       await runTool(proof.converterPath, [proof.sourceDir, "--export-dir", proof.nativeOutputDir, "--engine", proof.engine.replace(/^UE_/, ""), "--filter", proof.mapPackage]);
       scene = await readJson<RealLandscapeScene>(proof.nativeSceneJson);
       schema = await readJson<RealLandscapeSchema>(proof.schemaPath);
+      await rm(proof.publicOutputDir, { recursive: true, force: true });
+      report = await importUnrealDirectory({
+        sourceDir: proof.sourceDir, outputDir: proof.publicOutputDir, sourceKind: "local-directory",
+        engine: proof.engine, formatHint: proof.engine, graphBake: false, concurrency: 1,
+        modernConverter: { name: "modern", path: proof.converterPath, version: proof.converterVersion },
+        environment: { ...process.env, THREENATIVE_MODERN_UNREAL_CONVERTER_PATH: proof.converterPath }, log: () => {} });
+      expect(report.reused).toBe(false);
+      expect(report.importer.version).toBe(IMPORTER_VERSION);
+      expect(report.toolchain.modernConverter).toBe(proof.converterVersion);
     }, 900_000);
+
+    it("imports all 51 terrain meshes through the public GLB within stored world bounds", async () => {
+      expect(report.scenes).toHaveLength(1);
+      expect(report.scenes[0]!.landscapes).toBe(51);
+      expect(report.scenes[0]!.omittedActors.filter((entry) => entry.sourceClass === "LandscapeComponent")).toHaveLength(0);
+      const document = await new NodeIO().read(join(proof.publicOutputDir, report.scenes[0]!.glb));
+      const nodes = document.getRoot().listNodes().filter((node) => (node.getExtras().unreal as { sourceClass?: string } | undefined)?.sourceClass === "LandscapeComponent");
+      expect(nodes).toHaveLength(51);
+      for (const component of schema.exports.filter((entry) => entry.class === "LandscapeComponent")) {
+        const name = component.id.slice(component.id.lastIndexOf(":") + 1);
+        const matches = nodes.filter((node) => node.getName().endsWith(`/${name}`));
+        expect(matches).toHaveLength(1);
+        const node = matches[0]!;
+        const bounds = emptyLandscapeBounds();
+        const positions = node.getMesh()!.listPrimitives()[0]!.getAttribute("POSITION")!;
+        const matrix = node.getWorldMatrix();
+        for (let vertex = 0; vertex < positions.getCount(); vertex++) {
+          extendLandscapeBounds(bounds, transformLandscapePoint(matrix, positions.getElement(vertex, [0, 0, 0]) as [number, number, number]));
+        }
+        assertLandscapeBounds(bounds, storedLandscapeBounds(component), name);
+      }
+    });
 
     it("emits every stored landscape component with heights, normals, footprint and height bounds within 1%", () => {
       const components = schema.exports.filter((entry) => entry.class === "LandscapeComponent");

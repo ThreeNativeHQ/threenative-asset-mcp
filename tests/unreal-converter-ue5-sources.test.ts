@@ -7,7 +7,7 @@ import { NodeIO, type Accessor, type Primitive } from "@gltf-transform/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { CUE4PARSE_PATCH, CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
-import { parseUnrealSceneSource } from "../src/unreal/scenes.js";
+import { assembleSceneGlb, parseUnrealSceneSource } from "../src/unreal/scenes.js";
 import { modernSdkExecutable, toolchainCacheDir } from "../src/unreal/provision.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
@@ -305,7 +305,7 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
   });
 
   it("reads trailer-backed landscape source payloads through the pinned CUE4Parse fixes", () => {
-    expect(CUE4PARSE_PROGRAM).toContain("b4e95441+threenative.584.9");
+    expect(CUE4PARSE_PROGRAM).toContain("b4e95441+threenative.584.9.1");
     expect(CUE4PARSE_PROGRAM).toContain("LandscapeComponents");
     expect(CUE4PARSE_PROGRAM).toContain("TryReadLandscapeSourcePixels");
     expect(CUE4PARSE_PROGRAM).toContain("DecodeLandscapeHeightfield");
@@ -355,6 +355,7 @@ describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled fr
       "static void UndoUeDelta(",
       "static (float[] Heights, float[] Normals) DecodeLandscapeHeightfield(",
       "static int LandscapeRoundToInt(",
+      "static float[] LandscapeLocalNormals(",
       "static EditorMesh ReadMeshDescription(",
       "static EditorMesh ReadMeshDescriptionInEitherLayout(",
       "static void CheckActiveUvChannels(",
@@ -397,6 +398,7 @@ else if (args[0] == "landscape")
     var biasY = float.Parse(args[7], CultureInfo.InvariantCulture);
     UndoUeDelta(data, 0, size[0], size[1], 4, 1);
     var decoded = DecodeLandscapeHeightfield(data, size[0], size[1], componentSizeQuads, subsectionSizeQuads, numSubsections, biasX, biasY);
+    if (args.Length > 8) decoded = (decoded.Heights, LandscapeLocalNormals(decoded.Normals, float.Parse(args[8], CultureInfo.InvariantCulture), float.Parse(args[9], CultureInfo.InvariantCulture), float.Parse(args[10], CultureInfo.InvariantCulture)));
     Console.WriteLine(JsonSerializer.Serialize(new { componentSizeQuads, heights = decoded.Heights, normals = decoded.Normals }));
 }
 else if (args[0] == "sidecar")
@@ -568,6 +570,24 @@ ${comparer}
     expect(scene.landscapes).toHaveLength(1);
     scene.landscapes![0]!.heights.forEach((value, index) => expect(value).toBeCloseTo(expectedHeights[index]!, 5));
     expect(scene.landscapes![0]!.normals).toEqual(decoded.normals);
+    // Actual shipped C# helper -> public writer -> GLB normal matrix. Mirroring must keep its sign.
+    for (const scaleX of [2, -2]) {
+      const scale = { x: scaleX, y: 3, z: 5 };
+      const compensated = JSON.parse(run("landscape", file, `${textureWidth}x${textureHeight}`, `${componentSizeQuads}`, `${subsectionSizeQuads}`, `${numSubsections}`, `${biasX}`, `${biasY}`, `${scale.x}`, `${scale.y}`, `${scale.z}`)) as { normals: number[] };
+      const scaledSource = { ...scene, landscapes: [{ ...scene.landscapes![0]!, scale, normals: compensated.normals }] };
+      const written = await assembleSceneGlb({ source: scaledSource, package: "Synthetic.umap", outputRoot: root, outputStem: `normals-${scaleX}`, models: [], validate: async () => ({ bytes: 0, sha256: "synthetic" }) });
+      const document = await new NodeIO().read(join(root, written.glb));
+      const node = document.getRoot().listNodes().find((entry) => entry.getMesh())!;
+      const matrix = node.getWorldMatrix();
+      const local = node.getMesh()!.listPrimitives()[0]!.getAttribute("NORMAL")!.getElement(0, []);
+      // This fixture has no rotation; inverse-transpose is diagonal in glTF's Y,Z,-X basis.
+      const world = [local[0]! / matrix[0]!, local[1]! / matrix[5]!, local[2]! / matrix[10]!];
+      const length = Math.hypot(...world);
+      const expected = [normalY, normalZ, -Math.sign(scaleX) * normalX];
+      world.forEach((value, axis) => expect(value / length, `scale ${scaleX}, world normal axis ${axis}`).toBeCloseTo(expected[axis]!, 5));
+    }
+    expect(() => run("landscape", file, `${textureWidth}x${textureHeight}`, `${componentSizeQuads}`, `${subsectionSizeQuads}`, `${numSubsections}`, `${biasX}`, `${biasY}`, "0", "3", "5")).toThrow();
+
   });
 
   it("decodes a mesh description in the established FName layout", async () => {

@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.9",
+  version: "b4e95441+threenative.584.9.1",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3679,6 +3679,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     transform *= parentComponent.GetRelativeTransform();
                     parentComponent = parentComponent.GetOrDefault<FPackageIndex?>("AttachParent")?.Load<USceneComponent>();
                 }
+                try { decoded = (decoded.Heights, LandscapeLocalNormals(decoded.Normals, transform.Scale3D.X, transform.Scale3D.Y, transform.Scale3D.Z)); }
+                catch (InvalidDataException error) { OmitLandscape(proxyName, componentName, error.Message); continue; }
                 var rotation = transform.Rotator();
                 var landscapeGuid = proxy.LandscapeGuid.ToString();
                 var materialName = component.OverrideMaterial is { IsNull: false } overrideMaterial
@@ -4852,6 +4854,27 @@ static (float[] Heights, float[] Normals) DecodeLandscapeHeightfield(
     return (heights, normals);
 }
 
+// UE uses LocalToWorldNoScaling for packed landscape normals. Cancel glTF's inverse
+// scale using magnitudes only: RemoveScaling retains mirrored basis signs.
+static float[] LandscapeLocalNormals(float[] packed, float scaleX, float scaleY, float scaleZ)
+{
+    if (!float.IsFinite(scaleX) || !float.IsFinite(scaleY) || !float.IsFinite(scaleZ) || scaleX == 0 || scaleY == 0 || scaleZ == 0)
+        throw new InvalidDataException("landscape normal transform has invalid or zero world scale");
+    var output = new float[packed.Length];
+    for (var i = 0; i < packed.Length; i += 3)
+    {
+        var x = (double) packed[i] * Math.Abs((double) scaleX);
+        var y = (double) packed[i + 1] * Math.Abs((double) scaleY);
+        var z = (double) packed[i + 2] * Math.Abs((double) scaleZ);
+        var length = Math.Sqrt(x*x + y*y + z*z);
+        if (!double.IsFinite(length) || length == 0) throw new InvalidDataException("landscape packed normal is invalid or zero");
+        output[i] = (float) (x / length);
+        output[i + 1] = (float) (y / length);
+        output[i + 2] = (float) (z / length);
+    }
+    return output;
+}
+
 static int LandscapeRoundToInt(float value)
 {
     if (!float.IsFinite(value)) throw new InvalidDataException("landscape heightmap scale bias is not finite");
@@ -4919,9 +4942,10 @@ static bool TryReadLandscapeSourcePixels(UTexture2D texture, byte[]? packageByte
         raw = sourceArt;
     if (raw is null && packageBytes is not null)
     {
-        foreach (var (at, rawSize) in ScanEditorPayloads(packageBytes))
+        var candidates = ScanEditorPayloads(packageBytes).Where(entry => entry.RawSize == (ulong) total).ToArray();
+        if (candidates.Length > 1) { refusal = $"ambiguous editor source: {candidates.Length} payloads of {total} bytes"; return false; }
+        foreach (var (at, rawSize) in candidates)
         {
-            if (rawSize != (ulong) total) continue;
             try
             {
                 using var archive = new FByteArchive("landscape-editor-payload", packageBytes);
