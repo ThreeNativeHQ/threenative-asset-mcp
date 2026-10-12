@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.8.3",
+  version: "b4e95441+threenative.584.8.4",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2440,16 +2440,27 @@ static float[]? ReadStaticMeshBuildScale(UStaticMesh mesh)
         : null;
 }
 
-static uint? ReadStaticMeshBulkFlags(byte[] bytes, int exportAt, long validPos, AbstractUePackage package, VersionContainer versions)
+static (uint Flags, byte[] ContentHash, long PayloadSize, long? PayloadOffset)? ReadStaticMeshBulkHeader(byte[] bytes, int exportAt, long validPos, AbstractUePackage package, VersionContainer versions)
 {
     try
     {
-        // FEditorBulkData follows the UObject tagged properties and optional object GUID.
         using var archive = new FAssetArchive(new FByteArchive("static-mesh-bulk-object", bytes, versions), package);
+        if (exportAt < 0 || validPos > bytes.Length || exportAt >= validPos) return null;
         archive.Position = exportAt;
         new UObject().Deserialize(archive, validPos);
-        if (archive.Position > bytes.Length - 4) return null;
-        return BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(checked((int)archive.Position), 4));
+        // FEditorBulkData serializes flags, GUID, FSHAHash (20 bytes), size, then an optional inline offset.
+        if (archive.Position > validPos - 48) return null;
+        var flags = archive.Read<uint>();
+        archive.Read<FGuid>();
+        var contentHash = archive.ReadBytes(20);
+        var payloadSize = archive.Read<long>();
+        long? payloadOffset = null;
+        if ((flags & (1u | 512u | 1024u)) == 0)
+        {
+            if (archive.Position > validPos - 8) return null;
+            payloadOffset = archive.Read<long>();
+        }
+        return (flags, contentHash, payloadSize, payloadOffset);
     }
     catch { return null; }
 }
@@ -2483,24 +2494,14 @@ static byte[]? ReadStaticMeshSourcePayload(FPackageIndex? reference)
         return null;
     var bytes = file.Read();
     var export = package.ExportMap[resolved.ExportIndex];
-    if (export.SerialOffset < 0 || export.SerialOffset > bytes.Length - 56) return null;
+    if (export.SerialOffset < 0 || export.SerialOffset >= bytes.Length) return null;
     var exportAt = checked((int)export.SerialOffset);
-    var decodedFlags = ReadStaticMeshBulkFlags(bytes, exportAt, export.SerialOffset + export.SerialSize, package, provider.Versions);
-    if (decodedFlags is not { } flags) return null;
-    var hashAt = exportAt + 20;
-    var hashLength = 32;
-    var sizeAt = exportAt + 52;
-    var payloadSize = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt, 8));
-    // UE5.1+ serializes FIoHash as 32 bytes; older editor packages used the 20-byte hash directly.
-    if (payloadSize < 0 || payloadSize > 1_073_741_824L)
-    {
-        hashLength = 20;
-        sizeAt = exportAt + 40;
-        if (export.SerialSize < 49 || sizeAt > bytes.Length - 8) return null;
-        payloadSize = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt, 8));
-    }
-    if (payloadSize <= 0 || hashAt > bytes.Length - hashLength) return null;
-    var contentHash = bytes.AsSpan(hashAt, hashLength);
+    var decodedHeader = ReadStaticMeshBulkHeader(bytes, exportAt, export.SerialOffset + export.SerialSize, package, provider.Versions);
+    if (decodedHeader is not { } header) return null;
+    var flags = header.Flags;
+    var payloadSize = header.PayloadSize;
+    if (payloadSize <= 0 || payloadSize > 1_073_741_824L) return null;
+    var contentHash = header.ContentHash.AsSpan();
     long payloadAt = -1;
     // UE5.1 editor packages mark this record as a legacy-file reference even though the compressed
     // payload is indexed by the package trailer. Prefer that exact hash lookup whenever a trailer
@@ -2530,8 +2531,8 @@ static byte[]? ReadStaticMeshSourcePayload(FPackageIndex? reference)
             cursor += entrySize;
         }
     }
-    if (payloadAt < 0 && (flags & 1u) == 0 && sizeAt + 16 <= bytes.Length)
-        payloadAt = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt + 8, 8));
+    if (payloadAt < 0 && (flags & 1u) == 0 && header.PayloadOffset is { } inlineOffset)
+        payloadAt = inlineOffset;
     if (payloadAt < 0 || payloadAt > bytes.Length - 64) return null;
     try
     {

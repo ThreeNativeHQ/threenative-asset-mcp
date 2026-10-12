@@ -36,7 +36,7 @@ compiled converter gate.
 
 ## Remaining work
 
-- Repaired `.584.8.3` fresh World Partition and Hornbeam gates pass. Parent still owns all four final-head repository gates, CI and delivery. Earlier `.584.8.1` and `.584.8.2` repository evidence remains prior-head evidence; there is no external input blocker.
+- Repaired `.584.8.4` fresh World Partition and Hornbeam gates pass; final focused checks are recorded below. Parent still owns all four final-head repository gates, CI and delivery. Earlier `.584.8.1` and `.584.8.2` repository evidence remains prior-head evidence; there is no external input blocker.
 
 ## Integration Ledger
 
@@ -123,3 +123,19 @@ Verification on `.584.8.3`:
 - Modern Hornbeam LOD guard: 1/1 passes in 49.29s, with unchanged triangle counts 115,674 / 41,543 / 15,076 for requested LOD0/1/2. Log: `raw/598-release83-hornbeam.log`. Typecheck, JavaScript build and whitespace checks pass. Converter publish used only the existing PRD-598 source/bin cache and read the shared SDK; no other lane was edited.
 
 No full-suite, leak-gate, packed-MCP or final CI pass is claimed for this repair. Those remain the parent's delivery checks. All lane builds and real runs are finished and released for parent use; this checkout stays available for the active PR-51 delivery.
+
+## Bulk-header root-cause replan and repair
+
+**Release:** Unreleased — converter `b4e95441+threenative.584.8.4`; importer remains `121`. Parent owns fresh final repository gates, CI and propagation to PRD-599.
+
+The `.584.8.3` repair parsed the UObject preamble only for flags, while hash, raw size and inline offset still used fixed offsets from the export start. Its 32-byte-hash comment was incorrect: those bytes combined 12 bytes of the bulk GUID with the actual 20-byte FSHAHash. The official `EditorBulkData.cpp:1043-1055` sequence and pinned CUE4Parse `FEditorBulkData.cs:51-54` agree: flags, 16-byte GUID, 20-byte content hash and 8-byte raw size follow the UObject body. Official loading code reads an inline offset only for records outside the trailer that are neither virtualized nor cooked.
+
+The shared production `ReadStaticMeshBulkHeader` uses shipped `UObject.Deserialize` and archive reads for the complete header, bounds every bulk field by the export serial end and actual byte length, and returns the parsed fields to the payload consumer. There are no preamble-offset guesses or invented field defaults. Exact modern trailer hash selection, legacy inline identity, named unique legacy fallback/ambiguity refusal, higher-LOD identity and cooked scaling are preserved. Parent's cache-release marker was present before edits/build; only the PRD-598 private native cache was rebuilt.
+
+Compiled production-parser RED: valid empty-None/no-GUID and object-GUID-present preambles yield incorrect hash/size/offset under the old fixed-offset logic, while truncated serial bounds are accepted. The test compiles and fails on field assertions, not timeout/compilation. GREEN: all six static-mesh tests pass in 7.92s, including correct 20-byte hash, raw size, inline offset and truncated-export refusal, odd-None flags 64, and shipped legacy exporter/public relay. Local logs: `raw/598-header-{red,green}.log`.
+
+Fresh real WP proof: index `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index84.json`, new `final84/` outputs, 3/3 gates pass in 8.88s, restoring three native meshes and three public nodes at stored transforms. Log: `raw/598-release84-real-wp.log`. The earlier focused attempt overlapped provisioning and lost its assembly directory; after rebuilding, a missing FGuid import in the synthetic harness was fixed. Final checks are recorded below; neither attempt is claimed as passing.
+
+Modern Hornbeam guard passes 1/1 in 58.63s with selector `SM_EuropeanHornbeam_Sapling_01` against the default local pack and the rebuilt native executable (no alternate side binary), preserving triangle counts 115,674 / 41,543 / 15,076 for LOD0/1/2. Log: `raw/598-release84-hornbeam.log`. Typecheck and whitespace checks pass.
+
+Final default-worker focused run: all 168 tests across six files pass in 44.03s (static/source/header, external actors, instance parameters, graph dump, texture decode). Log: `raw/598-release84-final-focused.log`. No third review was run; parent owns fresh all-four repository gates/final CI and PRD-599 propagation.

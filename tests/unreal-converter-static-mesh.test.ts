@@ -205,7 +205,7 @@ sealed class SyntheticPositionBuffer : FPositionVertexBuffer
 
 const EDITOR_SOURCE = CUE4PARSE_PROGRAM.replace(/^\s*\/\/.*$/gm, "");
 const EDITOR_FUNCTIONS = [
-  "static uint? ReadStaticMeshBulkFlags(", "static EditorMesh? ReadUniqueLegacyLod0(",
+  "static (uint Flags, byte[] ContentHash, long PayloadSize, long? PayloadOffset)? ReadStaticMeshBulkHeader(", "static EditorMesh? ReadUniqueLegacyLod0(",
   "static byte[]? ReadStaticMeshSourcePayload(", "bool ExportEditorStaticMesh(",
   "static EditorMesh? ReadLargestMeshDescription(", "static List<(int At, ulong RawSize)> ScanEditorPayloads(",
   "static byte[] DecompressEditorPayload(", "static EditorMesh ReadMeshDescription(",
@@ -220,7 +220,8 @@ using System.Buffers.Binary;
 using System.Text;
 using System.Runtime.InteropServices;
 using CUE4Parse.Compression;
-using CUE4Parse.UE4.Objects.Core.Compression;`)
+using CUE4Parse.UE4.Objects.Core.Compression;
+using CUE4Parse.UE4.Objects.Core.Misc;`)
   .replace(/bool ExportEditorStaticMesh\(UStaticMesh mesh, FStaticMaterial\[\] materials, out StaticMeshMetadata\? metadata\)\n\{ throw new Exception\("unexpected editor fallback"\); \}/,
     `var provider = new FixtureProvider();\n${EDITOR_FUNCTIONS}`)
   .replace('if (args[0] == "scale")', `if (args[0] == "legacy")
@@ -238,13 +239,37 @@ using CUE4Parse.UE4.Objects.Core.Compression;`)
     if (success) await WriteMeshMetadataAsync(mesh.Name, metadata);
     Console.WriteLine(JsonSerializer.Serialize(new { success, metadata, reason = assetLookupDiagnostics.GetValueOrDefault(mesh.Name) }));
 }
+else if (args[0] == "header")
+{
+    var results = new List<object>();
+    foreach (var guidPresent in new[] { false, true })
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, Encoding.UTF8, true))
+        {
+            writer.Write(1); writer.Write(0); // None FName
+            writer.Write(guidPresent ? 1 : 0);
+            if (guidPresent) writer.Write(Enumerable.Range(1, 16).Select(i => (byte)i).ToArray());
+            writer.Write(64u);
+            writer.Write(Enumerable.Range(17, 16).Select(i => (byte)i).ToArray()); // bulk GUID
+            writer.Write(Enumerable.Range(33, 20).Select(i => (byte)i).ToArray());
+            writer.Write(123456789L);
+            writer.Write(987654321L);
+        }
+        var bytes = stream.ToArray();
+        var header = ReadStaticMeshBulkHeader(bytes, 0, bytes.Length, new SyntheticPackage(new[] { "Unused", "None" }), new VersionContainer(EGame.GAME_UE5_3));
+        var truncated = ReadStaticMeshBulkHeader(bytes, 0, bytes.Length - 1, new SyntheticPackage(new[] { "Unused", "None" }), new VersionContainer(EGame.GAME_UE5_3));
+        results.Add(new { flags = header?.Flags, hash = header is { } h ? Convert.ToHexString(h.ContentHash) : null, size = header?.PayloadSize, offset = header?.PayloadOffset, truncated = truncated is null });
+    }
+    Console.WriteLine(JsonSerializer.Serialize(results));
+}
 else if (args[0] == "flags")
 {
     var bytes = new byte[68];
     BinaryPrimitives.WriteInt32LittleEndian(bytes, 1); // odd None index, previously mistaken for virtualized flags
     BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(12), 64);
-    var flags = ReadStaticMeshBulkFlags(bytes, 0, bytes.Length, new SyntheticPackage(new[] { "Unused", "None" }), new VersionContainer(EGame.GAME_UE5_3));
-    Console.WriteLine(JsonSerializer.Serialize(new { flags }));
+    var header = ReadStaticMeshBulkHeader(bytes, 0, bytes.Length, new SyntheticPackage(new[] { "Unused", "None" }), new VersionContainer(EGame.GAME_UE5_3));
+    Console.WriteLine(JsonSerializer.Serialize(new { flags = header?.Flags }));
 }
 else if (args[0] == "scale")`)
   + `\n${EDITOR_RECORD.slice(0, EDITOR_RECORD.indexOf(");") + 2)}
@@ -287,6 +312,16 @@ describeWithTools(["modern-converter"], "native UE5 static mesh source and cooke
     });
     return result;
   }
+
+  it("reads the complete bulk header after variable UObject preambles within export bounds", async () => {
+    expect(editorBuild.code, editorBuild.output).toBe(0);
+    const result = await runBounded(sdk, [editorBuild.dll, "header"], { timeoutMs: 30_000, environment: childEnvironment(process.env) });
+    expect(result.code, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([false, true].map(() => ({
+      flags: 64, hash: Buffer.from(Array.from({ length: 20 }, (_, i) => i + 33)).toString("hex").toUpperCase(),
+      size: 123456789, offset: 987654321, truncated: true,
+    })));
+  });
 
   it("reads bulk flags after serialized UObject properties rather than the odd None name index", async () => {
     expect(editorBuild.code, editorBuild.output).toBe(0);
