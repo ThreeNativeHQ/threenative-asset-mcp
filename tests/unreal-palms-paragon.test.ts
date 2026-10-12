@@ -175,7 +175,10 @@ describe("an override that points outside the pack supersedes the ancestor defau
 // source model's BuildScale3D (8, 8, 8 here) when it builds the render data. The GLB came out 8x too small.
 
 /** A UE4.19-shaped package: a real summary up to the name table, then one StaticMesh-like tagged property block. */
-function buildPackage(scales: readonly (readonly [number, number, number])[], options: { hasGuid?: boolean; withProperty?: boolean; ue5?: boolean } = {}): Buffer {
+function buildPackage(
+  scales: readonly (readonly [number, number, number])[],
+  options: { hasGuid?: boolean; withProperty?: boolean; ue5?: boolean; profile?: "ue54" | "ue55" } = {},
+): Buffer {
   const names = ["None", "StaticMesh", "BuildSettings", "BuildScale3D", "StructProperty", "Vector", "bUseHighPrecisionTangentBasis"];
   const fstring = (text: string): Buffer => {
     const raw = Buffer.from(`${text}\0`, "utf8");
@@ -189,15 +192,23 @@ function buildPackage(scales: readonly (readonly [number, number, number])[], op
     out.writeInt32LE(value);
     return out;
   };
-  // UE5 (legacy -8) adds the UE5 file version after the UE4 one.
-  const versions = options.ue5 ? [i32(-8), i32(864), i32(522), i32(1009), i32(0)] : [i32(-7), i32(864), i32(516), i32(0)];
+  // UE5 (legacy -8) adds the UE5 file version after the UE4 one. UE5.4's tag 1012 and UE5.5's
+  // legacy -9 deliberately have no tagged BuildScale3D property: the modern converter sidecar is
+  // the only authoritative source for those routes.
+  const versions = options.profile === "ue54"
+    ? [i32(-8), i32(864), i32(522), i32(1012), i32(0)]
+    : options.profile === "ue55"
+      ? [i32(-9), i32(864), i32(522), i32(1016), i32(0)]
+      : options.ue5
+        ? [i32(-8), i32(864), i32(522), i32(1009), i32(0)]
+        : [i32(-7), i32(864), i32(516), i32(0)];
   const summaryLength = 4 + versions.length * 4 + 4 /* custom versions */ + 4 /* header size */ + folder.length + 4 /* flags */ + 4 + 4;
   const table = Buffer.concat(names.flatMap((name) => [fstring(name), Buffer.alloc(4)]));
   const header = Buffer.concat([
     i32(0x9e2a83c1 | 0), ...versions, i32(0), i32(summaryLength + table.length), folder, i32(0), i32(names.length), i32(summaryLength),
   ]);
   const name = (text: string): Buffer => Buffer.concat([i32(names.indexOf(text)), i32(0)]);
-  const tags = scales.map((scale) =>
+  const tags = options.profile ? [] : scales.map((scale) =>
     Buffer.concat([
       // UE5's large-world-coordinate FVector is three doubles.
       name("BuildScale3D"), name("StructProperty"), i32(options.ue5 ? 24 : 12), i32(0), name("Vector"), Buffer.alloc(16), Buffer.from([options.hasGuid ? 1 : 0]),
@@ -308,7 +319,13 @@ const argv = process.argv.slice(2);
 if (argv.includes("--version")) { process.stdout.write("fake-modern 1\\n"); process.exit(0); }
 const out = argv[argv.indexOf("--export-dir") + 1];
 fs.mkdirSync(join(out, "Meshes"), { recursive: true });
-fs.copyFileSync(${JSON.stringify(glb)}, join(out, "Meshes", "Mesh.glb"));
+      fs.copyFileSync(${JSON.stringify(glb)}, join(out, "Meshes", "Mesh.glb"));
+      fs.writeFileSync(join(out, "Meshes", "Mesh.metadata.json"), JSON.stringify({
+        format: "threenative-static-mesh-metadata",
+        version: 1,
+        buildScale3D: ${JSON.stringify(scale)},
+        lods: [{ lod: 0, status: "payload" }],
+      }));
 `,
     );
     await chmod(converter, 0o755);
@@ -333,6 +350,52 @@ fs.copyFileSync(${JSON.stringify(glb)}, join(out, "Meshes", "Mesh.glb"));
     expect(report.models[0]?.boundsMetres).toEqual([3, 10, 0]);
     expect(report.warnings.join("\n")).toContain("BuildScale3D (2, 3, 5)");
   });
+
+  for (const [label, profile] of [["UE5.4 tag 1012", "ue54"], ["UE5.5 legacy -9", "ue55"]] as const) {
+    it(`takes BuildScale3D from converter metadata for ${label}`, async () => {
+      const root = await scratch("build-scale-ue5-modern-");
+      const sourceDir = join(root, "source");
+      const content = join(sourceDir, "Content", "Test");
+      await mkdir(content, { recursive: true });
+      await writeFile(join(content, "Mesh.uasset"), buildPackage([], { profile }));
+      const document = new Document();
+      const buffer = document.createBuffer();
+      const position = document.createAccessor("POSITION").setType("VEC3").setArray(new Float32Array([0, 0, 0, 1, 0, 0, 0, 2, 0])).setBuffer(buffer);
+      const primitive = document.createPrimitive().setAttribute("POSITION", position).setMaterial(document.createMaterial("M_Plain"));
+      document.createScene().addChild(document.createNode("Mesh").setMesh(document.createMesh("Mesh").addPrimitive(primitive)));
+      const glb = join(root, "Mesh.glb");
+      await new NodeIO().write(glb, document);
+      const converter = join(root, "converter");
+      await writeFile(
+        converter,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const argv = process.argv.slice(2);
+if (argv.includes("--version")) { process.stdout.write("fake-modern 1\\n"); process.exit(0); }
+const out = argv[argv.indexOf("--export-dir") + 1];
+fs.mkdirSync(path.join(out, "Meshes"), { recursive: true });
+fs.copyFileSync(${JSON.stringify(glb)}, path.join(out, "Meshes", "Mesh.glb"));
+fs.writeFileSync(path.join(out, "Meshes", "Mesh.metadata.json"), JSON.stringify({ format: "threenative-static-mesh-metadata", version: 1, buildScale3D: [2, 2, 2], lods: [{ lod: 0, status: "payload" }] }));
+`,
+      );
+      await chmod(converter, 0o755);
+      const umodel = join(root, "umodel");
+      await writeFakeUmodel(umodel, { classes: { Mesh: ["StaticMesh"] }, listExitCode: 1 });
+      const report = await importUnrealDirectory({
+        sourceDir,
+        outputDir: join(root, "output"),
+        concurrency: 1,
+        freeSpaceBytes: 30_000_000_000,
+        graphBake: false,
+        environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache"), THREENATIVE_TOOLCHAIN_DIR: join(root, "toolchain") },
+        umodel: { name: "umodel", path: umodel, version: "fixture" },
+        modernConverter: { name: "modern", path: converter, version: "fake-modern 1" },
+      });
+      expect(report.models[0]?.boundsMetres).toEqual([2, 4, 0]);
+      expect(report.warnings.join("\n")).toContain("BuildScale3D (2, 2, 2)");
+    });
+  }
 
   it("leaves a mesh without the property exactly as exported", async () => {
     const { max, report } = await importMesh([1, 1, 1]);

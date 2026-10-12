@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.4",
+  version: "b4e95441+threenative.584.7",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -769,7 +769,7 @@ if (dataTextureAt >= 0)
         throw new ArgumentException($"--data-texture is not a relative package key: {dataTextureSelector}");
     dataTextureKey = dataTextureSelector + ".uasset";
 }
-// Source-model LODs of a skeletal mesh to export, as indices into its source model array.
+// Source-model LODs of a static or skeletal mesh to export, as indices into its source model array.
 var lodsAt = Array.IndexOf(args, "--lods");
 var requestedLods = lodsAt >= 0
     ? args[lodsAt + 1].Split(',', StringSplitOptions.RemoveEmptyEntries)
@@ -2167,6 +2167,19 @@ async Task WriteMeshMaterialPackagesAsync(string meshName, IEnumerable<FPackageI
     await File.WriteAllTextAsync(Path.Combine(output, "Meshes", meshName + ".materials.json"), JsonConvert.SerializeObject(known2));
 }
 
+async Task WriteMeshMetadataAsync(string meshName, StaticMeshMetadata metadata)
+{
+    await File.WriteAllTextAsync(
+        Path.Combine(output, "Meshes", meshName + ".metadata.json"),
+        JsonConvert.SerializeObject(new
+        {
+            format = "threenative-static-mesh-metadata",
+            version = 1,
+            buildScale3D = metadata.BuildScale3D,
+            lods = metadata.Lods.Select(lod => new { lod = lod.Lod, status = lod.Status, reason = lod.Reason }).ToArray(),
+        }));
+}
+
 // A refused material is recorded by its identity and fails the conversion at completion. The reason is flattened and bounded like
 // a mesh failure, so a long CUE4Parse message cannot grow the report.
 void RecordMaterialFailure(string identity, string reason)
@@ -2319,11 +2332,10 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
     var staticMaterials = mesh.StaticMaterials.Length > 0
         ? mesh.StaticMaterials
         : mesh.GetOrDefault("StaticMaterials", Array.Empty<FStaticMaterial>());
+    StaticMeshMetadata? metadata;
     if (mesh.RenderData?.LODs is not { Length: > 0 })
     {
-        // Uncooked editor mesh: no render data, only the source model. Decode LOD0's
-        // FMeshDescription from the package trailer instead.
-        if (!ExportEditorStaticMesh(mesh, staticMaterials, target))
+        if (!ExportEditorStaticMesh(mesh, staticMaterials, out metadata))
         {
             exportedMeshes.Remove(identity);
             meshFailures[mesh.Name] = assetLookupDiagnostics.GetValueOrDefault(mesh.Name, "the uncooked static mesh could not be decoded");
@@ -2332,28 +2344,140 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
     }
     else
     {
+        // EMeshQuality.Highest is the export default and drops every lower source-model LOD.
+        var quality = requestedLods.Any(lod => lod > 0) ? EMeshQuality.All : EMeshQuality.Highest;
         var session = new ExportSession { MaxDegreeOfParallelism = 1 };
         session.Add(mesh);
-        var results = await session.RunAsync(output, new ExportOptions(meshFormat: EMeshFormat.Gltf2, exportMaterials: false));
-        var emitted = results.SelectMany(result => result.DiskFilePaths ?? [])
-            .FirstOrDefault(path => path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase));
-        if (emitted is null || !File.Exists(emitted))
+        var results = await session.RunAsync(output, new ExportOptions(meshFormat: EMeshFormat.Gltf2, exportMaterials: false, meshQuality: quality));
+        var wanted = requestedLods.ToHashSet();
+        var glbByLod = new Dictionary<int, string>();
+        foreach (var path in results.SelectMany(result => result.DiskFilePaths ?? []).Where(path => path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)))
+        {
+            var stem = Path.GetFileNameWithoutExtension(path);
+            var marker = stem.LastIndexOf("_LOD", StringComparison.Ordinal);
+            var lod = marker < 0 || !int.TryParse(stem[(marker + 4)..], out var parsed) ? 0 : parsed;
+            if (wanted.Contains(lod)) glbByLod[lod] = path;
+        }
+        if (glbByLod.Count == 0)
         {
             exportedMeshes.Remove(identity);
             RecordMeshFailure(mesh.Name, "static mesh", results);
             return false;
         }
-        if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
+        foreach (var (lod, path) in glbByLod)
+        {
+            var lodTarget = Path.Combine(output, "Meshes", lod == 0 ? mesh.Name + ".glb" : mesh.Name + "_LOD" + lod + ".glb");
+            if (!Path.GetFullPath(path).Equals(Path.GetFullPath(lodTarget), StringComparison.OrdinalIgnoreCase)) File.Move(path, lodTarget, true);
+        }
+        metadata = new StaticMeshMetadata(ReadStaticMeshBuildScale(mesh), glbByLod.Keys.OrderBy(lod => lod).Select(lod => new StaticMeshLodMetadata(lod, "payload", null)).ToArray());
     }
     meshFailures.Remove(mesh.Name);
+    await WriteMeshMetadataAsync(mesh.Name, metadata!);
     await WriteMeshMaterialPackagesAsync(mesh.Name, staticMaterials.Select(slot => slot.MaterialInterface));
     foreach (var slot in staticMaterials.Where(slot => !string.IsNullOrWhiteSpace(slot.MaterialInterface?.Name)))
         await ExportMaterialAsync(slot.MaterialInterface!.Name, IndexPackagePath(slot.MaterialInterface));
     return true;
 }
 
-bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials, string target)
+static float[]? ReadStaticMeshBuildScale(UStaticMesh mesh)
 {
+    var source = (mesh.GetOrDefault<FStructFallback[]>("SourceModels") ?? Array.Empty<FStructFallback>()).FirstOrDefault();
+    var settings = source?.GetOrDefault<FScriptStruct>("BuildSettings")?.StructType;
+    var scale = settings is FStructFallback buildSettings
+        ? buildSettings.GetOrDefault<FScriptStruct>("BuildScale3D")?.StructType
+        : settings;
+    FVector value;
+    if (scale is FVector vector)
+    {
+        value = vector;
+    }
+    else if (scale is FStructFallback fallback)
+    {
+        value = new FVector(fallback.GetOrDefault<float>("X"), fallback.GetOrDefault<float>("Y"), fallback.GetOrDefault<float>("Z"));
+    }
+    else
+    {
+        return null;
+    }
+    return float.IsFinite(value.X) && float.IsFinite(value.Y) && float.IsFinite(value.Z) && value.X > 0 && value.Y > 0 && value.Z > 0
+        ? new[] { value.X, value.Y, value.Z }
+        : null;
+}
+
+static byte[]? ReadStaticMeshSourcePayload(FPackageIndex? reference)
+{
+    if (reference is null || reference.IsNull || reference.ResolvedObject is not { } resolved || resolved.Package is not Package package || resolved.ExportIndex < 0 || resolved.ExportIndex >= package.ExportMap.Length)
+        return null;
+    var provider = package.Provider;
+    if (provider is null || !provider.Files.TryGetValue(package.Name + ".uasset", out var file) || file.Size > 2_000_000_000L)
+        return null;
+    var bytes = file.Read();
+    var export = package.ExportMap[resolved.ExportIndex];
+    if (export.SerialOffset < 0 || export.SerialOffset > bytes.Length - 56) return null;
+    var exportAt = checked((int)export.SerialOffset);
+    var flags = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(exportAt, 4));
+    var hashAt = exportAt + 20;
+    var hashLength = 32;
+    var sizeAt = exportAt + 52;
+    var payloadSize = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt, 8));
+    // UE5.1+ serializes FIoHash as 32 bytes; older editor packages used the 20-byte hash directly.
+    if (payloadSize < 0 || payloadSize > 1_073_741_824L)
+    {
+        hashLength = 20;
+        sizeAt = exportAt + 40;
+        if (export.SerialSize < 49 || sizeAt > bytes.Length - 8) return null;
+        payloadSize = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt, 8));
+    }
+    if (payloadSize <= 0 || hashAt > bytes.Length - hashLength) return null;
+    var contentHash = bytes.AsSpan(hashAt, hashLength);
+    long payloadAt = -1;
+    // UE5.1 editor packages mark this record as a legacy-file reference even though the compressed
+    // payload is indexed by the package trailer. Prefer that exact hash lookup whenever a trailer
+    // exists; only fall back to the inline offset for older non-virtualized records.
+    var trailerAt = package.Summary.PayloadTocOffset;
+    if (trailerAt > 0 && trailerAt <= bytes.Length - 28)
+    {
+        var trailer = checked((int)trailerAt);
+        var version = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(trailer + 8, 4));
+        var headerLength = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(trailer + 12, 4));
+        var count = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(trailer + 24, 4));
+        if (headerLength < 28 || count < 0 || count > 10_000 || trailerAt + headerLength > bytes.Length) return null;
+        var cursor = trailer + 28;
+        var entrySize = version >= 2 ? 49 : version == 1 ? 45 : 44;
+        var trailerHash = contentHash.Slice(contentHash.Length - 20, 20);
+        for (var index = 0; index < count; index++)
+        {
+            if (cursor > bytes.Length - entrySize) return null;
+            if (bytes.AsSpan(cursor, 20).SequenceEqual(trailerHash))
+            {
+                var offset = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(cursor + 20, 8));
+                var access = version >= 2 ? bytes[cursor + 48] : version == 1 ? bytes[cursor + 44] : (byte)0;
+                if (offset >= 0 && access == 0) payloadAt = trailerAt + headerLength + offset;
+                break;
+            }
+            cursor += entrySize;
+        }
+    }
+    if (payloadAt < 0 && (flags & 1u) == 0 && sizeAt + 16 <= bytes.Length)
+        payloadAt = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(sizeAt + 8, 8));
+    if (payloadAt < 0 || payloadAt > bytes.Length - 64) return null;
+    try
+    {
+        using var archive = new FByteArchive("static-mesh-editor-payload", bytes);
+        archive.Position = payloadAt;
+        var compressed = new FCompressedBuffer(archive);
+        if (compressed.Header.TotalRawSize != (ulong)payloadSize) return null;
+        return DecompressEditorPayload(compressed);
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials, out StaticMeshMetadata metadata)
+{
+    metadata = new StaticMeshMetadata(ReadStaticMeshBuildScale(mesh), Array.Empty<StaticMeshLodMetadata>());
     // Same-named meshes in different folders: prefer the key whose last two path segments match
     // the owning package's.
     var packageTail = string.Join('/', (mesh.Owner?.Name ?? mesh.Name).Split('/').TakeLast(2));
@@ -2372,24 +2496,67 @@ bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials,
     // a payload with a stale tail through (see ReadMeshDescription).
     var cachedTriangles = (int)((mesh.GetOrDefault<FStructFallback[]>("SourceModels") ?? Array.Empty<FStructFallback>())
         .FirstOrDefault()?.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount") ?? 0);
-    var editorMesh = ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles);
-    if (editorMesh is null)
+    var sourceModels = mesh.GetOrDefault<FStructFallback[]>("SourceModels") ?? Array.Empty<FStructFallback>();
+    if (sourceModels.Length == 0)
     {
-        assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model" + (refusal is null ? "" : $" ({refusal})");
-        return false;
+        var editorMesh = ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles);
+        if (editorMesh is null)
+        {
+            assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model" + (refusal is null ? "" : $" ({refusal})");
+            return false;
+        }
+        var materialNames = editorMesh.GroupSlots.Select((slot, index) =>
+        {
+            var match = staticMaterials.FirstOrDefault(material =>
+                string.Equals(material.ImportedMaterialSlotName?.Text, slot, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(material.MaterialSlotName.Text, slot, StringComparison.OrdinalIgnoreCase))
+                ?? (index < staticMaterials.Length ? staticMaterials[index] : null);
+            return match?.MaterialInterface?.Name ?? match?.ImportedMaterialSlotName?.Text ?? slot;
+        }).ToArray();
+        WriteEditorMeshGlb(editorMesh, materialNames, mesh.Name, Path.Combine(output, "Meshes", mesh.Name + ".glb"));
+        metadata = new StaticMeshMetadata(metadata.BuildScale3D, new[] { new StaticMeshLodMetadata(0, "payload", null) });
+        return File.Exists(Path.Combine(output, "Meshes", mesh.Name + ".glb"));
     }
-    // Same material naming as the cooked glTF writer (MeshMaterialDto.SlotName): the material
-    // interface's name, else the imported slot name.
-    var materialNames = editorMesh.GroupSlots.Select((slot, index) =>
+
+    var wanted = requestedLods.ToHashSet();
+    var lodMetadata = new List<StaticMeshLodMetadata>();
+    var exported = 0;
+    foreach (var (lod, sourceModel) in sourceModels.Select((sourceModel, lod) => (lod, sourceModel)))
     {
-        var match = staticMaterials.FirstOrDefault(material =>
-            string.Equals(material.ImportedMaterialSlotName?.Text, slot, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(material.MaterialSlotName.Text, slot, StringComparison.OrdinalIgnoreCase))
-            ?? (index < staticMaterials.Length ? staticMaterials[index] : null);
-        return match?.MaterialInterface?.Name ?? match?.ImportedMaterialSlotName?.Text ?? slot;
-    }).ToArray();
-    WriteEditorMeshGlb(editorMesh, materialNames, mesh.Name, target);
-    return File.Exists(target);
+        var payload = ReadStaticMeshSourcePayload(sourceModel.GetOrDefault<FPackageIndex>("StaticMeshDescriptionBulkData"));
+        if (payload is null)
+        {
+            lodMetadata.Add(new StaticMeshLodMetadata(lod, "generated", "generated by Unreal at build time; not decoded"));
+            continue;
+        }
+        EditorMesh editorMesh;
+        try
+        {
+            var cached = (int)sourceModel.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount");
+            editorMesh = ReadMeshDescription(payload, cached);
+        }
+        catch (Exception error)
+        {
+            lodMetadata.Add(new StaticMeshLodMetadata(lod, "unreadable", error.Message));
+            if (lod == 0 && wanted.Contains(0)) assetLookupDiagnostics[mesh.Name] = $"LOD0 MeshDescription could not be decoded ({error.Message})";
+            continue;
+        }
+        lodMetadata.Add(new StaticMeshLodMetadata(lod, "payload", null));
+        if (!wanted.Contains(lod)) continue;
+        var materialNames = editorMesh.GroupSlots.Select((slot, index) =>
+        {
+            var match = staticMaterials.FirstOrDefault(material =>
+                string.Equals(material.ImportedMaterialSlotName?.Text, slot, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(material.MaterialSlotName.Text, slot, StringComparison.OrdinalIgnoreCase))
+                ?? (index < staticMaterials.Length ? staticMaterials[index] : null);
+            return match?.MaterialInterface?.Name ?? match?.ImportedMaterialSlotName?.Text ?? slot;
+        }).ToArray();
+        var lodTarget = Path.Combine(output, "Meshes", lod == 0 ? mesh.Name + ".glb" : mesh.Name + "_LOD" + lod + ".glb");
+        WriteEditorMeshGlb(editorMesh, materialNames, mesh.Name + (lod == 0 ? "" : "_LOD" + lod), lodTarget);
+        if (File.Exists(lodTarget)) exported++;
+    }
+    metadata = new StaticMeshMetadata(metadata.BuildScale3D, lodMetadata.ToArray());
+    return exported > 0;
 }
 
 T? LoadAssetByName<T>(string name) where T : UObject
@@ -6211,6 +6378,8 @@ sealed record EditorMesh(
     int[] TriangleGroups,
     bool[] LiveTriangles,
     string[] GroupSlots);
+sealed record StaticMeshLodMetadata(int Lod, string Status, string? Reason);
+sealed record StaticMeshMetadata(float[]? BuildScale3D, StaticMeshLodMetadata[] Lods);
 sealed record Rgba16fSourceArt(string Format, int SizeX, int SizeY, int NumSlices, int NumMips, bool PngCompressed, string? Compression, bool Srgb, long ElementCount, byte[]? Bytes);
 sealed record Rgba16fDataTexture(int Width, int Height, byte[] Bytes);
 sealed record Rgba16fPackage(string Key, string PackageKey, Dictionary<string, string> Sidecars);
