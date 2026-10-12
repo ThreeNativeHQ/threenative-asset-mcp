@@ -83,9 +83,39 @@ using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Assets.Objects;
+using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse_Conversion.Animations;
 using CUE4Parse_Conversion.Writers.ActorX.Structs.Animations;
+
+if (args.Contains("--frame-rates"))
+{
+    UObject Rate(int numerator, int? denominator)
+    {
+        var fields = new List<FPropertyTag> { new() { Name = new FName("Numerator"), Tag = new IntProperty(numerator) } };
+        if (denominator is { } value) fields.Add(new FPropertyTag { Name = new FName("Denominator"), Tag = new IntProperty(value) });
+        var scene = new UObject();
+        scene.Properties.Add(new FPropertyTag { Name = new FName("DisplayRate"), Tag = new StructProperty(new FScriptStruct(new FStructFallback(fields))) });
+        return scene;
+    }
+    foreach (var property in new[] { "DisplayRate", "TickResolution" })
+    {
+        var omitted = Rate(30, null);
+        omitted.Properties[0].Name = new FName(property);
+        if (!SequencerFrameRate(omitted, property, out var n, out var d, out var reason) || n != 30 || d != 1)
+            throw new Exception("Omitted denominator must use Unreal's 1 default: " + reason);
+        foreach (var invalidDenominator in new[] { 0, -1 })
+        {
+            var scene = Rate(30, invalidDenominator); scene.Properties[0].Name = new FName(property);
+            if (SequencerFrameRate(scene, property, out _, out _, out _)) throw new Exception("Explicit invalid denominator was accepted");
+        }
+        var rational = Rate(30000, 1001); rational.Properties[0].Name = new FName(property);
+        if (!SequencerFrameRate(rational, property, out n, out d, out reason) || n != 30000 || d != 1001)
+            throw new Exception("Rational rate was not preserved: " + reason);
+    }
+    Console.WriteLine("frame-rate defaults passed");
+    return;
+}
 
 if (args.Contains("--additive"))
 {
@@ -300,6 +330,10 @@ sealed class SkeletonExport(IPackage package) : ResolvedObject(package, 0) {
     expect(values[11]).toBe(99);
     expect(values[12]).toBeCloseTo(5, 5);
     expect(invalidReason).toMatch(/unsupported interpolation mode 99/);
+  });
+
+  it("uses the engine default only for an omitted frame-rate denominator", () => {
+    expect(execFileSync(sdk, [runner, "--frame-rates"], { encoding: "utf8" }).trim()).toBe("frame-rate defaults passed");
   });
 
   it("samples uniform FK keys with the scene rate despite a stale channel rate", () => {

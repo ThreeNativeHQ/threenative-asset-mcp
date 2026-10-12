@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.6.2",
+  version: "b4e95441+threenative.584.6.3",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3334,13 +3334,9 @@ static bool SequencerFrameRate(AbstractPropertyHolder movieScene, string propert
 {
     reason = "";
     numerator = 0;
-    denominator = 0;
-    if (movieScene.TryGetValue<FFrameRate>(out var typed, property))
-    {
-        numerator = typed.Numerator;
-        denominator = typed.Denominator;
-    }
-    else if (StructProperty(movieScene, property) is { } fallback)
+    denominator = 1;
+    // Tagged saves omit the engine's denominator default; typed fallback conversion loses that distinction.
+    if (StructProperty(movieScene, property) is { } fallback)
     {
         if (!StructNumber(fallback, "Numerator", out var rawNumerator))
         {
@@ -3348,12 +3344,12 @@ static bool SequencerFrameRate(AbstractPropertyHolder movieScene, string propert
             return false;
         }
         numerator = (int) rawNumerator;
-        if (!StructNumber(fallback, "Denominator", out var rawDenominator))
-        {
-            reason = $"the clip's MovieScene {property} carries no Denominator";
-            return false;
-        }
-        denominator = (int) rawDenominator;
+        if (StructNumber(fallback, "Denominator", out var rawDenominator)) denominator = (int) rawDenominator;
+    }
+    else if (movieScene.TryGetValue<FFrameRate>(out var typed, property))
+    {
+        numerator = typed.Numerator;
+        denominator = typed.Denominator;
     }
     else
     {
