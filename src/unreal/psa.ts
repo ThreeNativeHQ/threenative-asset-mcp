@@ -1,5 +1,7 @@
 import type { Document, Node } from "@gltf-transform/core";
 
+import { canonicalPackagePath } from "./animation-data.js";
+
 const CHUNK_HEADER_BYTES = 32;
 const BONE_BYTES = 120;
 const ANIMATION_INFO_BYTES = 168;
@@ -41,6 +43,8 @@ export interface PsaFile {
   readonly bones: readonly PsaBone[];
   readonly sequences: readonly PsaSequence[];
   readonly hasScaleKeys: boolean;
+  /** UE Viewer produced both this PSA and the model's embedded clips in the same export. */
+  readonly embeddedGlbSource?: boolean;
 }
 
 interface Chunk {
@@ -237,10 +241,18 @@ export interface AttachedPsaClip {
   readonly coverage: number;
 }
 
+export interface AttachedPsaUnresolved {
+  readonly name: string;
+  readonly package?: string;
+  readonly reason: string;
+}
+
 export interface AttachedPsaResult {
   readonly attached: readonly string[];
   readonly existing: readonly string[];
   readonly incompatible: readonly string[];
+  /** A clip that must not be attached, with the precise reason (never silently dropped). */
+  readonly unresolved: readonly AttachedPsaUnresolved[];
   /** Provenance for every clip the result names, so a caller can build exact exported-clip identities. */
   readonly clips: readonly AttachedPsaClip[];
 }
@@ -254,12 +266,18 @@ export interface AttachPsaOptions {
    * route), because that route has no package to compare.
    */
   readonly skeleton?: string;
+  /**
+   * Whether a clip that names a canonical skeleton may attach to a mesh whose own skeleton package is
+   * unknown. The importer permits this only when the mesh candidate is unique (the legacy single-mesh
+   * route); absent means the modern clip is left unresolved rather than cross-attached by bone name.
+   */
+  readonly allowUnknownSkeleton?: boolean;
 }
 
 function canonical(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
-  const normalized = value.replace(/\\/g, "/").replace(/\/{2,}/g, "/").trim().replace(/\.(?:uasset|umap)$/i, "");
-  return normalized.length > 0 ? normalized.toLowerCase() : undefined;
+  const normalized = canonicalPackagePath(value).trim().toLowerCase();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 /** A deterministic, collision-free actual animation name for a clip whose bare name another package took. */
@@ -287,13 +305,18 @@ export function attachPsaAnimations(
     for (const joint of skin.listJoints()) joints.set(joint.getName().toLowerCase(), joint);
   }
   // A document that already carries a clip of this name (UE Viewer's own GLB animation) keeps it; the
-  // name's package is unknown, so it is recorded as undefined and never disambiguated against.
+  // name's package is unknown, so it is recorded as undefined and never disambiguated against. An
+  // attached clip records the canonical package it came from, so the same package is recognised.
   const used = new Map<string, string | undefined>();
   for (const animation of root.listAnimations()) used.set(animation.getName().toLowerCase(), undefined);
+  // Every clip identity already attached or kept, so two identical PSA files for one disambiguated
+  // package never produce a repeated `B_Walk_2`.
+  const attachedIdentity = new Map<string, AttachedPsaClip>();
   const buffer = root.listBuffers()[0] ?? document.createBuffer("PSA animations");
   const attached: string[] = [];
   const alreadyPresent: string[] = [];
   const incompatible: string[] = [];
+  const unresolved: AttachedPsaUnresolved[] = [];
   const clips: AttachedPsaClip[] = [];
 
   for (const file of files) {
@@ -303,21 +326,51 @@ export function attachPsaAnimations(
       const sequenceSkeleton = canonical(sequence.skeleton);
       if (targetSkeleton !== undefined && sequenceSkeleton !== undefined && sequenceSkeleton !== targetSkeleton) {
         incompatible.push(sequence.name);
+        unresolved.push({ name: sequence.name, ...(sequence.package === undefined ? {} : { package: sequence.package }),
+          reason: `the clip's skeleton package ${sequenceSkeleton} differs from the mesh's skeleton package ${targetSkeleton}` });
         continue;
       }
+      // A clip that names a canonical skeleton must not fall back to bone-name matching against a mesh
+      // whose skeleton package is unknown: that is exactly how a modern clip cross-attaches to an
+      // arbitrary same-bone rig. Only the caller's single-candidate (legacy) case permits the fallback.
+      if (targetSkeleton === undefined && sequenceSkeleton !== undefined && resolved.allowUnknownSkeleton === false) {
+        unresolved.push({
+          name: sequence.name,
+          ...(sequence.package === undefined ? {} : { package: sequence.package }),
+          reason: "the clip names a skeleton package but the target mesh's skeleton is unknown; refusing to cross-attach by bone name",
+        });
+        continue;
+      }
+      const sequencePackage = canonical(sequence.package);
+      const identity = sequencePackage === undefined ? undefined : `${sequencePackage}\0${sequence.name.toLowerCase()}`;
       const key = sequence.name.toLowerCase();
+      const prior = identity === undefined ? undefined : attachedIdentity.get(identity);
+      if (prior !== undefined) {
+        // The same package's clip reached this mesh twice; keep the one already attached, not a copy.
+        alreadyPresent.push(prior.name);
+        clips.push(prior);
+        continue;
+      }
       if (used.has(key)) {
         const holder = used.get(key);
-        if (holder === undefined) {
+        if (holder === undefined && (sequencePackage === undefined || file.embeddedGlbSource === true)) {
+          // A legacy clip with no package provenance matches UE Viewer's own GLB clip by name: keep it.
           alreadyPresent.push(sequence.name);
-          clips.push({ name: sequence.name, source: sequence.name, coverage: 1 });
+          const clip = { name: sequence.name, source: sequence.name, ...(sequence.package === undefined ? {} : { package: sequence.package }), ...(sequence.skeleton === undefined ? {} : { skeleton: sequence.skeleton }), coverage: 1 };
+          clips.push(clip);
+          if (identity !== undefined) attachedIdentity.set(identity, clip);
+          used.set(key, sequencePackage);
           continue;
         }
-        if (holder === canonical(sequence.package)) {
+        if (holder !== undefined && holder === sequencePackage) {
+          // This exact package's clip is already present, so it is kept rather than duplicated.
           alreadyPresent.push(sequence.name);
           clips.push({ name: sequence.name, source: sequence.name, ...(sequence.package === undefined ? {} : { package: sequence.package }), ...(sequence.skeleton === undefined ? {} : { skeleton: sequence.skeleton }), coverage: 1 });
+          if (identity !== undefined) attachedIdentity.set(identity, clips[clips.length - 1]!);
           continue;
         }
+        // The name is taken by an unknown existing clip or another package: do not claim that clip.
+        // Fall through and attach this package's clip under a disambiguated actual name.
       }
       const mapped = sequence.tracks.filter((track) => joints.has(track.bone.toLowerCase()));
       const coverage = sequence.tracks.length === 0 ? 0 : mapped.length / sequence.tracks.length;
@@ -374,10 +427,11 @@ export function attachPsaAnimations(
               .setTargetPath("rotation"),
           );
       }
-      used.set(actual.toLowerCase(), canonical(sequence.package));
+      used.set(actual.toLowerCase(), sequencePackage);
       attached.push(actual);
       clips.push({ name: actual, source: sequence.name, ...(sequence.package === undefined ? {} : { package: sequence.package }), ...(sequence.skeleton === undefined ? {} : { skeleton: sequence.skeleton }), coverage });
+      if (identity !== undefined) attachedIdentity.set(identity, clips[clips.length - 1]!);
     }
   }
-  return { attached, existing: alreadyPresent, incompatible, clips };
+  return { attached, existing: alreadyPresent, incompatible, unresolved, clips };
 }

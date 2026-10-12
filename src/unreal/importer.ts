@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 
 import { BufferUtils, Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Root, type Texture } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsSpecular, KHRMaterialsUnlit } from "@gltf-transform/extensions";
-import { attachPsaAnimations, parsePsa, type AttachedPsaClip, type PsaFile } from "./psa.js";
+import { attachPsaAnimations, parsePsa, type AttachedPsaClip, type AttachedPsaUnresolved, type PsaFile } from "./psa.js";
 import {
   attachGameplayData,
   convertPhysics,
@@ -22,7 +22,7 @@ import {
   type RawGameplaySidecar,
   type RawPhysics,
 } from "./gameplay-data.js";
-import { animationArtifactPackage, animationArtifactPath, buildAnimationLogic, canonicalAnimationPath, parseAnimationDescriptor, type ExportedClip, type RawAnimationAsset } from "./animation-data.js";
+import { animationArtifactPackage, animationArtifactPath, buildAnimationLogic, canonicalAnimationPath, canonicalPackagePath, parseAnimationDescriptor, type ExportedClip, type RawAnimationAsset } from "./animation-data.js";
 
 import {
   type MaterialTextureBinding,
@@ -1671,6 +1671,8 @@ export interface PackagedModel {
   readonly attachedPsa: readonly string[];
   readonly existingPsa: readonly string[];
   readonly incompatiblePsa: readonly string[];
+  /** A clip that was not attached, with the precise reason, so it is never silently dropped. */
+  readonly unresolvedPsa: readonly AttachedPsaUnresolved[];
   /** Provenance for every attached or existing clip, so exported-clip identities carry their package. */
   readonly psaClips: readonly AttachedPsaClip[];
   readonly bounds: [number, number, number];
@@ -2023,6 +2025,12 @@ export async function packageGlb(options: {
    */
   readonly skeleton?: string;
   /**
+   * Whether a clip that names a canonical skeleton may attach by bone name to this mesh when its own
+   * skeleton package is unknown. The importer sets this only when this is the sole skeletal candidate,
+   * so a modern clip is never cross-attached to an arbitrary same-bone rig.
+   */
+  readonly allowUnknownSkeleton?: boolean;
+  /**
    * PRD-582 gameplay data for this package: the adapter's `Gameplay/<selector>.json`, plus the linked
    * PhysicsAsset when the mesh names one. Attached to the document as socket nodes, collision extras
    * and a physics-asset reference before the GLB is written.
@@ -2053,11 +2061,10 @@ export async function packageGlb(options: {
   const io = separateLayoutIO();
   const document = await io.read(options.gltfPath);
   const root = document.getRoot();
-  const psa = attachPsaAnimations(
-    document,
-    options.psaFiles ?? [],
-    options.skeleton === undefined ? {} : { skeleton: options.skeleton },
-  );
+  const psa = attachPsaAnimations(document, options.psaFiles ?? [], {
+    ...(options.skeleton === undefined ? {} : { skeleton: options.skeleton }),
+    ...(options.allowUnknownSkeleton === undefined ? {} : { allowUnknownSkeleton: options.allowUnknownSkeleton }),
+  });
   const gameplay = options.gameplay
     ? attachGameplayData(document, options.gameplay.data, {
         meshName: basename(options.glbPath, ".glb"),
@@ -2793,6 +2800,7 @@ export async function packageGlb(options: {
     attachedPsa: psa.attached,
     existingPsa: psa.existing,
     incompatiblePsa: psa.incompatible,
+    unresolvedPsa: psa.unresolved,
     psaClips: psa.clips,
     bounds: [
       Number.isFinite(max[0]) ? max[0] - (min[0] ?? 0) : 0,
@@ -3474,6 +3482,44 @@ export async function importUnrealDirectory(
     const packageName = parts.slice(content + 1).join("/").slice(0, -extname(file).length);
     return { namespace, path: `/Game/${packageName}` };
   };
+  // Exact canonical identity -> its source entry (relative package path). Two packages that share a
+  // basename are not collapsed to a last-write winner; a basename that names several packages is a
+  // precise ambiguity, and every artifact resolves to the exact package it came from. Shared by the
+  // legacy UE Viewer route (flat PSAs) and the modern converter route (nested artifacts).
+  const animationPackageByCanonical = new Map<string, { entry: string; canonical: string; object: string }>();
+  const animationCanonicalsByBasename = new Map<string, string[]>();
+  for (const entry of [...legacyAnimationPackages, ...modernAnimationPackages]) {
+    const canonical = canonicalPackagePath(sourceLocation(entry.file)?.path ?? entry.package);
+    const object = basename(entry.package, extname(entry.package));
+    animationPackageByCanonical.set(canonical.toLowerCase(), { entry: entry.package, canonical, object });
+    const base = object.toLowerCase();
+    const canonicals = animationCanonicalsByBasename.get(base) ?? [];
+    if (!canonicals.includes(canonical)) canonicals.push(canonical);
+    animationCanonicalsByBasename.set(base, canonicals);
+  }
+  // Resolve a canonical package path to its exact source entry, or a bare basename to the single
+  // entry that carries it. A canonical path never falls back to a same-basename entry; a basename
+  // that names several packages is never guessed.
+  const resolveAnimationPackage = (reference: string): { entry: string; canonical: string } | { ambiguous: readonly string[] } | { missing: string } => {
+    const trimmed = reference.replace(/\\/g, "/").trim();
+    if (trimmed.startsWith("/")) {
+      const canonical = canonicalPackagePath(trimmed).toLowerCase();
+      const exact = animationPackageByCanonical.get(canonical);
+      if (exact) return { entry: exact.entry, canonical: exact.canonical };
+      return { missing: canonicalPackagePath(trimmed) };
+    }
+    const base = trimmed.toLowerCase();
+    const candidates = animationCanonicalsByBasename.get(base) ?? [];
+    if (candidates.length === 1) {
+      const resolved = animationPackageByCanonical.get(candidates[0]!.toLowerCase())!;
+      return { entry: resolved.entry, canonical: resolved.canonical };
+    }
+    if (candidates.length > 1) return { ambiguous: candidates };
+    return { missing: reference };
+  };
+  /** The exact clip identity: its canonical package and object name, never a bare basename. */
+  const identityKey = (packagePath: string, object: string): string =>
+    `${canonicalPackagePath(packagePath).toLowerCase()}\0${object.toLowerCase()}`;
   // Export selection does not remove source dependencies. Index filenames from the existing
   // inventory, then read only the chosen material, exact parents and selected AO texture.
   const sourceFiles = new Map<string, Map<string, { file: string; size: number }[]>>();
@@ -4240,13 +4286,17 @@ export async function importUnrealDirectory(
     for (const failure of animationFailures) if (failure) failed.push(failure);
     const animationAssets = await indexExported(animationRaw);
     for (const [name, path] of animationAssets.psa) {
+      // The legacy UE Viewer route exports flat, so a PSA names its package only by its basename. Two
+      // legacy packages that share a basename are a precise ambiguity, never a first-match assignment.
+      const resolved = resolveAnimationPackage(name);
+      if ("ambiguous" in resolved) {
+        failed.push({ package: name, reason: `The ActorX PSA ${name}.psa matches ${resolved.ambiguous.length} animation packages; refusing to assign one.` });
+        continue;
+      }
+      const legacyPackage = "canonical" in resolved ? resolved.canonical : undefined;
       try {
         const parsed = parsePsa(await readFile(path));
-        // The legacy UE Viewer route exports flat; its PSA still names a source package, so a clip
-        // carries the entry's canonical package even though no skeleton provenance exists on this route.
-        const legacyEntry = legacyAnimationPackages.find((entry) => basename(entry.package, extname(entry.package)) === name);
-        const legacyPackage = legacyEntry ? (sourceLocation(legacyEntry.file)?.path ?? legacyEntry.package) : undefined;
-        psaFiles.push(legacyPackage === undefined ? parsed : { ...parsed, sequences: parsed.sequences.map((sequence) => ({ ...sequence, package: legacyPackage })) });
+        psaFiles.push({ ...parsed, embeddedGlbSource: true, ...(legacyPackage === undefined ? {} : { sequences: parsed.sequences.map((sequence) => ({ ...sequence, package: legacyPackage })) }) });
         if (parsed.hasScaleKeys) {
           warnings.push(
             `${name}.psa contains ActorX scale keys; translation and rotation were converted, while per-frame bone scale remains unsupported.`,
@@ -4254,7 +4304,7 @@ export async function importUnrealDirectory(
         }
       } catch (error) {
         failed.push({
-          package: legacyAnimationPackages.find((entry) => basename(entry.package, extname(entry.package)) === name)?.package ?? name,
+          package: legacyPackage ?? name,
           reason: `ActorX PSA conversion failed: ${error instanceof Error ? error.message : "unknown error"}`,
         });
       }
@@ -4467,11 +4517,6 @@ export async function importUnrealDirectory(
   // CUE4Parse adapter's animation route. UE5 clips join `psaFiles`, so the existing skeletal attach
   // binds them to the matching GLB; the logic assets become normalized JSON descriptors.
   const animationDescriptors: RawAnimationAsset[] = [];
-  const animationPackageByBasename = new Map<string, string>();
-  for (const entry of [...legacyAnimationPackages, ...modernAnimationPackages]) {
-    animationPackageByBasename.set(basename(entry.package, extname(entry.package)).toLowerCase(), entry.package);
-  }
-  const animationPackageFor = (name: string): string => animationPackageByBasename.get(name.toLowerCase()) ?? name;
   if (modernAnimationPackages.length > 0) {
     modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
     const modernAnimationRaw = join(staging, "modern-animations");
@@ -4496,12 +4541,26 @@ export async function importUnrealDirectory(
       const animationRoot = join(modernAnimationRaw, "Animation");
       const files = await listFiles(animationRoot).catch(() => []);
       const relativeArtifact = (path: string): string => relative(animationRoot, path).split(sep).join("/");
-      // A nested artifact's directory is the exact package it came from; a flat legacy artifact has no
-      // directory, so its basename maps through the package table. This never collapses two packages
-      // that share a clip basename into one last-write winner.
-      const entryPackageFor = (canonicalPackage: string): string => {
-        const base = canonicalPackage.split("/").filter((segment) => segment.length > 0).pop() ?? canonicalPackage;
-        return animationPackageFor(base);
+      // Resolve an artifact's package to its exact source entry and record the entry as produced.
+      // Two source packages that share a basename are a precise ambiguity, never a last-write or
+      // first-match fallback; a canonical artifact path never falls back to a same-basename entry.
+      const sourcePackageFor = (reference: string, label: string): string | undefined => {
+        const resolved = resolveAnimationPackage(reference);
+        if ("ambiguous" in resolved) {
+          failed.push({ package: reference.startsWith("/") ? canonicalPackagePath(reference) : reference, reason: `The animation artifact ${label} names ${reference}, which matches ${resolved.ambiguous.length} source packages; refusing to pick one.` });
+          return undefined;
+        }
+        if ("missing" in resolved) {
+          failed.push({ package: reference.startsWith("/") ? resolved.missing : reference, reason: `The animation artifact ${label} names ${reference}, which no source animation package in this import matches.` });
+          return undefined;
+        }
+        produced.add(resolved.entry.toLowerCase());
+        return resolved.canonical;
+      };
+      // The canonical identity to report a malformed artifact under, from its package provenance.
+      const reportIdentity = (reference: string): string => {
+        const resolved = resolveAnimationPackage(reference);
+        return "canonical" in resolved ? resolved.canonical : reference;
       };
       // Descriptors are read first, so a PSA can inherit its clip's exact skeleton provenance.
       const clipDescriptors = new Map<string, RawAnimationAsset>();
@@ -4509,49 +4568,62 @@ export async function importUnrealDirectory(
         if (!file.path.toLowerCase().endsWith(".json")) continue;
         const artifactPackage = animationArtifactPackage(relativeArtifact(file.path));
         const stem = basename(file.path).replace(/\.json$/i, "").replace(/\.clip$/i, "");
-        const reportPackage = artifactPackage ?? animationPackageFor(stem);
         try {
           const parsed = parseAnimationDescriptor(JSON.parse(await readFile(file.path, "utf8")) as unknown);
           if (!parsed.descriptor) {
             // Valid JSON of the wrong shape is a converter defect, reported for its package rather
             // than silently dropped by buildAnimationLogic's unknown-kind guard.
-            produced.add(reportPackage.toLowerCase());
-            failed.push({ package: reportPackage, reason: `The animation descriptor ${basename(file.path)} is not a threenative-unreal-animation descriptor: ${parsed.reason}.` });
+            failed.push({ package: artifactPackage ?? reportIdentity(stem), reason: `The animation descriptor ${basename(file.path)} is not a threenative-unreal-animation descriptor: ${parsed.reason}.` });
             continue;
           }
-          const descriptor = artifactPackage === undefined ? parsed.descriptor : { ...parsed.descriptor, package: artifactPackage };
-          const descriptorPackage = canonicalAnimationPath(descriptor.package ?? "");
+          const declared = canonicalPackagePath(parsed.descriptor.package ?? "");
+          // The artifact's directory is its provenance; a descriptor that declares a different
+          // package is refused, never silently overwritten with the directory's package.
+          if (artifactPackage !== undefined && declared.length > 0 && declared.toLowerCase() !== artifactPackage.toLowerCase()) {
+            failed.push({ package: declared, reason: `The animation descriptor ${basename(file.path)} declares package ${declared} but was written under ${artifactPackage}; refusing the mismatch.` });
+            continue;
+          }
+          const identity = artifactPackage ?? (declared.length > 0 ? declared : stem);
+          const source = sourcePackageFor(identity, basename(file.path));
+          if (source === undefined) continue;
+          const descriptor = artifactPackage === undefined && declared.length === 0 ? { ...parsed.descriptor, package: source } : parsed.descriptor;
+          const descriptorPackage = canonicalPackagePath(descriptor.package ?? source);
           if (descriptor.kind === "clip") {
             clipDescriptors.set(`${descriptorPackage.toLowerCase()}\0${(descriptor.name ?? "").toLowerCase()}`, descriptor);
           }
           animationDescriptors.push(descriptor);
-          produced.add(entryPackageFor(descriptorPackage).toLowerCase());
         } catch {
-          produced.add(reportPackage.toLowerCase());
-          failed.push({ package: reportPackage, reason: `The animation descriptor ${basename(file.path)} is not valid JSON; the package produced no usable animation.` });
+          failed.push({ package: artifactPackage ?? reportIdentity(stem), reason: `The animation descriptor ${basename(file.path)} is not valid JSON; the package produced no usable animation.` });
         }
       }
       for (const file of files) {
         if (!file.path.toLowerCase().endsWith(".psa")) continue;
         const artifactPackage = animationArtifactPackage(relativeArtifact(file.path));
         const stem = basename(file.path).replace(/\.psa$/i, "");
-        const packagePath = artifactPackage ?? animationPackageFor(stem);
+        const reference = artifactPackage ?? stem;
         try {
           const parsed = parsePsa(await readFile(file.path));
-          const clip = clipDescriptors.get(`${canonicalAnimationPath(packagePath).toLowerCase()}\0${stem.toLowerCase()}`);
+          const source = sourcePackageFor(reference, basename(file.path));
+          if (source === undefined) continue;
+          const packagePath = source;
+          const clip = clipDescriptors.get(`${canonicalPackagePath(packagePath).toLowerCase()}\0${stem.toLowerCase()}`);
           const skeleton = clip?.skeleton ?? undefined;
           psaFiles.push({
             ...parsed,
             sequences: parsed.sequences.map((sequence) => ({ ...sequence, package: packagePath, ...(skeleton === undefined ? {} : { skeleton }) })),
           });
-          produced.add(entryPackageFor(canonicalAnimationPath(packagePath)).toLowerCase());
           if (parsed.hasScaleKeys) warnings.push(`${stem}.psa carries ActorX scale keys; per-frame bone scale remains unsupported.`);
         } catch (error) {
-          failed.push({ package: packagePath, reason: `ActorX PSA conversion failed: ${error instanceof Error ? error.message : "unknown error"}` });
+          failed.push({ package: artifactPackage ?? reportIdentity(stem), reason: `ActorX PSA conversion failed: ${error instanceof Error ? error.message : "unknown error"}` });
         }
       }
       const reported = parseModernAnimationFailures(converted.stderr);
-      for (const [name, reason] of reported) failed.push({ package: animationPackageFor(name), reason });
+      for (const [name, reason] of reported) {
+        const resolved = resolveAnimationPackage(name);
+        const reportPackage = "canonical" in resolved ? resolved.canonical : name;
+        if ("entry" in resolved) produced.add(resolved.entry.toLowerCase());
+        failed.push({ package: reportPackage, reason });
+      }
       // A package the converter was asked for but wrote nothing for is reported, not left silent.
       for (const entry of modernAnimationPackages) {
         const stem = basename(entry.package, extname(entry.package));
@@ -5028,6 +5100,16 @@ export async function importUnrealDirectory(
   // Clip name -> the skeletal models it attached to, to catch a duplicate bone-name rig silently
   // receiving a clip that belongs to another skeleton.
   const attachedPsaByModel = new Map<string, Set<string>>();
+  // A clip the attachment pass refused with a precise reason, so it is reported once and never also
+  // blamed on bone coverage.
+  const unresolvedPsa: AttachedPsaUnresolved[] = [];
+  const unresolvedPsaIdentities = new Set<string>();
+  // The legacy bone-name fallback for a clip that names a canonical skeleton is safe only when this is
+  // the sole skeletal mesh candidate; two same-bone rigs also match, so the clip must stay unresolved.
+  const skeletalCandidateCount = new Set(
+    meshPackages.filter((entry) => entry.meshKind === "skeletal").map((entry) => entry.package),
+  ).size;
+  const allowUnknownSkeleton = skeletalCandidateCount <= 1;
   const animationLogic: ImportedAnimationLogic[] = [];
   const animationSidecars: ImportedAnimationClip[] = [];
   // A clip's descriptor and sidecar are written after the skeletal GLBs exist, so a reference resolves
@@ -5226,7 +5308,8 @@ export async function importUnrealDirectory(
             geometryScale,
             gameplayScale,
             psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
-            ...(lod === 0 && gameplayRaw?.skeletonRef ? { skeleton: gameplayRaw.skeletonRef } : {}),
+            allowUnknownSkeleton,
+            ...(gameplayRaw?.skeletonRef ? { skeleton: gameplayRaw.skeletonRef } : {}),
             ...(lod === 0 && gameplayRaw
               ? { gameplay: { data: gameplayRaw, ...(gameplayPhysics === undefined ? {} : { physics: gameplayPhysics }) } }
               : {}),
@@ -5246,6 +5329,12 @@ export async function importUnrealDirectory(
           for (const clip of packaged.attachedPsa) attachedPsa.add(clip);
           for (const clipName of packaged.existingPsa) existingPsa.add(clipName);
           for (const clipName of packaged.incompatiblePsa) incompatiblePsa.add(clipName);
+          for (const clip of packaged.unresolvedPsa) {
+            unresolvedPsa.push(clip);
+            const resolved = clip.package === undefined ? resolveAnimationPackage(clip.name) : undefined;
+            const packagePath = clip.package ?? (resolved && "canonical" in resolved ? resolved.canonical : clip.name);
+            unresolvedPsaIdentities.add(identityKey(packagePath, clip.name));
+          }
           for (const clip of packaged.psaClips) attachedPsaClips.push(clip);
           const validated = await validateGlb(glbPath);
           for (const section of packaged.sections) {
@@ -5535,7 +5624,9 @@ export async function importUnrealDirectory(
     // A clip reference resolves only against an animation that actually landed on a GLB: `attachedPsa`
     // are the PSAs a compatible mesh accepted, `existingPsa` those UE Viewer's GLB already carried. A
     // PSA that no mesh accepted is reported below, never resolved against a parsed file with no output.
-    const exportedClipNames = new Set([...attachedPsa, ...existingPsa].map((clip) => clip.toLowerCase()));
+    // Identity is the exact (canonical package, object), never a bare basename, so a supported A/Walk
+    // cannot hide a missing B/Walk.
+    const exportedClipIdentities = new Set<string>();
     // Identity is the actual glTF name plus the exact package the clip came from, so two same-named
     // clips from different packages never collapse into one basename. The source object name is kept so
     // a canonical reference resolves against the sequence it names even when the glTF name was
@@ -5543,17 +5634,14 @@ export async function importUnrealDirectory(
     const exportedClips: ExportedClip[] = [];
     const exportedClipsSeen = new Set<string>();
     for (const clip of attachedPsaClips) {
-      const packagePath = clip.package ?? animationPackageFor(clip.source);
-      const key = `${clip.name.toLowerCase()}\0${canonicalAnimationPath(packagePath).toLowerCase()}`;
+      const resolved = clip.package === undefined ? resolveAnimationPackage(clip.source) : undefined;
+      const packagePath = clip.package ?? (resolved && "canonical" in resolved ? resolved.canonical : clip.source);
+      exportedClipIdentities.add(identityKey(packagePath, clip.name));
+      exportedClipIdentities.add(identityKey(packagePath, clip.source));
+      const key = `${clip.name.toLowerCase()}\0${canonicalPackagePath(packagePath).toLowerCase()}`;
       if (exportedClipsSeen.has(key)) continue;
       exportedClipsSeen.add(key);
       exportedClips.push({ name: clip.name, object: clip.source, package: packagePath });
-    }
-    // A sidecar or PSA matches an exported clip by either its actual glTF name or the sequence name a
-    // disambiguated clip came from, so a same-basename clip is not reported as missing.
-    for (const clip of exportedClips) {
-      exportedClipNames.add(clip.name.toLowerCase());
-      exportedClipNames.add((clip.object ?? clip.name).toLowerCase());
     }
     const animationResult = buildAnimationLogic(animationDescriptors, exportedClips, undefined);
     for (const issue of animationResult.unresolved) {
@@ -5584,17 +5672,21 @@ export async function importUnrealDirectory(
     }
     for (const sidecar of animationResult.sidecars) {
       // A sidecar for a clip that produced no glTF animation is metadata only; say so rather than let a
-      // consumer bind notifies to a clip that does not exist.
-      const value = exportedClipNames.has(sidecar.name.toLowerCase()) || sidecar.value.unsupportedReason !== undefined
-        ? sidecar.value
+      // consumer bind notifies to a clip that does not exist. The match is the exact (package, object)
+      // identity, and the sidecar is recorded under the actual glTF name it resolves to.
+      const matched = exportedClipIdentities.has(identityKey(sidecar.package, sidecar.clip ?? sidecar.name))
+        || exportedClipIdentities.has(identityKey(sidecar.package, sidecar.name));
+      const actualName = sidecar.clip ?? sidecar.name;
+      const value = matched || sidecar.value.unsupportedReason !== undefined
+        ? { ...sidecar.value, clip: actualName, ...(actualName === sidecar.name ? {} : { source: sidecar.name }) }
         : { ...sidecar.value, unsupportedReason: "no exported glTF animation carries this clip's name" };
       const json = `${JSON.stringify(value, null, 2)}\n`;
-      const relativeJson = animationArtifactPath(sidecar.package, sidecar.name, ".clip.json");
+      const relativeJson = animationArtifactPath(sidecar.package, actualName, ".clip.json");
       const target = assertContained(promotion, relativeJson);
       await mkdir(dirname(target), { recursive: true });
       await writeFile(target, json);
       animationSidecars.push({
-        name: sidecar.name,
+        name: actualName,
         package: sidecar.package,
         json: relativeJson,
         bytes: Buffer.byteLength(json),
@@ -5607,15 +5699,23 @@ export async function importUnrealDirectory(
       log(`Wrote ${animationLogic.length} animation descriptor${animationLogic.length === 1 ? "" : "s"} and ${animationSidecars.length} clip sidecar${animationSidecars.length === 1 ? "" : "s"}.`);
     }
     // A decoded PSA that attached to no compatible mesh has no exported animation, so its package is
-    // reported rather than left to look resolved. This covers modern clips as well as legacy ones.
+    // reported rather than left to look resolved. This covers modern clips as well as legacy ones, and
+    // the check is the exact (package, object) identity so one package's clip never masks another's.
     for (const file of psaFiles) {
       for (const sequence of file.sequences) {
-        if (exportedClipNames.has(sequence.name.toLowerCase())) continue;
+        const resolved = sequence.package === undefined ? resolveAnimationPackage(sequence.name) : undefined;
+        const packagePath = sequence.package ?? (resolved && "canonical" in resolved ? resolved.canonical : sequence.name);
+        if (exportedClipIdentities.has(identityKey(packagePath, sequence.name))) continue;
+        // A clip refused for an ambiguous skeleton is already reported with its precise reason.
+        if (unresolvedPsaIdentities.has(identityKey(packagePath, sequence.name))) continue;
         failed.push({
-          package: sequence.package ?? animationPackageFor(sequence.name),
+          package: sequence.package ?? packagePath,
           reason: `ActorX PSA clip "${sequence.name}" was decoded, but no imported SkeletalMesh matched at least 80% of its bone names.`,
         });
       }
+    }
+    for (const clip of unresolvedPsa) {
+      failed.push({ package: clip.package ?? clip.name, reason: `ActorX PSA clip "${clip.name}" was not attached: ${clip.reason}.` });
     }
     // A funny clip landing on two rigs by bone name alone may have crossed from its real skeleton to a rig
     // that merely shares bone names; surface it instead of silently shipping it twice.

@@ -2412,23 +2412,42 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
 // model instead, so it is reported with its reason and never replaced by the bind pose.
 // One animation artifact per package, nested so two packages that share a clip or asset basename
 // ("/Game/A/Walk" and "/Game/B/Walk") never overwrite each other. The directory is the package path
-// below "/Game/"; the file name is the object name, which the importer reads back into exact provenance.
+// below "/Game/"; the file name is the object name, which the importer reads back into exact
+// provenance. A traversal segment is rejected, never dropped, so "/Game/../../etc" cannot alias to
+// "/Game/etc"; the result stays under the animation output root.
 string AnimationTarget(string packagePath, string fileName, string extension)
 {
     var relative = GamePackagePath(packagePath);
     var sub = relative.StartsWith("/Game/", StringComparison.OrdinalIgnoreCase) ? relative["/Game/".Length..] : relative.TrimStart('/');
-    var segments = sub.Split('/', StringSplitOptions.RemoveEmptyEntries)
-        .Where(segment => segment != "." && segment != "..")
-        .ToArray();
+    var segments = sub.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    foreach (var segment in segments)
+        if (segment == "." || segment == "..")
+            throw new InvalidDataException($"refusing a traversal segment in animation package {packagePath}");
+    if (fileName.Contains('/') || fileName.Contains('\\') || fileName == "." || fileName == "..")
+        throw new InvalidDataException($"refusing an unsafe animation artifact name {fileName}");
     var directory = segments.Length > 0 ? Path.Combine(segments) : "";
     return Path.Combine(output, "Animation", directory, fileName + extension);
 }
 
-void WriteAnimationJson(string packagePath, string fileName, object document) =>
-    File.WriteAllText(AnimationTarget(packagePath, fileName, ".json"), JsonConvert.SerializeObject(document, Formatting.Indented), new UTF8Encoding(false));
+// Every animation write goes through one place that creates the package directory first, so a nested
+// package's first write never throws DirectoryNotFound; the artifact path stays under the output root.
+string WriteAnimationTarget(string packagePath, string fileName, string extension)
+{
+    var target = AnimationTarget(packagePath, fileName, extension);
+    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+    return target;
+}
 
-void ReportAnimationFailure(string name, string reason) =>
-    Console.Error.WriteLine($"threenative-animation-failure {name} {reason}");
+void WriteAnimationJson(string packagePath, string fileName, object document) =>
+    File.WriteAllText(WriteAnimationTarget(packagePath, fileName, ".json"), JsonConvert.SerializeObject(document, Formatting.Indented), new UTF8Encoding(false));
+
+void WriteAnimationBytes(string packagePath, string fileName, string extension, byte[] bytes) =>
+    File.WriteAllBytes(WriteAnimationTarget(packagePath, fileName, extension), bytes);
+
+// A canonical package-qualified identity ("/Game/A/Walk.Walk") rather than a bare object name, so the
+// importer maps the failure to the exact package and never collapses two same-named clips.
+void ReportAnimationFailure(string packagePath, string name, string reason) =>
+    Console.Error.WriteLine($"threenative-animation-failure {(string.IsNullOrEmpty(packagePath) ? name : packagePath + "." + name)} {reason}");
 
 // The raw element of a fixed struct array (BlendParameters[3], InterpolationParam[3]). Reading it keeps
 // the fields the serializer omitted visible, so FBlendParameter's defaults can be restored: a typed read
@@ -2942,18 +2961,18 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
         foreach (var converted in animSet.Sequences) frames += converted.NumFrames;
         if (animSet.Sequences.Count == 0 || frames <= 0)
         {
-            ReportAnimationFailure(name, "CUE4Parse decoded no bone tracks for this clip");
+            ReportAnimationFailure(packagePath, name, "CUE4Parse decoded no bone tracks for this clip");
             return 0;
         }
         using (var writer = new FArchiveWriter())
         {
             new ActorXAnim(animSet, 0).Save(writer);
-            File.WriteAllBytes(AnimationTarget(packagePath, name, ".psa"), writer.GetBuffer());
+            WriteAnimationBytes(packagePath, name, ".psa", writer.GetBuffer());
         }
         WriteAnimationJson(packagePath, name + ".clip", document);
         return 1;
     }
-    catch (Exception error) { ReportAnimationFailure(name, error.Message); return 0; }
+    catch (Exception error) { ReportAnimationFailure(packagePath, name, error.Message); return 0; }
 }
 
 // Why no clip was exported, from the package's own evidence rather than a blanket engine-version guess.
@@ -3075,7 +3094,7 @@ void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
             ["interpolation"] = interpolation,
         });
     }
-    catch (Exception error) { ReportAnimationFailure(name, error.Message); }
+    catch (Exception error) { ReportAnimationFailure(packagePath, name, error.Message); }
 }
 
 void ExportMontage(UAnimMontage? montage, UAnimComposite? composite, string packagePath)
@@ -3117,7 +3136,7 @@ void ExportMontage(UAnimMontage? montage, UAnimComposite? composite, string pack
             ["notifies"] = NotifyRecords(asset, ((UAnimSequenceBase) asset).Notifies, null),
         });
     }
-    catch (Exception error) { ReportAnimationFailure(name, error.Message); }
+    catch (Exception error) { ReportAnimationFailure(packagePath, name, error.Message); }
 }
 
 foreach (var key in provider.Files.Keys.Where(key =>
@@ -3149,7 +3168,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
         }
         catch (Exception error)
         {
-            Console.Error.WriteLine($"threenative-animation-failure {Path.GetFileNameWithoutExtension(key)} {error.Message}");
+            ReportAnimationFailure(animationPackagePath, Path.GetFileNameWithoutExtension(key), error.Message);
         }
         continue;
     }

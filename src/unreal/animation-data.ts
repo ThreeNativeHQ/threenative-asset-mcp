@@ -230,7 +230,16 @@ export interface AnimationLogicIssue {
 
 export interface AnimationLogicResult {
   readonly assets: readonly AnimationLogicAsset[];
-  readonly sidecars: readonly { readonly name: string; readonly package: string; readonly value: NormalizedClipSidecar }[];
+  readonly sidecars: readonly {
+    readonly name: string;
+    readonly package: string;
+    /**
+     * The actual exported glTF animation name when the sidecar's clip resolved to one, so a consumer
+     * binds notifies to the disambiguated clip rather than to the source object name.
+     */
+    readonly clip?: string;
+    readonly value: NormalizedClipSidecar;
+  }[];
   readonly unresolved: readonly AnimationLogicIssue[];
   readonly unsupported: readonly { readonly package: string; readonly asset: string; readonly reason: string }[];
 }
@@ -290,37 +299,43 @@ function clipObject(clip: ExportedClip): string {
   return clip.object ?? clip.name;
 }
 
+/** A path or file-name segment is unsafe when it can step outside the directory it names. */
+function unsafeSegment(segment: string): boolean {
+  return segment === "." || segment === "..";
+}
+
 /**
  * A stable, package-distinct relative path for an animation artifact in the import output. The
  * package path becomes directories, so `/Game/A/Walk` and `/Game/B/Walk` write different files and
- * never overwrite each other. Segments that could escape the directory are dropped, and the caller
- * still validates the result against the output root.
+ * never overwrite each other. A traversal segment (`.` or `..`) is rejected rather than dropped, so
+ * `/Game/../../etc` never silently aliases to `/Game/etc`; the caller still validates containment.
  */
 export function animationArtifactPath(packagePath: string, name: string, extension: string): string {
   const canonical = canonicalAnimationPath(packagePath);
   const relative = canonical.startsWith("/Game/") ? canonical.slice("/Game/".length) : canonical.replace(/^\/+/, "");
-  const directory = relative
-    .split("/")
-    .filter((segment) => segment.length > 0 && segment !== "." && segment !== "..")
-    .join("/");
-  return directory.length > 0 ? `Animation/${directory}/${name}${extension}` : `Animation/${name}${extension}`;
+  const segments = relative.split("/").filter((segment) => segment.length > 0);
+  if (segments.some(unsafeSegment)) throw new Error(`refusing a traversal segment in animation package ${packagePath}`);
+  const file = `${name}${extension}`;
+  if (unsafeSegment(name) || /[/\\]/u.test(name) || /[/\\]/u.test(extension)) {
+    throw new Error(`refusing an unsafe animation artifact name ${JSON.stringify(file)}`);
+  }
+  const directory = segments.join("/");
+  return directory.length > 0 ? `Animation/${directory}/${file}` : `Animation/${file}`;
 }
 
 /**
  * The canonical package a nested animation artifact names, from its path relative to the `Animation`
  * root (`A/Walk/Walk.psa` -> `/Game/A/Walk`). A flat legacy artifact has no directory and returns
- * undefined, so the caller falls back to its package table.
+ * undefined, so the caller falls back to its package table. A traversal directory is rejected, not
+ * dropped, so a `..` never aliases one package onto another.
  */
 export function animationArtifactPackage(relativePath: string): string | undefined {
   const posix = relativePath.split("\\").join("/");
   const slash = posix.lastIndexOf("/");
   if (slash <= 0) return undefined;
-  const directory = posix
-    .slice(0, slash)
-    .split("/")
-    .filter((segment) => segment.length > 0 && segment !== "." && segment !== "..")
-    .join("/");
-  return directory.length > 0 ? `/Game/${directory}` : undefined;
+  const directory = posix.slice(0, slash).split("/").filter((segment) => segment.length > 0);
+  if (directory.some(unsafeSegment)) throw new Error(`refusing a traversal segment in animation artifact ${relativePath}`);
+  return directory.length > 0 ? `/Game/${directory.join("/")}` : undefined;
 }
 
 /** A parsed Unreal animation reference: a bare object name, or a canonical package-qualified path. */
@@ -334,13 +349,30 @@ export interface ParsedAnimationReference {
 /**
  * Normalizes a Unreal path the way the converter does: forward slashes, one separator, and no
  * `.uasset`/`.umap` extension. A mounted `<root>/Content/...` path becomes `/Game/...`, so a
- * filesystem mount and its Unreal name compare equal. Never mutates a bare object name.
+ * filesystem mount and its Unreal name compare equal. The `Content` segment is found wherever it
+ * appears, so a bare `Content/A/Walk.uasset` (no leading root) maps like `D:/proj/Content/A/Walk`.
+ * Never mutates a bare object name.
  */
 export function canonicalAnimationPath(value: string): string {
   const normalized = value.replace(/\\/g, "/").replace(/\/{2,}/g, "/").trim();
   const withoutExtension = normalized.replace(/\.(?:uasset|umap)$/i, "");
-  const contentAt = withoutExtension.toLowerCase().indexOf("/content/");
-  return contentAt >= 0 ? `/Game/${withoutExtension.slice(contentAt + "/content/".length)}` : withoutExtension;
+  const segments = withoutExtension.split("/");
+  const contentAt = segments.findIndex((segment) => segment.toLowerCase() === "content");
+  if (contentAt < 0) return withoutExtension;
+  const tail = segments.slice(contentAt + 1).filter((segment) => segment.length > 0);
+  return tail.length > 0 ? `/Game/${tail.join("/")}` : "/Game";
+}
+
+/**
+ * A canonical package path: `canonicalAnimationPath` with any trailing `.Object` suffix removed, so
+ * `/Game/A/SK_Hero.SK_Hero` and `/Game/A/SK_Hero` name the same package. A dot inside a folder name
+ * (before the last slash) never splits the path.
+ */
+export function canonicalPackagePath(value: string): string {
+  const normalized = canonicalAnimationPath(value);
+  const slash = normalized.lastIndexOf("/");
+  const dot = normalized.indexOf(".", slash + 1);
+  return dot >= 0 ? normalized.slice(0, dot) : normalized;
 }
 
 /**
@@ -426,9 +458,16 @@ export function resolveClip(name: string | undefined, clips: readonly ExportedCl
     return { clip: reference.name, unresolved: `the reference ${wanted} matches ${exact.length} exported animations` };
   }
   const matches = clips.filter((clip) => clipObject(clip).toLowerCase() === wanted.toLowerCase());
-  const packages = new Set(matches.map((match) => canonicalAnimationPath(match.package).toLowerCase()));
   if (matches.length === 0) return { clip: wanted, unresolved: "no exported animation has this name" };
-  if (packages.size > 1) return { clip: wanted, unresolved: `the name is ambiguous across ${packages.size} packages` };
+  if (matches.length > 1) {
+    const packages = new Set(matches.map((match) => canonicalAnimationPath(match.package).toLowerCase()));
+    return {
+      clip: wanted,
+      unresolved: packages.size > 1
+        ? `the name is ambiguous across ${packages.size} packages`
+        : `the name matches ${matches.length} exported animations`,
+    };
+  }
   return { clip: matches[0]!.name };
 }
 
@@ -562,7 +601,16 @@ export function buildAnimationLogic(
     if (raw.kind === "clip") {
       // A clip whose bone tracks could not be exported still keeps its notifies, curves and sync
       // markers as a sidecar; the unsupported reason above records that no glTF animation was written.
-      sidecars.push({ name, package: packagePath, value: normalizeClipSidecar(raw) });
+      // The sidecar names the actual exported animation when one matched, so a disambiguated clip is
+      // not bound by its bare source object name; `name` keeps the source object for reference.
+      const reference = packagePath.length > 0 ? `${canonicalPackagePath(packagePath)}.${name}` : name;
+      const resolved = resolveClip(reference, clips);
+      sidecars.push({
+        name,
+        package: packagePath,
+        ...(resolved.unresolved === undefined && resolved.clip.length > 0 ? { clip: resolved.clip } : {}),
+        value: normalizeClipSidecar(raw),
+      });
       continue;
     }
     if (raw.unsupportedReason) continue;

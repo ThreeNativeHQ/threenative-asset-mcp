@@ -7,6 +7,7 @@ import {
   blendAxes,
   buildAnimationLogic,
   canonicalAnimationPath,
+  canonicalPackagePath,
   normalizeClipSidecar,
   parseAnimationDescriptor,
   parseAnimationReference,
@@ -232,6 +233,12 @@ describe("animation descriptor trust boundary", () => {
 describe("canonical animation identity (AC-4, AC-5)", () => {
   it("normalizes a mounted path and splits a canonical object path", () => {
     expect(canonicalAnimationPath("D:/proj/Content/A/Walk.uasset")).toBe("/Game/A/Walk");
+    // A bare, rootless `Content/...` path maps the same way, so both equivalent forms agree.
+    expect(canonicalAnimationPath("Content/A/Walk.uasset")).toBe("/Game/A/Walk");
+    expect(canonicalAnimationPath("/Game/A/Walk.Walk")).toBe("/Game/A/Walk.Walk");
+    // A package path drops its object suffix; a dot inside a folder name never splits it.
+    expect(canonicalPackagePath("/Game/A/SK_Hero.SK_Hero")).toBe("/Game/A/SK_Hero");
+    expect(canonicalPackagePath("/Game/My.Folder/SK_Hero")).toBe("/Game/My.Folder/SK_Hero");
     expect(parseAnimationReference("/Game/A/Walk.Walk")).toEqual({ name: "Walk", package: "/Game/A/Walk", canonical: true });
     // A package-only reference takes its object name from the last segment.
     expect(parseAnimationReference("/Game/A/Walk")).toEqual({ name: "Walk", package: "/Game/A/Walk", canonical: true });
@@ -274,8 +281,11 @@ describe("canonical animation identity (AC-4, AC-5)", () => {
   it("writes package-distinct artifact paths and reads the package back, refusing traversal", () => {
     expect(animationArtifactPath("/Game/A/Walk", "Walk", ".psa")).toBe("Animation/A/Walk/Walk.psa");
     expect(animationArtifactPath("/Game/B/Walk", "Walk", ".psa")).toBe("Animation/B/Walk/Walk.psa");
-    expect(animationArtifactPath("/Game/../../etc", "x", ".json")).toBe("Animation/etc/x.json");
+    // A traversal segment is rejected, never silently dropped and aliased onto another package.
+    expect(() => animationArtifactPath("/Game/../../etc", "x", ".json")).toThrow(/traversal/);
+    expect(() => animationArtifactPath("/Game/A/Walk", "../x", ".json")).toThrow(/unsafe/);
     expect(animationArtifactPackage("A/Walk/Walk.psa")).toBe("/Game/A/Walk");
     expect(animationArtifactPackage("BS_Locomotion.json")).toBeUndefined();
+    expect(() => animationArtifactPackage("A/../../etc/Walk.psa")).toThrow(/traversal/);
   });
 });
