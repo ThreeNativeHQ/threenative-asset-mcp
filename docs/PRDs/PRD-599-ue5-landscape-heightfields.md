@@ -1,6 +1,6 @@
 # PRD-599 — UE5 landscape heightfields in levels
 
-**Status:** IN PROGRESS
+**Status:** IN PROGRESS — all local AC complete; independent review and CI pending
 **Priority:** P2 — terrain export implemented; parent owns the comparison sheet and final repository gates.
 **Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `src/unreal/scenes.ts`), new module; risk override: none.
 **Owner:** PRD-599 repair lane; parent owns orchestration
@@ -32,10 +32,19 @@ only to PNG. Engine headers to confirm the UE5 fields (tracked, not checked out)
 
 - [x] AC-1 [local]: A real UE5 level with a landscape imports with a terrain mesh whose height range and footprint match the landscape actor's bounds stored in the package, within 1%. proof: real-pack gate in `tests/fab-feature-corpus.test.ts` — Evidence: `.584.9.1` / importer 122, 2026-10-12: native and actual public importer GLB gates pass for all 51 components from the same eight-file stage; node-world POSITION bounds within 1%, zero terrain omissions, `reused: false`, pinned provenance.
 - [x] AC-2 [local]: A synthetic UE5 heightmap (known BGRA8 and `TSCF_UEDELTA` pixels) decodes to the expected heights. proof: red-to-green test beside `tests/unreal-converter-ue5-sources.test.ts` — Evidence: compiled BGRA8/UEDELTA known-height and public world-normal regression pass on `.584.9.1`; previous normal behavior fails for the expected direction.
-- [ ] AC-3 [local]: Before/after terrain sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: pending.
-- [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: pending.
+- [x] AC-3 [local]: Before/after terrain sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected actual before/after terrain and attached [PR52 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/52#issuecomment-6133268228). Same bounded eight-file stage, .584.8.1 blank terrain before and .584.9.1 public51-component GLB after. Production neutral renderer unchanged; existing fallback material, no layer-weight fidelity claim. Owner-only Drive permissions read back. Recipe and input/output SHA-256: raw/parent599-sheet.{mts,json}.
+- [x] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent normal-provisioner rebuild and all four gates pass on implementation7a04068: typecheck0.9s; default suite2,720 passed/17 skipped81.1s; leak gate clean89.6s; packed MCP15/15 in15.4s. Logs raw/parent599-final91-{typecheck,test,leaks,smoke}.log.
 
 ## Decisions
+
+- Height encoding: official LandscapeDataAccess.h:13,31–72; subsection duplicated-edge mapping
+  :177–208,314–329; LandscapeDataAccess.cpp:15–17 rounds atlas bias and :140–148 transforms local
+  vertices. Component fields are LandscapeComponent.h:437–501. LandscapeProxy.h:477–481 shares
+  the landscape GUID across proxies; :527 SectionOffset is not added again because component
+  relative location already accounts for it (Landscape.cpp:1387–1398).
+- SceneComponent.cpp:120–132 supplies native identity scale and :727–753 defines parent composition.
+  Source instances in this bounded proof have template-null components, no absolute flags and zero
+  rotations; stored root/component transforms plus native defaults determine their bounds.
 
 - Official engine reference: `5.8.3-release`, commit `396c9f059903aed5fec78ecd3d437a40c6415368`.
   `Engine/Source/Runtime/Landscape/Public/LandscapeDataAccess.h` confirms height decoding and,
@@ -61,7 +70,7 @@ only to PNG. Engine headers to confirm the UE5 fields (tracked, not checked out)
 
 ## Local verification
 
-Repair checks are recorded here; AC-3 and AC-4 remain pending parent delivery. The first two real-gate
+All local acceptance criteria have parent evidence; independent review and GitHub CI are in progress. The first two real-gate
 launches failed before conversion because the rebuilt apphost could not discover .NET. A private
 launcher now executes the converter DLL using the existing read-only SDK directly.
 
@@ -86,12 +95,12 @@ launcher now executes the converter DLL using the existing read-only SDK directl
 **Verification:** AC-1, AC-2.
 
 #### Phase 3: Evidence, ledger and gates
-**Status:** NOT STARTED
+**Status:** DONE
 **Files:** `docs/unreal-format-support.md` row "Landscape, UE5", `README.md` import table.
 **Verification:** AC-3, AC-4.
 
 
-- Real gate: 2 passed (23.39 s), private index `/home/joao/.cache/threenative-asset-mcp/prd599-real-proof/index.json`; source files SHA-256 checked before both imports.
+- Final parent real gate: 2 landscape gates passed (34 total including generic tests; 5.79 s), private index `/home/joao/.cache/threenative-asset-mcp/prd599-real-proof/index91.json`; source files SHA-256 checked before both imports.
 - `npm run typecheck`: passed.
 - Focused synthetic suites: 99 passed across converter source decoding, instance parameters and public scene assembly (38.54 s).
-- Parent still owns AC-3 comparison sheets and AC-4 full repository gates; repair builds and test processes have finished.
+- Parent completed AC-3 and AC-4. No conversion or test process remains active.
