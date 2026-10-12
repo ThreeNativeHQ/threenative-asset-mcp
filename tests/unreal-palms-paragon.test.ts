@@ -296,7 +296,7 @@ describe("BuildScale3D of an uncooked UE4 StaticMesh", () => {
   });
 
   // A UE5 editor mesh goes to the CUE4Parse converter, which decodes the same raw source model and writes (Y, Z, X).
-  async function importUe5Mesh(scale: readonly [number, number, number]) {
+  async function importUe5Mesh(scale: readonly [number, number, number], metadataFormat = "threenative-static-mesh-metadata") {
     const root = await scratch("build-scale-ue5-");
     const sourceDir = join(root, "source");
     const content = join(sourceDir, "Content", "Test");
@@ -321,7 +321,7 @@ const out = argv[argv.indexOf("--export-dir") + 1];
 fs.mkdirSync(join(out, "Meshes"), { recursive: true });
       fs.copyFileSync(${JSON.stringify(glb)}, join(out, "Meshes", "Mesh.glb"));
       fs.writeFileSync(join(out, "Meshes", "Mesh.metadata.json"), JSON.stringify({
-        format: "threenative-static-mesh-metadata",
+        format: ${JSON.stringify(metadataFormat)},
         version: 1,
         buildScale3D: ${JSON.stringify(scale)},
         lods: [{ lod: 0, status: "payload" }],
@@ -349,6 +349,12 @@ fs.mkdirSync(join(out, "Meshes"), { recursive: true });
     const report = await importUe5Mesh([2, 3, 5]);
     expect(report.models[0]?.boundsMetres).toEqual([3, 10, 0]);
     expect(report.warnings.join("\n")).toContain("BuildScale3D (2, 3, 5)");
+  });
+
+  it("ignores a metadata sidecar with the wrong format discriminator", async () => {
+    const report = await importUe5Mesh([2, 2, 2], "not-threenative-static-mesh-metadata");
+    expect(report.models[0]?.boundsMetres).toEqual([1, 2, 0]);
+    expect(report.warnings.join("\n")).not.toContain("BuildScale3D");
   });
 
   for (const [label, profile] of [["UE5.4 tag 1012", "ue54"], ["UE5.5 legacy -9", "ue55"]] as const) {

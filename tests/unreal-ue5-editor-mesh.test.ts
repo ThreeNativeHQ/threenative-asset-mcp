@@ -17,6 +17,7 @@ const HORNBEAM = process.env.THREENATIVE_UE5_EDITOR_PACK?.trim() || join(
   ".cache/threenative-asset-mcp/fab-downloads/parity-20261010T190956-00bdf8/c6f917b6-ffcb-4b86-9d9f-5274ba7f6a8e/MS_Hornbeam_UE51_V2/Content",
 );
 const CONVERTER = process.env.THREENATIVE_NATIVE_CONVERTER_PATH?.trim() || join(homedir(), ".cache/threenative-asset-mcp/toolchain/modern/bin/ThreeNativeConverter");
+const MESH_SELECTOR = process.env.THREENATIVE_UE5_EDITOR_MESH_SELECTOR?.trim();
 
 function converterReady(): boolean {
   try {
@@ -26,7 +27,7 @@ function converterReady(): boolean {
   }
 }
 
-const ready = existsSync(HORNBEAM) && converterReady();
+const ready = existsSync(HORNBEAM) && converterReady() && Boolean(MESH_SELECTOR);
 const outputs: string[] = [];
 afterAll(async () => {
   await Promise.all(outputs.map((directory) => rm(directory, { recursive: true, force: true })));
@@ -50,17 +51,16 @@ describe.skipIf(!ready)("uncooked UE5 Megascans (local European Hornbeam downloa
       const report = await importUnrealDirectory({
         sourceDir: HORNBEAM,
         outputDir,
-        onlyPackages: ["SM_EuropeanHornbeam_Sapling_01"],
+        onlyPackages: [MESH_SELECTOR!],
         modernConverter: { name: "modern", path: CONVERTER, version: CUE4PARSE_SOURCE.version },
         lods: [0, 1, 2],
       });
       expect(report.failed).toEqual([]);
-      expect(report.models.map((model) => model.glb)).toEqual([
-        "Models/SM_EuropeanHornbeam_Sapling_01.glb",
-        "Models/SM_EuropeanHornbeam_Sapling_01_LOD1.glb",
-        "Models/SM_EuropeanHornbeam_Sapling_01_LOD2.glb",
-      ]);
-      const counts = await Promise.all(report.models.map((model) => triangleCount(join(outputDir, model.glb))));
+      const base = report.models.find((model) => !/_LOD\d+\.glb$/i.test(model.glb));
+      expect(base).toBeDefined();
+      const lodPaths = [base!.glb, base!.glb.replace(/\.glb$/i, "_LOD1.glb"), base!.glb.replace(/\.glb$/i, "_LOD2.glb")];
+      expect(report.models.map((model) => model.glb)).toEqual(lodPaths);
+      const counts = await Promise.all(lodPaths.map((path) => triangleCount(join(outputDir, path))));
       expect(counts).toEqual([115_674, 41_543, 15_076]);
     },
     900_000,

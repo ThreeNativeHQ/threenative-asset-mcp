@@ -1173,6 +1173,23 @@ async function indexGlbs(root: string): Promise<Map<string, string>> {
   return glbs;
 }
 
+function indexMeshLodGlbs(glbs: ReadonlyMap<string, string>, name: string): Map<number, string> {
+  const lods = new Map<number, string>();
+  const base = name.toLowerCase();
+  for (const [stem, path] of glbs) {
+    const lower = stem.toLowerCase();
+    if (lower === base) {
+      lods.set(0, path);
+      continue;
+    }
+    const prefix = `${base}_lod`;
+    if (!lower.startsWith(prefix)) continue;
+    const lod = Number(lower.slice(prefix.length));
+    if (Number.isInteger(lod) && lod >= 0) lods.set(lod, path);
+  }
+  return lods;
+}
+
 /**
  * The adapter's `Gameplay/<selector>.json` sidecars, by lower-cased selector (the package path
  * without its extension, the same `entry.selector` the importer uses). PRD-582.
@@ -1340,7 +1357,7 @@ async function readConverterMeshMetadata(path: string): Promise<ModernMeshMetada
     const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
     if (typeof parsed !== "object" || parsed === null) return undefined;
     const raw = parsed as Record<string, unknown>;
-    if (raw.version !== 1 || !Array.isArray(raw.lods)) return undefined;
+    if (raw.format !== "threenative-static-mesh-metadata" || raw.version !== 1 || !Array.isArray(raw.lods)) return undefined;
     const scale = raw.buildScale3D;
     const buildScale3D = Array.isArray(scale) && scale.length === 3 && scale.every((value) => typeof value === "number" && Number.isFinite(value) && value > 0)
       ? [scale[0] as number, scale[1] as number, scale[2] as number] as const
@@ -4386,6 +4403,7 @@ export async function importUnrealDirectory(
   let modernCueSidecars = new Map<string, CueSidecar>();
   /** Mesh packages whose basename another routed package shares, decoded on their own: entry file -> GLB (undefined: failed). */
   const isolatedMeshGlbs = new Map<string, string | undefined>();
+  const isolatedMeshLodGlbs = new Map<string, Map<number, string>>();
   const isolatedMeshMetadata = new Map<string, ModernMeshMetadata | undefined>();
   /** Meshes UE Viewer exported after the modern converter failed on them. */
   const recoveredByUmodel = new Set<string>();
@@ -4527,13 +4545,17 @@ export async function importUnrealDirectory(
       await mapWithConcurrency(duplicates, 1, async (entry, index) => {
         const isolated = join(staging, "modern-duplicates", String(index).padStart(5, "0"));
         await mkdir(dirname(isolated), { recursive: true });
-        const run = await runModernConverter(modernConverter!.path, sourceDir, isolated, ["--filter", entry.selector], {
+        const isolatedArgs = ["--filter", entry.selector];
+        if (lodsArg) isolatedArgs.push("--lods", lodsArg);
+        const run = await runModernConverter(modernConverter!.path, sourceDir, isolated, isolatedArgs, {
           timeoutMs: 1_800_000,
           maxOutputBytes: 64 * 1024 * 1024,
         }, formatProfile);
         const name = basename(entry.package, extname(entry.package));
-        const glb = run.code === 0 ? (await indexGlbs(isolated)).get(name) : undefined;
+        const glbs = run.code === 0 ? await indexGlbs(isolated) : new Map<string, string>();
+        const glb = glbs.get(name);
         isolatedMeshGlbs.set(entry.file, glb);
+        isolatedMeshLodGlbs.set(entry.file, indexMeshLodGlbs(glbs, name));
         isolatedMeshMetadata.set(entry.file, run.code === 0 ? await readConverterMeshMetadata(join(isolated, "Meshes", `${name}.metadata.json`)) : undefined);
       });
       // Only a package decoded for its geometry earns this warning; a metadata-only package writes a
@@ -5321,8 +5343,11 @@ export async function importUnrealDirectory(
       const fromMeshDescription = uncookedNames.has(name);
       const fromModernConverter = modernNames.has(name);
       const modernMetadata = fromModernConverter
-        ? (isolatedMeshMetadata.get(entry.file) ?? modernMeshMetadata.get(name))
+        ? isolatedMeshMetadata.has(entry.file)
+          ? isolatedMeshMetadata.get(entry.file)
+          : modernMeshMetadata.get(name)
         : undefined;
+      const isolatedLodGlbs = isolatedMeshGlbs.has(entry.file) ? isolatedMeshLodGlbs.get(entry.file) ?? new Map<number, string>() : undefined;
       const defaultPath = isolatedMeshGlbs.has(entry.file)
         ? isolatedMeshGlbs.get(entry.file)
         : fromMeshDescription
@@ -5336,7 +5361,9 @@ export async function importUnrealDirectory(
       const lodPaths: { lod: number; path: string }[] = [];
       if (fromModernConverter && lodsArg !== undefined) {
         for (const lod of requestedLods) {
-          const path = lod === 0 ? defaultPath : modernGlbs.get(`${name}_LOD${lod}`);
+          const path = isolatedLodGlbs
+            ? isolatedLodGlbs.get(lod)
+            : lod === 0 ? defaultPath : modernGlbs.get(`${name}_LOD${lod}`);
           if (path) lodPaths.push({ lod, path });
         }
       } else if (defaultPath) {
