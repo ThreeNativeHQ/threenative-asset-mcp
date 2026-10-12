@@ -210,6 +210,15 @@ export function registerEffectsCorpusTests(corpusDir: string | undefined): void 
           const store = rawRipStore(niagaraScripts(dataFields, byIndex));
           const uniqueName = stringOf(property(handle.emitter.properties, "UniqueEmitterName")) ?? handle.emitter.name;
           const prefix = `Constants.${uniqueName}.`;
+          expect(store.size, `${system.name} emitter ${index} parsed raw RIP parameters`).toBeGreaterThan(0);
+          for (const suffix of [
+            "InitializeParticle.Lifetime Min", "InitializeParticle.Lifetime Max",
+            "InitializeParticle.Uniform Sprite Size Min", "InitializeParticle.Uniform Sprite Size Max",
+            "InitializeParticle.Sprite Rotation Angle Min", "InitializeParticle.Sprite Rotation Angle Max",
+            "InitializeParticle.Color Minimum", "InitializeParticle.Color Maximum",
+            "GravityForce.Gravity", "Drag.Drag",
+            "SolveForcesAndVelocity.Acceleration Limit", "SolveForcesAndVelocity.Speed Limit",
+          ]) expect(store.has(`${prefix}${suffix}`), `${system.name} emitter ${index} expected source input ${suffix}`).toBe(true);
           const rawModules = new Set<string>();
           for (const name of store.keys()) {
             if (!name.startsWith(prefix)) continue;

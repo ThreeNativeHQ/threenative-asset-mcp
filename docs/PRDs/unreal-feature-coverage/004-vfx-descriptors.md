@@ -125,3 +125,15 @@ A `Curve` is `{keys: [{t, v, arriveTangent, leaveTangent, interp}]}` and a `Rang
 **Files:** `src/unreal/effects-schema.ts` (Niagara mapping), `src/unreal/effects-dump.ts` (`.niagara.json`), `src/unreal/cue4parse-adapter.ts` (effect-package admission and `omittedActors` pointer), `src/unreal/importer.ts` (`EFFECT_CLASSES`, effect reconciliation, `IMPORTER_VERSION` 117), `src/unreal/scenes.ts` (`effectDescriptors` reconciliation), `tests/unreal-effects.test.ts`.
 **Implementation:** Read the emitter handles and versioned data, the renderer properties, and `RapidIterationParameters`. Map the known modules by script path.
 **Verification:** AC-3, AC-4, AC-6, AC-7 (sheets for every phase's PR).
+
+### Bounded source/proof hardening (2026-10-12)
+
+Complexity: 1 → LOW; risk override: none. Scope: the private final/render proof runners and `tests/helpers/effects-corpus.ts`; production renderer and converter unchanged.
+
+1. [local] Compare complete sorted input trees across before/after; reject changed slices before importing.
+2. [local] Bind both report pairs and captions to recorded full HEAD, complete source/code digests, native version/hash and live input trees; reject absent or inconsistent identities.
+3. [local] Require clean executed checkouts: before source matches the accepted base across all `src`, after tracked/untracked checkout changes are absent; record actual HEAD and code SHA.
+4. [local] Require nonempty real RIP stores and the common source inputs verified in all three stored systems before existing raw-field comparisons.
+5. [local] Wrap every caption and limitation and size the canvas from actual lines; preserve separate neutral metrics and picture identities.
+
+Checks: repository and both private scripts typecheck clean; existing Node effects/preview suites pass 88/88. Private synthetic self-checks reject dirty/untracked source, added input files, absent identity, wrong mode/SHA/input/native hash; caption layout retains all 12 long limitations with every text baseline inside the canvas; no native build, imports, screenshots or full gates authorized in this correction. Before converter-89 metadata remains pending: accepted source base, full executed HEAD/code digests, converter version/DLL hash and corresponding report paths must be filled after the parent patch; existing converter-88 slots remain deliberately unchanged.
