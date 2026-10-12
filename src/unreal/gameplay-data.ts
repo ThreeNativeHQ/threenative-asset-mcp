@@ -155,6 +155,8 @@ export interface RawGameplaySidecar {
   readonly staticSockets?: readonly RawSocket[];
   readonly collision?: RawCollision;
   readonly physicsAssetRef?: string;
+  /** The skeletal mesh's skeleton as a canonical package path (`/Game/A/SK_Hero`), for clip provenance. */
+  readonly skeletonRef?: string;
   readonly physics?: RawPhysics;
 }
 

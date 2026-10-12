@@ -2406,14 +2406,26 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
     return true;
 }
 
-// --- PRD-583: UE5 clips, blend spaces, aim offsets, montages and composites ------------------------------------------
+// PRD-583: UE5 clips, blend spaces, aim offsets, montages and composites ------------------------------------------
 // The pinned CUE4Parse reader exposes a clip's bone tracks only through RawAnimationData, the UE4
 // FUECompressedAnimData layout or ACL. A UE5.6+ clip keeps its tracks in a ControlRig MovieScene
 // model instead, so it is reported with its reason and never replaced by the bind pose.
-string AnimationTarget(string fileName, string extension) => Path.Combine(output, "Animation", fileName + extension);
+// One animation artifact per package, nested so two packages that share a clip or asset basename
+// ("/Game/A/Walk" and "/Game/B/Walk") never overwrite each other. The directory is the package path
+// below "/Game/"; the file name is the object name, which the importer reads back into exact provenance.
+string AnimationTarget(string packagePath, string fileName, string extension)
+{
+    var relative = GamePackagePath(packagePath);
+    var sub = relative.StartsWith("/Game/", StringComparison.OrdinalIgnoreCase) ? relative["/Game/".Length..] : relative.TrimStart('/');
+    var segments = sub.Split('/', StringSplitOptions.RemoveEmptyEntries)
+        .Where(segment => segment != "." && segment != "..")
+        .ToArray();
+    var directory = segments.Length > 0 ? Path.Combine(segments) : "";
+    return Path.Combine(output, "Animation", directory, fileName + extension);
+}
 
-void WriteAnimationJson(string fileName, object document) =>
-    File.WriteAllText(AnimationTarget(fileName, ".json"), JsonConvert.SerializeObject(document, Formatting.Indented), new UTF8Encoding(false));
+void WriteAnimationJson(string packagePath, string fileName, object document) =>
+    File.WriteAllText(AnimationTarget(packagePath, fileName, ".json"), JsonConvert.SerializeObject(document, Formatting.Indented), new UTF8Encoding(false));
 
 void ReportAnimationFailure(string name, string reason) =>
     Console.Error.WriteLine($"threenative-animation-failure {name} {reason}");
@@ -2500,8 +2512,23 @@ static Dictionary<string, object?> BlendAxis(FBlendParameter? typed, FStructFall
     };
 }
 
-static string? AnimationReferenceName(FPackageIndex? reference) =>
-    reference is null || reference.IsNull ? null : (reference.ResolvedObject?.Name.Text ?? reference.Name);
+// A canonical animation reference: the resolved object's package path plus its object name, e.g.
+// "/Game/A/Walk.Walk". Two clips that share an object name in different packages stay distinct, so a
+// consumer resolves the exact one rather than a bare basename. A reference the reader cannot resolve to
+// a package keeps its bare name, which the consumer only accepts when it is unambiguous.
+static string? AnimationReferenceName(FPackageIndex? reference)
+{
+    if (reference is null || reference.IsNull) return null;
+    var resolved = reference.ResolvedObject;
+    if (resolved is null) return reference.Name;
+    var name = resolved.Name.Text ?? reference.Name;
+    var packagePath = ResolvedPackagePath(resolved);
+    return string.IsNullOrEmpty(packagePath) ? name : packagePath + "." + name;
+}
+
+// The canonical package path of a skeleton reference, without the object suffix ("/Game/A/SK_Hero").
+// Used as skeleton provenance so a clip is matched to its exact skeleton package, not to a bare name.
+static string? SkeletonPackagePath(FPackageIndex? reference) => IndexPackagePath(reference);
 
 // The notifier a consumer dispatches, from the class behind the reference rather than the instance's own
 // object name. An editor places a notify instance whose object name is its own ("AnimNotify_Footstep_2");
@@ -2627,11 +2654,28 @@ static List<Dictionary<string, object?>> CurveList(IEnumerable<FFloatCurve?> cur
 
 // The sequence keeps its curves, notifies and sync markers on a separate data-model export. Resolve it
 // only from an exact reference the clip itself carries (its DataModel object pointer or its
-// DataModelInterface script-interface), or from a model whose Outer is this exact sequence. This reader
-// takes metadata only, so any data-model class is accepted here (the conventional UAnimDataModel or a
+// DataModelInterface script-interface), or from a model this exact sequence owns. This reader takes
+// metadata only, so any data-model class is accepted here (the conventional UAnimDataModel or a
 // Sequencer/ControlRig UAnimationSequencerDataModel); bone tracks still come from ExactDataModel. Never
 // fall back to the first "DataModel"-named export in the package: that misattributes one asset's
 // metadata to another. More than one model owned by the clip is ambiguous and reported, not guessed.
+// Ownership is the full object path, not Outer.Name: two objects nested in different owners can share a
+// name, and a name match alone would hand this clip another owner's model.
+static bool IsOwnedBy(UObject export, UObject owner)
+{
+    try
+    {
+        var outer = export.Outer;
+        if (outer is null) return false;
+        var outerPath = outer.GetPathName();
+        var ownerPath = owner.GetPathName();
+        if (!string.IsNullOrEmpty(outerPath) && !string.IsNullOrEmpty(ownerPath))
+            return string.Equals(outerPath, ownerPath, StringComparison.Ordinal);
+        return ReferenceEquals(outer, owner);
+    }
+    catch { return false; }
+}
+
 static UObject? DataModelExport(IPackage package, UObject sequence, out string ambiguity)
 {
     ambiguity = "";
@@ -2645,7 +2689,7 @@ static UObject? DataModelExport(IPackage package, UObject sequence, out string a
     }
     var owned = package.GetExports().Where(export =>
         export.ExportType.Contains("DataModel", StringComparison.OrdinalIgnoreCase) &&
-        string.Equals(export.Outer?.Name.Text, sequence.Name, StringComparison.Ordinal)).ToArray();
+        IsOwnedBy(export, sequence)).ToArray();
     if (owned.Length == 1) return owned[0];
     if (owned.Length > 1)
         ambiguity = $"the clip has {owned.Length} data-model exports whose Outer is the clip; refusing to choose one";
@@ -2668,7 +2712,7 @@ static UObject? ExactDataModel(UAnimSequence sequence, IPackage package)
         try { candidate = reference.Object.Load<UObject>(); } catch { }
     }
     candidate ??= package.GetExports().FirstOrDefault(export =>
-        IsConventionalDataModel(export) && string.Equals(export.Outer?.Name.Text, sequence.Name, StringComparison.Ordinal));
+        IsConventionalDataModel(export) && IsOwnedBy(export, sequence));
     return candidate is not null && IsConventionalDataModel(candidate) ? candidate : null;
 }
 
@@ -2866,7 +2910,7 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
         ["name"] = name,
         ["package"] = packagePath,
         ["className"] = "AnimSequence",
-        ["skeleton"] = sequence.Skeleton?.Name,
+        ["skeleton"] = SkeletonPackagePath(sequence.Skeleton),
     };
     try
     {
@@ -2890,7 +2934,7 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
         {
             // The metadata is still real, so its sidecar is written even though no clip is exported.
             document["unsupportedReason"] = modelReason.Length > 0 ? modelReason : UnsupportedReason(package, sequence);
-            WriteAnimationJson(name + ".clip", document);
+            WriteAnimationJson(packagePath, name + ".clip", document);
             return 0;
         }
         var animSet = sequence.ConvertAnims();
@@ -2904,9 +2948,9 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
         using (var writer = new FArchiveWriter())
         {
             new ActorXAnim(animSet, 0).Save(writer);
-            File.WriteAllBytes(AnimationTarget(name, ".psa"), writer.GetBuffer());
+            File.WriteAllBytes(AnimationTarget(packagePath, name, ".psa"), writer.GetBuffer());
         }
-        WriteAnimationJson(name + ".clip", document);
+        WriteAnimationJson(packagePath, name + ".clip", document);
         return 1;
     }
     catch (Exception error) { ReportAnimationFailure(name, error.Message); return 0; }
@@ -3011,7 +3055,7 @@ void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
                 ["type"] = StructText(raw, "InterpolationType"),
             });
         }
-        WriteAnimationJson(name, new Dictionary<string, object?>
+        WriteAnimationJson(packagePath, name, new Dictionary<string, object?>
         {
             ["format"] = "threenative-unreal-animation",
             ["version"] = 1,
@@ -3019,7 +3063,7 @@ void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
             ["name"] = name,
             ["package"] = packagePath,
             ["className"] = className,
-            ["skeleton"] = space.Skeleton?.Name,
+            ["skeleton"] = SkeletonPackagePath(space.Skeleton),
             ["blendSpaceType"] = aimOffset ? "aimOffset" : (space is UBlendSpace1D ? "1D" : "2D"),
             ["animLength"] = DumpNum(space.AnimLength),
             ["loop"] = space.GetOrDefault("bLoop", true),
@@ -3055,7 +3099,7 @@ void ExportMontage(UAnimMontage? montage, UAnimComposite? composite, string pack
             slots.Add(SlotRecord("DefaultSlot", composite!.AnimationTrack.AnimSegments));
             length = composite.AnimationTrack.GetLength();
         }
-        WriteAnimationJson(name, new Dictionary<string, object?>
+        WriteAnimationJson(packagePath, name, new Dictionary<string, object?>
         {
             ["format"] = "threenative-unreal-animation",
             ["version"] = 1,
@@ -3063,7 +3107,7 @@ void ExportMontage(UAnimMontage? montage, UAnimComposite? composite, string pack
             ["name"] = name,
             ["package"] = packagePath,
             ["className"] = montage is not null ? "AnimMontage" : "AnimComposite",
-            ["skeleton"] = ((UAnimationAsset) asset).Skeleton?.Name,
+            ["skeleton"] = SkeletonPackagePath(((UAnimationAsset) asset).Skeleton),
             ["length"] = DumpNum((float) length),
             ["rateScale"] = DumpNum(((UAnimSequenceBase) asset).RateScale),
             ["blendIn"] = BlendWindow(StructProperty(asset, "BlendIn")),
@@ -3862,6 +3906,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
     var staticSockets = new List<object>();
     object? collision = null;
     string? physicsAssetRef = null;
+    string? skeletonRef = null;
     foreach (var mesh in package.GetExports().OfType<USkeletalMesh>())
     {
         foreach (var socketIndex in mesh.Sockets)
@@ -3869,6 +3914,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
         if (mesh.Skeleton?.Load<USkeleton>() is { } skeleton)
             foreach (var socketIndex in skeleton.Sockets)
                 if (socketIndex?.Load<USkeletalMeshSocket>() is { } socket) skeletalSockets.Add(GpSocket(socket, "skeleton"));
+        if (mesh.Skeleton is { IsNull: false }) skeletonRef ??= SkeletonPackagePath(mesh.Skeleton);
         // Name the physics asset by its own package selector, not its bare asset name: two folders
         // can hold a same-named asset and a bare name would attach the wrong one. Fall back to the bare
         // name only when the resolved owner package is unavailable (the importer then reports ambiguity).
@@ -3885,13 +3931,14 @@ foreach (var key in provider.Files.Keys.Where(key =>
         if (mesh.BodySetup?.Load<UBodySetup>() is { } setup) collision = GpCollision(setup);
     }
     var physics = package.GetExports().OfType<UPhysicsAsset>().Select(GpPhysics).FirstOrDefault();
-    if (skeletalSockets.Count > 0 || staticSockets.Count > 0 || collision is not null || physicsAssetRef is not null || physics is not null)
+    if (skeletalSockets.Count > 0 || staticSockets.Count > 0 || collision is not null || physicsAssetRef is not null || skeletonRef is not null || physics is not null)
     {
         var gameplay = new Dictionary<string, object?> { ["version"] = 1, ["package"] = GameplaySelector(key) };
         if (skeletalSockets.Count > 0) gameplay["skeletalSockets"] = skeletalSockets;
         if (staticSockets.Count > 0) gameplay["staticSockets"] = staticSockets;
         if (collision is not null) gameplay["collision"] = collision;
         if (physicsAssetRef is not null) gameplay["physicsAssetRef"] = physicsAssetRef;
+        if (skeletonRef is not null) gameplay["skeletonRef"] = skeletonRef;
         if (physics is not null) gameplay["physics"] = physics;
         var gameplayTarget = Path.Combine(output, "Gameplay", GameplaySelector(key) + ".json");
         Directory.CreateDirectory(Path.GetDirectoryName(gameplayTarget)!);

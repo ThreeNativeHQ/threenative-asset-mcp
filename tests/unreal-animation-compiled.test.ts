@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 
 import { CUE4PARSE_ENGINE_CONTENT, CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
@@ -17,9 +17,41 @@ const INSTALLED_SDK = modernSdkExecutable;
 const PROOF_PACK = process.env.THREENATIVE_ANIMATION_PROOF_PACK;
 const PROOF_FILTER = process.env.THREENATIVE_ANIMATION_PROOF_FILTER;
 const PROOF_ENGINE = process.env.THREENATIVE_ANIMATION_PROOF_ENGINE ?? "5.8";
+// The one fixture whose exact shape is asserted, named by its canonical package (optionally `.Object`)
+// rather than by a frame count. Unset means no clip carries those assertions; a frame count alone can
+// match an unrelated clip and is never used to select the known proof.
+const KNOWN_CLIP = process.env.THREENATIVE_ANIMATION_KNOWN_CLIP;
 
 function escapeXml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** Artifacts are written under a package-derived directory; collect them recursively and relative. */
+async function collectRelativeFiles(root: string): Promise<string[]> {
+  const found: string[] = [];
+  const walk = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const full = join(directory, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else if (entry.isFile()) found.push(relative(root, full).split(sep).join("/"));
+    }
+  };
+  await walk(root);
+  return found.sort();
+}
+
+/** The expected nested artifact path for a document, mirroring `AnimationTarget`'s package directories. */
+function artifactRelative(packagePath: unknown, name: unknown, extension: string): string {
+  const canonical = typeof packagePath === "string" ? packagePath : "";
+  const relativePackage = canonical.startsWith("/Game/") ? canonical.slice("/Game/".length) : canonical.replace(/^\/+/, "");
+  const directory = relativePackage.split("/").filter((segment) => segment.length > 0).join("/");
+  return `${directory.length > 0 ? `${directory}/` : ""}${String(name)}${extension}`;
+}
+
+function matchesKnown(document: Record<string, unknown>, wanted: string): boolean {
+  const packagePath = typeof document.package === "string" ? document.package : "";
+  const name = typeof document.name === "string" ? document.name : "";
+  return wanted === packagePath || wanted === name || wanted === `${packagePath}.${name}`;
 }
 
 function assemblyReference(assembly: string): string {
@@ -95,7 +127,7 @@ describeWithTools(["modern-converter"], "converter animation code, compiled agai
     });
     expect(executed.code, executed.stderr.slice(-2000)).toBe(0);
     const animation = join(run, "Animation");
-    const files = await readdir(animation).catch(() => [] as string[]);
+    const files = await collectRelativeFiles(animation).catch(() => [] as string[]);
     expect(files.length).toBeGreaterThan(0);
     const documents = await Promise.all(files.filter((file) => file.endsWith(".json")).map(async (file) => JSON.parse(await readFile(join(animation, file), "utf8")) as Record<string, unknown>));
     for (const document of documents) {
@@ -121,13 +153,15 @@ describeWithTools(["modern-converter"], "converter animation code, compiled agai
     }
     // Each timed clip sidecar and its PSA must agree, so the reader's timing is tied to the bytes written:
     // the sidecar's key count is the PSA frame count, the PSA rate is the model's rational rate, and the
-    // PSA's endpoint (its last key) lands on the model's duration within a frame.
+    // PSA's endpoint (its last key) lands on the model's duration within a frame. A timed sidecar with no
+    // PSA is a defect, not a skip: the timing assertions cannot silently go unproven.
     for (const document of documents) {
       if (document.kind !== "clip" || document.timing === undefined) continue;
       const timing = document.timing as { frames: number; keys: number; rateNumerator: number; rateDenominator: number; duration: number };
-      const psaName = `${String(document.name)}.psa`;
-      if (!files.includes(psaName)) continue;
-      const psa = parsePsa(await readFile(join(animation, psaName)));
+      const expected = artifactRelative(document.package, document.name, ".psa");
+      const psaPath = files.find((file) => file === expected) ?? files.find((file) => basename(file) === `${String(document.name)}.psa`);
+      expect(psaPath, `the timed clip ${String(document.name)} has no corresponding PSA at ${expected}`).toBeDefined();
+      const psa = parsePsa(await readFile(join(animation, psaPath!)));
       const sequence = psa.sequences[0]!;
       expect(sequence.frames).toBe(timing.keys);
       expect(sequence.rate).toBeCloseTo(timing.rateNumerator / timing.rateDenominator, 6);
@@ -158,22 +192,22 @@ describeWithTools(["modern-converter"], "converter animation code, compiled agai
       }
     }
     expect(moving.length, "no exported clip carried a bone track with a varying rotation").toBeGreaterThan(0);
-    // The known conventional-model proof is identified by its own timing shape, not by a hardcoded clip
-    // name: its model reports NumberOfFrames 82 / NumberOfKeys 83 at 30/1, so the PSA must carry 83 keys
-    // per track at 30 fps and sample the endpoint at 82/30 = 2.733333 s, with 354 bones and 52 rotating.
-    // A general proof pack that carries no such clip skips this block.
-    const known = documents.find((document) =>
-      document.kind === "clip" && document.timing !== undefined &&
-      (document.timing as { frames: number }).frames === 82);
-    if (known !== undefined) {
-      const timing = known.timing as { frames: number; keys: number; rateNumerator: number; rateDenominator: number; duration: number };
+    // The known conventional-model proof is selected by an explicit fixture identifier (a canonical
+    // package, optionally `.Object`, from THREENATIVE_ANIMATION_KNOWN_CLIP), never by a frame count that
+    // could match an unrelated clip. When it is set, the fixture's own timing, its PSA's 83 keys at 30
+    // fps, its 354 bones, its 2.733333 s endpoint and its 52 rotating tracks are all asserted here.
+    if (KNOWN_CLIP) {
+      const known = documents.find((document) => document.kind === "clip" && document.timing !== undefined && matchesKnown(document, KNOWN_CLIP!));
+      expect(known, `the known fixture ${KNOWN_CLIP} produced no timed clip`).toBeDefined();
+      const timing = known!.timing as { frames: number; keys: number; rateNumerator: number; rateDenominator: number; duration: number };
       expect(timing.keys).toBe(83);
       expect(timing.rateNumerator).toBe(30);
       expect(timing.rateDenominator).toBe(1);
       expect(timing.duration).toBeCloseTo(2.733333, 5);
-      const psaName = `${String(known.name)}.psa`;
-      expect(files).toContain(psaName);
-      const psa = parsePsa(await readFile(join(animation, psaName)));
+      const expected = artifactRelative(known!.package, known!.name, ".psa");
+      const psaPath = files.find((file) => file === expected) ?? files.find((file) => basename(file) === `${String(known!.name)}.psa`);
+      expect(psaPath, `the known fixture ${KNOWN_CLIP} has no PSA at ${expected}`).toBeDefined();
+      const psa = parsePsa(await readFile(join(animation, psaPath!)));
       expect(psa.sequences.length).toBe(1);
       const sequence = psa.sequences[0]!;
       expect(sequence.rate).toBe(30);

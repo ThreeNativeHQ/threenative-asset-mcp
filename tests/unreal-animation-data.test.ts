@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   BLEND_AXIS_DEFAULTS,
+  animationArtifactPackage,
+  animationArtifactPath,
   blendAxes,
   buildAnimationLogic,
+  canonicalAnimationPath,
   normalizeClipSidecar,
   parseAnimationDescriptor,
+  parseAnimationReference,
   resolveClip,
   sectionStart,
   type RawAnimationAsset,
@@ -222,5 +226,56 @@ describe("animation descriptor trust boundary", () => {
     const noPackage = parseAnimationDescriptor({ format: "threenative-unreal-animation", version: 1, kind: "clip", name: "X" });
     expect(noPackage.reason).toBe("package is missing or empty");
     expect(parseAnimationDescriptor([]).reason).toBe("the document is not a JSON object");
+  });
+});
+
+describe("canonical animation identity (AC-4, AC-5)", () => {
+  it("normalizes a mounted path and splits a canonical object path", () => {
+    expect(canonicalAnimationPath("D:/proj/Content/A/Walk.uasset")).toBe("/Game/A/Walk");
+    expect(parseAnimationReference("/Game/A/Walk.Walk")).toEqual({ name: "Walk", package: "/Game/A/Walk", canonical: true });
+    // A package-only reference takes its object name from the last segment.
+    expect(parseAnimationReference("/Game/A/Walk")).toEqual({ name: "Walk", package: "/Game/A/Walk", canonical: true });
+    // A bare legacy name carries no package and is never treated as canonical.
+    expect(parseAnimationReference("M_Walk.Walk")).toEqual({ name: "M_Walk.Walk", canonical: false });
+  });
+
+  it("resolves a canonical reference to the exact package, even when two packages share a basename", () => {
+    const duplicate = [
+      { name: "Walk", package: "/Game/A/Walk", object: "Walk" },
+      { name: "B_Walk", package: "/Game/B/Walk", object: "Walk" },
+    ];
+    expect(resolveClip("/Game/B/Walk.Walk", duplicate)).toEqual({ clip: "B_Walk" });
+    expect(resolveClip("/Game/A/Walk.Walk", duplicate)).toEqual({ clip: "Walk" });
+  });
+
+  it("does not fall back to a same-basename clip on an explicit canonical mismatch", () => {
+    const one = [{ name: "Walk", package: "/Game/A/Walk", object: "Walk" }];
+    expect(resolveClip("/Game/B/Walk.Walk", one)).toMatchObject({
+      clip: "Walk",
+      unresolved: expect.stringMatching(/no exported animation matches/),
+    });
+  });
+
+  it("resolves a bare reference only when it is unique", () => {
+    const unique = [{ name: "Walk", package: "/Game/A/Walk", object: "Walk" }];
+    expect(resolveClip("Walk", unique)).toEqual({ clip: "Walk" });
+    const duplicated = [...unique, { name: "B_Walk", package: "/Game/B/Walk", object: "Walk" }];
+    expect(resolveClip("Walk", duplicated)).toMatchObject({ unresolved: expect.stringMatching(/ambiguous across 2 packages/) });
+  });
+
+  it("resolves a canonical reference whose glTF name was disambiguated to the source object", () => {
+    const duplicate = [
+      { name: "Wave", package: "/Game/A/Walk", object: "Wave" },
+      { name: "B_Walk_Wave", package: "/Game/B/Walk", object: "Wave" },
+    ];
+    expect(resolveClip("/Game/B/Walk.Wave", duplicate)).toEqual({ clip: "B_Walk_Wave" });
+  });
+
+  it("writes package-distinct artifact paths and reads the package back, refusing traversal", () => {
+    expect(animationArtifactPath("/Game/A/Walk", "Walk", ".psa")).toBe("Animation/A/Walk/Walk.psa");
+    expect(animationArtifactPath("/Game/B/Walk", "Walk", ".psa")).toBe("Animation/B/Walk/Walk.psa");
+    expect(animationArtifactPath("/Game/../../etc", "x", ".json")).toBe("Animation/etc/x.json");
+    expect(animationArtifactPackage("A/Walk/Walk.psa")).toBe("/Game/A/Walk");
+    expect(animationArtifactPackage("BS_Locomotion.json")).toBeUndefined();
   });
 });

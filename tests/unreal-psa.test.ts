@@ -132,6 +132,7 @@ describe("ActorX PSA conversion", () => {
       attached: ["Wave"],
       existing: [],
       incompatible: [],
+      clips: [{ name: "Wave", source: "Wave", coverage: 1 }],
     });
     const animation = document.getRoot().listAnimations()[0];
     expect(animation?.getName()).toBe("Wave");
@@ -148,6 +149,7 @@ describe("ActorX PSA conversion", () => {
       attached: [],
       existing: [],
       incompatible: ["Wave"],
+      clips: [],
     });
   });
 
@@ -160,6 +162,7 @@ describe("ActorX PSA conversion", () => {
       attached: [],
       existing: ["Wave"],
       incompatible: [],
+      clips: [{ name: "Wave", source: "Wave", coverage: 1 }],
     });
     expect(document.getRoot().listAnimations()).toHaveLength(1);
   });
@@ -174,5 +177,58 @@ describe("ActorX PSA conversion", () => {
     const keysAt = nonFinite.indexOf("ANIMKEYS") + 32;
     nonFinite.writeFloatLE(Number.NaN, keysAt);
     expect(() => parsePsa(nonFinite)).toThrow(/non-finite translation/);
+  });
+
+  function withProvenance(file: ReturnType<typeof parsePsa>, packagePath: string, skeleton: string) {
+    return { ...file, sequences: file.sequences.map((sequence) => ({ ...sequence, package: packagePath, skeleton })) };
+  }
+
+  function rig(): Document {
+    const document = new Document();
+    const rootJoint = document.createNode("root");
+    const handJoint = document.createNode("hand");
+    rootJoint.addChild(handJoint);
+    document.createSkin("Rig").addJoint(rootJoint).addJoint(handJoint).setSkeleton(rootJoint);
+    document.createScene().addChild(rootJoint);
+    return document;
+  }
+
+  it("does not attach a clip whose skeleton package differs, even when every bone name matches", () => {
+    const document = rig();
+    const foreign = withProvenance(parsePsa(fixture()), "/Game/B/Walk", "/Game/B/SK_Hero.SK_Hero");
+    expect(attachPsaAnimations(document, [foreign], { skeleton: "/Game/A/SK_Hero.SK_Hero" })).toMatchObject({
+      attached: [],
+      incompatible: ["Wave"],
+      clips: [],
+    });
+    expect(document.getRoot().listAnimations()).toHaveLength(0);
+  });
+
+  it("attaches a clip whose skeleton package matches and records its package provenance", () => {
+    const document = rig();
+    const own = withProvenance(parsePsa(fixture()), "/Game/B/Walk", "/Game/B/SK_Hero.SK_Hero");
+    const result = attachPsaAnimations(document, [own], { skeleton: "/Game/B/SK_Hero.SK_Hero" });
+    expect(result.attached).toEqual(["Wave"]);
+    expect(result.clips).toEqual([{ name: "Wave", source: "Wave", package: "/Game/B/Walk", skeleton: "/Game/B/SK_Hero.SK_Hero", coverage: 1 }]);
+    expect(document.getRoot().listAnimations()[0]!.getExtras()).toMatchObject({ unreal: { sourcePackage: "/Game/B/Walk" } });
+  });
+
+  it("gives two same-named clips from different packages distinct glTF animation names", () => {
+    const document = rig();
+    const first = withProvenance(parsePsa(fixture()), "/Game/A/Walk", "/Game/A/SK_Hero.SK_Hero");
+    const second = withProvenance(parsePsa(fixture()), "/Game/B/Walk", "/Game/B/SK_Hero.SK_Hero");
+    const result = attachPsaAnimations(document, [first, second]);
+    expect(result.attached).toEqual(["Wave", "B_Walk_Wave"]);
+    expect(result.clips.map((clip) => [clip.name, clip.source, clip.package])).toEqual([
+      ["Wave", "Wave", "/Game/A/Walk"],
+      ["B_Walk_Wave", "Wave", "/Game/B/Walk"],
+    ]);
+    expect(document.getRoot().listAnimations().map((animation) => animation.getName())).toEqual(["Wave", "B_Walk_Wave"]);
+  });
+
+  it("keeps a legacy clip with no skeleton provenance attaching by bone names alone", () => {
+    const document = rig();
+    const legacy = parsePsa(fixture());
+    expect(attachPsaAnimations(document, [legacy], { skeleton: "/Game/A/SK_Hero.SK_Hero" }).attached).toEqual(["Wave"]);
   });
 });

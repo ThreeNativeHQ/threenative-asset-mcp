@@ -27,6 +27,14 @@ export interface PsaSequence {
   readonly rate: number;
   readonly frames: number;
   readonly tracks: readonly PsaTrack[];
+  /**
+   * The canonical Unreal package the clip came from (`/Game/Dir/Asset`), when the caller that read the
+   * artifact knows it. A PSA file itself carries no package, so this is provenance supplied at parse
+   * time; it lets a clip be matched to the exact package that produced it rather than to a basename.
+   */
+  readonly package?: string;
+  /** The canonical package path of the skeleton the clip binds to, when known. */
+  readonly skeleton?: string;
 }
 
 export interface PsaFile {
@@ -219,34 +227,97 @@ export function parsePsa(bytes: Buffer): PsaFile {
   return { bones, sequences, hasScaleKeys: (chunks.get("SCALEKEYS")?.count ?? 0) > 0 };
 }
 
+export interface AttachedPsaClip {
+  /** The actual glTF animation name, distinct from any other clip already in the document. */
+  readonly name: string;
+  /** The PSA's own sequence name, which the reference resolver matches on. */
+  readonly source: string;
+  readonly package?: string;
+  readonly skeleton?: string;
+  readonly coverage: number;
+}
+
 export interface AttachedPsaResult {
   readonly attached: readonly string[];
   readonly existing: readonly string[];
   readonly incompatible: readonly string[];
+  /** Provenance for every clip the result names, so a caller can build exact exported-clip identities. */
+  readonly clips: readonly AttachedPsaClip[];
+}
+
+export interface AttachPsaOptions {
+  readonly minimumBoneCoverage?: number;
+  /**
+   * The canonical package path of the target mesh's skeleton. A clip that names a different canonical
+   * skeleton package is not attached, so two rigs that share bone names but not a skeleton never receive
+   * each other's clips. A clip with no skeleton provenance still attaches by bone names (legacy UE Viewer
+   * route), because that route has no package to compare.
+   */
+  readonly skeleton?: string;
+}
+
+function canonical(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.replace(/\\/g, "/").replace(/\/{2,}/g, "/").trim().replace(/\.(?:uasset|umap)$/i, "");
+  return normalized.length > 0 ? normalized.toLowerCase() : undefined;
+}
+
+/** A deterministic, collision-free actual animation name for a clip whose bare name another package took. */
+function disambiguatedName(packagePath: string | undefined, name: string, used: ReadonlySet<string>): string {
+  const relative = (packagePath ?? "").replace(/^\/Game\//i, "").split("/").filter(Boolean).join("_");
+  const stem = relative.length > 0 ? `${relative}_${name}` : `${name}_clip`;
+  let candidate = stem;
+  let counter = 2;
+  while (used.has(candidate.toLowerCase())) candidate = `${stem}_${counter++}`;
+  return candidate;
 }
 
 /** Adds PSA clips to a compatible glTF skin by case-insensitive joint name, ready for AnimationMixer. */
 export function attachPsaAnimations(
   document: Document,
   files: readonly PsaFile[],
-  minimumBoneCoverage = 0.8,
+  options: number | AttachPsaOptions = {},
 ): AttachedPsaResult {
+  const resolved: AttachPsaOptions = typeof options === "number" ? { minimumBoneCoverage: options } : options;
+  const minimumBoneCoverage = resolved.minimumBoneCoverage ?? 0.8;
+  const targetSkeleton = canonical(resolved.skeleton);
   const root = document.getRoot();
   const joints = new Map<string, Node>();
   for (const skin of root.listSkins()) {
     for (const joint of skin.listJoints()) joints.set(joint.getName().toLowerCase(), joint);
   }
-  const existing = new Set(root.listAnimations().map((animation) => animation.getName().toLowerCase()));
+  // A document that already carries a clip of this name (UE Viewer's own GLB animation) keeps it; the
+  // name's package is unknown, so it is recorded as undefined and never disambiguated against.
+  const used = new Map<string, string | undefined>();
+  for (const animation of root.listAnimations()) used.set(animation.getName().toLowerCase(), undefined);
   const buffer = root.listBuffers()[0] ?? document.createBuffer("PSA animations");
   const attached: string[] = [];
   const alreadyPresent: string[] = [];
   const incompatible: string[] = [];
+  const clips: AttachedPsaClip[] = [];
 
   for (const file of files) {
     for (const sequence of file.sequences) {
-      if (existing.has(sequence.name.toLowerCase())) {
-        alreadyPresent.push(sequence.name);
+      // A clip whose own skeleton provenance names a different package than the target's is not this
+      // mesh's clip, even when every bone name matches.
+      const sequenceSkeleton = canonical(sequence.skeleton);
+      if (targetSkeleton !== undefined && sequenceSkeleton !== undefined && sequenceSkeleton !== targetSkeleton) {
+        incompatible.push(sequence.name);
         continue;
+      }
+      const key = sequence.name.toLowerCase();
+      if (used.has(key)) {
+        const holder = used.get(key);
+        if (holder === undefined) {
+          alreadyPresent.push(sequence.name);
+          clips.push({ name: sequence.name, source: sequence.name, coverage: 1 });
+          continue;
+        }
+        if (holder === canonical(sequence.package)) {
+          alreadyPresent.push(sequence.name);
+          clips.push({ name: sequence.name, source: sequence.name, ...(sequence.package === undefined ? {} : { package: sequence.package }), ...(sequence.skeleton === undefined ? {} : { skeleton: sequence.skeleton }), coverage: 1 });
+          continue;
+        }
       }
       const mapped = sequence.tracks.filter((track) => joints.has(track.bone.toLowerCase()));
       const coverage = sequence.tracks.length === 0 ? 0 : mapped.length / sequence.tracks.length;
@@ -254,23 +325,24 @@ export function attachPsaAnimations(
         incompatible.push(sequence.name);
         continue;
       }
+      const actual = used.has(key) ? disambiguatedName(sequence.package, sequence.name, new Set(used.keys())) : sequence.name;
       const animation = document
-        .createAnimation(sequence.name)
-        .setExtras({ unreal: { sourceFormat: "ActorX PSA", boneCoverage: coverage } });
+        .createAnimation(actual)
+        .setExtras({ unreal: { sourceFormat: "ActorX PSA", boneCoverage: coverage, ...(sequence.package === undefined ? {} : { sourcePackage: sequence.package }) } });
       for (const track of mapped) {
         const target = joints.get(track.bone.toLowerCase())!;
         const input = document
-          .createAccessor(`${sequence.name}/${track.bone}/time`)
+          .createAccessor(`${actual}/${track.bone}/time`)
           .setType("SCALAR")
           .setArray(track.times)
           .setBuffer(buffer);
         const translation = document
-          .createAccessor(`${sequence.name}/${track.bone}/translation`)
+          .createAccessor(`${actual}/${track.bone}/translation`)
           .setType("VEC3")
           .setArray(track.translations)
           .setBuffer(buffer);
         const rotationOutput = document
-          .createAccessor(`${sequence.name}/${track.bone}/rotation`)
+          .createAccessor(`${actual}/${track.bone}/rotation`)
           .setType("VEC4")
           .setArray(track.rotations)
           .setBuffer(buffer);
@@ -302,9 +374,10 @@ export function attachPsaAnimations(
               .setTargetPath("rotation"),
           );
       }
-      existing.add(sequence.name.toLowerCase());
-      attached.push(sequence.name);
+      used.set(actual.toLowerCase(), canonical(sequence.package));
+      attached.push(actual);
+      clips.push({ name: actual, source: sequence.name, ...(sequence.package === undefined ? {} : { package: sequence.package }), ...(sequence.skeleton === undefined ? {} : { skeleton: sequence.skeleton }), coverage });
     }
   }
-  return { attached, existing: alreadyPresent, incompatible };
+  return { attached, existing: alreadyPresent, incompatible, clips };
 }
