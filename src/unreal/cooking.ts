@@ -139,18 +139,130 @@ export async function readPackageClasses(file: string, candidates: readonly stri
   return head ? classesInHead(head, candidates) : [];
 }
 
-const GAME_REFERENCE = /\/Game\/[A-Za-z0-9_]+(?:\/[A-Za-z0-9_]+)*/g;
+const GAME_REFERENCE = /\/Game\/[A-Za-z0-9_]+(?:\/{1,2}[A-Za-z0-9_]+)*/g;
 
 /**
- * The `/Game/...` source package paths named in a package's import/name tables at its head. A package
- * that references a material, texture or skeleton names that package's path, so these are the edges
- * of the dependency graph a slice must close over. Engine (`/Engine/...`) and script references are
- * excluded: they are not files in the pack.
+ * The `/Game/...` source package paths named in a package's import/name tables. A package that
+ * references a material, texture or skeleton names that package's path, so these are the edges of the
+ * dependency graph a slice must close over. Engine (`/Engine/...`) and script references are excluded:
+ * they are not files in the pack. Repeated separators collapse to one, so a normalized reference joins
+ * the same set as its canonical form.
  */
 export function gameReferencesInHead(head: Buffer): string[] {
   const refs = new Set<string>();
-  for (const match of head.toString("latin1").matchAll(GAME_REFERENCE)) refs.add(match[0]);
+  for (const match of head.toString("latin1").matchAll(GAME_REFERENCE)) refs.add(match[0].replace(/\/{2,}/g, "/").replace(/\/$/, ""));
   return [...refs];
+}
+
+/** A whole file's byte length, so a truncated package can be told from an unreadable one. */
+async function fileSize(file: string): Promise<number | undefined> {
+  let handle;
+  try {
+    handle = await open(file, "r");
+  } catch {
+    return undefined;
+  }
+  try {
+    return (await handle.stat()).size;
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * The `TotalHeaderSize` field of a package summary, or undefined for a byte string that is not a
+ * supported Unreal package. This mirrors the pinned CUE4Parse `FPackageFileSummary` read order for the
+ * two summary layouts the slice scanner meets: UE4 (legacy -3..-7) and UE5 (legacy -8/-9). `SavedHash`
+ * (20 bytes) precedes the size only from UE5 `PACKAGE_SAVED_HASH` (1016) on. The custom-version
+ * container size follows the legacy version: enum tags (-2), a variable guid record (-3..-5) or the
+ * modern guid+int (-6 and below).
+ */
+export function packageHeaderSize(prefix: Buffer): number | undefined {
+  try {
+    if (prefix.length < 40 || prefix.readUInt32LE(0) !== PACKAGE_MAGIC) return undefined;
+    let offset = 0;
+    const i32 = (): number => {
+      const value = prefix.readInt32LE(offset);
+      offset += 4;
+      return value;
+    };
+    i32(); // magic
+    const legacy = i32();
+    if (legacy > -2 || legacy < -9) return undefined; // not a UE4/UE5 summary
+    if (legacy !== -4) i32(); // legacy UE3 version
+    i32(); // UE4 object version
+    const ue5 = legacy <= -8 ? i32() : 0;
+    i32(); // licensee version
+    let totalHeaderSize: number | undefined;
+    if (ue5 >= 1016) {
+      offset += 20; // SavedHash
+      totalHeaderSize = i32();
+    }
+    const customVersions = i32();
+    if (customVersions < 0 || customVersions > 100_000) return undefined;
+    if (legacy === -2) offset += customVersions * 8;
+    else if (legacy >= -5) {
+      for (let index = 0; index < customVersions; index += 1) {
+        offset += 20;
+        const length = i32();
+        offset += length < 0 ? -length * 2 : length;
+      }
+    } else offset += customVersions * 20;
+    if (totalHeaderSize === undefined) totalHeaderSize = i32();
+    return totalHeaderSize;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The largest header this reader will load whole; a summary beyond it is refused rather than allocated. */
+const MAX_HEADER_BYTES = 64 * 1024 * 1024;
+
+/** A byte source with positioned reads; a `FileHandle` satisfies it. */
+export interface PositionedReader {
+  read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>;
+}
+
+/** Fills `buffer` from `position`, or throws. A short read must never leave a zero-filled tail that
+ * scans as absent data: a regular file returns the full request, but the contract is enforced, not
+ * assumed, so a truncated or concurrently changed file fails loudly. */
+export async function readExactly(handle: PositionedReader, buffer: Buffer, position: number): Promise<void> {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, position + offset);
+    if (bytesRead === 0) throw new Error(`short read at ${position + offset}: wanted ${buffer.length} bytes, got ${offset}`);
+    offset += bytesRead;
+  }
+}
+
+/**
+ * Reads a whole package header (summary, name table and import table) for the fallback class/edge scan.
+ * The name table holds every `/Game/...` path an import names, so scanning the whole header is a
+ * conservative superset of the import-table closure. Unlike the bounded head scan this throws on a
+ * truncated or unreadable package, so a dependency can never be dropped silently: the header size must
+ * be present, well-formed and inside the file.
+ */
+export async function readPackageHeaderRegion(file: string): Promise<Buffer> {
+  const size = await fileSize(file);
+  if (size === undefined) throw new Error(`cannot read package ${file}`);
+  let handle;
+  try {
+    handle = await open(file, "r");
+    // The custom-version container sits before `TotalHeaderSize` and can be tens of records long, so
+    // read a prefix wide enough to hold it rather than a fixed small window.
+    const prefix = Buffer.alloc(Math.min(64 * 1024, size));
+    await readExactly(handle, prefix, 0);
+    const totalHeaderSize = packageHeaderSize(prefix);
+    if (totalHeaderSize === undefined) throw new Error("not a supported Unreal package header");
+    if (totalHeaderSize < 16) throw new Error(`implausible header size ${totalHeaderSize}`);
+    if (totalHeaderSize > MAX_HEADER_BYTES) throw new Error(`header size ${totalHeaderSize} exceeds the ${MAX_HEADER_BYTES}-byte bound`);
+    if (totalHeaderSize > size) throw new Error(`truncated header: ${totalHeaderSize} bytes declared, file holds ${size}`);
+    const header = Buffer.alloc(totalHeaderSize);
+    await readExactly(handle, header, 0);
+    return header;
+  } finally {
+    await handle?.close();
+  }
 }
 
 export async function readPackageGameReferences(file: string): Promise<string[]> {

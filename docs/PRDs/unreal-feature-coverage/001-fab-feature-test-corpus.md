@@ -26,7 +26,7 @@ hints. Counts marked "name table" come from scanning `\0Class\0` in the package 
 
 | Listing (UID prefix) | Engine | Download | Classes |
 |---|---|---|---|
-| Animation Starter Pack, Epic (`98ff449d`, artifact `AnimStarterPack`) | 4.4 | 9 MiB | File names: AimOffset 2 (`Aim_Space_*`), BlendSpace 2 (`R_*`), PhysicsAsset 1, Skeleton 1, AnimBP 1, 62 sequences |
+| Animation Starter Pack, Epic (`98ff449d`, artifact `AnimStarterPack`) | 4.4 | 9 MiB | File names: BlendSpace 2 (`R_*`), PhysicsAsset 1, Skeleton 1, AnimBP 1, 62 sequences. The `Aim_Space_*` files are `AnimSequence` packages, so 4.4 has no `AimOffsetBlendSpace` (recorded gap) |
 | ROG Creatures: Stickman (`d36ddd1b`) | 4.22 | 174 MiB | File names: PhysicsAsset 1, BlendSpace 1, Montage 6, AnimBP 1 |
 | Soul: Cave (`75f42402`) | 4.18 | 1068 MiB | File names: Cascade 21 (`P_*`, `PGPU_*`), SoundCue 2; static meshes with collision |
 | Game Animation Sample (`880e319a`, artifact 5.8 on disk from the parity sweep) | 5.8 | 7.0 GiB on disk | Name table: SoundCue 6, AnimMontage 189, BlendSpace 17, BlendSpace1D 6, PhysicsAsset 41, SkeletalBodySetup 17, PhysicsConstraintTemplate 16, SkeletalMeshSocket 6, PoseAsset 136; no Cascade or Niagara |
@@ -66,9 +66,9 @@ Considered and not chosen, to avoid redundancy or size:
 ## Acceptance Criteria
 
 - [x] AC-1 [local]: `npx tsx scripts/fab-census.ts --out <dir>` reports every owned Unreal listing with download MiB and class-hint counts, and downloads no content. proof: run on the owner's library — Evidence: `npx tsx scripts/fab-census.ts --out /tmp/opencode/fabcensus/out` ran on 2026-10-12 over 37 Unreal listings (167,506 files, 195,016.9 MiB) and wrote `/tmp/opencode/fabcensus/out/fab-census.json`; no content downloaded.
-- [x] AC-2 [local]: Every class in the coverage matrix is confirmed from package name tables in its slice, and the counts are recorded in `docs/parity/feature-corpus.json`. proof: `npx tsx scripts/fab-slice.ts verify` — Evidence: 5 slices verified; each non-gap target class has a member and the counts are recorded. Recorded gaps: 4.4 has no `AimOffsetBlendSpace` (its `Aim_Space_*` files are `AnimSequence` packages) and no socket-bearing mesh; Stickman has no `SkeletalMeshSocket` or `AnimNotify`.
+- [x] AC-2 [local]: Each coverage-matrix class is either confirmed present in its slice or recorded as a gap in `docs/parity/feature-corpus.json`. The recorded `classCounts` are **package counts from name-table membership (presence), never object or export counts**, so a class with N members can report more. proof: `npx tsx scripts/fab-slice.ts verify` — Evidence: 5 slices verified; each non-gap target class has a member and its package count is recorded. Recorded gaps: 4.4 has no `AimOffsetBlendSpace`/`AimOffsetBlendSpace1D` (its `Aim_Space_*` files are `AnimSequence` packages), no `BlendSpace1D` and no socket-bearing mesh; Stickman has no `SkeletalMeshSocket` or `AnimNotify`.
 - [~] AC-3 [local]: Each slice imports through `asset_import_unreal` with the same per-package result (converted, skipped, failed, with reasons) as its full pack, so slicing drops no dependency. proof: `npx tsx scripts/fab-slice.ts compare-full <slice-id>` for each slice — Evidence: `anim-starter-4.4` (6 packages), `stickman-4.22` (11), `soul-cave-4.18` (13) and `vtol-5.4` (4) all report 0 differing packages. `game-anim-5.8` full-pack import was still running (3,895 packages through CUE4Parse) at delivery; its slice import produced 8 model GLBs, 48 textures and 23 materials.
-- [x] AC-4 [local]: All slices together use at most 1 GiB on disk. proof: `npx tsx scripts/fab-slice.ts verify` prints the total — Evidence: 218.6 MiB across 5 slices (3.0 + 94.8 + 0.8 + 2.8 + 117.3).
+- [x] AC-4 [local]: All slices together use at most 1 GiB on disk. The count includes each package's `.uexp`/`.ubulk`/`.uptnl` bulk-data sidecars, which are copied and removed with their owning package. proof: `npx tsx scripts/fab-slice.ts verify` prints the total — Evidence: 229,260,970 bytes (218.6 MiB) across 5 slices (3,113,959 + 122,977,887 + 873,698 + 99,372,031 + 2,923,395).
 - [x] AC-5 [local]: `FAB_FEATURE_CORPUS_DIR=~/.cache/threenative-asset-mcp/fab-slices npx vitest run tests/fab-feature-corpus.test.ts` imports every slice and passes. Without the variable, it skips and reports why. proof: both runs — Evidence: without the variable 8 pass + 1 skipped with the stated reason; with it, 9 pass, importing all 5 slices.
 - [ ] AC-6 [local]: Every PR attaches before/after sheets per the epic `README.md` evidence rule. Each slice's import is rendered beside the full pack's import of the same pieces, and the judge reports identical results, so slicing changes nothing visible. proof: the PR comment with sheets — Evidence: sheets prepared local-only under `/tmp/opencode/ac6/` (not published). Reproduce with `npx tsx scripts/fidelity-sheet.ts --source <full pack> --import <compare dir>/slice --out <out>` and the same for `full`. `anim-starter-4.4` `HeroTPP` and `stickman-4.22` `SK_Stickman` render with byte-identical judge metrics between slice and full (only the GLB path differs); `game-anim-5.8` and `vtol-5.4` are UE5 packs whose pieces carry no editor thumbnail, so a thumbnail-based sheet has no tiles for them and needs the `renderTiles` slice-vs-full path.
 
@@ -76,11 +76,11 @@ Considered and not chosen, to avoid redundancy or size:
 
 | Class group | UE4 early (4.4) | UE4 late (4.18–4.22) | UE5 (5.4–5.8) |
 |---|---|---|---|
-| Sockets | Animation Starter Pack (to confirm) | Stickman (to confirm) | Game Animation Sample (40 on one skeleton) |
+| Sockets | Animation Starter Pack (gap: no socket-bearing mesh) | Stickman (gap: no `SkeletalMeshSocket`) | Game Animation Sample (40 on one skeleton) |
 | PhysicsAsset, constraints | Animation Starter Pack | Stickman | Game Animation Sample |
 | StaticMesh simple collision | none | Soul: Cave | Game Animation Sample |
 | SoundCue | none | Soul: Cave | Game Animation Sample |
-| BlendSpace, AimOffset | Animation Starter Pack | Stickman | Game Animation Sample |
+| BlendSpace, AimOffset | Animation Starter Pack (BlendSpace; AimOffset gap, `Aim_Space_*` are AnimSequence) | Stickman (BlendSpace/1D; no AimOffset) | Game Animation Sample |
 | Montage, notifies | none | Stickman | Game Animation Sample |
 | PoseAsset | none | none | Game Animation Sample |
 | Cascade | none | Soul: Cave | gap accepted (same class model as UE4) |

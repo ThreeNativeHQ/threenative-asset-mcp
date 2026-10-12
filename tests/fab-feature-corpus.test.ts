@@ -1,21 +1,29 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
+  assertNoSymlinks,
   assertSafeChild,
+  containedPath,
+  corpusPath,
   diffPackageOutcomes,
   gamePathOf,
+  importFreshOutput,
+  listPackageFiles,
   packageDigest,
   packageOutcomes,
+  readCorpus,
   selectSlicePackages,
   type PackageOutcome,
   type ScannedPackage,
 } from "../scripts/fab-slice.js";
-import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
+import { packageHeaderSize, readExactly, readPackageHeaderRegion, type PositionedReader } from "../src/unreal/cooking.js";
+import { ImportError, importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
+import { primaryClassFixture } from "./helpers/uasset-fixture.js";
 
 describe("fab-slice dependency closure", () => {
   const scanned: ScannedPackage[] = [
@@ -68,6 +76,129 @@ describe("fab-slice path containment", () => {
     }
     expect(assertSafeChild("/root", "slice-id")).toBe("/root/slice-id");
   });
+
+  it("accepts a nested manifest path but refuses traversal, absolute and empty segments", () => {
+    expect(containedPath("/root", "Content/A/Mesh.uasset")).toBe("/root/Content/A/Mesh.uasset");
+    for (const bad of ["", "/etc/passwd", "../x", "a/../../x", "a//b", "a/./b", "a\\..\\b"]) {
+      expect(() => containedPath("/root", bad)).toThrow(/unsafe|escapes/);
+    }
+  });
+
+  it("refuses to delete or copy through a symlinked path", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "fab-slice-symlink-"));
+    directories.push(directory);
+    await mkdir(join(directory, "real"));
+    await symlink("/etc", join(directory, "link"));
+    await expect(assertNoSymlinks(directory, "link/hosts")).rejects.toThrow(/symlink/);
+    await expect(assertNoSymlinks(directory, "real/../real/ok.uasset")).rejects.toThrow(/unsafe/);
+    await expect(assertNoSymlinks(directory, "real/new.uasset")).resolves.toBe(join(directory, "real", "new.uasset"));
+  });
+
+  it("refuses a symlinked root, which would bypass the per-child check", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "fab-slice-rootlink-"));
+    directories.push(directory);
+    await mkdir(join(directory, "real"));
+    const rootLink = join(directory, "root-link");
+    await symlink(join(directory, "real"), rootLink);
+    // The root itself is a symlink: a contained `rel` still resolves through it, so it is refused.
+    await expect(assertNoSymlinks(rootLink, "new.uasset")).rejects.toThrow(/symlink/);
+    await expect(assertNoSymlinks(rootLink, "nested/new.uasset")).rejects.toThrow(/symlink/);
+    // A real root with no symlinked child is still accepted.
+    await expect(assertNoSymlinks(join(directory, "real"), "new.uasset")).resolves.toBe(join(directory, "real", "new.uasset"));
+  });
+});
+
+describe("fab-slice output-collision handling", () => {
+  it("propagates a collision without deleting the existing output", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "fab-slice-collision-"));
+    directories.push(directory);
+    const outputDir = join(directory, "out");
+    await mkdir(outputDir, { recursive: true });
+    const sentinel = join(outputDir, "import-report.json");
+    await writeFile(sentinel, "{}");
+    const collision = new ImportError("UNREAL_OUTPUT_COLLISION", "already holds a different import");
+    await expect(importFreshOutput("source", outputDir, async () => { throw collision; })).rejects.toMatchObject({
+      code: "UNREAL_OUTPUT_COLLISION",
+    });
+    await expect(readFile(sentinel, "utf8")).resolves.toBe("{}");
+    expect(existsSync(outputDir)).toBe(true);
+  });
+
+  it("rethrows a non-collision error unchanged", async () => {
+    const failure = new Error("boom");
+    await expect(importFreshOutput("source", "out", async () => { throw failure; })).rejects.toBe(failure);
+  });
+});
+
+describe("fab-slice package-header read", () => {
+  it("fills the buffer across short reads, so a partial read never leaves a zero tail", async () => {
+    const buffer = Buffer.alloc(8);
+    let calls = 0;
+    const chunked: PositionedReader = {
+      async read(target, offset, length) {
+        const bytesRead = Math.min(length, 3);
+        target.fill(calls + 1, offset, offset + bytesRead);
+        calls += 1;
+        return { bytesRead };
+      },
+    };
+    await readExactly(chunked, buffer, 0);
+    expect(calls).toBe(3);
+    expect([...buffer]).toEqual([1, 1, 1, 2, 2, 2, 3, 3]);
+  });
+
+  it("throws when a read ends before the buffer is full", async () => {
+    const empty: PositionedReader = { async read() { return { bytesRead: 0 }; } };
+    await expect(readExactly(empty, Buffer.alloc(4), 0)).rejects.toThrow(/short read/);
+  });
+
+  it("reads exactly the declared header bytes and refuses a truncated file", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "fab-slice-header-"));
+    directories.push(directory);
+    const bytes = primaryClassFixture({ ue4Version: 385 });
+    const totalHeaderSize = packageHeaderSize(bytes);
+    expect(totalHeaderSize).toBeDefined();
+    expect(totalHeaderSize).toBe(bytes.length);
+    const full = join(directory, "Full.uasset");
+    await writeFile(full, bytes);
+    const region = await readPackageHeaderRegion(full);
+    expect(region.length).toBe(totalHeaderSize);
+    expect(region.equals(bytes.subarray(0, totalHeaderSize))).toBe(true);
+    // One byte short of the declared header is the deterministic short-read boundary: it must throw,
+    // never return a zero-filled tail that scans as absent data.
+    const short = join(directory, "Short.uasset");
+    await writeFile(short, bytes.subarray(0, totalHeaderSize! - 1));
+    await expect(readPackageHeaderRegion(short)).rejects.toThrow(/truncated header/);
+  });
+});
+
+describe("fab-slice sidecar accounting", () => {
+  it("groups each package's .uexp/.ubulk with it and counts their bytes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "fab-slice-sidecars-"));
+    directories.push(directory);
+    const files = [
+      ["Content/A/Mesh.uasset", 10],
+      ["Content/A/Mesh.uexp", 3],
+      ["Content/A/Mesh.ubulk", 5],
+      ["Content/A/Other.uasset", 7],
+      ["Content/A/Other.ubulk", 2],
+      ["Content/A/Text.uasset", 4],
+      ["Content/A/Unrelated.bin", 9],
+    ] as const;
+    for (const [rel, size] of files) {
+      const abs = join(directory, rel);
+      await mkdir(dirname(abs), { recursive: true });
+      await writeFile(abs, Buffer.alloc(size));
+    }
+    const packages = await listPackageFiles(directory);
+    expect(packages.map((file) => file.rel)).toEqual(["Content/A/Mesh.uasset", "Content/A/Other.uasset", "Content/A/Text.uasset"]);
+    const mesh = packages.find((file) => file.rel.endsWith("Mesh.uasset"))!;
+    expect(mesh.sidecars.map((sidecar) => sidecar.rel).sort()).toEqual(["Content/A/Mesh.ubulk", "Content/A/Mesh.uexp"]);
+    expect(mesh.size).toBe(10);
+    expect(mesh.sidecars.reduce((sum, sidecar) => sum + sidecar.size, 0)).toBe(8);
+    const text = packages.find((file) => file.rel.endsWith("Text.uasset"))!;
+    expect(text.sidecars).toEqual([]);
+  });
 });
 
 describe("fab-slice import-report comparison", () => {
@@ -109,37 +240,67 @@ describe("fab-slice import-report comparison", () => {
       { package: "Content/A/X.uasset", slice: { status: "converted" }, full: { status: "absent" } },
     ]);
   });
+
+  it("catches a selected package the slice silently dropped (a row only the full pack has)", () => {
+    const slice = new Map<string, PackageOutcome>();
+    const full = new Map<string, PackageOutcome>([["Content/A/X.uasset", { status: "converted" }]]);
+    expect(diffPackageOutcomes(slice, full, ["Content/A/X.uasset"])).toEqual([
+      { package: "Content/A/X.uasset", slice: { status: "absent" }, full: { status: "converted" } },
+    ]);
+  });
+
+  it("compares a selected package absent on both sides (no difference, but not ignored)", () => {
+    const selected = ["Content/A/Anim.uasset", "Content/A/Mesh.uasset"];
+    const slice = new Map<string, PackageOutcome>([["Content/A/Mesh.uasset", { status: "converted" }]]);
+    const full = new Map<string, PackageOutcome>([["Content/A/Mesh.uasset", { status: "converted" }]]);
+    expect(diffPackageOutcomes(slice, full, selected)).toEqual([]);
+    expect(selected.filter((pkg) => !slice.has(pkg) && !full.has(pkg))).toEqual(["Content/A/Anim.uasset"]);
+  });
+
+  it("ignores a full-only row outside the selected packages", () => {
+    const slice = new Map<string, PackageOutcome>([["Content/A/X.uasset", { status: "converted" }]]);
+    const full = new Map<string, PackageOutcome>([
+      ["Content/A/X.uasset", { status: "converted" }],
+      ["Content/B/Other.uasset", { status: "failed", reason: "not in the slice" }],
+    ]);
+    expect(diffPackageOutcomes(slice, full, ["Content/A/X.uasset"])).toEqual([]);
+  });
 });
 
 // Licensed slices are local-only and never committed. Set FAB_FEATURE_CORPUS_DIR to the slices root
-// (`~/.cache/threenative-asset-mcp/fab-slices` by default) to import every built slice below.
+// (`~/.cache/threenative-asset-mcp/fab-slices` by default) to import every slice the committed record
+// names. The record (`docs/parity/feature-corpus.json`) is the source of the slice ids; a missing slice
+// is a failure, not a skip, so an empty or partial directory cannot pass.
 const corpusDir = process.env.FAB_FEATURE_CORPUS_DIR;
+const directories: string[] = [];
+afterAll(async () => {
+  await Promise.all(directories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
 
 if (!corpusDir) {
   describe("feature corpus slices (skipped)", () => {
     it.skip("FAB_FEATURE_CORPUS_DIR is not set; set it to the fab-slices root to import the licensed slices (local-only, never committed)", () => {});
   });
 } else {
-  const temporary: string[] = [];
-  afterAll(async () => {
-    await Promise.all(temporary.map((dir) => rm(dir, { recursive: true, force: true })));
-  });
-
   describe("feature corpus slices (FAB_FEATURE_CORPUS_DIR, local-only)", () => {
-    it("imports every built slice and accounts for each of its packages", async () => {
-      const sliceIds = ["anim-starter-4.4", "stickman-4.22", "soul-cave-4.18", "vtol-5.4", "game-anim-5.8"];
-      for (const id of sliceIds) {
-        const sourceDir = join(corpusDir, id);
-        if (!existsSync(sourceDir)) continue;
-        const outputDir = await mkdtemp(join(tmpdir(), `fab-corpus-${id}-`));
-        temporary.push(outputDir);
+    it("imports every committed-manifest slice and accounts for its outcomes", async () => {
+      const record = await readCorpus(corpusPath());
+      expect(record.slices.length).toBeGreaterThan(0);
+      for (const entry of record.slices) {
+        const sourceDir = join(corpusDir, entry.id);
+        expect(existsSync(sourceDir), `committed slice ${entry.id} is missing under ${corpusDir}`).toBe(true);
+        expect(entry.packages, `committed record for ${entry.id} has no packages`).toBeGreaterThan(0);
+        const outputDir = await mkdtemp(join(tmpdir(), `fab-corpus-${entry.id}-`));
+        directories.push(outputDir);
         const report = await importUnrealDirectory({ sourceDir, outputDir, sourceKind: "local-directory" });
-        // The slice classifies every package it holds; animations merge into their mesh and carry no
-        // per-package row, so the outcome count is only bounded below by one.
         expect(report.counts.packages).toBeGreaterThan(0);
-        // Every package the slice holds gets a per-package outcome; a skip or a failure carries a
-        // reason. `compare-full` is what proves those outcomes equal the full pack's.
-        for (const [, outcome] of packageOutcomes(report)) {
+        const outcomes = packageOutcomes(report);
+        // Animations merge into their mesh and carry no per-package row, so the outcome count is only a
+        // subset of the package count; what is checked is that the importer classified something and
+        // that every non-converted row names a reason.
+        expect(outcomes.size).toBeGreaterThan(0);
+        expect(outcomes.size).toBeLessThanOrEqual(report.counts.packages);
+        for (const [, outcome] of outcomes) {
           expect(outcome.status).toMatch(/^(converted|skipped|failed)$/);
           if (outcome.status !== "converted") expect(outcome.reason?.length ?? 0).toBeGreaterThan(0);
         }

@@ -19,15 +19,15 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { FabCli, type FabOwnedListing } from "../src/fab/fabcli.js";
 import type { DecoderRoute } from "../src/fab/routes.js";
-import { classesInHead, gameReferencesInHead, readPackageHead } from "../src/unreal/cooking.js";
-import { importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
+import { classesInHead, gameReferencesInHead, readPackageHead, readPackageHeaderRegion } from "../src/unreal/cooking.js";
+import { ImportError, importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
 import { parseImportedPackages, parsePrimaryClass } from "../src/unreal/static-mesh-sections.js";
 
 export const SLICE_LIMIT_BYTES = 1024 * 1024 * 1024;
@@ -37,11 +37,13 @@ const USAGE = [
   "  fab-slice.ts make --slice <id> [--full <dir>] [--out <dir>] [--record] [--cleanup] [--per-class N]",
   "  fab-slice.ts make --all [--out <dir>] [--record]",
   "  fab-slice.ts verify [--out <dir>] [--record]",
-  "  fab-slice.ts compare-full <slice-id> --full <dir> [--out <dir>] [--force]",
+  "  fab-slice.ts compare-full <slice-id> --full <dir> [--out <dir>]",
   "  fab-slice.ts list",
 ].join("\n");
 
 const PACKAGE_EXTENSIONS = new Set([".uasset", ".umap"]);
+/** A package's bulk-data sidecars; they are not packages themselves and travel with their owner. */
+const SIDECAR_EXTENSIONS = [".uexp", ".ubulk", ".uptnl"] as const;
 
 export interface SlicePlan {
   /** Slice id; also the directory name under the slices root. */
@@ -162,19 +164,25 @@ export async function writeCorpus(path: string, corpus: FeatureCorpus): Promise<
 
 // --- filesystem ----------------------------------------------------------------------------------
 
-interface PackageFile {
+interface TreeFile {
   readonly abs: string;
   readonly rel: string;
   readonly size: number;
 }
 
-async function listPackageFiles(root: string): Promise<PackageFile[]> {
-  const found: PackageFile[] = [];
+interface PackageFile extends TreeFile {
+  /** `.uexp`/`.ubulk`/`.uptnl` bulk data that belongs to this package, if present. */
+  readonly sidecars: readonly TreeFile[];
+}
+
+/** Every regular file below `root`, with its size, sorted by relative path. */
+async function listTreeFiles(root: string): Promise<TreeFile[]> {
+  const found: TreeFile[] = [];
   async function walk(dir: string): Promise<void> {
     for (const entry of await readdir(dir, { withFileTypes: true })) {
       const abs = join(dir, entry.name);
       if (entry.isDirectory()) await walk(abs);
-      else if (entry.isFile() && PACKAGE_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
+      else if (entry.isFile()) {
         const info = await stat(abs);
         found.push({ abs, rel: relative(root, abs), size: info.size });
       }
@@ -182,6 +190,30 @@ async function listPackageFiles(root: string): Promise<PackageFile[]> {
   }
   await walk(root);
   return found.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+}
+
+/**
+ * The packages below `root` with any bulk-data sidecars beside them. The package extension is stripped
+ * from the relative path to find `<stem>.uexp`, `.ubulk` and `.uptnl`, so a sidecar is only counted and
+ * copied with the package that owns it.
+ */
+export async function listPackageFiles(root: string): Promise<PackageFile[]> {
+  const all = await listTreeFiles(root);
+  const byRel = new Map(all.map((file) => [file.rel, file]));
+  const packages: PackageFile[] = [];
+  for (const file of all) {
+    const extension = extname(file.rel).toLowerCase();
+    if (!PACKAGE_EXTENSIONS.has(extension)) continue;
+    const stem = file.rel.slice(0, file.rel.length - extension.length);
+    const sidecars = SIDECAR_EXTENSIONS.map((sidecar) => byRel.get(`${stem}${sidecar}`)).filter((sidecar): sidecar is TreeFile => sidecar !== undefined);
+    packages.push({ ...file, sidecars });
+  }
+  return packages;
+}
+
+/** The bytes a package occupies, its sidecars included. */
+function packageBytes(file: PackageFile): number {
+  return file.size + file.sidecars.reduce((sum, sidecar) => sum + sidecar.size, 0);
 }
 
 /** The `/Game/...` package path a package file would have in the pack: the path below `Content/`. */
@@ -208,13 +240,49 @@ export function assertSafeChild(root: string, segment: string): string {
   return join(root, segment);
 }
 
+/** Resolves a slash-separated relative path under `root`, refusing absolute, empty, `.`, `..` or escaping parts. */
+export function containedPath(root: string, rel: string): string {
+  if (rel === "" || isAbsolute(rel)) throw new Error(`unsafe manifest path "${rel}"`);
+  const parts = rel.split(/[\\/]/);
+  if (parts.some((part) => part === "" || part === "." || part === "..")) throw new Error(`unsafe manifest path "${rel}"`);
+  const base = resolve(root);
+  const abs = resolve(base, rel);
+  if (abs === base || !abs.startsWith(base + sep)) throw new Error(`manifest path escapes its root: "${rel}"`);
+  return abs;
+}
+
+/**
+ * `containedPath` plus a check that no path component is a symlink. A manifest is local-only, but it
+ * names paths this tool deletes, so a tampered or shared manifest must not be able to point a delete or
+ * copy at a file outside the slice (through `../` or a symlinked directory).
+ */
+export async function assertNoSymlinks(root: string, rel: string): Promise<string> {
+  const abs = containedPath(root, rel);
+  // The root itself can be a symlink (a tampered slice directory), which would let a contained `rel`
+  // still resolve outside the intended tree. Check it before any child.
+  const rootInfo = await lstat(resolve(root)).catch(() => undefined);
+  if (rootInfo?.isSymbolicLink()) throw new Error(`refusing to touch symlink root "${root}"`);
+  const parts = rel.split(/[\\/]/);
+  let current = resolve(root);
+  for (const part of parts) {
+    current = join(current, part);
+    const info = await lstat(current).catch(() => undefined);
+    if (info?.isSymbolicLink()) throw new Error(`refusing to touch symlink "${rel}"`);
+  }
+  return abs;
+}
+
 // --- dependency closure --------------------------------------------------------------------------
 
 export interface ScannedPackage {
   readonly rel: string;
   readonly classes: readonly string[];
   readonly refs: readonly string[];
-  /** The exact class the package's own object is, when the package format exposes it (UE4). */
+  /**
+   * The class of the package's first export record, when the format exposes it (UE4). A UE4 export map
+   * is not ordered by asset, so this is only used to pick a slice representative; counts come from
+   * `classes` membership.
+   */
   readonly primaryClass?: string;
 }
 
@@ -223,8 +291,8 @@ export interface ScannedPackage {
  * from one through the `/Game/...` references of the import table. The closure is closed under
  * recursion and cannot leave the pack because only indexed pack files are ever added.
  *
- * A package matches a class exactly when its own object is that class (UE4); a class with no exact
- * package (a sub-object like `SkeletalMeshSocket`, or a UE5 package whose reader names no primary
+ * A package matches a class exactly when its first export record is that class (UE4); a class with no
+ * such package (a sub-object like `SkeletalMeshSocket`, or a UE5 package whose reader names no primary
  * class) falls back to name-table membership, which is evidence of presence. A bounded number of the
  * smallest representatives is taken per class so a class with hundreds of members cannot pull a
  * pack-sized slice. That bounds assets, never classes: every target class still needs a member.
@@ -313,16 +381,15 @@ export function packageDigest(relPaths: readonly string[]): string {
 }
 
 /**
- * Packages per class. An exact count is used when the package format exposes the primary class (a
- * UE4 editor package does), so `AnimSequence` counts animations, not every package that names the
- * class. A class with no exact package (a sub-object, or a UE5 package) falls back to name-table
- * membership: evidence of presence, not an export count.
+ * The number of packages that *name* each class in their name or import table: evidence of presence,
+ * never an object or export count. A package that merely imports a class for a property is counted, so
+ * a class with N members can report more than N. This is the coverage signal the corpus records; the
+ * exact primary class is used only to pick slice representatives, not to report counts.
  */
 export function classCounts(scanned: readonly ScannedPackage[], candidates: readonly string[]): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const className of candidates) {
-    const exact = scanned.filter((entry) => entry.primaryClass === className).length;
-    counts[className] = exact > 0 ? exact : scanned.filter((entry) => entry.classes.includes(className)).length;
+    counts[className] = scanned.filter((entry) => entry.classes.includes(className)).length;
   }
   return counts;
 }
@@ -345,18 +412,26 @@ async function mapConcurrency<T, R>(items: readonly T[], limit: number, worker: 
 async function scanPackages(files: readonly PackageFile[], candidates: readonly string[]): Promise<ScannedPackage[]> {
   return mapConcurrency(files, 12, async (file) => {
     const head = await readPackageHead(file.abs);
-    if (!head) return { rel: file.rel, classes: [], refs: [] };
-    const names = classesInHead(head, candidates);
+    if (!head) throw new Error(`cannot read the package head of "${file.rel}"`);
     const primary = parsePrimaryClass(head);
     if (primary !== undefined) {
       // A UE4 editor package exposes its own object's class and its exact import table, so both the
       // match and the dependency edges are read rather than guessed.
+      const names = classesInHead(head, candidates);
       const imports = parseImportedPackages(head) ?? [];
       return { rel: file.rel, primaryClass: primary, classes: [...new Set([primary, ...names])], refs: imports };
     }
-    // A UE5 package (or one this reader does not support): fall back to name-table class membership
-    // and the `/Game/...` paths the editor stored.
-    return { rel: file.rel, classes: names, refs: gameReferencesInHead(head) };
+    // A UE5 package (or one this reader does not support) has no import-table reader here. Read its
+    // whole header and take name-table class membership plus every `/Game/...` path it names. The name
+    // table is a superset of the import table, and a truncated or unreadable header throws instead of
+    // silently dropping a dependency from the closure.
+    let header: Buffer;
+    try {
+      header = await readPackageHeaderRegion(file.abs);
+    } catch (error) {
+      throw new Error(`cannot read the Unreal package header of "${file.rel}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { rel: file.rel, classes: classesInHead(header, candidates), refs: gameReferencesInHead(header) };
   });
 }
 
@@ -391,16 +466,25 @@ export function packageOutcomes(report: ImportReport): Map<string, PackageOutcom
 
 /**
  * The packages of a slice whose import outcome differs from the full pack: a different status, or a
- * different reason. A dependency the slice dropped shows up here. Outcome reasons are compared
- * exactly; when they carry absolute paths that differ this is a false positive a caller must inspect.
+ * different reason. `selected` is the slice's own package list; every selected package is compared,
+ * including one with no outcome row on either side (both absent), so a dependency the slice dropped —
+ * or a selected package the importer never classified — cannot hide by emitting no row. Full-only rows
+ * outside `selected` are ignored. Outcome reasons are compared exactly; when they carry absolute paths
+ * that differ this is a false positive a caller must inspect.
  */
 export function diffPackageOutcomes(
   slice: ReadonlyMap<string, PackageOutcome>,
   full: ReadonlyMap<string, PackageOutcome>,
+  selected?: readonly string[],
 ): PackageDiff[] {
+  const absent: PackageOutcome = { status: "absent" };
+  // The slice's own emitted rows that the manifest missed stay in scope, so nothing the slice produced
+  // is dropped from the comparison; full-only rows are never added.
+  const packages = new Set([...(selected ?? slice.keys()), ...slice.keys()]);
   const diffs: PackageDiff[] = [];
-  for (const [pkg, sliceOutcome] of slice) {
-    const fullOutcome = full.get(pkg) ?? { status: "absent" as const };
+  for (const pkg of packages) {
+    const sliceOutcome = slice.get(pkg) ?? absent;
+    const fullOutcome = full.get(pkg) ?? absent;
     if (sliceOutcome.status !== fullOutcome.status || (sliceOutcome.reason ?? "") !== (fullOutcome.reason ?? "")) {
       diffs.push({ package: pkg, slice: sliceOutcome, full: fullOutcome });
     }
@@ -461,7 +545,10 @@ async function downloadSlice(slice: SlicePlan, log: (message: string) => void): 
 interface SliceManifest {
   readonly id: string;
   readonly targetClasses: readonly string[];
+  /** Selected package relative paths. */
   readonly files: readonly string[];
+  /** Bulk-data sidecars copied with their owning package. */
+  readonly sidecars?: readonly string[];
   readonly packageDigest: string;
   readonly bytes: number;
 }
@@ -482,38 +569,53 @@ async function makeSlice(slice: SlicePlan, fullDir: string, outRoot: string, log
   if (files.length === 0) throw new Error(`"${fullDir}" contains no Unreal packages`);
   const candidates = new Set([...slice.targetClasses, ...SLICES.flatMap((entry) => entry.targetClasses)]);
   const scanned = await scanPackages(files, [...candidates]);
-  const sizeByRel = new Map(files.map((file) => [file.rel, file.size]));
+  const byRel = new Map(files.map((file) => [file.rel, file]));
+  const scannedByRel = new Map(scanned.map((entry) => [entry.rel, entry]));
+  // The byte budget counts each package's bulk-data sidecars, so a sidecar cannot push a slice past the
+  // limit unnoticed.
+  const sizeByRel = new Map(files.map((file) => [file.rel, packageBytes(file)]));
   const selected = selectSlicePackages(scanned, slice.targetClasses, perClass, (rel) => sizeByRel.get(rel) ?? 0);
   if (selected.length === 0) {
     throw new Error(`no package in "${fullDir}" names a target class of ${slice.id} (${slice.targetClasses.join(", ")})`);
   }
-  const byRel = new Map(scanned.map((entry) => [entry.rel, entry]));
-  const bytes = selected.reduce((sum, rel) => sum + (files.find((file) => file.rel === rel)?.size ?? 0), 0);
+  const bytes = selected.reduce((sum, rel) => sum + (sizeByRel.get(rel) ?? 0), 0);
   if (bytes > SLICE_LIMIT_BYTES) {
     throw new Error(
       `${slice.id} needs ${(bytes / 1024 / 1024).toFixed(1)} MiB, above the ${SLICE_LIMIT_BYTES / 1024 / 1024} MiB total limit; narrow the target classes or pick a smaller pack rather than dropping a target`,
     );
   }
-  // Preserve unrelated files: remove only what a previous slice manifest claimed, then copy.
+  // Preserve unrelated files: remove only what a previous slice manifest claimed, then copy. Every path
+  // comes from a manifest, so validate containment and reject symlinks before deleting or writing.
   const previous = await readSliceManifest(sliceDir);
+  const selectedSidecars = selected.flatMap((rel) => (byRel.get(rel)?.sidecars ?? []).map((sidecar) => sidecar.rel));
+  const currentCopied = new Set([...selected, ...selectedSidecars]);
   await mkdir(sliceDir, { recursive: true });
-  const selectedSet = new Set(selected);
-  for (const rel of previous?.files ?? []) {
-    if (!selectedSet.has(rel)) await rm(join(sliceDir, rel), { force: true });
+  for (const rel of [...(previous?.files ?? []), ...(previous?.sidecars ?? [])]) {
+    if (currentCopied.has(rel)) continue;
+    await assertNoSymlinks(sliceDir, rel);
+    await rm(join(sliceDir, rel), { force: true });
   }
   for (const rel of selected) {
+    const pkg = byRel.get(rel)!;
+    await assertNoSymlinks(sliceDir, rel);
     await mkdir(dirname(join(sliceDir, rel)), { recursive: true });
-    await cp(join(fullDir, rel), join(sliceDir, rel));
+    await cp(pkg.abs, join(sliceDir, rel));
+    for (const sidecar of pkg.sidecars) {
+      await assertNoSymlinks(sliceDir, sidecar.rel);
+      await mkdir(dirname(join(sliceDir, sidecar.rel)), { recursive: true });
+      await cp(sidecar.abs, join(sliceDir, sidecar.rel));
+    }
   }
   const manifest: SliceManifest = {
     id: slice.id,
     targetClasses: slice.targetClasses,
     files: selected,
+    sidecars: selectedSidecars,
     packageDigest: packageDigest(selected),
     bytes,
   };
   await writeFile(join(sliceDir, SLICE_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`);
-  const counts = classCounts(selected.map((rel) => byRel.get(rel)!), slice.targetClasses);
+  const counts = classCounts(selected.map((rel) => scannedByRel.get(rel)!), slice.targetClasses);
   log(`${slice.id}: ${selected.length} packages, ${(bytes / 1024 / 1024).toFixed(1)} MiB, ${JSON.stringify(counts)}`);
   return manifest;
 }
@@ -531,7 +633,7 @@ async function verifySlice(slice: SlicePlan, outRoot: string): Promise<CorpusSli
   const files = await listPackageFiles(sliceDir);
   const scanned = await scanPackages(files, slice.targetClasses);
   const counts = classCounts(scanned, slice.targetClasses);
-  const bytes = files.reduce((sum, file) => sum + file.size, 0);
+  const bytes = files.reduce((sum, file) => sum + packageBytes(file), 0);
   const gaps = new Set(slice.gaps ?? []);
   const missing = slice.targetClasses.filter((className) => counts[className] === 0 && !gaps.has(className));
   if (missing.length > 0) {
@@ -562,7 +664,6 @@ interface CliOptions {
   readonly out?: string;
   readonly record: boolean;
   readonly cleanup: boolean;
-  readonly force: boolean;
   readonly perClass: number;
   readonly positionals: readonly string[];
 }
@@ -588,7 +689,6 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     all: argv.includes("--all"),
     record: argv.includes("--record"),
     cleanup: argv.includes("--cleanup"),
-    force: argv.includes("--force"),
     perClass,
     positionals: argv.slice(1).filter((value) => !value.startsWith("--")),
     ...(slice !== undefined ? { slice } : {}),
@@ -607,34 +707,65 @@ async function importTree(sourceDir: string, outputDir: string, engine: string |
   });
 }
 
-async function runCompareFull(slice: SlicePlan, fullDir: string, outRoot: string, force: boolean, log: (message: string) => void): Promise<number> {
+/**
+ * Imports `sourceDir` into `outputDir` and propagates the importer's output-collision refusal with
+ * fresh-directory guidance. It never deletes or replaces existing output: a collision means the
+ * directory holds a different import (or unrelated files) this tool did not create, so only the caller
+ * can pick a new one. `runImport` is injected so a regression test can drive the collision path.
+ */
+export async function importFreshOutput(
+  sourceDir: string,
+  outputDir: string,
+  runImport: (sourceDir: string, outputDir: string) => Promise<ImportReport>,
+  log: (message: string) => void = () => {},
+): Promise<ImportReport> {
+  log(`Importing ${sourceDir}…`);
+  try {
+    return await runImport(sourceDir, outputDir);
+  } catch (error) {
+    if (!(error instanceof ImportError) || error.code !== "UNREAL_OUTPUT_COLLISION") throw error;
+    throw new ImportError(
+      "UNREAL_OUTPUT_COLLISION",
+      `${outputDir} already holds a different import; this tool never deletes or overwrites existing output. Choose a fresh output directory. (${error.message})`,
+      error.retryable,
+    );
+  }
+}
+
+async function runCompareFull(slice: SlicePlan, fullDir: string, outRoot: string, log: (message: string) => void): Promise<number> {
   const sliceDir = assertSafeChild(outRoot, slice.id);
   if (!existsSync(sliceDir)) throw new Error(`slice ${slice.id} is not built at ${sliceDir}; run make first`);
+  const manifest = await readSliceManifest(sliceDir);
+  if (!manifest) throw new Error(`slice ${slice.id} has no ${SLICE_MANIFEST}; run make first`);
+  const selected = manifest.files.filter((rel) => PACKAGE_EXTENSIONS.has(extname(rel).toLowerCase()));
   const work = join(outRoot, "compare", slice.id);
   await mkdir(work, { recursive: true });
-  const sliceReportPath = join(work, "slice", "import-report.json");
-  const fullReportPath = join(work, "full", "import-report.json");
-  const readOrImport = async (sourceDir: string, outputDir: string, reportPath: string): Promise<ImportReport> => {
-    if (!force) {
-      const cached = await readFile(reportPath, "utf8").catch(() => undefined);
-      if (cached !== undefined) return JSON.parse(cached) as ImportReport;
-    }
-    log(`Importing ${sourceDir}…`);
-    return importTree(sourceDir, outputDir, slice.engine, log);
-  };
-  const sliceReport = await readOrImport(sliceDir, join(work, "slice"), sliceReportPath);
-  const fullReport = await readOrImport(fullDir, join(work, "full"), fullReportPath);
-  const diffs = diffPackageOutcomes(packageOutcomes(sliceReport), packageOutcomes(fullReport));
+  // No script-level report cache: the importer reuses its own report only when the importer version and
+  // the source-tree hash still match, so a warm report cannot prove a changed importer correct, and the
+  // long full-pack import stays resumable because a matching report is returned as `reused`. A stale
+  // report at the output is refused, never deleted and replaced: the output may be an import this task
+  // did not create, so the collision propagates and the caller chooses a fresh directory.
+  const runImport = (sourceDir: string, outputDir: string): Promise<ImportReport> => importTree(sourceDir, outputDir, slice.engine, log);
+  const sliceReport = await importFreshOutput(sliceDir, join(work, "slice"), runImport, log);
+  const fullReport = await importFreshOutput(fullDir, join(work, "full"), runImport, log);
+  const sliceOutcomes = packageOutcomes(sliceReport);
+  const fullOutcomes = packageOutcomes(fullReport);
+  const diffs = diffPackageOutcomes(sliceOutcomes, fullOutcomes, selected);
+  // Selected packages with no row on either side are still compared (both absent); record them so the
+  // "nothing differs" claim is not mistaken for "every package emitted a row". Full-only rows outside
+  // the slice are ignored, and counted, so that is explicit too.
+  const bothAbsent = selected.filter((pkg) => !sliceOutcomes.has(pkg) && !fullOutcomes.has(pkg));
+  const ignoredFullOnly = [...fullOutcomes.keys()].filter((pkg) => !selected.includes(pkg));
   const outPath = join(work, "compare.json");
-  await writeFile(outPath, `${JSON.stringify({ slice: slice.id, packages: packageOutcomes(sliceReport).size, diffs }, null, 2)}\n`);
+  await writeFile(outPath, `${JSON.stringify({ slice: slice.id, selected: selected.length, sliceRows: sliceOutcomes.size, bothAbsent, ignoredFullOnly: ignoredFullOnly.length, diffs }, null, 2)}\n`);
   if (diffs.length === 0) {
-    log(`${slice.id}: ${packageOutcomes(sliceReport).size} slice packages match the full pack. Report: ${outPath}`);
+    log(`${slice.id}: all ${selected.length} selected packages match the full pack (${bothAbsent.length} absent on both sides). Report: ${outPath}`);
     return 0;
   }
   for (const diff of diffs.slice(0, 40)) {
     log(`${diff.package}: slice ${diff.slice.status} vs full ${diff.full.status}`);
   }
-  log(`${slice.id}: ${diffs.length} of ${packageOutcomes(sliceReport).size} slice packages differ. Report: ${outPath}`);
+  log(`${slice.id}: ${diffs.length} of ${selected.length} selected packages differ. Report: ${outPath}`);
   return 1;
 }
 
@@ -696,7 +827,7 @@ async function main(): Promise<number> {
   if (options.command === "compare-full") {
     const slice = findSlice(options.slice ?? options.positionals[0] ?? "");
     const full = options.full ?? slice.defaultFull ?? acquisitionDir(slice);
-    return runCompareFull(slice, resolve(full), outRoot, options.force, log);
+    return runCompareFull(slice, resolve(full), outRoot, log);
   }
 
   return 0;
