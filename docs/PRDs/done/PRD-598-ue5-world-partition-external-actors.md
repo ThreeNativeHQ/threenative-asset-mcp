@@ -1,6 +1,6 @@
 # PRD-598 — UE5 World Partition external actors in levels
 
-**Status:** IN PROGRESS — all local criteria complete; final independent review and CI pending
+**Status:** DONE
 **Priority:** P2 — real actor placement, mount isolation, sheets and repository gates pass on the repaired implementation.
 **Complexity:** 2 (LOW) — importer, adapter, format ledger, and focused real gates; risk override: licensed evidence remains local-only.
 **Owner:** lane-598; parent owns final sheet and delivery
@@ -36,7 +36,7 @@ compiled converter gate.
 
 ## Remaining work
 
-- Final independent review and CI remain in progress; there is no external input blocker.
+- Final-head CI is in progress. There is no external input blocker.
 
 ## Integration Ledger
 
@@ -73,11 +73,11 @@ compiled converter gate.
 ## Local real evidence
 
 - Source stage: `/home/joao/.cache/threenative-asset-mcp/prd598-real-stage-Zt2Wd8` — 28 hashed files: the selected `.umap`, 3 probe-confirmed external actor packages, and the 24-file dependency closure.
-- Native output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/native-output/Scenes/` (exact JSON path is in the local proof index).
-- Public output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/public-output` (`import-report.json`, scene GLB, scene manifest); report source hash `sha256:9a0bee37c32cff152f8c9634577fd538e47dd51f8e22c561ac10cf91cf31b331`.
-- Association output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/association-output/Scenes/` (exact JSON path is in the local proof index); 3 valid actors remain while same-basename/different-prefix and external-object distractors are excluded, and the deliberately corrupt matching package is an `ExternalActorPackage` omission with a named load reason.
-- Fresh focused evidence: `PRD598_REAL_WP_PROOF_INDEX=/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index.json npx vitest run tests/fab-feature-corpus.test.ts --maxWorkers=1` → 35 passed, 9 expected skips; `npx vitest run tests/unreal-external-actors.test.ts --maxWorkers=1` → 3 passed.
-- Parent completed the final local repository gates and inspected/attached the sheet; independent review and this PR’s CI remain pending.
+- Native output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/final81/native-output/Scenes/` (exact JSON path is in the local proof index).
+- Public output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/final81/public-output` (`import-report.json`, scene GLB, scene manifest); report source hash `sha256:9a0bee37c32cff152f8c9634577fd538e47dd51f8e22c561ac10cf91cf31b331`.
+- Association output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/final81/association-output/Scenes/` (exact JSON path is in the local proof index); 3 valid actors remain while same-basename/different-prefix and external-object distractors are excluded, and the deliberately corrupt matching package is an `ExternalActorPackage` omission with a named load reason.
+- Final real evidence: `PRD598_REAL_WP_PROOF_INDEX=/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index81.json THREENATIVE_TOOLCHAIN_DIR=/home/joao/.cache/threenative-asset-mcp/prd598-toolchain npx vitest run tests/fab-feature-corpus.test.ts -t 'PRD-598'` → 3 passed, 41 unrelated tests skipped, 21.29s. The compiled/public ownership regression has27 passing checks.
+- Parent completed final local repository gates and inspected/attached the sheet. Both allowed reviews completed; this PR’s final CI remains in progress.
 
 ## Decisions
 
@@ -86,6 +86,10 @@ compiled converter gate.
 
 ## Review 1 mount-identity repair
 
-The shipped native matcher previously stripped every prefix before `Content/`, admitting an actor from one plugin into another plugin’s same-path map. Converter `b4e95441+threenative.584.8.1` now preserves the full provider prefix in both ownership comparisons and omission paths; importer stays `121` because only native association changed. The source-extracted compiled production helpers and public TypeScript helper share synthetic ownership cases for root Content, project Content, two plugin mounts, case/separator variants, other map prefixes and external objects. Focused verification: the old compiled matcher failed three cross-mount cases (24 passed), then all 27 passed after repair; `npm run typecheck` and `git diff --check` pass. Private logs: `raw/598-mount-{red,green,typecheck}.log`. final native build and AC-1/AC-4 proof remain the parent’s work.
+The shipped native matcher previously stripped every prefix before `Content/`, admitting an actor from one plugin into another plugin’s same-path map. Converter `b4e95441+threenative.584.8.1` now preserves the full provider prefix in both ownership comparisons and omission paths; importer stays `121` because only native association changed. The source-extracted compiled production helpers and public TypeScript helper share synthetic ownership cases for root Content, project Content, two plugin mounts, case/separator variants, other map prefixes and external objects. Focused verification: the old compiled matcher failed three cross-mount cases (24 passed), then all 27 passed after repair; `npm run typecheck` and `git diff --check` pass. Private logs: `raw/598-mount-{red,green,typecheck}.log`. The parent completed the final native build, fresh AC-1 proof and all four AC-4 gates.
 
-- Final parent proof: repaired mount matching retains all three actual actors, and the freshly imported scene matches the inspected sheet bytes. All local ACs are complete. The first independent review requested the mount fix;5f9b22b repairs it, with actual compiled old-code failures and27 passing ownership checks. Final independent review remains pending.
+- Final parent proof: repaired mount matching retains all three actual actors, and the freshly imported scene matches the inspected sheet bytes. All local ACs are complete. The first independent review requested the mount fix;5f9b22b repairs it, with actual compiled old-code failures and27 passing ownership checks. The second and final review found stale documentation only; the command and pending-proof sentence are corrected below.
+
+## Final review disposition
+
+The second independent review requested changes only to the stale proof command and contradictory pending-proof sentence. Both are corrected in this final document, with the actual final21.29s result and index81.json. Its code repair and tests were accepted as correct. No third review or independent APPROVE verdict is claimed; delivery rests on the repaired findings, parent evidence and final CI. All local acceptance criteria are complete, so this original PRD moves to done/.

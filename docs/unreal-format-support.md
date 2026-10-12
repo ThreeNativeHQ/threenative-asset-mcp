@@ -178,7 +178,7 @@ CUE4Parse decodes every class in PRD-582 and PRD-583 on UE4 and UE5. UE Viewer d
 |---|---|
 | [PRD-596](PRDs/PRD-596-ue5-sequencer-animation-clips.md) | UE 5.4+ `AnimSequence` clips stored in the Sequencer/FK Control Rig data model (P1) |
 | [PRD-597](PRDs/PRD-597-ue5-static-mesh-lods-and-build-scale.md) | UE5 static mesh LOD1+ and UE 5.4+ `BuildScale3D` |
-| [PRD-598](PRDs/PRD-598-ue5-world-partition-external-actors.md) | World Partition external actors placed in their level |
+| [PRD-598](PRDs/done/PRD-598-ue5-world-partition-external-actors.md) | World Partition external actors placed in their level |
 | [PRD-599](PRDs/PRD-599-ue5-landscape-heightfields.md) | UE5 landscape heightfields in levels (after PRD-598) |
 
 Visual parity of the existing formats stays with PRD-537 and PRD-538 (corpus sweep and baseline).
