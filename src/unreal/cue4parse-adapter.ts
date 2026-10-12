@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.6.3",
+  version: "b4e95441+threenative.584.6.4",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3699,11 +3699,14 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
     try
     {
         var sequencerModel = ExactSequencerDataModel(sequence, package);
+        var dataModel = DataModelExport(package, sequence, out var dataModelAmbiguity);
+        document["notifies"] = NotifyRecords(sequence, sequence.Notifies, sequencerModel ?? dataModel);
+        document["curves"] = CurveRecords(sequence, sequencerModel ?? dataModel, ExactDataModel(sequence, package));
+        document["syncMarkers"] = SyncMarkerRecords(sequence, sequencerModel ?? dataModel);
+        if (dataModelAmbiguity.Length > 0) document["dataModelAmbiguity"] = dataModelAmbiguity;
+
         if (sequencerModel is not null)
         {
-            document["notifies"] = new List<object>();
-            document["curves"] = new List<object>();
-            document["syncMarkers"] = new List<object>();
             if (!PopulateFromDataModel(sequence, package, out var sequencerReason, out var sequencerTiming))
             {
                 document["unsupportedReason"] = sequencerReason.Length > 0 ? sequencerReason : UnsupportedReason(package, sequence);
@@ -3719,11 +3722,6 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
             WriteAnimationJson(packagePath, name + ".clip", document);
             return 1;
         }
-        var dataModel = DataModelExport(package, sequence, out var dataModelAmbiguity);
-        document["notifies"] = NotifyRecords(sequence, sequence.Notifies, dataModel);
-        document["curves"] = CurveRecords(sequence, dataModel, ExactDataModel(sequence, package));
-        document["syncMarkers"] = SyncMarkerRecords(sequence, dataModel);
-        if (dataModelAmbiguity.Length > 0) document["dataModelAmbiguity"] = dataModelAmbiguity;
         var hasRaw = sequence.RawAnimationData is { Length: > 0 };
         var modelReason = "";
         if (!hasRaw && (sequence.CompressedDataStructure is null || sequencerModel is not null))

@@ -62,6 +62,18 @@ describeWithTools(["modern-converter"], "UE5 Sequencer channel evaluator", () =>
         `<None Include="${join(CUE4PARSE_BIN, "*.dll")}" Exclude="${["System*.dll", "Microsoft*.dll", "mscorlib.dll", "netstandard.dll"].map(name => join(CUE4PARSE_BIN, name)).join(";")}" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" /></ItemGroup></Project>`,
     );
     const declarations = [
+      extractCSharp(CUE4PARSE_PROGRAM, "int ExportClip("),
+      extractCSharp(CUE4PARSE_PROGRAM, "List<Dictionary<string, object?>> NotifyRecords("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static List<Dictionary<string, object?>> SyncMarkerRecords("),
+      extractCSharp(CUE4PARSE_PROGRAM, "List<Dictionary<string, object?>> CurveRecords("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static List<Dictionary<string, object?>> CurveList("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static string StructText("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static (string ClassName, string Kind) NotifyClassNames("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static string NotifyObjectClass("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static bool IsOwnedBy("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static UObject? DataModelExport("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static UObject? ExactDataModel("),
+      extractCSharp(CUE4PARSE_PROGRAM, "static UObject? ExactSequencerDataModel("),
       extractCSharp(CUE4PARSE_PROGRAM, "static CAnimSet ConvertAbsoluteSequencerAnimation("),
       extractCSharp(CUE4PARSE_PROGRAM, "static bool EvaluateSequencerChannel("),
       extractCSharp(CUE4PARSE_PROGRAM, "static bool SampleSequencerChannel("),
@@ -75,6 +87,10 @@ describeWithTools(["modern-converter"], "UE5 Sequencer channel evaluator", () =>
     await writeFile(
       join(project, "Program.cs"),
       `using System.Globalization;
+using System.Text.Json;
+using CUE4Parse.UE4.Writers;
+using CUE4Parse_Conversion.Writers.ActorX;
+using CUE4Parse.UE4.Objects.Engine.Animation;
 using CUE4Parse.UE4.Objects.Engine.Curves;
 using System.Runtime.CompilerServices;
 using CUE4Parse.UE4.Assets;
@@ -87,6 +103,43 @@ using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse_Conversion.Animations;
 using CUE4Parse_Conversion.Writers.ActorX.Structs.Animations;
+
+if (args.Contains("--metadata"))
+{
+    FPropertyTag Tag(string name, FPropertyTagType value) => new() { Name = new FName(name), Tag = value };
+    FStructFallback Row(params FPropertyTag[] tags) => new(tags.ToList());
+    FPropertyTagType Struct(FStructFallback row) => new StructProperty(new FScriptStruct(row));
+    FPropertyTagType Rows(params FStructFallback[] rows) => new ArrayProperty(new UScriptArray(rows.Select(Struct).ToList(), "StructProperty"));
+    var sequence = new UAnimSequence { Name = "AuthoredClip" };
+    var model = new AnimationSequencerDataModel { Name = "Model" };
+    model.Properties.AddRange(new FPropertyTag[] {
+        Tag("AnimNotifyTracks", Rows(Row(Tag("Notifies", Rows(Row(
+            Tag("NotifyName", new NameProperty(new FName("Footstep"))),
+            Tag("LinkValue", new FloatProperty(0.25f)), Tag("Duration", new FloatProperty(0.125f)),
+            Tag("TrackIndex", new IntProperty(2)))))))),
+        Tag("SyncMarkers", Struct(Row(Tag("MarkerName", new NameProperty(new FName("LeftPlant"))), Tag("Time", new FloatProperty(0.5f))))),
+        Tag("LegacyCurveData", Struct(Row(Tag("FloatCurves", Rows(Row(
+            Tag("CurveName", new NameProperty(new FName("Stride"))),
+            Tag("FloatCurve", new StructProperty(new FScriptStruct(new FRichCurve { Keys = new[] { new FRichCurveKey(0.25f, 0.75f) } })))))))))
+    });
+    var package = new MetadataPackage(sequence, model);
+    model.Outer = new MetadataExport(package);
+    if (!ReferenceEquals(ExactSequencerDataModel(sequence, package), model)) throw new Exception("Sequencer fixture was not resolved");
+    if (ExportClip(sequence, package, "/Game/Synthetic/AuthoredClip") != 0) throw new Exception("Unsupported fixture unexpectedly exported PSA");
+    return;
+}
+
+${CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("static string NotifyObjectName("), CUE4PARSE_PROGRAM.indexOf("// A clip\'s notifies"))}
+static double DumpNum(float value) => float.IsFinite(value) ? value : 0d;
+${CUE4PARSE_PROGRAM.split("\n").filter(line => line.startsWith("static bool IsConventionalDataModel(") || line.startsWith("static bool IsSequencerDataModel(")).join("\n")}
+${CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("static FRawCurveTracks? SelectAuthoredCurveTracks("), CUE4PARSE_PROGRAM.indexOf("// One FFloatCurve"))}
+static string? SkeletonPackagePath(FPackageIndex? reference) => null;
+static string UnsupportedReason(IPackage package, UAnimSequence sequence) => "unsupported synthetic rig";
+// Only bone population is forced unsupported; the shipped branch and native metadata readers run.
+static bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string reason, out Dictionary<string, object?>? timing) { reason = "unsupported synthetic rig"; timing = null; return false; }
+static void WriteAnimationJson(string packagePath, string fileName, object document) => Console.WriteLine(JsonSerializer.Serialize(document));
+static void WriteAnimationBytes(string packagePath, string name, string extension, byte[] bytes) => throw new Exception("Unexpected PSA write");
+static void ReportAnimationFailure(string packagePath, string name, string reason) => throw new Exception(reason);
 
 if (args.Contains("--frame-rates"))
 {
@@ -264,6 +317,22 @@ Console.WriteLine(invalidReason);
 
 ${declarations}
 
+sealed class AnimationSequencerDataModel : UObject { }
+sealed class MetadataExport(IPackage package) : ResolvedObject(package, 0) {
+    public override FName Name => new("AuthoredClip");
+}
+sealed class MetadataPackage : AbstractUePackage {
+    public MetadataPackage(UObject sequence, UObject model) : base("/Game/Synthetic/AuthoredClip", null) {
+        ExportsLazy = new[] { new Lazy<UObject>(() => sequence), new Lazy<UObject>(() => model) };
+        IsFullyLoaded = true;
+    }
+    public override FPackageFileSummary Summary => default!;
+    public override FNameEntrySerialized[] NameMap => [];
+    public override int ImportMapLength => 0;
+    public override int ExportMapLength => 2;
+    public override int GetExportIndex(string name, StringComparison comparisonType = StringComparison.Ordinal) => -1;
+    public override ResolvedObject? ResolvePackageIndex(FPackageIndex? index) => null;
+}
 sealed class SkeletonPackage : AbstractUePackage {
     public SkeletonPackage(USkeleton skeleton) : base("/Synthetic/TwoBones", null) {
         ExportsLazy = new[] { new Lazy<UObject>(() => skeleton) };
@@ -310,6 +379,15 @@ sealed class SkeletonExport(IPackage package) : ResolvedObject(package, 0) {
 
   afterAll(async () => {
     if (root) await rm(root, { recursive: true, force: true });
+  });
+
+  it("preserves native authored metadata in the reported Sequencer clip sidecar", () => {
+    const document = JSON.parse(execFileSync(sdk, [runner, "--metadata"], { encoding: "utf8" }));
+    expect(document.kind).toBe("clip");
+    expect(document.unsupportedReason).toBe("unsupported synthetic rig");
+    expect(document.notifies).toEqual([{ name: "Footstep", time: 0.25, duration: 0.125, track: 2, kind: "notify", className: "AnimNotify" }]);
+    expect(document.syncMarkers).toEqual([{ name: "LeftPlant", time: 0.5 }]);
+    expect(document.curves).toEqual([{ name: "Stride", keys: [{ time: 0.25, value: 0.75, arrive: 0, leave: 0, interp: "RCIM_Linear" }] }]);
   });
 
   it("matches Unreal's constant, linear, cubic, weighted and extrapolated channel formulas", () => {

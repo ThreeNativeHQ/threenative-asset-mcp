@@ -580,7 +580,7 @@ async function importSlice(sliceDir: string, label: string, cleanups: (() => Pro
   expect(versionRun.code, versionRun.stderr).toBe(0);
   // The executable prints "threenative-cue4parse <version>"; only that exact anchored prefix is removed.
   const version = versionRun.stdout.trim().replace(/^threenative-cue4parse /, "");
-  expect(version, "executed private converter identity").toBe("b4e95441+threenative.584.6.3");
+  expect(version, "executed private converter identity").toBe("b4e95441+threenative.584.6.4");
   expect(version).toBe(CUE4PARSE_SOURCE.version);
   const root = await mkdtemp(join(tmpdir(), `effects-corpus-${label}-`));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
