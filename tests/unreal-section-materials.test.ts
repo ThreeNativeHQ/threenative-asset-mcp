@@ -8,9 +8,9 @@ import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { importUnrealDirectory } from "../src/unreal/importer.js";
-import { parseMeshMaterialPackages, parseStaticMeshSections, remapGltfSectionMaterials, type StaticMeshSections } from "../src/unreal/static-mesh-sections.js";
+import { parseImportedPackages, parseMeshMaterialPackages, parsePrimaryClass, parseStaticMeshSections, remapGltfSectionMaterials, type StaticMeshSections } from "../src/unreal/static-mesh-sections.js";
 import { writeFakeUmodel } from "./helpers/unreal-fixture.js";
-import { staticMeshUasset, writeStaticMeshUasset } from "./helpers/uasset-fixture.js";
+import { primaryClassFixture, staticMeshUasset, writeStaticMeshUasset } from "./helpers/uasset-fixture.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -65,6 +65,36 @@ describe("parseStaticMeshSections", () => {
     expect(parseStaticMeshSections(Buffer.alloc(64))).toBeUndefined();
     expect(parseStaticMeshSections(staticMeshUasset({ slots: TREE_SLOTS, sectionMap: TREE_MAP }).subarray(0, 120))).toBeUndefined();
     expect(parseStaticMeshSections(staticMeshUasset({ slots: TREE_SLOTS, sectionMap: [] }))).toBeUndefined();
+  });
+});
+
+describe("parsePrimaryClass and parseImportedPackages", () => {
+  // The first export's ClassIndex is an import index. The import's *object name* is the real class
+  // (`StaticMesh`); its *class name* is the metaclass (`Class`). Returning the metaclass made every
+  // package read as class "Class", so exact class matching never fired.
+  it("reads the class import's object name, not its metaclass", () => {
+    for (const ue4Version of [385, 514, 517, 522] as const) {
+      const bytes = primaryClassFixture({ ue4Version, primaryClass: "StaticMesh" });
+      expect(parsePrimaryClass(bytes)).toBe("StaticMesh");
+    }
+    expect(parsePrimaryClass(primaryClassFixture({ ue4Version: 385, primaryClass: "SkeletalMesh" }))).toBe("SkeletalMesh");
+    expect(parsePrimaryClass(primaryClassFixture({ ue4Version: 522, primaryClass: "SoundWave" }))).toBe("SoundWave");
+  });
+
+  it("returns undefined for UE5 (a negative legacy version) or bytes that are not a package", () => {
+    const ue5 = Buffer.from(primaryClassFixture({ ue4Version: 522 }));
+    ue5.writeInt32LE(-8, 4); // UE5 summary layout: the UE5 version shifts every later field
+    expect(parsePrimaryClass(ue5)).toBeUndefined();
+    expect(parsePrimaryClass(Buffer.alloc(64))).toBeUndefined();
+  });
+
+  it("extracts every /Game/ package a referenced import's Package outer names", () => {
+    const bytes = primaryClassFixture({
+      ue4Version: 522,
+      importedPackages: ["/Game/Pack/Materials/MI_Trunk", "/Game/Pack/Textures/T_Bark"],
+    });
+    expect([...(parseImportedPackages(bytes) ?? [])].sort()).toEqual(["/Game/Pack/Materials/MI_Trunk", "/Game/Pack/Textures/T_Bark"]);
+    expect(parseImportedPackages(primaryClassFixture({ ue4Version: 385 }))).toEqual([]);
   });
 });
 

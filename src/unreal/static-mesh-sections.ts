@@ -25,6 +25,17 @@ const UE4_NON_OUTER_PACKAGE_IMPORT = 520;
 /** The last UE4 object version (4.27); UE5 packages have another summary layout. */
 const UE4_LAST_VERSION = 522;
 const UE4_PACKAGE_SUMMARY_LOCALIZATION_ID = 516;
+/**
+ * `VER_UE4_OLDEST_LOADABLE_PACKAGE` (4.4): the oldest UE4 summary the name- and import-table readers
+ * here can walk. The tagged-property readers need a newer bound; see `readHeader`'s `minVersion`.
+ */
+const UE4_OLDEST_LOADABLE_PACKAGE = 214;
+/**
+ * `VER_UE4_SERIALIZE_TEXT_IN_PACKAGES` (4.15): summaries from this object version on carry the two
+ * gatherable-text fields. Older summaries omit them, so reading them unconditionally shifts every
+ * later field (a 4.4 mesh read its import table where its gatherable-text data was).
+ */
+const UE4_SERIALIZE_TEXT_IN_PACKAGES = 459;
 const PKG_FILTER_EDITOR_ONLY = 0x80000000;
 
 class Reader {
@@ -74,25 +85,40 @@ interface Header {
   readonly names: readonly string[];
   readonly importNames: readonly string[];
   readonly imports: readonly ImportEntry[];
+  readonly exportCount: number;
+  readonly exportOffset: number;
   readonly bodyStart: number;
 }
 
 /**
  * The summary, name table and import table of a UE4 editor package. `maxVersion` bounds the object versions a caller has
  * checked its own reading against: the tagged-property readers here serve UE Viewer's range (below 520), the import
- * table alone is read through 4.27, where each import gains a `PackageName`.
+ * table alone is read through 4.27, where each import gains a `PackageName`. `minVersion` defaults to the tagged-property
+ * floor (4.15); the name- and import-table readers pass `UE4_OLDEST_LOADABLE_PACKAGE` so a 4.4 package is read too.
  */
-function readHeader(bytes: Buffer, maxVersion = UE4_NON_OUTER_PACKAGE_IMPORT - 1): Header | undefined {
+function readHeader(bytes: Buffer, maxVersion = UE4_NON_OUTER_PACKAGE_IMPORT - 1, minVersion = 504): Header | undefined {
   const reader = new Reader(bytes);
   reader.i32(); // magic
   const legacy = reader.i32();
-  if (legacy > -5 || legacy < -7) return undefined; // -8 is UE5, with another summary layout
-  reader.i32(); // legacy UE3 version
+  // -2..-7 are the UE4 summary formats; -8/-9 are UE5, with another summary layout.
+  if (legacy > -2 || legacy < -7) return undefined;
+  // The UE3 version is absent only from the one summary format that dropped it (-4).
+  if (legacy !== -4) reader.i32();
   const ue4 = reader.i32();
   reader.i32(); // licensee version
-  if (ue4 < 504 || ue4 > Math.min(maxVersion, UE4_LAST_VERSION)) return undefined;
+  if (ue4 < minVersion || ue4 > Math.min(maxVersion, UE4_LAST_VERSION)) return undefined;
   const customVersions = reader.i32();
-  reader.offset += customVersions * 20;
+  if (customVersions < 0 || customVersions > 100_000) return undefined;
+  // The custom-version container encoding follows the legacy version: 8-byte enum tags (-2), a
+  // fixed guid + int + variable friendly-name string (-3..-5), or the modern guid + int (-6..-7).
+  if (legacy === -2) reader.offset += customVersions * 8;
+  else if (legacy >= -5) {
+    for (let index = 0; index < customVersions; index += 1) {
+      reader.offset += 20;
+      const length = reader.i32();
+      reader.offset += length < 0 ? -length * 2 : length;
+    }
+  } else reader.offset += customVersions * 20;
   const totalHeaderSize = reader.i32();
   const folderLength = reader.i32();
   reader.offset += folderLength;
@@ -100,25 +126,29 @@ function readHeader(bytes: Buffer, maxVersion = UE4_NON_OUTER_PACKAGE_IMPORT - 1
   const nameCount = reader.i32();
   const nameOffset = reader.i32();
   if (ue4 >= UE4_PACKAGE_SUMMARY_LOCALIZATION_ID && (packageFlags & PKG_FILTER_EDITOR_ONLY) === 0) {
-    // 4.19+ editor packages carry a LocalizationId FString here.
+    // 4.18+ editor packages carry a LocalizationId FString here.
     const length = reader.i32();
     if (length < 0 || length > 1024) return undefined; // a UTF-16 id is not expected in an editor save
     reader.offset += length;
   }
-  reader.i32(); // gatherable text count
-  reader.i32(); // gatherable text offset
-  reader.i32(); // export count
-  reader.i32(); // export offset
+  if (ue4 >= UE4_SERIALIZE_TEXT_IN_PACKAGES) {
+    reader.i32(); // gatherable text count
+    reader.i32(); // gatherable text offset
+  }
+  const exportCount = reader.i32();
+  const exportOffset = reader.i32();
   const importCount = reader.i32();
   const importOffset = reader.i32();
   if (nameCount < 1 || nameCount > 1_000_000 || importCount < 0 || importCount > 1_000_000) return undefined;
   const names: string[] = [];
   const table = reader.at(nameOffset);
+  // `VER_UE4_NAME_HASHES_SERIALIZED` (4.12): each entry gains a trailing 4-byte hash. Older packages do not.
+  const nameHashBytes = ue4 >= 504 ? 4 : 0;
   for (let index = 0; index < nameCount; index += 1) {
     const length = table.i32();
     if (length <= 0 || length > 4096) return undefined; // UTF-16 names have a negative length: not handled
     names.push(bytes.toString("latin1", table.offset, table.offset + length - 1));
-    table.offset += length + 4;
+    table.offset += length + nameHashBytes;
   }
   const imports: ImportEntry[] = [];
   // FObjectImport: ClassPackage, ClassName, OuterIndex, ObjectName; an editor save from 4.22 on adds PackageName.
@@ -129,7 +159,63 @@ function readHeader(bytes: Buffer, maxVersion = UE4_NON_OUTER_PACKAGE_IMPORT - 1
     const outer = entry.i32();
     imports.push({ className, outer, name: entry.name() });
   }
-  return { names, importNames: imports.map((entry) => entry.name), imports, bodyStart: totalHeaderSize };
+  return {
+    names,
+    importNames: imports.map((entry) => entry.name),
+    imports,
+    exportCount,
+    exportOffset,
+    bodyStart: totalHeaderSize,
+  };
+}
+
+/**
+ * The class of a UE4 editor package's first export record. That export's `ClassIndex` is an import
+ * index, and an FObjectImport's *object name* is the class it names (`StaticMesh`) while its *class
+ * name* is the metaclass (`Class`); reading the object name gives the class, not the metaclass. A UE4
+ * export map is not ordered by asset, so callers treat this as a representative hint rather than an
+ * export count. Undefined for UE5 or an unreadable package.
+ */
+export function parsePrimaryClass(bytes: Buffer): string | undefined {
+  try {
+    const header = readHeader(bytes, UE4_LAST_VERSION, UE4_OLDEST_LOADABLE_PACKAGE);
+    if (!header || header.exportCount < 1 || header.exportOffset <= 0) return undefined;
+    const classIndex = bytes.readInt32LE(header.exportOffset);
+    if (classIndex >= 0) return undefined;
+    return header.imports[-classIndex - 1]?.name;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Every `/Game/...` package a UE4 editor package's import table references. Each referenced import
+ * whose outer is a `Package` import names the package it lives in, so these are exact dependency
+ * edges for the slice closure. Undefined for UE5 or an unreadable package.
+ */
+export function parseImportedPackages(bytes: Buffer): readonly string[] | undefined {
+  try {
+    const header = readHeader(bytes, UE4_LAST_VERSION, UE4_OLDEST_LOADABLE_PACKAGE);
+    if (!header) return undefined;
+    const packages = new Set<string>();
+    for (const entry of header.imports) {
+      if (entry.outer >= 0) continue;
+      const outer = header.imports[-entry.outer - 1];
+      if (outer?.className === "Package" && outer.name.startsWith("/Game/")) packages.add(outer.name);
+    }
+    return [...packages];
+  } catch {
+    return undefined;
+  }
+}
+
+/** `parseImportedPackages` for a `.uasset` on disk. */
+export async function readImportedPackages(path: string): Promise<readonly string[] | undefined> {
+  try {
+    return parseImportedPackages(await readFile(path));
+  } catch {
+    return undefined;
+  }
 }
 
 /** Skips the rest of a tagged property after its common header (name, type, size, array index). */

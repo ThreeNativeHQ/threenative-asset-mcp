@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "limitBytes": 1073741824,
+  "slices": [
+    {
+      "id": "anim-starter-4.4",
+      "listingId": "98ff449d-79db-4f54-9303-75486c4fb9d9",
+      "artifactId": "AnimStarterPack",
+      "engine": "UE_4.4",
+      "route": "umodel",
+      "targetClasses": [
+        "SkeletalMeshSocket",
+        "SkeletalMesh",
+        "BlendSpace",
+        "BlendSpace1D",
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D",
+        "PhysicsAsset",
+        "Skeleton",
+        "AnimBlueprint",
+        "AnimSequence"
+      ],
+      "classCounts": {
+        "SkeletalMeshSocket": 0,
+        "SkeletalMesh": 2,
+        "BlendSpace": 3,
+        "BlendSpace1D": 0,
+        "AimOffsetBlendSpace": 0,
+        "AimOffsetBlendSpace1D": 0,
+        "PhysicsAsset": 2,
+        "Skeleton": 18,
+        "AnimBlueprint": 1,
+        "AnimSequence": 16
+      },
+      "packages": 20,
+      "bytes": 3113959,
+      "packageDigest": "sha256:85cca763f2c70caaac532f71666cac693535ba90f35f7313d084bb97e5c95fe0",
+      "gaps": [
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D",
+        "BlendSpace1D",
+        "SkeletalMeshSocket"
+      ]
+    },
+    {
+      "id": "game-anim-5.4",
+      "listingId": "880e319a-a59e-4ed2-b268-b32dac7fa016",
+      "artifactId": "GameAnimationSample_5.4",
+      "engine": "UE_5.4",
+      "route": "cue4parse",
+      "targetClasses": [
+        "AnimSequence",
+        "SkeletalMesh",
+        "Skeleton"
+      ],
+      "classCounts": {
+        "AnimSequence": 4,
+        "SkeletalMesh": 2,
+        "Skeleton": 9
+      },
+      "packages": 14,
+      "bytes": 11351325,
+      "packageDigest": "sha256:3a710cf979c3166e43f844600fc001486d66d3db5268621d3096daacb01c72f9",
+      "gaps": []
+    },
+    {
+      "id": "game-anim-5.8",
+      "listingId": "880e319a-a59e-4ed2-b268-b32dac7fa016",
+      "artifactId": "GameAnimationSample_5.8",
+      "engine": "UE_5.8",
+      "route": "cue4parse",
+      "targetClasses": [
+        "SkeletalMeshSocket",
+        "PhysicsAsset",
+        "PhysicsConstraintTemplate",
+        "SkeletalBodySetup",
+        "SoundCue",
+        "AnimMontage",
+        "BlendSpace",
+        "BlendSpace1D",
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D",
+        "PoseAsset"
+      ],
+      "classCounts": {
+        "SkeletalMeshSocket": 2,
+        "PhysicsAsset": 8,
+        "PhysicsConstraintTemplate": 2,
+        "SkeletalBodySetup": 3,
+        "SoundCue": 1,
+        "AnimMontage": 1,
+        "BlendSpace": 1,
+        "BlendSpace1D": 1,
+        "AimOffsetBlendSpace": 0,
+        "AimOffsetBlendSpace1D": 0,
+        "PoseAsset": 3
+      },
+      "packages": 137,
+      "bytes": 122977887,
+      "packageDigest": "sha256:23e9085711730a29fbf7b827429fcece5ef4fb8216ba6b140263e686c023c2ad",
+      "gaps": [
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D"
+      ]
+    },
+    {
+      "id": "soul-cave-4.18",
+      "listingId": "75f42402-40bb-4a1b-b557-18e2c9604273",
+      "artifactId": "SoulCave418",
+      "engine": "UE_4.18",
+      "route": "umodel",
+      "targetClasses": [
+        "ParticleSystem",
+        "SoundCue",
+        "StaticMesh",
+        "BodySetup"
+      ],
+      "classCounts": {
+        "ParticleSystem": 1,
+        "SoundCue": 1,
+        "StaticMesh": 2,
+        "BodySetup": 1
+      },
+      "packages": 13,
+      "bytes": 873698,
+      "packageDigest": "sha256:24cbd152ce1950433fe3b024ab973bbfa71798784e4e86a01ea2cd13fe08ed7f",
+      "gaps": []
+    },
+    {
+      "id": "stickman-4.22",
+      "listingId": "d36ddd1b-8139-427d-8f8a-6a91469dc6b8",
+      "artifactId": "ROGCreata5e7dce4b29aV1",
+      "engine": "UE_4.22",
+      "route": "mesh-description",
+      "targetClasses": [
+        "SkeletalMeshSocket",
+        "SkeletalMesh",
+        "AnimMontage",
+        "BlendSpace",
+        "BlendSpace1D",
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D",
+        "PhysicsAsset",
+        "Skeleton",
+        "AnimNotify"
+      ],
+      "classCounts": {
+        "SkeletalMeshSocket": 0,
+        "SkeletalMesh": 1,
+        "AnimMontage": 1,
+        "BlendSpace": 1,
+        "BlendSpace1D": 2,
+        "AimOffsetBlendSpace": 0,
+        "AimOffsetBlendSpace1D": 0,
+        "PhysicsAsset": 2,
+        "Skeleton": 8,
+        "AnimNotify": 0
+      },
+      "packages": 15,
+      "bytes": 99372031,
+      "packageDigest": "sha256:079a0e6cc318b283aeaf9cb4e1820f8ce889f4dcea508648a7d488526af7fc73",
+      "gaps": [
+        "SkeletalMeshSocket",
+        "AnimNotify",
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D"
+      ]
+    },
+    {
+      "id": "vtol-5.4",
+      "listingId": "03152868-7c84-4363-bafc-322031e95513",
+      "artifactId": "FreeSciFa6c7dbbcefe6V1",
+      "engine": "UE_5.4",
+      "route": "cue4parse",
+      "targetClasses": [
+        "NiagaraSystem",
+        "NiagaraEmitter"
+      ],
+      "classCounts": {
+        "NiagaraSystem": 3,
+        "NiagaraEmitter": 3
+      },
+      "packages": 6,
+      "bytes": 3604091,
+      "packageDigest": "sha256:cb678becf31af176c64f1ae97f10aca382e4d236ee027cb24fddaf6b4818fa55",
+      "gaps": []
+    }
+  ]
+}

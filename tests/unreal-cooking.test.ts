@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { readPackageCooking } from "../src/unreal/cooking.js";
+import { gameReferencesInHead, readPackageCooking } from "../src/unreal/cooking.js";
 
 const PACKAGE_MAGIC = 0x9e2a83c1;
 
@@ -261,5 +261,65 @@ describe("readPackageCooking", () => {
       Buffer.concat([packageHead(["/Script/Engine"]), padding, packageHead(["AssetImportData"]).subarray(24)]),
     );
     await expect(readPackageCooking(file)).resolves.toMatchObject({ state: "uncooked" });
+  });
+});
+
+function lengthPrefixed(value: string, encoding: "utf8" | "utf16le"): Buffer {
+  const marker = Buffer.alloc(4);
+  marker.writeInt32LE(encoding === "utf16le" ? -(value.length + 1) : value.length + 1, 0);
+  return Buffer.concat([marker, Buffer.from(`${value}\0`, encoding)]);
+}
+
+describe("gameReferencesInHead", () => {
+  it.each(["utf8", "utf16le"] as const)("finds multiple references in one %s string and its following string", (encoding) => {
+    const head = Buffer.concat([
+      lengthPrefixed("/Game/A.Mesh /Game/B.Mesh", encoding),
+      lengthPrefixed("/Game/C.Mesh", encoding),
+    ]);
+    expect(gameReferencesInHead(head)).toEqual(["/Game/A", "/Game/B", "/Game/C"]);
+  });
+
+  it.each(["utf8", "utf16le"] as const)("reads one nested /Game/ path as a whole in a %s string", (encoding) => {
+    // Advancing past the prefix instead of past the terminator re-enters the middle of the same
+    // string and reports the spurious sub-path `/Game/B/Game` as a second reference.
+    const head = lengthPrefixed("/Game/B/Game/B/Game/", encoding);
+    expect(gameReferencesInHead(head)).toEqual(["/Game/B/Game/B/Game"]);
+  });
+
+  it("keeps a hyphen and a Unicode letter in a full package path (UTF-8)", () => {
+    const head = Buffer.concat([Buffer.alloc(3), lengthPrefixed("/Game/Pack/My-Mesh_Ünïcode", "utf8")]);
+    expect(gameReferencesInHead(head)).toContain("/Game/Pack/My-Mesh_Ünïcode");
+  });
+
+  it("reads a UTF-16LE reference at an odd byte offset", () => {
+    const head = Buffer.concat([Buffer.alloc(1), lengthPrefixed("/Game/Pack/SK_UEFN_Mannequin", "utf16le")]);
+    expect(gameReferencesInHead(head)).toContain("/Game/Pack/SK_UEFN_Mannequin");
+  });
+
+  it("collapses repeated separators and drops an object suffix", () => {
+    const head = Buffer.from("/Game//A\/B/Mesh.Mesh\0", "latin1");
+    expect(gameReferencesInHead(head)).toEqual(["/Game/A/B/Mesh"]);
+  });
+
+  it("excludes engine and script references", () => {
+    const head = Buffer.from("/Engine/Foo/Bar\0/Script/Engine\0/Game/A/T_Albedo\0", "latin1");
+    expect(gameReferencesInHead(head)).toEqual(["/Game/A/T_Albedo"]);
+  });
+
+  it("reads NUL-terminated refs out of a long invalid-binary head at odd offsets without decoding it whole", () => {
+    // Bytes that are not text and include lone surrogate halves if decoded as UTF-16LE: a whole-head
+    // decode would materialize a huge malformed string (and, on some packages, abort the process).
+    const noise = Buffer.alloc(64 * 1024);
+    for (let index = 0; index < noise.length; index += 1) noise[index] = (index * 131 + 17) & 0xff;
+    const asciiRef = Buffer.from("/Game/Pack/Ascii-Mesh\0", "utf8");
+    const utf16Ref = Buffer.from("/Game/Pack/Utf16_Mesh\0", "utf16le");
+    const head = Buffer.concat([
+      noise.subarray(0, 3), // odd offset for the UTF-8 ref
+      asciiRef,
+      noise.subarray(0, 2), // odd offset for the UTF-16LE ref
+      utf16Ref,
+      noise.subarray(0, noise.length - asciiRef.length - utf16Ref.length - 5),
+    ]);
+    expect(gameReferencesInHead(head)).toEqual(["/Game/Pack/Ascii-Mesh", "/Game/Pack/Utf16_Mesh"]);
   });
 });
