@@ -190,6 +190,8 @@ export async function writeMeshFixture(
 export interface FakeUmodelOptions {
   /** Directory whose contents are copied into `-out=` on export. */
   readonly exportFrom?: string;
+  /** `<packageName>` → the directory copied for that package instead of `exportFrom`: a texture exported alone, apart from its mesh. */
+  readonly exportFromByPackage?: Readonly<Record<string, string>>;
   /** `<packageName>` → the class list `-list` reports. Every row takes the package's own name as its object name. */
   readonly classes: Readonly<Record<string, readonly string[]>>;
   /**
@@ -243,7 +245,8 @@ if (argv.includes("-list")) {
 if (argv.includes("-export")) {
   if (options.exportExitCode) process.exit(options.exportExitCode);
   if ((options.emptyExports || []).includes(target)) process.exit(0);
-  if (!options.exportFrom) process.exit(0);
+  const exportFrom = (options.exportFromByPackage && options.exportFromByPackage[target]) || options.exportFrom;
+  if (!exportFrom) process.exit(0);
   const out = (argv.find((entry) => entry.indexOf("-out=") === 0) || "").slice("-out=".length);
   const subdirectory = options.outputSubdirectory || "Group/Package";
   if (options.nativeOutputPaths) {
@@ -259,7 +262,7 @@ if (argv.includes("-export")) {
   }
   const destination = join(out, subdirectory);
   fs.mkdirSync(destination, { recursive: true });
-  fs.cpSync(options.exportFrom, destination, { recursive: true });
+  fs.cpSync(exportFrom, destination, { recursive: true });
   if (options.corruptBuffer) {
     for (const name of fs.readdirSync(destination)) {
       if (name.endsWith(".bin")) fs.writeFileSync(join(destination, name), Buffer.alloc(4));
@@ -283,6 +286,8 @@ process.exit(0);
 export interface FakeModernMaterialConverterOptions {
   /** Package basenames answered with no sidecar at all, unlike the default empty `props.txt`. */
   readonly emptyExports?: readonly string[];
+  /** Directory of PNGs written under `Textures/` beside each answered sidecar: the editor thumbnails the real converter ships. */
+  readonly texturesFrom?: string;
 }
 
 export async function writeFakeModernMaterialConverter(
@@ -306,6 +311,7 @@ if (exportAt >= 0 && filterAt >= 0) {
   }
   fs.mkdirSync(join(argv[exportAt + 1], "Materials"), { recursive: true });
   fs.writeFileSync(join(argv[exportAt + 1], "Materials", target + ".props.txt"), "");
+  if (options.texturesFrom) fs.cpSync(options.texturesFrom, join(argv[exportAt + 1], "Textures"), { recursive: true });
 }
 process.exit(0);
 `;

@@ -62,7 +62,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 111;
+export const IMPORTER_VERSION = 112;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -997,6 +997,24 @@ async function refreshPngIndex(assets: ExportedAssets): Promise<ExportedAssets> 
   if (assets.pngAll === undefined) return assets;
   const { png, ambiguousPng } = await resolvePngByContent(assets.pngAll);
   return { ...assets, png, ambiguousPng };
+}
+
+// Some material exports carry editor previews. Prefer a larger export from the unique source package,
+// preserving existing choices when a name is ambiguous.
+async function preferStandaloneResolution(assets: ExportedAssets, standalone: ReadonlyMap<string, string>): Promise<ExportedAssets> {
+  const sharp = (await import("sharp")).default;
+  const pixels = async (path: string): Promise<number> => {
+    // An unreadable PNG counts as empty: it never wins, and the packager reports it where it binds it.
+    const metadata = await sharp(path, { limitInputPixels: 268_435_456, unlimited: true }).metadata().catch(() => undefined);
+    return (metadata?.width ?? 0) * (metadata?.height ?? 0);
+  };
+  let png: Map<string, string> | undefined;
+  for (const [name, exported] of standalone) {
+    const indexed = assets.png.get(name);
+    if (indexed === undefined || indexed === exported || assets.ambiguousPng?.has(name)) continue;
+    if ((await pixels(exported)) > (await pixels(indexed))) (png ??= new Map(assets.png)).set(name, exported);
+  }
+  return png === undefined ? assets : { ...assets, png };
 }
 
 async function indexGlbs(root: string): Promise<Map<string, string>> {
@@ -4570,6 +4588,14 @@ export async function importUnrealDirectory(
   // Copies of one texture name that separate exports wrote collapse to one source when their bytes match, so a
   // texture exported into two folders is not a conflict when both copies are the very same image.
   assets = await refreshPngIndex(assets);
+  // A Texture2D package whose name no other package shares is one source: its own export is the full-resolution decode.
+  const standalonePng = new Map<string, string>();
+  for (const entry of texturePackages) {
+    const name = basename(entry.package, extname(entry.package));
+    const exported = textureSources.get(entry.file);
+    if (exported !== undefined && textureNameCounts.get(name) === 1) standalonePng.set(name, exported);
+  }
+  assets = await preferStandaloneResolution(assets, standalonePng);
 
   // Material packages by `/Game/...` path, for names several packages share: their isolated exports are the only
   // copy of each that no other package overwrote.
