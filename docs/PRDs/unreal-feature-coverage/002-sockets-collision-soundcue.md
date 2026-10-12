@@ -1,6 +1,6 @@
 # PRD-582 — Import Unreal sockets, collision, physics assets and SoundCues
 
-**Status:** PARTIAL — the CUE4Parse extraction, the gameplay-data module, the public importer integration and the focused gates are in place (AC-1, AC-3, AC-6 proved locally, now including `BodySetup`/`SkeletalBodySetup` and cross-package PhysicsAsset/Skeleton metadata on the UE Viewer geometry route). AC-2, AC-4, AC-5 and AC-8 wait on the PRD-581 real corpus; no real pack has been run yet.
+**Status:** PARTIAL — the CUE4Parse extraction, the gameplay-data module, the public importer integration and the focused gates are in place (AC-1, AC-3, AC-6 proved locally). A 2026-10-11 real-corpus run of five Fab slices with the `threenative.82` converter proves sockets (AC-2), the PhysicsAsset route (AC-4, with one UE4.4 bodies gap) and SoundCues (AC-5). The PhysicsAsset crash that aborted promotion (a null `ProfileInstance`/limit on omitted default tags) is fixed. AC-8 waits on the before/after sheets.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new gameplay-data module (+2), crosses the .NET converter / Node importer boundary (+2); risk override: none
 **Owner:** João
 **Depends on:** PRD-581 (corpus slices and `tests/fab-feature-corpus.test.ts`)
@@ -22,8 +22,13 @@ UE 4.19 pack). The full notes are kept locally and are not committed. Findings:
   their properties. So these classes go to the CUE4Parse adapter for **every** engine version. CUE4Parse
   already opens UE4 packages with an `EGame.GAME_UE4_xx` (`olderProvider`, adapter ~1539).
 - **Sockets.**
-  - Skeletal sockets live mostly on the `USkeleton` (`Skeleton.h:378`), not the mesh: `SK_TwinBlast` has
-    about 40, while `SKM_UE4_Mannequin` has none.
+  - Skeletal sockets live mostly on the `USkeleton` (`Skeleton.h:378`), not the mesh. The 2026-10-11 probe
+    assumed `SK_TwinBlast` (about 40 sockets) and an empty `SKM_UE4_Mannequin`. Real-corpus verification
+    **contradicts that assumption**: `SK_TwinBlast` is absent from the corpus, and the actual Game Animation
+    Sample mannequin `SKM_UEFN_Mannequin` has five effective sockets. Four attach (`palm_l_Socket` →
+    `hand_l`, `palm_r_Socket` → `hand_r`, `RagdollTrace` → `spine_03`, `prop_01_Socket` → `prop_01`); the
+    fifth names the virtual bone `VB hand_r_prop_01`, which the exported skin lacks, so it is reported in
+    `import-report.json` `missingBones` and not attached.
   - The mesh adds its own `Sockets` list (`SkeletalMesh.h:2448`). The effective list is skeleton plus mesh,
     and the mesh wins on a name clash (inferred from `GetActiveSocketList`).
   - `UStaticMesh.Sockets` is native (`StaticMesh.cpp:7471`) and has no bone.
@@ -39,11 +44,23 @@ UE 4.19 pack). The full notes are kept locally and are not committed. Findings:
   - `SkeletalBodySetups[]` and `ConstraintSetup[]` are sub-exports.
   - Bodies link to the mesh only by bone name. The mesh points at the asset through `SkeletalMesh.PhysicsAsset`.
   - `CollisionDisableTable` is native.
-  - Verified: UE5.8 `PA_Mannequin` (22 bodies, 21 constraints) and UE4.19 `SK_Mannequin_PhysicsAsset` (19 bodies).
+  - A constraint's `DefaultInstance.ProfileInstance` and its `ConeLimit`/`TwistLimit`/`LinearLimit`/drive
+    sub-structs arrive null: Unreal omits a tag whose value equals the native default, so CUE4Parse's
+    struct fallback leaves the field null. The adapter now rebuilds Unreal's native defaults
+    (`FLinearConstraint` Limit 0 axes Locked, `FConeConstraint`/`FTwistConstraint` 45° Free, `FConstraintDrive`
+    stiffness 50 damping 1 drives off) instead of dereferencing the null (which aborted the whole import).
+  - Verified 2026-10-11: UE5.8 `PA_UEFN_Mannequin` (23 bodies, 22 constraints) and UE4.22 `PHYS_Stickman`
+    (14 bodies, 13 constraints), both with no missing sub-exports. UE4.4 `HeroTPP_Physics` decodes its 22
+    constraints but reports 0 bodies, because that package stores the body array as `Bodies`, the name
+    renamed to `SkeletalBodySetups` in later engines. CUE4Parse reads only `SkeletalBodySetups`, so the
+    UE4.4 bodies are a remaining decoder gap, not a crash.
 - **SoundCue.**
   - Nodes are tagged sub-exports linked by `ChildNodes`.
   - **CUE4Parse defect (verified):** `USoundNodeWavePlayer.SoundWave` is a bogus native read on UE5.8 editor
     assets. Read the soft path `SoundWaveAssetPtr`, or the tagged `SoundWave`.
+  - The 2026-10-11 probe assumed the Game Animation Sample had no SoundCue and Soul: Cave had one. Actual
+    verification: the Game Animation Sample slice holds `BackgroundMix` (4 waves); Soul: Cave holds
+    `Footstep_Dirt_Cue` (8 waves), all eight resolved to exported audio.
 
 **Repo hooks** (`src/unreal/importer.ts` unless noted):
 
@@ -93,12 +110,12 @@ attach point, and a physics layer reads `Physics/*.json`.
 ## Acceptance Criteria
 
 - [x] AC-1 [local]: A synthetic socket on a known bone, with a non-zero `FRotator` and an offset, lands at the hand-computed glTF position and rotation (≤ 1e-4 m, ≤ 0.01°). The test is red before the fix. proof: `npx vitest run tests/unreal-gameplay-data.test.ts -t socket` — Evidence: green 2026-10-11; a socket with location `[100,200,300]` and 90° yaw lands at `[1,3,2]`, rotation `[0, √½, 0, −√½]`. The scale basis swap and the mesh-wins merge regression are pinned too.
-- [ ] AC-2 [local]: On the Game Animation Sample slice, `SK_TwinBlast` has one `socket:*` node per effective socket (skeleton plus mesh), each parented to the joint its `BoneName` names. Static mesh sockets hang under their mesh node. proof: `FAB_FEATURE_CORPUS_DIR=… npx vitest run tests/fab-feature-corpus.test.ts -t sockets` — Evidence: pending (real corpus).
+- [x] AC-2 [local]: On the Game Animation Sample slice, `SKM_UEFN_Mannequin` has one `socket:*` node per effective socket (skeleton plus mesh), each parented to the joint its `BoneName` names. Static mesh sockets hang under their mesh node. proof: `FAB_FEATURE_CORPUS_DIR=… npx vitest run tests/fab-feature-corpus.test.ts -t sockets` — Evidence: real corpus 2026-10-11, five of five effective sockets accounted for; the GLB holds four `socket:*` nodes (`palm_l_Socket` → `hand_l`, `palm_r_Socket` → `hand_r`, `RagdollTrace` → `spine_03`, `prop_01_Socket` → `prop_01`) and the fifth socket, naming the virtual bone `VB hand_r_prop_01` absent from the skin, is reported in `missingBones`. The earlier probe's `SK_TwinBlast`/`SKM_UE4_Mannequin` fixture claim was wrong for this corpus.
 - [x] AC-3 [local]: Sphere, box, capsule and convex `AggGeom` elements become metre-scale shapes. Capsule half-height is `Length/2 + Radius`, and `CTF_UseComplexAsSimple` yields no simple shapes. proof: `npx vitest run tests/unreal-gameplay-data.test.ts -t collision` (compiled adapter helpers against real CUE4Parse types) — Evidence: green 2026-10-11; the scaling follows `Engine/Private/PhysicsEngine/BodySetup.cpp` (sphere min-abs axis, box per-abs axis, capsule max cross-section), tapered capsules keep both radii, and the compiled `GpShape` runs against a real `FKBoxElem`. The physical-unit sidecar assertion runs in `tests/unreal-gameplay-import.integration.test.ts`.
-- [ ] AC-4 [local]: On every slice with a physics asset (4.4, 4.22, 5.8), `Physics/*.json` has one body per `SkeletalBodySetup`, one constraint per `PhysicsConstraintTemplate`, and each named bone resolves to a joint in the skinned GLB or is listed in `import-report.json`. proof: `… tests/fab-feature-corpus.test.ts -t physics` — Evidence: pending (real corpus); the integration test proves the path on a synthetic fixture.
-- [ ] AC-5 [local]: On the Soul: Cave and Game Animation Sample slices, every SoundCue becomes a `.cue.json`, and each `WavePlayer` leaf names an exported audio file or a reported missing wave. No leaf uses the bogus `USoundNodeWavePlayer.SoundWave` value. proof: `… tests/fab-feature-corpus.test.ts -t soundcue`, plus a compiled test that is red when the native `SoundWave` is read — Evidence: pending (real corpus); the compiled test that the native `SoundWave` is never read is green, and the synthetic cue path is green.
+- [ ] AC-4 [local]: On every slice with a physics asset (4.4, 4.22, 5.8), `Physics/*.json` has one body per `SkeletalBodySetup`, one constraint per `PhysicsConstraintTemplate`, and each named bone resolves to a joint in the skinned GLB or is listed in `import-report.json`. proof: `… tests/fab-feature-corpus.test.ts -t physics` — Evidence: real corpus 2026-10-11. Constraints decode on every slice with a physics asset, no missing sub-exports: UE4.22 14 bodies/13 constraints, UE5.8 `PA_UEFN_Mannequin` 23/22, UE5.8 `Face_Archetype_Physics` 6/1, UE5.8 running-shoes 2/0. Remaining gap: UE4.4 `HeroTPP_Physics` reports 22 constraints but 0 bodies, because that package names the body array `Bodies` (renamed `SkeletalBodySetups` later); CUE4Parse reads only the new name. The integration test proves the path on a synthetic fixture.
+- [x] AC-5 [local]: On the Soul: Cave and Game Animation Sample slices, every SoundCue becomes a `.cue.json`, and each `WavePlayer` leaf names an exported audio file or a reported missing wave. No leaf uses the bogus `USoundNodeWavePlayer.SoundWave` value. proof: `… tests/fab-feature-corpus.test.ts -t soundcue`, plus a compiled test that is red when the native `SoundWave` is read — Evidence: real corpus 2026-10-11; every cue became a `.cue.json` with no missing waves (Soul: Cave `Footstep_Dirt_Cue`, 8 waves; Game Animation Sample `BackgroundMix`, 4 waves — contradicting the earlier "no GASP cue" assumption). The compiled test that the native `SoundWave` is never read is green.
 - [x] AC-6 [local]: These classes are no longer reported as skipped, and no required gameplay class is excluded. A package of its own (`SkeletalMeshSocket`, `StaticMeshSocket`, `PhysicsAsset`, `SoundCue`) routes to CUE4Parse for geometry and metadata. An ordinary mesh whose only gameplay signal is a `BodySetup`/`SkeletalBodySetup` or a cross-package `PhysicsAsset`/`Skeleton` reference enters the converter input for its metadata only: its geometry keeps the verified UE Viewer / MeshDescription route, and the sidecar is read back for its model. `docs/unreal-format-support.md` moves each row with its evidence. proof: `npx vitest run tests/unreal-gameplay-import.integration.test.ts tests/unreal-import.integration.test.ts` — Evidence: green 2026-10-11; two strict public-API regressions — a UE4 `StaticMesh`+`BodySetup` package that keeps its UE Viewer geometry while gaining metre collision, and a UE4 `SkeletalMesh`+`Skeleton` package with a cross-package `PhysicsAsset` reference (no socket class) that resolves the physics asset — plus a SoundCue-only package that is no longer listed as skipped. Real-corpus proof pending.
-- [ ] AC-7 [local]: Repository gates are green: `npm run typecheck`, `npm run test:leaks` with default workers, and `npx vitest run tests/mcp-smoke.test.ts`. proof: those commands — Evidence: `npm run typecheck` green; the focused gameplay/converter/importer suites and the full-program compile are green. `test:leaks` and `mcp-smoke` not run this round.
+- [ ] AC-7 [local]: Repository gates are green: `npm run typecheck`, `npm run test:leaks` with default workers, and `npx vitest run tests/mcp-smoke.test.ts`. proof: those commands — Evidence: 2026-10-11 `npm run typecheck` green and the four focused gameplay suites green (170 tests, default workers) after the `threenative.82` converter rebuild; an earlier round proved the full 2457-test gate, the packed-MCP smoke and the leak gate. `test:leaks` and `mcp-smoke` not re-run this round.
 - [ ] AC-8 [local]: Every PR attaches before/after sheets per the epic `README.md` evidence rule. Before: meshes with no attach points or colliders. After: the same camera with socket markers and axes, collision shapes, and physics bodies drawn as wireframe overlays. SoundCue has nothing visible, so the PR also shows its cue graph as a diagram. proof: the PR comment with sheets — Evidence: pending.
 
 ## Integration Ledger
@@ -117,7 +134,7 @@ attach point, and a physics layer reads `Physics/*.json`.
 ## Execution Phases
 
 #### Phase 1: Sockets and the CUE4Parse route
-**Status:** PARTIAL — adapter writer, module and public route done and locally proved; real-corpus sockets (AC-2) pending.
+**Status:** PARTIAL — adapter writer, module, public route and real-corpus sockets proved (AC-1, AC-2).
 **Files:**
 - `src/unreal/cue4parse-adapter.ts`: a `Gameplay/*.json` writer for skeleton, mesh and static sockets.
 - `src/unreal/importer.ts`: classification flags, `needsModernConverter`, skip exemptions.
@@ -133,7 +150,7 @@ attach point, and a physics layer reads `Physics/*.json`.
 **Verification:** AC-1, AC-2.
 
 #### Phase 2: Collision and physics assets
-**Status:** PARTIAL — shapes, constraints, drives and sidecars done and locally proved; `BodySetup`/`SkeletalBodySetup` and cross-package PhysicsAsset/Skeleton metadata now enter the converter input while the mesh keeps its UE Viewer / MeshDescription geometry; gameplay values carry the mesh's `BuildScale3D` (`meshGeometryScale`) rather than a bare 0.01. Real-corpus physics (AC-4) pending.
+**Status:** PARTIAL — shapes, constraints, drives and sidecars done; `BodySetup`/`SkeletalBodySetup` and cross-package PhysicsAsset/Skeleton metadata enter the converter input while the mesh keeps its UE Viewer / MeshDescription geometry. Real-corpus physics ran 2026-10-11: the null-profile crash is fixed and constraints decode on every slice, with one UE4.4 bodies gap (`Bodies` vs `SkeletalBodySetups`) left open (AC-3, AC-4 partial).
 **Files:** adapter (BodySetup and PhysicsAsset writers), `gameplay-data.ts`, tests.
 **Implementation:**
 - Shapes go to metres and glTF basis, with `meshGeometryScale` (the mesh's `BuildScale3D`) applied.
@@ -143,7 +160,7 @@ attach point, and a physics layer reads `Physics/*.json`.
 **Verification:** AC-3, AC-4.
 
 #### Phase 3: SoundCue, ledger and gates
-**Status:** PARTIAL — cue graph, ledger rows and focused gates done; real-corpus SoundCue (AC-5) and the before/after sheets (AC-8) pending.
+**Status:** PARTIAL — cue graph, ledger rows, focused gates and real-corpus SoundCues proved (AC-5); the before/after sheets (AC-8) are pending.
 **Files:** adapter (SoundCue writer), `gameplay-data.ts`, `docs/unreal-format-support.md`, `README.md` import table, tests.
 **Implementation:**
 - Walk the graph from `FirstNode` through `ChildNodes`.
