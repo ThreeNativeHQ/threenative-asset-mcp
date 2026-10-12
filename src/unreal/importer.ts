@@ -79,7 +79,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 117;
+export const IMPORTER_VERSION = 121;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -609,6 +609,28 @@ export function isWorldPartitionExternalPackage(path: string): boolean {
     .replace(/\\/g, "/")
     .split("/")
     .some((segment) => /^__external(actors|objects)__$/i.test(segment));
+}
+
+/** Returns the `.umap` owning an external actor package, or undefined for external objects/malformed paths. */
+export function worldPartitionExternalActorMap(path: string): string | undefined {
+  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+  const marker = parts.findIndex((part) => part.toLowerCase() === "__externalactors__");
+  if (marker < 0 || !parts.at(-1)?.toLowerCase().endsWith(".uasset") || parts.length - marker < 5) return undefined;
+  const mapParts = parts.slice(marker + 1, -3);
+  if (mapParts.length === 0) return undefined;
+  return `${[...parts.slice(0, marker), ...mapParts].join("/")}.umap`;
+}
+
+/** External actors are level data: only an actor package owned by an imported map is consumed by the level export. */
+export function shouldSkipWorldPartitionExternalPackage(path: string, importedMapPackages: Iterable<string>): boolean {
+  if (!isWorldPartitionExternalPackage(path)) return false;
+  const owner = worldPartitionExternalActorMap(path);
+  if (owner === undefined) return true;
+  const normalizedOwner = owner.toLowerCase();
+  for (const imported of importedMapPackages) {
+    if (imported.replace(/\\/g, "/").toLowerCase() === normalizedOwner) return false;
+  }
+  return true;
 }
 
 const UNSUPPORTED_CLASSES = new Map<string, string>([
@@ -3861,13 +3883,15 @@ export async function importUnrealDirectory(
       ]),
   );
   const mapFiles = new Set([...mapPackages, ...modernMapPackages].map((entry) => entry.file));
+  const importedMapPackages = new Set([...mapPackages, ...modernMapPackages].map((entry) => entry.package.toLowerCase()));
   // A World Partition .umap may embed UStaticMesh exports for landscape/HLOD cells. Those are
   // level dependencies, not a second standalone mesh package for the map itself.
   const assetMeshPackages = meshPackages.filter((entry) => !mapFiles.has(entry.file));
   const skipped: { package: string; reason: string }[] = [];
   const failed: { package: string; reason: string }[] = [];
   for (const entry of externalActorEntries) {
-    skipped.push({ package: entry.package, reason: WORLD_PARTITION_EXTERNAL_REASON });
+    if (shouldSkipWorldPartitionExternalPackage(entry.package, importedMapPackages))
+      skipped.push({ package: entry.package, reason: WORLD_PARTITION_EXTERNAL_REASON });
   }
   for (const entry of classified) if (hlodProxyFiles.has(entry.file)) skipped.push({ package: entry.package, reason: HLOD_PROXY_REASON });
   for (const entry of classified) {

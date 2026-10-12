@@ -4,7 +4,7 @@ Single place to track which Unreal 4 and Unreal 5 formats the importer supports,
 and which are missing. `README.md` ("Unreal import support") links here. Update this file in the same
 commit as any importer, converter or adapter change that moves a row.
 
-Last audited: 2026-10-12, `IMPORTER_VERSION` 117 (`src/unreal/importer.ts`). Evidence comes from the
+Last audited: 2026-10-12, `IMPORTER_VERSION` 121 (`src/unreal/importer.ts`). Evidence comes from the
 README import table, `src/unreal/`, `tests/`, and the engine headers in `~/projects/UnrealEngine-5.8.3`
 (tag `5.8.3-release`, `Engine/Source/Runtime/Engine/Classes`, file names only).
 
@@ -108,7 +108,7 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | `LandscapeComponent` heightfields | UE4 editor | Implemented | indexed terrain mesh | Compressed BGRA8 heightmaps only. |
 | Landscape, UE5 | UE5 | **Missing** | none | The importer lists `LandscapeComponent` as unsupported when standalone. The UE5 level export writes an empty `landscapes` list (PRD-599). |
 | Landscape layer weights and `LandscapeLayerInfoObject` | any | **Missing** | none | |
-| World Partition external actors (`__ExternalActors__`) | UE5 | Reported | none | Skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/unreal-external-actors.test.ts`); owned UE5.3 input `MedievalGame_5.3` contains a World Partition level and external actors, so implementation is unblocked (PRD-598). |
+| World Partition external actors (`__ExternalActors__`) | UE5 | Reported | level scene GLB (real-pack verification pending) | The selected level export loads matching `__ExternalActors__` packages; packages belonging to maps outside the import remain skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/unreal-external-actors.test.ts`, PRD-598). |
 | Level streaming, sublevels, HLOD proxies | any | Implemented | partial | `tests/unreal-hlod-proxy.test.ts`, `tests/unreal-level-gate.test.ts`. |
 | `DecalActor` and decal components | any | **Missing** | none | |
 | Volumes (post-process, audio, blocking) | any | **Missing** | none | |

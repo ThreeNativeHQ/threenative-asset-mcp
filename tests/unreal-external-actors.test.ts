@@ -2,7 +2,14 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { importUnrealDirectory, isWorldPartitionExternalPackage, WORLD_PARTITION_EXTERNAL_REASON } from "../src/unreal/importer.js";
+import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
+import {
+  importUnrealDirectory,
+  isWorldPartitionExternalPackage,
+  shouldSkipWorldPartitionExternalPackage,
+  worldPartitionExternalActorMap,
+  WORLD_PARTITION_EXTERNAL_REASON,
+} from "../src/unreal/importer.js";
 import { writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fixture.js";
 
 const directories: string[] = [];
@@ -16,6 +23,22 @@ describe("World Partition external packages", () => {
     expect(isWorldPartitionExternalPackage("__externalobjects__\\Pack\\0\\1\\abc.uasset")).toBe(true);
     expect(isWorldPartitionExternalPackage("Content/Meshes/SM_ExternalActors.uasset")).toBe(false);
     expect(isWorldPartitionExternalPackage("Content/Meshes/SM_Car.uasset")).toBe(false);
+  });
+
+  it("associates actor packages with their map and leaves unrelated maps skipped", () => {
+    const actor = "Content/__ExternalActors__/Maps/Imported/00/FH/actor.uasset";
+    const otherActor = "Content/__ExternalActors__/Maps/Other/00/FH/actor.uasset";
+    const object = "Content/__ExternalObjects__/Maps/Imported/00/FH/object.uasset";
+    expect(worldPartitionExternalActorMap(actor)).toBe("Content/Maps/Imported.umap");
+    expect(shouldSkipWorldPartitionExternalPackage(actor, ["Content/Maps/Imported.umap"])).toBe(false);
+    expect(shouldSkipWorldPartitionExternalPackage(otherActor, ["Content/Maps/Imported.umap"])).toBe(true);
+    expect(shouldSkipWorldPartitionExternalPackage(object, ["Content/Maps/Imported.umap"])).toBe(true);
+  });
+
+  it("loads actors from the selected map's __ExternalActors__ packages", () => {
+    expect(CUE4PARSE_PROGRAM).toContain("__ExternalActors__");
+    expect(CUE4PARSE_PROGRAM).toContain("package.GetExports().OfType<AActor>()");
+    expect(CUE4PARSE_PROGRAM).toContain("IsExternalActorForLevel");
   });
 
   it("skips external actor packages instead of failing them as meshes", async () => {

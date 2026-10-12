@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.4",
+  version: "b4e95441+threenative.584.8",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -855,6 +855,42 @@ if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
+static string SourceRelativePackagePath(string key)
+{
+    var normalized = key.Replace('\\', '/');
+    var rootedContent = normalized.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
+    return rootedContent >= 0 ? normalized[(rootedContent + 1)..] : normalized;
+}
+static bool IsExternalActorForLevel(string actorKey, string levelKey)
+{
+    var actor = SourceRelativePackagePath(actorKey);
+    var level = SourceRelativePackagePath(levelKey);
+    const string marker = "__ExternalActors__/";
+    var markerAt = actor.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+    if (markerAt < 0 || !actor.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) return false;
+    var actorPath = actor[(markerAt + marker.Length)..].Split('/', StringSplitOptions.RemoveEmptyEntries);
+    if (actorPath.Length < 4) return false;
+    var mapPath = string.Join('/', actorPath.Take(actorPath.Length - 3));
+    var levelPath = level.EndsWith(".umap", StringComparison.OrdinalIgnoreCase) ? level[..^5] : level;
+    if (levelPath.StartsWith("Content/", StringComparison.OrdinalIgnoreCase)) levelPath = levelPath[8..];
+    return string.Equals(mapPath, levelPath, StringComparison.OrdinalIgnoreCase);
+}
+IEnumerable<UObject> ActorsForLevel(string levelKey, ULevel level)
+{
+    foreach (var actorIndex in level.Actors ?? [])
+        if (actorIndex?.Load<UObject>() is { } actor) yield return actor;
+    foreach (var actorKey in provider.Files.Keys.Where(key => IsExternalActorForLevel(key, levelKey)))
+    {
+        IPackage package;
+        try { package = provider.LoadPackage(actorKey); }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine($"external actor package skipped {actorKey}: {error.Message}");
+            continue;
+        }
+        foreach (var actor in package.GetExports().OfType<AActor>()) yield return actor;
+    }
+}
 // The provider mounts a loose directory under its top-level .uproject stem when one is present, else its
 // name. Compute that mount once from the same selection and reuse it for every gameplay selector below, so
 // a full project whose folder name differs from its .uproject stem still yields root-relative selectors.
@@ -3311,7 +3347,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
     foreach (var world in package.GetExports().OfType<UWorld>())
     {
         var level = world.PersistentLevel.Load<ULevel>();
-        if (level?.Actors is null) continue;
+        if (level is null) continue;
         PropertyUtil.SearchPropertyInTemplate = true;
         var actors = new List<object>();
         var texts = new List<object>();
@@ -3321,10 +3357,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
         var blueprintComponents = 0;
         var hasCamera = false;
         double cameraX = 0, cameraY = 0, cameraZ = 0, cameraPitch = 0, cameraYaw = 0, cameraRoll = 0;
-        foreach (var actorIndex in level.Actors)
+        foreach (var actor in ActorsForLevel(key, level))
         {
-            var actor = actorIndex?.Load<UObject>();
-            if (actor is null) continue;
             var componentReferences = new List<FPackageIndex?> {
                 actor.GetOrDefault<FPackageIndex?>("RootComponent"),
                 actor.GetOrDefault<FPackageIndex?>("RenderComponent"),
