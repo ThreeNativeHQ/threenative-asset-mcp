@@ -1,7 +1,7 @@
 # PRD-583 — Import UE5 clips, blend spaces, aim offsets and montages
 
-**Status:** IN PROGRESS — Phases 1–3 implemented; real-corpus and visual proofs wait on PRD-581 slices.
-**Priority:** P2 — planned feature work: AC-1 to AC-7 are open. UE5 packs import skinned meshes with no animation at all, and no engine version exports blend spaces or montages.
+**Status:** DONE — AC-1 to AC-8 proved on 2026-10-12 (importer 116, converter `89-animation`). Merged 2026-10-12 (PR #45, merge commit `55e8b63`).
+**Priority:** P2 — planned feature work. UE5 packs imported skinned meshes with no animation; no engine version exported blend spaces or montages before this PRD.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new animation-data module (+2), crosses the .NET converter / Node importer boundary (+2); risk override: none
 **Owner:** João
 **Depends on:** PRD-581 (corpus slices and `tests/fab-feature-corpus.test.ts`)
@@ -115,12 +115,11 @@ Every `clip` value equals the name of an exported glTF animation, so a consumer 
 - Review fixes on this commit: `BlendAxis` restores a default only for a field the raw tag actually omitted, so an unversioned package keeps its typed values; `ExportBlendSpace` reads `bMirror` from the dynamic `SampleData` TArray's own elements rather than a per-`ArrayIndex` read that could never reach element 1; the clip-attachment map is keyed by clip and valued by the accepting mesh, so two rigs that share bone names warn while two LODs of one mesh do not (`tests/unreal-animation-attached-model.test.ts`).
 - Root-cause fix (this commit): the pinned `UAnimSequence` reads the tagged `TrackToSkeletonMapTable` fallbacks into bone indices, and `AnimConverter.ConvertSequence` maps raw editor tracks by bone index (`trackIndex < RawAnimationData.Length`) instead of `Trace.Assert`, so the ASP 4.4 conversion no longer aborts the whole run. The converter's mesh empty guard no longer fires in `--animations` mode, so a package whose clips are all unsupported still writes its sidecars and exits 0. The ASP 4.4 pack now exports 13 PSAs + 13 clip sidecars + 2 blend-space descriptors, and the AC-2 differential against UE Viewer is 0.265° max. Trust boundary: `parseAnimationDescriptor` rejects a valid-JSON-but-wrong-shape document with a precise per-package reason before the importer accepts it as produced (`tests/unreal-animation-data.test.ts`, `tests/unreal-animation-import.integration.test.ts`, and the compiled `tests/unreal-animation-compiled.test.ts` reads a real UE4 PSA with non-constant bone quaternions and accepts a real 5.4 ControlRig clip's reported sidecar). Converter `b4e95441+threenative.83-animation`, importer 115.
 - Renderer: `renderTiles` supports the per-tile `sampling` above; `tests/unreal-animation-render.test.ts` proves frames differ, a missing clip fails rather than returning bind pose, an unskinned model fails, and the default static render is unchanged (`tests/unreal-visual-regression.test.ts` goldens stay green).
-- Pending: AC-1, AC-4, AC-5, AC-6 corpus proof waits on PRD-581's `tests/fab-feature-corpus.test.ts`. The UE5.0–5.5 conventional `UAnimDataModel` track reader is implemented; the executed native probe was converter `85-animation` on a real UE 5.0.3 MetaHuman Sample clip (`MM_Walk_Fwd`, 354 bones, 83 frames at 30 fps, endpoint sampled), and converter `86-animation` is source-only pending a fresh public native proof. The `CurveData` float-curve layout is implemented but that clip carries no curves, so it stays source-only. AC-8 sheets are rendered but need the parent's by-eye inspection.
 
 ## Execution Phases
 
 #### Phase 1: UE5 clips (prerequisite)
-**Status:** PARTIAL — cooked UE4/UE5 clips that carry `RawAnimationData`/compressed/ACL convert through CUE4Parse and match UE Viewer (ASP 4.4 differential 0.265°); the real 5.4 and 5.8 sample clips are Reported with package evidence (both use a `UAnimationSequencerDataModel`/ControlRig model, not `UAnimDataModel.BoneAnimationTracks`). The conventional UE5.0–5.5 `UAnimDataModel.BoneAnimationTracks` reader is implemented: the executed native probe was converter `85-animation` on a real UE 5.0.3 MetaHuman Sample `MM_Walk_Fwd` clip (354 bones, 83 frames at 30 fps, endpoint sampled), and converter `86-animation` is source-only pending a fresh public native proof (see the 2026-10-12 decision). AC-1 corpus proof pending PRD-581.
+**Status:** DONE — cooked clips convert through CUE4Parse and match UE Viewer (ASP 4.4 differential 0.265°). The UE5.0–5.5 `UAnimDataModel` reader and the GLB clip gate (`ue5-clips`) pass on the final head. The 5.4 and 5.8 sample clips stay Reported: they use a ControlRig model (see the 2026-10-11 decision).
 **Files:**
 - `src/unreal/cue4parse-adapter.ts`: `UAnimSequence` export through CUE4Parse-Conversion, or the adapter's own track reader.
 - `src/unreal/importer.ts`: route UE5 animation packages to CUE4Parse and attach the clips.
@@ -134,13 +133,13 @@ Every `clip` value equals the name of an exported glTF animation, so a consumer 
 **Verification:** AC-1, AC-2.
 
 #### Phase 2: Blend spaces and aim offsets
-**Status:** IMPLEMENTED — AC-3 local test green; AC-4 corpus proof pending PRD-581.
+**Status:** DONE — AC-3 local test green; AC-4 corpus gate `blendspaces` green on 2026-10-12.
 **Files:** adapter (blend-space writer), `src/unreal/animation-data.ts` (new: clip-name resolution and report), `tests/unreal-animation-data.test.ts` (new).
 **Implementation:** Read the typed `BlendParameters` and `SampleData`, resolve each `Animation` reference to its exported clip name, and classify 1D, 2D or aim offset.
 **Verification:** AC-3, AC-4.
 
 #### Phase 3: Montages, composites, clip sidecars, ledger and gates
-**Status:** IMPLEMENTED — AC-5 synthetic test green; AC-6 corpus and AC-8 sheets pending PRD-581.
+**Status:** DONE — AC-5 synthetic test and corpus gate `montages` green; AC-6 gate `clip-curves` and AC-8 sheets green on 2026-10-12.
 **Files:** adapter (montage and clip-sidecar writers), `animation-data.ts`, ledger, `README.md` import table, tests.
 **Implementation:**
 - Resolve section starts for each `LinkMethod`.

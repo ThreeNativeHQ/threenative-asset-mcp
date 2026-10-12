@@ -1,6 +1,6 @@
 # PRD-critical-texture-regressions — Finish texture regression protection
 
-**Status:** IN PROGRESS — implementation, real-asset proof and local repository checks pass; final-head PR41 CI pending.
+**Status:** DONE — implementation, real-asset proof, repository checks and required CI pass; PR #41 merged 2026-10-12 as `5715b56`.
 **Priority:** P0 — prevent the known chair/crate texture-resolution regression from recurring.
 **Complexity:** 3 (LOW) — 1–5 implementation files and the TypeScript/generated .NET boundary; no new subsystem.
 **Owner:** João / next coding session
@@ -43,10 +43,10 @@ Affected boundaries: native material/standalone extraction and its sprite/font/s
 - [x] The new PR shows both assets before/after with identical camera/environment settings and visibly restored texture detail. proof: actual final-head rendered comparisons in the new PR; reuse the published PR40 sheet only if its production/render inputs are unchanged.
 
 #### Phase 3: Integrate and verify
-**Status:** IN PROGRESS — local checks pass; final-head CI pending
+**Status:** COMPLETE — local checks pass; required CI passed on PR #41 head `1707f4e` (2026-10-12).
 
 - [x] The integrated final head passes repository checks. proof: `npm run typecheck`, `npm test` (builds first, default workers), `npm run test:leaks`, and `npx vitest run tests/mcp-smoke.test.ts`; avoid repeating equivalent runs when the existing command already proves the requirement.
-- [ ] Required CI checks pass on the exact pushed new PR head. proof: new PR checks with matching head SHA. Record results/limits in the existing PR/PRD, without standalone verification reports.
+- [x] Required CI checks pass on the exact pushed new PR head. proof: new PR checks with matching head SHA. Record results/limits in the existing PR/PRD, without standalone verification reports. Evidence: PR #41 head `1707f4e` passed Verify (Node 20.19.0), Verify (Node 24.x), parallel, leak-gate (run 38199243761) and Provision from an empty cache (Debian 13) (run 38199243762); merged 2026-10-12 as `5715b56`.
 
 ## Acceptance criteria
 
@@ -85,4 +85,4 @@ Delivery uses the existing repair lane `.worktrees/importer-native-texture-sourc
 
 Local final code verification at `d6134a9ae9343b583d2c612e4c0337dd0f26a959`: `npm run typecheck` exit0; `npm test` exit0 (build first, default workers: 2,425 passed, five licensed-input skips); `npm run test:leaks` exit0 (same 2,425 passed, five skips; `leak-gate: clean`); `npx vitest run tests/mcp-smoke.test.ts` exit0 (15 passed). Logs: `/tmp/critical-texture-{typecheck,test,leaks,smoke}.log`. Used owned native79 toolchain with auto-install disabled; protected native78 inputs retained. Source/tests unchanged by the subsequent PRD-only evidence commit.
 
-New PR41 contains the published comparison and full-GLB hash justification for reusing it. The repair checkout is retained (14 MB measured, without dereferencing links) because PR41 is open and unmerged. The original nodes checkout contains the requested PRD and other existing work; no checkout or licensed evidence was deleted. No merge, publish, baseline ratchet, broad corpus sweep or engine-pin change performed. Final-head CI remains the sole open gate.
+New PR41 contains the published comparison and full-GLB hash justification for reusing it. The repair checkout is retained (14 MB measured, without dereferencing links) and PR41 merged 2026-10-12 (`5715b56`); removing that checkout is a separate step. The original nodes checkout contains the requested PRD and other existing work; no checkout or licensed evidence was deleted. No merge, publish, baseline ratchet, broad corpus sweep or engine-pin change performed. Required CI passed on PR #41 head `1707f4e`; no gate remains open.

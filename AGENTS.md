@@ -71,6 +71,8 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
 
 ## Fab and Unreal imports
 
+- **Format ledger:** `docs/unreal-format-support.md` lists supported, verified and missing Unreal formats. Keep it current; the update rules are in `CLAUDE.md`.
+
 - **Local official engine reference:** `/home/joao/projects/UnrealEngine-5.8.3`, tag
   `5.8.3-release`, commit `396c9f059903aed5fec78ecd3d437a40c6415368`. This is a shallow,
   blob-filtered sparse clone made through authenticated `gh`; expand the sparse paths when needed.
@@ -102,7 +104,7 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   reproduce it, so a section with no base colour asks the graph baker (`src/unreal/graph-baker.ts`,
   PRD-538): CUE4Parse dumps the graph, `material-graph.ts` evaluates a closed node set and bakes a
   base-colour PNG (`source: "graph"`). Anything it cannot evaluate (e.g. `ReflectionVectorWS` feeding a
-  cubemap lookup, `CameraVectorWS`, a `CollectionParameter`) stays on the neutral fallback and is named under the section's `graph`.
+  cubemap lookup, `CameraVectorWS`) stays on the neutral fallback and is named under the section's `graph`.
   Engine content functions are not in the pack, so a bake that relies on them is `heuristic`. View-dependent
   nodes stand in as recorded approximations: `Fresnel` as its mean over a sphere's visible surface,
   `DepthFade` as fully faded in, `TwoSidedSign` as +1 (front face), `Time` as 0 and `Panner` unpanned (one
@@ -126,8 +128,8 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   The reader accepts one distinct name, the only case seen, and refuses more with the reason in the mesh
   failure.
 - **`BuildScale3D` applies on every UE4 route.** Neither UE Viewer nor the uncooked MeshDescription converter
-  multiplies the source model by it; the importer does (`meshGeometryScale`). UE5 editor meshes are not yet
-  covered: `readBuildScale3D` reads legacy -7 headers only.
+  multiplies the source model by it; the importer does (`meshGeometryScale`). `readBuildScale3D` reads
+  legacy -7 and -8 headers (UE 5.0–5.3); the UE 5.4 tag layout and the 5.5 -9 header are not read yet (PRD-597).
 - Fab downloads land in `~/.cache/threenative-asset-mcp/fab-downloads/<listing>/<artifact>`. They
   are licensed, not redistributable: never commit pack contents. Delete what you downloaded when
   you are done; FabCLI fetched Soul Cave (1.2 GB) in 17 s, so re-downloading is cheap.

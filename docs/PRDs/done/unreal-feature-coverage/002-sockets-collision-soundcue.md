@@ -1,6 +1,6 @@
 # PRD-582 — Import Unreal sockets, collision, physics assets and SoundCues
 
-**Status:** DONE — AC-1 through AC-8 proved on 2026-10-12. Final source `8ef7c2f`, importer 115 and immutable converter `threenative.86-gameplay` passed the five-slice gameplay gates, default-worker leak gate and packed-MCP smoke. Four inspected before/after sheets are embedded in [PR #44's screenshot comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/44#issuecomment-6121157154). The PR remains open; no merge is authorized.
+**Status:** DONE — AC-1 through AC-8 proved on 2026-10-12. Final source `8ef7c2f`, importer 115 and immutable converter `threenative.86-gameplay` passed the five-slice gameplay gates, default-worker leak gate and packed-MCP smoke. Four inspected before/after sheets are embedded in [PR #44's screenshot comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/44#issuecomment-6121157154). Merged 2026-10-12 (PR #44, merge commit `e66ba8b`).
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new gameplay-data module (+2), crosses the .NET converter / Node importer boundary (+2); risk override: none
 **Owner:** João
 **Depends on:** PRD-581 (corpus slices and `tests/fab-feature-corpus.test.ts`)

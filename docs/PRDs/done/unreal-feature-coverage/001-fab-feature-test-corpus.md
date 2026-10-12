@@ -1,6 +1,6 @@
 # PRD-581 — Small Fab test corpus for gameplay, animation and VFX imports
 
-**Status:** DONE — all six acceptance criteria are proved; PR #43 includes the screenshot comment.
+**Status:** DONE — all six acceptance criteria are proved; PR #43 includes the screenshot comment. Merged 2026-10-12 (PR #43).
 **Priority:** P2 — an indispensable prerequisite of PRD-582 and PRD-583 (both P2): neither can prove its outputs on real packs until AC-2 to AC-5 exist.
 **Complexity:** 2 (LOW) — 1–5 implementation files (1), Fab/FabCLI external API (+1); risk override: none
 **Owner:** João
