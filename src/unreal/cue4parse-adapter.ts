@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.82",
+  version: "b4e95441+threenative.83-animation",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -413,9 +413,71 @@ diff --git a/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs b/CUE4Pars
              return (Type) ver;
 +        if (Ar.IsAbsentInUe4Package(GUID))
 +            return Type.BeforeCustomVersionWasAdded;
-
+ 
          return Ar.Game switch
          {
+diff --git a/CUE4Parse/UE4/Assets/Exports/Animation/UAnimSequence.cs b/CUE4Parse/UE4/Assets/Exports/Animation/UAnimSequence.cs
+--- a/CUE4Parse/UE4/Assets/Exports/Animation/UAnimSequence.cs
++++ b/CUE4Parse/UE4/Assets/Exports/Animation/UAnimSequence.cs
+@@ -57,6 +57,19 @@ public override void Deserialize(FAssetArchive Ar, long validPos)
+             RefFrameIndex = GetOrDefault(nameof(RefFrameIndex), 0);
+             RetargetSource = GetOrDefault<FName>(nameof(RetargetSource));
+             RetargetSourceAssetReferencePose = GetOrDefault<FTransform[]>(nameof(RetargetSourceAssetReferencePose));
++            // The editor raw-data track map is a tagged UPROPERTY whose elements land as struct fallbacks,
++            // so read BoneTreeIndex from the fallback. Without it the editor RawAnimationData has no bone
++            // mapping and GetNumTracks / FindTrackForBoneIndex return nothing.
++            if (TryGetValue<FStructFallback[]>(out var trackMapFallback, nameof(TrackToSkeletonMapTable)))
++            {
++                var trackMap = new FTrackToSkeletonMap[trackMapFallback.Length];
++                for (var index = 0; index < trackMapFallback.Length; index++)
++                {
++                    trackMapFallback[index].TryGetValue<int>(out var boneTreeIndex, "BoneTreeIndex");
++                    trackMap[index] = new FTrackToSkeletonMap { BoneTreeIndex = boneTreeIndex };
++                }
++                TrackToSkeletonMapTable = trackMap;
++            }
+             Interpolation = GetOrDefault<EAnimInterpolationType>(nameof(Interpolation));
+ 
+             if (BoneCompressionSettings == null && Ar.Game == GAME_RogueCompany)
+diff --git a/CUE4Parse-Conversion/Legacy/AnimConverter.cs b/CUE4Parse-Conversion/Legacy/AnimConverter.cs
+--- a/CUE4Parse-Conversion/Legacy/AnimConverter.cs
++++ b/CUE4Parse-Conversion/Legacy/AnimConverter.cs
+@@ -135,24 +135,26 @@ private static CAnimSequence ConvertSequence(this UAnimSequence animSequence, US
+             var numBones = skeleton.BoneCount;
+             if (animSequence.RawAnimationData is { Length: > 0 })
+             {
+-                Trace.Assert(animSequence.RawAnimationData.Length == animSeq.Tracks.Capacity);
+-
+-                static void CopyArray<T>(out T[] dest, T[] src)
++                // The editor raw tracks and the tagged track map must agree. A package that does not
++                // line up is converted by bone index for the tracks it does carry; the remaining bones
++                // keep the rest pose. It must never abort the whole conversion run for other assets.
++                static void CopyArray<T>(out T[] dest, T[]? src)
+                 {
+-                    dest = new T[src.Length];
+-                    src.CopyTo(dest, 0);
++                    dest = src is null ? [] : new T[src.Length];
++                    src?.CopyTo(dest, 0);
+                 }
+ 
++                var rawData = animSequence.RawAnimationData;
+                 for (var boneIndex = 0; boneIndex < numBones; boneIndex++)
+                 {
+                     var track = new CAnimTrack();
+                     animSeq.Tracks.Add(track);
+                     var trackIndex = animSequence.FindTrackForBoneIndex(boneIndex);
+-                    if (trackIndex >= 0)
++                    if (trackIndex >= 0 && trackIndex < rawData.Length)
+                     {
+-                        CopyArray(out track.KeyQuat, animSequence.RawAnimationData[trackIndex].RotKeys);
+-                        CopyArray(out track.KeyPos, animSequence.RawAnimationData[trackIndex].PosKeys);
+-                        CopyArray(out track.KeyScale, animSequence.RawAnimationData[trackIndex].ScaleKeys);
++                        CopyArray(out track.KeyQuat, rawData[trackIndex].RotKeys);
++                        CopyArray(out track.KeyPos, rawData[trackIndex].PosKeys);
++                        CopyArray(out track.KeyScale, rawData[trackIndex].ScaleKeys);
+                     }
+                 }
+             }
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">

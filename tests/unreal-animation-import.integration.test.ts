@@ -49,6 +49,7 @@ if (argv.includes("--animations") && exportAt >= 0) {
     samples: [{ animation: "M_Walk", sampleValue: [150, 0, 0], rateScale: 1, mirror: false }],
   }));
   fs.writeFileSync(join(animation, "BS_Bad.json"), "{ not json");
+  fs.writeFileSync(join(animation, "BS_WrongShape.json"), JSON.stringify({ format: "something-else", name: "x" }));
 }
 process.exit(0);
 `,
@@ -64,8 +65,8 @@ it("imports logic-only animation packages without failing empty and reports each
   const outputDir = join(directory, "output");
   const animation = join(sourceDir, "Content", "Anim");
   await mkdir(animation, { recursive: true });
-  for (const name of ["BS_Locomotion", "BS_Empty", "BS_Bad"]) await writeFile(join(animation, `${name}.uasset`), Buffer.from("\u0000BlendSpace\u0000"));
-  const tools = await writeAnimationTools(directory, ["BS_Locomotion", "BS_Empty", "BS_Bad"]);
+  for (const name of ["BS_Locomotion", "BS_Empty", "BS_Bad", "BS_WrongShape"]) await writeFile(join(animation, `${name}.uasset`), Buffer.from("\u0000BlendSpace\u0000"));
+  const tools = await writeAnimationTools(directory, ["BS_Locomotion", "BS_Empty", "BS_Bad", "BS_WrongShape"]);
 
   const report = await importUnrealDirectory({
     sourceDir,
@@ -83,5 +84,9 @@ it("imports logic-only animation packages without failing empty and reports each
   expect(report.animationLogic[0]!.name).toBe("BS_Locomotion");
   expect(report.animationLogic[0]!.unresolvedClips).toEqual([{ clip: "M_Walk", reason: "no exported animation has this name" }]);
   expect(report.failed.some((entry) => entry.package.endsWith("BS_Bad.uasset") && /not valid JSON/.test(entry.reason))).toBe(true);
+  // Valid JSON of the wrong shape is a defect reported for its package, not silently ignored.
+  expect(
+    report.failed.some((entry) => entry.package.endsWith("BS_WrongShape.uasset") && /not a threenative-unreal-animation descriptor: format is not/.test(entry.reason)),
+  ).toBe(true);
   expect(report.failed.some((entry) => entry.package.endsWith("BS_Empty.uasset") && /wrote no clip or descriptor/.test(entry.reason))).toBe(true);
 });

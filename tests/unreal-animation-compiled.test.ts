@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 
 import { CUE4PARSE_ENGINE_CONTENT, CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
+import { parsePsa } from "../src/unreal/psa.js";
 import { modernSdkExecutable, toolchainCacheDir } from "../src/unreal/provision.js";
 import { childEnvironment, runBounded } from "../src/unreal/toolchain.js";
 import { describeWithTools } from "./helpers/require-tool.js";
@@ -106,6 +107,27 @@ describeWithTools(["modern-converter"], "converter animation code, compiled agai
       }
       if (document.kind === "clip" && document.unsupportedReason !== undefined) {
         expect(String(document.unsupportedReason)).toMatch(/bone tracks|ControlRig|compressed/i);
+      }
+    }
+    // A UE4-era proof pack (raw editor tracks) must produce real ActorX clips whose bone quaternions
+    // vary over time. This exercises the raw FRawAnimSequenceTrack read and the track-map bone mapping
+    // the pinned reader previously left empty, rather than only the descriptor envelope.
+    const psaFiles = files.filter((file) => file.toLowerCase().endsWith(".psa"));
+    for (const file of psaFiles) {
+      const psa = parsePsa(await readFile(join(animation, file)));
+      expect(psa.sequences.length).toBeGreaterThan(0);
+      for (const sequence of psa.sequences) {
+        expect(sequence.frames).toBeGreaterThan(0);
+        const moves = sequence.tracks.some((track) => {
+          if (track.rotations.length < 8) return false;
+          let maxDelta = 0;
+          for (let i = 4; i < track.rotations.length; i += 4) {
+            const delta = Math.abs(track.rotations[i]! - track.rotations[i - 4]!) + Math.abs(track.rotations[i + 1]! - track.rotations[i - 3]!) + Math.abs(track.rotations[i + 2]! - track.rotations[i - 2]!) + Math.abs(track.rotations[i + 3]! - track.rotations[i - 1]!);
+            maxDelta = Math.max(maxDelta, delta);
+          }
+          return maxDelta > 1e-4;
+        });
+        expect(moves, `${file} has no bone track with a varying rotation`).toBe(true);
       }
     }
   });

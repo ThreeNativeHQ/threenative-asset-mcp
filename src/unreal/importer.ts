@@ -22,7 +22,7 @@ import {
   type RawGameplaySidecar,
   type RawPhysics,
 } from "./gameplay-data.js";
-import { buildAnimationLogic, type ExportedClip, type RawAnimationAsset } from "./animation-data.js";
+import { buildAnimationLogic, parseAnimationDescriptor, type ExportedClip, type RawAnimationAsset } from "./animation-data.js";
 
 import {
   type MaterialTextureBinding,
@@ -77,7 +77,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 116;
+export const IMPORTER_VERSION = 115;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -4489,11 +4489,20 @@ export async function importUnrealDirectory(
       for (const file of await listFiles(join(modernAnimationRaw, "Animation")).catch(() => [])) {
         if (!file.path.toLowerCase().endsWith(".json")) continue;
         const stem = basename(file.path, ".json").replace(/\.clip$/i, "");
+        const reportName = animationPackageFor(stem).toLowerCase();
         try {
-          const descriptor = JSON.parse(await readFile(file.path, "utf8")) as RawAnimationAsset;
-          animationDescriptors.push(descriptor);
-          produced.add(animationPackageFor(typeof descriptor.name === "string" && descriptor.name.length > 0 ? descriptor.name : stem).toLowerCase());
+          const parsed = parseAnimationDescriptor(JSON.parse(await readFile(file.path, "utf8")) as unknown);
+          if (!parsed.descriptor) {
+            // Valid JSON of the wrong shape is a converter defect, reported for its package rather
+            // than silently dropped by buildAnimationLogic's unknown-kind guard.
+            produced.add(reportName);
+            failed.push({ package: animationPackageFor(stem), reason: `The animation descriptor ${basename(file.path)} is not a threenative-unreal-animation descriptor: ${parsed.reason}.` });
+            continue;
+          }
+          animationDescriptors.push(parsed.descriptor);
+          produced.add(animationPackageFor(parsed.descriptor.name!).toLowerCase());
         } catch {
+          produced.add(reportName);
           failed.push({ package: animationPackageFor(stem), reason: `The animation descriptor ${basename(file.path)} is not valid JSON; the package produced no usable animation.` });
         }
       }

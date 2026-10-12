@@ -5,6 +5,7 @@ import {
   blendAxes,
   buildAnimationLogic,
   normalizeClipSidecar,
+  parseAnimationDescriptor,
   resolveClip,
   sectionStart,
   type RawAnimationAsset,
@@ -192,5 +193,34 @@ describe("blend-space sample flags (AC-3, AC-4)", () => {
     expect(consequence).toContain("an additive blend space names no base pose the import can apply");
     const aim: RawAnimationAsset = { kind: "blendSpace", blendSpaceType: "aimOffset", additive: true, name: "AO_Hero", package: "/Game/Anim/AO_Hero", samples: [] };
     expect(buildAnimationLogic([aim], clips, undefined).unresolved).toEqual([]);
+  });
+});
+
+describe("animation descriptor trust boundary", () => {
+  it("accepts the adapter envelope and returns the descriptor", () => {
+    const parsed = parseAnimationDescriptor({
+      format: "threenative-unreal-animation",
+      version: 1,
+      kind: "blendSpace",
+      name: "BS_Locomotion",
+      package: "/Game/Anim/BS_Locomotion",
+    });
+    expect(parsed.reason).toBeUndefined();
+    expect(parsed.descriptor?.name).toBe("BS_Locomotion");
+  });
+
+  it("rejects valid JSON of the wrong shape with a precise reason", () => {
+    // A converter that writes `{}` or a document with an unrecognised kind must be reported for its
+    // package, never pushed into buildAnimationLogic where an unknown kind is silently dropped.
+    expect(parseAnimationDescriptor({}).reason).toBe('format is not "threenative-unreal-animation"');
+    expect(parseAnimationDescriptor({ format: "threenative-unreal-animation", version: 2 }).reason).toBe("version is not 1");
+    expect(parseAnimationDescriptor({ format: "threenative-unreal-animation", version: 1, kind: "unknown" }).reason).toBe(
+      "kind is not one of blendSpace, montage, composite, clip",
+    );
+    const noName = parseAnimationDescriptor({ format: "threenative-unreal-animation", version: 1, kind: "clip", package: "/Game/Anim/X" });
+    expect(noName.reason).toBe("name is missing or empty");
+    const noPackage = parseAnimationDescriptor({ format: "threenative-unreal-animation", version: 1, kind: "clip", name: "X" });
+    expect(noPackage.reason).toBe("package is missing or empty");
+    expect(parseAnimationDescriptor([]).reason).toBe("the document is not a JSON object");
   });
 });

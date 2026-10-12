@@ -235,6 +235,40 @@ export interface AnimationLogicResult {
   readonly unsupported: readonly { readonly package: string; readonly asset: string; readonly reason: string }[];
 }
 
+/** The descriptor envelope every adapter animation JSON carries. */
+export const ANIMATION_DESCRIPTOR_FORMAT = "threenative-unreal-animation";
+export const ANIMATION_DESCRIPTOR_VERSION = 1;
+const ANIMATION_DESCRIPTOR_KINDS = new Set(["blendSpace", "montage", "composite", "clip"]);
+
+export interface ParsedAnimationDescriptor {
+  readonly descriptor?: RawAnimationAsset;
+  /** A precise reason the document is not a usable descriptor, for the package report. */
+  readonly reason?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validates the minimal envelope of an adapter animation descriptor before the importer accepts it as
+ * produced. A converter that writes valid JSON of the wrong shape (or a truncated file) must be
+ * reported for its package, never silently pushed into `buildAnimationLogic` where an unknown `kind`
+ * is dropped without a trace.
+ */
+export function parseAnimationDescriptor(value: unknown): ParsedAnimationDescriptor {
+  if (!isRecord(value)) return { reason: "the document is not a JSON object" };
+  if (value.format !== ANIMATION_DESCRIPTOR_FORMAT) return { reason: `format is not "${ANIMATION_DESCRIPTOR_FORMAT}"` };
+  if (value.version !== ANIMATION_DESCRIPTOR_VERSION) return { reason: `version is not ${ANIMATION_DESCRIPTOR_VERSION}` };
+  if (typeof value.kind !== "string" || !ANIMATION_DESCRIPTOR_KINDS.has(value.kind)) {
+    return { reason: `kind is not one of ${[...ANIMATION_DESCRIPTOR_KINDS].join(", ")}` };
+  }
+  if (typeof value.name !== "string" || value.name.length === 0) return { reason: "name is missing or empty" };
+  if (typeof value.package !== "string" || value.package.length === 0) return { reason: "package is missing or empty" };
+  return { descriptor: value as unknown as RawAnimationAsset };
+}
+
+
 /** One exported glTF animation and the package it came from, for clip-name resolution. */
 export interface ExportedClip {
   readonly name: string;
