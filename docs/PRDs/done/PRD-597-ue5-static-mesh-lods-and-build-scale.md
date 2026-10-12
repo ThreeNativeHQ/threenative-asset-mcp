@@ -1,7 +1,7 @@
 # PRD-597 — UE5 static mesh LODs and BuildScale3D
 
-**Status:** IN PROGRESS
-**Priority:** P2 — cooked scale repair complete; parent final gates on the new head pending.
+**Status:** DONE
+**Priority:** P2 — requested UE5 payload LODs and editor BuildScale are implemented and verified; cooked scale is preserved.
 **Complexity:** 2 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `src/unreal/mesh-build-scale.ts`); risk override: none.
 **Owner:** unassigned
 **Depends on:** None
@@ -41,8 +41,8 @@ payloads that exist can be decoded.
 - [x] AC-1 [local]: A synthetic UE 5.4+ (tag 1012) static mesh with `BuildScale3D` (2, 2, 2) imports at twice the size of the same mesh at (1, 1, 1). proof: composed native decode and public importer wiring in `tests/unreal-converter-static-mesh.test.ts` and `tests/unreal-palms-paragon.test.ts` — Evidence: the pinned native reader decodes actual serialized complete-type-name `SourceModels` array → `BuildSettings` → `BuildScale3D` tags, including FVector double payloads, with `VersionContainer(GAME_UE5_4)` (1012). The shipped scale helper returns `[1,1,1]` and `[2,2,2]`; the public importer fixture routes a synthetic 1012 header and consumes metadata at twice the size. This composes property decoding and scale consumption; it is not a fabricated full-package import.
 - [x] AC-2 [local]: The same holds for a legacy -9 (UE 5.5+) package. proof: the same composed tests — Evidence: `VersionContainer(GAME_UE5_5)` drives the native complete-type-name tag decoder over serialized nested properties and FVector doubles; the shipped scale helper returns unit and doubled scale. The public importer fixture separately routes a synthetic legacy -9 header and doubles geometry using converter metadata. The native fixture does not deserialize a legacy -9 package summary.
 - [x] AC-3 [local]: A cooked UE5 static mesh imported with `lods: [0, 1]` writes `Models/<name>_LOD1.glb` with fewer triangles than LOD0. proof: `tests/unreal-import.integration.test.ts` beside the `SM_Rock_LOD1` case (:1418) and the native fixture in `tests/unreal-converter-static-mesh.test.ts` — Evidence: the contract test passes `--lods`, promotion, naming, and distinct A/B geometry. The fixture compiles and invokes shipped `ExportStaticMeshAsync` with actual synthetic `FStaticMeshRenderData` buffers and requested LODs `[0]` versus `[0,1]`; its native-emitted promoted GLBs contain 2 triangles at LOD0 and 1 at LOD1. The shipped metadata writer emits null scale for cooked render buffers; the composed public importer preserves their native bounds. These are synthetic cooked buffers, not a serialized real cooked package.
-- [x] AC-4 [local]: A real UE5 editor pack (Megascans European Hornbeam or Common Hazel, UE5.1) imported with `lods: [0, 1, 2]` writes each LOD that has a payload, and the report names each generated LOD. proof: `npx vitest run tests/unreal-ue5-editor-mesh.test.ts` — Evidence: passed on 2026-10-12 in 72.85s with the isolated full `.584.7.2` converter against the local European Hornbeam Content tree; promoted 115,674 / 41,543 / 15,076 triangle LOD0/1/2 GLBs. The test selector is local environment input, paths are derived from returned LOD0, and no licensed piece identifier is committed. No generated LOD was faked.
-- [ ] AC-5 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent ran all four on implementation `aaf843f` with fresh `.584.7.2` toolchain: exits 0; typecheck 1.0s, default suite 2,702 passed / 15 skipped (85.4s), leak gate clean (88.0s), packed MCP 15/15 (11.2s). Raw logs: `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent597-final-{typecheck,test,leaks,smoke}.log`. Reopened: the cooked-scale repair changes code after these gates; parent must rerun all four on the new head.
+- [x] AC-4 [local]: A real UE5 editor pack (Megascans European Hornbeam or Common Hazel, UE5.1) imported with `lods: [0, 1, 2]` writes each LOD that has a payload, and the report names each generated LOD. proof: `npx vitest run tests/unreal-ue5-editor-mesh.test.ts` — Evidence: passed on 2026-10-12 in 112.22s with the isolated full `.584.7.3` converter against the local European Hornbeam Content tree; promoted 115,674 / 41,543 / 15,076 triangle LOD0/1/2 GLBs. The test selector is local environment input, paths are derived from returned LOD0, and no licensed piece identifier is committed. No generated LOD was faked.
+- [x] AC-5 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent ran all four on final implementation `b19ab0b` with fresh `.584.7.3`: exits0; typecheck0.9s, default suite2,703 passed/15 skipped83.0s, clean leak gate86.4s, packed MCP15/15 in10.5s. Raw logs: `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent597-final73-{typecheck,test,leaks,smoke}.log`. Fresh final Hornbeam check also passed112.22s.
 
 ## Integration Ledger
 
@@ -74,9 +74,13 @@ payloads that exist can be decoded.
 **Status:** COMPLETE
 **Files:** `src/unreal/cue4parse-adapter.ts` (`ExportStaticMeshAsync`, `ExportEditorStaticMesh`), `src/unreal/importer.ts`.
 **Implementation:** Cooked path with `EMeshQuality.All`; editor path maps source models to payloads; report generated LODs.
-**Verification:** AC-3 passes both the importer ownership contract and the native synthetic cooked-buffer writer fixture; AC-4 passed in `tests/unreal-ue5-editor-mesh.test.ts` with the isolated full `.584.7.1` converter proof wrapper.
+**Verification:** AC-3 passes native shipped-exporter and public-importer composition, including cooked scale preservation; AC-4 passed the full `.584.7.3` converter on European Hornbeam.
 
 #### Phase 3: Ledger and gates
-**Status:** IN PROGRESS
+**Status:** DONE
 **Files:** `docs/unreal-format-support.md` rows "StaticMesh LOD1 and higher" and "StaticMesh BuildScale3D", `README.md` import table.
-**Verification:** Documentation and active version pins are updated. Earlier fresh-toolchain receipts apply to the prior head. Final typecheck, default-worker tests, leak gate, MCP smoke and reviewer round 2 remain parent-owned gates.
+**Verification:** All five acceptance criteria pass on final implementation `b19ab0b`; parent receipts and final native/editor proof are recorded above.
+
+## Final review disposition
+
+Two read-only review rounds ran. Round2 returned REQUEST_CHANGES for cooked scale double application. Commit `b19ab0b` resolves that sole finding: Unreal already scales cooked render vertices (`StaticMeshBuilder.cpp:1596,1694-1703`), so cooked metadata carries no importer-applied scale. The composed native-to-public regression failed before the fix and passes after it; the parent inspected the change and ran all four final gates plus the real editor proof. The review verdict is preserved; no third review or independent approval is claimed.
