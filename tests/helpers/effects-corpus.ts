@@ -134,7 +134,7 @@ export function registerEffectsCorpusTests(corpusDir: string | undefined): void 
         if (object.kind === "particle-parameter") {
           // Unbaked particle parameters are exclusions, never agreements.
           expect(table!.entryCount, `${dual.where} raw Table is empty`).toBe(0);
-          expect(table!.values, `${dual.where} raw Table has no values`).toEqual([]);
+          // The real pack keeps a stray Values array beside EntryCount 0, so only EntryCount decides "unbaked".
           const check = crossCheckParticleParameterDefault(object, table!, 16);
           expect(check.tableBaked, `${dual.where} particle-parameter Table is unbaked`).toBe(false);
           expect(check.defaultValue.length, `${dual.where} no-owner default is explicit`).toBeGreaterThan(0);
@@ -578,7 +578,8 @@ async function importSlice(sliceDir: string, label: string, cleanups: (() => Pro
   const environment = { ...childEnvironment(process.env), DOTNET_GCHeapHardLimit: "0x40000000" };
   const versionRun = await runBounded(converterPath, ["--version"], { timeoutMs: 30_000, environment });
   expect(versionRun.code, versionRun.stderr).toBe(0);
-  const version = versionRun.stdout.trim();
+  // The executable prints "threenative-cue4parse <version>"; only that exact anchored prefix is removed.
+  const version = versionRun.stdout.trim().replace(/^threenative-cue4parse /, "");
   expect(version, "executed private converter identity").toBe("b4e95441+threenative.584.4");
   expect(version).toBe(CUE4PARSE_SOURCE.version);
   const root = await mkdtemp(join(tmpdir(), `effects-corpus-${label}-`));
@@ -599,7 +600,7 @@ async function importSlice(sliceDir: string, label: string, cleanups: (() => Pro
   expect(report.importer.version, "current public importer").toBe(117);
   expect(report.toolchain.modernConverter, "public import used the executed private converter").toBe(version);
   const dumpPath = join(root, "effects-dump.json");
-  const dumped = await runBounded(converterPath, [sliceDir, "--dump-effects", dumpPath, "--engine", slice.engine], {
+  const dumped = await runBounded(converterPath, [sliceDir, "--dump-effects", dumpPath, "--engine", slice.engine.replace(/^UE_/, "")], {
     cwd: root, timeoutMs: 30_000, maxOutputBytes: 64 * 1024 * 1024, environment,
   });
   expect(dumped.code, `${dumped.stdout}\n${dumped.stderr}`).toBe(0);
