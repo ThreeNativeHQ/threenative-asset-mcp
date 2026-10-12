@@ -1,6 +1,6 @@
 # PRD-599 — UE5 landscape heightfields in levels
 
-**Status:** IN PROGRESS — final union integrated; parent fresh gates, final independent review and CI pending
+**Status:** DONE — final integrated local acceptance complete; final review and current-head CI remain delivery checks
 **Priority:** P2 — terrain export implemented; parent owns the comparison sheet and final repository gates.
 **Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `src/unreal/scenes.ts`), new module; risk override: none.
 **Owner:** PRD-599 repair lane; parent owns orchestration
@@ -33,7 +33,7 @@ only to PNG. Engine headers to confirm the UE5 fields (tracked, not checked out)
 - [x] AC-1 [local]: A real UE5 level with a landscape imports with a terrain mesh whose height range and footprint match the landscape actor's bounds stored in the package, within 1%. proof: real-pack gate in `tests/fab-feature-corpus.test.ts` — Evidence: `.584.9.1` / importer 122, 2026-10-12: native and actual public importer GLB gates pass for all 51 components from the same eight-file stage; node-world POSITION bounds within 1%, zero terrain omissions, `reused: false`, pinned provenance.
 - [x] AC-2 [local]: A synthetic UE5 heightmap (known BGRA8 and `TSCF_UEDELTA` pixels) decodes to the expected heights. proof: red-to-green test beside `tests/unreal-converter-ue5-sources.test.ts` — Evidence: `.584.9.2` shares `TryDecodeLandscapeSourcePixels` between the actual texture reader and compiled synthetic harness. Raw BGRA8 and encoded UEDELTA both dispatch through it and assert the same known heights, normals, subsection atlas boundaries and mip-0 byte count; the public GLB nonuniform/mirrored normal regression remains. Disabling only its production UEDELTA branch compiles but fails the expected height assertion (-252.64844 vs -18.6953125), while raw passes; restored focused suites pass. Unsupported compression, PNG flag and truncated payload refusals are asserted.
 - [x] AC-3 [local]: Before/after terrain sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected actual before/after terrain and attached [PR52 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/52#issuecomment-6133268228). Selected eight-package terrain-only proof, not full-map completeness; material layers unsupported and final combined map sample parent-owned pending. Same bounded eight-file stage, .584.8.1 blank terrain before and .584.9.1 public51-component GLB after. Production neutral renderer unchanged; existing fallback material, no layer-weight fidelity claim. Direct native PNG attachment is on the same PR52 comment. Recipe and input/output SHA-256: raw/parent599-sheet.{mts,json}.
-- [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent normal-provisioner rebuild and all four gates pass on implementation7a04068: typecheck0.9s; default suite2,720 passed/17 skipped81.1s; leak gate clean89.6s; packed MCP15/15 in15.4s. Logs raw/parent599-final91-{typecheck,test,leaks,smoke}.log. These remain evidence for the prior implementation; parent must rerun all four and the real gate on final union `.584.9.4`.
+- [x] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent normal-provisioner rebuild and all four gates pass on implementation7a04068: typecheck0.9s; default suite2,720 passed/17 skipped81.1s; leak gate clean89.6s; packed MCP15/15 in15.4s. Logs raw/parent599-final91-{typecheck,test,leaks,smoke}.log. These remain evidence for the prior implementation; parent must rerun all four and the real gate on final union `.584.9.4`.
 
 ## Decisions
 
@@ -95,7 +95,7 @@ launcher now executes the converter DLL using the existing read-only SDK directl
 **Verification:** AC-1, AC-2.
 
 #### Phase 3: Evidence, ledger and gates
-**Status:** PENDING — parent refresh after final union `.584.9.4`
+**Status:** DONE — fresh final union local acceptance passed
 **Files:** `docs/unreal-format-support.md` row "Landscape, UE5", `README.md` import table.
 **Verification:** AC-3, AC-4.
 
@@ -116,3 +116,11 @@ The existing sheet proves only the selected eight-package terrain slice, not ful
 Prior `.584.9.3` union verification: private normal-provisioner rebuild passed and the retained outside-bin launcher reports `b4e95441+threenative.584.9.3`; typecheck and diff checks passed. Corrected default-worker `CI=true` focused run passed 353 tests across 11 files, with one existing opt-in suite skipped (44.06 s): the 337 union guards plus public scene coverage, retaining the dispatch and nonuniform/mirrored-normal guards. An initial run passed 290 but failed 59 compiled harness tests because its executable override pointed outside `modern/bin`, so harness assembly lookup used the launcher directory; rerunning with the private bin executable resolved this without code changes. The real-proof index still uses the retained launcher. No final-tag real terrain, all-four-gates, CI or final-review approval is claimed. Build and test command sessions have exited.
 
 Final `.584.9.4` mechanical integration: `npm run typecheck` and `git diff --cached --check` pass. No native build, cache mutation, runtime tests or review was run; those remain parent-owned.
+
+## Final integrated parent verification
+
+Final source68a7790 plus doc-only PRD-598 merge; converter `.584.9.4` / importer122. Typecheck1.2s, default2,738 passed /17 skipped115.9s, leak gate112.0s clean, packed MCP15/15 in13.9s. Fresh native/public gates pass37 tests including3 WP and2 landscape gates in48.92s; private index94.json and wp-index94.json. All51 landscape components match stored world bounds within1%, zero terrain omissions, and all3 selected mesh actors retain decoded geometry and stored transforms. Modern Hornbeam requested LOD0/1/2 guard passes unchanged115,674 /41,543 /15,076 triangles. Source files SHA checked and imports fresh. Logs raw/parent599-final94-{typecheck,test,leaks,smoke,real,hornbeam}.log.
+
+The final94 terrain GLB is byte-identical to the inspected native PR52 image input (SHA-2565cd60fad494d2bb494b09bc7268bb0c6d3033abccfd2eee15c43b0c9fac07c0d). A direct GLB edge audit found10,809 shared boundary vertices across163 touching component pairs and zero height mismatch. This is geometry evidence for the selected eight-package terrain slice; it does not prove full-village coverage. Terrain layers remain unsupported and the green material is the existing fallback. The PR52 native attachment comment now states these limits. An additional combined35-file sample is running separately, with no full-map completeness claim. No renderer changes or per-asset tuning.
+
+Both final local acceptance and original ACs are complete; final independent review round2/2 and current-head CI remain merge prerequisites. Prior proof sections above are historical; this section supersedes pending final94 gate statements. No deployment/publication.
