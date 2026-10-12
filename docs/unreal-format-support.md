@@ -4,7 +4,7 @@ Single place to track which Unreal 4 and Unreal 5 formats the importer supports,
 and which are missing. `README.md` ("Unreal import support") links here. Update this file in the same
 commit as any importer, converter or adapter change that moves a row.
 
-Last audited: 2026-10-11, `IMPORTER_VERSION` 114 (`src/unreal/importer.ts`). Evidence comes from the
+Last audited: 2026-10-11, `IMPORTER_VERSION` 115 (`src/unreal/importer.ts`). Evidence comes from the
 README import table, `src/unreal/`, `tests/`, and the engine headers in `~/projects/UnrealEngine-5.8.3`
 (tag `5.8.3-release`, `Engine/Source/Runtime/Engine/Classes`, file names only).
 
