@@ -1,6 +1,6 @@
 # PRD-596 — UE 5.4+ animation clips from the Sequencer data model
 
-**Status:** INPROGRESS — authored metadata repaired; parent final gates, .584.6.4 corpus replay and sheets remain; only AC-2 requires owner input
+**Status:** BLOCKED — independent AC-2 owner reference only; all internal criteria pass
 **Priority:** P1 — UE5.4+ FK Sequencer clips now import with bound motion; independent AC-2 pose comparison remains open.
 **Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, a new evaluator), new module; risk override: none.
 **Owner:** PRD-596 lane; parent owns final gates and sheet inspection
@@ -50,12 +50,12 @@ Risk: euler order and tangent semantics give a plausible but wrong pose. The dif
 
 ## Acceptance Criteria
 
-- [x] AC-1 [local]: Importing the `game-anim-5.8` slice through `asset_import_unreal` exports its seed clips as GLB animations with moving bones, and the report lists no ControlRig reason for them. proof: `PRD583_ANIMATION_PROOF=/absolute/path/current-prd583-proof.json npx vitest run tests/fab-feature-corpus.test.ts -t ue5-clips` — Evidence: parent strict `ue5-clips` replay passed on implementation `5cc6ddc`, converter `.584.6.3`, importer119 (3.07s). All seven selected UE5.8 native AnimSequences have public sidecars without unsupported reasons, GLB animations bound to actual skinned geometry, finite timing within one frame, and genuine bound-bone motion across the selection. Consumed local index: `/home/joao/.cache/agent-dumps/prd-596-599/raw/current596-proof.json`; raw gate: `parent596-final63-corpus.log`. Prior-head proof only; parent must replay/inspect the metadata repair on `.584.6.4` before final acceptance.
+- [x] AC-1 [local]: Importing the `game-anim-5.8` slice through `asset_import_unreal` exports its seed clips as GLB animations with moving bones, and the report lists no ControlRig reason for them. proof: `PRD583_ANIMATION_PROOF=/absolute/path/current-prd583-proof.json npx vitest run tests/fab-feature-corpus.test.ts -t ue5-clips` — Evidence: parent strict `ue5-clips` replay passed on implementation `80df0c3`, converter `.584.6.4`, importer119 (3.43s). All seven selected UE5.8 native AnimSequences have public sidecars without unsupported reasons, GLB animations bound to actual skinned geometry, finite timing within one frame, and genuine bound-bone motion across the selection. Consumed local index: `/home/joao/.cache/agent-dumps/prd-596-599/raw/current596-proof.json`; raw gate: `parent596-final64-corpus.log`.
 - [ ] AC-2 [local]: A Sequencer-model clip matches an independent decode of the same clip within 0.5° per bone per frame. proof: differential gate beside `clip-differential` (`tests/helpers/animation-corpus.ts:252`) — Evidence: blocked on independent owner reference; authenticated library survey found no transition pair. See the owner-action section below. Remains unchecked.
 - [x] AC-3 [local]: Each channel interpolation mode (constant, linear, cubic auto, cubic user, cubic break, weighted) evaluates to the engine's formula on synthetic keys, and an unsupported mode reports its reason. proof: `THREENATIVE_TOOLCHAIN_DIR=/tmp/prd596-toolchain npx vitest run tests/unreal-sequencer-channels.test.ts` — Evidence: metadata repair focused gate passes all six compiled shipped-helper tests on `.584.6.4`, including actual `ExportClip` reported Sequencer sidecar with native tagged notify/curve/sync-marker values; the metadata construction is shared before success/failure selection. Old code failed with empty `notifies` (five existing tests passed); logs: `raw/596-metadata-{red,green}.log`. Combined Sequencer/native metadata gates:13 passed (2.99s); typecheck and `git diff --check` passed. Prior evidence: all five compiled shipped-helper tests pass on `.584.6.3`: constant/linear/cubic/weighted/extrapolated formulas, scene-rate sampling, fractional whole-transform quaternion blend, omitted-denominator defaults with explicit invalid-rate rejection, and additive base-pose protection/restoration on success and failure. Red/green and deliberate Euler-blend mutation logs remain local under `raw/rates596-*` and `raw/parent596-rate-default-*`.
-- [x] AC-4 [local]: The `game-anim-5.4` slice imports its seed clip the same way. proof: same gate as AC-1 over `gasp54` — Evidence: the same strict gate passed all325 selected native UE5.4 AnimSequences against325 public sidecars and8 model GLBs, requiring bound geometry, valid timing and genuine motion across the selection. The fresh public replay selected every prior clip and model while excluding unrelated standalone audio promotion; no animation was removed to make the gate pass. Prior-head proof only; parent must replay/inspect the metadata repair on `.584.6.4` before final acceptance. Prior-head proof only; parent must replay/inspect the metadata repair on `.584.6.4` before final acceptance.
-- [x] AC-5 [local]: Before/after sheet of one 5.8 clip on the mannequin (several frames) is attached to the PR and inspected by eye. proof: PR comment link — Evidence: final `.584.6.3` moving and additive-integrity sheets rendered with the production neutral renderer, inspected by the parent and attached in [PR49 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/49#issuecomment-6132085569). Before is pre-review `.584.5`, after is final `.584.6.3`, at0.000/0.040/0.050s. The same rest-pose camera is retained; a moving foot can reach its boundary. Licensed PNGs are private owner-only Drive files outside the repo. Prior-head proof only; parent must replay/inspect the metadata repair on `.584.6.4` before final acceptance.
-- [ ] AC-6 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent ran all four on implementation `5cc6ddc` (later changes are prose only), `.584.6.3` / importer119: typecheck0.7s, default suite2,698 passed/16 skipped83.6s, clean leak gate91.5s, packed MCP15/15 in11.6s. Logs: `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent596-final-{typecheck,test,leaks,smoke}.log`. Prior-head proof only; parent must replay/inspect the metadata repair on `.584.6.4` before final acceptance.
+- [x] AC-4 [local]: The `game-anim-5.4` slice imports its seed clip the same way. proof: same gate as AC-1 over `gasp54` — Evidence: the same strict gate passed all325 selected native UE5.4 AnimSequences against325 public sidecars and8 model GLBs, requiring bound geometry, valid timing and genuine motion across the selection. The fresh public replay selected every prior clip and model while excluding unrelated standalone audio promotion; no animation was removed to make the gate pass.
+- [x] AC-5 [local]: Before/after sheet of one 5.8 clip on the mannequin (several frames) is attached to the PR and inspected by eye. proof: PR comment link — Evidence: moving and additive-integrity sheets whose after-GLB SHA-256 matches final `.584.6.4` rendered with the production neutral renderer, inspected by the parent and attached in [PR49 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/49#issuecomment-6132085569). Before is pre-review `.584.5`, after GLB is byte-identical to final `.584.6.4`, at0.000/0.040/0.050s. The same rest-pose camera is retained; a moving foot can reach its boundary. Licensed PNGs are private owner-only Drive files outside the repo.
+- [x] AC-6 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent ran all four on implementation `80df0c3`, `.584.6.4` / importer119: typecheck0.9s, default suite2,699 passed/16 skipped92.3s, clean leak gate97.3s, packed MCP15/15 in10.6s. Logs: `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent596-final64-{typecheck,test,leaks,smoke}.log`.
 
 ## Integration Ledger
 
@@ -64,6 +64,9 @@ Risk: euler order and tangent semantics give a plausible but wrong pose. The dif
 | UE5 Sequencer-model clips | `asset_import_unreal` → `importUnrealDirectory` → CUE4Parse `ExportClip` (`cue4parse-adapter.ts:3512, 3669`) → PSA → `attachPsaAnimations` (`src/unreal/psa.ts:294`) | Non-FK models and invalid rates remain Reported with an exact reason | AC-1, AC-4 |
 
 ## Decisions
+
+- 2026-10-12 (final parent disposition): second and final independent review requested changes for discarded Sequencer metadata. Commit `80df0c3` repairs the sole finding; parent reviewed the actual diff and reran all four gates plus fresh2/325/7 real native/public clip proof. No third review or independent approval is claimed. Comparison GLB SHA-256 `d6840257fa629a876a6f56ba9ae7f53831d94f3bfcb354152e13fbdddf659090` is identical between the inspected sheet and final `.584.6.4`; local identity JSON records both paths. All internal criteria are complete. Only independent AC-2 remains blocked, so this original PRD moves to `BLOCKED/independent-animation-reference/`.
+
 
 - 2026-10-12 (metadata repair): Complexity 1 → LOW; risk override none. Scope: `ExportClip`, existing compiled Sequencer harness, converter `.584.6.4` pins, README/format ledger and this PRD; importer119 stays unchanged. Read authored metadata once before the Sequencer early returns, using the actual resolved Sequencer model while retaining exact conventional-model curve discovery and ambiguity reporting. No sampling/additive behavior changes. Parent owns full gates, rebuild, public reimports and sheets; AC-6 reopened. AC-2 alone still requires an independent external reference.
 
@@ -95,17 +98,17 @@ Paths below are relative to that checkout; exact ranges were inspected for this 
 
 The consumed local proof index is `/home/joao/.cache/agent-dumps/prd-596-599/raw/current596-proof.json`.
 Fresh public imports and separate actual native CLI exports are under
-`/home/joao/.cache/agent-dumps/prd-596-599/raw/current596-2026-10-12T20-15-39-874Z/`:
+`/home/joao/.cache/agent-dumps/prd-596-599/raw/current596-64/`:
 
 | Fixture | Public / native directories | Model GLBs | Native clips / public sidecars | Bound motion |
 |---|---|---:|---:|---|
 | modern | `modern-public` / `modern-native` | 2 | 2 / 2 | both walk clips |
-| gasp54 | `gasp54-public-resume` / `gasp54-native-resume` | 8 | 325 / 325 | at least one genuinely moving clip |
+| gasp54 | `gasp54-public` / `gasp54-native` | 8 | 325 / 325 | at least one genuinely moving clip |
 | gasp58 | `gasp58-public` / `gasp58-native` | 8 | 7 / 7 | at least one genuinely moving clip |
 
-All reports record importer119, `reused:false`, and converter `b4e95441+threenative.584.6.3`.
-Actual executable banner: `threenative-cue4parse b4e95441+threenative.584.6.3`.
-Actual converter DLL SHA-256: `d2689cf9f1c75fbae531c7fcf7505ae9fd43f339b61f6a17bc63d8ea06e76a9d`.
+All reports record importer119, `reused:false`, and converter `b4e95441+threenative.584.6.4`.
+Actual executable banner: `threenative-cue4parse b4e95441+threenative.584.6.4`.
+Actual converter DLL SHA-256: `761e73d21abc8a66677aa54fcf3342a6980eca94da8b33f44a8fa71e5b0b7c83`.
 The strict gate verifies binary identity, DLL digest, report provenance, native descriptors, public artifact
 hashes, actual NodeIO animations, bound geometry, finite timing and motion. Current scopes require only their
 own fixtures; historical corpus gates retain the frozen previous/before converter requirements.
@@ -113,13 +116,13 @@ own fixtures; historical corpus gates retain the frozen previous/before converte
 The final5.4 replay retains all325 clips and8 models from the prior selection, skipping unrelated standalone
 audio promotion after the original command was terminated before publishing its report. One unselected
 blendspace descriptor is reported outside this clip proof; the whole pack is not claimed error-free.
-Recipes and raw logs remain local: `current596-recipe.mts`, `parent596-final63-resume54.mts`,
-`parent596-final63-corpus.log`. Licensed inputs, outputs and renders stay outside the repository.
+Recipes and raw logs remain local: `current596-64-recipe.mts`,
+`parent596-final64-corpus.log`. Licensed inputs, outputs and renders stay outside the repository.
 
 Final comparison sheets are private owner-only Drive files, rendered from the final GLB bytes and inspected:
 [moving comparison](https://drive.google.com/file/d/1BlNF0o3vODTzMvlK7QBA4h9-q1YdIX-l/view?usp=drivesdk) and
 [additive integrity](https://drive.google.com/file/d/1WW5DF-dAPNcghHvPSy84TP0hbH-1gJuQ/view?usp=drivesdk).
-Before means pre-review `.584.5`, after means `.584.6.3`; neither row substitutes a bind pose for the requested
+Before means pre-review `.584.5`, after was rendered on `.584.6.3` and its GLB bytes match final `.584.6.4`; neither row substitutes a bind pose for the requested
 clip. Both use the same neutral renderer and rest-pose camera. A moving foot reaches the camera boundary;
 this presentation limit does not change the numeric motion gate. PR attachment is recorded under AC-5.
 
@@ -146,25 +149,25 @@ npx vitest run tests/fab-feature-corpus.test.ts -t sequencer-differential
 ```
 
 Expected result: every compared bone key is within 0.5°; the gate reports maximum error.
-Use the indexed `.584.6.3` private toolchain and current proof index for the owner-reference differential; the strict corpus now passes on that build.
+Use the indexed `.584.6.4` private toolchain and current proof index for the owner-reference differential; the strict corpus now passes on that build.
 AC-2 remains unchecked until this independent comparison passes.
 
 ## Execution Phases
 
 #### Phase 1: Layout and channel evaluator
-**Status:** INPROGRESS — authored metadata repaired; parent final gates, .584.6.4 corpus replay and sheets remain; only AC-2 requires owner input
+**Status:** DONE — local implementation, proof and gates complete; independent AC-2 is tracked below
 **Files:** new evaluator inside `src/unreal/cue4parse-adapter.ts` (the C# program is embedded there); `tests/unreal-sequencer-channels.test.ts`.
 **Implementation:** Expand the sparse checkout with the paths in Context. Record the layout facts under Decisions. Implement channel evaluation and the Euler-to-quaternion step. Find the AC-2 reference pair (owner's library via `fab_list_owned`).
 **Verification:** AC-3.
 
 #### Phase 2: Converter and importer route
-**Status:** INPROGRESS — authored metadata repaired; parent final gates, .584.6.4 corpus replay and sheets remain; only AC-2 requires owner input
+**Status:** DONE — local implementation, proof and gates complete; independent AC-2 is tracked below
 **Files:** `src/unreal/cue4parse-adapter.ts` (`ExportClip`, `UnsupportedReason`), `src/unreal/importer.ts` (version), `tests/helpers/animation-corpus.ts` (invert the ControlRig assertion, add the differential gate).
 **Implementation:** Route a Sequencer-model clip through the evaluator into `RawAnimationData`. Keep the sidecar. Bump versions.
-**Verification:** AC-1, AC-2, AC-4.
+**Verification:** AC-1 and AC-4 passed; AC-2 remains owner-blocked.
 
 #### Phase 3: Evidence and ledger
-**Status:** INPROGRESS — authored metadata repaired; parent final gates, .584.6.4 corpus replay and sheets remain; only AC-2 requires owner input
+**Status:** DONE — local implementation, proof and gates complete; independent AC-2 is tracked below
 **Files:** `docs/unreal-format-support.md`, `README.md` import table.
-**Implementation:** Sheets, ledger row, and README are updated with importer/converter provenance and local proof paths; formal corpus replay, PR attachment, and final gates remain parent-owned.
+**Implementation:** Sheets, ledger row, and README are updated with importer/converter provenance and local proof paths; formal corpus replay, PR attachment, and final gates passed.
 **Verification:** AC-5, AC-6.
