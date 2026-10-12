@@ -108,7 +108,7 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | `LandscapeComponent` heightfields | UE4 editor | Implemented | indexed terrain mesh | Compressed BGRA8 heightmaps only. |
 | Landscape, UE5 | UE5 | **Missing** | none | The importer lists `LandscapeComponent` as unsupported when standalone. The UE5 level export writes an empty `landscapes` list (PRD-599). |
 | Landscape layer weights and `LandscapeLayerInfoObject` | any | **Missing** | none | |
-| World Partition external actors (`__ExternalActors__`) | UE5 | Reported | none | Skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/unreal-external-actors.test.ts`); the UE5 level export reads `PersistentLevel.Actors` only, so a World Partition level has no actors (PRD-598). |
+| World Partition external actors (`__ExternalActors__`) | UE5 | Reported | none | Skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/unreal-external-actors.test.ts`); owned UE5.3 input `MedievalGame_5.3` contains a World Partition level and external actors, so implementation is unblocked (PRD-598). |
 | Level streaming, sublevels, HLOD proxies | any | Implemented | partial | `tests/unreal-hlod-proxy.test.ts`, `tests/unreal-level-gate.test.ts`. |
 | `DecalActor` and decal components | any | **Missing** | none | |
 | Volumes (post-process, audio, blocking) | any | **Missing** | none | |
