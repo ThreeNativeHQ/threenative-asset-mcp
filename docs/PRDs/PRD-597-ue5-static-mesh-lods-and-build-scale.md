@@ -1,7 +1,7 @@
 # PRD-597 — UE5 static mesh LODs and BuildScale3D
 
-**Status:** IN PROGRESS
-**Priority:** P2 — implementation and AC-1..AC-4 proofs are complete on this lane; AC-5 remains the repository-gate checkpoint.
+**Status:** COMPLETE
+**Priority:** P2 — implementation and AC-1..AC-5 proofs are complete on this lane.
 **Complexity:** 2 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `src/unreal/mesh-build-scale.ts`); risk override: none.
 **Owner:** unassigned
 **Depends on:** None
@@ -42,8 +42,7 @@ payloads that exist can be decoded.
 - [x] AC-2 [local]: The same holds for a legacy -9 (UE 5.5+) package. proof: same importer wiring test and native fixture — Evidence: the native pinned CUE4Parse harness reads the tagged property as `[2,2,2]` for its `ue55-legacy9` context, and the importer wiring case passes. The native fixture is the property-read proof; the TypeScript case is only the scale-consumption proof.
 - [x] AC-3 [local]: A cooked UE5 static mesh imported with `lods: [0, 1]` writes `Models/<name>_LOD1.glb` with fewer triangles than LOD0. proof: `tests/unreal-import.integration.test.ts` beside the `SM_Rock_LOD1` case (:1418) and the native fixture in `tests/unreal-converter-static-mesh.test.ts` — Evidence: the contract test passes `--lods`, promotion, naming, and distinct A/B geometry. The native pinned CUE4Parse `ExportSession` fixture uses actual `FStaticMeshRenderData` buffers: `Highest` writes only 2 triangles, while `All` writes LOD0 with 2 and `_LOD1` with 1. The synthetic fixture is explicitly named and does not present generated geometry as decoded.
 - [x] AC-4 [local]: A real UE5 editor pack (Megascans European Hornbeam or Common Hazel, UE5.1) imported with `lods: [0, 1, 2]` writes each LOD that has a payload, and the report names each generated LOD. proof: `npx vitest run tests/unreal-ue5-editor-mesh.test.ts` — Evidence: passed on 2026-10-12 in 68.64s with the isolated full `.584.7.1` converter against the local European Hornbeam Content tree; promoted 115,674 / 41,543 / 15,076 triangle LOD0/1/2 GLBs. The test selector is local environment input, paths are derived from returned LOD0, and no licensed piece identifier is committed. No generated LOD was faked.
-- [ ] AC-5 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: `npm run typecheck` passed; `npx vitest run tests/mcp-smoke.test.ts` passed 15/15; `npm test` and `npm run test:leaks` reached the leak gate but failed 83 tests in 6 files because the generated native converter still calls the unavailable three-argument `FRawAnimSequenceTrack` constructor (`Program.cs:2380,2383`) from the pre-existing lane-596 animation change, plus the pre-existing blend-axis assertion. `test:leaks` reported `leak-gate: clean`; AC-5 remains open for the parent checkout's rebuilt converter baseline.
-- [ ] AC-5 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent receipts on the fresh `/home/joao/.cache/threenative-asset-mcp/prd597-toolchain` already pass all four gates at the pre-repair head (`/home/joao/.cache/agent-dumps/prd-596-599/raw/parent597-{typecheck,test,leaks,smoke}.log`); the stale native-converter blocker is removed. Re-run all four once on this final repair head.
+- [x] AC-5 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: all four passed on 2026-10-12 with `THREENATIVE_TOOLCHAIN_DIR=/home/joao/.cache/threenative-asset-mcp/prd597-toolchain`; typecheck exited 0, `npm test` passed 148 files / 2,701 tests (15 skipped), `test:leaks` passed the same suite with `leak-gate: clean`, and MCP smoke passed 1 file / 15 tests. Raw receipts: `/home/joao/.cache/agent-dumps/prd-596-599/raw/repair597-{typecheck,test,leaks,smoke}.log`.
 
 ## Integration Ledger
 
@@ -74,6 +73,6 @@ payloads that exist can be decoded.
 **Verification:** AC-3 passes both the importer ownership contract and the native synthetic cooked-buffer writer fixture; AC-4 passed in `tests/unreal-ue5-editor-mesh.test.ts` with the isolated full `.584.7.1` converter proof wrapper.
 
 #### Phase 3: Ledger and gates
-**Status:** IN PROGRESS
+**Status:** COMPLETE
 **Files:** `docs/unreal-format-support.md` rows "StaticMesh LOD1 and higher" and "StaticMesh BuildScale3D", `README.md` import table.
-**Verification:** Documentation and active version pins are updated. Parent fresh-toolchain receipts show typecheck, default-worker tests, leak gate, and MCP smoke all pass at the pre-repair head; the same four commands remain the final checkpoint for this repair head.
+**Verification:** Documentation and active version pins are updated. The final fresh-toolchain receipts show typecheck, default-worker tests, leak gate, and MCP smoke all pass on the repair checkpoint.
