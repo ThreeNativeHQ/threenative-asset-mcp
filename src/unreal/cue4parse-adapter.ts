@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.79",
+  version: "b4e95441+threenative.81",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -457,6 +457,9 @@ using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.Material.Parameters;
 using CUE4Parse.UE4.Assets.Exports.Sound;
+using CUE4Parse.UE4.Assets.Exports.Sound.Node;
+using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Objects.PhysicsEngine;
 using CUE4Parse.UE4.Assets.Exports.Engine;
 using CUE4Parse.UE4.Assets.Exports.Engine.Font;
 using CUE4Parse.UE4.Assets.Exports.Actor;
@@ -569,6 +572,7 @@ if (dumpAt < 0 && graphAt < 0)
     Directory.CreateDirectory(Path.Combine(output, "Sprites"));
     Directory.CreateDirectory(Path.Combine(output, "TileMaps"));
     Directory.CreateDirectory(Path.Combine(output, "Grooms"));
+    Directory.CreateDirectory(Path.Combine(output, "Gameplay"));
 }
 ObjectTypeRegistry.RegisterClass(typeof(USkeletalMeshEditorData));
 // CUE4Parse swallows an export it cannot deserialize and logs it, which leaves a mesh with no
@@ -2927,6 +2931,47 @@ foreach (var key in provider.Files.Keys.Where(key =>
         if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
         exported++;
     }
+    // PRD-582: sockets, static-mesh simple collision and the PhysicsAsset reference for this package, plus every
+    // SoundCue graph. The importer reads Gameplay/*.json and Audio/*.cue.json and turns them into glTF nodes,
+    // extras and metre-scale sidecars.
+    var skeletalSockets = new List<object>();
+    var staticSockets = new List<object>();
+    object? collision = null;
+    string? physicsAssetRef = null;
+    foreach (var mesh in package.GetExports().OfType<USkeletalMesh>())
+    {
+        foreach (var socketIndex in mesh.Sockets)
+            if (socketIndex?.Load<USkeletalMeshSocket>() is { } socket) skeletalSockets.Add(GpSocket(socket, "mesh"));
+        if (mesh.Skeleton?.Load<USkeleton>() is { } skeleton)
+            foreach (var socketIndex in skeleton.Sockets)
+                if (socketIndex?.Load<USkeletalMeshSocket>() is { } socket) skeletalSockets.Add(GpSocket(socket, "skeleton"));
+        if (mesh.PhysicsAsset is { IsNull: false } physicsIndex) physicsAssetRef = physicsIndex.Load<UPhysicsAsset>()?.Name ?? physicsIndex.Name;
+    }
+    foreach (var mesh in package.GetExports().OfType<UStaticMesh>())
+    {
+        foreach (var socketIndex in mesh.Sockets ?? Array.Empty<FPackageIndex>())
+            if (socketIndex?.Load<UStaticMeshSocket>() is { } socket) staticSockets.Add(GpStaticSocket(socket));
+        if (mesh.BodySetup?.Load<UBodySetup>() is { } setup) collision = GpCollision(setup);
+    }
+    var physics = package.GetExports().OfType<UPhysicsAsset>().Select(GpPhysics).FirstOrDefault();
+    if (skeletalSockets.Count > 0 || staticSockets.Count > 0 || collision is not null || physicsAssetRef is not null || physics is not null)
+    {
+        var gameplay = new Dictionary<string, object?> { ["version"] = 1, ["package"] = GameplaySelector(key) };
+        if (skeletalSockets.Count > 0) gameplay["skeletalSockets"] = skeletalSockets;
+        if (staticSockets.Count > 0) gameplay["staticSockets"] = staticSockets;
+        if (collision is not null) gameplay["collision"] = collision;
+        if (physicsAssetRef is not null) gameplay["physicsAssetRef"] = physicsAssetRef;
+        if (physics is not null) gameplay["physics"] = physics;
+        var gameplayTarget = Path.Combine(output, "Gameplay", GameplaySelector(key) + ".json");
+        Directory.CreateDirectory(Path.GetDirectoryName(gameplayTarget)!);
+        await File.WriteAllTextAsync(gameplayTarget, JsonConvert.SerializeObject(gameplay, Formatting.Indented));
+        exported++;
+    }
+    foreach (var cue in package.GetExports().OfType<USoundCue>())
+    {
+        await File.WriteAllTextAsync(Path.Combine(output, "Audio", cue.Name + ".cue.json"), JsonConvert.SerializeObject(GpCue(cue), Formatting.Indented));
+        exported++;
+    }
 }
 foreach (var (failedMesh, failureDetail) in meshFailures)
     Console.Error.WriteLine($"threenative-mesh-failure\t{failedMesh}\t{failureDetail}");
@@ -4240,10 +4285,287 @@ static EGame ParseGame(string version) => version switch
     _ => throw new ArgumentException($"unsupported --engine version {version}")
 };
 
+// PRD-582 gameplay data. Every value is written in Unreal's own frame (centimetres, UE axes, FRotator
+// degrees); src/unreal/gameplay-data.ts converts it to metres and glTF space. Keeping the conversion in
+// TypeScript makes it unit-testable without compiling the converter.
+static object GpVec(FVector value) => new[] { value.X, value.Y, value.Z };
+static object GpRot(FRotator value) => new[] { value.Pitch, value.Yaw, value.Roll };
+static string GpText(FName name) => name.IsNone ? "" : name.Text;
+
+static object? GpShape(FKShapeElem shape)
+{
+    var result = new Dictionary<string, object?>();
+    switch (shape)
+    {
+        case FKSphereElem sphere:
+            result["type"] = "sphere"; result["center"] = GpVec(sphere.Center); result["radius"] = sphere.Radius; break;
+        case FKBoxElem box:
+            result["type"] = "box"; result["center"] = GpVec(box.Center); result["rotation"] = GpRot(box.Rotation);
+            result["x"] = box.X; result["y"] = box.Y; result["z"] = box.Z; break;
+        case FKSphylElem sphyl:
+            result["type"] = "capsule"; result["center"] = GpVec(sphyl.Center); result["rotation"] = GpRot(sphyl.Rotation);
+            result["radius"] = sphyl.Radius; result["length"] = sphyl.Length; break;
+        case FKTaperedCapsuleElem tapered:
+            // Keep both end radii: collapsing them to one radius loses the taper. The importer keeps
+            // radius0 and radius1, and only uses radius (the larger) for a coarse single-radius consumer.
+            result["type"] = "capsule"; result["center"] = GpVec(tapered.Center); result["rotation"] = GpRot(tapered.Rotation);
+            result["radius"] = Math.Max(tapered.Radius0, tapered.Radius1); result["radius0"] = tapered.Radius0; result["radius1"] = tapered.Radius1;
+            result["length"] = tapered.Length; break;
+        case FKConvexElem convex:
+            result["type"] = "convex"; result["center"] = GpVec(convex.Transform.Translation); result["rotation"] = GpRot(convex.Transform.Rotation.Rotator());
+            // The hull's own local scale is preserved, so the importer applies it instead of dropping it.
+            result["scale"] = GpVec(convex.Transform.Scale3D);
+            result["vertices"] = convex.VertexData.Select(vertex => GpVec(vertex)).ToArray();
+            result["indices"] = convex.IndexData; break;
+        default:
+            return null;
+    }
+    if (!shape.Name.IsNone) result["name"] = shape.Name.Text;
+    return result;
+}
+
+static List<object> GpAggShapes(FKAggregateGeom? aggregate)
+{
+    var shapes = new List<object>();
+    if (aggregate is null) return shapes;
+    foreach (var sphere in aggregate.SphereElems) if (GpShape(sphere) is { } shape) shapes.Add(shape);
+    foreach (var box in aggregate.BoxElems) if (GpShape(box) is { } shape) shapes.Add(shape);
+    foreach (var sphyl in aggregate.SphylElems) if (GpShape(sphyl) is { } shape) shapes.Add(shape);
+    foreach (var convex in aggregate.ConvexElems) if (GpShape(convex) is { } shape) shapes.Add(shape);
+    foreach (var tapered in aggregate.TaperedCapsuleElems) if (GpShape(tapered) is { } shape) shapes.Add(shape);
+    return shapes;
+}
+
+static object GpCollision(UBodySetup setup)
+{
+    var profile = setup.GetOrDefault<FName>("CollisionProfileName");
+    var result = new Dictionary<string, object?>
+    {
+        ["traceFlag"] = setup.GetOrDefault<ECollisionTraceFlag>("CollisionTraceFlag").ToString(),
+        ["shapes"] = GpAggShapes(setup.AggGeom),
+    };
+    if (!profile.IsNone && !string.IsNullOrEmpty(profile.Text)) result["profile"] = profile.Text;
+    return result;
+}
+
+static object GpFrame(FVector location, FVector primary, FVector secondary) => new Dictionary<string, object?>
+{
+    ["location"] = GpVec(location), ["primaryAxis"] = GpVec(primary), ["secondaryAxis"] = GpVec(secondary),
+};
+
+static object? GpDamping(USkeletalBodySetup body)
+{
+    if (!body.TryGetValue<FStructFallback>(out var instance, "DefaultInstance") || instance is null) return null;
+    return new Dictionary<string, object?>
+    {
+        ["linear"] = instance.GetOrDefault<float>("LinearDamping"),
+        ["angular"] = instance.GetOrDefault<float>("AngularDamping"),
+    };
+}
+
+static object GpDrive(FConstraintDrive drive) => new Dictionary<string, object?>
+{
+    ["stiffness"] = drive.Stiffness,
+    ["damping"] = drive.Damping,
+    ["maxForce"] = drive.MaxForce,
+    ["positionDrive"] = drive.bEnablePositionDrive,
+    ["velocityDrive"] = drive.bEnableVelocityDrive,
+};
+
+static object GpDrives(FConstraintProfileProperties profile)
+{
+    var linear = profile.LinearDrive;
+    var angular = profile.AngularDrive;
+    return new Dictionary<string, object?>
+    {
+        ["linear"] = new Dictionary<string, object?>
+        {
+            ["positionTarget"] = GpVec(linear.PositionTarget),
+            ["velocityTarget"] = GpVec(linear.VelocityTarget),
+            ["x"] = GpDrive(linear.XDrive), ["y"] = GpDrive(linear.YDrive), ["z"] = GpDrive(linear.ZDrive),
+        },
+        ["angular"] = new Dictionary<string, object?>
+        {
+            ["orientationTarget"] = GpRot(angular.OrientationTarget),
+            ["angularVelocityTarget"] = GpVec(angular.AngularVelocityTarget),
+            ["swing"] = GpDrive(angular.SwingDrive), ["twist"] = GpDrive(angular.TwistDrive), ["slerp"] = GpDrive(angular.SlerpDrive),
+            ["mode"] = angular.AngularDriveMode.ToString(),
+        },
+    };
+}
+
+static object GpPhysics(UPhysicsAsset asset)
+{
+    var bodies = new List<object>();
+    var missingBodies = 0;
+    foreach (var index in asset.SkeletalBodySetups)
+    {
+        if (index?.Load<USkeletalBodySetup>() is not { } body) { missingBodies++; continue; }
+        var entry = new Dictionary<string, object?>
+        {
+            ["bone"] = GpText(body.BoneName),
+            ["physicsType"] = body.PhysicsType.ToString(),
+            ["traceFlag"] = body.CollisionTraceFlag.ToString(),
+            ["shapes"] = GpAggShapes(body.AggGeom),
+        };
+        if (GpDamping(body) is { } damping) entry["damping"] = damping;
+        bodies.Add(entry);
+    }
+    var constraints = new List<object>();
+    var missingConstraints = 0;
+    foreach (var index in asset.ConstraintSetup)
+    {
+        if (index?.Load<UPhysicsConstraintTemplate>() is not { } template) { missingConstraints++; continue; }
+        var instance = template.DefaultInstance;
+        var profile = instance.ProfileInstance;
+        constraints.Add(new Dictionary<string, object?>
+        {
+            ["child"] = GpText(instance.ConstraintBone1),
+            ["parent"] = GpText(instance.ConstraintBone2),
+            ["childFrame"] = GpFrame(instance.Pos1, instance.PriAxis1, instance.SecAxis1),
+            ["parentFrame"] = GpFrame(instance.Pos2, instance.PriAxis2, instance.SecAxis2),
+            ["swing1Deg"] = profile.ConeLimit.Swing1LimitDegrees,
+            ["swing2Deg"] = profile.ConeLimit.Swing2LimitDegrees,
+            ["twistDeg"] = profile.TwistLimit.TwistLimitDegrees,
+            ["linearLimit"] = profile.LinearLimit.Limit,
+            ["motions"] = new Dictionary<string, object?>
+            {
+                ["linear"] = new[] { profile.LinearLimit.XMotion.ToString(), profile.LinearLimit.YMotion.ToString(), profile.LinearLimit.ZMotion.ToString() },
+                ["swing1"] = profile.ConeLimit.Swing1Motion.ToString(),
+                ["swing2"] = profile.ConeLimit.Swing2Motion.ToString(),
+                ["twist"] = profile.TwistLimit.TwistMotion.ToString(),
+            },
+            ["drives"] = GpDrives(profile),
+            ["disableCollision"] = profile.bDisableCollision,
+        });
+    }
+    var disabled = new List<object>();
+    foreach (var pair in asset.CollisionDisableTable ?? new Dictionary<FRigidBodyIndexPair, bool>())
+        if (pair.Value) disabled.Add(new[] { pair.Key.Indices[0], pair.Key.Indices[1] });
+    return new Dictionary<string, object?>
+    {
+        ["asset"] = asset.Name, ["bodies"] = bodies, ["constraints"] = constraints,
+        ["collisionDisabledPairs"] = disabled, ["missingBodies"] = missingBodies, ["missingConstraints"] = missingConstraints,
+    };
+}
+
+static object GpSocket(USkeletalMeshSocket socket, string source) => new Dictionary<string, object?>
+{
+    ["name"] = GpText(socket.SocketName), ["bone"] = GpText(socket.BoneName), ["source"] = source,
+    ["location"] = GpVec(socket.RelativeLocation), ["rotation"] = GpRot(socket.RelativeRotation), ["scale"] = GpVec(socket.RelativeScale),
+};
+
+static object GpStaticSocket(UStaticMeshSocket socket)
+{
+    var result = new Dictionary<string, object?>
+    {
+        ["name"] = GpText(socket.SocketName),
+        ["location"] = GpVec(socket.RelativeLocation), ["rotation"] = GpRot(socket.RelativeRotation), ["scale"] = GpVec(socket.RelativeScale),
+    };
+    if (!string.IsNullOrEmpty(socket.Tag)) result["tag"] = socket.Tag;
+    return result;
+}
+
+static object GpCueNode(UObject node, int depth)
+{
+    var result = new Dictionary<string, object?> { ["type"] = node.ExportType };
+    var parameters = new Dictionary<string, object?>();
+    switch (node)
+    {
+        // A UE5 editor SoundCue stores the wave as a soft path; the native SoundWave FPackageIndex CUE4Parse reads
+        // is bogus on those assets, so only SoundWaveAssetPtr is used here.
+        case USoundNodeWavePlayer player:
+            if (!string.IsNullOrEmpty(player.SoundWaveAssetPtr.AssetPathName.Text)) parameters["wave"] = player.SoundWaveAssetPtr.AssetPathName.Text;
+            break;
+        case USoundNodeSwitch soundSwitch:
+            parameters["intParameterName"] = GpText(soundSwitch.GetOrDefault<FName>("IntParameterName")); break;
+        case USoundNodeBranch branch:
+            parameters["boolParameterName"] = GpText(branch.GetOrDefault<FName>("BoolParameterName")); break;
+        case USoundNodeParamCrossFade crossFade:
+            parameters["paramName"] = GpText(crossFade.GetOrDefault<FName>("ParamName")); break;
+        case USoundNodeMixer mixer:
+            parameters["inputVolume"] = mixer.InputVolume; break;
+        case USoundNodeRandom random:
+            parameters["weights"] = random.Weights; break;
+    }
+    if (parameters.Count > 0) result["params"] = parameters;
+    if (node is USoundNode soundNode && depth < 256)
+    {
+        var children = new List<object>();
+        foreach (var child in soundNode.ChildNodes ?? Array.Empty<FPackageIndex>())
+            if (child?.Load<UObject>() is { } loaded) children.Add(GpCueNode(loaded, depth + 1));
+        if (children.Count > 0) result["children"] = children;
+    }
+    return result;
+}
+
+static object GpCue(USoundCue cue)
+{
+    var result = new Dictionary<string, object?>
+    {
+        ["name"] = cue.Name,
+        ["volume"] = cue.VolumeMultiplier,
+        ["pitch"] = cue.PitchMultiplier,
+        ["root"] = cue.FirstNode?.Load<UObject>() is { } first ? GpCueNode(first, 0) : null,
+    };
+    var attenuation = new Dictionary<string, object?>();
+    if (cue.TryGetValue<FPackageIndex>(out var settings, "AttenuationSettings") && settings is { IsNull: false } && !string.IsNullOrEmpty(settings.Name))
+        attenuation["asset"] = settings.Name;
+    if (cue.GetOrDefault<bool>("bOverrideAttenuation")) attenuation["overridden"] = true;
+    if (attenuation.Count > 0) result["attenuation"] = attenuation;
+    return result;
+}
+
+// The provider key relative to the mount, without its package extension: the same selector the importer
+// uses (entry.selector), so Gameplay/<selector>.json maps back to the package it came from.
+string GameplaySelector(string key)
+{
+    var normalized = key.Replace('\\', '/');
+    var mount = new DirectoryInfo(root).Name + "/";
+    var relative = normalized.StartsWith(mount, StringComparison.Ordinal) ? normalized[mount.Length..] : normalized;
+    if (relative.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) return relative[..^".uasset".Length];
+    if (relative.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)) return relative[..^".umap".Length];
+    return relative;
+}
+
 // The instance's own overrides, written as .props.txt blocks. A row is written only when CUE4Parse read it whole: a tagged row must
 // carry the tags it needs, and a binary row must come from a material whose read raised no logged failure. Presence is the tag
 // list: a missing tag is never read as 0, false or a default colour. The typed views of a tagged set are not used: GetParams
 // flattens the parent's values into the instance, and GetOrDefault cannot tell an absent field from a zero one.
+
+
+public sealed class PackageReadFailureSink(Dictionary<string, string> failures) : Serilog.Core.ILogEventSink
+{
+    public void Emit(Serilog.Events.LogEvent logEvent)
+    {
+        if (logEvent.Exception is null) return;
+        var match = System.Text.RegularExpressions.Regex.Match(logEvent.RenderMessage(), "^Could not read \"?(?<type>[^\"]+?)\"? named \"?(?<name>[^\"]+?)\"? correctly$");
+        if (!match.Success) return;
+        var root = logEvent.Exception;
+        while (root.InnerException is not null) root = root.InnerException;
+        var first = (root.Message.Split('\n')[0]).Trim();
+        failures.TryAdd(match.Groups["name"].Value, $"{match.Groups["type"].Value} {root.GetType().Name}: {first}");
+    }
+}
+
+public sealed class USkeletalMeshEditorData : UObject
+{
+    public override void Deserialize(FAssetArchive ar, long validPos)
+    {
+        base.Deserialize(ar, validPos);
+        var count = ar.Read<int>();
+        if (count < 0 || count > 128) throw new InvalidDataException($"Invalid editor LOD count {count}");
+        for (var index = 0; index < count; index++)
+        {
+            if (FEditorObjectVersion.Get(ar) >= FEditorObjectVersion.Type.SkeletalMeshBuildRefactor) ar.Position += 2;
+            _ = new FByteBulkData(ar);
+            ar.Position += 16;
+            _ = ar.ReadBoolean();
+        }
+    }
+}
+
+
 public static class MaterialOverrides
 {
     public sealed class Refusal(string message) : Exception(message);
@@ -4463,37 +4785,6 @@ public static class MaterialOverrides
     }
 
     static string Number(float value) => value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-}
-
-public sealed class PackageReadFailureSink(Dictionary<string, string> failures) : Serilog.Core.ILogEventSink
-{
-    public void Emit(Serilog.Events.LogEvent logEvent)
-    {
-        if (logEvent.Exception is null) return;
-        var match = System.Text.RegularExpressions.Regex.Match(logEvent.RenderMessage(), "^Could not read \"?(?<type>[^\"]+?)\"? named \"?(?<name>[^\"]+?)\"? correctly$");
-        if (!match.Success) return;
-        var root = logEvent.Exception;
-        while (root.InnerException is not null) root = root.InnerException;
-        var first = (root.Message.Split('\n')[0]).Trim();
-        failures.TryAdd(match.Groups["name"].Value, $"{match.Groups["type"].Value} {root.GetType().Name}: {first}");
-    }
-}
-
-public sealed class USkeletalMeshEditorData : UObject
-{
-    public override void Deserialize(FAssetArchive ar, long validPos)
-    {
-        base.Deserialize(ar, validPos);
-        var count = ar.Read<int>();
-        if (count < 0 || count > 128) throw new InvalidDataException($"Invalid editor LOD count {count}");
-        for (var index = 0; index < count; index++)
-        {
-            if (FEditorObjectVersion.Get(ar) >= FEditorObjectVersion.Type.SkeletalMeshBuildRefactor) ar.Position += 2;
-            _ = new FByteBulkData(ar);
-            ar.Position += 16;
-            _ = ar.ReadBoolean();
-        }
-    }
 }
 
 // PNGs that were re-encoded from a JPEG source payload, by reference, so NormalizeSourcePng can tell them apart.
