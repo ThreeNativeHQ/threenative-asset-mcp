@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.85-gameplay",
+  version: "b4e95441+threenative.86-gameplay",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -711,6 +711,10 @@ if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
+// The provider mounts a loose directory under its top-level .uproject stem when one is present, else its
+// name. Compute that mount once from the same selection and reuse it for every gameplay selector below, so
+// a full project whose folder name differs from its .uproject stem still yields root-relative selectors.
+var looseMountPrefix = LooseMountPrefix(root);
 if (dataTextureKey is not null) dataTexturePackage = ResolveRgba16fPackage(provider, root, dataTextureSelector!);
 if (dumpAt >= 0)
 {
@@ -4679,17 +4683,32 @@ static object GpCue(USoundCue cue)
     return result;
 }
 
-// The provider key relative to the mount, without its package extension: the same selector the importer
+// The key prefix the pinned provider gives a loose directory (DefaultFileProvider.IterateFiles): the stem
+// of a top-level .uproject when one is present, the directory name otherwise. A full project's folder name
+// need not equal its .uproject stem (a Fab download folder does not), so the mount must follow the same
+// selection the provider made rather than the folder name. Root() refuses a .uproject for engine content,
+// so this is always the pack root's own mount. Factor it out so the compiled regression can call it.
+static string LooseMountPrefix(string root)
+{
+    var directory = new DirectoryInfo(Path.TrimEndingDirectorySeparator(root));
+    var uproject = directory.GetFiles("*.uproject", SearchOption.TopDirectoryOnly).FirstOrDefault();
+    return uproject is not null ? Path.GetFileNameWithoutExtension(uproject.Name) + "/" : directory.Name + "/";
+}
+
+// The provider key relative to a mount, without its package extension: the same selector the importer
 // uses (entry.selector), so Gameplay/<selector>.json maps back to the package it came from.
-string GameplaySelector(string key)
+static string GameplaySelectorUnder(string mountPrefix, string key)
 {
     var normalized = key.Replace('\\', '/');
-    var mount = new DirectoryInfo(root).Name + "/";
-    var relative = normalized.StartsWith(mount, StringComparison.Ordinal) ? normalized[mount.Length..] : normalized;
+    var relative = normalized.StartsWith(mountPrefix, StringComparison.Ordinal) ? normalized[mountPrefix.Length..] : normalized;
     if (relative.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) return relative[..^".uasset".Length];
     if (relative.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)) return relative[..^".umap".Length];
     return relative;
 }
+
+// The selector of one key under the pack root's loose-provider mount, computed once at startup
+// (looseMountPrefix), so the gameplay sidecars and the physics asset reference both strip it.
+string GameplaySelector(string key) => GameplaySelectorUnder(looseMountPrefix, key);
 
 // The raw SoundCue sidecar path. The package selector is a path segment, so two same-named cues in
 // different folders never overwrite one file. Factor it out so the compiled regression can call it.

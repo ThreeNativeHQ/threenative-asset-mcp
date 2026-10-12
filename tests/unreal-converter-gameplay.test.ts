@@ -127,10 +127,13 @@ describeWithTools(["modern-converter"], "Converter gameplay-data helpers (compil
       "static object GpCueNode(",
       "static object GpCue(",
       "static string GpCueTarget(",
+      "static string LooseMountPrefix(",
+      "static string GameplaySelectorUnder(",
     ].map((signature) => extractCSharp(CUE4PARSE_PROGRAM, signature));
     await writeFile(
       join(project, "Program.cs"),
       `using System.Runtime.Loader;
+using CUE4Parse.FileProvider;
 using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
@@ -142,6 +145,7 @@ using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Objects.PhysicsEngine;
+using CUE4Parse.UE4.Versions;
 using Newtonsoft.Json;
 
 var probe = Environment.GetEnvironmentVariable("THREENATIVE_CUE4PARSE_BIN");
@@ -279,6 +283,47 @@ if (args[0] == "cue-target")
         bothExist = File.Exists(first) && File.Exists(second),
     }));
 }
+if (args[0] == "mount")
+{
+    // A full project whose folder name ("download-cache") differs from its .uproject stem
+    // ("GameAnimationSample"): the pinned provider mounts it under the stem, so the production helper
+    // must derive that same mount and strip it. A zero-byte Content/A.uasset is enough for the real
+    // provider to register a key; no package is parsed and no licensed fixture is used.
+    var probeRoot = args[1];
+    var projectRoot = Path.Combine(probeRoot, "download-cache");
+    Directory.CreateDirectory(Path.Combine(projectRoot, "Content"));
+    File.WriteAllText(Path.Combine(projectRoot, "GameAnimationSample.uproject"), "{}");
+    File.WriteAllBytes(Path.Combine(projectRoot, "Content", "A.uasset"), Array.Empty<byte>());
+
+    var prefix = LooseMountPrefix(projectRoot);
+    var selector = GameplaySelectorUnder(prefix, "GameAnimationSample/Content/A.uasset");
+    var physicsSelector = GameplaySelectorUnder(prefix, "GameAnimationSample/Content/Physics/PA_X.uasset");
+    var noExtension = GameplaySelectorUnder(prefix, "GameAnimationSample/Content/Audio/SC_Footstep");
+    var unrelated = GameplaySelectorUnder(prefix, "OtherProject/Content/A.uasset");
+
+    var plainRoot = Path.Combine(probeRoot, "plain-pack");
+    Directory.CreateDirectory(Path.Combine(plainRoot, "Content"));
+    File.WriteAllBytes(Path.Combine(plainRoot, "Content", "A.uasset"), Array.Empty<byte>());
+    var plainPrefix = LooseMountPrefix(plainRoot);
+    var plainSelector = GameplaySelectorUnder(plainPrefix, "plain-pack/Content/A.uasset");
+
+    var provider = new DefaultFileProvider(projectRoot, SearchOption.AllDirectories, new VersionContainer(), StringComparer.OrdinalIgnoreCase);
+    provider.Initialize();
+    provider.PostMount();
+    var keys = provider.Files.Keys.OrderBy(key => key, StringComparer.Ordinal).ToArray();
+
+    Console.WriteLine(JsonConvert.SerializeObject(new
+    {
+        prefix,
+        selector,
+        physicsSelector,
+        noExtension,
+        unrelated,
+        plainPrefix,
+        plainSelector,
+        keys,
+    }));
+}
 
 ${functions.join("\n")}
 
@@ -356,6 +401,37 @@ class TestBody : UBodySetup
     expect(result.distinct).toBe(true);
     expect(result.bothExist).toBe(true);
     expect(result.firstContent).not.toBe(result.secondContent);
+  });
+
+  it("mounts a full project under its .uproject stem, not its folder name", () => {
+    const result = JSON.parse(run("mount", join(root, "mount"))) as {
+      prefix: string;
+      selector: string;
+      physicsSelector: string;
+      noExtension: string;
+      unrelated: string;
+      plainPrefix: string;
+      plainSelector: string;
+      keys: string[];
+    };
+    // The folder is "download-cache" but the real provider mounted it under the .uproject stem; the
+    // helper must follow the provider's selection, and every key it registered must carry that prefix.
+    expect(result.prefix).toBe("GameAnimationSample/");
+    expect(result.keys.length).toBeGreaterThan(0);
+    for (const key of result.keys) expect(key.startsWith(result.prefix)).toBe(true);
+    expect(result.keys).toContain("GameAnimationSample/Content/A.uasset");
+    // The selector is root-relative: the mount is stripped, the folder name is not. The old code stripped
+    // "download-cache" (the folder name) and left "GameAnimationSample/Content/..." behind.
+    expect(result.selector).toBe("Content/A");
+    expect(result.physicsSelector).toBe("Content/Physics/PA_X");
+    // An extension-less key (the physics owner name case) keeps its relative path.
+    expect(result.noExtension).toBe("Content/Audio/SC_Footstep");
+    // A key under a different mount keeps that mount: only the package extension is removed, never a
+    // prefix the provider did not register.
+    expect(result.unrelated).toBe("OtherProject/Content/A");
+    // With no .uproject the mount is the directory name, as the provider does.
+    expect(result.plainPrefix).toBe("plain-pack/");
+    expect(result.plainSelector).toBe("Content/A");
   });
 
   it("rebuilds Unreal's native constraint defaults when the saved profile omits them", () => {

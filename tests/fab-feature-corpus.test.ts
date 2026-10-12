@@ -436,15 +436,15 @@ if (!corpusDir) {
 
 // PRD-582 gameplay gates over the real corpus. The five matrix slices are required: when
 // FAB_FEATURE_CORPUS_DIR is set, an absent one is a failure, never an empty success. Each slice is
-// imported once through the public `importUnrealDirectory` with the immutable `threenative.85-gameplay`
+// imported once through the public `importUnrealDirectory` with the immutable `threenative.86-gameplay`
 // converter snapshot; the shared root toolchain binary is mutable and is never used. Output stays
 // under the owner's cache so an import can be inspected, and each output is removed first so a stale
 // report can never satisfy a gate. Licensed names never appear below: a model is located by its
 // reported characteristics, and its socket, bone and wave names are compared only at runtime.
 
-const CONVERTER_85_GAMEPLAY = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "converter-85-gameplay", "ThreeNativeConverter");
+const CONVERTER_86_GAMEPLAY = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "converter-86-gameplay", "ThreeNativeConverter");
 // A distinct owned output, so the earlier snapshot's evidence is preserved rather than overwritten.
-const FINAL_IMPORT_DIR = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "final-imports-85-gameplay");
+const FINAL_IMPORT_DIR = join(homedir(), ".cache", "threenative-asset-mcp", "prd582", "final-imports-86-gameplay");
 
 function runConverter(file: string, args: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -469,8 +469,8 @@ if (corpusDir) {
     const imported = new Map<string, { readonly report: ImportReport; readonly outputDir: string }>();
 
     beforeAll(async () => {
-      // The override lets an operator point the gate at their own 85-gameplay build; it must still report it.
-      const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim() || CONVERTER_85_GAMEPLAY;
+      // The override lets an operator point the gate at their own 86-gameplay build; it must still report it.
+      const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim() || CONVERTER_86_GAMEPLAY;
       const versionLine = (await runConverter(converterPath, ["--version"]))
         .trim()
         .split("\n")
@@ -478,8 +478,8 @@ if (corpusDir) {
         .filter((line) => line.length > 0)
         .pop();
       const versionMatch = versionLine === undefined ? null : /threenative\.([0-9]+(?:-gameplay)?)\b/.exec(versionLine);
-      if (versionMatch?.[1] !== "85-gameplay") {
-        throw new Error(`the gameplay gate needs the immutable converter-85-gameplay snapshot, but ${converterPath} reports "${versionLine ?? ""}"`);
+      if (versionMatch?.[1] !== "86-gameplay") {
+        throw new Error(`the gameplay gate needs the immutable converter-86-gameplay snapshot, but ${converterPath} reports "${versionLine ?? ""}"`);
       }
       const version = versionLine!.split(/\s+/).slice(1).join(" ") || versionLine!;
 
@@ -537,7 +537,7 @@ if (corpusDir) {
       expect(mannequin.kind).toBe("skeletal");
       expect(mannequin.sockets).toHaveLength(4);
       expect(mannequin.missingBones).toHaveLength(1);
-      // The mesh with the most sockets carries twelve; converter 85 decodes its own socket list.
+      // The mesh with the most sockets carries twelve; converter 86 decodes its own socket list.
       const shoe = report.models.reduce((widest, model) =>
         (model.sockets?.length ?? 0) > (widest.sockets?.length ?? 0) ? model : widest,
       );
