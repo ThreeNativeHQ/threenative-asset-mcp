@@ -131,11 +131,23 @@ describe("skeleton reporting", () => {
 });
 
 describe("unsupported and clip sidecars", () => {
-  it("keeps an unsupported asset with its precise reason and no fake descriptor", () => {
-    const raw: RawAnimationAsset = { kind: "clip", name: "M_58", package: "/Game/Anim/M_58", skeleton: "SK_Hero", unsupportedReason: "bone tracks live in a ControlRig MovieScene model" };
+  it("keeps an unsupported clip's metadata as a sidecar and reports the disposition", () => {
+    const raw: RawAnimationAsset = {
+      kind: "clip",
+      name: "M_58",
+      package: "/Game/Anim/M_58",
+      skeleton: "SK_Hero",
+      unsupportedReason: "bone tracks live in an AnimationDataModel export the pinned reader does not map",
+      notifies: [{ name: "Footstep", time: 0.5, className: "AnimNotify_Footstep" }],
+      syncMarkers: [{ name: "Sync_0", time: 0.25 }],
+    };
     const result = buildAnimationLogic([raw], clips, ["SK_Hero"]);
     expect(result.assets).toEqual([]);
-    expect(result.unsupported).toEqual([{ package: "/Game/Anim/M_58", asset: "M_58", reason: "bone tracks live in a ControlRig MovieScene model" }]);
+    expect(result.unsupported).toEqual([{ package: "/Game/Anim/M_58", asset: "M_58", reason: "bone tracks live in an AnimationDataModel export the pinned reader does not map" }]);
+    expect(result.sidecars).toHaveLength(1);
+    expect(result.sidecars[0]!.value.notifies).toHaveLength(1);
+    expect(result.sidecars[0]!.value.syncMarkers).toEqual([{ name: "Sync_0", time: 0.25 }]);
+    expect(result.sidecars[0]!.value.unsupportedReason).toMatch(/AnimationDataModel/);
   });
 
   it("reads notifies and float curves from a sidecar with every key preserved", () => {
@@ -150,5 +162,35 @@ describe("unsupported and clip sidecars", () => {
     expect(sidecar.curves[0]!.keys).toHaveLength(2);
     expect(sidecar.curves[0]!.name).toBe("contact_l");
     expect(sidecar.syncMarkers).toEqual([{ name: "Sync_0", time: 0.25 }]);
+  });
+});
+
+describe("blend-space sample flags (AC-3, AC-4)", () => {
+  it("keeps a sample's mirror flag and defaults loop to Unreal's true", () => {
+    const raw: RawAnimationAsset = {
+      kind: "blendSpace",
+      blendSpaceType: "2D",
+      name: "BS_Walk",
+      package: "/Game/Anim/BS_Walk",
+      skeleton: "SK_Hero",
+      mirrorDataTable: "MDT_Hero",
+      samples: [{ animation: "M_Walk", sampleValue: [0, 0, 0], mirror: true }],
+    };
+    const space = buildAnimationLogic([raw], clips, ["SK_Hero"]).assets[0]!.value;
+    if (space.kind !== "blendSpace") throw new Error("expected a blend space");
+    expect(space.samples[0]!.mirror).toBe(true);
+    expect(space.loop).toBe(true);
+    const { mirrorDataTable: _table, ...withoutTable } = raw;
+    expect(buildAnimationLogic([withoutTable], clips, ["SK_Hero"]).unresolved.map((issue) => issue.reason)).toContain(
+      "a mirrored sample needs a MirrorDataTable the import does not carry",
+    );
+  });
+
+  it("reports an additive space with no base pose but not an aim offset", () => {
+    const additive: RawAnimationAsset = { kind: "blendSpace", blendSpaceType: "2D", additive: true, name: "BS_Add", package: "/Game/Anim/BS_Add", samples: [] };
+    const consequence = buildAnimationLogic([additive], clips, undefined).unresolved.map((issue) => issue.reason);
+    expect(consequence).toContain("an additive blend space names no base pose the import can apply");
+    const aim: RawAnimationAsset = { kind: "blendSpace", blendSpaceType: "aimOffset", additive: true, name: "AO_Hero", package: "/Game/Anim/AO_Hero", samples: [] };
+    expect(buildAnimationLogic([aim], clips, undefined).unresolved).toEqual([]);
   });
 });

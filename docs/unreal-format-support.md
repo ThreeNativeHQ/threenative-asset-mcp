@@ -48,14 +48,14 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | `SkeletalMesh`, cooked | UE4 | Implemented | skinned GLB | Joints, weights and inverse-bind matrices preserved. |
 | `SkeletalMesh`, editor source | UE5 | **Verified** | skinned GLB | README: "UE5 editor skeletal geometry". |
 | `AnimSequence` | UE4 | **Verified** | GLB clips | 146 clips in Animal Variety Pack. |
-| `AnimSequence` | UE5.0–5.5 | Implemented | GLB clips | The CUE4Parse adapter converts `RawAnimationData`, `FUECompressedAnimData` or ACL tracks to ActorX PSA, attaches them by bone name. Corpus proof pending PRD-581. |
-| `AnimSequence` | UE5.6+ (incl. 5.8) | Reported | none | The clip's bone tracks live in a `UFKControlRig` MovieScene model (`AnimDataModel`); the pinned CUE4Parse reader exposes none. Each package is reported with that reason, never a bind-pose clip. |
+| `AnimSequence` | UE5.0–5.5 | Implemented | GLB clips | The pinned `UAnimSequence` reader maps only `RawAnimationData`, `FUECompressedAnimData` or ACL tracks (`CUE4Parse/…/UAnimSequence.cs`, `CUE4Parse-Conversion/Legacy/AnimConverter.cs`); it has no `UAnimDataModel.BoneAnimationTracks` path, so a cooked clip here must carry one of those three. Adapter converts them to ActorX PSA and attaches by bone name. Corpus proof pending PRD-581. |
+| `AnimSequence` | UE5.6+ (incl. 5.8) | Reported | none | A clip with no raw or compressed bone data is reported from the package's own evidence (a `DataModel` export, a `ControlRig` model, or `NumFrames`), never with a blanket engine-version claim and never as a bind-pose clip. |
 | ActorX `.psa` clips | UE4 | Implemented | attached by bone name | Needs at least 80% of tracks to match. |
 | ActorX per-frame bone scale | any | Reported | none | |
 | `Skeleton` (standalone) | any | **Missing** | none | Read only as part of a mesh. |
-| `BlendSpace`, `BlendSpace1D`, `AimOffsetBlendSpace` | any | Implemented | `Animation/<name>.json` | Typed `BlendParameters` with `FBlendParameter` defaults restored, samples resolved to exported clips. |
-| `AnimMontage`, `AnimComposite` | any | Implemented | `Animation/<name>.json` | Section starts resolved per `LinkMethod`, slots and notifies with class. |
-| `AnimSequence` notifies and float curves | any | Implemented | `<clip>.clip.json` | Read from `RawCurveData`, `CompressedCurveData` or `LegacyCurveData`. |
+| `BlendSpace`, `BlendSpace1D`, `AimOffsetBlendSpace` | any | Implemented | `Animation/<name>.json` | Axes read from the typed `BlendParameters` fixed array with `FBlendParameter` defaults restored per omitted field, samples resolved to exported clips, `bMirror`, `bLoop` and additive flags preserved, a mirror sample with no `MirrorDataTable` reported. |
+| `AnimMontage`, `AnimComposite` | any | Implemented | `Animation/<name>.json` | Section starts resolved per `LinkMethod`, slots and notifies with the resolved class and a `blueprint` kind for a Blueprint notifier. |
+| `AnimSequence` notifies, curves and sync markers | any | Implemented | `<clip>.clip.json` | Read from `RawCurveData`, `CompressedCurveData`, `LegacyCurveData` (on the sequence or a referenced `AnimationDataModel` export); a clip with unsupported tracks still keeps its sidecar and reports the reason. |
 | `AnimStreamable` | any | **Missing** | none | Not read by the adapter. |
 | `PoseAsset` | any | **Missing** | none | Out of scope (PRD-583 decision): a Three.js consumer cannot run pose search. |
 | `AnimBlueprint` (`AnimBlueprintGeneratedClass`) | any | Reported | none | CUE4Parse reads it only as graph and bytecode. |

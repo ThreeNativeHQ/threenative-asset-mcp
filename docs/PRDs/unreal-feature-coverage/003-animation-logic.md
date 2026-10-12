@@ -18,7 +18,7 @@ The 2026-10-11 probe found the UE5 bone-track storage changes across versions:
 | Engine | Where bone tracks live | Where curves live |
 |---|---|---|
 | UE4 up to about UE5.2 | `UAnimSequence` raw data | `RawCurveData.FloatCurves[]` (typed `FRawCurveTracks`) |
-| UE 5.0–5.5 | `UAnimDataModel.BoneAnimationTracks` | `UAnimDataModel` |
+| UE 5.0–5.5 (cooked) | `UAnimSequence` compressed path (`RawAnimationData`, `FUECompressedAnimData` or ACL); the editor `UAnimDataModel.BoneAnimationTracks` is stripped when cooked | `UAnimDataModel` in the editor; the compressed curve streams in a cooked package |
 | UE 5.8 (verified) | an `FKControlRig` MovieScene model, about 322 KB per clip | a separate `AnimationSequencerDataModel` export, `Properties.LegacyCurveData.FloatCurves[]` |
 
 **Logic assets.** Blend spaces, aim offsets and montages are **Missing**. Raw clips are content, and these
@@ -95,29 +95,30 @@ Every `clip` value equals the name of an exported glTF animation, so a consumer 
 
 - 2026-10-11 (agent): PoseAsset is out of scope. Game Animation Sample uses it for pose search, which a Three.js consumer cannot use without that runtime. It stays Missing in the ledger. Reopen it if a pack uses pose assets for facial or corrective poses.
 - 2026-10-11 (agent): no blend-space or montage runtime ships here. JSON plus named clips is the contract, and the playback layer belongs to `threenative-engine`.
-- 2026-10-11 (agent): **UE5.6+ (verified on 5.8) clips are Reported, not exported.** A real Game Animation Sample 5.8 clip (`M_Neutral_Stand_Idle_Loop`: `NumFrames` 0, no `RawAnimationData`, no `CompressedDataStructure`) keeps its bone tracks in a `UFKControlRig` MovieScene model. The pinned CUE4Parse reader exposes no such track data, so the adapter reports the exact reason and writes no clip. A 5.0–5.5 clip uses `RawAnimationData`, `FUECompressedAnimData` or ACL and converts through the same `ConvertAnims` path as UE4.
+- 2026-10-11 (agent): **UE5.6+ (verified on 5.8) clips are Reported, not exported.** A real Game Animation Sample 5.8 clip (`M_Neutral_Stand_Idle_Loop`: `NumFrames` 0, no `RawAnimationData`, no `CompressedDataStructure`) keeps its bone tracks in a `UFKControlRig` MovieScene model. The pinned CUE4Parse reader exposes no such track data, so the adapter reports the reason it finds in the package (a `DataModel` export, a `ControlRig` model, or `NumFrames`) rather than a blanket version claim, and writes no clip.
+- 2026-10-11 (agent): **A 5.0–5.5 cooked clip uses `RawAnimationData`, `FUECompressedAnimData` or ACL and converts through the same `ConvertAnims` path as UE4.** Verified against the pinned source: `UAnimSequence.cs` deserialises only those three and `CUE4Parse-Conversion/Legacy/AnimConverter.cs` switches on `RawAnimationData` / `FUECompressedAnimData` / `FACLCompressedAnimData`. The pinned reader has no `UAnimDataModel.BoneAnimationTracks` mapping, so a cooked package's tracks cannot be in that editor model. A clip that reaches the adapter with none of the three is reported with its own evidence, not claimed supported.
 - 2026-10-11 (agent): **AC-2 differential uses the ASP 4.4 UE Viewer/CUE4Parse pair when the PRD-581 slices are not yet present**, as AC-2 permits. The 5.4-vs-5.8 pair is added only if a 5.4 slice arrives; the 5.8 side cannot carry bone tracks today.
 
 ## Progress (2026-10-11, PRD-583 branch)
 
-- Adapter (`src/unreal/cue4parse-adapter.ts`): `--animations` mode writes `Animation/<clip>.psa` for decodable clips and `Animation/<asset>.json` for blend spaces, aim offsets, montages and composites, with `FBlendParameter` defaults, `LinkMethod` section fields, notifies and curves. Unsupported clips carry a precise `unsupportedReason`.
-- Importer (`src/unreal/importer.ts`): UE5 clips and all-version logic packages route to CUE4Parse (`hasAnimationLogic`, cooking hints); PSAs attach by bone name; normalized JSON and a `Animation/` output plus report fields `animationLogic`/`animationClips`.
-- Pure logic (`src/unreal/animation-data.ts`) and tests (`tests/unreal-animation-data.test.ts`, 14 cases): AC-3 and the AC-5 synthetic Relative/Proportional proof are green locally.
-- Compiled proof (`tests/unreal-animation-compiled.test.ts`): the shipped adapter program compiles against the installed CUE4Parse and, on a local 5.8 pack, reads typed `BlendParameters` with restored defaults.
+- Adapter (`src/unreal/cue4parse-adapter.ts`): `--animations` mode writes `Animation/<clip>.psa` for decodable clips and `Animation/<asset>.json` for blend spaces, aim offsets, montages and composites, with `FBlendParameter` defaults, `LinkMethod` section fields, notifies, curves and sync markers. Blend-space axes come from the typed `BlendParameters` fixed array (a raw-tag presence check restores only an omitted field); samples keep `bMirror`; `bLoop` defaults from the source; notifies use the resolved class with a `blueprint` kind. A clip with unsupported tracks still writes its sidecar and names the package evidence.
+- Importer (`src/unreal/importer.ts`): UE5 clips and all-version logic packages route to CUE4Parse (`hasAnimationLogic`, cooking hints). Clip references resolve **after** the skeletal GLBs exist, against the animations that actually attached; a PSA no mesh accepted is reported for modern and legacy alike. The empty guard no longer trips on a logic-only package. Each modern animation package gets a precise failure when the converter exits nonzero, writes malformed JSON, or writes nothing.
+- Pure logic (`src/unreal/animation-data.ts`) and tests (`tests/unreal-animation-data.test.ts`, 16 cases): AC-3, mirror/additive reporting, the unsupported-clip sidecar and the AC-5 synthetic Relative/Proportional proof are green locally.
+- Compiled proof (`tests/unreal-animation-compiled.test.ts`, `tests/unreal-animation-blend-axis.test.ts`): the shipped adapter program compiles against the installed CUE4Parse; the axis reader is exercised on constructed typed axes (unequal axes, an omitted `Max`/`GridNum`, a raw tag that disagrees with the typed array) and the notify class/kind derivation on resolved classes.
 - Pending: AC-1, AC-2, AC-4, AC-5 (corpus), AC-6, AC-8 (sheets) wait on the PRD-581 slices.
 
 ## Execution Phases
 
 #### Phase 1: UE5 clips (prerequisite)
-**Status:** IMPLEMENTED — 5.0–5.5 route via CUE4Parse; 5.6+ Reported. AC-1/AC-2 corpus proof pending PRD-581.
+**Status:** IMPLEMENTED — cooked 5.0–5.5 route via CUE4Parse (`RawAnimationData`/compressed/ACL, source-verified); 5.6+ Reported with package evidence. AC-1/AC-2 corpus proof pending PRD-581.
 **Files:**
 - `src/unreal/cue4parse-adapter.ts`: `UAnimSequence` export through CUE4Parse-Conversion, or the adapter's own track reader.
 - `src/unreal/importer.ts`: route UE5 animation packages to CUE4Parse and attach the clips.
 - `docs/unreal-format-support.md`: correct the UE5 `AnimSequence` row to Missing now, then move it on evidence.
 
 **Implementation:**
-1. Probe whether pinned CUE4Parse-Conversion exports 5.0–5.5 `UAnimDataModel` tracks and 5.8 ControlRig-model tracks.
-2. Implement the supported models. Any unsupported model gets a precise report reason.
+1. Probe whether pinned CUE4Parse-Conversion exports 5.0–5.5 tracks and 5.8 ControlRig-model tracks. **Result (source-verified):** the reader maps only `RawAnimationData`, `FUECompressedAnimData` and ACL; it has no `UAnimDataModel` mapping, so a cooked clip's tracks are one of those three, and 5.8 ControlRig-model tracks are unsupported.
+2. Implement the supported models. Any unsupported model gets a precise report reason drawn from the package's own evidence.
 3. For the AC-2 differential, add a minimal 5.4 clip slice to PRD-581's corpus only if 5.8 tracks work; otherwise use the ASP pair.
 
 **Verification:** AC-1, AC-2.

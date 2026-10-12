@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.80",
+  version: "b4e95441+threenative.81",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2345,26 +2345,75 @@ static string StructText(FStructFallback? data, string field)
     return "";
 }
 
+// One blend-space axis. UBlendSpaceBase.BlendParameters is the typed fixed array and holds the actual
+// values. A field the serializer omitted has no raw tag, and CUE4Parse's FBlendParameter(FStructFallback)
+// then returns default(T) instead of the struct's default, so that field alone takes the Unreal default
+// (Min 0, Max 100, GridNum 4, DisplayName "None", the two flags false). When no raw tag exists at all
+// (an unversioned package) the typed read is the only source and is used as stored.
+static Dictionary<string, object?> BlendAxis(FBlendParameter? typed, FStructFallback? raw)
+{
+    bool present(string field) => raw is not null && raw.Properties.Exists(property => property.Name.Text == field);
+    return new Dictionary<string, object?>
+    {
+        ["displayName"] = present("DisplayName") ? (typed?.DisplayName ?? "") : "None",
+        ["min"] = present("Min") ? DumpNum(typed?.Min ?? 0f) : 0d,
+        ["max"] = present("Max") ? DumpNum(typed?.Max ?? 0f) : 100d,
+        ["gridNum"] = present("GridNum") ? (typed?.GridNum ?? 0) : 4,
+        ["snapToGrid"] = present("bSnapToGrid") && (typed?.bSnapToGrid ?? false),
+        ["wrapInput"] = present("bWrapInput") && (typed?.bWrapInput ?? false),
+    };
+}
+
 static string? AnimationReferenceName(FPackageIndex? reference) =>
     reference is null || reference.IsNull ? null : (reference.ResolvedObject?.Name.Text ?? reference.Name);
 
+// The notifier a consumer dispatches, from the class behind the reference rather than the instance's own
+// object name. An editor places a notify instance whose object name is its own ("AnimNotify_Footstep_2");
+// its class is "AnimNotify_Footstep". A Blueprint notifier resolves to a generated class named "<Name>_C",
+// whose behaviour is bytecode this importer cannot run, so it is marked "blueprint".
+static (string ClassName, string Kind) NotifyClassNames(string? objectClass, string? objectName, string? stateClass)
+{
+    var blueprint = false;
+    var className = objectClass;
+    if (string.IsNullOrEmpty(className) || className is "Class" or "BlueprintGeneratedClass" or "Object" or "ScriptClass")
+        className = objectName;
+    if (string.IsNullOrEmpty(className) && !string.IsNullOrEmpty(stateClass)) className = stateClass;
+    if (string.IsNullOrEmpty(className)) className = "AnimNotify";
+    if (className.EndsWith("_C", StringComparison.Ordinal)) { className = className[..^2]; blueprint = true; }
+    var kind = !string.IsNullOrEmpty(stateClass) ? "state" : blueprint ? "blueprint" : "notify";
+    return (className, kind);
+}
+
+static string NotifyObjectClass(FPackageIndex? reference)
+{
+    if (reference is null || reference.IsNull) return "";
+    var resolved = reference.ResolvedObject;
+    return resolved?.Class?.Name.Text ?? reference.Name;
+}
+
+static string NotifyObjectName(FPackageIndex? reference) =>
+    reference is null || reference.IsNull ? "" : (reference.ResolvedObject?.Name.Text ?? reference.Name);
+
 // A clip's notifies. UE4 sequences keep them in the Notifies property; UE5.6+ moves them into
-// AnimNotifyTracks[].Notifies, which the pinned reader leaves as a struct fallback.
-List<Dictionary<string, object?>> NotifyRecords(UObject asset, FAnimNotifyEvent[]? typed)
+// AnimNotifyTracks[].Notifies, which the pinned reader leaves as a struct fallback. The data model may
+// carry the tracks when the sequence itself no longer does.
+List<Dictionary<string, object?>> NotifyRecords(UObject asset, FAnimNotifyEvent[]? typed, UObject? model)
 {
     var notifies = new List<FAnimNotifyEvent>();
     if (typed is not null) notifies.AddRange(typed);
     if (notifies.Count == 0)
-        foreach (var track in asset.GetOrDefault<FStructFallback[]>("AnimNotifyTracks", []))
-            if (track.TryGetValue<FAnimNotifyEvent[]>(out var inner, "Notifies") && inner is not null)
-                notifies.AddRange(inner);
+        foreach (var holder in new[] { asset, model }.Where(holder => holder is not null))
+            foreach (var track in holder!.GetOrDefault<FStructFallback[]>("AnimNotifyTracks", []))
+                if (track.TryGetValue<FAnimNotifyEvent[]>(out var inner, "Notifies") && inner is not null)
+                    notifies.AddRange(inner);
     var records = new List<Dictionary<string, object?>>();
     foreach (var notify in notifies)
     {
         var stateClass = notify.NotifyStateClass;
-        var notifyObject = notify.Notify;
-        var rawName = notifyObject?.Name ?? stateClass?.Name ?? "AnimNotify";
-        var className = rawName.EndsWith("_C", StringComparison.Ordinal) ? rawName[..^2] : rawName;
+        var (className, kind) = NotifyClassNames(
+            NotifyObjectClass(notify.Notify),
+            NotifyObjectName(notify.Notify),
+            NotifyObjectClass(stateClass) is { Length: > 0 } stateClassName ? stateClassName : NotifyObjectName(stateClass));
         var name = notify.NotifyName?.Text;
         if (string.IsNullOrEmpty(name)) name = className;
         records.Add(new Dictionary<string, object?>
@@ -2373,18 +2422,38 @@ List<Dictionary<string, object?>> NotifyRecords(UObject asset, FAnimNotifyEvent[
             ["time"] = DumpNum(notify.GetTime()),
             ["duration"] = DumpNum(notify.Duration),
             ["track"] = notify.TrackIndex,
-            ["kind"] = stateClass is { IsNull: false } ? "state" : "notify",
+            ["kind"] = kind,
             ["className"] = className,
         });
     }
     return records;
 }
 
-// Float curves from RawCurveData (UE4 and this UE5.8 pack) or the LegacyCurveData the 5.6+ layout uses.
-List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence)
+// The clip's authored sync markers, from the sequence or the separate data model.
+static List<Dictionary<string, object?>> SyncMarkerRecords(UObject asset, UObject? model)
+{
+    var records = new List<Dictionary<string, object?>>();
+    foreach (var holder in new[] { asset, model })
+    {
+        if (holder is null || !holder.TryGetAllValues(out FStructFallback[] markers, "SyncMarkers")) continue;
+        foreach (var marker in markers)
+            records.Add(new Dictionary<string, object?>
+            {
+                ["name"] = StructText(marker, "MarkerName"),
+                ["time"] = StructNumber(marker, "Time", out var time) ? time : 0d,
+            });
+        if (records.Count > 0) break;
+    }
+    return records;
+}
+
+// Float curves from RawCurveData / CompressedCurveData (UE4-era), the LegacyCurveData a 5.6+ sequence
+// keeps, or the LegacyCurveData on a separate AnimationDataModel export.
+List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence, UObject? model)
 {
     FRawCurveTracks? tracks = sequence.RawCurveData ?? sequence.CompressedCurveData;
     if (tracks is null && StructProperty(sequence, "LegacyCurveData") is { } legacy) tracks = new FRawCurveTracks(legacy);
+    if (tracks is null && model is not null && StructProperty(model, "LegacyCurveData") is { } modelLegacy) tracks = new FRawCurveTracks(modelLegacy);
     var records = new List<Dictionary<string, object?>>();
     if (tracks?.FloatCurves is not { } curves) return records;
     foreach (var curve in curves)
@@ -2403,6 +2472,74 @@ List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence)
         records.Add(new Dictionary<string, object?> { ["name"] = curve?.CurveName.Text ?? "", ["keys"] = keys });
     }
     return records;
+}
+
+// The 5.6+ editor sequence keeps its curves and sync markers on a separate AnimationDataModel export,
+// reached through a data-model property when the sequence names one, else the only such export.
+static UObject? DataModelExport(IPackage package, UObject sequence)
+{
+    if (sequence.TryGetValue<FPackageIndex>(out var modelIndex, "DataModel", "AnimationDataModel", "SequencerDataModel") && modelIndex is { IsNull: false })
+    {
+        try { if (modelIndex.Load<UObject>() is { } model) return model; } catch { }
+    }
+    return package.GetExports().FirstOrDefault(export => export.ExportType.Contains("DataModel", StringComparison.OrdinalIgnoreCase));
+}
+
+int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
+{
+    var name = sequence.Name;
+    var document = new Dictionary<string, object?>
+    {
+        ["format"] = "threenative-unreal-animation",
+        ["version"] = 1,
+        ["kind"] = "clip",
+        ["name"] = name,
+        ["package"] = packagePath,
+        ["className"] = "AnimSequence",
+        ["skeleton"] = sequence.Skeleton?.Name,
+    };
+    try
+    {
+        var dataModel = DataModelExport(package, sequence);
+        document["notifies"] = NotifyRecords(sequence, sequence.Notifies, dataModel);
+        document["curves"] = CurveRecords(sequence, dataModel);
+        document["syncMarkers"] = SyncMarkerRecords(sequence, dataModel);
+        var hasRaw = sequence.RawAnimationData is { Length: > 0 };
+        if (!hasRaw && sequence.CompressedDataStructure is null)
+        {
+            // The metadata is still real, so its sidecar is written even though no clip is exported.
+            document["unsupportedReason"] = UnsupportedReason(package, sequence);
+            WriteAnimationJson(name + ".clip", document);
+            return 0;
+        }
+        var animSet = sequence.ConvertAnims();
+        var frames = 0;
+        foreach (var converted in animSet.Sequences) frames += converted.NumFrames;
+        if (animSet.Sequences.Count == 0 || frames <= 0)
+        {
+            ReportAnimationFailure(name, "CUE4Parse decoded no bone tracks for this clip");
+            return 0;
+        }
+        using (var writer = new FArchiveWriter())
+        {
+            new ActorXAnim(animSet, 0).Save(writer);
+            File.WriteAllBytes(AnimationTarget(name, ".psa"), writer.GetBuffer());
+        }
+        WriteAnimationJson(name + ".clip", document);
+        return 1;
+    }
+    catch (Exception error) { ReportAnimationFailure(name, error.Message); return 0; }
+}
+
+// Why no clip was exported, from the package's own evidence rather than a blanket engine-version guess.
+string UnsupportedReason(IPackage package, UAnimSequence sequence)
+{
+    var model = package.GetExports().FirstOrDefault(export => export.ExportType.Contains("DataModel", StringComparison.OrdinalIgnoreCase));
+    if (model is not null)
+        return $"the clip stores no raw or compressed bone data; its bone tracks are in a {model.ExportType} export the pinned CUE4Parse AnimationExporter does not map";
+    if (package.GetExports().Any(export => export.ExportType.Contains("ControlRig", StringComparison.OrdinalIgnoreCase)))
+        return "the clip stores no raw or compressed bone data; its bone tracks are in a ControlRig MovieScene model the pinned CUE4Parse AnimationExporter does not map";
+    return $"the clip stores no raw or compressed bone data (NumFrames {sequence.NumFrames}); the pinned CUE4Parse reader mapped no bone tracks";
 }
 
 static Dictionary<string, object?> SlotRecord(string slotName, FAnimSegment[] segments)
@@ -2438,49 +2575,6 @@ static Dictionary<string, object?> BlendWindow(FStructFallback? data) => new()
     ["mode"] = StructText(data, "BlendOption"),
 };
 
-void ExportClip(UAnimSequence sequence, string packagePath)
-{
-    var name = sequence.Name;
-    var document = new Dictionary<string, object?>
-    {
-        ["format"] = "threenative-unreal-animation",
-        ["version"] = 1,
-        ["kind"] = "clip",
-        ["name"] = name,
-        ["package"] = packagePath,
-        ["className"] = "AnimSequence",
-        ["skeleton"] = sequence.Skeleton?.Name,
-    };
-    try
-    {
-        var hasRaw = sequence.RawAnimationData is { Length: > 0 };
-        if (!hasRaw && sequence.CompressedDataStructure is null)
-        {
-            document["unsupportedReason"] = "the clip stores no RawAnimationData or compressed bone data; its bone tracks are in a UE5.6+ ControlRig MovieScene model the pinned CUE4Parse AnimationExporter cannot read";
-            WriteAnimationJson(name, document);
-            return;
-        }
-        var animSet = sequence.ConvertAnims();
-        var frames = 0;
-        foreach (var converted in animSet.Sequences) frames += converted.NumFrames;
-        if (animSet.Sequences.Count == 0 || frames <= 0)
-        {
-            ReportAnimationFailure(name, "CUE4Parse decoded no bone tracks for this clip");
-            return;
-        }
-        using (var writer = new FArchiveWriter())
-        {
-            new ActorXAnim(animSet, 0).Save(writer);
-            File.WriteAllBytes(AnimationTarget(name, ".psa"), writer.GetBuffer());
-        }
-        document["notifies"] = NotifyRecords(sequence, sequence.Notifies);
-        document["curves"] = CurveRecords(sequence);
-        document["syncMarkers"] = Array.Empty<object>();
-        WriteAnimationJson(name + ".clip", document);
-    }
-    catch (Exception error) { ReportAnimationFailure(name, error.Message); }
-}
-
 void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
 {
     var name = space.Name;
@@ -2490,32 +2584,31 @@ void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
         var aimOffset = className.StartsWith("AimOffset", StringComparison.OrdinalIgnoreCase) ||
             space.GetOrDefault<bool>("bContainsRotationOffsetMeshSpaceSamples");
         var axes = new List<object>();
-        var axisCount = Math.Max(space.BlendParameters?.Length ?? 0, 1);
-        for (var index = 0; index < axisCount; index++)
+        // UBlendSpaceBase always carries three axes. The typed fixed array is the source; the raw tag for
+        // a given index only says which of its fields the serializer wrote, so BlendAxis can restore a
+        // genuinely omitted default without reading the other values from Properties.
+        for (var index = 0; index < 3; index++)
         {
             var raw = FixedArrayElement(space, "BlendParameters", index);
-            // A versioned package keeps each field's presence; an unversioned one leaves no raw tag, so the
-            // typed array answers with whatever it stored. The defaults apply only where a field is absent.
-            var hasRaw = raw is not null;
             var typed = space.BlendParameters is { } parameters && index < parameters.Length ? parameters[index] : (FBlendParameter?) null;
-            axes.Add(new Dictionary<string, object?>
-            {
-                ["displayName"] = hasRaw ? StructText(raw, "DisplayName") : typed?.DisplayName ?? "",
-                ["min"] = hasRaw ? (StructNumber(raw, "Min", out var min) ? min : 0d) : typed?.Min ?? 0d,
-                ["max"] = hasRaw ? (StructNumber(raw, "Max", out var max) ? max : 100d) : typed?.Max ?? 100d,
-                ["gridNum"] = hasRaw ? (StructNumber(raw, "GridNum", out var grid) ? (int) grid : 4) : typed?.GridNum ?? 4,
-                ["snapToGrid"] = hasRaw ? (StructBool(raw, "bSnapToGrid", out var snap) && snap) : typed?.bSnapToGrid ?? false,
-                ["wrapInput"] = hasRaw ? (StructBool(raw, "bWrapInput", out var wrap) && wrap) : typed?.bWrapInput ?? false,
-            });
+            axes.Add(BlendAxis(typed, raw));
         }
         var samples = new List<object>();
-        foreach (var sample in space.SampleData ?? [])
+        var sampleData = space.SampleData ?? [];
+        for (var index = 0; index < sampleData.Length; index++)
+        {
+            var sample = sampleData[index];
+            // The pinned reader's FBlendSample exposes only Animation, SampleValue and RateScale, so
+            // bMirror is read from the sample's own raw element rather than dropped.
+            var rawSample = FixedArrayElement(space, "SampleData", index);
             samples.Add(new Dictionary<string, object?>
             {
                 ["animation"] = AnimationReferenceName(sample.Animation),
                 ["sampleValue"] = new[] { DumpNum(sample.SampleValue.X), DumpNum(sample.SampleValue.Y), DumpNum(sample.SampleValue.Z) },
                 ["rateScale"] = DumpNum(sample.RateScale),
+                ["mirror"] = StructBool(rawSample, "bMirror", out var mirror) && mirror,
             });
+        }
         var interpolation = new List<object>();
         for (var index = 0; index < 3; index++)
         {
@@ -2538,8 +2631,10 @@ void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
             ["skeleton"] = space.Skeleton?.Name,
             ["blendSpaceType"] = aimOffset ? "aimOffset" : (space is UBlendSpace1D ? "1D" : "2D"),
             ["animLength"] = DumpNum(space.AnimLength),
-            ["loop"] = space.GetOrDefault<bool>("bLoop"),
+            ["loop"] = space.GetOrDefault("bLoop", true),
             ["additive"] = aimOffset,
+            ["mirrorDataTable"] = AnimationReferenceName(space.GetOrDefault<FPackageIndex>("MirrorDataTable")),
+            ["previewBasePose"] = AnimationReferenceName(space.GetOrDefault<FPackageIndex>("PreviewBasePose")),
             ["axes"] = axes,
             ["samples"] = samples,
             ["interpolation"] = interpolation,
@@ -2584,7 +2679,7 @@ void ExportMontage(UAnimMontage? montage, UAnimComposite? composite, string pack
             ["blendOut"] = BlendWindow(StructProperty(asset, "BlendOut")),
             ["slots"] = slots,
             ["sections"] = sections,
-            ["notifies"] = NotifyRecords(asset, ((UAnimSequenceBase) asset).Notifies),
+            ["notifies"] = NotifyRecords(asset, ((UAnimSequenceBase) asset).Notifies, null),
         });
     }
     catch (Exception error) { ReportAnimationFailure(name, error.Message); }
@@ -2610,7 +2705,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
             {
                 switch (export)
                 {
-                    case UAnimSequence clip: ExportClip(clip, animationPackagePath); exported++; break;
+                    case UAnimSequence clip: exported += ExportClip(clip, package, animationPackagePath); break;
                     case UBlendSpaceBase space: ExportBlendSpace(space, animationPackagePath); exported++; break;
                     case UAnimMontage montage: ExportMontage(montage, null, animationPackagePath); exported++; break;
                     case UAnimComposite composite: ExportMontage(null, composite, animationPackagePath); exported++; break;

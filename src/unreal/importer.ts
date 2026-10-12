@@ -77,7 +77,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 114;
+export const IMPORTER_VERSION = 115;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -3829,8 +3829,11 @@ export async function importUnrealDirectory(
     && paperPackages.length === 0
     && groomPackages.length === 0
     && gameplayPackages.length === 0
+    // Blend spaces, aim offsets, montages and composites are content on their own and are decoded by the
+    // CUE4Parse animation route even when no mesh is present, so they must not trip the empty guard.
+    && modernAnimationPackages.length === 0
   ) {
-    const animationCount = legacyAnimationPackages.length + modernAnimationPackages.length;
+    const animationCount = legacyAnimationPackages.length;
     const animationOnly = animationCount > 0
       ? ` Found ${animationCount} animation package${animationCount === 1 ? "" : "s"}, but no compatible SkeletalMesh to receive those tracks.`
       : "";
@@ -4436,12 +4439,18 @@ export async function importUnrealDirectory(
       formatProfile,
     );
     if (converted.code !== 0) {
+      const cause = modernConverterFailureCause(converted);
+      for (const entry of modernAnimationPackages) {
+        failed.push({ package: entry.package, reason: `The modern animation converter exited ${converted.code}${cause ? `: ${cause}` : "."}` });
+      }
       warnings.push(`The modern animation converter exited ${converted.code}; no animation was decoded.`);
     } else {
+      const produced = new Set<string>();
       for (const [name, path] of (await indexExported(modernAnimationRaw)).psa) {
         try {
           const parsed = parsePsa(await readFile(path));
           psaFiles.push(parsed);
+          produced.add(animationPackageFor(name).toLowerCase());
           if (parsed.hasScaleKeys) warnings.push(`${name}.psa carries ActorX scale keys; per-frame bone scale remains unsupported.`);
         } catch (error) {
           failed.push({ package: animationPackageFor(name), reason: `ActorX PSA conversion failed: ${error instanceof Error ? error.message : "unknown error"}` });
@@ -4449,23 +4458,28 @@ export async function importUnrealDirectory(
       }
       for (const file of await listFiles(join(modernAnimationRaw, "Animation")).catch(() => [])) {
         if (!file.path.toLowerCase().endsWith(".json")) continue;
-        try { animationDescriptors.push(JSON.parse(await readFile(file.path, "utf8")) as RawAnimationAsset); }
-        catch { /* a malformed descriptor leaves its package reported as failed below */ }
+        const stem = basename(file.path, ".json").replace(/\.clip$/i, "");
+        try {
+          const descriptor = JSON.parse(await readFile(file.path, "utf8")) as RawAnimationAsset;
+          animationDescriptors.push(descriptor);
+          produced.add(animationPackageFor(typeof descriptor.name === "string" && descriptor.name.length > 0 ? descriptor.name : stem).toLowerCase());
+        } catch {
+          failed.push({ package: animationPackageFor(stem), reason: `The animation descriptor ${basename(file.path)} is not valid JSON; the package produced no usable animation.` });
+        }
       }
-      for (const [name, reason] of parseModernAnimationFailures(converted.stderr)) failed.push({ package: animationPackageFor(name), reason });
+      const reported = parseModernAnimationFailures(converted.stderr);
+      for (const [name, reason] of reported) failed.push({ package: animationPackageFor(name), reason });
+      // A package the converter was asked for but wrote nothing for is reported, not left silent.
+      for (const entry of modernAnimationPackages) {
+        const stem = basename(entry.package, extname(entry.package));
+        if (produced.has(entry.package.toLowerCase()) || reported.has(stem)) continue;
+        failed.push({ package: entry.package, reason: "The modern animation converter reported success but wrote no clip or descriptor for this package." });
+      }
       warnings.push(`Decoded ${modernAnimationPackages.length} animation package${modernAnimationPackages.length === 1 ? "" : "s"} with the modern converter.`);
     }
   }
-  // Every clip reference resolves against the exported AnimSequence PSAs. The importer cannot map an
-  // Unreal skeleton object name to an imported mesh, so it does not claim to; the descriptor keeps it.
-  const exportedClips: ExportedClip[] = psaFiles.flatMap((file) =>
-    file.sequences.map((sequence) => ({ name: sequence.name, package: animationPackageFor(sequence.name) })),
-  );
-  const animationResult = buildAnimationLogic(animationDescriptors, exportedClips, undefined);
-  for (const issue of animationResult.unresolved) {
-    warnings.push(`${issue.asset}: ${issue.kind} reference "${issue.clip}" is unresolved (${issue.reason}).`);
-  }
-  for (const entry of animationResult.unsupported) failed.push({ package: entry.package, reason: entry.reason });
+  // Every clip reference is resolved later, after the skeletal GLBs exist: a PSA that no compatible
+  // mesh accepted is reported then, never resolved against a parsed file that produced no glTF animation.
   if (modernTexturePackages.length > 0) {
     modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
     const modernTextureRoot = join(staging, "modern-textures");
@@ -4925,49 +4939,13 @@ export async function importUnrealDirectory(
   const attachedPsa = new Set<string>();
   const existingPsa = new Set<string>();
   const incompatiblePsa = new Set<string>();
+  // Clip name -> the skeletal models it attached to, to catch a duplicate bone-name rig silently
+  // receiving a clip that belongs to another skeleton.
+  const attachedPsaByModel = new Map<string, Set<string>>();
   const animationLogic: ImportedAnimationLogic[] = [];
   const animationSidecars: ImportedAnimationClip[] = [];
-  for (const asset of animationResult.assets) {
-    const json = `${JSON.stringify(asset.value, null, 2)}\n`;
-    const relativeJson = `Animation/${asset.name}.json`;
-    const target = assertContained(promotion, relativeJson);
-    await mkdir(dirname(target), { recursive: true });
-    await writeFile(target, json);
-    const resolvedClips = asset.value.kind === "blendSpace"
-      ? asset.value.samples.filter((sample) => sample.unresolved === undefined).map((sample) => sample.clip)
-      : asset.value.slots.flatMap((slot) => slot.segments.filter((segment) => segment.unresolved === undefined).map((segment) => segment.clip));
-    animationLogic.push({
-      name: asset.name,
-      package: asset.package,
-      kind: asset.value.kind,
-      json: relativeJson,
-      bytes: Buffer.byteLength(json),
-      sha256: createHash("sha256").update(json).digest("hex"),
-      resolvedClips: [...new Set(resolvedClips)],
-      unresolvedClips: animationResult.unresolved
-        .filter((issue) => issue.asset === asset.name)
-        .map((issue) => ({ clip: issue.clip, reason: issue.reason })),
-    });
-  }
-  for (const sidecar of animationResult.sidecars) {
-    const json = `${JSON.stringify(sidecar.value, null, 2)}\n`;
-    const relativeJson = `Animation/${sidecar.name}.clip.json`;
-    const target = assertContained(promotion, relativeJson);
-    await mkdir(dirname(target), { recursive: true });
-    await writeFile(target, json);
-    animationSidecars.push({
-      name: sidecar.name,
-      package: sidecar.package,
-      json: relativeJson,
-      bytes: Buffer.byteLength(json),
-      sha256: createHash("sha256").update(json).digest("hex"),
-      curves: sidecar.value.curves.length,
-      notifies: sidecar.value.notifies.length,
-    });
-  }
-  if (animationLogic.length > 0 || animationSidecars.length > 0) {
-    log(`Wrote ${animationLogic.length} animation descriptor${animationLogic.length === 1 ? "" : "s"} and ${animationSidecars.length} clip sidecar${animationSidecars.length === 1 ? "" : "s"}.`);
-  }
+  // A clip's descriptor and sidecar are written after the skeletal GLBs exist, so a reference resolves
+  // only against an animation that actually landed (see the attach pass below).
 
   // Copies of one texture name that separate exports wrote collapse to one source when their bytes match, so a
   // texture exported into two folders is not a conflict when both copies are the very same image.
@@ -5177,7 +5155,13 @@ export async function importUnrealDirectory(
           saturatedUvs += packaged.saturatedUvs;
           repairedMorphDeltas += packaged.repairedMorphDeltas;
           conflictingMorphDeltas += packaged.conflictingMorphDeltas;
-          for (const name of packaged.attachedPsa) attachedPsa.add(name);
+          for (const name of packaged.attachedPsa) {
+            attachedPsa.add(name);
+            const models = attachedPsaByModel.get(name.toLowerCase()) ?? new Set<string>();
+            // LODs of one mesh are one rig, so the base mesh name groups them.
+            models.add(name);
+            attachedPsaByModel.set(name.toLowerCase(), models);
+          }
           for (const name of packaged.existingPsa) existingPsa.add(name);
           for (const name of packaged.incompatiblePsa) incompatiblePsa.add(name);
           const validated = await validateGlb(glbPath);
@@ -5465,14 +5449,81 @@ export async function importUnrealDirectory(
         `Kept ${existingPsa.size} animation clip${existingPsa.size === 1 ? "" : "s"} already present in UE Viewer's skeletal GLB instead of duplicating the matching PSA clip.`,
       );
     }
-    if (psaFiles.length > 0 && attachedPsa.size === 0 && existingPsa.size === 0) {
-      for (const entry of legacyAnimationPackages) {
+    // A clip reference resolves only against an animation that actually landed on a GLB: `attachedPsa`
+    // are the PSAs a compatible mesh accepted, `existingPsa` those UE Viewer's GLB already carried. A
+    // PSA that no mesh accepted is reported below, never resolved against a parsed file with no output.
+    const exportedClipNames = new Set([...attachedPsa, ...existingPsa].map((clip) => clip.toLowerCase()));
+    const exportedClips: ExportedClip[] = [...attachedPsa, ...existingPsa].map((clip) => ({ name: clip, package: animationPackageFor(clip) }));
+    const animationResult = buildAnimationLogic(animationDescriptors, exportedClips, undefined);
+    for (const issue of animationResult.unresolved) {
+      warnings.push(`${issue.asset}: ${issue.kind} reference "${issue.clip}" is unresolved (${issue.reason}).`);
+    }
+    for (const entry of animationResult.unsupported) failed.push({ package: entry.package, reason: entry.reason });
+    for (const asset of animationResult.assets) {
+      const json = `${JSON.stringify(asset.value, null, 2)}\n`;
+      const relativeJson = `Animation/${asset.name}.json`;
+      const target = assertContained(promotion, relativeJson);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, json);
+      const resolvedClips = asset.value.kind === "blendSpace"
+        ? asset.value.samples.filter((sample) => sample.unresolved === undefined).map((sample) => sample.clip)
+        : asset.value.slots.flatMap((slot) => slot.segments.filter((segment) => segment.unresolved === undefined).map((segment) => segment.clip));
+      animationLogic.push({
+        name: asset.name,
+        package: asset.package,
+        kind: asset.value.kind,
+        json: relativeJson,
+        bytes: Buffer.byteLength(json),
+        sha256: createHash("sha256").update(json).digest("hex"),
+        resolvedClips: [...new Set(resolvedClips)],
+        unresolvedClips: animationResult.unresolved
+          .filter((issue) => issue.asset === asset.name)
+          .map((issue) => ({ clip: issue.clip, reason: issue.reason })),
+      });
+    }
+    for (const sidecar of animationResult.sidecars) {
+      // A sidecar for a clip that produced no glTF animation is metadata only; say so rather than let a
+      // consumer bind notifies to a clip that does not exist.
+      const value = exportedClipNames.has(sidecar.name.toLowerCase()) || sidecar.value.unsupportedReason !== undefined
+        ? sidecar.value
+        : { ...sidecar.value, unsupportedReason: "no exported glTF animation carries this clip's name" };
+      const json = `${JSON.stringify(value, null, 2)}\n`;
+      const relativeJson = `Animation/${sidecar.name}.clip.json`;
+      const target = assertContained(promotion, relativeJson);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, json);
+      animationSidecars.push({
+        name: sidecar.name,
+        package: sidecar.package,
+        json: relativeJson,
+        bytes: Buffer.byteLength(json),
+        sha256: createHash("sha256").update(json).digest("hex"),
+        curves: sidecar.value.curves.length,
+        notifies: sidecar.value.notifies.length,
+      });
+    }
+    if (animationLogic.length > 0 || animationSidecars.length > 0) {
+      log(`Wrote ${animationLogic.length} animation descriptor${animationLogic.length === 1 ? "" : "s"} and ${animationSidecars.length} clip sidecar${animationSidecars.length === 1 ? "" : "s"}.`);
+    }
+    // A decoded PSA that attached to no compatible mesh has no exported animation, so its package is
+    // reported rather than left to look resolved. This covers modern clips as well as legacy ones.
+    for (const file of psaFiles) {
+      for (const sequence of file.sequences) {
+        if (exportedClipNames.has(sequence.name.toLowerCase())) continue;
         failed.push({
-          package: entry.package,
-          reason: "ActorX PSA was decoded, but no imported SkeletalMesh matched at least 80% of its bone names.",
+          package: animationPackageFor(sequence.name),
+          reason: `ActorX PSA clip "${sequence.name}" was decoded, but no imported SkeletalMesh matched at least 80% of its bone names.`,
         });
       }
-    } else if (incompatiblePsa.size > 0) {
+    }
+    // A funny clip landing on two rigs by bone name alone may have crossed from its real skeleton to a rig
+    // that merely shares bone names; surface it instead of silently shipping it twice.
+    for (const [clip, models] of attachedPsaByModel) {
+      if (models.size > 1) {
+        warnings.push(`Animation clip "${clip}" attached to ${models.size} skeletal models by bone name (${[...models].join(", ")}); a duplicate bone-name rig may have received a clip that belongs to another skeleton.`);
+      }
+    }
+    if (incompatiblePsa.size > 0) {
       warnings.push(
         `${incompatiblePsa.size} ActorX animation clip${incompatiblePsa.size === 1 ? " was" : "s were"} not attached to at least one skeletal model because fewer than 80% of bone names matched.`,
       );
@@ -6299,7 +6350,11 @@ export async function importUnrealDirectory(
       strands.length === 0 &&
       dataTextures.length === 0 &&
       soundCues.length === 0 &&
-      physicsAssets.length === 0
+      physicsAssets.length === 0 &&
+      // An animation logic package (blend space, montage) or a clip sidecar is a promoted output, so a
+      // logic-only import is not empty.
+      animationLogic.length === 0 &&
+      animationSidecars.length === 0
     ) {
       const reasons = failed.slice(0, 5).map((entry) => `${entry.package}: ${entry.reason}`);
       const more = failed.length > reasons.length ? ` (+${failed.length - reasons.length} more)` : "";

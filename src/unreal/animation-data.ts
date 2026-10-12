@@ -28,6 +28,8 @@ export interface RawBlendSample {
   readonly animation?: string;
   readonly sampleValue?: readonly [number, number, number];
   readonly rateScale?: number;
+  /** `FBlendSample::bMirror`: the sample plays mirrored by the blend space's `MirrorDataTable`. */
+  readonly mirror?: boolean;
 }
 
 export interface RawBlendWindow {
@@ -93,6 +95,10 @@ export interface RawAnimationAsset {
   readonly animLength?: number;
   readonly loop?: boolean;
   readonly additive?: boolean;
+  /** `UBlendSpaceBase::MirrorDataTable`, needed to realise any sample with `bMirror`. */
+  readonly mirrorDataTable?: string | null;
+  /** `UBlendSpace::PreviewBasePose`, the base pose an additive space blends against. */
+  readonly previewBasePose?: string | null;
   readonly axes?: readonly RawBlendAxis[];
   readonly samples?: readonly RawBlendSample[];
   readonly interpolation?: readonly { readonly time?: number; readonly type?: string }[];
@@ -201,6 +207,8 @@ export interface NormalizedClipSidecar {
   readonly notifies: readonly NormalizedNotify[];
   readonly curves: readonly NormalizedClipCurve[];
   readonly syncMarkers: readonly { readonly name: string; readonly time: number }[];
+  /** Set when the clip's bone tracks could not be exported, so the sidecar is metadata only. */
+  readonly unsupportedReason?: string;
 }
 
 export type NormalizedAnimationAsset = NormalizedBlendSpace | NormalizedMontage;
@@ -307,26 +315,39 @@ function normalizeNotifies(notifies: readonly RawNotify[] | undefined): readonly
 
 function normalizeBlendSpace(raw: RawAnimationAsset, clips: readonly ExportedClip[], closed: Set<string>): NormalizedBlendSpace {
   const type = raw.blendSpaceType ?? "2D";
+  const additive = raw.additive ?? type === "aimOffset";
+  const mirrorDataTable = text(raw.mirrorDataTable ?? "");
   const samples = (raw.samples ?? []).map((sample): NormalizedBlendSample => {
     const resolved = resolveClip(sample.animation, clips);
     if (resolved.unresolved) closed.add(`${resolved.clip}\0${resolved.unresolved}`);
     const value = sample.sampleValue ?? [0, 0, 0];
+    const mirror = sample.mirror ?? false;
+    // A mirrored sample is produced by reflecting through a `MirrorDataTable`. Without one, the sample
+    // cannot be realised, so say so instead of dropping the flag on the floor.
+    if (mirror && mirrorDataTable.length === 0) {
+      closed.add(`${resolved.clip}\0a mirrored sample needs a MirrorDataTable the import does not carry`);
+    }
     return {
       clip: resolved.clip,
       pos: [finite(value[0], 0), finite(value[1], 0), finite(value[2], 0)],
       rateScale: finite(sample.rateScale, 1),
-      mirror: false,
+      mirror,
       ...(resolved.unresolved ? { unresolved: resolved.unresolved } : {}),
     };
   });
+  // An additive space that is not an aim offset blends each sample onto a base pose. Aim-offset
+  // mesh-space samples carry their own offset and need none.
+  if (additive && type !== "aimOffset" && text(raw.previewBasePose ?? "").length === 0) {
+    closed.add(`\0an additive blend space names no base pose the import can apply`);
+  }
   return {
     kind: "blendSpace",
     type,
     axes: blendAxes(raw.axes),
     samples,
     smoothing: (raw.interpolation ?? []).map((entry) => ({ time: finite(entry.time, 0), type: text(entry.type, "Average") })),
-    loop: raw.loop ?? false,
-    additive: raw.additive ?? type === "aimOffset",
+    loop: raw.loop ?? true,
+    additive,
   };
 }
 
@@ -380,6 +401,7 @@ export function normalizeClipSidecar(raw: RawAnimationAsset): NormalizedClipSide
       })),
     })),
     syncMarkers: (raw.syncMarkers ?? []).map((marker) => ({ name: text(marker.name), time: finite(marker.time, 0) })),
+    ...(raw.unsupportedReason ? { unsupportedReason: raw.unsupportedReason } : {}),
   };
 }
 
@@ -406,14 +428,14 @@ export function buildAnimationLogic(
     const name = text(raw.name);
     const packagePath = text(raw.package);
     const className = text(raw.className);
-    if (raw.unsupportedReason) {
-      unsupported.push({ package: packagePath, asset: name, reason: raw.unsupportedReason });
-      continue;
-    }
+    if (raw.unsupportedReason) unsupported.push({ package: packagePath, asset: name, reason: raw.unsupportedReason });
     if (raw.kind === "clip") {
+      // A clip whose bone tracks could not be exported still keeps its notifies, curves and sync
+      // markers as a sidecar; the unsupported reason above records that no glTF animation was written.
       sidecars.push({ name, package: packagePath, value: normalizeClipSidecar(raw) });
       continue;
     }
+    if (raw.unsupportedReason) continue;
     if (raw.kind !== "blendSpace" && raw.kind !== "montage" && raw.kind !== "composite") continue;
     const closed = new Set<string>();
     const skeletonName = text(raw.skeleton ?? "");
