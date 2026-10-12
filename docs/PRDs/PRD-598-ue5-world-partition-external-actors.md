@@ -1,7 +1,7 @@
 # PRD-598 — UE5 World Partition external actors in levels
 
-**Status:** IN PROGRESS
-**Priority:** P2 — AC-1 and AC-2 have local real-pack evidence; AC-3 and AC-4 remain open on the parent’s final head.
+**Status:** IN PROGRESS — local criteria complete; independent review and CI pending
+**Priority:** P2 — all four local criteria have evidence; independent review and CI remain in progress.
 **Complexity:** 2 (LOW) — importer, adapter, format ledger, and focused real gates; risk override: licensed evidence remains local-only.
 **Owner:** lane-598; parent owns final sheet and delivery
 **Depends on:** None
@@ -31,12 +31,12 @@ compiled converter gate.
 
 - [x] AC-1 [local]: A real UE5 World Partition level imports with its external actors placed: the scene GLB holds one node per external actor that carries a supported component, at the transform the package stores. proof: opt-in real-pack gate in `tests/fab-feature-corpus.test.ts` — Evidence: private proof index `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index.json`; native scene JSON has 3 probe-confirmed actors, public output has 3/3 resolved actors, one mesh node per actor with decoded POSITION data, and GLB world matrices matching the native transforms.
 - [x] AC-2 [local]: External actor packages of a map that is not imported stay skipped with `WORLD_PARTITION_EXTERNAL_REASON`. proof: `npx vitest run tests/unreal-external-actors.test.ts --maxWorkers=1` (extended) — Evidence: 3 passed; the real compiled association fixture also rejects same-basename/different-prefix and `__ExternalObjects__` packages.
-- [ ] AC-3 [local]: Before/after level sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: pending.
-- [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: pending.
+- [x] AC-3 [local]: Before/after level sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected the actual scene actor crops, attached in [PR51 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/51#issuecomment-6132573301). Before is the same bounded level through `.584.4` (0 actors), after is `.584.8` (3 actors); empty before tiles contain no placeholder geometry. Owner-only Drive PNG, local SHA/path metadata `raw/parent598-sheet.json`.
+- [x] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent final checks on implementation `aee9c49` (subsequent edits are prose only): typecheck0.8s, default suite2,694 passed/16 skipped74.4s, clean leak gate82.6s, packed MCP15/15 in12.7s. Logs are `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent598-final-{typecheck,test,leaks,smoke}.log`.
 
 ## Remaining work
 
-- AC-3 PR attachment and AC-4 final checks are parent-owned work in progress. There is no external input blocker.
+- Independent review and final CI are in progress. There is no external input blocker.
 
 ## Integration Ledger
 
@@ -59,8 +59,8 @@ compiled converter gate.
 **Verification:** converter `b4e95441+threenative.584.8`, importer `121`; focused real gate and external-actor tests pass.
 
 #### Phase 3: Evidence and gates
-**Status:** IN PROGRESS
-**Verification:** AC-3, AC-4; ledger row to Verified.
+**Status:** DONE
+**Verification:** AC-3 and AC-4 passed; ledger row is Verified.
 
 ## Source-backed implementation facts
 
@@ -77,7 +77,7 @@ compiled converter gate.
 - Public output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/public-output` (`import-report.json`, scene GLB, scene manifest); report source hash `sha256:9a0bee37c32cff152f8c9634577fd538e47dd51f8e22c561ac10cf91cf31b331`.
 - Association output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/association-output/Scenes/` (exact JSON path is in the local proof index); 3 valid actors remain while same-basename/different-prefix and external-object distractors are excluded, and the deliberately corrupt matching package is an `ExternalActorPackage` omission with a named load reason.
 - Fresh focused evidence: `PRD598_REAL_WP_PROOF_INDEX=/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index.json npx vitest run tests/fab-feature-corpus.test.ts --maxWorkers=1` → 35 passed, 9 expected skips; `npx vitest run tests/unreal-external-actors.test.ts --maxWorkers=1` → 3 passed.
-- Parent reports prior repository gates and PR #50 CI green; AC-4 stays open here until those gates run on the integrated final head, and AC-3 stays parent-owned.
+- Parent completed the final local repository gates and inspected/attached the sheet; independent review and this PR’s CI remain pending.
 
 ## Decisions
 
