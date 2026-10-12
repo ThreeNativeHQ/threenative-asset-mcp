@@ -56,9 +56,13 @@ describeWithTools(["modern-converter"], "UE5 Sequencer channel evaluator", () =>
       join(project, "SequencerChannels.csproj"),
       `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>` +
         `<ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><UseSharedCompilation>false</UseSharedCompilation></PropertyGroup>` +
-        `<ItemGroup><Reference Include="CUE4Parse"><HintPath>${join(CUE4PARSE_BIN, "CUE4Parse.dll")}</HintPath></Reference></ItemGroup></Project>`,
+        `<ItemGroup>${["CUE4Parse", "CUE4Parse-Conversion", "Newtonsoft.Json"].map(name =>
+          `<Reference Include="${name}"><HintPath>${join(CUE4PARSE_BIN, name + ".dll")}</HintPath></Reference>`,
+        ).join("")}` +
+        `<None Include="${join(CUE4PARSE_BIN, "*.dll")}" Exclude="${["System*.dll", "Microsoft*.dll", "mscorlib.dll", "netstandard.dll"].map(name => join(CUE4PARSE_BIN, name)).join(";")}" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" /></ItemGroup></Project>`,
     );
     const declarations = [
+      extractCSharp(CUE4PARSE_PROGRAM, "static CAnimSet ConvertAbsoluteSequencerAnimation("),
       extractCSharp(CUE4PARSE_PROGRAM, "static bool EvaluateSequencerChannel("),
       extractCSharp(CUE4PARSE_PROGRAM, "static bool SampleSequencerChannel("),
       extractRecord(CUE4PARSE_PROGRAM, "sealed record SequencerKey("),
@@ -68,6 +72,80 @@ describeWithTools(["modern-converter"], "UE5 Sequencer channel evaluator", () =>
       join(project, "Program.cs"),
       `using System.Globalization;
 using CUE4Parse.UE4.Objects.Engine.Curves;
+using System.Runtime.CompilerServices;
+using CUE4Parse.UE4.Assets;
+using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Objects.Core.Math;
+using CUE4Parse.UE4.Objects.UObject;
+using CUE4Parse_Conversion.Animations;
+using CUE4Parse_Conversion.Writers.ActorX.Structs.Animations;
+
+if (args.Contains("--additive"))
+{
+    // FReferenceSkeleton only exposes an archive constructor. Populate native fields
+    // in memory rather than manufacturing a serialized Unreal package.
+    var reference = (FReferenceSkeleton)RuntimeHelpers.GetUninitializedObject(typeof(FReferenceSkeleton));
+    SetReference(nameof(FReferenceSkeleton.FinalRefBoneInfo), new[] {
+        new FMeshBoneInfo(new FName("root"), -1), new FMeshBoneInfo(new FName("child"), 0) });
+    SetReference(nameof(FReferenceSkeleton.FinalRefBonePose), new[] {
+        FTransform.Identity, new FTransform(new FVector(10, 0, 0)) });
+    SetReference(nameof(FReferenceSkeleton.FinalNameToIndexMap), new Dictionary<string, int> { ["root"] = 0, ["child"] = 1 });
+    void SetReference(string name, object value) => typeof(FReferenceSkeleton).GetField(name)!.SetValue(reference, value);
+
+    var skeleton = new USkeleton {
+        Name = "TwoBones", ReferenceSkeleton = reference,
+        BoneTree = new EBoneTranslationRetargetingMode[2], AnimRetargetSources = new()
+    };
+    var package = new SkeletonPackage(skeleton);
+    var sequence = new UAnimSequence {
+        Name = "AbsoluteRawMarkedAdditive", NumFrames = 2, SequenceLength = 1, RateScale = 1,
+        RetargetSource = new FName("None"),
+        AdditiveAnimType = EAdditiveAnimationType.AAT_LocalSpaceBase,
+        RefPoseType = EAdditiveBasePoseType.ABPT_RefPose, RefFrameIndex = 0,
+        TrackToSkeletonMapTable = new[] {
+            new FTrackToSkeletonMap { BoneTreeIndex = 0 }, new FTrackToSkeletonMap { BoneTreeIndex = 1 } },
+        RawAnimationData = new[] {
+            new FRawAnimSequenceTrack(new[] { FVector.ZeroVector }, new[] { FQuat.Identity }, new[] { FVector.OneVector }),
+            new FRawAnimSequenceTrack(new[] { new FVector(10, 0, 0) }, new[] { FQuat.Identity }, new[] { FVector.OneVector }) }
+    };
+    // Skeleton has a private setter; use the real FPackageIndex loader path.
+    typeof(UAnimationAsset).GetProperty(nameof(UAnimationAsset.Skeleton))!.SetValue(sequence, new FPackageIndex(package, 1));
+    if (!ReferenceEquals(sequence.Skeleton!.Load<USkeleton>(), skeleton)) throw new Exception("Skeleton resolution failed");
+
+    var before = sequence.ConvertAnims();
+    CheckChild(before, 20);
+    var saved = sequence.AdditiveAnimType;
+    var after = ConvertAbsoluteSequencerAnimation(sequence);
+    CheckChild(after, 10);
+    if (sequence.AdditiveAnimType != saved) throw new Exception("Additive enum was not restored");
+    if (sequence.RawAnimationData[1].PosKeys[0].X != 10) throw new Exception("Source raw data was mutated");
+    var reconverted = sequence.ConvertAnims();
+    CheckChild(reconverted, 20);
+    var missingSkeleton = new UAnimSequence { AdditiveAnimType = saved };
+    var threw = false;
+    try { ConvertAbsoluteSequencerAnimation(missingSkeleton); }
+    catch (Exception) { threw = true; }
+    if (!threw) throw new Exception("Missing skeleton must fail conversion");
+    if (missingSkeleton.AdditiveAnimType != saved) throw new Exception("Additive enum was not restored after failure");
+    Console.WriteLine(string.Join(",", new[] {
+        before.Sequences[0].Tracks[1].KeyPos[0].X.ToString(CultureInfo.InvariantCulture),
+        after.Sequences[0].Tracks[1].KeyPos[0].X.ToString(CultureInfo.InvariantCulture),
+        (sequence.AdditiveAnimType == saved).ToString(),
+        reconverted.Sequences[0].Tracks[1].KeyPos[0].X.ToString(CultureInfo.InvariantCulture),
+        sequence.RawAnimationData[1].PosKeys[0].X.ToString(CultureInfo.InvariantCulture),
+        threw.ToString(), (missingSkeleton.AdditiveAnimType == saved).ToString()
+    }));
+    return;
+
+    static void CheckChild(CAnimSet result, float expected) {
+        if (result.Sequences.Count != 1 || result.Sequences[0].Tracks.Count != 2) throw new Exception("Unexpected output shape");
+        var keys = result.Sequences[0].Tracks[1].KeyPos;
+        if (keys.Length == 0 || keys.Any(p => MathF.Abs(p.X - expected) > 0.0001f || p.Y != 0 || p.Z != 0))
+            throw new Exception($"Expected every child translation to be ({expected},0,0); got {string.Join(",", keys.Select(p => p.X))}");
+    }
+
+}
 
 SequencerKey Key(float value, ERichCurveInterpMode interp, ERichCurveTangentMode tangent = ERichCurveTangentMode.RCTM_Auto, float arrive = 0, float leave = 0, float arriveWeight = 0, float leaveWeight = 0, ERichCurveTangentWeightMode weightMode = ERichCurveTangentWeightMode.RCTWM_WeightedNone) =>
     new(value, arrive, leave, arriveWeight, leaveWeight, interp, tangent, weightMode);
@@ -101,6 +179,24 @@ EvaluateSequencerChannel(invalid, 5, out _, out var invalidReason);
 Console.WriteLine(invalidReason);
 
 ${declarations}
+
+sealed class SkeletonPackage : AbstractUePackage {
+    public SkeletonPackage(USkeleton skeleton) : base("/Synthetic/TwoBones", null) {
+        ExportsLazy = new[] { new Lazy<UObject>(() => skeleton) };
+        IsFullyLoaded = true;
+    }
+    public override FPackageFileSummary Summary => default!;
+    public override FNameEntrySerialized[] NameMap => [];
+    public override int ImportMapLength => 0;
+    public override int ExportMapLength => 1;
+    public override int GetExportIndex(string name, StringComparison comparisonType = StringComparison.Ordinal)
+        => string.Equals(name, ExportsLazy[0].Value.Name, comparisonType) ? 0 : -1;
+    public override ResolvedObject? ResolvePackageIndex(FPackageIndex? index)
+        => index?.Index == 1 ? new SkeletonExport(this) : null;
+}
+sealed class SkeletonExport(IPackage package) : ResolvedObject(package, 0) {
+    public override FName Name => new("TwoBones");
+}
 `,
     );
     const projectFile = join(project, "SequencerChannels.csproj");
@@ -153,6 +249,13 @@ ${declarations}
   });
 
   it("guards the absolute Sequencer export from legacy additive accumulation", () => {
-    expect(CUE4PARSE_PROGRAM).toMatch(/sequencerModel is not null[\s\S]{0,5000}AAT_None/);
+    const values = execFileSync(sdk, [runner, "--additive"], { encoding: "utf8" }).trim().split(",");
+    expect(Number(values[0]), "native additive baseline child X").toBe(20);
+    expect(Number(values[1]), "shipped absolute helper child X").toBe(10);
+    expect(values[2], "additive enum restored after success").toBe("True");
+    expect(Number(values[3]), "legacy reconversion still accumulates base pose").toBe(20);
+    expect(Number(values[4]), "raw source child X unchanged").toBe(10);
+    expect(values[5], "missing skeleton throws").toBe("True");
+    expect(values[6], "additive enum restored after failure").toBe("True");
   });
 });

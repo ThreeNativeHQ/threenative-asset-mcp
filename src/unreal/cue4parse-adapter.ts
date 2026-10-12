@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.6",
+  version: "b4e95441+threenative.584.6.1",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3641,6 +3641,21 @@ bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string 
 // A raw track array is either a single constant key or the model's full NumberOfKeys entries.
 static bool ValidKeyCount(int count, int keys) => count == 0 || count == 1 || count == keys;
 
+// Reconstructed FK tracks are absolute; disable legacy base-pose accumulation only during conversion.
+static CAnimSet ConvertAbsoluteSequencerAnimation(UAnimSequence sequence)
+{
+    var originalAdditiveType = sequence.AdditiveAnimType;
+    sequence.AdditiveAnimType = EAdditiveAnimationType.AAT_None;
+    try
+    {
+        return sequence.ConvertAnims();
+    }
+    finally
+    {
+        sequence.AdditiveAnimType = originalAdditiveType;
+    }
+}
+
 int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
 {
     var name = sequence.Name;
@@ -3669,22 +3684,10 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
                 return 0;
             }
             if (sequencerTiming is not null) document["timing"] = sequencerTiming;
-            // PopulateFromSequencerDataModel reconstructs absolute bone transforms. The legacy ActorX
-            // converter treats AdditiveAnimType as authored deltas and adds the base pose again, so only
-            // this reconstructed route temporarily disables that conversion; compressed routes retain it.
-            var originalAdditiveType = sequence.AdditiveAnimType;
-            sequence.AdditiveAnimType = EAdditiveAnimationType.AAT_None;
-            try
+            using (var writer = new FArchiveWriter())
             {
-                using (var writer = new FArchiveWriter())
-                {
-                    new ActorXAnim(sequence.ConvertAnims(), 0).Save(writer);
-                    WriteAnimationBytes(packagePath, name, ".psa", writer.GetBuffer());
-                }
-            }
-            finally
-            {
-                sequence.AdditiveAnimType = originalAdditiveType;
+                new ActorXAnim(ConvertAbsoluteSequencerAnimation(sequence), 0).Save(writer);
+                WriteAnimationBytes(packagePath, name, ".psa", writer.GetBuffer());
             }
             WriteAnimationJson(packagePath, name + ".clip", document);
             return 1;
