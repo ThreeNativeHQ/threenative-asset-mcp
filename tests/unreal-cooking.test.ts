@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { readPackageCooking } from "../src/unreal/cooking.js";
+import { gameReferencesInHead, readPackageCooking } from "../src/unreal/cooking.js";
 
 const PACKAGE_MAGIC = 0x9e2a83c1;
 
@@ -261,5 +261,33 @@ describe("readPackageCooking", () => {
       Buffer.concat([packageHead(["/Script/Engine"]), padding, packageHead(["AssetImportData"]).subarray(24)]),
     );
     await expect(readPackageCooking(file)).resolves.toMatchObject({ state: "uncooked" });
+  });
+});
+
+function lengthPrefixed(value: string, encoding: "utf8" | "utf16le"): Buffer {
+  const marker = Buffer.alloc(4);
+  marker.writeInt32LE(encoding === "utf16le" ? -(value.length + 1) : value.length + 1, 0);
+  return Buffer.concat([marker, Buffer.from(`${value}\0`, encoding)]);
+}
+
+describe("gameReferencesInHead", () => {
+  it("keeps a hyphen and a Unicode letter in a full package path (UTF-8)", () => {
+    const head = Buffer.concat([Buffer.alloc(3), lengthPrefixed("/Game/Pack/My-Mesh_Ünïcode", "utf8")]);
+    expect(gameReferencesInHead(head)).toContain("/Game/Pack/My-Mesh_Ünïcode");
+  });
+
+  it("reads a UTF-16LE reference at an odd byte offset", () => {
+    const head = Buffer.concat([Buffer.alloc(1), lengthPrefixed("/Game/Pack/SK_UEFN_Mannequin", "utf16le")]);
+    expect(gameReferencesInHead(head)).toContain("/Game/Pack/SK_UEFN_Mannequin");
+  });
+
+  it("collapses repeated separators and drops an object suffix", () => {
+    const head = Buffer.from("/Game//A\/B/Mesh.Mesh\0", "latin1");
+    expect(gameReferencesInHead(head)).toEqual(["/Game/A/B/Mesh"]);
+  });
+
+  it("excludes engine and script references", () => {
+    const head = Buffer.from("/Engine/Foo/Bar\0/Script/Engine\0/Game/A/T_Albedo\0", "latin1");
+    expect(gameReferencesInHead(head)).toEqual(["/Game/A/T_Albedo"]);
   });
 });

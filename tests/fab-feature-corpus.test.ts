@@ -14,12 +14,15 @@ import {
   gamePathOf,
   importFreshOutput,
   listPackageFiles,
+  missingRequiredSlices,
   packageDigest,
   packageOutcomes,
   readCorpus,
   selectSlicePackages,
+  SLICES,
   type PackageOutcome,
   type ScannedPackage,
+  type SlicePlan,
 } from "../scripts/fab-slice.js";
 import { packageHeaderSize, readExactly, readPackageHeaderRegion, type PositionedReader } from "../src/unreal/cooking.js";
 import { ImportError, importUnrealDirectory, type ImportReport } from "../src/unreal/importer.js";
@@ -66,6 +69,58 @@ describe("fab-slice dependency closure", () => {
     expect(gamePathOf("Content/A/B/Mesh.uasset")).toBe("/Game/A/B/Mesh");
     expect(gamePathOf("GameAnimationSample_5.8/Content/A/Mesh.uasset")).toBe("/Game/A/Mesh");
     expect(packageDigest(["b", "a"])).toBe(packageDigest(["a", "b"]));
+  });
+});
+
+describe("fab-slice finite per-class selection", () => {
+  const niagara: ScannedPackage[] = [
+    { rel: "Content/VFX/NS_A.uasset", classes: ["NiagaraSystem"], refs: [] },
+    { rel: "Content/VFX/NS_B.uasset", classes: ["NiagaraSystem"], refs: [] },
+    { rel: "Content/VFX/NS_C.uasset", classes: ["NiagaraSystem"], refs: [] },
+  ];
+
+  it("keeps N distinct NiagaraSystem representatives, not one", () => {
+    expect(selectSlicePackages(niagara, ["NiagaraSystem"], 3)).toEqual([
+      "Content/VFX/NS_A.uasset",
+      "Content/VFX/NS_B.uasset",
+      "Content/VFX/NS_C.uasset",
+    ]);
+    expect(selectSlicePackages(niagara, ["NiagaraSystem"], 2)).toHaveLength(2);
+  });
+
+  it("counts a package matching two target classes as covering both (overlapping coverage)", () => {
+    const overlap: ScannedPackage[] = [
+      { rel: "Content/VFX/Both.uasset", classes: ["NiagaraSystem", "NiagaraEmitter"], refs: [] },
+      { rel: "Content/VFX/OnlyEmitter.uasset", classes: ["NiagaraEmitter"], refs: [] },
+    ];
+    expect(selectSlicePackages(overlap, ["NiagaraSystem", "NiagaraEmitter"], 1)).toEqual(["Content/VFX/Both.uasset"]);
+  });
+
+  it("takes the whole pool when a class has fewer than N members (insufficient pool)", () => {
+    expect(selectSlicePackages(niagara.slice(0, 2), ["NiagaraSystem"], 5)).toEqual([
+      "Content/VFX/NS_A.uasset",
+      "Content/VFX/NS_B.uasset",
+    ]);
+  });
+});
+
+describe("fab-slice required-slice verification", () => {
+  it("reports every missing required slice and ignores an optional one", () => {
+    const plans = [
+      { id: "a" },
+      { id: "b" },
+      { id: "c", optional: true },
+    ] as unknown as SlicePlan[];
+    expect(missingRequiredSlices(plans, new Set(["a"])).map((slice) => slice.id)).toEqual(["b"]);
+    expect(missingRequiredSlices(plans, new Set(["a", "b"])).map((slice) => slice.id)).toEqual([]);
+    expect(missingRequiredSlices(plans, new Set(["c"])).map((slice) => slice.id)).toEqual(["a", "b"]);
+  });
+
+  it("keeps the five matrix slices required and the sixth GASP 5.4 slice optional", () => {
+    const built = new Set(["anim-starter-4.4", "stickman-4.22", "soul-cave-4.18", "vtol-5.4"]);
+    expect(SLICES.find((slice) => slice.id === "game-anim-5.4")?.optional).toBe(true);
+    expect(missingRequiredSlices(SLICES, built).map((slice) => slice.id)).toEqual(["game-anim-5.8"]);
+    expect(missingRequiredSlices(SLICES, new Set(SLICES.map((slice) => slice.id)))).toEqual([]);
   });
 });
 

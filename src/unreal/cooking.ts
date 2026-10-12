@@ -139,7 +139,39 @@ export async function readPackageClasses(file: string, candidates: readonly stri
   return head ? classesInHead(head, candidates) : [];
 }
 
-const GAME_REFERENCE = /\/Game\/[A-Za-z0-9_]+(?:\/{1,2}[A-Za-z0-9_]+)*/g;
+const GAME_PREFIX = "/Game/";
+
+/**
+ * A character that can appear inside a `/Game/...` reference: a path separator, an ASCII letter, digit,
+ * underscore or hyphen, or any non-ASCII Unicode letter or digit. Everything else ends the reference,
+ * so a dot (the `.Object` suffix), NUL, whitespace, punctuation or a UTF-8 replacement char terminates
+ * it. That is what stops a reference being truncated at a hyphen or a Unicode letter and what keeps it
+ * from being extended into unrelated bytes.
+ */
+const REFERENCE_ASCII = /[A-Za-z0-9]/;
+const REFERENCE_UNICODE = /[\p{L}\p{N}]/u;
+
+function isReferenceChar(char: string): boolean {
+  if (char === "/" || char === "_" || char === "-" || REFERENCE_ASCII.test(char)) return true;
+  return char.charCodeAt(0) > 0x7f && REFERENCE_UNICODE.test(char);
+}
+
+/** The full `/Game/...` package paths in one decoded string, object suffixes removed and repeated
+ * separators collapsed. */
+function scanGameReferences(text: string): string[] {
+  const refs: string[] = [];
+  let index = 0;
+  for (;;) {
+    const start = text.indexOf(GAME_PREFIX, index);
+    if (start === -1) break;
+    let end = start + GAME_PREFIX.length;
+    while (end < text.length && isReferenceChar(text[end]!)) end += 1;
+    const path = text.slice(start, end).replace(/\/{2,}/g, "/").replace(/\/$/, "");
+    if (path.length > GAME_PREFIX.length) refs.push(path);
+    index = end > start ? end : start + GAME_PREFIX.length;
+  }
+  return refs;
+}
 
 /**
  * The `/Game/...` source package paths named in a package's import/name tables. A package that
@@ -147,10 +179,16 @@ const GAME_REFERENCE = /\/Game\/[A-Za-z0-9_]+(?:\/{1,2}[A-Za-z0-9_]+)*/g;
  * dependency graph a slice must close over. Engine (`/Engine/...`) and script references are excluded:
  * they are not files in the pack. Repeated separators collapse to one, so a normalized reference joins
  * the same set as its canonical form.
+ *
+ * Unreal serializes a string as UTF-8 when it is ANSI and as UTF-16LE otherwise, at any byte offset, so
+ * this scans the UTF-8 decode and both UTF-16LE alignments. A path is read by its legal characters
+ * rather than a fixed class, so a hyphen or a Unicode letter never truncates it.
  */
 export function gameReferencesInHead(head: Buffer): string[] {
   const refs = new Set<string>();
-  for (const match of head.toString("latin1").matchAll(GAME_REFERENCE)) refs.add(match[0].replace(/\/{2,}/g, "/").replace(/\/$/, ""));
+  for (const text of [head.toString("utf8"), head.toString("utf16le"), head.subarray(1).toString("utf16le")]) {
+    for (const ref of scanGameReferences(text)) refs.add(ref);
+  }
   return [...refs];
 }
 

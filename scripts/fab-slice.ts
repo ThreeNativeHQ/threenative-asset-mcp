@@ -58,6 +58,8 @@ export interface SlicePlan {
   readonly defaultFull?: string;
   /** Recorded matrix gaps this slice does not fill (accepted, not hidden). */
   readonly gaps?: readonly string[];
+  /** An extra slice strict `verify` does not require; the five artifacts of the matrix are required. */
+  readonly optional?: boolean;
 }
 
 /** The five non-redundant artifacts of the coverage matrix (`001-fab-feature-test-corpus.md`). */
@@ -111,12 +113,40 @@ export const SLICES: readonly SlicePlan[] = [
       ".cache/threenative-asset-mcp/fab-downloads/parity-20261010T210430-b1b64a/880e319a-a59e-4ed2-b268-b32dac7fa016/GameAnimationSample_5.8",
     ),
   },
+  // Optional sixth slice (PRD-583): the same Game Animation Sample listing's 5.4 artifact, for the
+  // UE 5.0-5.5 clip data model. Strict `verify` does not require it until it is built and recorded.
+  // Its seed is one clip and the two mannequin meshes so the closure stays small:
+  //   Content/Characters/UEFN_Mannequin/Animations/AimOffset/M_Neutral_AO_Stand_X0_Y0.uasset
+  //   Content/Characters/UEFN_Mannequin/Meshes/SKM_UEFN_Mannequin.uasset
+  //   Content/Characters/UEFN_Mannequin/Meshes/SK_UEFN_Mannequin.uasset
+  {
+    id: "game-anim-5.4",
+    listingId: "880e319a-a59e-4ed2-b268-b32dac7fa016",
+    artifactId: "GameAnimationSample_5.4",
+    engine: "UE_5.4",
+    route: "cue4parse",
+    targetClasses: ["AnimSequence", "SkeletalMesh", "Skeleton"],
+    defaultFull: join(
+      homedir(),
+      ".cache/threenative-asset-mcp/fab-downloads/prd583-20261011/game-animation-5.4",
+    ),
+    optional: true,
+  },
 ];
 
 export function findSlice(id: string): SlicePlan {
   const slice = SLICES.find((entry) => entry.id === id);
   if (!slice) throw new Error(`unknown slice "${id}". Known: ${SLICES.map((entry) => entry.id).join(", ")}`);
   return slice;
+}
+
+/**
+ * The required slices (not `optional`) absent from the built set. Strict `verify` and `--record` call
+ * this before writing the record, so a missing required slice fails loudly instead of being skipped
+ * and dropped from `docs/parity/feature-corpus.json`.
+ */
+export function missingRequiredSlices(slices: readonly SlicePlan[], builtIds: ReadonlySet<string>): SlicePlan[] {
+  return slices.filter((slice) => !slice.optional && !builtIds.has(slice.id));
 }
 
 // --- corpus record (numeric identifiers only) ----------------------------------------------------
@@ -347,26 +377,34 @@ export function selectSlicePackages(
     return [...closure(seeds)].sort();
   }
 
-  // Greedy set-cover: repeatedly take the class not yet covered whose smallest candidate adds the
-  // fewest new bytes, so representatives that share a character's dependency closure win over the
-  // smallest package of each class taken in isolation. This is what keeps a class-rich UE5 pack
-  // from becoming a pack-sized slice.
+  // Greedy set-cover: repeatedly add the candidate whose dependency closure adds the fewest new bytes,
+  // so representatives that share a character's dependency closure win over the smallest package of
+  // each class taken in isolation. This is what keeps a class-rich UE5 pack from becoming a pack-sized
+  // slice. Each target class needs up to `perClass` distinct matching representatives, bounded by the
+  // class's available pool; a package matching several target classes covers all of them at once. The
+  // round bound is the total representatives required, so a class whose pool is smaller than `perClass`
+  // cannot spin.
   const include = new Set<string>();
   const byteTotal = (set: Set<string>): number => (sizeOf ? [...set].reduce((sum, rel) => sum + sizeOf(rel), 0) : set.size);
-  for (let round = 0; round < targetClasses.length; round += 1) {
-    const uncovered = targetClasses.filter(
-      (className) => ![...include].some((rel) => matches(byRel.get(rel), className)),
-    );
-    if (uncovered.length === 0) break;
+  const needFor = (className: string): number => Math.min(perClass, poolFor(className).length);
+  const covers = (className: string): number => [...include].filter((rel) => matches(byRel.get(rel), className)).length;
+  const maxRounds = targetClasses.reduce((sum, className) => sum + needFor(className), 0);
+  for (let round = 0; round < maxRounds; round += 1) {
+    const unmet = targetClasses.filter((className) => covers(className) < needFor(className));
+    if (unmet.length === 0) break;
     let bestSeed: string | undefined;
     let bestAdded = Number.POSITIVE_INFINITY;
-    for (const className of uncovered) {
-      for (const candidate of poolFor(className).slice(0, 24)) {
+    let bestGain = 0;
+    for (const className of unmet) {
+      for (const candidate of poolFor(className).slice(0, Math.max(24, perClass))) {
+        if (include.has(candidate.rel)) continue;
         const next = closure([...include, candidate.rel]);
         const added = byteTotal(next) - byteTotal(include);
-        if (added < bestAdded) {
+        const gain = unmet.filter((name) => matches(byRel.get(candidate.rel), name)).length;
+        if (added < bestAdded || (added === bestAdded && gain > bestGain)) {
           bestAdded = added;
           bestSeed = candidate.rel;
+          bestGain = gain;
         }
       }
     }
@@ -786,8 +824,14 @@ async function main(): Promise<number> {
   }
 
   if (options.command === "make") {
+    // `--all` builds only what has a full pack on disk: an optional slice whose pack is absent (the
+    // GASP 5.4 default) is skipped rather than failing the whole run. `verify` still fails when a
+    // required slice is missing, so a skip here can never pass unnoticed.
     const targets = options.all
-      ? SLICES.filter((slice) => options.full !== undefined || slice.defaultFull !== undefined || existsSync(acquisitionDir(slice)))
+      ? SLICES.filter((slice) => {
+          const full = options.full ?? slice.defaultFull;
+          return (full !== undefined && existsSync(full)) || existsSync(acquisitionDir(slice));
+        })
       : [findSlice(options.slice ?? options.positionals[0] ?? "")];
     if (targets.length === 0) throw new Error(`nothing to make\n${USAGE}`);
     for (const slice of targets) {
@@ -798,11 +842,16 @@ async function main(): Promise<number> {
   }
 
   if (options.command === "verify" || (options.command === "make" && options.record)) {
+    const builtIds = new Set(SLICES.filter((slice) => existsSync(assertSafeChild(outRoot, slice.id))).map((slice) => slice.id));
+    const missing = missingRequiredSlices(SLICES, builtIds);
+    if (missing.length > 0) {
+      throw new Error(`required slice(s) not built under ${outRoot}: ${missing.map((slice) => slice.id).join(", ")}; run make first`);
+    }
     const corpus = await readCorpus(corpusPath());
     const slices: CorpusSlice[] = [];
     let totalBytes = 0;
     for (const slice of SLICES) {
-      if (!existsSync(assertSafeChild(outRoot, slice.id))) continue;
+      if (!builtIds.has(slice.id)) continue;
       const built = await verifySlice(slice, outRoot);
       slices.push(built);
       totalBytes += built.bytes;

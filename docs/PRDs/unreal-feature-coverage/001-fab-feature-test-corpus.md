@@ -92,6 +92,7 @@ An empty cell is a recorded gap, not a hidden one. Fill it only when a small pac
 
 - 2026-10-11 (João): keep the corpus small and free of redundancy. João claimed VTOL Dust and Animation Starter Pack for the Niagara and early-UE4 animation gaps.
 - 2026-10-11 (agent): drop Sci-Fi Creatures, Animal Variety and Spruce from the corpus (redundant, see Context). Keep the Game Animation Sample 5.8 artifact already on disk instead of downloading the 5.4 one. PRD-583 may add a small 5.4 clip slice if UE5 clip export needs the 5.0–5.5 data model.
+- 2026-10-11 (agent): register the optional sixth slice `game-anim-5.4` (listing `880e319a-a59e-4ed2-b268-b32dac7fa016`, artifact `GameAnimationSample_5.4`, engine `UE_5.4`, full pack at `/home/joao/.cache/threenative-asset-mcp/fab-downloads/prd583-20261011/game-animation-5.4`). Target classes `AnimSequence`, `SkeletalMesh`, `Skeleton`; seed is one aim-offset clip and the two UEFN mannequin meshes, closure kept minimal. It stays optional: strict `verify` still requires only the five matrix slices until it is built and recorded. Not built yet; root assigns after review.
 
 ## Integration Ledger
 
