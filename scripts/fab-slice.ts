@@ -21,7 +21,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { cp, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { FabCli, type FabOwnedListing } from "../src/fab/fabcli.js";
@@ -81,9 +81,9 @@ export const SLICES: readonly SlicePlan[] = [
     artifactId: "ROGCreata5e7dce4b29aV1",
     engine: "UE_4.22",
     route: "mesh-description",
-    targetClasses: ["SkeletalMeshSocket", "SkeletalMesh", "AnimMontage", "BlendSpace", "BlendSpace1D", "PhysicsAsset", "Skeleton", "AnimNotify"],
+    targetClasses: ["SkeletalMeshSocket", "SkeletalMesh", "AnimMontage", "BlendSpace", "BlendSpace1D", "AimOffsetBlendSpace", "AimOffsetBlendSpace1D", "PhysicsAsset", "Skeleton", "AnimNotify"],
     // The mesh names no `SkeletalMeshSocket` entry and no montage names an `AnimNotify` class entry.
-    gaps: ["SkeletalMeshSocket", "AnimNotify"],
+    gaps: ["SkeletalMeshSocket", "AnimNotify", "AimOffsetBlendSpace", "AimOffsetBlendSpace1D"],
   },
   {
     id: "soul-cave-4.18",
@@ -107,7 +107,9 @@ export const SLICES: readonly SlicePlan[] = [
     artifactId: "GameAnimationSample_5.8",
     engine: "UE_5.8",
     route: "cue4parse",
-    targetClasses: ["SkeletalMeshSocket", "PhysicsAsset", "PhysicsConstraintTemplate", "SkeletalBodySetup", "SoundCue", "AnimMontage", "BlendSpace", "BlendSpace1D", "PoseAsset"],
+    targetClasses: ["SkeletalMeshSocket", "PhysicsAsset", "PhysicsConstraintTemplate", "SkeletalBodySetup", "SoundCue", "AnimMontage", "BlendSpace", "BlendSpace1D", "AimOffsetBlendSpace", "AimOffsetBlendSpace1D", "PoseAsset"],
+    // Both full source packs were scanned: neither holds an aim-offset blend-space class.
+    gaps: ["AimOffsetBlendSpace", "AimOffsetBlendSpace1D"],
     defaultFull: join(
       homedir(),
       ".cache/threenative-asset-mcp/fab-downloads/parity-20261010T210430-b1b64a/880e319a-a59e-4ed2-b268-b32dac7fa016/GameAnimationSample_5.8",
@@ -509,17 +511,43 @@ export function packageOutcomes(report: ImportReport): Map<string, PackageOutcom
 }
 
 /**
+ * The source-root prefixes a comparison treats as equivalent. The pinned provider keys a loose
+ * directory as `<root>/<package path>`, where the root is the directory name, or the project name when
+ * the directory holds a top-level `.uproject`. The slice and the full pack live in differently named
+ * directories, so their otherwise identical outcomes embed different roots.
+ */
+export interface SourceRoots {
+  readonly slice: string;
+  readonly full: string;
+}
+
+/**
+ * Replaces the source-root segment a Content-relative package path embeds with a fixed token. The root
+ * must fall on an explicit textual boundary — start of the string, whitespace, a quote or an open paren
+ * — so a directory name is never rewritten inside a longer path segment, and it must lead a
+ * `Content/...` path so a coincidental mention elsewhere is left alone. Every other detail, including
+ * the package's relative identity and any dependency path, is left exactly as it was.
+ */
+function normalizeSourceRoot(reason: string, root: string): string {
+  if (root.length === 0) return reason;
+  const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return reason.replace(new RegExp(`(^|[\\s"'(])${escaped}/Content/`, "g"), "$1«source-root»/Content/");
+}
+
+/**
  * The packages of a slice whose import outcome differs from the full pack: a different status, or a
  * different reason. `selected` is the slice's own package list; every selected package is compared,
  * including one with no outcome row on either side (both absent), so a dependency the slice dropped —
  * or a selected package the importer never classified — cannot hide by emitting no row. Full-only rows
- * outside `selected` are ignored. Outcome reasons are compared exactly; when they carry absolute paths
- * that differ this is a false positive a caller must inspect.
+ * outside `selected` are ignored. Outcome reasons are compared exactly by default; pass `sourceRoots`
+ * to treat the slice and full pack's differing source-root prefixes as equivalent, while leaving every
+ * other reason detail — a different failure, a different dependency path — a real difference.
  */
 export function diffPackageOutcomes(
   slice: ReadonlyMap<string, PackageOutcome>,
   full: ReadonlyMap<string, PackageOutcome>,
   selected?: readonly string[],
+  sourceRoots?: SourceRoots,
 ): PackageDiff[] {
   const absent: PackageOutcome = { status: "absent" };
   // The slice's own emitted rows that the manifest missed stay in scope, so nothing the slice produced
@@ -529,7 +557,9 @@ export function diffPackageOutcomes(
   for (const pkg of packages) {
     const sliceOutcome = slice.get(pkg) ?? absent;
     const fullOutcome = full.get(pkg) ?? absent;
-    if (sliceOutcome.status !== fullOutcome.status || (sliceOutcome.reason ?? "") !== (fullOutcome.reason ?? "")) {
+    const sliceReason = sliceOutcome.reason === undefined ? "" : normalizeSourceRoot(sliceOutcome.reason, sourceRoots?.slice ?? "");
+    const fullReason = fullOutcome.reason === undefined ? "" : normalizeSourceRoot(fullOutcome.reason, sourceRoots?.full ?? "");
+    if (sliceOutcome.status !== fullOutcome.status || sliceReason !== fullReason) {
       diffs.push({ package: pkg, slice: sliceOutcome, full: fullOutcome });
     }
   }
@@ -776,6 +806,17 @@ export async function importFreshOutput(
   }
 }
 
+/**
+ * The prefix the pinned CUE4Parse provider mounts a loose directory under, mirrored from its
+ * `DefaultFileProvider`: the top-level `.uproject` name when the directory holds one, the directory
+ * name otherwise. The importer's package keys and refusal reasons embed it, so the slice and full
+ * pack need it normalized away before their outcomes are compared.
+ */
+async function sourceMountPrefix(sourceDir: string): Promise<string> {
+  const uproject = (await readdir(sourceDir)).find((name) => name.toLowerCase().endsWith(".uproject"));
+  return uproject ? uproject.slice(0, -".uproject".length) : basename(sourceDir);
+}
+
 async function runCompareFull(slice: SlicePlan, fullDir: string, outRoot: string, log: (message: string) => void): Promise<number> {
   const sliceDir = assertSafeChild(outRoot, slice.id);
   if (!existsSync(sliceDir)) throw new Error(`slice ${slice.id} is not built at ${sliceDir}; run make first`);
@@ -794,7 +835,8 @@ async function runCompareFull(slice: SlicePlan, fullDir: string, outRoot: string
   const fullReport = await importFreshOutput(fullDir, join(work, "full"), runImport, log);
   const sliceOutcomes = packageOutcomes(sliceReport);
   const fullOutcomes = packageOutcomes(fullReport);
-  const diffs = diffPackageOutcomes(sliceOutcomes, fullOutcomes, selected);
+  const [sliceRoot, fullRoot] = await Promise.all([sourceMountPrefix(sliceDir), sourceMountPrefix(resolve(fullDir))]);
+  const diffs = diffPackageOutcomes(sliceOutcomes, fullOutcomes, selected, { slice: sliceRoot, full: fullRoot });
   // Selected packages with no row on either side are still compared (both absent); record them so the
   // "nothing differs" claim is not mistaken for "every package emitted a row". Full-only rows outside
   // the slice are ignored, and counted, so that is explicit too.

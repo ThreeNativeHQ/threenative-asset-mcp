@@ -351,6 +351,43 @@ describe("fab-slice import-report comparison", () => {
     ]);
     expect(diffPackageOutcomes(slice, full, ["Content/A/X.uasset"])).toEqual([]);
   });
+
+  const PKG = "Content/IsolatedExamples/LookAtPOI/TestLevelContent/Characters/Eye/M_LookAtPOI_Eye.uasset";
+
+  it("treats two source-root prefixes as equivalent when the roots are known", () => {
+    // The provider keys a loose directory as "<source-root>/<package path>". The slice and the full
+    // pack live under different directory names, so the same refusal embeds different roots.
+    const slice = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `0 in game-anim-5.8/${PKG}; exactly one is needed` }]]);
+    const full = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `0 in GameAnimationSample/${PKG}; exactly one is needed` }]]);
+    expect(diffPackageOutcomes(slice, full, [PKG])).toHaveLength(1);
+    expect(diffPackageOutcomes(slice, full, [PKG], { slice: "game-anim-5.8", full: "GameAnimationSample" })).toEqual([]);
+  });
+
+  it("keeps a differing failure detail a difference after the source root is normalized", () => {
+    const slice = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `0 exports named in game-anim-5.8/${PKG}; exactly one is needed` }]]);
+    const full = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `2 exports named in GameAnimationSample/${PKG}; exactly one is needed` }]]);
+    expect(diffPackageOutcomes(slice, full, [PKG], { slice: "game-anim-5.8", full: "GameAnimationSample" })).toHaveLength(1);
+  });
+
+  it("does not normalize an unrelated dependency path that differs between the sides", () => {
+    const slice = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `needs game-anim-5.8/${PKG} and /Game/SliceOnly/Dep.uasset` }]]);
+    const full = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `needs GameAnimationSample/${PKG} and /Game/FullOnly/Dep.uasset` }]]);
+    const diffs = diffPackageOutcomes(slice, full, [PKG], { slice: "game-anim-5.8", full: "GameAnimationSample" });
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0]!.full.reason).toContain("/Game/FullOnly/Dep.uasset");
+  });
+
+  it("does not rewrite a source-root name inside a longer path segment", () => {
+    const slice = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `in some-game-anim-5.8/${PKG}` }]]);
+    const full = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `in some-GameAnimationSample/${PKG}` }]]);
+    expect(diffPackageOutcomes(slice, full, [PKG], { slice: "game-anim-5.8", full: "GameAnimationSample" })).toHaveLength(1);
+  });
+
+  it("does not rewrite a source-root name after a Unicode letter in the same component", () => {
+    const slice = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `in PaketÜgame-anim-5.8/${PKG}` }]]);
+    const full = new Map<string, PackageOutcome>([[PKG, { status: "failed", reason: `in PaketÜGameAnimationSample/${PKG}` }]]);
+    expect(diffPackageOutcomes(slice, full, [PKG], { slice: "game-anim-5.8", full: "GameAnimationSample" })).toHaveLength(1);
+  });
 });
 
 // Licensed slices are local-only and never committed. Set FAB_FEATURE_CORPUS_DIR to the slices root

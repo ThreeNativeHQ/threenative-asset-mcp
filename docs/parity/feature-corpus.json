@@ -78,6 +78,8 @@
         "AnimMontage",
         "BlendSpace",
         "BlendSpace1D",
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D",
         "PoseAsset"
       ],
       "classCounts": {
@@ -89,12 +91,17 @@
         "AnimMontage": 1,
         "BlendSpace": 1,
         "BlendSpace1D": 1,
+        "AimOffsetBlendSpace": 0,
+        "AimOffsetBlendSpace1D": 0,
         "PoseAsset": 3
       },
       "packages": 137,
       "bytes": 122977887,
       "packageDigest": "sha256:23e9085711730a29fbf7b827429fcece5ef4fb8216ba6b140263e686c023c2ad",
-      "gaps": []
+      "gaps": [
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D"
+      ]
     },
     {
       "id": "soul-cave-4.18",
@@ -131,6 +138,8 @@
         "AnimMontage",
         "BlendSpace",
         "BlendSpace1D",
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D",
         "PhysicsAsset",
         "Skeleton",
         "AnimNotify"
@@ -141,6 +150,8 @@
         "AnimMontage": 1,
         "BlendSpace": 1,
         "BlendSpace1D": 2,
+        "AimOffsetBlendSpace": 0,
+        "AimOffsetBlendSpace1D": 0,
         "PhysicsAsset": 2,
         "Skeleton": 8,
         "AnimNotify": 0
@@ -150,7 +161,9 @@
       "packageDigest": "sha256:079a0e6cc318b283aeaf9cb4e1820f8ce889f4dcea508648a7d488526af7fc73",
       "gaps": [
         "SkeletalMeshSocket",
-        "AnimNotify"
+        "AnimNotify",
+        "AimOffsetBlendSpace",
+        "AimOffsetBlendSpace1D"
       ]
     },
     {

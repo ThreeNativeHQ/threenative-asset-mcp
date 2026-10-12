@@ -279,6 +279,13 @@ describe("gameReferencesInHead", () => {
     expect(gameReferencesInHead(head)).toEqual(["/Game/A", "/Game/B", "/Game/C"]);
   });
 
+  it.each(["utf8", "utf16le"] as const)("reads one nested /Game/ path as a whole in a %s string", (encoding) => {
+    // Advancing past the prefix instead of past the terminator re-enters the middle of the same
+    // string and reports the spurious sub-path `/Game/B/Game` as a second reference.
+    const head = lengthPrefixed("/Game/B/Game/B/Game/", encoding);
+    expect(gameReferencesInHead(head)).toEqual(["/Game/B/Game/B/Game"]);
+  });
+
   it("keeps a hyphen and a Unicode letter in a full package path (UTF-8)", () => {
     const head = Buffer.concat([Buffer.alloc(3), lengthPrefixed("/Game/Pack/My-Mesh_Ünïcode", "utf8")]);
     expect(gameReferencesInHead(head)).toContain("/Game/Pack/My-Mesh_Ünïcode");
