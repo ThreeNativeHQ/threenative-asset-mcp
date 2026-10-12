@@ -36,7 +36,7 @@ compiled converter gate.
 
 ## Remaining work
 
-- Final-head CI is in progress. There is no external input blocker.
+- Integrated `.584.8.2` fresh real-pack proof, all four repository gates and final-head CI are pending parent execution. Earlier `.584.8.1` evidence below remains prior-head evidence; there is no external input blocker.
 
 ## Integration Ledger
 
@@ -93,3 +93,9 @@ The shipped native matcher previously stripped every prefix before `Content/`, a
 ## Final review disposition
 
 The second independent review requested changes only to the stale proof command and contradictory pending-proof sentence. Both are corrected in this final document, with the actual final21.29s result and index81.json. Its code repair and tests were accepted as correct. No third review or independent APPROVE verdict is claimed; delivery rests on the repaired findings, parent evidence and final CI. All local acceptance criteria are complete, so this original PRD moves to done/.
+
+## Frozen PR-50 integration
+
+Ordinary merge of published PR-50 head `a5908767c4358d07f739254f101d7ad2c27be224` preserves PRD-597 source-model LODs, tagged BuildScale3D and cooked-render no-double-scale behavior alongside PRD-598 external actors and full provider mount ownership. Both original completed PRDs and the other planning PRDs are retained. Converter pin is `b4e95441+threenative.584.8.2` because the `.584.8.1` cache lacks PRD-597 code; importer remains `121`. Build uses only the PRD-598 converter cache with the existing shared SDK. Prior real-pack and repository evidence remains `.584.8.1` evidence; fresh final-tag real proof, all four gates and CI belong to the parent and are pending.
+
+Integration verification: the own-cache converter build passed and reports `.584.8.2`; `npm run typecheck` passed. Focused runs with default workers and `CI=true` passed 337 tests across 11 files (one existing opt-in real-editor test skipped): converter/static mesh, UE5 sources, instance parameters, graph dump, external actors, texture decode, editor mesh/build scale and importer integration/duplicate-package routes. Compiled production cooked bounds and full-mount actor ownership both passed. `git diff --check` passed. No fresh final-tag real-pack gate, full-suite, leak gate, packed-MCP or CI result is claimed here.
