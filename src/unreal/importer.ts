@@ -1136,6 +1136,8 @@ async function indexGameplaySidecars(root: string): Promise<Map<string, string>>
 /** A raw SoundCue sidecar with the source package selector it came from. PRD-582. */
 interface CueSidecar {
   readonly path: string;
+  /** True only for the old flat raw Audio/<name>.cue.json layout. */
+  readonly legacyFlat: boolean;
   /** The cue's own package selector, e.g. `Content/Audio/SC_Footstep`. */
   readonly selector: string;
   /** The cue asset name, e.g. `SC_Footstep`. */
@@ -1157,7 +1159,7 @@ async function indexCueSidecars(root: string): Promise<Map<string, CueSidecar>> 
     const slash = withoutExt.lastIndexOf("/");
     const selector = slash >= 0 ? withoutExt.slice(0, slash) : withoutExt;
     const name = slash >= 0 ? withoutExt.slice(slash + 1) : withoutExt;
-    cues.set(withoutExt.toLowerCase(), { path: file.path, selector, name });
+    cues.set(withoutExt.toLowerCase(), { path: file.path, selector, name, legacyFlat: slash < 0 });
   }
   return cues;
 }
@@ -5105,12 +5107,12 @@ export async function importUnrealDirectory(
     // selector (or, for a flattened legacy sidecar, its bare name), so a package this build already
     // converted is never also reported as skipped.
     const cuePackageSelectors = new Set<string>();
+    const legacyCueNames = new Set<string>();
     for (const cue of modernCueSidecars.values()) {
       cuePackageSelectors.add(cue.selector.toLowerCase());
-      // Only a truly flat legacy sidecar (its selector is its bare name) may stand in for the package.
-      // A new sidecar keyed by a full selector must not let a same-named package in another folder be
-      // reported converted when it emitted nothing.
-      if (cue.selector.toLowerCase() === cue.name.toLowerCase()) cuePackageSelectors.add(cue.name.toLowerCase());
+      // A new root-level package can also have selector === name. Only the actual flat raw
+      // layout may claim a package by basename; keep those names separate from exact selectors.
+      if (cue.legacyFlat) legacyCueNames.add(cue.name.toLowerCase());
     }
     for (const [key, { selector, package: packagePath }] of gameplaySelectors) {
       if (meshSelectors.has(key)) continue;
@@ -5120,7 +5122,7 @@ export async function importUnrealDirectory(
         // `modernCueSidecars`. Report it skipped only when no cue claimed it, so a descriptor-only
         // import never lists a package it actually converted.
         const cueName = basename(packagePath, extname(packagePath)).toLowerCase();
-        if (cuePackageSelectors.has(key) || cuePackageSelectors.has(cueName)) continue;
+        if (cuePackageSelectors.has(key) || legacyCueNames.has(cueName)) continue;
         skipped.push({
           package: packagePath,
           reason: "Gameplay package produced no Gameplay sidecar; it holds no socket, collision, physics asset or SoundCue this build decoded.",

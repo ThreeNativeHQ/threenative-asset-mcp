@@ -106,16 +106,17 @@ async function runImport(
   packages: Record<string, readonly string[]>,
   outputs: (root: string) => Record<string, Record<string, string>>,
   umodelExportFrom?: string,
-  extras?: { readonly ue5?: readonly string[]; readonly listExitCode?: number },
+  extras?: { readonly ue5?: readonly string[]; readonly listExitCode?: number; readonly rootPackages?: boolean },
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "asset-mcp-gameplay-import-"));
   onTestFinished(() => rm(root, { recursive: true, force: true }));
   const sourceDir = join(root, "source");
   const ue5 = new Set(extras?.ue5 ?? []);
   const classes: Record<string, string[]> = {};
+  const contentRoot = extras?.rootPackages ? "" : "Content";
   for (const [relative, names] of Object.entries(packages)) {
-    await mkdir(dirname(join(sourceDir, "Content", relative)), { recursive: true });
-    await writeFile(join(sourceDir, "Content", `${relative}.uasset`), ue5.has(relative) ? ue5Package(names) : ue4Package(names));
+    await mkdir(dirname(join(sourceDir, contentRoot, relative)), { recursive: true });
+    await writeFile(join(sourceDir, contentRoot, `${relative}.uasset`), ue5.has(relative) ? ue5Package(names) : ue4Package(names));
     // UE Viewer cannot list a UE5 package: report no rows for it, so only the name-table sniff can name it.
     classes[relative.split("/").pop()!] = ue5.has(relative) ? [] : [...names];
   }
@@ -498,6 +499,21 @@ describe("gameplay data through the public import path", () => {
     expect(report.skipped.some((entry) => entry.package.includes("Audio/B/SC_Footstep"))).toBe(true);
     expect(report.failed.some((entry) => entry.package.includes("SC_Footstep"))).toBe(false);
     expect(report.skipped.some((entry) => entry.package.includes("Audio/A/SC_Footstep"))).toBe(false);
+  });
+
+  it("does not let a new root-level cue claim a missing nested same-named cue", async () => {
+    const { report } = await runImport(
+      { SC_Same: ["SoundCue"], "Nested/SC_Same": ["SoundCue"] },
+      () => ({ "": {
+        "Audio/SC_Same/SC_Same.cue.json": `text:${JSON.stringify({ name: "SC_Same", root: null })}`,
+      } }),
+      undefined,
+      { rootPackages: true },
+    );
+    expect(report.soundCues).toHaveLength(1);
+    expect(report.soundCues[0]!.package).toBe("SC_Same.uasset");
+    expect(report.skipped.some(entry => entry.package === "Nested/SC_Same.uasset")).toBe(true);
+    expect(report.skipped.some(entry => entry.package === "SC_Same.uasset")).toBe(false);
   });
 
   it("resolves a cue wave to the SoundWave its full package selector names, not a same-named one", async () => {
