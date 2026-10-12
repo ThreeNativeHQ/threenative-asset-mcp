@@ -34,9 +34,9 @@ compiled converter gate.
 - [ ] AC-3 [local]: Before/after level sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: pending.
 - [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: pending.
 
-## Blocked on
+## Remaining work
 
-- AC-3 parent-owned before/after sheet inspection and AC-4 rerun on the integrated final head. The Phase 1 real input is unblocked and remains local-only.
+- AC-3 PR attachment and AC-4 final checks are parent-owned work in progress. There is no external input blocker.
 
 ## Integration Ledger
 
@@ -73,8 +73,13 @@ compiled converter gate.
 ## Local real evidence
 
 - Source stage: `/home/joao/.cache/threenative-asset-mcp/prd598-real-stage-Zt2Wd8` — 28 hashed files: the selected `.umap`, 3 probe-confirmed external actor packages, and the 24-file dependency closure.
-- Native output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/native-output/Scenes/MedievalVillage_P_WP.scene-source.json`.
+- Native output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/native-output/Scenes/` (exact JSON path is in the local proof index).
 - Public output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/public-output` (`import-report.json`, scene GLB, scene manifest); report source hash `sha256:9a0bee37c32cff152f8c9634577fd538e47dd51f8e22c561ac10cf91cf31b331`.
-- Association output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/association-output/Scenes/MedievalVillage_P_WP.scene-source.json`; 3 valid actors remain while same-basename/different-prefix and external-object distractors are excluded, and the deliberately corrupt matching package is an `ExternalActorPackage` omission with a named load reason.
+- Association output: `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/association-output/Scenes/` (exact JSON path is in the local proof index); 3 valid actors remain while same-basename/different-prefix and external-object distractors are excluded, and the deliberately corrupt matching package is an `ExternalActorPackage` omission with a named load reason.
 - Fresh focused evidence: `PRD598_REAL_WP_PROOF_INDEX=/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index.json npx vitest run tests/fab-feature-corpus.test.ts --maxWorkers=1` → 35 passed, 9 expected skips; `npx vitest run tests/unreal-external-actors.test.ts --maxWorkers=1` → 3 passed.
 - Parent reports prior repository gates and PR #50 CI green; AC-4 stays open here until those gates run on the integrated final head, and AC-3 stays parent-owned.
+
+## Decisions
+
+- Official reference: `/home/joao/projects/UnrealEngine-5.8.3`, tag `5.8.3-release`, commit `396c9f059903aed5fec78ecd3d437a40c6415368`. `Engine/Source/Runtime/Engine/Private/Level.cpp:4151-4164` constructs the external actor directory from the mount, complete map package path and short name. `:4069-4110` appends two bucket directories and the remaining Base36 name for both Original and Reduced schemes. Matching the complete owning map path before the last three path components follows that layout; same-basename maps elsewhere are excluded. `:4598-4602` discovers on-disk external packages through the map-specific external actor paths. These source snippets were read directly from the official Git blobs; no engine build was required.
+- Parent inspected the production neutral comparison: original `.584.4` public scene has0 actors; `.584.8` has3 actual decoded actors. Full-level framing shows widely spaced pieces as small points, so the attached comparison uses crops of the three actual public scene nodes. Global placement is independently checked against the stored source transforms in the real gate. Renderer policy and lighting are unchanged; no fidelity sweep was run.
