@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.86-gameplay",
+  version: "b4e95441+threenative.89-animation",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -413,9 +413,139 @@ diff --git a/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs b/CUE4Pars
              return (Type) ver;
 +        if (Ar.IsAbsentInUe4Package(GUID))
 +            return Type.BeforeCustomVersionWasAdded;
-
+ 
          return Ar.Game switch
          {
+diff --git a/CUE4Parse/UE4/Assets/Exports/Animation/FRawAnimSequenceTrack.cs b/CUE4Parse/UE4/Assets/Exports/Animation/FRawAnimSequenceTrack.cs
+--- a/CUE4Parse/UE4/Assets/Exports/Animation/FRawAnimSequenceTrack.cs
++++ b/CUE4Parse/UE4/Assets/Exports/Animation/FRawAnimSequenceTrack.cs
+@@ -9,6 +9,17 @@ public class FRawAnimSequenceTrack : IUStruct
+     public readonly FVector[] PosKeys;
+     public readonly FQuat[] RotKeys;
+     public readonly FVector[] ScaleKeys;
+     public readonly float[] KeyTimes;
+ 
++    // A UAnimDataModel track read from a package saved before FUE5ReleaseStreamObjectVersion::RawAnimSequenceTrackSerializer
++    // is written as tagged PosKeys/RotKeys/ScaleKeys arrays. Building it here lets the adapter hand it to AnimConverter
++    // exactly like a native raw track, without a second track representation.
++    public FRawAnimSequenceTrack(FVector[] posKeys, FQuat[] rotKeys, FVector[] scaleKeys)
++    {
++        PosKeys = posKeys;
++        RotKeys = rotKeys;
++        ScaleKeys = scaleKeys;
++        KeyTimes = [];
++    }
++
+     public FRawAnimSequenceTrack(FArchive Ar)
+diff --git a/CUE4Parse/UE4/Assets/Objects/FScriptStruct.cs b/CUE4Parse/UE4/Assets/Objects/FScriptStruct.cs
+--- a/CUE4Parse/UE4/Assets/Objects/FScriptStruct.cs
++++ b/CUE4Parse/UE4/Assets/Objects/FScriptStruct.cs
+@@ -163,5 +163,9 @@ public class FScriptStruct
+             "Rotator" => type == ReadType.ZERO ? new FRotator() : new FRotator(Ar),
+             "Rotator3f" => type == ReadType.ZERO ? new FRotator() : new FRotator(Ar.Read<float>(), Ar.Read<float>(), Ar.Read<float>()),
+             "Rotator3d" => type == ReadType.ZERO ? new FRotator() : new FRotator(Ar.Read<double>(), Ar.Read<double>(), Ar.Read<double>()),
+-            "RawAnimSequenceTrack" => new FRawAnimSequenceTrack(Ar),
++            // UE5's FRawAnimSequenceTrack gained a WithSerializer trait at FUE5ReleaseStreamObjectVersion::RawAnimSequenceTrackSerializer.
++            // Before that version the struct was written as tagged UPROPERTYs, so read the fallback rather than the native bulk layout.
++            "RawAnimSequenceTrack" => FUE5ReleaseStreamObjectVersion.Get(Ar) >= FUE5ReleaseStreamObjectVersion.Type.RawAnimSequenceTrackSerializer
++                ? new FRawAnimSequenceTrack(Ar)
++                : new FStructFallback(Ar, structName),
+             "Spline" => type == ReadType.ZERO ? new FSpline() : new FSpline(Ar),
+diff --git a/CUE4Parse/UE4/Assets/Exports/Animation/UAnimSequence.cs b/CUE4Parse/UE4/Assets/Exports/Animation/UAnimSequence.cs
+--- a/CUE4Parse/UE4/Assets/Exports/Animation/UAnimSequence.cs
++++ b/CUE4Parse/UE4/Assets/Exports/Animation/UAnimSequence.cs
+@@ -57,6 +57,22 @@ public override void Deserialize(FAssetArchive Ar, long validPos)
+             RefFrameIndex = GetOrDefault(nameof(RefFrameIndex), 0);
+             RetargetSource = GetOrDefault<FName>(nameof(RetargetSource));
+             RetargetSourceAssetReferencePose = GetOrDefault<FTransform[]>(nameof(RetargetSourceAssetReferencePose));
++            // The editor raw-data track map is a tagged UPROPERTY whose elements land as struct fallbacks,
++            // so read BoneTreeIndex from the fallback. Without it the editor RawAnimationData has no bone
++            // mapping and GetNumTracks / FindTrackForBoneIndex return nothing.
++            if (TryGetValue<FStructFallback[]>(out var trackMapFallback, nameof(TrackToSkeletonMapTable)))
++            {
++                var trackMap = new FTrackToSkeletonMap[trackMapFallback.Length];
++                for (var index = 0; index < trackMapFallback.Length; index++)
++                {
++                    // A missing BoneTreeIndex is INDEX_NONE, not bone 0: defaulting it to 0 would map an
++                    // unmapped raw track onto the root bone. AnimConverter rejects such a malformed map.
++                    if (!trackMapFallback[index].TryGetValue<int>(out var boneTreeIndex, "BoneTreeIndex"))
++                        boneTreeIndex = -1;
++                    trackMap[index] = new FTrackToSkeletonMap { BoneTreeIndex = boneTreeIndex };
++                }
++                TrackToSkeletonMapTable = trackMap;
++            }
+             Interpolation = GetOrDefault<EAnimInterpolationType>(nameof(Interpolation));
+ 
+             if (BoneCompressionSettings == null && Ar.Game == GAME_RogueCompany)
+diff --git a/CUE4Parse-Conversion/Legacy/AnimConverter.cs b/CUE4Parse-Conversion/Legacy/AnimConverter.cs
+--- a/CUE4Parse-Conversion/Legacy/AnimConverter.cs
++++ b/CUE4Parse-Conversion/Legacy/AnimConverter.cs
+@@ -135,24 +135,40 @@ private static CAnimSequence ConvertSequence(this UAnimSequence animSequence, US
+             var numBones = skeleton.BoneCount;
+             if (animSequence.RawAnimationData is { Length: > 0 })
+             {
+-                Trace.Assert(animSequence.RawAnimationData.Length == animSeq.Tracks.Capacity);
+-
+-                static void CopyArray<T>(out T[] dest, T[] src)
++                // The editor raw tracks and the tagged track map must agree and cover unique, in-range
++                // bones. A package that does not line up is rejected with its own reason instead of
++                // silently keeping the rest pose; the adapter catches the failure per clip, so it never
++                // aborts the whole conversion run for the other assets.
++                static void CopyArray<T>(out T[] dest, T[]? src)
+                 {
+-                    dest = new T[src.Length];
+-                    src.CopyTo(dest, 0);
++                    dest = src is null ? [] : new T[src.Length];
++                    src?.CopyTo(dest, 0);
+                 }
+ 
++                var rawData = animSequence.RawAnimationData;
++                var trackMap = animSequence.GetTrackMap();
++                if (trackMap.Length == 0)
++                    throw new InvalidDataException($"the clip has {rawData.Length} raw bone tracks but no track-to-bone map");
++                if (trackMap.Length != rawData.Length)
++                    throw new InvalidDataException($"the clip's raw track map has {trackMap.Length} entries for {rawData.Length} tracks");
++                var mapped = new bool[numBones];
++                for (var trackIndex = 0; trackIndex < trackMap.Length; trackIndex++)
++                {
++                    var mappedBone = trackMap[trackIndex].BoneTreeIndex;
++                    if (mappedBone < 0 || mappedBone >= numBones)
++                        throw new InvalidDataException($"the clip's raw track {trackIndex} maps to bone {mappedBone}, outside the skeleton's {numBones} bones");
++                    if (mapped[mappedBone])
++                        throw new InvalidDataException($"the clip's raw track map maps more than one track to bone {mappedBone}");
++                    mapped[mappedBone] = true;
++                }
+                 for (var boneIndex = 0; boneIndex < numBones; boneIndex++)
+                 {
+                     var track = new CAnimTrack();
+                     animSeq.Tracks.Add(track);
++                    if (!mapped[boneIndex]) continue; // a sparsely animated bone legitimately keeps the rest pose
+                     var trackIndex = animSequence.FindTrackForBoneIndex(boneIndex);
+-                    if (trackIndex >= 0)
+-                    {
+-                        CopyArray(out track.KeyQuat, animSequence.RawAnimationData[trackIndex].RotKeys);
+-                        CopyArray(out track.KeyPos, animSequence.RawAnimationData[trackIndex].PosKeys);
+-                        CopyArray(out track.KeyScale, animSequence.RawAnimationData[trackIndex].ScaleKeys);
+-                    }
++                    CopyArray(out track.KeyQuat, rawData[trackIndex].RotKeys);
++                    CopyArray(out track.KeyPos, rawData[trackIndex].PosKeys);
++                    CopyArray(out track.KeyScale, rawData[trackIndex].ScaleKeys);
+                 }
+             }
+diff --git a/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs b/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs
+--- a/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs
++++ b/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs
+@@ -23,6 +23,8 @@ namespace CUE4Parse.UE4.Assets.Exports.Animation
+         public FAnimCurveBase(FStructFallback data)
+         {
+-            CurveName = data.GetOrDefault<FName>(nameof(CurveName));
++            CurveName = data.TryGetValue<FName>(out var curveName, nameof(CurveName))
++                ? curveName
++                : data.GetOrDefault<CUE4Parse.UE4.Objects.Engine.Animation.FSmartName>("Name").DisplayName;
+             CurveTypeFlags = data.GetOrDefault<int>(nameof(CurveTypeFlags));
+         }
+     }
+
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
@@ -579,10 +709,16 @@ using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Versions;
+using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Objects.Engine.Animation;
+using CUE4Parse.UE4.Writers;
 using CUE4Parse_Conversion;
+using CUE4Parse_Conversion.Animations;
 using CUE4Parse_Conversion.Exporters;
 using CUE4Parse_Conversion.Options;
 using CUE4Parse_Conversion.Sounds;
+using CUE4Parse_Conversion.Writers.ActorX;
+using CUE4Parse_Conversion.Writers.ActorX.Structs.Animations;
 using Newtonsoft.Json;
 
 if (args.Contains("--version")) { Console.WriteLine("threenative-cue4parse ${CUE4PARSE_SOURCE.version}"); return; }
@@ -641,6 +777,10 @@ var requestedLods = lodsAt >= 0
         .ToArray()
     : new[] { 0 };
 if (requestedLods.Length == 0) throw new ArgumentException("--lods needs at least one LOD index");
+// Animation mode (PRD-583): read the package's animation data (clips, blend spaces, aim offsets,
+// montages, composites) and write it under Animation/. It is kept apart from the mesh/material
+// export so a pack's clips do not force a second full decode of every mesh.
+var animationsOnly = args.Contains("--animations");
 bool MatchesFilter(string key)
 {
     // Data-texture mode names one package: the provider key its selector maps to, case and separators included.
@@ -674,6 +814,7 @@ if (dumpAt < 0 && graphAt < 0)
     Directory.CreateDirectory(Path.Combine(output, "TileMaps"));
     Directory.CreateDirectory(Path.Combine(output, "Grooms"));
     Directory.CreateDirectory(Path.Combine(output, "Gameplay"));
+    Directory.CreateDirectory(Path.Combine(output, "Animation"));
 }
 ObjectTypeRegistry.RegisterClass(typeof(USkeletalMeshEditorData));
 // CUE4Parse swallows an export it cannot deserialize and logs it, which leaves a mesh with no
@@ -2279,6 +2420,749 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
     return true;
 }
 
+// PRD-583: UE5 clips, blend spaces, aim offsets, montages and composites ------------------------------------------
+// The pinned CUE4Parse reader exposes a clip's bone tracks only through RawAnimationData, the UE4
+// FUECompressedAnimData layout or ACL. A UE5.6+ clip keeps its tracks in a ControlRig MovieScene
+// model instead, so it is reported with its reason and never replaced by the bind pose.
+// One animation artifact per package, nested so two packages that share a clip or asset basename
+// ("/Game/A/Walk" and "/Game/B/Walk") never overwrite each other. The directory is the package path
+// below "/Game/"; the file name is the object name, which the importer reads back into exact
+// provenance. A traversal segment is rejected, never dropped, so "/Game/../../etc" cannot alias to
+// "/Game/etc"; the result stays under the animation output root.
+string AnimationTarget(string packagePath, string fileName, string extension)
+{
+    var relative = GamePackagePath(packagePath);
+    var sub = relative.StartsWith("/Game/", StringComparison.OrdinalIgnoreCase) ? relative["/Game/".Length..] : relative.TrimStart('/');
+    var segments = sub.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    foreach (var segment in segments)
+        if (segment == "." || segment == "..")
+            throw new InvalidDataException($"refusing a traversal segment in animation package {packagePath}");
+    if (fileName.Contains('/') || fileName.Contains('\\') || fileName == "." || fileName == "..")
+        throw new InvalidDataException($"refusing an unsafe animation artifact name {fileName}");
+    var directory = segments.Length > 0 ? Path.Combine(segments) : "";
+    return Path.Combine(output, "Animation", directory, fileName + extension);
+}
+
+// Every animation write goes through one place that creates the package directory first, so a nested
+// package's first write never throws DirectoryNotFound; the artifact path stays under the output root.
+string WriteAnimationTarget(string packagePath, string fileName, string extension)
+{
+    var target = AnimationTarget(packagePath, fileName, extension);
+    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+    return target;
+}
+
+void WriteAnimationJson(string packagePath, string fileName, object document) =>
+    File.WriteAllText(WriteAnimationTarget(packagePath, fileName, ".json"), JsonConvert.SerializeObject(document, Formatting.Indented), new UTF8Encoding(false));
+
+void WriteAnimationBytes(string packagePath, string fileName, string extension, byte[] bytes) =>
+    File.WriteAllBytes(WriteAnimationTarget(packagePath, fileName, extension), bytes);
+
+// A canonical package-qualified identity ("/Game/A/Walk.Walk") rather than a bare object name, so the
+// importer maps the failure to the exact package and never collapses two same-named clips.
+void ReportAnimationFailure(string packagePath, string name, string reason) =>
+    Console.Error.WriteLine($"threenative-animation-failure {(string.IsNullOrEmpty(packagePath) ? name : packagePath + "." + name)} {reason}");
+
+// The raw element of a fixed struct array (BlendParameters[3], InterpolationParam[3]). Reading it keeps
+// the fields the serializer omitted visible, so FBlendParameter's defaults can be restored: a typed read
+// returns 0 for an absent GridNum, while Unreal's default is 4.
+static FStructFallback? FixedArrayElement(UObject holder, string name, int index)
+{
+    foreach (var property in holder.Properties)
+        if (property.Name.Text == name && property.ArrayIndex == index)
+            return property.Tag?.GetValue(typeof(FStructFallback)) as FStructFallback;
+    return null;
+}
+
+// The raw elements of a dynamic struct TArray (SampleData is one). Unlike a fixed array, whose raw tag
+// is one property per index, the whole TArray is one ArrayProperty at ArrayIndex 0, so a per-index
+// FixedArrayElement read never reaches element 1 and reads the array as a struct at 0. Here the array's
+// own tag yields every element.
+static FStructFallback[] ArrayElements(AbstractPropertyHolder holder, string name)
+{
+    foreach (var property in holder.Properties)
+        if (property.Name.Text == name && property.Tag?.GetValue(typeof(FStructFallback[])) is FStructFallback[] elements)
+            return elements;
+    return [];
+}
+
+static FStructFallback? StructProperty(UObject holder, string name)
+{
+    // A struct tag is either a bare FStructFallback or, when the struct name resolved to a typed struct,
+    // an FScriptStruct wrapping one; unwrap it so a caller that only wants the fields reads both.
+    FStructFallback? found = null;
+    foreach (var property in holder.Properties)
+    {
+        if (property.Name.Text != name) continue;
+        var value = property.Tag?.GenericValue;
+        if (value is FStructFallback fallback) found = fallback;
+        else if (value is FScriptStruct script && script.StructType is FStructFallback inner) found = inner;
+    }
+    return found;
+}
+
+static bool StructNumber(FStructFallback? data, string field, out double value)
+{
+    value = 0;
+    if (data is null) return false;
+    if (data.TryGetValue<float>(out var single, field)) { value = single; return true; }
+    if (data.TryGetValue<int>(out var integer, field)) { value = integer; return true; }
+    return false;
+}
+
+static bool StructBool(FStructFallback? data, string field, out bool value)
+{
+    value = false;
+    return data is not null && data.TryGetValue<bool>(out value, field);
+}
+
+static string StructText(FStructFallback? data, string field)
+{
+    if (data is null) return "";
+    if (data.TryGetValue<string>(out var text, field)) return text ?? "";
+    if (data.TryGetValue<FName>(out var name, field)) return name.Text ?? "";
+    if (data.TryGetValue<byte>(out var number, field)) return number.ToString();
+    return "";
+}
+
+// One blend-space axis. UBlendSpaceBase.BlendParameters is the typed fixed array and holds the actual
+// values. When the raw tag exists it says which fields the serializer wrote, and
+// CUE4Parse's FBlendParameter(FStructFallback) then leaves an omitted field at default(T) instead of the
+// struct's default, so that field alone takes the Unreal default (Min 0, Max 100, GridNum 4,
+// DisplayName "None", the two flags false). When no raw tag exists at all (an unversioned package) the
+// typed read is the only source, so every typed value is used as stored rather than replaced by defaults.
+static Dictionary<string, object?> BlendAxis(FBlendParameter? typed, FStructFallback? raw)
+{
+    bool omitted(string field) => raw is not null && !raw.Properties.Exists(property => property.Name.Text == field);
+    return new Dictionary<string, object?>
+    {
+        ["displayName"] = omitted("DisplayName") ? "None" : (typed?.DisplayName ?? ""),
+        ["min"] = omitted("Min") ? 0d : DumpNum(typed?.Min ?? 0f),
+        ["max"] = omitted("Max") ? 100d : DumpNum(typed?.Max ?? 0f),
+        ["gridNum"] = omitted("GridNum") ? 4 : (typed?.GridNum ?? 0),
+        ["snapToGrid"] = omitted("bSnapToGrid") ? false : (typed?.bSnapToGrid ?? false),
+        ["wrapInput"] = omitted("bWrapInput") ? false : (typed?.bWrapInput ?? false),
+    };
+}
+
+// A canonical animation reference: the resolved object's package path plus its object name, e.g.
+// "/Game/A/Walk.Walk". Two clips that share an object name in different packages stay distinct, so a
+// consumer resolves the exact one rather than a bare basename. A reference the reader cannot resolve to
+// a package keeps its bare name, which the consumer only accepts when it is unambiguous.
+static string? AnimationReferenceName(FPackageIndex? reference)
+{
+    if (reference is null || reference.IsNull) return null;
+    var resolved = reference.ResolvedObject;
+    if (resolved is null) return reference.Name;
+    var name = resolved.Name.Text ?? reference.Name;
+    var packagePath = ResolvedPackagePath(resolved);
+    return string.IsNullOrEmpty(packagePath) ? name : packagePath + "." + name;
+}
+
+// The canonical package path of a skeleton reference, without the object suffix ("/Game/A/SK_Hero").
+// Used as skeleton provenance so a clip is matched to its exact skeleton package, not to a bare name.
+static string? SkeletonPackagePath(FPackageIndex? reference) => IndexPackagePath(reference);
+
+// The notifier a consumer dispatches, from the class behind the reference rather than the instance's own
+// object name. An editor places a notify instance whose object name is its own ("AnimNotify_Footstep_2");
+// its class is "AnimNotify_Footstep". A Blueprint notifier resolves to a generated class named "<Name>_C",
+// whose behaviour is bytecode this importer cannot run, so it is marked "blueprint".
+static (string ClassName, string Kind) NotifyClassNames(string? objectClass, string? objectName, string? stateClass)
+{
+    var blueprint = false;
+    var className = objectClass;
+    if (string.IsNullOrEmpty(className) || className is "Class" or "BlueprintGeneratedClass" or "Object" or "ScriptClass")
+        className = objectName;
+    if (string.IsNullOrEmpty(className) && !string.IsNullOrEmpty(stateClass)) className = stateClass;
+    if (string.IsNullOrEmpty(className)) className = "AnimNotify";
+    if (className.EndsWith("_C", StringComparison.Ordinal)) { className = className[..^2]; blueprint = true; }
+    var kind = !string.IsNullOrEmpty(stateClass) ? "state" : blueprint ? "blueprint" : "notify";
+    return (className, kind);
+}
+
+static string NotifyObjectClass(FPackageIndex? reference)
+{
+    if (reference is null || reference.IsNull) return "";
+    var resolved = reference.ResolvedObject;
+    return resolved?.Class?.Name.Text ?? reference.Name;
+}
+
+static string NotifyObjectName(FPackageIndex? reference) =>
+    reference is null || reference.IsNull ? "" : (reference.ResolvedObject?.Name.Text ?? reference.Name);
+
+// A clip's notifies. UE4 sequences keep them in the Notifies property; UE5.6+ moves them into
+// AnimNotifyTracks[].Notifies, which the pinned reader leaves as a struct fallback. The data model may
+// carry the tracks when the sequence itself no longer does.
+List<Dictionary<string, object?>> NotifyRecords(UObject asset, FAnimNotifyEvent[]? typed, UObject? model)
+{
+    var notifies = new List<FAnimNotifyEvent>();
+    if (typed is not null) notifies.AddRange(typed);
+    if (notifies.Count == 0)
+        foreach (var holder in new[] { asset, model }.Where(holder => holder is not null))
+            foreach (var track in holder!.GetOrDefault<FStructFallback[]>("AnimNotifyTracks", []))
+                if (track.TryGetValue<FAnimNotifyEvent[]>(out var inner, "Notifies") && inner is not null)
+                    notifies.AddRange(inner);
+    var records = new List<Dictionary<string, object?>>();
+    foreach (var notify in notifies)
+    {
+        var stateClass = notify.NotifyStateClass;
+        var (className, kind) = NotifyClassNames(
+            NotifyObjectClass(notify.Notify),
+            NotifyObjectName(notify.Notify),
+            NotifyObjectClass(stateClass) is { Length: > 0 } stateClassName ? stateClassName : NotifyObjectName(stateClass));
+        var name = notify.NotifyName?.Text;
+        if (string.IsNullOrEmpty(name)) name = className;
+        records.Add(new Dictionary<string, object?>
+        {
+            ["name"] = name,
+            ["time"] = DumpNum(notify.GetTime()),
+            ["duration"] = DumpNum(notify.Duration),
+            ["track"] = notify.TrackIndex,
+            ["kind"] = kind,
+            ["className"] = className,
+        });
+    }
+    return records;
+}
+
+// The clip's authored sync markers, from the sequence or the separate data model.
+static List<Dictionary<string, object?>> SyncMarkerRecords(UObject asset, UObject? model)
+{
+    var records = new List<Dictionary<string, object?>>();
+    foreach (var holder in new[] { asset, model })
+    {
+        if (holder is null || !holder.TryGetAllValues(out FStructFallback[] markers, "SyncMarkers")) continue;
+        foreach (var marker in markers)
+            records.Add(new Dictionary<string, object?>
+            {
+                ["name"] = StructText(marker, "MarkerName"),
+                ["time"] = StructNumber(marker, "Time", out var time) ? time : 0d,
+            });
+        if (records.Count > 0) break;
+    }
+    return records;
+}
+
+// Float curves from RawCurveData / CompressedCurveData (UE4-era), the LegacyCurveData a 5.6+ sequence
+// keeps, the LegacyCurveData on a separate AnimationDataModel export, or the conventional
+// UAnimDataModel.CurveData.FloatCurves. CurveData is read only from the clip's exact conventional model
+// (never the first DataModel-named export), so a 5.6+ Sequencer model's curves are not misattributed.
+List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence, UObject? model, UObject? exactModel)
+{
+    // UAnimationSequencerDataModel::GetCurveData returns LegacyCurveData. The sequence's runtime
+    // RawCurveData can have reduced keys (602 authored keys versus 2 runtime keys in the real proof).
+    var modelLegacy = model is null ? null : StructProperty(model, "LegacyCurveData");
+    var sequenceLegacy = StructProperty(sequence, "LegacyCurveData");
+    FRawCurveTracks? conventional = null;
+    if (exactModel is not null && StructProperty(exactModel, "CurveData") is { } curveData)
+    {
+        if (curveData.TryGetValue<FFloatCurve[]>(out var typedCurves, "FloatCurves") && typedCurves is not null)
+            conventional = new FRawCurveTracks(typedCurves);
+        else if (curveData.TryGetValue<FStructFallback[]>(out var rawCurves, "FloatCurves") && rawCurves is not null)
+            conventional = new FRawCurveTracks(rawCurves.Select(curve => new FFloatCurve(curve)).ToArray());
+    }
+    var tracks = SelectAuthoredCurveTracks(conventional,
+        modelLegacy is null ? null : new FRawCurveTracks(modelLegacy),
+        sequenceLegacy is null ? null : new FRawCurveTracks(sequenceLegacy),
+        sequence.RawCurveData, sequence.CompressedCurveData);
+    if (tracks?.FloatCurves is { } curves) return CurveList(curves);
+    return [];
+}
+
+static FRawCurveTracks? SelectAuthoredCurveTracks(FRawCurveTracks? conventional, FRawCurveTracks? modelLegacy, FRawCurveTracks? sequenceLegacy, FRawCurveTracks? raw, FRawCurveTracks? compressed) =>
+    conventional ?? modelLegacy ?? sequenceLegacy ?? raw ?? compressed;
+
+// One FFloatCurve's keys, with the interpolation mode and both tangents. The name is the curve's own
+// smart name from the model, so a consumer joins on the authored name rather than an index.
+static List<Dictionary<string, object?>> CurveList(IEnumerable<FFloatCurve?> curves)
+{
+    var records = new List<Dictionary<string, object?>>();
+    foreach (var curve in curves)
+    {
+        var keys = new List<Dictionary<string, object?>>();
+        if (curve?.FloatCurve?.Keys is { } richKeys)
+            foreach (var key in richKeys)
+                keys.Add(new Dictionary<string, object?>
+                {
+                    ["time"] = DumpNum(key.Time),
+                    ["value"] = DumpNum(key.Value),
+                    ["arrive"] = DumpNum(key.ArriveTangent),
+                    ["leave"] = DumpNum(key.LeaveTangent),
+                    ["interp"] = key.InterpMode.ToString(),
+                });
+        records.Add(new Dictionary<string, object?> { ["name"] = curve?.CurveName.Text ?? "", ["keys"] = keys });
+    }
+    return records;
+}
+
+// The sequence keeps its curves, notifies and sync markers on a separate data-model export. Resolve it
+// only from an exact reference the clip itself carries (its DataModel object pointer or its
+// DataModelInterface script-interface), or from a model this exact sequence owns. This reader takes
+// metadata only, so any data-model class is accepted here (the conventional UAnimDataModel or a
+// Sequencer/ControlRig UAnimationSequencerDataModel); bone tracks still come from ExactDataModel. Never
+// fall back to the first "DataModel"-named export in the package: that misattributes one asset's
+// metadata to another. More than one model owned by the clip is ambiguous and reported, not guessed.
+// Ownership is the full object path, not Outer.Name: two objects nested in different owners can share a
+// name, and a name match alone would hand this clip another owner's model.
+static bool IsOwnedBy(UObject export, UObject owner)
+{
+    try
+    {
+        var outer = export.Outer;
+        if (outer is null) return false;
+        var outerPath = outer.GetPathName();
+        var ownerPath = owner.GetPathName();
+        if (!string.IsNullOrEmpty(outerPath) && !string.IsNullOrEmpty(ownerPath))
+            return string.Equals(outerPath, ownerPath, StringComparison.Ordinal);
+        return ReferenceEquals(outer, owner);
+    }
+    catch { return false; }
+}
+
+static UObject? DataModelExport(IPackage package, UObject sequence, out string ambiguity)
+{
+    ambiguity = "";
+    if (sequence.TryGetValue<FPackageIndex>(out var modelIndex, "DataModel", "AnimationDataModel", "SequencerDataModel") && modelIndex is { IsNull: false })
+    {
+        try { if (modelIndex.Load<UObject>() is { } model) return model; } catch { }
+    }
+    else if (sequence.TryGetValue<FScriptInterface>(out var reference, "DataModelInterface") && reference.Object is { IsNull: false })
+    {
+        try { if (reference.Object.Load<UObject>() is { } model) return model; } catch { }
+    }
+    var owned = package.GetExports().Where(export =>
+        export.ExportType.Contains("DataModel", StringComparison.OrdinalIgnoreCase) &&
+        IsOwnedBy(export, sequence)).ToArray();
+    if (owned.Length == 1) return owned[0];
+    if (owned.Length > 1)
+        ambiguity = $"the clip has {owned.Length} data-model exports whose Outer is the clip; refusing to choose one";
+    return null;
+}
+
+// The conventional UAnimDataModel (UE5.0-5.5 editor bone tracks) for this exact clip. It is the object
+// the clip's own DataModel/DataModelInterface property names, or the editor-created export that is named
+// "AnimDataModel" and, as NewObject(this, "AnimDataModel") makes it, has this sequence as its Outer.
+// A ControlRig/Sequencer model is a different class and is never accepted here, so an unknown model stays
+// explicit unsupported rather than being read as if it were the conventional one.
+static bool IsConventionalDataModel(UObject export) => export.ExportType is "AnimDataModel" or "UAnimDataModel";
+
+static UObject? ExactDataModel(UAnimSequence sequence, IPackage package)
+{
+    UObject? candidate = null;
+    if (sequence.TryGetValue<UObject>(out var direct, "DataModel") && direct is not null) candidate = direct;
+    else if (sequence.TryGetValue<FScriptInterface>(out var reference, "DataModelInterface") && reference.Object is { IsNull: false })
+    {
+        try { candidate = reference.Object.Load<UObject>(); } catch { }
+    }
+    candidate ??= package.GetExports().FirstOrDefault(export =>
+        IsConventionalDataModel(export) && IsOwnedBy(export, sequence));
+    return candidate is not null && IsConventionalDataModel(candidate) ? candidate : null;
+}
+
+// Vectors and quaternions of a tagged FRawAnimSequenceTrack. A UE5 LWC package tags them as the float
+// structs Vector3f/Quat4f (CUE4Parse TIntVector3/4<float>); an older package tags them as Vector/Quat.
+static FVector[] TaggedVectors(FStructFallback data, string field)
+{
+    if (data.TryGetValue<TIntVector3<float>[]>(out var floats, field) && floats is not null)
+        return floats.Select(value => new FVector(value.X, value.Y, value.Z)).ToArray();
+    if (data.TryGetValue<FVector[]>(out var vectors, field) && vectors is not null) return vectors;
+    return [];
+}
+
+static FQuat[] TaggedQuats(FStructFallback data, string field)
+{
+    // Both the LWC "Quat4f" and the older "Quat" tagged structs are FScriptStruct-wrapped FQuat in the
+    // pinned reader (FScriptStruct maps both names to FQuat), so read FQuat[] first. Reading
+    // TIntVector4<float>[] instead returns a silently zero-filled array for a Quat and drops every
+    // rotation, which is why the Quat4f-first order was wrong.
+    if (data.TryGetValue<FQuat[]>(out var quats, field) && quats is not null) return quats;
+    if (data.TryGetValue<TIntVector4<float>[]>(out var floats, field) && floats is not null)
+        return floats.Select(value => new FQuat(value.X, value.Y, value.Z, value.W)).ToArray();
+    return [];
+}
+
+// One FBoneAnimationTrack's FRawAnimSequenceTrack, from either serialization. A package at or after
+// FUE5ReleaseStreamObjectVersion::RawAnimSequenceTrackSerializer stores the native bulk arrays (the
+// FScriptStruct patch maps it to FRawAnimSequenceTrack); before that it is tagged properties.
+static bool ModelTrackData(FStructFallback track, out FRawAnimSequenceTrack raw, out string reason)
+{
+    reason = "";
+    if (track.TryGetValue<FRawAnimSequenceTrack>(out var native, "InternalTrackData") && native is not null)
+    {
+        raw = native;
+        return true;
+    }
+    if (track.TryGetValue<FStructFallback>(out var tagged, "InternalTrackData") && tagged is not null)
+    {
+        raw = new FRawAnimSequenceTrack(TaggedVectors(tagged, "PosKeys"), TaggedQuats(tagged, "RotKeys"), TaggedVectors(tagged, "ScaleKeys"));
+        return true;
+    }
+    raw = new FRawAnimSequenceTrack([], [], []);
+    reason = "carries no InternalTrackData";
+    return false;
+}
+
+// Map a conventional UAnimDataModel's actual bone tracks into the fields the UE4 converter already reads,
+// with the model's own rational timing. Every track is validated: a unique, in-range BoneTreeIndex and a
+// non-empty raw track. A model that fails validation yields a precise reason and no clip, never a
+// fabricated bind-pose PSA. Returns false with an empty reason when there is no conventional model, so
+// the caller can name the actual unsupported evidence (a ControlRig/Sequencer model).
+bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string reason, out Dictionary<string, object?>? timing)
+{
+    reason = "";
+    timing = null;
+    var skeleton = sequence.Skeleton?.Load<USkeleton>();
+    if (skeleton is null)
+    {
+        reason = "the clip names no skeleton to map its data-model tracks onto";
+        return false;
+    }
+    var model = ExactDataModel(sequence, package);
+    if (model is null) return false;
+    if (!model.TryGetValue<int>(out var numberOfFrames, "NumberOfFrames") || numberOfFrames <= 0)
+    {
+        reason = "the clip's data model carries no positive NumberOfFrames";
+        return false;
+    }
+    // UAnimDataModel.NumberOfFrames counts the intervals between keys; the model's own NumberOfKeys is
+    // one more and includes both endpoints. The ActorX sampler needs one frame per key, so the key count
+    // is NumberOfFrames + 1. Read the model's NumberOfKeys when the package carries it and require it.
+    var numberOfKeys = numberOfFrames + 1;
+    if (model.TryGetValue<int>(out var modelNumberOfKeys, "NumberOfKeys") && modelNumberOfKeys != numberOfKeys)
+    {
+        reason = $"the clip's data model has NumberOfFrames {numberOfFrames} but NumberOfKeys {modelNumberOfKeys}, not {numberOfKeys}";
+        return false;
+    }
+    // FrameRate is an FFrameRate tagged as a struct property; StructProperty unwraps the FScriptStruct
+    // wrapper the pinned reader puts around it before reading the rational fields. A tagged struct omits
+    // a property equal to its native default: Numerator defaults to 0 and Denominator to 1. So an omitted
+    // Denominator is the default 1 (never a guess), while an omitted Numerator is the default 0 and
+    // cannot name a rate. An explicit zero or negative value is a malformed serialized rate, not a
+    // default, so it is rejected with its own precise reason instead of being coerced to 1.
+    var frameRate = StructProperty(model, "FrameRate");
+    if (frameRate is null)
+    {
+        reason = "the clip's data model carries no FrameRate";
+        return false;
+    }
+    if (!StructNumber(frameRate, "Numerator", out var rateNumerator))
+    {
+        reason = "the clip's data model FrameRate carries no Numerator";
+        return false;
+    }
+    var numerator = (int) rateNumerator;
+    if (numerator <= 0)
+    {
+        reason = $"the clip's data model FrameRate has a non-positive Numerator {rateNumerator}";
+        return false;
+    }
+    var denominator = 1;
+    if (StructNumber(frameRate, "Denominator", out var rateDenominator))
+    {
+        if ((int) rateDenominator <= 0)
+        {
+            reason = $"the clip's data model FrameRate has a non-positive Denominator {rateDenominator}";
+            return false;
+        }
+        denominator = (int) rateDenominator;
+    }
+    var duration = numberOfFrames * (double) denominator / numerator;
+    // The model's own PlayLength must agree with NumberOfFrames at the rational rate to within a frame,
+    // or the timing is not the serialized UAnimDataModel contract.
+    if (model.TryGetValue<float>(out var playLength, "PlayLength") && playLength > 0f && Math.Abs(playLength - duration) > (double) denominator / numerator)
+    {
+        reason = $"the clip's data model PlayLength {playLength} disagrees with NumberOfFrames {numberOfFrames} at {numerator}/{denominator} fps ({duration}) by more than one frame";
+        return false;
+    }
+    if (!model.TryGetValue<FStructFallback[]>(out var tracks, "BoneAnimationTracks") || tracks.Length == 0)
+    {
+        reason = "the clip's data model carries no bone tracks";
+        return false;
+    }
+    var data = new List<FRawAnimSequenceTrack>();
+    var map = new List<FTrackToSkeletonMap>();
+    var seen = new bool[skeleton.BoneCount];
+    for (var index = 0; index < tracks.Length; index++)
+    {
+        var track = tracks[index];
+        if (!track.TryGetValue<int>(out var boneIndex, "BoneTreeIndex"))
+        {
+            reason = $"the clip's data-model track {index} carries no BoneTreeIndex";
+            return false;
+        }
+        if (boneIndex < 0 || boneIndex >= skeleton.BoneCount)
+        {
+            reason = $"the clip's data-model track {index} names bone {boneIndex}, outside the skeleton's {skeleton.BoneCount} bones";
+            return false;
+        }
+        if (seen[boneIndex])
+        {
+            reason = $"the clip's data model maps more than one track to bone {boneIndex}";
+            return false;
+        }
+        seen[boneIndex] = true;
+        if (!ModelTrackData(track, out var raw, out var trackReason))
+        {
+            reason = $"the clip's data-model track {index} (bone {boneIndex}) {trackReason}";
+            return false;
+        }
+        if (raw.RotKeys.Length == 0 && raw.PosKeys.Length == 0 && raw.ScaleKeys.Length == 0)
+        {
+            reason = $"the clip's data-model track {index} (bone {boneIndex}) carries no keys";
+            return false;
+        }
+        // Each real track array holds NumberOfKeys entries; a constant track holds one. Anything else is
+        // not the serialized UAnimDataModel contract and must be rejected, never resampled by a guess.
+        if (!ValidKeyCount(raw.RotKeys.Length, numberOfKeys) || !ValidKeyCount(raw.PosKeys.Length, numberOfKeys) || !ValidKeyCount(raw.ScaleKeys.Length, numberOfKeys))
+        {
+            reason = $"the clip's data-model track {index} (bone {boneIndex}) has {raw.RotKeys.Length}/{raw.PosKeys.Length}/{raw.ScaleKeys.Length} rot/pos/scale keys, not 1 or {numberOfKeys}";
+            return false;
+        }
+        data.Add(raw);
+        map.Add(new FTrackToSkeletonMap { BoneTreeIndex = boneIndex });
+    }
+    sequence.RawAnimationData = data.ToArray();
+    sequence.TrackToSkeletonMapTable = map.ToArray();
+    // ActorX derives FramesPerSecond from NumFrames / SequenceLength, and samples key i at frame i.
+    // Set NumFrames to the key count and SequenceLength to NumFrames / fps so every key is sampled at
+    // its own frame, the endpoint key is included, and the rate is exactly the model's rational fps.
+    sequence.NumFrames = numberOfKeys;
+    sequence.SequenceLength = (float) (numberOfKeys * (double) denominator / numerator);
+    timing = new Dictionary<string, object?>
+    {
+        ["frames"] = numberOfFrames,
+        ["keys"] = numberOfKeys,
+        ["rateNumerator"] = numerator,
+        ["rateDenominator"] = denominator,
+        ["duration"] = duration,
+    };
+    return true;
+}
+
+// A raw track array is either a single constant key or the model's full NumberOfKeys entries.
+static bool ValidKeyCount(int count, int keys) => count == 0 || count == 1 || count == keys;
+
+int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
+{
+    var name = sequence.Name;
+    var document = new Dictionary<string, object?>
+    {
+        ["format"] = "threenative-unreal-animation",
+        ["version"] = 1,
+        ["kind"] = "clip",
+        ["name"] = name,
+        ["package"] = packagePath,
+        ["className"] = "AnimSequence",
+        ["skeleton"] = SkeletonPackagePath(sequence.Skeleton),
+    };
+    try
+    {
+        var dataModel = DataModelExport(package, sequence, out var dataModelAmbiguity);
+        document["notifies"] = NotifyRecords(sequence, sequence.Notifies, dataModel);
+        document["curves"] = CurveRecords(sequence, dataModel, ExactDataModel(sequence, package));
+        document["syncMarkers"] = SyncMarkerRecords(sequence, dataModel);
+        if (dataModelAmbiguity.Length > 0) document["dataModelAmbiguity"] = dataModelAmbiguity;
+        var hasRaw = sequence.RawAnimationData is { Length: > 0 };
+        var modelReason = "";
+        if (!hasRaw && sequence.CompressedDataStructure is null)
+        {
+            if (PopulateFromDataModel(sequence, package, out var populateReason, out var modelTiming))
+            {
+                hasRaw = true;
+                if (modelTiming is not null) document["timing"] = modelTiming;
+            }
+            else modelReason = populateReason;
+        }
+        if (!hasRaw && sequence.CompressedDataStructure is null)
+        {
+            // The metadata is still real, so its sidecar is written even though no clip is exported.
+            document["unsupportedReason"] = modelReason.Length > 0 ? modelReason : UnsupportedReason(package, sequence);
+            WriteAnimationJson(packagePath, name + ".clip", document);
+            return 0;
+        }
+        var animSet = sequence.ConvertAnims();
+        var frames = 0;
+        foreach (var converted in animSet.Sequences) frames += converted.NumFrames;
+        if (animSet.Sequences.Count == 0 || frames <= 0)
+        {
+            ReportAnimationFailure(packagePath, name, "CUE4Parse decoded no bone tracks for this clip");
+            return 0;
+        }
+        using (var writer = new FArchiveWriter())
+        {
+            new ActorXAnim(animSet, 0).Save(writer);
+            WriteAnimationBytes(packagePath, name, ".psa", writer.GetBuffer());
+        }
+        WriteAnimationJson(packagePath, name + ".clip", document);
+        return 1;
+    }
+    catch (Exception error) { ReportAnimationFailure(packagePath, name, error.Message); return 0; }
+}
+
+// Why no clip was exported, from the package's own evidence rather than a blanket engine-version guess.
+// This names the exact conventional model when one exists; it never guesses from the first export whose
+// type merely contains "DataModel", which for a ControlRig pack is a different asset's model.
+string UnsupportedReason(IPackage package, UAnimSequence sequence)
+{
+    if (ExactDataModel(sequence, package) is { } model)
+        return $"the clip's {model.ExportType} bone tracks could not be read";
+    if (package.GetExports().Any(export => export.ExportType.Contains("ControlRig", StringComparison.OrdinalIgnoreCase) ||
+        export.ExportType.Contains("SequencerDataModel", StringComparison.OrdinalIgnoreCase)))
+        return "the clip's bone tracks are in a ControlRig/Sequencer MovieScene model the importer does not evaluate";
+    return $"the clip stores no raw or compressed bone data (NumFrames {sequence.NumFrames}) and references no UAnimDataModel";
+}
+
+static Dictionary<string, object?> SlotRecord(string slotName, FAnimSegment[] segments)
+{
+    var list = new List<object>();
+    foreach (var segment in segments)
+        list.Add(new Dictionary<string, object?>
+        {
+            ["animation"] = AnimationReferenceName(segment.AnimReference),
+            ["startPos"] = DumpNum(segment.StartPos),
+            ["clipStart"] = DumpNum(segment.AnimStartTime),
+            ["clipEnd"] = DumpNum(segment.AnimEndTime),
+            ["playRate"] = DumpNum(segment.AnimPlayRate),
+            ["loopCount"] = segment.LoopingCount,
+        });
+    return new Dictionary<string, object?> { ["name"] = slotName, ["segments"] = list };
+}
+
+static Dictionary<string, object?> SectionRecord(FCompositeSection section) => new()
+{
+    ["name"] = section.SectionName.Text ?? "",
+    ["next"] = section.NextSectionName.Text ?? "",
+    ["linkMethod"] = section.LinkMethod.ToString(),
+    ["segmentBeginTime"] = DumpNum(section.SegmentBeginTime),
+    ["segmentLength"] = DumpNum(section.SegmentLength),
+    ["linkValue"] = DumpNum(section.LinkValue),
+};
+
+static Dictionary<string, object?> BlendWindow(FStructFallback? data) => new()
+{
+    ["time"] = StructNumber(data, "BlendTime", out var time) ? time : 0d,
+    ["value"] = 0d,
+    ["mode"] = StructText(data, "BlendOption"),
+};
+
+void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
+{
+    var name = space.Name;
+    try
+    {
+        var className = space.ExportType;
+        var aimOffset = className.StartsWith("AimOffset", StringComparison.OrdinalIgnoreCase) ||
+            space.GetOrDefault<bool>("bContainsRotationOffsetMeshSpaceSamples");
+        var axes = new List<object>();
+        // UBlendSpaceBase always carries three axes. The typed fixed array is the source; the raw tag for
+        // a given index only says which of its fields the serializer wrote, so BlendAxis can restore a
+        // genuinely omitted default without reading the other values from Properties.
+        for (var index = 0; index < 3; index++)
+        {
+            var raw = FixedArrayElement(space, "BlendParameters", index);
+            var typed = space.BlendParameters is { } parameters && index < parameters.Length ? parameters[index] : (FBlendParameter?) null;
+            axes.Add(BlendAxis(typed, raw));
+        }
+        var samples = new List<object>();
+        var sampleData = space.SampleData ?? [];
+        // The pinned reader's FBlendSample exposes only Animation, SampleValue and RateScale, so bMirror
+        // is read from the dynamic SampleData TArray's own raw elements rather than dropped. The typed
+        // sample still carries Animation/SampleValue/RateScale.
+        var rawSamples = ArrayElements(space, "SampleData");
+        for (var index = 0; index < sampleData.Length; index++)
+        {
+            var sample = sampleData[index];
+            var rawSample = index < rawSamples.Length ? rawSamples[index] : null;
+            // FBlendSample's own default (constructor and UPROPERTY) is RateScale 1. The pinned
+            // FBlendSample(FStructFallback) overwrites that with default(float) 0 when the tag omits the
+            // field, so restore 1 only for a field the raw tag actually omitted; an explicit 0 is kept.
+            var rateScale = DumpNum(sample.RateScale);
+            if (rawSample is not null && StructNumber(rawSample, "RateScale", out var rawRateScale)) rateScale = rawRateScale;
+            else if (rawSample is not null) rateScale = 1d;
+            samples.Add(new Dictionary<string, object?>
+            {
+                ["animation"] = AnimationReferenceName(sample.Animation),
+                ["sampleValue"] = new[] { DumpNum(sample.SampleValue.X), DumpNum(sample.SampleValue.Y), DumpNum(sample.SampleValue.Z) },
+                ["rateScale"] = rateScale,
+                ["mirror"] = StructBool(rawSample, "bMirror", out var mirror) && mirror,
+            });
+        }
+        var interpolation = new List<object>();
+        for (var index = 0; index < 3; index++)
+        {
+            var raw = FixedArrayElement(space, "InterpolationParam", index);
+            if (raw is null) continue;
+            interpolation.Add(new Dictionary<string, object?>
+            {
+                ["time"] = StructNumber(raw, "InterpolationTime", out var time) ? time : 0d,
+                ["type"] = StructText(raw, "InterpolationType"),
+            });
+        }
+        WriteAnimationJson(packagePath, name, new Dictionary<string, object?>
+        {
+            ["format"] = "threenative-unreal-animation",
+            ["version"] = 1,
+            ["kind"] = "blendSpace",
+            ["name"] = name,
+            ["package"] = packagePath,
+            ["className"] = className,
+            ["skeleton"] = SkeletonPackagePath(space.Skeleton),
+            ["blendSpaceType"] = aimOffset ? "aimOffset" : (space is UBlendSpace1D ? "1D" : "2D"),
+            ["animLength"] = DumpNum(space.AnimLength),
+            ["loop"] = space.GetOrDefault("bLoop", true),
+            ["additive"] = aimOffset,
+            ["mirrorDataTable"] = AnimationReferenceName(space.GetOrDefault<FPackageIndex>("MirrorDataTable")),
+            ["previewBasePose"] = AnimationReferenceName(space.GetOrDefault<FPackageIndex>("PreviewBasePose")),
+            ["axes"] = axes,
+            ["samples"] = samples,
+            ["interpolation"] = interpolation,
+        });
+    }
+    catch (Exception error) { ReportAnimationFailure(packagePath, name, error.Message); }
+}
+
+void ExportMontage(UAnimMontage? montage, UAnimComposite? composite, string packagePath)
+{
+    UObject? asset = (UObject?) montage ?? composite;
+    if (asset is null) return;
+    var name = asset.Name;
+    try
+    {
+        var slots = new List<object>();
+        var sections = new List<object>();
+        double length;
+        if (montage is not null)
+        {
+            foreach (var slot in montage.SlotAnimTracks) slots.Add(SlotRecord(slot.SlotName.Text, slot.AnimTrack.AnimSegments));
+            foreach (var section in montage.CompositeSections) sections.Add(SectionRecord(section));
+            length = montage.CalculateSequenceLength();
+        }
+        else
+        {
+            slots.Add(SlotRecord("DefaultSlot", composite!.AnimationTrack.AnimSegments));
+            length = composite.AnimationTrack.GetLength();
+        }
+        WriteAnimationJson(packagePath, name, new Dictionary<string, object?>
+        {
+            ["format"] = "threenative-unreal-animation",
+            ["version"] = 1,
+            ["kind"] = montage is not null ? "montage" : "composite",
+            ["name"] = name,
+            ["package"] = packagePath,
+            ["className"] = montage is not null ? "AnimMontage" : "AnimComposite",
+            ["skeleton"] = SkeletonPackagePath(((UAnimationAsset) asset).Skeleton),
+            ["length"] = DumpNum((float) length),
+            ["rateScale"] = DumpNum(((UAnimSequenceBase) asset).RateScale),
+            ["blendIn"] = BlendWindow(StructProperty(asset, "BlendIn")),
+            ["blendOut"] = BlendWindow(StructProperty(asset, "BlendOut")),
+            ["slots"] = slots,
+            ["sections"] = sections,
+            ["notifies"] = NotifyRecords(asset, ((UAnimSequenceBase) asset).Notifies, null),
+        });
+    }
+    catch (Exception error) { ReportAnimationFailure(packagePath, name, error.Message); }
+}
+
 foreach (var key in provider.Files.Keys.Where(key =>
     (key.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) || key.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)) && MatchesFilter(key)))
 {
@@ -2288,6 +3172,28 @@ foreach (var key in provider.Files.Keys.Where(key =>
     {
         if (error.ToString().Contains("mapping file is missing", StringComparison.OrdinalIgnoreCase)) mappingRequired = true;
         lastLoadError = error;
+        continue;
+    }
+    if (animationsOnly)
+    {
+        var animationPackagePath = DumpGamePath(package.Name);
+        try
+        {
+            foreach (var export in package.GetExports())
+            {
+                switch (export)
+                {
+                    case UAnimSequence clip: exported += ExportClip(clip, package, animationPackagePath); break;
+                    case UBlendSpaceBase space: ExportBlendSpace(space, animationPackagePath); exported++; break;
+                    case UAnimMontage montage: ExportMontage(montage, null, animationPackagePath); exported++; break;
+                    case UAnimComposite composite: ExportMontage(null, composite, animationPackagePath); exported++; break;
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            ReportAnimationFailure(animationPackagePath, Path.GetFileNameWithoutExtension(key), error.Message);
+        }
         continue;
     }
     foreach (var export in package.GetExports()) selectedExportTypes.Add(export.GetType().Name);
@@ -3043,6 +3949,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
     var staticSockets = new List<object>();
     object? collision = null;
     string? physicsAssetRef = null;
+    string? skeletonRef = null;
     foreach (var mesh in package.GetExports().OfType<USkeletalMesh>())
     {
         foreach (var socketIndex in mesh.Sockets)
@@ -3050,6 +3957,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
         if (mesh.Skeleton?.Load<USkeleton>() is { } skeleton)
             foreach (var socketIndex in skeleton.Sockets)
                 if (socketIndex?.Load<USkeletalMeshSocket>() is { } socket) skeletalSockets.Add(GpSocket(socket, "skeleton"));
+        if (mesh.Skeleton is { IsNull: false }) skeletonRef ??= SkeletonPackagePath(mesh.Skeleton);
         // Name the physics asset by its own package selector, not its bare asset name: two folders
         // can hold a same-named asset and a bare name would attach the wrong one. Fall back to the bare
         // name only when the resolved owner package is unavailable (the importer then reports ambiguity).
@@ -3066,13 +3974,14 @@ foreach (var key in provider.Files.Keys.Where(key =>
         if (mesh.BodySetup?.Load<UBodySetup>() is { } setup) collision = GpCollision(setup);
     }
     var physics = package.GetExports().OfType<UPhysicsAsset>().Select(GpPhysics).FirstOrDefault();
-    if (skeletalSockets.Count > 0 || staticSockets.Count > 0 || collision is not null || physicsAssetRef is not null || physics is not null)
+    if (skeletalSockets.Count > 0 || staticSockets.Count > 0 || collision is not null || physicsAssetRef is not null || skeletonRef is not null || physics is not null)
     {
         var gameplay = new Dictionary<string, object?> { ["version"] = 1, ["package"] = GameplaySelector(key) };
         if (skeletalSockets.Count > 0) gameplay["skeletalSockets"] = skeletalSockets;
         if (staticSockets.Count > 0) gameplay["staticSockets"] = staticSockets;
         if (collision is not null) gameplay["collision"] = collision;
         if (physicsAssetRef is not null) gameplay["physicsAssetRef"] = physicsAssetRef;
+        if (skeletonRef is not null) gameplay["skeletonRef"] = skeletonRef;
         if (physics is not null) gameplay["physics"] = physics;
         var gameplayTarget = Path.Combine(output, "Gameplay", GameplaySelector(key) + ".json");
         Directory.CreateDirectory(Path.GetDirectoryName(gameplayTarget)!);
@@ -3093,7 +4002,9 @@ foreach (var (failedMesh, failureDetail) in meshFailures)
     Console.Error.WriteLine($"threenative-mesh-failure\t{failedMesh}\t{failureDetail}");
 if (exported == 0 && mappingRequired) throw new InvalidDataException("This cooked UE5 package uses unversioned properties. Place its game-compatible .usmap mapping file in the imported directory.");
 if (exported == 0 && lastLoadError is not null) throw new InvalidDataException("CUE4Parse could not decode the selected Unreal package.", lastLoadError);
-if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
+// Animation mode is not an empty mesh export: a clip whose tracks the reader cannot map still writes
+// its sidecar, and the importer reports each package. Aborting here would hide every one of them.
+if (exported == 0 && !animationsOnly) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
 
 // A refused material fails the conversion even when a mesh or texture in the same package exported: the output is incomplete, and a
 // successful sibling cannot publish it as whole.
