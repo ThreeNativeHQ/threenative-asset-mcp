@@ -2494,14 +2494,18 @@ void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
         for (var index = 0; index < axisCount; index++)
         {
             var raw = FixedArrayElement(space, "BlendParameters", index);
+            // A versioned package keeps each field's presence; an unversioned one leaves no raw tag, so the
+            // typed array answers with whatever it stored. The defaults apply only where a field is absent.
+            var hasRaw = raw is not null;
+            var typed = space.BlendParameters is { } parameters && index < parameters.Length ? parameters[index] : (FBlendParameter?) null;
             axes.Add(new Dictionary<string, object?>
             {
-                ["displayName"] = StructText(raw, "DisplayName"),
-                ["min"] = StructNumber(raw, "Min", out var min) ? min : 0d,
-                ["max"] = StructNumber(raw, "Max", out var max) ? max : 100d,
-                ["gridNum"] = StructNumber(raw, "GridNum", out var grid) ? (int) grid : 4,
-                ["snapToGrid"] = StructBool(raw, "bSnapToGrid", out var snap) && snap,
-                ["wrapInput"] = StructBool(raw, "bWrapInput", out var wrap) && wrap,
+                ["displayName"] = hasRaw ? StructText(raw, "DisplayName") : typed?.DisplayName ?? "",
+                ["min"] = hasRaw ? (StructNumber(raw, "Min", out var min) ? min : 0d) : typed?.Min ?? 0d,
+                ["max"] = hasRaw ? (StructNumber(raw, "Max", out var max) ? max : 100d) : typed?.Max ?? 100d,
+                ["gridNum"] = hasRaw ? (StructNumber(raw, "GridNum", out var grid) ? (int) grid : 4) : typed?.GridNum ?? 4,
+                ["snapToGrid"] = hasRaw ? (StructBool(raw, "bSnapToGrid", out var snap) && snap) : typed?.bSnapToGrid ?? false,
+                ["wrapInput"] = hasRaw ? (StructBool(raw, "bWrapInput", out var wrap) && wrap) : typed?.bWrapInput ?? false,
             });
         }
         var samples = new List<object>();
