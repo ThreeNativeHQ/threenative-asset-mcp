@@ -3598,7 +3598,9 @@ foreach (var (failedMesh, failureDetail) in meshFailures)
     Console.Error.WriteLine($"threenative-mesh-failure\t{failedMesh}\t{failureDetail}");
 if (exported == 0 && mappingRequired) throw new InvalidDataException("This cooked UE5 package uses unversioned properties. Place its game-compatible .usmap mapping file in the imported directory.");
 if (exported == 0 && lastLoadError is not null) throw new InvalidDataException("CUE4Parse could not decode the selected Unreal package.", lastLoadError);
-if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
+// Animation mode is not an empty mesh export: a clip whose tracks the reader cannot map still writes
+// its sidecar, and the importer reports each package. Aborting here would hide every one of them.
+if (exported == 0 && !animationsOnly) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
 
 // A refused material fails the conversion even when a mesh or texture in the same package exported: the output is incomplete, and a
 // successful sibling cannot publish it as whole.
