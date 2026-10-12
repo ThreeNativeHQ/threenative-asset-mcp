@@ -43,7 +43,7 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | Cooked `StaticMesh` | UE5.5 | **Verified** | GLB | README names UE5.5 cooked static geometry. |
 | `StaticMesh` LOD1 and higher from editor source | UE5 | **Verified** | `Models/<name>_LOD<n>.glb` | `lods: [0, 1, 2]` on the local European Hornbeam UE5.1 artifact emits each payload-backed source model; the importer names every promoted LOD. The native synthetic cooked fixture also proves `EMeshQuality.All` writes a distinct lower-triangle LOD1 payload. |
 | `StaticMesh` with Nanite data and no fallback mesh | UE5 | Reported | none | Reported honestly, no geometry. |
-| `StaticMesh` BuildScale3D | UE5 | Implemented | scaled GLB | CUE4Parse emits `SourceModels[0].BuildSettings.BuildScale3D` metadata for the modern route; the native pinned fixture reads tagged values for UE5.4 tag 1012 and UE5.5 legacy -9, while importer wiring proves consumption. The byte scanner remains for UE4/UE Viewer routes. |
+| `StaticMesh` BuildScale3D | UE5 | Implemented | scaled GLB | CUE4Parse emits `SourceModels[0].BuildSettings.BuildScale3D` metadata for editor source geometry; cooked render buffers already include the scale and emit null; the native pinned fixture reads tagged values for UE5.4 tag 1012 and UE5.5 legacy -9, while importer wiring proves consumption. The byte scanner remains for UE4/UE Viewer routes. |
 | `SkeletalMesh`, skinned | UE4.0–4.20 | **Verified** | skinned GLB | Animal Variety Pack (6 rigged animals, 146 clips) |
 | `SkeletalMesh`, cooked | UE4 | Implemented | skinned GLB | Joints, weights and inverse-bind matrices preserved. |
 | `SkeletalMesh`, editor source | UE5 | **Verified** | skinned GLB | README: "UE5 editor skeletal geometry". |

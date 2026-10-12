@@ -1,9 +1,12 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { NodeIO } from "@gltf-transform/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { importUnrealDirectory } from "../src/unreal/importer.js";
+import { writeFakeUmodel } from "./helpers/unreal-fixture.js";
 
 import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
 import { childEnvironment, runBounded } from "../src/unreal/toolchain.js";
@@ -233,6 +236,54 @@ describeWithTools(["modern-converter"], "native UE5 static mesh source and cooke
     ]);
   });
 
+  it("preserves native cooked bounds through the public importer without applying source BuildScale twice", async () => {
+    expect(build.code, build.output).toBe(0);
+    const native = join(root, "composed-native");
+    const result = await run("lods", join(root, "composed-highest"), native);
+    expect(result.code, result.stderr).toBe(0);
+    const sourceDir = join(root, "composed-source");
+    const outputDir = join(root, "composed-output");
+    await mkdir(sourceDir, { recursive: true });
+    // The header selects the public UE5 route; native render buffers and metadata supply the actual proof.
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    header.writeInt32LE(-8, 4);
+    header.writeInt32LE(1009, 12);
+    await writeFile(join(sourceDir, "SyntheticCooked.uasset"), Buffer.concat([header, Buffer.from("StaticMesh\0Default__StaticMesh\0")]));
+    const umodel = join(root, "composed-umodel");
+    await writeFakeUmodel(umodel, { classes: {}, listExitCode: 1 });
+    const converter = join(root, "composed-relay");
+    await writeFile(converter, `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const argv = process.argv.slice(2);
+const out = argv[argv.indexOf("--export-dir") + 1];
+fs.mkdirSync(out, { recursive: true });
+fs.cpSync(${JSON.stringify(native)}, out, { recursive: true });
+`);
+    await chmod(converter, 0o755);
+    const extent = async (file: string) => {
+      const document = await new NodeIO().read(file);
+      const positions = document.getRoot().listMeshes()[0]!.listPrimitives()[0]!.getAttribute("POSITION")!;
+      const min = positions.getMin([]);
+      const max = positions.getMax([]);
+      return max.map((value, axis) => value - min[axis]!);
+    };
+    const nativeBounds = await extent(join(native, "Meshes", "SyntheticCooked.glb"));
+    const report = await importUnrealDirectory({
+      sourceDir, outputDir, lods: [0, 1], graphBake: false,
+      freeSpaceBytes: 30_000_000_000,
+      environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: join(root, "composed-cache") },
+      umodel: { name: "umodel", path: umodel, version: "fixture" },
+      modernConverter: { name: "modern", path: converter, version: "native-output relay" },
+    });
+    expect(report.models.map(model => model.glb)).toEqual(["Models/SyntheticCooked.glb", "Models/SyntheticCooked_LOD1.glb"]);
+    expect(report.models[0]?.boundsMetres).toEqual(nativeBounds);
+    expect(await extent(join(outputDir, report.models[0]!.glb))).toEqual(nativeBounds);
+    const metadata = JSON.parse(await readFile(join(native, "Meshes", "SyntheticCooked.metadata.json"), "utf8"));
+    expect(metadata.buildScale3D).toBeNull();
+  });
+
   it("runs shipped ExportStaticMeshAsync on synthetic cooked buffers for requested LOD0 versus LOD0/1", async () => {
     expect(build.code, build.output).toBe(0);
     const highest = join(root, "highest");
@@ -246,7 +297,7 @@ describeWithTools(["modern-converter"], "native UE5 static mesh source and cooke
     expect(files).toContain("SyntheticCooked_LOD1.glb");
     expect(await readdir(join(highest, "Meshes"))).not.toContain("SyntheticCooked_LOD1.glb");
     const metadata = JSON.parse(await readFile(join(all, "Meshes", "SyntheticCooked.metadata.json"), "utf8"));
-    expect(metadata.buildScale3D).toEqual([2, 2, 2]);
+    expect(metadata.buildScale3D).toBeNull();
     expect(metadata.lods.map((lod: { lod: number }) => lod.lod)).toEqual([0, 1]);
     const triangles = async (path: string): Promise<number> => {
       const document = await new NodeIO().read(path);

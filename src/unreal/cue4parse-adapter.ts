@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.7.2",
+  version: "b4e95441+threenative.584.7.3",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2369,7 +2369,8 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
             var lodTarget = Path.Combine(output, "Meshes", lod == 0 ? mesh.Name + ".glb" : mesh.Name + "_LOD" + lod + ".glb");
             if (!Path.GetFullPath(path).Equals(Path.GetFullPath(lodTarget), StringComparison.OrdinalIgnoreCase)) File.Move(path, lodTarget, true);
         }
-        metadata = new StaticMeshMetadata(ReadStaticMeshBuildScale(mesh), glbByLod.Keys.OrderBy(lod => lod).Select(lod => new StaticMeshLodMetadata(lod, "payload", null)).ToArray());
+        // Cooked render vertices already include BuildScale3D (StaticMeshBuilder.cpp:1694-1703).
+        metadata = new StaticMeshMetadata(null, glbByLod.Keys.OrderBy(lod => lod).Select(lod => new StaticMeshLodMetadata(lod, "payload", null)).ToArray());
     }
     meshFailures.Remove(mesh.Name);
     await WriteMeshMetadataAsync(mesh.Name, metadata!);
