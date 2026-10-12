@@ -1,15 +1,26 @@
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 
 import {
   BINARY_MANIFEST_MAGIC,
+  assertOutsideCheckout,
   classifyFileName,
   decodeByteBlob,
+  parseJsonManifest,
   parseManifest,
   selectOldestArtifact,
 } from "../scripts/fab-census.js";
 import type { FabUnrealVersion } from "../src/fab/fabcli.js";
+
+function tempRoot(): string {
+  const dir = mkdtempSync(join(tmpdir(), "fab-census-test-"));
+  onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
 
 /** Encodes an integer the way Epic's JSON manifests do: LE bytes, each as a 3-digit decimal group. */
 function blob(value: number, bytes = 4): string {
@@ -164,5 +175,62 @@ describe("fab-census manifest parsing", () => {
     ];
     expect(selectOldestArtifact(artifacts)?.artifact.artifactId).toBe("Oldest");
     expect(selectOldestArtifact([{ artifactId: "Only", engineVersions: [], targetPlatforms: [] }])?.oldestEngine).toBeUndefined();
+  });
+});
+
+describe("fab-census JSON manifest strictness", () => {
+  it("rejects a manifest with no FileManifestList array instead of reporting zero files", () => {
+    expect(() => parseJsonManifest({ ChunkFilesizeList: {} })).toThrow(/FileManifestList/);
+    expect(() => parseJsonManifest({ FileManifestList: "nope", ChunkFilesizeList: {} })).toThrow(/FileManifestList/);
+  });
+
+  it("rejects a manifest with no size table instead of guessing from chunk parts", () => {
+    const manifest = {
+      FileManifestList: [
+        { Filename: "Content/Pack/A.uasset", FileChunkParts: [{ Guid: "G", Size: blob(4096) }] },
+      ],
+    };
+    expect(() => parseJsonManifest(manifest)).toThrow(/ChunkFilesizeList/);
+    expect(() => parseManifest(Buffer.from(JSON.stringify(manifest), "utf8"))).toThrow(/ChunkFilesizeList/);
+  });
+
+  it("accepts a valid empty list with an empty size map", () => {
+    const summary = parseJsonManifest({ FileManifestList: [], ChunkFilesizeList: {} });
+    expect(summary.format).toBe("json");
+    expect(summary.fileCount).toBe(0);
+    expect(summary.downloadBytes).toBe(0);
+  });
+
+  it("rejects a non-blob size entry", () => {
+    expect(() => parseJsonManifest({ FileManifestList: [], ChunkFilesizeList: { GUID_A: 12 } })).toThrow(/size blob/);
+  });
+});
+
+describe("fab-census output path containment", () => {
+  it("rejects a path inside the primary checkout or any repository-local worktree, created or not", () => {
+    const primary = tempRoot();
+    const linked = join(primary, ".worktrees", "task");
+    mkdirSync(linked, { recursive: true });
+    for (const candidate of [
+      join(primary, "out"),
+      join(linked, "out"),
+      join(linked, "nested", "not-yet-created"),
+    ]) {
+      expect(() => assertOutsideCheckout(candidate, [primary, linked])).toThrow(/outside every checkout/);
+    }
+  });
+
+  it("rejects a symlink that points into a worktree", () => {
+    const primary = tempRoot();
+    const elsewhere = tempRoot();
+    const link = join(elsewhere, "link");
+    symlinkSync(primary, link, "dir");
+    expect(() => assertOutsideCheckout(join(link, "out"), [primary])).toThrow(/outside every checkout/);
+  });
+
+  it("allows a path outside every root", () => {
+    const primary = tempRoot();
+    const outside = tempRoot();
+    expect(() => assertOutsideCheckout(join(outside, "out"), [primary])).not.toThrow();
   });
 });

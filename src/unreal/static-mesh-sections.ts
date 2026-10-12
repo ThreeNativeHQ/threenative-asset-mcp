@@ -74,6 +74,8 @@ interface Header {
   readonly names: readonly string[];
   readonly importNames: readonly string[];
   readonly imports: readonly ImportEntry[];
+  readonly exportCount: number;
+  readonly exportOffset: number;
   readonly bodyStart: number;
 }
 
@@ -107,8 +109,8 @@ function readHeader(bytes: Buffer, maxVersion = UE4_NON_OUTER_PACKAGE_IMPORT - 1
   }
   reader.i32(); // gatherable text count
   reader.i32(); // gatherable text offset
-  reader.i32(); // export count
-  reader.i32(); // export offset
+  const exportCount = reader.i32();
+  const exportOffset = reader.i32();
   const importCount = reader.i32();
   const importOffset = reader.i32();
   if (nameCount < 1 || nameCount > 1_000_000 || importCount < 0 || importCount > 1_000_000) return undefined;
@@ -129,7 +131,62 @@ function readHeader(bytes: Buffer, maxVersion = UE4_NON_OUTER_PACKAGE_IMPORT - 1
     const outer = entry.i32();
     imports.push({ className, outer, name: entry.name() });
   }
-  return { names, importNames: imports.map((entry) => entry.name), imports, bodyStart: totalHeaderSize };
+  return {
+    names,
+    importNames: imports.map((entry) => entry.name),
+    imports,
+    exportCount,
+    exportOffset,
+    bodyStart: totalHeaderSize,
+  };
+}
+
+/**
+ * The primary export's class name of a UE4 editor package: the class the package's own object is.
+ * The first export's `ClassIndex` is an import index, so its class name comes from the import table.
+ * This is the package's real class, unlike a name-table entry, which also matches a class a mesh
+ * merely imports for a property. Undefined for UE5 or an unreadable package.
+ */
+export function parsePrimaryClass(bytes: Buffer): string | undefined {
+  try {
+    const header = readHeader(bytes, UE4_LAST_VERSION);
+    if (!header || header.exportCount < 1 || header.exportOffset <= 0) return undefined;
+    const classIndex = bytes.readInt32LE(header.exportOffset);
+    if (classIndex >= 0) return undefined;
+    return header.imports[-classIndex - 1]?.className;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Every `/Game/...` package a UE4 editor package's import table references. Each referenced import
+ * whose outer is a `Package` import names the package it lives in, so these are exact dependency
+ * edges for the slice closure. Undefined for UE5 or an unreadable package.
+ */
+export function parseImportedPackages(bytes: Buffer): readonly string[] | undefined {
+  try {
+    const header = readHeader(bytes, UE4_LAST_VERSION);
+    if (!header) return undefined;
+    const packages = new Set<string>();
+    for (const entry of header.imports) {
+      if (entry.outer >= 0) continue;
+      const outer = header.imports[-entry.outer - 1];
+      if (outer?.className === "Package" && outer.name.startsWith("/Game/")) packages.add(outer.name);
+    }
+    return [...packages];
+  } catch {
+    return undefined;
+  }
+}
+
+/** `parseImportedPackages` for a `.uasset` on disk. */
+export async function readImportedPackages(path: string): Promise<readonly string[] | undefined> {
+  try {
+    return parseImportedPackages(await readFile(path));
+  } catch {
+    return undefined;
+  }
 }
 
 /** Skips the rest of a tagged property after its common header (name, type, size, array index). */

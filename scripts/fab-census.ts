@@ -10,11 +10,13 @@
  * fetch the manifest body. Credentials are read through the existing `FabCli` client, never here.
  */
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { inflateSync } from "node:zlib";
 
+import { isInside } from "../src/audio/fsutil.js";
 import { FabCli, assertCatalogId, type FabOwnedListing, type FabUnrealVersion } from "../src/fab/fabcli.js";
 import { compareEngines, decoderRoute, oldestEngine, type DecoderRoute } from "../src/fab/routes.js";
 import { runBounded } from "../src/unreal/toolchain.js";
@@ -151,41 +153,35 @@ function jsonFileNames(list: readonly unknown[]): string[] {
   return names;
 }
 
-function jsonChunkParts(entry: unknown): readonly Record<string, unknown>[] {
-  const record = asRecord(entry);
-  const parts = record?.FileChunkParts ?? record?.SharedFileChunkParts;
-  return Array.isArray(parts) ? parts.flatMap((part) => (asRecord(part) ? [asRecord(part)!] : [])) : [];
-}
-
 export function parseJsonManifest(root: unknown): ManifestSummary {
   const manifest = asRecord(root);
   if (!manifest) throw new Error("the JSON manifest is not an object");
-  const list = Array.isArray(manifest.FileManifestList) ? manifest.FileManifestList : [];
-  const names = jsonFileNames(list);
-  const sizes = asRecord(manifest.ChunkFilesizeList);
-  let downloadBytes = 0;
-  if (sizes) {
-    const seen = new Set<string>();
-    for (const [guid, blob] of Object.entries(sizes)) {
-      if (seen.has(guid) || typeof blob !== "string") continue;
-      seen.add(guid);
-      downloadBytes += Number(decodeByteBlob(blob));
-    }
-  } else {
-    // Older JSON manifests keep no per-chunk size table; the unique chunk parts' sizes are the
-    // download, since a file references a byte range of a shared chunk.
-    const seen = new Set<string>();
-    for (const entry of list) {
-      for (const part of jsonChunkParts(entry)) {
-        const guid = part.Guid ?? part.guid;
-        const size = part.Size ?? part.size;
-        if (typeof guid !== "string" || typeof size !== "string" || seen.has(guid)) continue;
-        seen.add(guid);
-        downloadBytes += Number(decodeByteBlob(size));
-      }
-    }
+  const list = manifest.FileManifestList;
+  if (!Array.isArray(list)) {
+    throw new Error("the JSON manifest has no FileManifestList array");
   }
-  return { format: "json", fileCount: list.length, downloadBytes, classHints: classHintsFor(names) };
+  const sizes = asRecord(manifest.ChunkFilesizeList);
+  if (!sizes) {
+    // The per-chunk size table is the only accurate download total. Summing a file's first chunk
+    // part instead guesses a byte range that repeats shared chunks and counts compressed bytes as
+    // uncompressed, so it is not a fallback: a manifest without the table is unresolvable.
+    throw new Error("the JSON manifest has no ChunkFilesizeList size table, so its download size cannot be read");
+  }
+  const names = jsonFileNames(list);
+  let downloadBytes = 0;
+  for (const [guid, blob] of Object.entries(sizes)) {
+    if (typeof blob !== "string") {
+      throw new Error(`the JSON manifest's ChunkFilesizeList entry ${guid} is not a size blob`);
+    }
+    downloadBytes += Number(decodeByteBlob(blob));
+  }
+  return {
+    format: "json",
+    fileCount: list.length,
+    downloadBytes,
+    // An empty list with an empty size map is a valid, empty manifest, not a parse failure.
+    classHints: classHintsFor(names),
+  };
 }
 
 // --- binary manifest ----------------------------------------------------------------------------
@@ -390,8 +386,9 @@ async function manifestUrls(
   ];
   const run = await runBounded(toolPath, args, { timeoutMs: 180_000 });
   if (run.code !== 0) {
-    const detail = (run.stderr.trim() || run.stdout.trim()).slice(0, 300);
-    throw new Error(`fabcli manifest exited ${run.code}${detail ? `: ${detail}` : ""}`);
+    // `fabcli manifest` echoes the signed distribution URLs on failure. Those URLs grant temporary
+    // access to licensed content, so only the exit code is safe to store and report.
+    throw new Error(`fabcli manifest exited ${run.code}`);
   }
   const parsed: unknown = JSON.parse(run.stdout);
   if (!Array.isArray(parsed)) throw new Error("fabcli manifest did not return an array");
@@ -468,15 +465,64 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   return { out: resolve(out) };
 }
 
-/** The checkout this script lives in; `--out` must not land under it. */
+/** The checkout this script lives in. */
 function checkoutRoot(): string {
   return dirname(dirname(fileURLToPath(import.meta.url)));
 }
 
-export function assertOutsideCheckout(out: string, root: string = checkoutRoot()): void {
-  const absolute = isAbsolute(out) ? out : resolve(out);
-  if (absolute === root || absolute.startsWith(root + sep)) {
-    throw new Error(`--out must be outside the checkout (${root}); refusing to write the census into the repository`);
+function runGit(start: string, args: readonly string[]): string {
+  try {
+    return execFileSync("git", ["-C", start, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Resolves a path to its canonical form even when the leaf does not exist yet: the nearest existing
+ * parent is realpath'd, so a symlink into a checkout cannot hide the real destination. */
+function canonicalPath(path: string): string {
+  let current = resolve(path);
+  const trailing: string[] = [];
+  for (;;) {
+    try {
+      return resolve(realpathSync(current), ...trailing);
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return resolve(path);
+      trailing.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Every worktree root of the repository that contains this script: the primary owning checkout, this
+ * linked worktree, and any sibling repository-local worktree. A census report carries licensed pack
+ * names, so it must not land in any of them, not only the checkout the script runs from.
+ */
+export function repositoryCheckoutRoots(start: string = checkoutRoot()): string[] {
+  const roots = new Set<string>();
+  roots.add(canonicalPath(start));
+  const common = runGit(start, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (common) roots.add(canonicalPath(dirname(common)));
+  const list = runGit(start, ["worktree", "list", "--porcelain"]);
+  for (const line of list.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) roots.add(canonicalPath(line.slice("worktree ".length).trim()));
+  }
+  return [...roots];
+}
+
+export function assertOutsideCheckout(out: string, roots: readonly string[] = repositoryCheckoutRoots()): void {
+  const target = canonicalPath(out);
+  for (const root of roots) {
+    if (isInside(target, canonicalPath(root))) {
+      throw new Error(
+        `--out must be outside every checkout of this repository (${root}); refusing to write the census into a repository worktree`,
+      );
+    }
   }
 }
 

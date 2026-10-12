@@ -105,7 +105,7 @@ const UNKNOWN: PackageCooking = Object.freeze({
 });
 
 /** Reads the bounded prefix of one package, or undefined when it cannot be read. */
-async function readHead(file: string): Promise<Buffer | undefined> {
+export async function readPackageHead(file: string): Promise<Buffer | undefined> {
   let handle;
   try {
     handle = await open(file, "r");
@@ -123,10 +123,45 @@ async function readHead(file: string): Promise<Buffer | undefined> {
   }
 }
 
+/**
+ * The candidate class names whose `\0Class\0` name-table entry appears in a package's bounded head.
+ * The length prefix and terminator bracket the entry, so `AnimMontage` does not match inside a longer
+ * name. Membership proves the class is named in the package: it is evidence of presence, never of how
+ * many objects of that class the package exports.
+ */
+export function classesInHead(head: Buffer, candidates: readonly string[]): string[] {
+  const text = head.toString("latin1");
+  return candidates.filter((className) => text.includes(`\0${className}\0`));
+}
+
+export async function readPackageClasses(file: string, candidates: readonly string[]): Promise<string[]> {
+  const head = await readPackageHead(file);
+  return head ? classesInHead(head, candidates) : [];
+}
+
+const GAME_REFERENCE = /\/Game\/[A-Za-z0-9_]+(?:\/[A-Za-z0-9_]+)*/g;
+
+/**
+ * The `/Game/...` source package paths named in a package's import/name tables at its head. A package
+ * that references a material, texture or skeleton names that package's path, so these are the edges
+ * of the dependency graph a slice must close over. Engine (`/Engine/...`) and script references are
+ * excluded: they are not files in the pack.
+ */
+export function gameReferencesInHead(head: Buffer): string[] {
+  const refs = new Set<string>();
+  for (const match of head.toString("latin1").matchAll(GAME_REFERENCE)) refs.add(match[0]);
+  return [...refs];
+}
+
+export async function readPackageGameReferences(file: string): Promise<string[]> {
+  const head = await readPackageHead(file);
+  return head ? gameReferencesInHead(head) : [];
+}
+
 /** Object names a package names in the name and import tables at its head: the packages it
  * references, such as a static mesh's materials and textures. Those are separate files on disk. */
 export async function readPackageObjectNames(file: string): Promise<Set<string>> {
-  const head = await readHead(file);
+  const head = await readPackageHead(file);
   const names = new Set<string>();
   if (!head) return names;
   for (const match of head.toString("latin1").matchAll(/[\x20-\x7e]{4,}/g)) {
@@ -144,7 +179,7 @@ export async function readPackageObjectNames(file: string): Promise<Set<string>>
  * the export produces nothing — after the whole pack has been downloaded and every package walked.
  * A Fab marketplace pack is Unreal *source*, so this is the common case, not the exotic one. */
 export async function readPackageCooking(file: string): Promise<PackageCooking> {
-  const head = await readHead(file);
+  const head = await readPackageHead(file);
   if (!head || head.readUInt32LE(0) !== PACKAGE_MAGIC) return UNKNOWN;
   // Names are stored as length-prefixed ASCII, so a byte search finds them without walking the
   // name table — whose layout varies by engine version in ways this check must not depend on.
