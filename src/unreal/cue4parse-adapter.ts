@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.86-gameplay",
+  version: "b4e95441+threenative.80",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -579,10 +579,16 @@ using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Versions;
+using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Objects.Engine.Animation;
+using CUE4Parse.UE4.Writers;
 using CUE4Parse_Conversion;
+using CUE4Parse_Conversion.Animations;
 using CUE4Parse_Conversion.Exporters;
 using CUE4Parse_Conversion.Options;
 using CUE4Parse_Conversion.Sounds;
+using CUE4Parse_Conversion.Writers.ActorX;
+using CUE4Parse_Conversion.Writers.ActorX.Structs.Animations;
 using Newtonsoft.Json;
 
 if (args.Contains("--version")) { Console.WriteLine("threenative-cue4parse ${CUE4PARSE_SOURCE.version}"); return; }
@@ -641,6 +647,10 @@ var requestedLods = lodsAt >= 0
         .ToArray()
     : new[] { 0 };
 if (requestedLods.Length == 0) throw new ArgumentException("--lods needs at least one LOD index");
+// Animation mode (PRD-583): read the package's animation data (clips, blend spaces, aim offsets,
+// montages, composites) and write it under Animation/. It is kept apart from the mesh/material
+// export so a pack's clips do not force a second full decode of every mesh.
+var animationsOnly = args.Contains("--animations");
 bool MatchesFilter(string key)
 {
     // Data-texture mode names one package: the provider key its selector maps to, case and separators included.
@@ -674,6 +684,7 @@ if (dumpAt < 0 && graphAt < 0)
     Directory.CreateDirectory(Path.Combine(output, "TileMaps"));
     Directory.CreateDirectory(Path.Combine(output, "Grooms"));
     Directory.CreateDirectory(Path.Combine(output, "Gameplay"));
+    Directory.CreateDirectory(Path.Combine(output, "Animation"));
 }
 ObjectTypeRegistry.RegisterClass(typeof(USkeletalMeshEditorData));
 // CUE4Parse swallows an export it cannot deserialize and logs it, which leaves a mesh with no
@@ -2279,6 +2290,302 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
     return true;
 }
 
+// --- PRD-583: UE5 clips, blend spaces, aim offsets, montages and composites ------------------------------------------
+// The pinned CUE4Parse reader exposes a clip's bone tracks only through RawAnimationData, the UE4
+// FUECompressedAnimData layout or ACL. A UE5.6+ clip keeps its tracks in a ControlRig MovieScene
+// model instead, so it is reported with its reason and never replaced by the bind pose.
+string AnimationTarget(string fileName, string extension) => Path.Combine(output, "Animation", fileName + extension);
+
+void WriteAnimationJson(string fileName, object document) =>
+    File.WriteAllText(AnimationTarget(fileName, ".json"), JsonConvert.SerializeObject(document, Formatting.Indented), new UTF8Encoding(false));
+
+void ReportAnimationFailure(string name, string reason) =>
+    Console.Error.WriteLine($"threenative-animation-failure {name} {reason}");
+
+// The raw element of a fixed struct array (BlendParameters[3], InterpolationParam[3]). Reading it keeps
+// the fields the serializer omitted visible, so FBlendParameter's defaults can be restored: a typed read
+// returns 0 for an absent GridNum, while Unreal's default is 4.
+static FStructFallback? FixedArrayElement(UObject holder, string name, int index)
+{
+    foreach (var property in holder.Properties)
+        if (property.Name.Text == name && property.ArrayIndex == index)
+            return property.Tag?.GetValue(typeof(FStructFallback)) as FStructFallback;
+    return null;
+}
+
+static FStructFallback? StructProperty(UObject holder, string name)
+{
+    FStructFallback? found = null;
+    foreach (var property in holder.Properties)
+        if (property.Name.Text == name) found = property.Tag?.GetValue(typeof(FStructFallback)) as FStructFallback;
+    return found;
+}
+
+static bool StructNumber(FStructFallback? data, string field, out double value)
+{
+    value = 0;
+    if (data is null) return false;
+    if (data.TryGetValue<float>(out var single, field)) { value = single; return true; }
+    if (data.TryGetValue<int>(out var integer, field)) { value = integer; return true; }
+    return false;
+}
+
+static bool StructBool(FStructFallback? data, string field, out bool value)
+{
+    value = false;
+    return data is not null && data.TryGetValue<bool>(out value, field);
+}
+
+static string StructText(FStructFallback? data, string field)
+{
+    if (data is null) return "";
+    if (data.TryGetValue<string>(out var text, field)) return text ?? "";
+    if (data.TryGetValue<FName>(out var name, field)) return name.Text ?? "";
+    if (data.TryGetValue<byte>(out var number, field)) return number.ToString();
+    return "";
+}
+
+static string? AnimationReferenceName(FPackageIndex? reference) =>
+    reference is null || reference.IsNull ? null : (reference.ResolvedObject?.Name.Text ?? reference.Name);
+
+// A clip's notifies. UE4 sequences keep them in the Notifies property; UE5.6+ moves them into
+// AnimNotifyTracks[].Notifies, which the pinned reader leaves as a struct fallback.
+List<Dictionary<string, object?>> NotifyRecords(UObject asset, FAnimNotifyEvent[]? typed)
+{
+    var notifies = new List<FAnimNotifyEvent>();
+    if (typed is not null) notifies.AddRange(typed);
+    if (notifies.Count == 0)
+        foreach (var track in asset.GetOrDefault<FStructFallback[]>("AnimNotifyTracks", []))
+            if (track.TryGetValue<FAnimNotifyEvent[]>(out var inner, "Notifies") && inner is not null)
+                notifies.AddRange(inner);
+    var records = new List<Dictionary<string, object?>>();
+    foreach (var notify in notifies)
+    {
+        var stateClass = notify.NotifyStateClass;
+        var notifyObject = notify.Notify;
+        var rawName = notifyObject?.Name ?? stateClass?.Name ?? "AnimNotify";
+        var className = rawName.EndsWith("_C", StringComparison.Ordinal) ? rawName[..^2] : rawName;
+        var name = notify.NotifyName?.Text;
+        if (string.IsNullOrEmpty(name)) name = className;
+        records.Add(new Dictionary<string, object?>
+        {
+            ["name"] = name,
+            ["time"] = DumpNum(notify.GetTime()),
+            ["duration"] = DumpNum(notify.Duration),
+            ["track"] = notify.TrackIndex,
+            ["kind"] = stateClass is { IsNull: false } ? "state" : "notify",
+            ["className"] = className,
+        });
+    }
+    return records;
+}
+
+// Float curves from RawCurveData (UE4 and this UE5.8 pack) or the LegacyCurveData the 5.6+ layout uses.
+List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence)
+{
+    FRawCurveTracks? tracks = sequence.RawCurveData ?? sequence.CompressedCurveData;
+    if (tracks is null && StructProperty(sequence, "LegacyCurveData") is { } legacy) tracks = new FRawCurveTracks(legacy);
+    var records = new List<Dictionary<string, object?>>();
+    if (tracks?.FloatCurves is not { } curves) return records;
+    foreach (var curve in curves)
+    {
+        var keys = new List<Dictionary<string, object?>>();
+        if (curve?.FloatCurve?.Keys is { } richKeys)
+            foreach (var key in richKeys)
+                keys.Add(new Dictionary<string, object?>
+                {
+                    ["time"] = DumpNum(key.Time),
+                    ["value"] = DumpNum(key.Value),
+                    ["arrive"] = DumpNum(key.ArriveTangent),
+                    ["leave"] = DumpNum(key.LeaveTangent),
+                    ["interp"] = key.InterpMode.ToString(),
+                });
+        records.Add(new Dictionary<string, object?> { ["name"] = curve?.CurveName.Text ?? "", ["keys"] = keys });
+    }
+    return records;
+}
+
+static Dictionary<string, object?> SlotRecord(string slotName, FAnimSegment[] segments)
+{
+    var list = new List<object>();
+    foreach (var segment in segments)
+        list.Add(new Dictionary<string, object?>
+        {
+            ["animation"] = AnimationReferenceName(segment.AnimReference),
+            ["startPos"] = DumpNum(segment.StartPos),
+            ["clipStart"] = DumpNum(segment.AnimStartTime),
+            ["clipEnd"] = DumpNum(segment.AnimEndTime),
+            ["playRate"] = DumpNum(segment.AnimPlayRate),
+            ["loopCount"] = segment.LoopingCount,
+        });
+    return new Dictionary<string, object?> { ["name"] = slotName, ["segments"] = list };
+}
+
+static Dictionary<string, object?> SectionRecord(FCompositeSection section) => new()
+{
+    ["name"] = section.SectionName.Text ?? "",
+    ["next"] = section.NextSectionName.Text ?? "",
+    ["linkMethod"] = section.LinkMethod.ToString(),
+    ["segmentBeginTime"] = DumpNum(section.SegmentBeginTime),
+    ["segmentLength"] = DumpNum(section.SegmentLength),
+    ["linkValue"] = DumpNum(section.LinkValue),
+};
+
+static Dictionary<string, object?> BlendWindow(FStructFallback? data) => new()
+{
+    ["time"] = StructNumber(data, "BlendTime", out var time) ? time : 0d,
+    ["value"] = 0d,
+    ["mode"] = StructText(data, "BlendOption"),
+};
+
+void ExportClip(UAnimSequence sequence, string packagePath)
+{
+    var name = sequence.Name;
+    var document = new Dictionary<string, object?>
+    {
+        ["format"] = "threenative-unreal-animation",
+        ["version"] = 1,
+        ["kind"] = "clip",
+        ["name"] = name,
+        ["package"] = packagePath,
+        ["className"] = "AnimSequence",
+        ["skeleton"] = sequence.Skeleton?.Name,
+    };
+    try
+    {
+        var hasRaw = sequence.RawAnimationData is { Length: > 0 };
+        if (!hasRaw && sequence.CompressedDataStructure is null)
+        {
+            document["unsupportedReason"] = "the clip stores no RawAnimationData or compressed bone data; its bone tracks are in a UE5.6+ ControlRig MovieScene model the pinned CUE4Parse AnimationExporter cannot read";
+            WriteAnimationJson(name, document);
+            return;
+        }
+        var animSet = sequence.ConvertAnims();
+        var frames = 0;
+        foreach (var converted in animSet.Sequences) frames += converted.NumFrames;
+        if (animSet.Sequences.Count == 0 || frames <= 0)
+        {
+            ReportAnimationFailure(name, "CUE4Parse decoded no bone tracks for this clip");
+            return;
+        }
+        using (var writer = new FArchiveWriter())
+        {
+            new ActorXAnim(animSet, 0).Save(writer);
+            File.WriteAllBytes(AnimationTarget(name, ".psa"), writer.GetBuffer());
+        }
+        document["notifies"] = NotifyRecords(sequence, sequence.Notifies);
+        document["curves"] = CurveRecords(sequence);
+        document["syncMarkers"] = Array.Empty<object>();
+        WriteAnimationJson(name + ".clip", document);
+    }
+    catch (Exception error) { ReportAnimationFailure(name, error.Message); }
+}
+
+void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
+{
+    var name = space.Name;
+    try
+    {
+        var className = space.ExportType;
+        var aimOffset = className.StartsWith("AimOffset", StringComparison.OrdinalIgnoreCase) ||
+            space.GetOrDefault<bool>("bContainsRotationOffsetMeshSpaceSamples");
+        var axes = new List<object>();
+        var axisCount = Math.Max(space.BlendParameters?.Length ?? 0, 1);
+        for (var index = 0; index < axisCount; index++)
+        {
+            var raw = FixedArrayElement(space, "BlendParameters", index);
+            axes.Add(new Dictionary<string, object?>
+            {
+                ["displayName"] = StructText(raw, "DisplayName"),
+                ["min"] = StructNumber(raw, "Min", out var min) ? min : 0d,
+                ["max"] = StructNumber(raw, "Max", out var max) ? max : 100d,
+                ["gridNum"] = StructNumber(raw, "GridNum", out var grid) ? (int) grid : 4,
+                ["snapToGrid"] = StructBool(raw, "bSnapToGrid", out var snap) && snap,
+                ["wrapInput"] = StructBool(raw, "bWrapInput", out var wrap) && wrap,
+            });
+        }
+        var samples = new List<object>();
+        foreach (var sample in space.SampleData ?? [])
+            samples.Add(new Dictionary<string, object?>
+            {
+                ["animation"] = AnimationReferenceName(sample.Animation),
+                ["sampleValue"] = new[] { DumpNum(sample.SampleValue.X), DumpNum(sample.SampleValue.Y), DumpNum(sample.SampleValue.Z) },
+                ["rateScale"] = DumpNum(sample.RateScale),
+            });
+        var interpolation = new List<object>();
+        for (var index = 0; index < 3; index++)
+        {
+            var raw = FixedArrayElement(space, "InterpolationParam", index);
+            if (raw is null) continue;
+            interpolation.Add(new Dictionary<string, object?>
+            {
+                ["time"] = StructNumber(raw, "InterpolationTime", out var time) ? time : 0d,
+                ["type"] = StructText(raw, "InterpolationType"),
+            });
+        }
+        WriteAnimationJson(name, new Dictionary<string, object?>
+        {
+            ["format"] = "threenative-unreal-animation",
+            ["version"] = 1,
+            ["kind"] = "blendSpace",
+            ["name"] = name,
+            ["package"] = packagePath,
+            ["className"] = className,
+            ["skeleton"] = space.Skeleton?.Name,
+            ["blendSpaceType"] = aimOffset ? "aimOffset" : (space is UBlendSpace1D ? "1D" : "2D"),
+            ["animLength"] = DumpNum(space.AnimLength),
+            ["loop"] = space.GetOrDefault<bool>("bLoop"),
+            ["additive"] = aimOffset,
+            ["axes"] = axes,
+            ["samples"] = samples,
+            ["interpolation"] = interpolation,
+        });
+    }
+    catch (Exception error) { ReportAnimationFailure(name, error.Message); }
+}
+
+void ExportMontage(UAnimMontage? montage, UAnimComposite? composite, string packagePath)
+{
+    UObject? asset = (UObject?) montage ?? composite;
+    if (asset is null) return;
+    var name = asset.Name;
+    try
+    {
+        var slots = new List<object>();
+        var sections = new List<object>();
+        double length;
+        if (montage is not null)
+        {
+            foreach (var slot in montage.SlotAnimTracks) slots.Add(SlotRecord(slot.SlotName.Text, slot.AnimTrack.AnimSegments));
+            foreach (var section in montage.CompositeSections) sections.Add(SectionRecord(section));
+            length = montage.CalculateSequenceLength();
+        }
+        else
+        {
+            slots.Add(SlotRecord("DefaultSlot", composite!.AnimationTrack.AnimSegments));
+            length = composite.AnimationTrack.GetLength();
+        }
+        WriteAnimationJson(name, new Dictionary<string, object?>
+        {
+            ["format"] = "threenative-unreal-animation",
+            ["version"] = 1,
+            ["kind"] = montage is not null ? "montage" : "composite",
+            ["name"] = name,
+            ["package"] = packagePath,
+            ["className"] = montage is not null ? "AnimMontage" : "AnimComposite",
+            ["skeleton"] = ((UAnimationAsset) asset).Skeleton?.Name,
+            ["length"] = DumpNum((float) length),
+            ["rateScale"] = DumpNum(((UAnimSequenceBase) asset).RateScale),
+            ["blendIn"] = BlendWindow(StructProperty(asset, "BlendIn")),
+            ["blendOut"] = BlendWindow(StructProperty(asset, "BlendOut")),
+            ["slots"] = slots,
+            ["sections"] = sections,
+            ["notifies"] = NotifyRecords(asset, ((UAnimSequenceBase) asset).Notifies),
+        });
+    }
+    catch (Exception error) { ReportAnimationFailure(name, error.Message); }
+}
+
 foreach (var key in provider.Files.Keys.Where(key =>
     (key.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) || key.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)) && MatchesFilter(key)))
 {
@@ -2288,6 +2595,28 @@ foreach (var key in provider.Files.Keys.Where(key =>
     {
         if (error.ToString().Contains("mapping file is missing", StringComparison.OrdinalIgnoreCase)) mappingRequired = true;
         lastLoadError = error;
+        continue;
+    }
+    if (animationsOnly)
+    {
+        var animationPackagePath = DumpGamePath(package.Name);
+        try
+        {
+            foreach (var export in package.GetExports())
+            {
+                switch (export)
+                {
+                    case UAnimSequence clip: ExportClip(clip, animationPackagePath); exported++; break;
+                    case UBlendSpaceBase space: ExportBlendSpace(space, animationPackagePath); exported++; break;
+                    case UAnimMontage montage: ExportMontage(montage, null, animationPackagePath); exported++; break;
+                    case UAnimComposite composite: ExportMontage(null, composite, animationPackagePath); exported++; break;
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine($"threenative-animation-failure {Path.GetFileNameWithoutExtension(key)} {error.Message}");
+        }
         continue;
     }
     foreach (var export in package.GetExports()) selectedExportTypes.Add(export.GetType().Name);

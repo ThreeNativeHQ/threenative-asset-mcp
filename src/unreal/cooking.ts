@@ -65,6 +65,10 @@ export interface PackageCooking {
   readonly levelHint: boolean;
   /** A whole name-table entry naming the GroomAsset class, which only a hair package carries. */
   readonly groomHint: boolean;
+  /** A whole name-table entry naming an AnimSequence-family class (UE Viewer cannot list UE5 clips). */
+  readonly animationHint: boolean;
+  /** A whole name-table entry naming a blend-space, aim-offset, montage or composite class. */
+  readonly animationLogicHint: boolean;
   /** Serialized BlueprintGeneratedClass/SCS prefab hint for newer headers UE Viewer rejects. */
   readonly blueprintPrefabHint: boolean;
   /** An editor-only class with nothing to import, named when UE Viewer cannot list the package. */
@@ -122,6 +126,8 @@ const UNKNOWN: PackageCooking = Object.freeze({
   materialHint: false,
   levelHint: false,
   groomHint: false,
+  animationHint: false,
+  animationLogicHint: false,
   blueprintPrefabHint: false,
   nonImportableClassHint: undefined,
   gameplayClasses: [],
@@ -428,6 +434,13 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
   // A whole name-table entry, like nonImportableClassHint: the cards mesh a groom renders with is a
   // StaticMesh package and names no GroomAsset.
   const groomHint = file.toLowerCase().endsWith(".uasset") && head.includes("\0GroomAsset\0", 0, "latin1");
+  // A clip or logic asset UE Viewer cannot list (UE5) or cannot export (blend spaces, montages). The class
+  // name is a whole name-table entry, so "AnimSequence" does not match inside "AnimSequenceBase".
+  const animationHint = file.toLowerCase().endsWith(".uasset") &&
+    ["AnimSequence", "AnimSet", "MeshAnimation"].some((className) => head.includes(`\0${className}\0`, 0, "latin1"));
+  const animationLogicHint = file.toLowerCase().endsWith(".uasset") &&
+    ["BlendSpace", "BlendSpace1D", "AimOffsetBlendSpace", "AimOffsetBlendSpace1D", "AnimMontage", "AnimComposite"]
+      .some((className) => head.includes(`\0${className}\0`, 0, "latin1"));
   // A whole name-table entry: the length prefix's high byte and the NUL terminator bracket it,
   // so "MaterialFunction" does not match inside "MaterialFunctionInstance".
   const nonImportableClassHint = NON_IMPORTABLE_CLASSES.find((className) => head.includes(`\0${className}\0`, 0, "latin1"));
@@ -464,6 +477,8 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     materialHint,
     levelHint,
     groomHint,
+    animationHint,
+    animationLogicHint,
     blueprintPrefabHint,
     nonImportableClassHint,
     gameplayClasses,

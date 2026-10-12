@@ -22,6 +22,7 @@ import {
   type RawGameplaySidecar,
   type RawPhysics,
 } from "./gameplay-data.js";
+import { buildAnimationLogic, type ExportedClip, type RawAnimationAsset } from "./animation-data.js";
 
 import {
   type MaterialTextureBinding,
@@ -76,7 +77,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 115;
+export const IMPORTER_VERSION = 114;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -103,6 +104,19 @@ export function parseModernMeshFailures(stderr: string): Map<string, string> {
   const failures = new Map<string, string>();
   for (const line of stderr.split(/\r?\n/)) {
     const match = MODERN_MESH_FAILURE.exec(line.trim());
+    if (match?.[1] && match[2] && !failures.has(match[1])) failures.set(match[1], match[2].trim());
+  }
+  return failures;
+}
+
+/** One line per animation asset the modern converter could not decode: `threenative-animation-failure name reason`. */
+const MODERN_ANIMATION_FAILURE = /^threenative-animation-failure\s+(\S+)\s+(.+)$/;
+
+/** Why the modern converter produced no clip for each animation it named, keyed by object name. */
+export function parseModernAnimationFailures(stderr: string): Map<string, string> {
+  const failures = new Map<string, string>();
+  for (const line of stderr.split(/\r?\n/)) {
+    const match = MODERN_ANIMATION_FAILURE.exec(line.trim());
     if (match?.[1] && match[2] && !failures.has(match[1])) failures.set(match[1], match[2].trim());
   }
   return failures;
@@ -403,6 +417,32 @@ export interface ImportedGroom {
   readonly excludedGuides: number;
 }
 
+/** One exported blend space, aim offset, montage or composite (PRD-583). */
+export interface ImportedAnimationLogic {
+  readonly name: string;
+  readonly package: string;
+  readonly kind: "blendSpace" | "montage" | "composite";
+  /** The normalized descriptor, relative to the output directory. */
+  readonly json: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  /** Clip names this asset references and that resolve to exactly one exported animation. */
+  readonly resolvedClips: readonly string[];
+  /** Clip references that do not resolve; a consumer must not bind them to the wrong clip. */
+  readonly unresolvedClips: readonly { readonly clip: string; readonly reason: string }[];
+}
+
+/** Notifies, curves and sync markers for one exported clip, pulled from the source package (PRD-583). */
+export interface ImportedAnimationClip {
+  readonly name: string;
+  readonly package: string;
+  readonly json: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly curves: number;
+  readonly notifies: number;
+}
+
 export interface ImportReport {
   readonly importer: { readonly name: string; readonly version: number };
   readonly source: {
@@ -451,6 +491,8 @@ export interface ImportReport {
     readonly strands: number;
     readonly soundCues: number;
     readonly physicsAssets: number;
+    readonly animationLogic: number;
+    readonly animationClips: number;
     readonly skipped: number;
     readonly failed: number;
   };
@@ -470,6 +512,8 @@ export interface ImportReport {
   readonly strands: readonly ImportedGroom[];
   readonly soundCues: readonly ImportedSoundCue[];
   readonly physicsAssets: readonly ImportedPhysicsAsset[];
+  readonly animationLogic: readonly ImportedAnimationLogic[];
+  readonly animationClips: readonly ImportedAnimationClip[];
   readonly skipped: readonly { readonly package: string; readonly reason: string }[];
   readonly failed: readonly { readonly package: string; readonly reason: string }[];
   readonly materialCoverage: {
@@ -723,6 +767,8 @@ interface PackageClassification {
   readonly classes: readonly string[];
   readonly meshKind: "static" | "skeletal" | undefined;
   readonly hasAnimation: boolean;
+  /** A blend space, aim offset, montage or composite: UE Viewer exports none of these, at any engine version. */
+  readonly hasAnimationLogic: boolean;
   readonly hasTexture: boolean;
   readonly hasCubemap: boolean;
   readonly hasMaterial: boolean;
@@ -3177,6 +3223,7 @@ export async function importUnrealDirectory(
         classes: [],
         meshKind: undefined,
         hasAnimation: false,
+        hasAnimationLogic: false,
         hasTexture: false,
         hasCubemap: false,
         hasMaterial: false,
@@ -3254,11 +3301,29 @@ export async function importUnrealDirectory(
       // not `needsModernConverter`, so its geometry keeps the verified UE Viewer / MeshDescription route.
       const hasGameplayMetadata =
         hasGameplay || classes.some((className) => GAMEPLAY_METADATA_CLASSES.has(className));
-      const needsModernConverter = hasGameplay || (modernHeader && (
-        hasMaterial ||
-        hasBlueprintPrefab ||
-        (run.code !== 0 && (meshKind !== undefined || hasTexture || hasCubemap || hasSound || dataClass !== undefined || textureStackClass !== undefined || hasGroom))
-      ));
+      const hasAnimation =
+        classes.some((className) => ["AnimSequence", "AnimSet", "MeshAnimation"].includes(className)) ||
+        (classes.includes("Skeleton") && !classes.includes("SkeletalMesh")) ||
+        cooking?.animationHint === true;
+      // Blend spaces, aim offsets, montages and composites: UE Viewer exports none of them at any version,
+      // so they always take the CUE4Parse route. The adapter classifies the exact kind from the typed fields.
+      const hasAnimationLogic =
+        cooking?.animationLogicHint === true ||
+        classes.some((className) =>
+          className === "AnimMontage" || className === "AnimComposite" ||
+          className.startsWith("BlendSpace") || className.startsWith("AimOffset"),
+        );
+      // Gameplay classes and animation logic force the modern route at any version; animation clips do so
+      // for a modern (UE5) header. A UE4 clip stays on UE Viewer's ActorX PSA route (legacyAnimationPackages).
+      const needsModernConverter =
+        hasGameplay ||
+        hasAnimationLogic ||
+        (modernHeader && (
+          hasMaterial ||
+          hasBlueprintPrefab ||
+          hasAnimation ||
+          (run.code !== 0 && (meshKind !== undefined || hasTexture || hasCubemap || hasSound || dataClass !== undefined || textureStackClass !== undefined || hasGroom || hasAnimation))
+        ));
       // UE Viewer cannot list UE5 packages at all; when the name table shows an editor-only class
       // with nothing to import, report that class instead of a listing failure.
       const nonImportableClass = run.code !== 0 && !needsModernConverter ? cooking?.nonImportableClassHint : undefined;
@@ -3269,9 +3334,8 @@ export async function importUnrealDirectory(
         file: entry.file,
         classes,
         meshKind,
-        hasAnimation:
-          classes.some((className) => ["AnimSequence", "AnimSet", "MeshAnimation"].includes(className)) ||
-          (classes.includes("Skeleton") && !classes.includes("SkeletalMesh")),
+        hasAnimation,
+        hasAnimationLogic,
         hasTexture,
         hasCubemap,
         hasMaterial,
@@ -3300,6 +3364,7 @@ export async function importUnrealDirectory(
         classes: [],
         meshKind: undefined,
         hasAnimation: false,
+        hasAnimationLogic: false,
         hasTexture: false,
         hasCubemap: false,
         hasMaterial: false,
@@ -3344,7 +3409,14 @@ export async function importUnrealDirectory(
     )).filter((file): file is string => file !== undefined),
   );
   const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error && !hlodProxyFiles.has(entry.file));
-  const animationPackages = classified.filter((entry) => entry.hasAnimation && !entry.error);
+  // UE4 clips stay on UE Viewer's ActorX PSA route. UE5 clips and every blend space, aim offset, montage
+  // and composite take the CUE4Parse adapter's animation route instead (PRD-583).
+  const legacyAnimationPackages = classified.filter(
+    (entry) => entry.hasAnimation && !entry.hasAnimationLogic && !entry.needsModernConverter && !entry.error,
+  );
+  const modernAnimationPackages = classified.filter(
+    (entry) => !entry.error && (entry.hasAnimationLogic || (entry.hasAnimation && entry.needsModernConverter)),
+  );
   // A Texture2D export nested in an offline UFont is its glyph atlas, not a standalone texture
   // asset. It is promoted with metrics below so it cannot produce a duplicate false failure.
   const texturePackages = classified.filter((entry) => entry.hasTexture && !entry.hasFont && !entry.error);
@@ -3758,8 +3830,9 @@ export async function importUnrealDirectory(
     && groomPackages.length === 0
     && gameplayPackages.length === 0
   ) {
-    const animationOnly = animationPackages.length > 0
-      ? ` Found ${animationPackages.length} animation package${animationPackages.length === 1 ? "" : "s"}, but no compatible SkeletalMesh to receive those tracks.`
+    const animationCount = legacyAnimationPackages.length + modernAnimationPackages.length;
+    const animationOnly = animationCount > 0
+      ? ` Found ${animationCount} animation package${animationCount === 1 ? "" : "s"}, but no compatible SkeletalMesh to receive those tracks.`
       : "";
     throw new ImportError(
       "UNREAL_EXPORT_EMPTY",
@@ -4094,11 +4167,11 @@ export async function importUnrealDirectory(
   }
 
   const psaFiles: PsaFile[] = [];
-  if (animationPackages.length > 0) {
+  if (legacyAnimationPackages.length > 0) {
     const animationRaw = join(staging, "animations");
     await mkdir(animationRaw, { recursive: true });
-    log(`Exporting ${animationPackages.length} standalone animation packages as ActorX PSA…`);
-    const animationFailures = await mapWithConcurrency(animationPackages, 1, async (entry) => {
+    log(`Exporting ${legacyAnimationPackages.length} standalone animation packages as ActorX PSA…`);
+    const animationFailures = await mapWithConcurrency(legacyAnimationPackages, 1, async (entry) => {
       try {
         const run = await runUmodelExport(umodel.path, sourceDir, animationRaw, ["-psk", "-nooverwrite"], entry.selector, {
           timeoutMs: 1_800_000,
@@ -4131,13 +4204,13 @@ export async function importUnrealDirectory(
         }
       } catch (error) {
         failed.push({
-          package: animationPackages.find((entry) => basename(entry.package, extname(entry.package)) === name)?.package ?? name,
+          package: legacyAnimationPackages.find((entry) => basename(entry.package, extname(entry.package)) === name)?.package ?? name,
           reason: `ActorX PSA conversion failed: ${error instanceof Error ? error.message : "unknown error"}`,
         });
       }
     }
     if (animationAssets.psa.size === 0 && animationFailures.every((entry) => entry === undefined)) {
-      for (const entry of animationPackages) {
+      for (const entry of legacyAnimationPackages) {
         failed.push({
           package: entry.package,
           reason: "UE Viewer recognized animation content but produced no ActorX PSA output.",
@@ -4340,6 +4413,59 @@ export async function importUnrealDirectory(
       }
     }
   }
+  // PRD-583: UE5 clips and every blend space, aim offset, montage and composite come from the pinned
+  // CUE4Parse adapter's animation route. UE5 clips join `psaFiles`, so the existing skeletal attach
+  // binds them to the matching GLB; the logic assets become normalized JSON descriptors.
+  const animationDescriptors: RawAnimationAsset[] = [];
+  const animationPackageByBasename = new Map<string, string>();
+  for (const entry of [...legacyAnimationPackages, ...modernAnimationPackages]) {
+    animationPackageByBasename.set(basename(entry.package, extname(entry.package)).toLowerCase(), entry.package);
+  }
+  const animationPackageFor = (name: string): string => animationPackageByBasename.get(name.toLowerCase()) ?? name;
+  if (modernAnimationPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const modernAnimationRaw = join(staging, "modern-animations");
+    await mkdir(modernAnimationRaw, { recursive: true });
+    log(`Decoding ${modernAnimationPackages.length} animation package${modernAnimationPackages.length === 1 ? "" : "s"} with the modern converter…`);
+    const converted = await runModernConverter(
+      modernConverter.path,
+      sourceDir,
+      modernAnimationRaw,
+      ["--animations"],
+      { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 },
+      formatProfile,
+    );
+    if (converted.code !== 0) {
+      warnings.push(`The modern animation converter exited ${converted.code}; no animation was decoded.`);
+    } else {
+      for (const [name, path] of (await indexExported(modernAnimationRaw)).psa) {
+        try {
+          const parsed = parsePsa(await readFile(path));
+          psaFiles.push(parsed);
+          if (parsed.hasScaleKeys) warnings.push(`${name}.psa carries ActorX scale keys; per-frame bone scale remains unsupported.`);
+        } catch (error) {
+          failed.push({ package: animationPackageFor(name), reason: `ActorX PSA conversion failed: ${error instanceof Error ? error.message : "unknown error"}` });
+        }
+      }
+      for (const file of await listFiles(join(modernAnimationRaw, "Animation")).catch(() => [])) {
+        if (!file.path.toLowerCase().endsWith(".json")) continue;
+        try { animationDescriptors.push(JSON.parse(await readFile(file.path, "utf8")) as RawAnimationAsset); }
+        catch { /* a malformed descriptor leaves its package reported as failed below */ }
+      }
+      for (const [name, reason] of parseModernAnimationFailures(converted.stderr)) failed.push({ package: animationPackageFor(name), reason });
+      warnings.push(`Decoded ${modernAnimationPackages.length} animation package${modernAnimationPackages.length === 1 ? "" : "s"} with the modern converter.`);
+    }
+  }
+  // Every clip reference resolves against the exported AnimSequence PSAs. The importer cannot map an
+  // Unreal skeleton object name to an imported mesh, so it does not claim to; the descriptor keeps it.
+  const exportedClips: ExportedClip[] = psaFiles.flatMap((file) =>
+    file.sequences.map((sequence) => ({ name: sequence.name, package: animationPackageFor(sequence.name) })),
+  );
+  const animationResult = buildAnimationLogic(animationDescriptors, exportedClips, undefined);
+  for (const issue of animationResult.unresolved) {
+    warnings.push(`${issue.asset}: ${issue.kind} reference "${issue.clip}" is unresolved (${issue.reason}).`);
+  }
+  for (const entry of animationResult.unsupported) failed.push({ package: entry.package, reason: entry.reason });
   if (modernTexturePackages.length > 0) {
     modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
     const modernTextureRoot = join(staging, "modern-textures");
@@ -4799,6 +4925,49 @@ export async function importUnrealDirectory(
   const attachedPsa = new Set<string>();
   const existingPsa = new Set<string>();
   const incompatiblePsa = new Set<string>();
+  const animationLogic: ImportedAnimationLogic[] = [];
+  const animationSidecars: ImportedAnimationClip[] = [];
+  for (const asset of animationResult.assets) {
+    const json = `${JSON.stringify(asset.value, null, 2)}\n`;
+    const relativeJson = `Animation/${asset.name}.json`;
+    const target = assertContained(promotion, relativeJson);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, json);
+    const resolvedClips = asset.value.kind === "blendSpace"
+      ? asset.value.samples.filter((sample) => sample.unresolved === undefined).map((sample) => sample.clip)
+      : asset.value.slots.flatMap((slot) => slot.segments.filter((segment) => segment.unresolved === undefined).map((segment) => segment.clip));
+    animationLogic.push({
+      name: asset.name,
+      package: asset.package,
+      kind: asset.value.kind,
+      json: relativeJson,
+      bytes: Buffer.byteLength(json),
+      sha256: createHash("sha256").update(json).digest("hex"),
+      resolvedClips: [...new Set(resolvedClips)],
+      unresolvedClips: animationResult.unresolved
+        .filter((issue) => issue.asset === asset.name)
+        .map((issue) => ({ clip: issue.clip, reason: issue.reason })),
+    });
+  }
+  for (const sidecar of animationResult.sidecars) {
+    const json = `${JSON.stringify(sidecar.value, null, 2)}\n`;
+    const relativeJson = `Animation/${sidecar.name}.clip.json`;
+    const target = assertContained(promotion, relativeJson);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, json);
+    animationSidecars.push({
+      name: sidecar.name,
+      package: sidecar.package,
+      json: relativeJson,
+      bytes: Buffer.byteLength(json),
+      sha256: createHash("sha256").update(json).digest("hex"),
+      curves: sidecar.value.curves.length,
+      notifies: sidecar.value.notifies.length,
+    });
+  }
+  if (animationLogic.length > 0 || animationSidecars.length > 0) {
+    log(`Wrote ${animationLogic.length} animation descriptor${animationLogic.length === 1 ? "" : "s"} and ${animationSidecars.length} clip sidecar${animationSidecars.length === 1 ? "" : "s"}.`);
+  }
 
   // Copies of one texture name that separate exports wrote collapse to one source when their bytes match, so a
   // texture exported into two folders is not a conflict when both copies are the very same image.
@@ -5297,7 +5466,7 @@ export async function importUnrealDirectory(
       );
     }
     if (psaFiles.length > 0 && attachedPsa.size === 0 && existingPsa.size === 0) {
-      for (const entry of animationPackages) {
+      for (const entry of legacyAnimationPackages) {
         failed.push({
           package: entry.package,
           reason: "ActorX PSA was decoded, but no imported SkeletalMesh matched at least 80% of its bone names.",
@@ -6247,6 +6416,8 @@ export async function importUnrealDirectory(
         strands: strands.length,
         soundCues: soundCues.length,
         physicsAssets: physicsAssets.length,
+        animationLogic: animationLogic.length,
+        animationClips: animationSidecars.length,
         skipped: skipped.length,
         failed: failed.length,
       },
@@ -6266,6 +6437,8 @@ export async function importUnrealDirectory(
       strands,
       soundCues,
       physicsAssets,
+      animationLogic,
+      animationClips: animationSidecars,
       skipped,
       failed,
       materialCoverage: coverage,
