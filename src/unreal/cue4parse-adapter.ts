@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.67",
+  version: "b4e95441+threenative.78",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -273,6 +273,48 @@ index 10bfc73..b1d220e 100644
                  }
              }
  
+diff --git a/CUE4Parse/UE4/Versions/VersionUtils.cs b/CUE4Parse/UE4/Versions/VersionUtils.cs
+--- a/CUE4Parse/UE4/Versions/VersionUtils.cs
++++ b/CUE4Parse/UE4/Versions/VersionUtils.cs
+@@ -27,4 +27,14 @@ public static class VersionUtils
+
+         return -1; // Determine by game
+     }
++
++    // A package saved by UE4 lists every custom version it used, so a GUID missing from its non-empty container names a field its
++    // engine never wrote. CustomVer reports -1 for it and the callers then guess from --engine, which can open a UE5-only field.
++    public static bool IsAbsentInUe4Package(this FArchive Ar, FGuid key)
++    {
++        var summary = (Ar as FAssetArchive)?.Owner?.Summary;
++        return summary is { bUnversioned: false, CustomVersionContainer: { Versions.Length: > 0 } versions } &&
++               summary.FileVersionUE.FileVersionUE5 == 0 &&
++               versions.GetVersion(key) == -1;
++    }
+ }
+diff --git a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
+--- a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
++++ b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
+@@ -395,6 +395,8 @@ public static class FUE5MainStreamObjectVersion
+         var ver = Ar.CustomVer(GUID);
+         if (ver >= 0)
+             return (Type) ver;
++        if (Ar.IsAbsentInUe4Package(GUID))
++            return Type.BeforeCustomVersionWasAdded;
+
+         return Ar.Game switch
+         {
+diff --git a/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs b/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs
+--- a/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs
++++ b/CUE4Parse/UE4/Versions/FUE5ReleaseStreamObjectVersion.cs
+@@ -227,6 +227,8 @@ public static class FUE5ReleaseStreamObjectVersion
+         var ver = Ar.CustomVer(GUID);
+         if (ver >= 0)
+             return (Type) ver;
++        if (Ar.IsAbsentInUe4Package(GUID))
++            return Type.BeforeCustomVersionWasAdded;
+
+         return Ar.Game switch
+         {
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
@@ -291,6 +333,116 @@ export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
 </Project>
 `;
 
+/**
+ * The engine-content rules the converter and its compiled tests share: the root, the key the pinned provider gives a loose
+ * directory, the exact /Engine/ reference lookup, and the provenance of a loaded body. Written beside Program.cs and compiled
+ * against the pinned CUE4Parse source by tests/unreal-engine-content-compiled.test.ts, so the tests run the shipped code.
+ */
+export const CUE4PARSE_ENGINE_CONTENT = String.raw`using CUE4Parse.FileProvider;
+using CUE4Parse.UE4.Assets;
+
+public static class EngineContent
+{
+    // Every provider-readable file under the root Root last checked, by the key the pinned provider would register for it. The
+    // provider's own comparer is OrdinalIgnoreCase, so a key names its file only when the root spells the two the same way.
+    private static readonly Dictionary<string, string> Sources = new(StringComparer.Ordinal);
+    // The same keys folded to case, which is exactly how the provider reads them: two files under one folded key would leave one
+    // of them unreadable under whichever spelling the enumeration reached first.
+    private static readonly Dictionary<string, string> Folded = new(StringComparer.OrdinalIgnoreCase);
+
+    // The extensions the pinned provider registers as files (GameFile.UeKnownExtensions), so a pair of case-distinct folders is
+    // judged on the package keys it holds and not on an unrelated file that happens to share a name across the two.
+    private static readonly HashSet<string> ProviderFiles = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "uasset", "umap", "upk", "xxx", "udk", "u", "mbamap", "sword", "rbd", "aa3", "ut3", "ut2", "utx", "unr", "umx",
+        "uax", "usx", "ukx", "map", "lm", "s8m", "ccpk", "mo",
+        "uexp", "ubulk", "uptnl", "tfc",
+        "bin", "ini", "uplugin", "upluginmanifest", "locres", "locmeta", "wem", "ewem", "bnk", "pck", "bank", "awb", "acb",
+    };
+
+    // The configured root, without a trailing separator. It must be an existing directory that is not a filesystem root and holds
+    // no .uproject (a project, not Engine/Content). A link at the root or anywhere under it is refused before anything is read:
+    // links are never followed or skipped, because the provider would read through them and a cache key would miss the bytes.
+    // Two files the provider would register under one key are refused here too, before it exists: /Engine/A/T.uasset and an
+    // /Engine/a/T.uasset are one key to a case-insensitive comparer, and only one of them could ever be read.
+    public static string Root(string configured)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(configured));
+        Sources.Clear();
+        Folded.Clear();
+        var directory = new DirectoryInfo(root);
+        if (!directory.Exists) throw new DirectoryNotFoundException($"engine content directory not found: {root}");
+        if (directory.Parent is null) throw new InvalidDataException($"engine content root cannot be a filesystem root: {root}");
+        if (directory.LinkTarget is not null) throw new InvalidDataException($"engine content root is a link: {root}; links are refused, not followed");
+        if (directory.GetFiles("*.uproject", SearchOption.TopDirectoryOnly).Length > 0) throw new InvalidDataException($"engine content root holds a .uproject, so it is a project rather than Engine/Content: {root}");
+        var pending = new Stack<DirectoryInfo>();
+        pending.Push(directory);
+        var mount = MountPrefix(root);
+        while (pending.Count > 0)
+        {
+            foreach (var entry in pending.Pop().EnumerateFileSystemInfos())
+            {
+                if (entry.LinkTarget is not null) throw new InvalidDataException($"engine content contains a link at {entry.FullName}; links are refused, not followed or skipped");
+                if (entry is DirectoryInfo child) { pending.Push(child); continue; }
+                // The provider reads the extension the way SubstringAfter('.') gives it, without its dot.
+                var extension = Path.GetExtension(entry.Name).TrimStart('.');
+                if (extension.Length == 0 || !ProviderFiles.Contains(extension)) continue;
+                // The key the pinned provider builds: the mount prefix, then the path relative to the root in forward slashes.
+                var key = mount + Path.GetRelativePath(root, entry.FullName).Replace('\\', '/');
+                if (!Folded.TryAdd(key, entry.FullName))
+                    throw new InvalidDataException($"engine content holds files the provider would key as one ({key}): {Folded[key]} and {entry.FullName}; case-distinct packages are refused, not merged");
+                Sources.Add(key, entry.FullName);
+            }
+        }
+        return root;
+    }
+
+    // The key prefix the pinned provider gives a loose directory: DirectoryInfo.Name, the name it reads, which carries no trailing
+    // separator. Root refuses a .uproject, the only input that would give the provider a different mount.
+    public static string MountPrefix(string root) => new DirectoryInfo(Path.TrimEndingDirectorySeparator(root)).Name + "/";
+
+    // The one key an exact /Engine/<folders>/<name>.<name> reference names under the mount, or false for anything else: an object
+    // name that is not the package's own, a path outside /Engine/, an empty, dot or parent segment, a backslash, a drive-style
+    // segment or a control character. Nothing is matched by basename, so a same-named body elsewhere is never selected.
+    // The spelling is ordinal at both ends. A prefix the reference spells /engine/ is not this mount, and a key the root spells
+    // in another case names no file here: the provider's comparer would fold the two and answer a reference with a namesake.
+    public static bool TryExactReference(string mountPrefix, string reference, out string key, out string objectName)
+    {
+        key = string.Empty;
+        objectName = string.Empty;
+        const string engine = "/Engine/";
+        if (!reference.StartsWith(engine, StringComparison.Ordinal)) return false;
+        var dot = reference.LastIndexOf('.');
+        if (dot < 0) return false;
+        var packagePath = reference[..dot];
+        objectName = reference[(dot + 1)..];
+        if (objectName.Length == 0 || objectName != packagePath[(packagePath.LastIndexOf('/') + 1)..]) return false;
+        var folders = packagePath[engine.Length..].Split('/');
+        if (folders.Any(folder => folder.Length == 0 || folder == "." || folder == ".." || folder.Contains('\\') || folder.Contains(':') || folder.Any(char.IsControl))) return false;
+        var candidate = mountPrefix + string.Join('/', folders) + ".uasset";
+        if (!Sources.ContainsKey(candidate)) return false;
+        key = candidate;
+        return true;
+    }
+
+    // The file an exact key names, spelled the way the reference spells it, or null when the root holds only a case-folded
+    // namesake. It is the provider key the root registered, so an exact export never resolves its own path by folding.
+    public static string? ExactSource(string key) => Sources.TryGetValue(key, out var source) ? source : null;
+
+    // The /Engine/ path of a loaded body's package, when the engine provider loaded that package; otherwise null. Provenance is the
+    // provider that loaded the package (IPackage.Provider), never the path a pack names the body by: a pack-owned package keeps no
+    // engine provenance even under the engine's own name, and a body reached by a nested call into engine content keeps its own.
+    public static string? PackagePath(IPackage? owner, IFileProvider? engineProvider, string? mountPrefix)
+    {
+        if (owner is null || engineProvider is null || mountPrefix is null || !ReferenceEquals(owner.Provider, engineProvider)) return null;
+        // A loaded package is named by its provider key without the extension: "<mount>/Functions/A/B".
+        var name = owner.Name;
+        if (!name.StartsWith(mountPrefix, StringComparison.OrdinalIgnoreCase) || name.Length == mountPrefix.Length) return null;
+        return "/Engine/" + name[mountPrefix.Length..];
+    }
+}
+`;
+
 export const CUE4PARSE_PROGRAM = String.raw`using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -303,6 +455,7 @@ using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Exports.Material;
+using CUE4Parse.UE4.Assets.Exports.Material.Parameters;
 using CUE4Parse.UE4.Assets.Exports.Sound;
 using CUE4Parse.UE4.Assets.Exports.Engine;
 using CUE4Parse.UE4.Assets.Exports.Engine.Font;
@@ -336,6 +489,43 @@ var root = Path.GetFullPath(args[0]);
 var output = dumpAt >= 0 || graphAt >= 0 ? Path.GetFullPath(".") : Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
 var filterAt = Array.IndexOf(args, "--filter");
 var filter = filterAt >= 0 ? args[filterAt + 1] : null;
+// Exact mode: one Engine package, named by its canonical /Engine/ reference under the root (EngineContent.TryExactReference). Only
+// that package's own Texture2D is exported, with the suffix and basename fallbacks off, and its sRGB flag written beside the PNG.
+var exactAt = Array.IndexOf(args, "--exact-reference");
+string? exactPackage = null;
+string? exactObject = null;
+string? exactFile = null;
+if (exactAt >= 0)
+{
+    if (filterAt >= 0) throw new ArgumentException("--exact-reference and --filter cannot be given together");
+    EngineContent.Root(root);
+    if (!EngineContent.TryExactReference(EngineContent.MountPrefix(root), args[exactAt + 1], out var exactKey, out var exactName))
+        throw new ArgumentException($"--exact-reference is not an exact /Engine/ package reference: {args[exactAt + 1]}");
+    exactPackage = exactKey;
+    exactObject = exactName;
+    // The body the key names, at the spelling the reference gave it. A root that holds only /engine/a/T.uasset has already been
+    // refused by TryExactReference, so this is never resolved by folding the key back onto a path.
+    exactFile = EngineContent.ExactSource(exactKey)
+        ?? throw new ArgumentException($"--exact-reference names no engine source: {args[exactAt + 1]}");
+}
+// Data-texture mode: one Texture2D of one package, named by its root-relative selector (the package path without .uasset). The
+// selector is mapped onto the provider key of the one loose file at that exact path. It writes the stored RGBA16F source bytes
+// beside a manifest, and refuses any source it cannot reproduce exactly.
+var dataTextureAt = Array.IndexOf(args, "--data-texture");
+string? dataTextureSelector = null;
+string? dataTextureKey = null;
+Rgba16fPackage? dataTexturePackage = null;
+if (dataTextureAt >= 0)
+{
+    if (exactAt >= 0 || filterAt >= 0) throw new ArgumentException("--data-texture cannot be combined with --filter or --exact-reference");
+    if (dumpAt >= 0 || graphAt >= 0) throw new ArgumentException("--data-texture cannot be combined with --dump-properties or --dump-graphs");
+    if (dataTextureAt + 1 >= args.Length) throw new ArgumentException("--data-texture needs a package key");
+    dataTextureSelector = args[dataTextureAt + 1];
+    if (dataTextureSelector.Length == 0 || dataTextureSelector.Contains('\\') || dataTextureSelector.StartsWith('/') ||
+        dataTextureSelector.Split('/').Any(part => part is "" or "." or ".."))
+        throw new ArgumentException($"--data-texture is not a relative package key: {dataTextureSelector}");
+    dataTextureKey = dataTextureSelector + ".uasset";
+}
 // Source-model LODs of a skeletal mesh to export, as indices into its source model array.
 var lodsAt = Array.IndexOf(args, "--lods");
 var requestedLods = lodsAt >= 0
@@ -349,6 +539,10 @@ var requestedLods = lodsAt >= 0
 if (requestedLods.Length == 0) throw new ArgumentException("--lods needs at least one LOD index");
 bool MatchesFilter(string key)
 {
+    // Data-texture mode names one package: the provider key its selector maps to, case and separators included.
+    if (dataTexturePackage is not null) return string.Equals(key, dataTexturePackage.Key, StringComparison.Ordinal);
+    // Exact mode names one package by its key under the root: no suffix or basename can select another package.
+    if (exactPackage is not null) return string.Equals(key, exactPackage, StringComparison.OrdinalIgnoreCase);
     if (filter is null) return true;
     static string Normalize(string value)
     {
@@ -387,12 +581,32 @@ string? olderEngineAttempts = null;
 
 var engineAt = Array.IndexOf(args, "--engine");
 var game = engineAt >= 0 ? ParseGame(args[engineAt + 1]) : DetectGame(root);
+// Engine content is an explicitly configured Engine/Content root and the X.Y version it was cooked for: both or neither.
+// It has its own provider and VersionContainer, so the pack's provider and its graph export loop are unchanged.
+var engineContentAt = Array.IndexOf(args, "--engine-content");
+var engineContentVersionAt = Array.IndexOf(args, "--engine-content-version");
+if ((engineContentAt >= 0) != (engineContentVersionAt >= 0)) throw new ArgumentException("--engine-content and --engine-content-version must be given together");
+DefaultFileProvider? engineProvider = null;
+string? engineContentVersion = null;
+string? engineContentKeyPrefix = null;
+if (engineContentAt >= 0)
+{
+    // Refused before the provider enumerates anything: a link at the root or under it, a filesystem root, or a project.
+    var engineRoot = EngineContent.Root(args[engineContentAt + 1]);
+    engineContentVersion = args[engineContentVersionAt + 1];
+    engineProvider = new DefaultFileProvider(engineRoot, SearchOption.AllDirectories, new VersionContainer(ParseGame(engineContentVersion)), StringComparer.OrdinalIgnoreCase);
+    engineProvider.Initialize();
+    engineProvider.PostMount();
+    // The provider keys a loose directory under its own name, so the Content root's keys begin "Content/".
+    engineContentKeyPrefix = EngineContent.MountPrefix(engineRoot);
+}
 var provider = new DefaultFileProvider(root, SearchOption.AllDirectories, new VersionContainer(game), StringComparer.OrdinalIgnoreCase);
 var mappings = Directory.EnumerateFiles(root, "*.usmap", SearchOption.AllDirectories).ToArray();
 if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length} .usmap files. Keep only the mapping that matches this asset's game/version.");
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
+if (dataTextureKey is not null) dataTexturePackage = ResolveRgba16fPackage(provider, root, dataTextureSelector!);
 if (dumpAt >= 0)
 {
     var dumpPath = Path.GetFullPath(args[dumpAt + 1]);
@@ -469,6 +683,15 @@ static object? GraphValue(object? value) => value switch
     FScriptStruct script => GraphValue(script.StructType),
     _ => null,
 };
+// A scalar is kept when it reads. A UV set the export holds but cannot be read is not dropped: an absent CoordinateIndex or
+// ConstCoordinate means UV0, so it is kept under the name with an "Error" suffix, and the material graph refuses it only where
+// that set is demanded. Other unreadable scalars are still dropped.
+static void GraphRecordConstant(Dictionary<string, object?> constants, string name, int arrayIndex, string typeName, object? value)
+{
+    var converted = GraphValue(value);
+    if (converted is not null) constants[arrayIndex > 0 ? $"{name}[{arrayIndex}]" : name] = converted;
+    else if (name is "CoordinateIndex" or "ConstCoordinate") constants[name + "Error"] = $"property {name} ({typeName}) could not be read";
+}
 static string GraphEnumName(object? value, string prefix)
 {
     var text = value switch { FName name => name.Text, null => "", _ => value.ToString() ?? "" };
@@ -516,6 +739,44 @@ static (FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bo
         constant = useConstant ? GraphValue(type.GetProperty("Constant")?.GetValue(input)) : null;
     }
     return (expression, output, mask != 0 ? channels : null, constant, useConstant);
+}
+
+// A Custom node's Inputs array wraps each FExpressionInput in an FStructFallback that also carries the pin's
+// InputName. Returns the named pins in array order, or null with a reason when the layout is raw, a wrapper is
+// unreadable, or a name repeats; an unnamed pin keeps its index as a stable key. The value is the unwrapped
+// FExpressionInput, so its target, OutputIndex and mask survive unchanged.
+static List<(string Name, object Value)>? GraphCustomInputs(bool raw, UScriptArray array, out string? error)
+{
+    if (raw)
+    {
+        error = "Custom Inputs use a raw layout this converter cannot read";
+        return null;
+    }
+    var seen = new HashSet<string>(StringComparer.Ordinal);
+    var pins = new List<(string Name, object Value)>();
+    for (var element = 0; element < array.Properties.Count; element++)
+    {
+        if (array.Properties[element].GenericValue is not FScriptStruct { StructType: FStructFallback wrapper })
+        {
+            error = $"Custom Inputs[{element}] is not a struct wrapper";
+            return null;
+        }
+        var name = GraphText(GraphProperty(wrapper, "InputName")?.Tag?.GenericValue);
+        if (string.IsNullOrEmpty(name)) name = $"Inputs[{element}]";
+        if (!seen.Add(name))
+        {
+            error = $"Custom Inputs has a duplicate pin name {name}";
+            return null;
+        }
+        if (GraphProperty(wrapper, "Input")?.Tag?.GenericValue is not FScriptStruct { StructType: FExpressionInput input })
+        {
+            error = $"Custom Input {name} has no readable input";
+            return null;
+        }
+        pins.Add((name, input));
+    }
+    error = null;
+    return pins;
 }
 
 // Real Unreal reads an input as tagged properties when the package does not record FCoreObjectVersion at all.
@@ -702,6 +963,11 @@ int DumpMaterialGraphs(string key, string graphDir, HashSet<string> usedFileName
         string className, exportName;
         try { className = DumpExportClass(package, index); exportName = DumpExportName(package, index); }
         catch { continue; }
+        if (className == "MaterialInstanceConstant")
+        {
+            DumpMaterialInstanceRecord(package, index, exportName, graphDir, usedFileNames);
+            continue;
+        }
         if (className != "Material") continue;
         Dictionary<string, object?> document;
         try { document = BuildMaterialGraph(package, package.ExportsLazy[index].Value, exportName); }
@@ -720,6 +986,46 @@ int DumpMaterialGraphs(string key, string graphDir, HashSet<string> usedFileName
         written++;
     }
     return written;
+}
+
+// A UMaterialInstanceConstant a graph dump loads, as one qualified record beside the graphs (converter 74). props holds only the
+// instance's own overrides, in the .props.txt blocks the importer reads: its Parent line, MaterialOverrides.Blocks (scalars, vectors
+// and static switches) and its own TextureParameterValues by qualified package and object. A flattened CollectedTextureParameters
+// block never enters a record. A read that cannot be proven complete is recorded as refused with its reason, never dropped.
+void DumpMaterialInstanceRecord(IPackage package, int index, string exportName, string graphDir, HashSet<string> usedFileNames)
+{
+    var record = new Dictionary<string, object?>
+    {
+        ["format"] = 1, ["kind"] = "materialInstance", ["package"] = DumpGamePath(package.Name), ["object"] = exportName,
+        ["parent"] = null, ["complete"] = false, ["props"] = null, ["refusal"] = null,
+    };
+    try
+    {
+        if (package.ExportsLazy[index].Value is not UMaterialInstanceConstant instance)
+            throw new InvalidDataException($"{exportName} did not deserialize as a material instance");
+        var text = new StringBuilder();
+        if (instance.TryGetValue<FPackageIndex>(out var parent, "Parent") && !parent.IsNull && parent.Name != "None")
+        {
+            var parentPackage = ResolvedPackagePath(package.ResolvePackageIndex(parent));
+            if (parentPackage is null) throw new InvalidDataException($"the parent of {exportName} does not resolve to a qualified package");
+            record["parent"] = new Dictionary<string, object?> { ["package"] = parentPackage, ["object"] = parent.Name };
+            text.AppendLine($"Parent = Material'{parentPackage}.{parent.Name}'");
+        }
+        // The scalar, vector and static switch blocks are MaterialOverrides' own: a layer, an unreadable row or an incomplete read refuses here.
+        text.Append(MaterialOverrides.Blocks(instance, exportName, packageReadFailures));
+        text.Append(MaterialOverrides.Textures(instance, exportName, packageReadFailures, reference => {
+            try { return ResolvedPackagePath(package.ResolvePackageIndex(reference)); } catch { return null; }
+        }));
+        record["complete"] = true;
+        record["props"] = text.ToString();
+    }
+    catch (Exception error)
+    {
+        record["refusal"] = error.Message;
+    }
+    var fileName = exportName;
+    for (var suffix = 2; !usedFileNames.Add(fileName); suffix++) fileName = $"{exportName}__{suffix}";
+    File.WriteAllText(Path.Combine(graphDir, fileName + ".instance.json"), JsonConvert.SerializeObject(record, Formatting.Indented), new UTF8Encoding(false));
 }
 
 Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject material, string materialName)
@@ -811,6 +1117,13 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                                 guids.Add(element.GenericValue is FScriptStruct { StructType: FGuid attributeGuid } ? attributeGuid.ToString() : "");
                             node["attributeTypes"] = guids;
                         }
+                        else if (className == "Custom" && name == "Inputs")
+                        {
+                            // A Custom node's Inputs array wraps each pin's FExpressionInput; name it from its InputName.
+                            var custom = GraphCustomInputs(GraphRawInputs(owner), array, out var customError);
+                            if (custom is null) node["error"] = customError;
+                            else foreach (var (pinName, pinValue) in custom) inputs[pinName] = Pin(pinValue, prefix, callInputs, depth);
+                        }
                         else if (array.Properties.Count > 0 && array.Properties.All(element => GraphIsInput(element.GenericValue)))
                         {
                             for (var element = 0; element < array.Properties.Count; element++)
@@ -818,10 +1131,7 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
                         }
                     }
                     else if (!GraphIgnoredProperties.Contains(name) && !name.StartsWith("MaterialExpression", StringComparison.Ordinal))
-                    {
-                        var converted = GraphValue(value);
-                        if (converted is not null) constants[property.ArrayIndex > 0 ? $"{name}[{property.ArrayIndex}]" : name] = converted;
-                    }
+                        GraphRecordConstant(constants, name, property.ArrayIndex, property.PropertyType.Text, value);
                 }
                 catch (Exception error) { node["error"] = $"{name}: {error.Message}"; }
             }
@@ -929,7 +1239,8 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
     UObject? GraphLoadFunction(FPackageIndex? functionIndex, string? path)
     {
         try { if (functionIndex?.Load<UObject>() is { } direct) return direct; } catch { }
-        if (string.IsNullOrEmpty(path) || path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return null;
+        if (string.IsNullOrEmpty(path)) return null;
+        if (path.StartsWith("/Engine/", StringComparison.OrdinalIgnoreCase)) return GraphLoadEngineFunction(path);
         var slash = path.LastIndexOf('/');
         var functionName = path[(slash + 1)..];
         var dot = functionName.IndexOf('.');
@@ -948,6 +1259,26 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
             for (var index = 0; index < functionPackage.ExportsLazy.Length; index++)
             {
                 if (DumpExportName(functionPackage, index) == functionName) return functionPackage.ExportsLazy[index].Value;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // The one engine package an exact /Engine/<folders>/<name>.<name> reference names, read from the configured content root.
+    // Nothing is matched by basename and nothing falls back to another mount: the reference must name exactly that package
+    // and object, and the key must exist exactly under the configured root (EngineContent.TryExactReference).
+    UObject? GraphLoadEngineFunction(string path)
+    {
+        if (engineProvider is null || engineContentKeyPrefix is null) return null;
+        if (!EngineContent.TryExactReference(engineContentKeyPrefix, path, out var key, out var objectName)) return null;
+        if (!engineProvider.Files.ContainsKey(key)) return null;
+        try
+        {
+            var enginePackage = engineProvider.LoadPackage(key);
+            for (var index = 0; index < enginePackage.ExportsLazy.Length; index++)
+            {
+                if (DumpExportName(enginePackage, index) == objectName) return enginePackage.ExportsLazy[index].Value;
             }
         }
         catch { }
@@ -1006,6 +1337,11 @@ Dictionary<string, object?> BuildMaterialGraph(IPackage package, UObject materia
         var callPins = (Dictionary<string, object?>) node["inputs"]!;
         // The call stores each wired input and only a guid for the function input it feeds.
         var function = GraphLoadFunction(functionIndex, node["function"] as string);
+        // A body records the configured engine content it came from only when the engine provider loaded its package. The package
+        // that loaded it decides, not the path the call names: a pack may mount its own package under /Engine/.
+        var enginePackage = function is null ? null : EngineContent.PackagePath(function.Owner, engineProvider, engineContentKeyPrefix);
+        if (enginePackage is not null && engineContentVersion is not null)
+            fn["engine"] = new Dictionary<string, object?> { ["version"] = engineContentVersion, ["package"] = enginePackage };
         var inputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
         var outputExpressions = new Dictionary<string, UObject>(StringComparer.Ordinal);
         if (function is not null)
@@ -1346,6 +1682,9 @@ Exception? lastLoadError = null;
 var textureFailures = new List<string>();
 var selectedExportTypes = new HashSet<string>(StringComparer.Ordinal);
 var exportedMaterials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+// Refused materials by qualified identity. Bounded: the first 64 are kept, and later refusals are counted. Either fails the conversion.
+var materialFailures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+var materialFailuresDropped = 0;
 // Materials/<name>.mat and .props.txt per sidecar name -> the package that owns it (see MaterialSidecarName).
 var materialSidecarOwners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var exportedSprites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1486,6 +1825,19 @@ async Task WriteMeshMaterialPackagesAsync(string meshName, IEnumerable<FPackageI
     await File.WriteAllTextAsync(Path.Combine(output, "Meshes", meshName + ".materials.json"), JsonConvert.SerializeObject(known2));
 }
 
+// A refused material is recorded by its identity and fails the conversion at completion. The reason is flattened and bounded like
+// a mesh failure, so a long CUE4Parse message cannot grow the report.
+void RecordMaterialFailure(string identity, string reason)
+{
+    if (!materialFailures.ContainsKey(identity) && materialFailures.Count >= 64)
+    {
+        materialFailuresDropped++;
+        return;
+    }
+    var flat = string.Join(' ', reason.Split(new[] { '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    materialFailures[identity] = flat.Length <= 500 ? flat : flat[..500];
+}
+
 async Task ExportMaterialAsync(string initialName, string? initialPath = null)
 {
     var pending = new Queue<(string Name, string? Path)>();
@@ -1551,7 +1903,6 @@ async Task ExportMaterialAsync(string initialName, string? initialPath = null)
         var materialDirectory = Path.Combine(output, "Materials");
         Directory.CreateDirectory(materialDirectory);
         var mat = string.Join("\n", references.Select((entry, index) => $"Other[{index}]={entry.Texture}")) + "\n";
-        await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".mat"), mat);
         var props = new StringBuilder();
         // The parent's package path lets the importer pick between same-named parents.
         if (parentName.Length > 0) props.AppendLine($"Parent = Material'{(parentPath is null ? parentName : parentPath)}.{parentSidecar}'");
@@ -1579,7 +1930,25 @@ async Task ExportMaterialAsync(string initialName, string? initialPath = null)
             props.AppendLine("    }");
         }
         props.AppendLine("}");
-        await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".props.txt"), props.ToString());
+        // The overrides are read before either sidecar is written. A refused material writes neither, but it is recorded by its
+        // identity, so the conversion fails at completion. Its textures are still extracted below, as the rest of the output is.
+        var identity = $"{GamePackagePath(materialKey)}.{material.Name}";
+        string? refusal = null;
+        if (material is UMaterialInstance overridden)
+        {
+            try { props.Append(MaterialOverrides.Blocks(overridden, material.Name, packageReadFailures)); }
+            catch (MaterialOverrides.Refusal error) { refusal = error.Message; }
+        }
+        if (refusal is null)
+        {
+            await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".mat"), mat);
+            await File.WriteAllTextAsync(Path.Combine(materialDirectory, sidecarName + ".props.txt"), props.ToString());
+        }
+        else
+        {
+            Console.Error.WriteLine($"material overrides refused {material.Name}: {refusal}");
+            RecordMaterialFailure(identity, refusal);
+        }
 
         foreach (var textureName in references.Select(entry => entry.Texture).Distinct(StringComparer.OrdinalIgnoreCase))
         {
@@ -2305,7 +2674,15 @@ foreach (var key in provider.Files.Keys.Where(key =>
             JsonConvert.SerializeObject(descriptor, Formatting.Indented));
         exported++;
     }
-    foreach (var texture in package.GetExports().OfType<UTexture2D>())
+    // Data-texture mode exports only this package's own Texture2D as raw RGBA16F. The PNG exporters below never see it: they
+    // cannot encode the format, so the importer asks for this path after their failure instead.
+    if (dataTextureKey is not null)
+    {
+        ExportRgba16fDataTexture(package, provider, dataTexturePackage!, output, dataTextureSelector!);
+        exported++;
+        continue;
+    }
+    foreach (var texture in package.GetExports().OfType<UTexture2D>().Where(candidate => exactObject is null || candidate.Name == exactObject))
     {
         var session = new ExportSession { MaxDegreeOfParallelism = 1 };
         session.Add(texture);
@@ -2328,7 +2705,10 @@ foreach (var key in provider.Files.Keys.Where(key =>
             var packageFiles = Directory.EnumerateFiles(root, Path.GetFileNameWithoutExtension(key) + ".uasset", SearchOption.AllDirectories)
                 .Where(candidate => normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
                 .ToArray();
-            var candidates = Directory.EnumerateFiles(root, texture.Name + ".uasset", SearchOption.AllDirectories).ToArray();
+            // Exact mode keeps only the file EngineContent.Root registered for this key, spelled as the reference spells it,
+            // at the path it registered: a case-folded namesake can neither be selected nor take its place.
+            if (exactFile is not null) packageFiles = new[] { exactFile };
+            var candidates = exactFile is not null ? Array.Empty<string>() : Directory.EnumerateFiles(root, texture.Name + ".uasset", SearchOption.AllDirectories).ToArray();
             var textureFile = packageFiles.FirstOrDefault()
                 ?? candidates.FirstOrDefault(candidate =>
                     normalizedKey.EndsWith(Path.GetRelativePath(root, candidate).Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
@@ -2348,6 +2728,8 @@ foreach (var key in provider.Files.Keys.Where(key =>
             }
             await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, texture));
         }
+        // Exact mode writes the texture's own sRGB flag beside its PNG, so the bake decodes it as Unreal does: never a namesake's, never a guess.
+        if (exactObject is not null) await File.WriteAllTextAsync(Path.Combine(output, "Textures", texture.Name + ".props.txt"), $"SRGB={texture.SRGB}\n");
         exported++;
     }
     foreach (var cubemap in package.GetExports().OfType<UTextureCube>())
@@ -2551,6 +2933,212 @@ foreach (var (failedMesh, failureDetail) in meshFailures)
 if (exported == 0 && mappingRequired) throw new InvalidDataException("This cooked UE5 package uses unversioned properties. Place its game-compatible .usmap mapping file in the imported directory.");
 if (exported == 0 && lastLoadError is not null) throw new InvalidDataException("CUE4Parse could not decode the selected Unreal package.", lastLoadError);
 if (exported == 0) throw new InvalidDataException($"No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced. Loaded export types: {string.Join(", ", selectedExportTypes)}." + (textureFailures.Count > 0 ? "\n" + string.Join("\n", textureFailures) : ""));
+
+// A refused material fails the conversion even when a mesh or texture in the same package exported: the output is incomplete, and a
+// successful sibling cannot publish it as whole.
+if (materialFailures.Count > 0) throw new InvalidDataException(
+    $"{materialFailures.Count + materialFailuresDropped} material(s) could not be imported with their overrides, so the conversion is incomplete:\n" +
+    string.Join("\n", materialFailures.Select(entry => $"{entry.Key}: {entry.Value}")) +
+    (materialFailuresDropped > 0 ? $"\n... and {materialFailuresDropped} more" : ""));
+
+// Raw RGBA16F source art (TSF_RGBA16F). Unreal stores these samples unfiltered: UE 4.19 Texture.cpp copies the mip without PNG
+// encoding (CanPNGCompress excludes the format), 8 bytes per pixel. The producer keeps those bytes exactly, so nothing is clamped,
+// resized or re-encoded, and a source outside that layout is refused rather than converted. The two records are declared last.
+// The CUE4Parse read: the typed Source struct and the SourceArt bulk (the FEditorBulkData payload of a UE 5.1+ package), with enum names
+// stripped of their type prefix.
+static Rgba16fSourceArt ReadRgba16fSourceArt(UTexture2D texture)
+{
+    var source = texture.GetOrDefault<FStructFallback?>("Source", null) ?? throw new InvalidDataException("the texture has no typed Source struct");
+    static string EnumName(FStructFallback properties, string name)
+    {
+        var text = properties.GetOrDefault<FName>(name).Text ?? "";
+        return text[(text.LastIndexOf(':') + 1)..];
+    }
+    // CompressionFormat is missing from a UE 4.19 Source, which predates the field, and the default there is uncompressed. Presence
+    // is checked first: a missing field is null, while a present one must read as an enum name, so a field of another type is refused
+    // instead of being taken for the default.
+    static string? CompressionName(FStructFallback properties)
+    {
+        if (!properties.Properties.Any(tag => string.Equals(tag.Name.Text, "CompressionFormat", StringComparison.OrdinalIgnoreCase))) return null;
+        var text = properties.TryGetValue<FName>(out var format, "CompressionFormat") ? format.Text ?? "" : "";
+        if (text.Length == 0) throw new InvalidDataException("the source CompressionFormat is present but not an enum name");
+        return text[(text.LastIndexOf(':') + 1)..];
+    }
+    // A UE 5.1+ package keeps the source in FEditorBulkData, not SourceArt. With TSCF_None its Oodle-decoded payload is the mip data itself, mip 0
+    // at offset 0 (UE 5.8.3 Texture.cpp FTextureSource::Decompress, CalcMipOffset), so the validation below applies to it unchanged. The recorded
+    // size must equal the size in the buffer header before anything is decoded.
+    static (long, byte[]?) EditorSource(FEditorBulkData editor)
+    {
+        var header = editor.Payload.Header;
+        if (editor.PayloadSize is < 1 or > (1L << 30) || (ulong) editor.PayloadSize != header.TotalRawSize)
+            throw new InvalidDataException($"the editor payload holds {header.TotalRawSize} bytes but its bulk data records {editor.PayloadSize} (1 byte to 1 GiB is read)");
+        return (editor.PayloadSize, DecompressEditorPayload(editor.Payload));
+    }
+    var (elementCount, bytes) = texture.SourceArt is { } bulk ? ((long) bulk.Header.ElementCount, bulk.ReadDataOnce())
+        : texture.EditorData is { } editor ? EditorSource(editor)
+        : throw new InvalidDataException("the texture has no SourceArt bulk data");
+    return new Rgba16fSourceArt(
+        EnumName(source, "Format"),
+        source.GetOrDefault<int>("SizeX"),
+        source.GetOrDefault<int>("SizeY"),
+        source.GetOrDefault<int>("NumSlices"),
+        source.GetOrDefault<int>("NumMips"),
+        source.GetOrDefault<bool>("bPNGCompressed", false),
+        CompressionName(source),
+        texture.SRGB,
+        elementCount,
+        bytes);
+}
+// The rules the raw layout must meet. Every refusal names the rule, and nothing is written before all of them pass.
+static Rgba16fDataTexture ValidateRgba16fSourceArt(Rgba16fSourceArt source)
+{
+    if (source.Format != "TSF_RGBA16F") throw new InvalidDataException($"source format {source.Format} is not TSF_RGBA16F");
+    if (source.PngCompressed) throw new InvalidDataException("the source is PNG-compressed; Unreal never compresses RGBA16F, so the raw layout does not apply");
+    if (source.Compression is not (null or "TSCF_None")) throw new InvalidDataException($"the source uses compression {source.Compression}; only uncompressed raw SourceArt is exported");
+    if (source.Srgb) throw new InvalidDataException("the texture is sRGB; its raw RGBA16F values are linear and must not be decoded");
+    if (source.NumMips != 1) throw new InvalidDataException($"the source holds {source.NumMips} mips; exactly one mip is supported");
+    if (source.NumSlices != 1) throw new InvalidDataException($"the source holds {source.NumSlices} slices; exactly one slice is supported");
+    if (source.SizeX is < 1 or > 65536 || source.SizeY is < 1 or > 65536)
+        throw new InvalidDataException($"source dimensions {source.SizeX}x{source.SizeY} are outside 1 to 65536");
+    var expected = (long) source.SizeX * source.SizeY * 8;
+    if (expected > 1L << 30) throw new InvalidDataException("the RGBA16F source exceeds the 1 GiB limit");
+    if (source.Bytes is null) throw new InvalidDataException("the SourceArt read returned no bytes");
+    if (source.ElementCount != expected || source.Bytes.LongLength != expected)
+        throw new InvalidDataException($"SourceArt read is incomplete or not raw: {source.Bytes.LongLength} bytes, element count {source.ElementCount}; {source.SizeX}x{source.SizeY} RGBA16F is {expected} bytes");
+    for (var offset = 0; offset < source.Bytes.Length; offset += 2)
+    {
+        var sample = BinaryPrimitives.ReadUInt16LittleEndian(source.Bytes.AsSpan(offset, 2));
+        if ((sample & 0x7C00) == 0x7C00)
+            throw new InvalidDataException($"non-finite half-float sample at sample {offset / 2} (pixel {offset / 8}, channel {offset / 2 % 4})");
+    }
+    return new Rgba16fDataTexture(source.SizeX, source.SizeY, source.Bytes);
+}
+// SHA-256 of the package file set: for each present file (.uasset, .uexp, .ubulk, .uptnl, in that order), its "ext size" line and its bytes.
+static string PackageSetSha256(IReadOnlyList<(string Extension, byte[] Bytes)> files)
+{
+    using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+    foreach (var file in files)
+    {
+        hash.AppendData(Encoding.ASCII.GetBytes($"{file.Extension} {file.Bytes.Length}\n"));
+        hash.AppendData(file.Bytes);
+    }
+    return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+}
+// Writes <name>.rgba16f-le and <name>.rgba16f.json. Each file is renamed into place from a temporary sibling.
+static string WriteRgba16fDataTexture(string directory, string name, string packageKey, string objectPath, string packageSha256, Rgba16fDataTexture data, string converter)
+{
+    Directory.CreateDirectory(directory);
+    var binaryName = name + ".rgba16f-le";
+    var binaryPath = Path.Combine(directory, binaryName);
+    var manifestPath = Path.Combine(directory, name + ".rgba16f.json");
+    var dataSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data.Bytes)).ToLowerInvariant();
+    var descriptor = new {
+        format = "threenative-rgba16f-data-texture",
+        version = 1,
+        name,
+        source = new { package = packageKey, @object = name, objectPath, @class = "Texture2D", sourceFormat = "TSF_RGBA16F", sha256 = packageSha256 },
+        data = new {
+            file = binaryName, format = "RGBA16F", layout = "little-endian-half4", width = data.Width, height = data.Height,
+            mips = 1, slices = 1, channels = 4, bytesPerPixel = 8, bytes = data.Bytes.Length, sha256 = dataSha256, srgb = false, colorSpace = "none"
+        },
+        provenance = new { converter, unrealSource = "UE 4.19 Texture.cpp raw SourceArt path: bPNGCompressed false, 8 bytes per pixel" },
+        limits = new[] { "Raw SourceArt bytes only: no PivotPainter, classifier, source UV, graph or WPO semantic decoding is applied." }
+    };
+    File.WriteAllBytes(binaryPath + ".tmp", data.Bytes);
+    File.Move(binaryPath + ".tmp", binaryPath, true);
+    File.WriteAllText(manifestPath + ".tmp", JsonConvert.SerializeObject(descriptor, Formatting.Indented) + "\n");
+    File.Move(manifestPath + ".tmp", manifestPath, true);
+    return manifestPath;
+}
+// The provider key of the loose file at root/relativePath, found by its physical path and never by a key, a suffix or a basename.
+// The provider names a loose root after its own folder and folds keys case-insensitively, so a key can name another file. Null when
+// no file exists at that path. Refused when the file exists but the provider holds no loose entry for exactly it, or holds two.
+static string? ExactLooseKey(DefaultFileProvider provider, string root, string name, string relativePath)
+{
+    var physical = Path.GetFullPath(Path.Combine(root, relativePath));
+    // The file name is compared first, so only the files that share it pay for the full path comparison.
+    var fileName = Path.GetFileName(physical);
+    var keys = provider.Files
+        .Where(entry => entry.Value is CUE4Parse.FileProvider.Objects.OsGameFile loose && string.Equals(loose.ActualFile.Name, fileName, StringComparison.Ordinal) &&
+            string.Equals(Path.GetFullPath(loose.ActualFile.FullName), physical, StringComparison.Ordinal))
+        .Select(entry => entry.Key)
+        .ToArray();
+    if (keys.Length == 1) return keys[0];
+    if (keys.Length > 1)
+    {
+        var listed = string.Join(", ", keys);
+        throw RefuseRgba16fDataTexture(name, $"{relativePath} is registered {keys.Length} times ({listed}); exactly one key is needed");
+    }
+    if (File.Exists(physical)) throw RefuseRgba16fDataTexture(name, $"the provider registered no loose file at exactly {relativePath}");
+    return null;
+}
+// The package a --data-texture selector names: the provider key of its .uasset, the package name the manifest records (the selector
+// with .uasset, which the promotion checks), and the provider keys of the sidecars that exist at the same physical stem.
+static Rgba16fPackage ResolveRgba16fPackage(DefaultFileProvider provider, string root, string selector)
+{
+    var name = Path.GetFileName(selector);
+    var key = ExactLooseKey(provider, root, name, selector + ".uasset")
+        ?? throw RefuseRgba16fDataTexture(name, $"no package has exactly the key {selector}.uasset under the source root");
+    var sidecars = new Dictionary<string, string>();
+    foreach (var extension in new[] { ".uexp", ".ubulk", ".uptnl" })
+        if (ExactLooseKey(provider, root, name, selector + extension) is { } sidecar) sidecars[extension] = sidecar;
+    RequireConsumedPayloads(provider, name, selector, key, sidecars);
+    return new Rgba16fPackage(key, selector + ".uasset", sidecars);
+}
+// The payloads the load consumes for the package: FindPayloads on the file of the .uasset, the call LoadPackage makes. The provider folds
+// keys case-insensitively, so it can hand over a namesake of a sidecar the exact stem lacks. Each extension must be consumed by the object
+// the provider holds under its mapping key, or by nothing when the stem has no file. Anything else is refused before the package is read.
+static void RequireConsumedPayloads(DefaultFileProvider provider, string name, string selector, string key, Dictionary<string, string> sidecars)
+{
+    provider.Files.FindPayloads(provider.Files[key], out var uexp, out var ubulks, out var uptnls);
+    var consumed = new Dictionary<string, IReadOnlyList<CUE4Parse.FileProvider.Objects.GameFile>>
+    {
+        [".uexp"] = uexp is null ? [] : [uexp],
+        [".ubulk"] = ubulks,
+        [".uptnl"] = uptnls,
+    };
+    foreach (var (extension, payloads) in consumed)
+    {
+        var mappedKey = sidecars.GetValueOrDefault(extension);
+        if (payloads.Count > 1) throw RefuseRgba16fDataTexture(name, $"the provider would load {payloads.Count} {extension} files for {selector}; exactly one is needed");
+        if (payloads.Count == 0 && mappedKey is null) continue;
+        if (payloads.Count == 0)
+            throw RefuseRgba16fDataTexture(name, $"the provider would load no {extension} for {selector}, though {mappedKey} is registered at exactly that path");
+        if (mappedKey is null)
+            throw RefuseRgba16fDataTexture(name, $"the provider would load {payloads[0].Path} as the {extension} of {selector}, but no {extension} exists at exactly {selector}{extension}");
+        if (!object.ReferenceEquals(payloads[0], provider.Files[mappedKey]))
+            throw RefuseRgba16fDataTexture(name, $"the provider would load {payloads[0].Path} as the {extension} of {selector}, not {mappedKey}");
+    }
+}
+// The package file set the converter hashes: the .uasset, then each sidecar that exists, each read through its exact provider key.
+static List<(string Extension, byte[] Bytes)> ReadRgba16fPackageFiles(DefaultFileProvider provider, Rgba16fPackage mapping)
+{
+    var files = new List<(string Extension, byte[] Bytes)> { (".uasset", provider.Files[mapping.Key].Read()) };
+    foreach (var extension in new[] { ".uexp", ".ubulk", ".uptnl" })
+        if (mapping.Sidecars.TryGetValue(extension, out var sidecar)) files.Add((extension, provider.Files[sidecar].Read()));
+    return files;
+}
+// Exports the one Texture2D named like the package file. The package file set is read through the provider by its exact keys.
+static void ExportRgba16fDataTexture(IPackage package, DefaultFileProvider provider, Rgba16fPackage mapping, string output, string selector)
+{
+    var name = Path.GetFileName(selector);
+    var textures = package.GetExports().OfType<UTexture2D>().Where(candidate => candidate.Name == name).ToArray();
+    if (textures.Length != 1) throw RefuseRgba16fDataTexture(name, $"{textures.Length} Texture2D exports are named {name} in {mapping.Key}; exactly one is needed");
+    var texture = textures[0];
+    var files = ReadRgba16fPackageFiles(provider, mapping);
+    Rgba16fDataTexture data;
+    try { data = ValidateRgba16fSourceArt(ReadRgba16fSourceArt(texture)); }
+    catch (InvalidDataException error) { throw RefuseRgba16fDataTexture(name, error.Message); }
+    // The manifest names the package by its root-relative selector, which is what the promotion checks, and never by the provider key.
+    var manifest = WriteRgba16fDataTexture(Path.Combine(output, "DataTextures"), name, mapping.PackageKey, texture.GetPathName(), PackageSetSha256(files), data, "threenative-cue4parse ${CUE4PARSE_SOURCE.version}");
+    Console.WriteLine($"threenative-data-texture {name}: {manifest}");
+}
+// Names the refusal on stderr the way the importer reads texture failures, and returns the exception to throw.
+static Exception RefuseRgba16fDataTexture(string name, string reason)
+{
+    Console.Error.WriteLine($"threenative-texture-failure {name}: {reason}");
+    return new InvalidDataException(reason);
+}
 
 static byte[] EncodeBgre8AsRadiance(byte[] source, int width, int height)
 {
@@ -2960,6 +3548,44 @@ int ExportGroomPayloads(byte[] bytes, string name)
 // exactly one FName layout reads it that way; without that count, or with a mismatch, it stays a refusal.
 static EditorMesh ReadMeshDescription(byte[] raw, int cachedTriangles = 0)
 {
+    var mesh = ReadMeshDescriptionInEitherLayout(raw, cachedTriangles);
+    // Checked once the layout is settled: inside an attempt, a refusal would be retried as the other FName layout and
+    // reported as that layout's error.
+    CheckActiveUvChannels(mesh);
+    return mesh;
+}
+
+// Every UV channel spans every allocated vertex instance (holes included), as Normal and VertexIndex do, and each live
+// triangle corner names an allocated instance with a finite coordinate in every channel. Only live triangles are written,
+// so only their corners need one. A channel that does not span, or a corner with a non-finite coordinate, is refused
+// rather than padded.
+static void CheckActiveUvChannels(EditorMesh mesh)
+{
+    var instances = mesh.InstanceVertices.Length;
+    foreach (var (channel, values) in mesh.UvChannels)
+    {
+        if (values.Length != instances * 2)
+            throw new InvalidDataException("UV channel " + channel + " has " + values.Length / 2 + " values for " + instances + " vertex instances.");
+    }
+    for (var triangle = 0; triangle < mesh.TriangleInstances.Length / 3; triangle++)
+    {
+        if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
+        for (var corner = 0; corner < 3; corner++)
+        {
+            var instance = mesh.TriangleInstances[triangle * 3 + corner];
+            if (instance < 0 || instance >= instances)
+                throw new InvalidDataException("Triangle " + triangle + " uses vertex instance " + instance + " of " + instances + ".");
+            foreach (var (channel, values) in mesh.UvChannels)
+            {
+                if (!float.IsFinite(values[instance * 2]) || !float.IsFinite(values[instance * 2 + 1]))
+                    throw new InvalidDataException("UV channel " + channel + " is not finite at vertex instance " + instance + ".");
+            }
+        }
+    }
+}
+
+static EditorMesh ReadMeshDescriptionInEitherLayout(byte[] raw, int cachedTriangles)
+{
     // Both FName array layouts are tried; only one consumes the whole payload.
     try
     {
@@ -2997,9 +3623,18 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
         reader.ReadByte();
         return text;
     }
+    // A TextureCoordinate index is one UV channel: an FVector2f (kind 2, eight bytes) in at most eight channels, which is
+    // what Unreal's UV sets are. Any other layout is one this reader does not map, so it is refused by name.
+    void CheckUvChannel(int channel, int kind, int elementSize)
+    {
+        if (channel >= 8) throw new NotSupportedException("VertexInstance TextureCoordinate channel " + channel + " is past the eight UV channels Unreal allows");
+        if (kind != 2 || elementSize != 8) throw new NotSupportedException("VertexInstance TextureCoordinate channel " + channel + " is attribute kind " + kind + " with " + elementSize + "-byte elements, not FVector2f");
+    }
     var arrays = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+    var kinds = new Dictionary<string, int>(StringComparer.Ordinal);
     var names = new Dictionary<string, string[]>(StringComparer.Ordinal);
     var live = new Dictionary<string, bool[]>(StringComparer.Ordinal);
+    var textureCoordinates = 0; // the UV channels of the VertexInstances element: one TextureCoordinate index each
     var elementTypes = reader.ReadInt32();
     if (elementTypes is < 1 or > 64) throw new InvalidDataException("Not a mesh description.");
     for (var elementIndex = 0; elementIndex < elementTypes; elementIndex++)
@@ -3024,6 +3659,7 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
                 reader.ReadInt32();
                 reader.ReadInt32();
                 var indices = reader.ReadInt32();
+                if (element == "VertexInstances" && attribute == "TextureCoordinate") textureCoordinates = indices;
                 for (var index = 0; index < indices; index++)
                 {
                     reader.ReadInt32(); // extent
@@ -3049,7 +3685,9 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
                     }
                     var elementSize = reader.ReadInt32();
                     var elements = reader.ReadInt32();
+                    if (element == "VertexInstances" && attribute == "TextureCoordinate") CheckUvChannel(index, kind, elementSize);
                     arrays[key] = reader.ReadBytes(checked(elementSize * elements));
+                    kinds[key] = kind;
                 }
                 // The default value is written even for an attribute with no channels, so its size
                 // comes from the attribute type: FVector4f, FVector3f, FVector2f, float, int32, and
@@ -3069,63 +3707,218 @@ static EditorMesh ReadMeshDescriptionLayout(byte[] raw, bool compactNames, int c
         throw new InvalidDataException("Mesh description was not fully consumed.");
     float[] Floats(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, float>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
     int[] Ints(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, int>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
+    // A vertex-instance colour is a linear FVector4f (attribute kind 0, 16 bytes), the layout Unreal
+    // writes for MeshAttribute::VertexInstance::Color. Any other stored type would need a reinterpretation
+    // this reader does not do, so it is left absent rather than guessed; absent also means no colour buffer.
+    float[] Colors()
+    {
+        const string key = "VertexInstances[0].Color[0]";
+        return arrays.TryGetValue(key, out var bytes) && kinds.TryGetValue(key, out var kind) && kind == 0
+            ? MemoryMarshal.Cast<byte, float>(bytes).ToArray()
+            : [];
+    }
+    // UV channel n is TextureCoordinate index n: one FVector2f per allocated vertex instance, holes included, so it spans
+    // the same count as VertexIndex and Normal. A channel that does not is refused rather than padded or renumbered.
+    var instanceVertices = Ints("VertexInstances[0].VertexIndex[0]");
+    var uvChannels = new (int Channel, float[] Values)[textureCoordinates];
+    for (var channel = 0; channel < textureCoordinates; channel++)
+        uvChannels[channel] = (channel, MemoryMarshal.Cast<byte, float>(arrays["VertexInstances[0].TextureCoordinate[" + channel + "]"]).ToArray());
+    var triangleInstances = Ints("Triangles[0].VertexInstanceIndex[0]");
+    var triangleLive = live.TryGetValue("Triangles", out var triangleFlags) ? triangleFlags : [];
     return new EditorMesh(
         Floats("Vertices[0].Position[0]"),
-        Ints("VertexInstances[0].VertexIndex[0]"),
+        instanceVertices,
         Floats("VertexInstances[0].Normal[0]"),
-        Floats("VertexInstances[0].TextureCoordinate[0]"),
-        Ints("Triangles[0].VertexInstanceIndex[0]"),
+        uvChannels,
+        Colors(),
+        triangleInstances,
         Ints("Triangles[0].PolygonGroupIndex[0]"),
-        live.TryGetValue("Triangles", out var triangles) ? triangles : [],
+        triangleLive,
         names.TryGetValue("PolygonGroups[0].ImportedMaterialSlotName[0]", out var slots) ? slots : []);
 }
 
 // Writes the decoded source model with the cooked glTF writer's conventions: centimetres to metres,
-// Unreal's Z-up swapped to glTF's Y-up, and Unreal's triangle order kept (the axis swap and
-// Unreal's left-handedness cancel). Vertex colours and tangents are left out, as the UE Viewer
-// route leaves them out: Megascans vertex colours are wind masks, not tint, and glTF clients
-// generate MikkTSpace tangents when none are given.
+// Unreal's Z-up swapped to glTF's Y-up, and Unreal's triangle order kept (the axis swap and Unreal's
+// left-handedness cancel). Tangents are still left out, so a glTF client generates MikkTSpace tangents.
+// Every UV channel the MeshDescription carries is written as TEXCOORD_<index> at its own index, and only those: an
+// absent channel is not written, no set is zero-filled or renumbered, and a source without UV channels has no TEXCOORD
+// at all. Each primitive stores every distinct vertex once, keyed by its whole value (position, normal, colour and all
+// channels), so instances that differ only in a later channel keep separate vertices.
+// A source model whose MeshDescription carries a per-vertex-instance Color is written as COLOR_0, as the
+// cooked writer does; glTF clients with a material that does not read it would still multiply it into the
+// base colour, so the importer drops COLOR_0 for those sections. Without such an attribute no COLOR_0 is
+// written at all, so nothing is invented for an unpainted mesh.
 static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string name, string target)
 {
-    var builder = new SharpGLTF.Geometry.MeshBuilder<
-        SharpGLTF.Geometry.VertexTypes.VertexPositionNormal,
-        SharpGLTF.Geometry.VertexTypes.VertexTexture1,
-        SharpGLTF.Geometry.VertexTypes.VertexEmpty>(name);
-    var materials = new Dictionary<int, SharpGLTF.Materials.MaterialBuilder>();
-    SharpGLTF.Materials.MaterialBuilder Material(int group)
+    // Every vertex instance must have a colour for the attribute to line up with the instance indexing,
+    // so a colour buffer of any other length is treated as absent rather than padded or truncated.
+    var colors = mesh.VertexColors.Length == mesh.InstanceVertices.Length * 4 ? mesh.VertexColors : null;
+    var root = SharpGLTF.Schema2.ModelRoot.CreateModel();
+    SharpGLTF.Schema2.Mesh? gltfMesh = null;
+    var materials = new Dictionary<int, SharpGLTF.Schema2.Material>();
+    SharpGLTF.Schema2.Material Material(int group)
     {
         if (materials.TryGetValue(group, out var existing)) return existing;
-        var material = new SharpGLTF.Materials.MaterialBuilder(group >= 0 && group < materialNames.Length ? materialNames[group] : "MaterialSlot_" + group)
+        var builder = new SharpGLTF.Materials.MaterialBuilder(group >= 0 && group < materialNames.Length ? materialNames[group] : "MaterialSlot_" + group)
             .WithBaseColor(System.Numerics.Vector4.One);
+        var material = SharpGLTF.Schema2.Toolkit.CreateMaterial(root, builder);
         materials[group] = material;
         return material;
     }
-    SharpGLTF.Geometry.VertexBuilder<
-        SharpGLTF.Geometry.VertexTypes.VertexPositionNormal,
-        SharpGLTF.Geometry.VertexTypes.VertexTexture1,
-        SharpGLTF.Geometry.VertexTypes.VertexEmpty> Vertex(int instance)
+    // One vertex instance's packed value: position and normal converted as before, the colour (when the mesh has one)
+    // as the value Unreal's shader reads, then each UV channel at the instance's own index.
+    float[] PackVertex(int instance)
     {
         var vertex = mesh.InstanceVertices[instance];
         var position = new System.Numerics.Vector3(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 2], mesh.Positions[vertex * 3 + 1]) * 0.01f;
         var normal = new System.Numerics.Vector3(mesh.Normals[instance * 3], mesh.Normals[instance * 3 + 2], mesh.Normals[instance * 3 + 1]);
         normal = normal.LengthSquared() > 1e-12f && float.IsFinite(normal.LengthSquared()) ? System.Numerics.Vector3.Normalize(normal) : System.Numerics.Vector3.UnitY;
-        var uv = new System.Numerics.Vector2(mesh.Uv0[instance * 2], mesh.Uv0[instance * 2 + 1]);
-        return new(new SharpGLTF.Geometry.VertexTypes.VertexPositionNormal(position, normal), new SharpGLTF.Geometry.VertexTypes.VertexTexture1(uv));
+        var packed = new List<float> { position.X, position.Y, position.Z, normal.X, normal.Y, normal.Z };
+        if (colors is not null)
+        {
+            var color = EditorVertexColor(colors, instance);
+            packed.AddRange(new[] { color.X, color.Y, color.Z, color.W });
+        }
+        foreach (var (_, values) in mesh.UvChannels) packed.AddRange(new[] { values[instance * 2], values[instance * 2 + 1] });
+        return packed.ToArray();
     }
-    var triangleCount = mesh.TriangleInstances.Length / 3;
-    for (var triangle = 0; triangle < triangleCount; triangle++)
+    SharpGLTF.Schema2.Accessor VertexAccessor(byte[] bytes, int count, SharpGLTF.Schema2.DimensionType dimensions, SharpGLTF.Schema2.EncodingType encoding = SharpGLTF.Schema2.EncodingType.FLOAT, bool normalized = false)
+    {
+        var view = root.UseBufferView(bytes, 0, null, 0, SharpGLTF.Schema2.BufferMode.ARRAY_BUFFER);
+        var accessor = root.CreateAccessor();
+        accessor.SetVertexData(view, 0, count, dimensions, encoding, normalized);
+        return accessor;
+    }
+    SharpGLTF.Schema2.Accessor IndexAccessor(IReadOnlyList<int> indices, int vertexCount)
+    {
+        // The narrowest index type that holds every vertex index: UNSIGNED_SHORT up to 65536 vertices.
+        var wide = vertexCount > 65536;
+        var bytes = wide
+            ? MemoryMarshal.AsBytes(indices.Select(index => (uint)index).ToArray().AsSpan()).ToArray()
+            : MemoryMarshal.AsBytes(indices.Select(index => (ushort)index).ToArray().AsSpan()).ToArray();
+        var view = root.UseBufferView(bytes, 0, null, 0, SharpGLTF.Schema2.BufferMode.ELEMENT_ARRAY_BUFFER);
+        var accessor = root.CreateAccessor();
+        accessor.SetIndexData(view, 0, indices.Count, wide ? SharpGLTF.Schema2.IndexEncodingType.UNSIGNED_INT : SharpGLTF.Schema2.IndexEncodingType.UNSIGNED_SHORT);
+        return accessor;
+    }
+    static byte[] FloatBytes(float[] values) => MemoryMarshal.AsBytes(values.AsSpan()).ToArray();
+    // The byte a normalized UNSIGNED_BYTE COLOR_0 stores for an encoded channel. The encoders above add half a step, so
+    // truncating at 255 lands on the byte Unreal's ToFColor(true) writes, exactly as the SharpGLTF encoder did.
+    static byte ColourByte(float encoded) => (byte)Math.Clamp(MathF.Floor(encoded * 255f), 0f, 255f);
+    // Two corners at one position make a zero-area triangle, which the builder this writer replaces dropped (whatever their
+    // normal, colour or UVs); the position is the first three components of a packed vertex.
+    bool SamePosition(float[] left, float[] right) => left.AsSpan(0, 3).SequenceEqual(right.AsSpan(0, 3));
+    // Triangles are grouped by material slot, one primitive per slot in the order each slot is first used, and only the
+    // live triangles are written.
+    var groupOrder = new List<int>();
+    var groupTriangles = new Dictionary<int, List<int>>();
+    for (var triangle = 0; triangle < mesh.TriangleInstances.Length / 3; triangle++)
     {
         if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
         var group = triangle < mesh.TriangleGroups.Length ? mesh.TriangleGroups[triangle] : 0;
-        builder.UsePrimitive(Material(group)).AddTriangle(
-            Vertex(mesh.TriangleInstances[triangle * 3]),
-            Vertex(mesh.TriangleInstances[triangle * 3 + 1]),
-            Vertex(mesh.TriangleInstances[triangle * 3 + 2]));
+        if (!groupTriangles.TryGetValue(group, out var triangles))
+        {
+            groupOrder.Add(group);
+            groupTriangles[group] = triangles = new List<int>();
+        }
+        triangles.Add(triangle);
     }
-    var scene = new SharpGLTF.Scenes.SceneBuilder();
-    scene.AddRigidMesh(builder, System.Numerics.Matrix4x4.Identity);
+    foreach (var group in groupOrder)
+    {
+        var vertices = new List<float[]>();
+        var vertexOf = new Dictionary<float[], int>(new EditorVertexComparer());
+        var indices = new List<int>();
+        foreach (var triangle in groupTriangles[group])
+        {
+            var corners = new[] { PackVertex(mesh.TriangleInstances[triangle * 3]), PackVertex(mesh.TriangleInstances[triangle * 3 + 1]), PackVertex(mesh.TriangleInstances[triangle * 3 + 2]) };
+            // A triangle with two corners at one position is dropped, as it always was. The UV channels and normals only split
+            // vertices, so the triangles, and therefore the index buffer of a single-channel source, are unchanged.
+            if (SamePosition(corners[0], corners[1]) || SamePosition(corners[1], corners[2]) || SamePosition(corners[2], corners[0])) continue;
+            foreach (var packed in corners)
+            {
+                if (!vertexOf.TryGetValue(packed, out var local))
+                {
+                    local = vertices.Count;
+                    vertices.Add(packed);
+                    vertexOf.Add(packed, local);
+                }
+                indices.Add(local);
+            }
+        }
+        // A group whose triangles were all dropped has no primitive, as before.
+        if (indices.Count == 0) continue;
+        gltfMesh ??= root.CreateMesh(name);
+        var count = vertices.Count;
+        var positions = new float[count * 3];
+        var normals = new float[count * 3];
+        var colourBytes = colors is null ? null : new byte[count * 4];
+        var uvs = mesh.UvChannels.Select(_ => new float[count * 2]).ToArray();
+        for (var vertex = 0; vertex < count; vertex++)
+        {
+            var packed = vertices[vertex];
+            Array.Copy(packed, 0, positions, vertex * 3, 3);
+            Array.Copy(packed, 3, normals, vertex * 3, 3);
+            var at = 6;
+            if (colourBytes is not null)
+            {
+                for (var component = 0; component < 4; component++) colourBytes[vertex * 4 + component] = ColourByte(packed[at + component]);
+                at += 4;
+            }
+            for (var channel = 0; channel < uvs.Length; channel++)
+            {
+                uvs[channel][vertex * 2] = packed[at];
+                uvs[channel][vertex * 2 + 1] = packed[at + 1];
+                at += 2;
+            }
+        }
+        var primitive = gltfMesh.CreatePrimitive();
+        primitive.Material = Material(group);
+        primitive.SetVertexAccessor("POSITION", VertexAccessor(FloatBytes(positions), count, SharpGLTF.Schema2.DimensionType.VEC3));
+        primitive.SetVertexAccessor("NORMAL", VertexAccessor(FloatBytes(normals), count, SharpGLTF.Schema2.DimensionType.VEC3));
+        if (colourBytes is not null)
+            primitive.SetVertexAccessor("COLOR_0", VertexAccessor(colourBytes, count, SharpGLTF.Schema2.DimensionType.VEC4, SharpGLTF.Schema2.EncodingType.UNSIGNED_BYTE, normalized: true));
+        for (var channel = 0; channel < uvs.Length; channel++)
+            primitive.SetVertexAccessor("TEXCOORD_" + mesh.UvChannels[channel].Channel, VertexAccessor(FloatBytes(uvs[channel]), count, SharpGLTF.Schema2.DimensionType.VEC2));
+        primitive.SetIndexAccessor(IndexAccessor(indices, count));
+    }
+    var scene = root.UseScene(0);
+    if (gltfMesh is not null) SharpGLTF.Schema2.Toolkit.WithMesh(scene.CreateNode(), gltfMesh);
     Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-    scene.ToGltf2().SaveGLB(target);
+    root.SaveGLB(target);
+}
+
+// One vertex instance's colour as the value Unreal's shader reads. The MeshDescription stores a linear
+// FVector4f, but the static-mesh build packs it with FLinearColor::ToFColor(true) -- sRGB-encoding RGB
+// (standard .0031308 breakpoint), keeping alpha linear, quantising to a byte -- and VET_Color reads that
+// byte / 255 with no gamma decode (the Platform.ush code applies a channel swizzle only). A glTF COLOR_0
+// of the raw source would make a client read a different colour than Unreal, so the shader value is
+// written instead. UE5.8's ToFColorSRGB takes RGB through a fast LUT, which may differ from this standard
+// sRGB curve by at most one byte; alpha is the same round-to-nearest. A colour index past the buffer would
+// be a malformed mesh; Unreal's default white is used so the whole export does not fail over one bad
+// triangle, and an unpainted mesh writes no COLOR_0 at all.
+static System.Numerics.Vector4 EditorVertexColor(float[] colors, int instance)
+{
+    var at = instance * 4;
+    return at >= 0 && at + 3 < colors.Length
+        ? new System.Numerics.Vector4(SrgbVertexChannel(colors[at]), SrgbVertexChannel(colors[at + 1]), SrgbVertexChannel(colors[at + 2]), LinearVertexChannel(colors[at + 3]))
+        : System.Numerics.Vector4.One;
+}
+
+// The byte Unreal's ToFColor(true) writes for a linear RGB channel, as the normalized value SharpGLTF
+// stores. MathF.Round(..., AwayFromZero) is the modern nearest byte (.5 up); the +0.5 offset makes
+// SharpGLTF's truncating byte encoder land on exactly that byte: floor((byte + 0.5) / 255 * 255) == byte.
+static float SrgbVertexChannel(float value)
+{
+    if (!float.IsFinite(value)) return value;
+    var linear = Math.Clamp(value, 0f, 1f);
+    var srgb = linear <= 0.0031308f ? linear * 12.92f : 1.055f * MathF.Pow(linear, 1f / 2.4f) - 0.055f;
+    return (MathF.Round(srgb * 255f, MidpointRounding.AwayFromZero) + 0.5f) / 255f;
+}
+
+// Alpha stays linear through ToFColor; only the RGB curve is applied.
+static float LinearVertexChannel(float value)
+{
+    return float.IsFinite(value) ? (MathF.Round(Math.Clamp(value, 0f, 1f) * 255f, MidpointRounding.AwayFromZero) + 0.5f) / 255f : value;
 }
 
 // Editor source art is stored the way FTextureSource keeps it, not as a display image. A
@@ -3362,6 +4155,7 @@ static EGame DetectGame(string root)
 
 static EGame ParseGame(string version) => version switch
 {
+    "5.8" => EGame.GAME_UE5_8,
     "5.7" => EGame.GAME_UE5_7,
     "5.6" => EGame.GAME_UE5_6,
     "5.5" => EGame.GAME_UE5_5,
@@ -3400,6 +4194,231 @@ static EGame ParseGame(string version) => version switch
     "4.0" => EGame.GAME_UE4_0,
     _ => throw new ArgumentException($"unsupported --engine version {version}")
 };
+
+// The instance's own overrides, written as .props.txt blocks. A row is written only when CUE4Parse read it whole: a tagged row must
+// carry the tags it needs, and a binary row must come from a material whose read raised no logged failure. Presence is the tag
+// list: a missing tag is never read as 0, false or a default colour. The typed views of a tagged set are not used: GetParams
+// flattens the parent's values into the instance, and GetOrDefault cannot tell an absent field from a zero one.
+public static class MaterialOverrides
+{
+    public sealed class Refusal(string message) : Exception(message);
+
+    // A parameter as the blocks name it. Association and Index are null when the source did not hold them; Guid is null when zero.
+    sealed record ParameterIdentity(string Name, string? Association, int? Index, string? Guid);
+
+    // A switch row. A row that does not override (Enabled false) writes nothing and inherits the parent's value.
+    readonly record struct SwitchRow(ParameterIdentity Identity, bool Enabled, bool Value);
+
+    // The instance's own TextureParameterValues, by qualified package and object: Blocks does not write them. The declared tagged
+    // collection is the only source. Its ParameterInfo carries the association and index that the typed array's flattened Name drops,
+    // so a typed row is never admitted: with no declared tag it cannot prove its identity. A declared collection that cannot be read
+    // refuses, and so does a read that did not complete for the material, since its rows then cannot be taken as the whole set. A row's
+    // identity is admitted as Blocks admits a global one, and its block writes that identity. An authored null texture refuses, since
+    // inheriting the parent's texture for it is not source-proven. qualify gives the package path of a texture reference, or null.
+    public static string Textures(UMaterialInstanceConstant instance, string material, IReadOnlyDictionary<string, string> readFailures, Func<FPackageIndex, string?> qualify)
+    {
+        // Null for an absent collection the read completed for; an absent one the read did not complete for refuses inside Rows.
+        var rows = Rows(instance, "TextureParameterValues", material, readFailures);
+        if (rows is null)
+        {
+            if (instance.TextureParameterValues.Length > 0)
+                throw new Refusal("TextureParameterValues has typed rows but no declared tag, so their association and index are not proven");
+            return "";
+        }
+        if (readFailures.TryGetValue(material, out var failure))
+            throw new Refusal($"TextureParameterValues is present, but the material did not read completely ({failure}), so its rows cannot be taken as the whole set");
+        var text = new StringBuilder();
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var index = 0;
+        foreach (var row in rows)
+        {
+            var identity = Claim(TaggedIdentity(row, "TextureParameterValues"), "TextureParameterValues", names);
+            var value = Required<FPackageIndex>(row, "ParameterValue", "TextureParameterValues");
+            if (value is null) throw new Refusal($"TextureParameterValues row '{identity.Name}' has a ParameterValue that cannot be read");
+            if (value.IsNull) throw new Refusal($"TextureParameterValues row '{identity.Name}' is an authored null texture, and inheriting the parent's texture for it is not source-proven");
+            var package = value.Name == "None" ? null : qualify(value);
+            if (package is null) throw new Refusal($"TextureParameterValues row '{identity.Name}' does not name a qualified texture, so the instance's texture is not known");
+            Block(text, "TextureParameterValues", index++, [$"    ParameterValue = Texture2D'{package}.{value.Name}'", .. Lines(identity)]);
+        }
+        return text.ToString();
+    }
+
+    // Everything is read before any text is returned, so a refused material leaves the caller nothing to write.
+    public static string Blocks(UMaterialInstance instance, string material, IReadOnlyDictionary<string, string> readFailures)
+    {
+        var scalars = Rows(instance, "ScalarParameterValues", material, readFailures) ?? Array.Empty<FStructFallback>();
+        var vectors = Rows(instance, "VectorParameterValues", material, readFailures) ?? Array.Empty<FStructFallback>();
+        var switches = SwitchRows(instance, material, readFailures);
+        var text = new StringBuilder();
+
+        var scalarNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var index = 0;
+        foreach (var row in scalars)
+        {
+            var identity = Claim(TaggedIdentity(row, "ScalarParameterValues"), "ScalarParameterValues", scalarNames);
+            var value = Required<float>(row, "ParameterValue", "ScalarParameterValues");
+            if (!float.IsFinite(value)) throw new Refusal($"ScalarParameterValues row '{identity.Name}' has a non-finite ParameterValue");
+            Block(text, "ScalarParameterValues", index++, [$"    ParameterValue = {Number(value)}", .. Lines(identity)]);
+        }
+
+        var vectorNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        index = 0;
+        foreach (var row in vectors)
+        {
+            var identity = Claim(TaggedIdentity(row, "VectorParameterValues"), "VectorParameterValues", vectorNames);
+            var color = Required<FLinearColor>(row, "ParameterValue", "VectorParameterValues");
+            if (!float.IsFinite(color.R) || !float.IsFinite(color.G) || !float.IsFinite(color.B) || !float.IsFinite(color.A))
+                throw new Refusal($"VectorParameterValues row '{identity.Name}' has a non-finite channel");
+            var value = $"{{R={Number(color.R)},G={Number(color.G)},B={Number(color.B)},A={Number(color.A)}}}";
+            Block(text, "VectorParameterValues", index++, [$"    ParameterValue = {value}", .. Lines(identity)]);
+        }
+
+        // Every row claims its identity, enabled or not, so a disabled row cannot share a name with an override.
+        var switchNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        index = 0;
+        foreach (var row in switches)
+        {
+            Claim(row.Identity, "StaticSwitchParameters", switchNames);
+            // bOverride = false inherits the parent's value, so the row writes nothing.
+            if (!row.Enabled) continue;
+            Block(text, "StaticSwitchParameters", index++, [$"    Value = {(row.Value ? "true" : "false")}", "    bOverride = true", .. Lines(row.Identity)]);
+        }
+        return text.ToString();
+    }
+
+    // The switch rows the instance overrides with. A tagged set (StaticParameters, else its runtime copy) is read tag by tag, so its
+    // presence is the evidence. A binary set carries no tags, and a read that stopped early leaves a short list that looks whole, so
+    // it is trusted only when the material's read raised no logged failure.
+    static List<SwitchRow> SwitchRows(UMaterialInstance instance, string material, IReadOnlyDictionary<string, string> readFailures)
+    {
+        var field = Has(instance, "StaticParameters") ? "StaticParameters" : Has(instance, "StaticParametersRuntime") ? "StaticParametersRuntime" : null;
+        if (field is not null)
+        {
+            if (!instance.TryGetValue<FStructFallback>(out var set, field)) throw new Refusal($"{field} is present but cannot be read");
+            return (Rows(set, "StaticSwitchParameters", material, readFailures) ?? Array.Empty<FStructFallback>()).Select(TaggedSwitch).ToList();
+        }
+        if (readFailures.TryGetValue(material, out var failure))
+            throw new Refusal($"its static switches are read from the binary StaticParameters, and the material did not read completely ({failure})");
+        return (instance.StaticParameters?.StaticSwitchParameters ?? Array.Empty<FStaticSwitchParameter>()).Select(BinarySwitch).ToList();
+    }
+
+    static SwitchRow TaggedSwitch(FStructFallback row)
+    {
+        var identity = TaggedIdentity(row, "StaticSwitchParameters");
+        var enabled = Required<bool>(row, "bOverride", "StaticSwitchParameters");
+        // A row that inherits needs no value, so its Value tag is required only when it overrides.
+        return new SwitchRow(identity, enabled, enabled && Required<bool>(row, "Value", "StaticSwitchParameters"));
+    }
+
+    // A row CUE4Parse read from the binary archive. The archive reads a bare name and sets the index to -1, and the parameterless
+    // FMaterialParameterInfo it runs on sets the association to global. Layer parameters did not exist in this format.
+    static SwitchRow BinarySwitch(FStaticSwitchParameter row)
+    {
+        if (row is null) throw new Refusal("StaticSwitchParameters has a row that could not be read");
+        var info = row.ParameterInfo ?? throw new Refusal("StaticSwitchParameters row has no ParameterInfo, so its name is not known");
+        if (info.Association != EMaterialParameterAssociation.GlobalParameter)
+            throw new Refusal($"StaticSwitchParameters row is a {info.Association} parameter, and only global parameters are supported");
+        if (info.Index != -1) throw new Refusal("StaticSwitchParameters row has a layer index, which only layer parameters use");
+        var identity = new ParameterIdentity(Admit(info.Name.Text ?? "", "StaticSwitchParameters"), info.Association.ToString(), info.Index, ExpressionGuid(row.ExpressionGuid));
+        return new SwitchRow(identity, row.bOverride, row.Value);
+    }
+
+    // The parameter a tagged row overrides. The association is required: an absent one would read as the enum's first member, a layer.
+    // The index and the expression GUID are written only when their tags hold them, never as defaults.
+    static ParameterIdentity TaggedIdentity(FStructFallback row, string owner)
+    {
+        if (row is null) throw new Refusal($"{owner} has a row that could not be read");
+        string name;
+        string? association = null;
+        int? index = null;
+        if (Has(row, "ParameterInfo"))
+        {
+            var info = Required<FStructFallback>(row, "ParameterInfo", owner);
+            var value = Required<EMaterialParameterAssociation>(info, "Association", owner);
+            if (value != EMaterialParameterAssociation.GlobalParameter)
+                throw new Refusal($"{owner} row is a {value} parameter, and only global parameters are supported");
+            if (Has(info, "Index"))
+            {
+                index = Required<int>(info, "Index", owner);
+                if (index != -1) throw new Refusal($"{owner} row has a layer index, which only layer parameters use");
+            }
+            association = value.ToString();
+            name = Required<FName>(info, "Name", owner).Text ?? "";
+        }
+        else
+        {
+            // Legacy rows predate layer parameters and name the parameter directly, so they carry no association or index to write.
+            name = Required<FName>(row, "ParameterName", owner).Text ?? "";
+        }
+        var guid = Has(row, "ExpressionGUID") ? ExpressionGuid(Required<FGuid>(row, "ExpressionGUID", owner)) : null;
+        return new ParameterIdentity(Admit(name, owner), association, index, guid);
+    }
+
+    static string Admit(string name, string owner)
+    {
+        if (name is "" or "None" || name != name.Trim() || name.IndexOfAny(new[] { '{', '}', '\r', '\n' }) >= 0)
+            throw new Refusal($"{owner} row names '{name}', which the .props.txt blocks cannot carry");
+        return name;
+    }
+
+    // Rows claim a parameter by its identity: name, association and index. Two claims on one identity are a collision.
+    static ParameterIdentity Claim(ParameterIdentity identity, string owner, HashSet<string> claimed)
+    {
+        if (!claimed.Add($"{identity.Association}|{identity.Index}|{identity.Name}"))
+            throw new Refusal($"{owner} has two rows named '{identity.Name}', so their identity collides");
+        return identity;
+    }
+
+    // An absent GUID reads as zero, which is also how a binary row without one reads, so a zero GUID is left out rather than written.
+    static string? ExpressionGuid(FGuid guid) =>
+        guid.A == 0 && guid.B == 0 && guid.C == 0 && guid.D == 0 ? null : guid.ToString();
+
+    // The parameter's own block fields. Only what the source held is written: an absent index or GUID is not invented.
+    static IEnumerable<string> Lines(ParameterIdentity identity)
+    {
+        yield return "    ParameterInfo =";
+        yield return "    {";
+        yield return $"        Name = {identity.Name}";
+        if (identity.Association is not null) yield return $"        Association = {identity.Association}";
+        if (identity.Index is not null) yield return $"        Index = {identity.Index}";
+        yield return "    }";
+        if (identity.Guid is not null) yield return $"    ExpressionGUID = {identity.Guid}";
+    }
+
+    // Present is the array, empty included. Absent means no override only when the read completed. The only completion evidence
+    // read here is CUE4Parse's logged read failure for this export, keyed by its name; a list cut short without a logged failure
+    // cannot be detected from the converter.
+    static FStructFallback[]? Rows(AbstractPropertyHolder holder, string field, string material, IReadOnlyDictionary<string, string> readFailures)
+    {
+        if (Has(holder, field))
+        {
+            if (holder.TryGetValue<FStructFallback[]>(out var rows, field)) return rows ?? Array.Empty<FStructFallback>();
+            throw new Refusal($"{field} is present but its rows cannot be read");
+        }
+        if (readFailures.TryGetValue(material, out var failure))
+            throw new Refusal($"{field} is absent and the material did not read completely ({failure})");
+        return null;
+    }
+
+    static bool Has(AbstractPropertyHolder holder, string field) => holder.Properties.Any(tag => tag.Name.Text == field);
+
+    static T Required<T>(AbstractPropertyHolder holder, string field, string owner)
+    {
+        if (!Has(holder, field)) throw new Refusal($"{owner} row has no {field} tag, so its value is not known");
+        if (!holder.TryGetValue<T>(out var value, field)) throw new Refusal($"{owner} row's {field} tag cannot be read as {typeof(T).Name}");
+        return value;
+    }
+
+    static void Block(StringBuilder text, string collection, int index, IEnumerable<string> fields)
+    {
+        text.AppendLine($"{collection}[{index}] =");
+        text.AppendLine("{");
+        foreach (var field in fields) text.AppendLine(field);
+        text.AppendLine("}");
+    }
+
+    static string Number(float value) => value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+}
 
 public sealed class PackageReadFailureSink(Dictionary<string, string> failures) : Serilog.Core.ILogEventSink
 {
@@ -3447,9 +4466,28 @@ sealed record EditorMesh(
     float[] Positions,
     int[] InstanceVertices,
     float[] Normals,
-    float[] Uv0,
+    (int Channel, float[] Values)[] UvChannels,
+    float[] VertexColors,
     int[] TriangleInstances,
     int[] TriangleGroups,
     bool[] LiveTriangles,
     string[] GroupSlots);
+sealed record Rgba16fSourceArt(string Format, int SizeX, int SizeY, int NumSlices, int NumMips, bool PngCompressed, string? Compression, bool Srgb, long ElementCount, byte[]? Bytes);
+sealed record Rgba16fDataTexture(int Width, int Height, byte[] Bytes);
+sealed record Rgba16fPackage(string Key, string PackageKey, Dictionary<string, string> Sidecars);
+
+// Packed glTF vertices are equal when every component is equal under float.Equals, so -0 matches 0 and NaN matches
+// NaN: the equality the MeshBuilder this writer replaces used. Every present UV channel is a component of the key, so
+// vertices that differ only in a later channel stay apart.
+sealed class EditorVertexComparer : IEqualityComparer<float[]>
+{
+    public bool Equals(float[]? left, float[]? right) => left!.AsSpan().SequenceEqual(right!.AsSpan());
+
+    public int GetHashCode(float[] vertex)
+    {
+        var hash = new HashCode();
+        foreach (var component in vertex) hash.Add(component);
+        return hash.ToHashCode();
+    }
+}
 `;

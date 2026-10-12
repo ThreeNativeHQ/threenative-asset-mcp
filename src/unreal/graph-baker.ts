@@ -2,21 +2,25 @@ import { readdir } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import sharp from "sharp";
 import { dumpEngineArg } from "../fab/routes.js";
-import { dumpMaterialGraphs } from "./graph-dump.js";
-import type { MaterialGraph } from "./graph-dump.js";
+import { assertEngineContentDirectory, engineContentFromEnvironment, engineVersionOf, isEngineReference, type EngineContentConfig } from "./engine-content.js";
+import { canonicalPackage, dumpMaterialGraphs, materialInstanceKey, type MaterialGraph, type MaterialInstanceRecord } from "./graph-dump.js";
 import {
   bakeGraph,
   emissiveOnlyEffect,
   noColourOutput,
   particleDrivenBaseColor,
   graphPathClasses,
+  graphNormalDependencies,
   graphPathTextures,
+  proveEmissionZero,
+  type EmissionProof,
   type EmissiveEffect,
   type BakeResult,
   type GraphParameters,
+  type NormalDependencies,
   type TextureRaster,
 } from "./material-graph.js";
-import { parsePropsFile, type PropsFile } from "./materials.js";
+import { parsePropsFile, type CollectedTextureParameter, type PropsFile } from "./materials.js";
 import { surfaceKey, type SurfaceNormals } from "./surface-normals.js";
 import type { ExternalTool } from "./toolchain.js";
 
@@ -31,9 +35,13 @@ import type { ExternalTool } from "./toolchain.js";
 
 /** The part of the importer's exported-asset index the baker reads. */
 export interface GraphBakeAssets {
-  /** Texture object name -> PNG written by UE Viewer. */
+  /**
+   * Texture object name -> PNG written by UE Viewer. The binding for a caller that gives no `exportTexture`: a name it
+   * holds uniquely is that texture. It cannot say which package a same-named PNG came from, so it is never consulted
+   * when an exporter is present.
+   */
   readonly png: ReadonlyMap<string, string>;
-  /** Basenames with several physical PNG producers; a sample of one cannot name its exact pixels. */
+  /** Basenames with several physical PNG producers; without an exporter a sample of one is refused, not guessed. */
   readonly ambiguousPng?: ReadonlySet<string> | undefined;
 }
 
@@ -42,6 +50,13 @@ export interface GraphBakeRequest {
   readonly materialName: string;
   /** Unreal object basename; the `.uasset` and `.props.txt` lookup key. */
   readonly lookupName: string;
+  /**
+   * The qualified package the section's material is imported from (`/Game/Dir/Name`), as the mesh's import table names it.
+   * The walk looks the material's own graph up in that package, so a same-named graph of another package is never taken
+   * for it, and a parent with no graph of its own continues from the package its `Parent =` line names. Absent (a legacy
+   * caller), the first link is looked up by name alone, as it always was.
+   */
+  readonly materialPackage?: string | undefined;
   readonly assets: GraphBakeAssets;
   /** Returns the `.props.txt` text for a material (or texture) name, or undefined. */
   readonly readProps: (name: string) => string | undefined;
@@ -50,6 +65,14 @@ export interface GraphBakeRequest {
    * section carries `COLOR_0`; absent, VertexColor stays unsupported.
    */
   readonly vertexColor?: readonly [number, number, number, number] | undefined;
+  /**
+   * Set by the importer only when every primitive using this section keeps glTF `COLOR_0` (the mesh carries the
+   * colour Unreal's `VertexColor` node reads) and the section's consumer is OPAQUE. It lets the baker accept a graph
+   * whose BaseColor output is the `VertexColor` node's RGB exactly (see `directVertexColorGraph`): the mesh supplies
+   * the colour, so a copied graph with that node lowered to neutral white bakes a residual-factor PNG and the original
+   * `COLOR_0` stays authoritative. Absent, such a graph is unsupported exactly as before.
+   */
+  readonly directVertexColor?: boolean | undefined;
   /**
    * Only classify: report whether the material is an emissive-only effect and never bake. The importer probes a
    * translucent section that already has a base-colour texture, which a plain request would not look at.
@@ -69,6 +92,12 @@ export interface GraphBakeRequest {
   readonly objectRadius?: (() => number | undefined) | undefined;
 }
 
+/** Literal Roughness and Metallic values the graph's own outputs set (see `sourceScalarFactors`). */
+export interface GraphPbrFactors {
+  readonly roughness?: number;
+  readonly metallic?: number;
+}
+
 export type GraphBakeOutcome = BakeResult & {
   /** Present when the material wires only Emissive: no albedo exists in the package (see `emissiveOnlyEffect`). */
   readonly effect?: EmissiveEffect;
@@ -81,12 +110,25 @@ export type GraphBakeOutcome = BakeResult & {
   readonly noAlbedo?: string;
   /**
    * Probe only: whether the BaseColor path reads VertexColor (after static switches). Absent when the graph is unknown,
-   * truncated or unreadable.
+   * truncated or unreadable, and when its switch choices never settle (the active path is then no path at all, so the
+   * importer must not drop a mesh's COLOR_0 on it).
    */
   readonly vertexColorOnBaseColor?: boolean;
   /**
+   * Present when the bake lowered a direct `BaseColor -> VertexColor` graph to neutral white (see
+   * `directVertexColorGraph`): the mesh's `COLOR_0` supplies the colour and the baked PNG is only a residual factor,
+   * not the colour itself. Only set for that proved composition.
+   */
+  readonly vertexColorResidual?: boolean;
+  /**
+   * Present with a `vertexColorResidual` bake when the graph's own Roughness or Metallic output is a literal constant (see
+   * `sourceScalarFactors`). The importer applies them as glTF factors only where no packed metallicRoughness texture is bound.
+   */
+  readonly pbrFactors?: GraphPbrFactors;
+  /**
    * Probe only: the textures the active BaseColor path samples, and whether the instance chain overrides a static
-   * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first.
+   * switch. A chain that picks a branch can bind a texture the flattened `.mat` never lists first. Absent when that path
+   * has a node the evaluator cannot read, since a bake of it would fail too.
    */
   readonly baseColourTextures?: readonly string[];
   readonly switchOverridden?: boolean;
@@ -94,9 +136,31 @@ export type GraphBakeOutcome = BakeResult & {
   readonly graphMaterial?: string;
   /** The parameters the evaluator saw, after nearest-wins merging over the instance chain. */
   readonly parameters?: GraphParameters;
+  /**
+   * Whether the graph emits no light for this instance (see `proveEmissionZero`). Present whenever the graph itself was read,
+   * on a bake, a probe or an effect alike, so the importer can drop a stale emissive binding or factor on that proof alone.
+   */
+  readonly emissionZero?: EmissionProof;
+  /**
+   * Present whenever the graph itself was read, on a bake, a probe or an effect alike: the textures its active Normal reads (see
+   * `graphNormalDependencies`), so the importer can drop a flattened normal map the graph proves stale on that proof alone.
+   */
+  readonly normalDependencies?: NormalDependencies;
 };
 
 export type GraphBaker = (request: GraphBakeRequest) => Promise<GraphBakeOutcome>;
+
+/**
+ * One resolvable texture source: the PNG the exporter wrote for the exact package, and the `.props.txt` text of
+ * that same package when the exporter produced one. The props carry the source's own `SRGB` override, so the bake
+ * decodes the pixels of the package the graph names and never a same-named package's metadata.
+ */
+export interface GraphTextureSource {
+  readonly path: string;
+  readonly properties?: string | undefined;
+  /** The engine content an `/Engine/` reference was answered from: its Unreal version and package. Absent for a pack package. */
+  readonly engine?: { readonly version: string; readonly package: string } | undefined;
+}
 
 export interface GraphBakerOptions {
   readonly sourceDir: string;
@@ -108,10 +172,20 @@ export interface GraphBakerOptions {
   /** The importer's longest embedded edge; the bake never exceeds 1024 either way. */
   readonly maxTextureSize?: number | undefined;
   /**
-   * Exports one texture package that the mesh export did not carry (colour textures that only a material
-   * function references) and returns the PNG path, or undefined. Tried after `assets.png`.
+   * Resolves one texture the graph samples to its source, or undefined. It is authoritative and consulted before
+   * `assets.png`: when the export returns undefined the bake is refused rather than falling back to a same-named PNG in
+   * the mesh export, which could be another package. The second argument is the full reference the graph or instance
+   * names for that object (`/Game/A/B/T_X.T_X`), absent when the graph proves none, and the exporter must answer only
+   * for that package. A bare string is the PNG path alone (legacy); a `GraphTextureSource` also carries the exact
+   * package's `.props.txt`, so the sRGB decode uses that package's own `SRGB` and never a namesake's. Without an
+   * exporter the caller's `assets.png` map is the binding (see `GraphBakeAssets`).
    */
-  readonly exportTexture?: ((name: string) => Promise<string | undefined>) | undefined;
+  readonly exportTexture?: ((name: string, reference?: string) => Promise<string | GraphTextureSource | undefined>) | undefined;
+  /**
+   * Engine content that supplies the `/Engine/` material functions a pack names. Read from THREENATIVE_ENGINE_CONTENT_DIR
+   * and THREENATIVE_ENGINE_CONTENT_VERSION only when a graph is actually needed; absent means no engine content.
+   */
+  readonly engineContent?: EngineContentConfig | undefined;
   /** Test seam; production runs the converter's `--dump-graphs` mode. */
   readonly dumpGraphs?: typeof dumpMaterialGraphs;
 }
@@ -123,13 +197,23 @@ const BAKE_CACHE_BYTES = 256 * 1024 * 1024;
 const STATIC_SWITCH_NOTE = "static switch values taken from the parent's defaults";
 
 /**
+ * The note for a texture read from engine content whose version is not the pack's own, or when the pack's version is unknown.
+ * Worded as the function note is (`material-graph.ts`), so both name the content they came from. Undefined when the versions match.
+ */
+function engineTextureNote(name: string, engine: { readonly version: string; readonly package: string }, packEngine: string | undefined): string | undefined {
+  if (packEngine !== undefined && packEngine === engine.version) return undefined;
+  const packNote = packEngine === undefined ? "the pack's Unreal version is unknown" : `the pack is ${packEngine}`;
+  return `${name} read from engine content ${engine.version} (${engine.package}); ${packNote}`;
+}
+
+/**
  * The one place that decides whether a UE Viewer PNG carries sRGB-encoded colour.
  * The evaluator combines this with the sampler type of each node: only `Color` samplers decode
  * sRGB, Normal / Masks / Grayscale / LinearColor samplers read the stored bytes. So this flag only
  * has to say whether the texture's own `SRGB` property was switched off; UE Viewer writes that into
  * a texture's `.props.txt` when it exports one, and absent properties mean Unreal's default (true).
  */
-function textureIsSrgb(propsText: string | undefined): boolean {
+export function textureIsSrgb(propsText: string | undefined): boolean {
   return !(propsText !== undefined && /^\s*SRGB\s*=\s*false\b/im.test(propsText));
 }
 
@@ -138,6 +222,20 @@ function textureBasename(reference: string): string {
   const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference;
   const afterSlash = quoted.slice(quoted.lastIndexOf("/") + 1);
   return (afterSlash.includes(".") ? afterSlash.slice(afterSlash.lastIndexOf(".") + 1) : afterSlash).trim();
+}
+
+/**
+ * The package a texture reference names, lower-cased and without its object: `Texture2D'/Game/A/T_X.T_X'`,
+ * `/Game/A/T_X.T_X` and `/Game/A/T_X` all give `game/a/t_x`, and so does a props-style `Content/A/T_X`, since the
+ * pack's `Content` folder is the `/Game` mount. A bare object name names no package: undefined.
+ */
+export function texturePackageKey(reference: string): string | undefined {
+  const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference;
+  const slash = quoted.lastIndexOf("/");
+  if (slash < 0) return undefined;
+  const dot = quoted.indexOf(".", slash);
+  const path = (dot < 0 ? quoted : quoted.slice(0, dot)).replace(/^\/+/, "").toLowerCase();
+  return path.startsWith("content/") ? `game/${path.slice("content/".length)}` : path;
 }
 
 async function listUassetBasenames(root: string): Promise<Set<string>> {
@@ -155,33 +253,82 @@ function mergeFirst<T>(target: Map<string, T>, key: string, value: T): void {
 }
 
 /**
- * Parameters for an instance chain, nearest wins. Overrides (`TextureParameterValues`,
- * `VectorParameterValues`, `ScalarParameterValues`) of every level beat any default; defaults
- * (`Collected*`) then fill in from the instance upwards. The evaluator fills the rest from the
- * graph's own node defaults.
+ * Parameters for an instance chain, nearest wins. Overrides (`TextureParameterValues`, `VectorParameterValues`,
+ * `ScalarParameterValues`) of every level beat any default; defaults (`Collected*`) then fill in from the instance upwards. The
+ * evaluator fills the rest from the graph's own node defaults.
+ *
+ * A texture parameter settles once, at the nearest level that overrides it, and the settling entry gives both its object name and
+ * its full reference (`Texture2D'/Game/A/T_X.T_X'`, which keeps the package), so the two maps can never disagree. A `None` in a native
+ * link (`unresolvedOverrides`) settles the parameter as unknown instead (`unresolvedTextures`): UE Viewer wrote it for a texture it
+ * cannot name, so no ancestor's override, no default and no node default may stand in for it. `reasons` names, per unresolved
+ * parameter, why it is unknown. A record's own `None` is never passed in here: it is an authored null that overrides nothing.
  */
-export function chainParameters(chain: readonly PropsFile[]): GraphParameters {
+export function chainParameters(chain: readonly PropsFile[], reasons?: ReadonlyMap<string, string>): GraphParameters {
   const textures = new Map<string, string>();
+  const textureReferences = new Map<string, string>();
+  const unresolvedTextures = new Map<string, string>();
   const vectors = new Map<string, [number, number, number, number]>();
   const scalars = new Map<string, number>();
   const switches = new Map<string, boolean>();
+  const settled = new Set<string>();
+  const settleTexture = (name: string, texture: string, reference: string | undefined): void => {
+    const key = name.trim().toLowerCase();
+    if (settled.has(key)) return;
+    settled.add(key);
+    textures.set(key, texture);
+    textureReferences.set(key, reference ?? texture);
+  };
+  const settleUnresolved = (name: string): void => {
+    const key = name.trim().toLowerCase();
+    if (settled.has(key)) return;
+    settled.add(key);
+    unresolvedTextures.set(key, reasons?.get(key) ?? `${name} is a texture override the exporter could not name (None), so its texture is unknown`);
+  };
   for (const props of chain) {
     for (const entry of props.switchOverrides) mergeFirst(switches, entry.name, entry.value);
-    for (const entry of props.overrides) mergeFirst(textures, entry.name, entry.texture);
+    for (const entry of props.overrides) settleTexture(entry.name, entry.texture, entry.reference);
+    // After this level's known overrides, so a `None` beside a known override of the same name never shadows it.
+    for (const name of props.unresolvedOverrides) settleUnresolved(name);
     for (const entry of props.vectorOverrides) mergeFirst(vectors, entry.name, [...entry.value]);
     for (const entry of props.scalarOverrides) mergeFirst(scalars, entry.name, entry.value);
   }
   for (const props of chain) {
-    for (const entry of props.collected) mergeFirst(textures, entry.name, entry.texture);
+    for (const entry of props.collected) settleTexture(entry.name, entry.texture, entry.reference);
     for (const entry of props.vectors) mergeFirst(vectors, entry.name, [...entry.value]);
     for (const entry of props.scalars) mergeFirst(scalars, entry.name, entry.value);
   }
-  return { textures, vectors, scalars, switches };
+  return {
+    textures,
+    textureReferences,
+    ...(unresolvedTextures.size > 0 ? { unresolvedTextures } : {}),
+    vectors,
+    scalars,
+    switches,
+  };
 }
 
-function parametersKey(parameters: GraphParameters): string {
+export function parametersKey(parameters: GraphParameters): string {
   const sorted = <T>(map: ReadonlyMap<string, T>): [string, T][] => [...map].sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify([sorted(parameters.textures), sorted(parameters.vectors), sorted(parameters.scalars), sorted(parameters.switches)]);
+  // Two chains can carry the same object names from different packages, and those bake differently, so the key also holds
+  // each reference by its package identity: `/Game/A/T` and `Content/A/T` are the same package. A reference that addresses the
+  // engine mount keeps its own spelling instead, class, object, prefix case, padding and all: it is answered by engine content or not at
+  // all, so folding `/Engine/A/T.T` onto `/engine/A/T.T` would let a refusal answer a valid request, or the reverse.
+  const references = [...parameters.textureReferences ?? []]
+    .map(([name, reference]): [string, string] => [
+      name,
+      isEngineReference(reference) ? reference : texturePackageKey(reference) ?? reference.toLowerCase(),
+    ])
+    .sort(([a], [b]) => a.localeCompare(b));
+  // An unknown texture is part of the key too: a bake that read the ancestor's or the node's texture has the same textures and
+  // references as one whose parameter is unknown, and it must never answer for it.
+  return JSON.stringify([
+    sorted(parameters.textures),
+    references,
+    sorted(parameters.vectors),
+    sorted(parameters.scalars),
+    sorted(parameters.switches),
+    sorted(parameters.unresolvedTextures ?? new Map<string, string>()),
+  ]);
 }
 
 function unavailable(reason: string): GraphBakeOutcome {
@@ -203,25 +350,178 @@ export function graphReadsObjectRadius(graph: MaterialGraph): boolean {
   return graph.nodes.some((node) => node.class === "ObjectRadius");
 }
 
-/** `/Game/A/B/Name` and `Content/A/B/Name` name one package; compare them without the mount point or case. */
-function normalisedPackage(path: string): string {
-  return path.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^(?:Game|Content)\//i, "").toLowerCase();
+/**
+ * The one composition where a `VertexColor` graph is exactly representable without baking the colour: BaseColor is the
+ * `VertexColor` node's output 0 with the RGB channel selection (`[1,1,1,0]`, or a null mask, which the evaluator reads
+ * as RGB for output 0), the graph is neither truncated nor errored, the node is readable, and neither an Opacity nor an
+ * OpacityMask path is wired. No function, Make, arithmetic, swizzle or other general VertexColor use qualifies.
+ */
+export function directVertexColorGraph(graph: MaterialGraph): boolean {
+  // A wired attributes output may make the individual root pins dormant; the dump does not record which mode is active.
+  if (graph.truncated || graph.error || graph.outputs.materialAttributes) return false;
+  const { baseColor, opacity, opacityMask } = graph.outputs;
+  if (!baseColor || opacity || opacityMask) return false;
+  if (baseColor.output !== 0) return false;
+  if (baseColor.mask !== null && !(baseColor.mask[0] === 1 && baseColor.mask[1] === 1 && baseColor.mask[2] === 1 && baseColor.mask[3] === 0)) return false;
+  const node = graph.nodes.find((candidate) => candidate.id === baseColor.node);
+  return node !== undefined && node.class === "VertexColor" && node.error === undefined;
+}
+
+/**
+ * A copy of `graph` whose BaseColor-producing node is a neutral white `Constant3Vector`. The bake of this copy is a
+ * residual factor only; the original graph is left untouched for probes, class reporting and source provenance.
+ */
+export function whiteLoweredGraph(graph: MaterialGraph): MaterialGraph {
+  const target = graph.outputs.baseColor?.node;
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) =>
+      node.id === target ? { id: node.id, class: "Constant3Vector", inputs: {}, constants: { Constant: [1, 1, 1, 0] } } : node,
+    ),
+  };
+}
+
+/**
+ * The literal Roughness and Metallic the graph's own outputs set, for a residual bake. A factor is proved only when its output
+ * pin is output 0 with a null or R-only mask, wired to a readable `Constant` with no wired inputs: an omitted R is that
+ * Constant's default, 0, and a finite R in [0, 1] is taken as written. Anything else gives no factor (an unconnected pin, another
+ * output, a wider mask, a parameter or other node, a malformed or out-of-range value, a truncated or errored graph). Nothing is
+ * guessed, capped or clamped, and the instance's scalar parameters are never read: a graph that does not wire them cannot use them.
+ */
+function sourceScalarFactors(graph: MaterialGraph): GraphPbrFactors | undefined {
+  if (graph.truncated || graph.error) return undefined;
+  const roughness = literalScalarOutput(graph, graph.outputs.roughness);
+  const metallic = literalScalarOutput(graph, graph.outputs.metallic);
+  if (roughness === undefined && metallic === undefined) return undefined;
+  return { ...(roughness === undefined ? {} : { roughness }), ...(metallic === undefined ? {} : { metallic }) };
+}
+
+function literalScalarOutput(graph: MaterialGraph, pin: MaterialGraph["outputs"]["roughness"]): number | undefined {
+  if (!pin || pin.output !== 0) return undefined;
+  if (pin.mask !== null && !(pin.mask[0] === 1 && pin.mask[1] === 0 && pin.mask[2] === 0 && pin.mask[3] === 0)) return undefined;
+  const source = graph.nodes.find((candidate) => candidate.id === pin.node);
+  if (!source || source.class !== "Constant" || source.error !== undefined) return undefined;
+  if (Object.values(source.inputs).some((input) => input !== null)) return undefined;
+  const value = source.constants.R;
+  if (value === undefined) return 0;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
 }
 
 /**
  * The graph of material `name`. The dump keys the first graph of a name by that name and any later one of the same
- * name by its package path, so a plain lookup by name always lands on one arbitrary namesake. With the package the
- * instance's `Parent =` line named, the matching graph is taken wherever it is keyed.
+ * name by its package path, so a plain lookup by name always lands on one arbitrary namesake. Without a package the
+ * lookup is by name, as it always was. With one, only the graph of exactly that package is taken, wherever it is keyed
+ * (`Content/` and `/Game/` are one mount; `/Engine/` and unmounted paths never match the pack's). A miss is a miss, and
+ * two exact matches are refused. The dump already keeps every claimant of a duplicated identity out of `graphs`
+ * (`duplicateGraphs`), so the walk names that reason for it rather than reaching this miss.
  */
 export function graphNamed(graphs: ReadonlyMap<string, MaterialGraph>, name: string, packagePath: string | undefined): MaterialGraph | undefined {
-  const byName = graphs.get(name);
-  if (packagePath === undefined) return byName;
-  const wanted = normalisedPackage(packagePath);
-  if (byName !== undefined && normalisedPackage(byName.package) === wanted) return byName;
+  if (packagePath === undefined) return graphs.get(name);
+  const wanted = canonicalPackage(packagePath);
+  // The dump holds the pack's graphs, all in its /Game mount, so a request outside that mount names none of them.
+  if (!wanted.startsWith("game:")) return undefined;
+  const exact = new Set<MaterialGraph>();
   for (const candidate of graphs.values()) {
-    if (candidate.material === name && normalisedPackage(candidate.package) === wanted) return candidate;
+    if (candidate.material === name && canonicalPackage(candidate.package) === wanted) exact.add(candidate);
   }
-  return byName;
+  return exact.size === 1 ? [...exact][0] : undefined;
+}
+
+type DumpedGraphs = {
+  readonly graphs: ReadonlyMap<string, MaterialGraph>;
+  readonly invalid: ReadonlyMap<string, string>;
+  readonly duplicateGraphs: ReadonlyMap<string, string>;
+  readonly instances: ReadonlyMap<string, MaterialInstanceRecord>;
+  readonly invalidInstances: ReadonlyMap<string, string>;
+};
+
+/**
+ * The link a parent with no exported props stands for: the qualified instance record of exactly `packagePath` and `object`. A record
+ * of the same name in another package is never substituted, and a record that cannot be used says why, so the walk can report it.
+ */
+function recoveredLink(
+  dumped: DumpedGraphs,
+  packagePath: string | undefined,
+  object: string,
+): { readonly link: PropsFile } | { readonly reason: string } {
+  if (packagePath === undefined) return { reason: `${object} has no exported props, and the link naming it names no package, so no instance record matches it` };
+  // The pack's records are all in its /Game mount, so a request outside it (an /Engine/ master, an unmounted path) is never matched to one.
+  if (!canonicalPackage(packagePath).startsWith("game:"))
+    return { reason: `${object} has no exported props and no instance record for ${packagePath}, which is outside the pack's /Game mount` };
+  const key = materialInstanceKey(packagePath, object);
+  const record = dumped.instances.get(key);
+  if (record !== undefined) return { link: parsePropsFile(record.props ?? "") };
+  const invalid = dumped.invalidInstances.get(key);
+  if (invalid !== undefined) return { reason: `${object} has no exported props, and its instance record cannot be used (${invalid})` };
+  return { reason: `${object} has no exported props and no instance record for ${packagePath}` };
+}
+
+/** A texture reference that names its package and its object (`Texture2D'/Game/A/T_X.T_X'`, `/Engine/A/T_X.T_X`), never a bare name. */
+function namesPackageAndObject(reference: string): boolean {
+  const quoted = /'([^']+)'/.exec(reference)?.[1] ?? reference.trim();
+  return texturePackageKey(quoted) !== undefined && /\/[^/]+\.[^/]+$/.test(quoted);
+}
+
+/**
+ * The override that proves a link's `None` texture for `name`, or why it stays unknown. The proof is the usable record of exactly the
+ * link's own identity (`packagePath` and `object`, canonical and never a basename), and it must give the parameter an override of its own
+ * that names a package and an object. A non-global parameter is never proven, and neither is a request that names no package.
+ */
+function provenTexture(
+  dumped: DumpedGraphs,
+  link: PropsFile,
+  name: string,
+  packagePath: string | undefined,
+  object: string,
+): { readonly override: CollectedTextureParameter } | { readonly reason: string } {
+  const key = name.trim().toLowerCase();
+  const lead = `${name} is an unresolved texture override of ${object} (the exporter named no texture for it), and`;
+  if (packagePath === undefined) return { reason: `${lead} the request names no package, so no instance record can prove it` };
+  if (link.nonGlobalTextures.includes(key)) return { reason: `${lead} it is not a global parameter, the only kind an instance record proves` };
+  const identity = materialInstanceKey(packagePath, object);
+  const record = dumped.instances.get(identity);
+  if (record === undefined) {
+    const invalid = dumped.invalidInstances.get(identity);
+    return { reason: `${lead} ${invalid === undefined ? `no instance record for ${packagePath} proves it` : `its instance record cannot be used (${invalid})`}` };
+  }
+  const own = parsePropsFile(record.props ?? "");
+  if (own.nonGlobalTextures.includes(key)) return { reason: `${lead} the instance record's override is not a global parameter` };
+  const entry = own.overrides.find((candidate) => candidate.name.trim().toLowerCase() === key);
+  if (entry === undefined) return { reason: `${lead} the instance record names no texture for it` };
+  if (!namesPackageAndObject(entry.reference ?? entry.texture)) return { reason: `${lead} the instance record names no qualified texture for it` };
+  return { override: entry };
+}
+
+/**
+ * A native link's own `None` texture overrides, each recovered only where `provenTexture` proves it. A known override the link already
+ * gives the parameter settles it first, so a `None` beside it stays as it is. Returns the link with the proven overrides added as known
+ * textures, and the reason each override that stays unknown is unknown.
+ */
+function recoverUnresolvedTextures(
+  dumped: DumpedGraphs,
+  link: PropsFile,
+  packagePath: string | undefined,
+  object: string,
+): { readonly link: PropsFile; readonly reasons: ReadonlyMap<string, string> } {
+  const reasons = new Map<string, string>();
+  if (link.unresolvedOverrides.length === 0) return { link, reasons };
+  const recovered: CollectedTextureParameter[] = [];
+  const remaining: string[] = [];
+  for (const name of link.unresolvedOverrides) {
+    const key = name.trim().toLowerCase();
+    if (link.overrides.some((override) => override.name.trim().toLowerCase() === key)) {
+      remaining.push(name);
+      continue;
+    }
+    const proof = provenTexture(dumped, link, name, packagePath, object);
+    if ("override" in proof) recovered.push(proof.override);
+    else {
+      remaining.push(name);
+      reasons.set(key, proof.reason);
+    }
+  }
+  if (recovered.length === 0) return { link, reasons };
+  return { link: { ...link, overrides: [...link.overrides, ...recovered], unresolvedOverrides: remaining }, reasons };
 }
 
 /** Returns undefined when graph baking is switched off by the caller (the importer decides that). */
@@ -231,7 +531,7 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
   const size = Math.max(1, Math.min(options.maxTextureSize ?? MAX_BAKE_SIZE, MAX_BAKE_SIZE));
 
   let packages: Promise<Set<string>> | undefined;
-  let graphs: Promise<{ readonly graphs: ReadonlyMap<string, MaterialGraph>; readonly invalid: ReadonlyMap<string, string> } | { readonly error: string }> | undefined;
+  let graphs: Promise<DumpedGraphs | { readonly error: string }> | undefined;
 
   const sourcePackages = (): Promise<Set<string>> => (packages ??= listUassetBasenames(options.sourceDir).catch(() => new Set<string>()));
   // With THREENATIVE_TOOLCHAIN_AUTOINSTALL=0 the dump resolves an installed converter or throws; either
@@ -242,21 +542,30 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
         "Some sections have no base-colour texture; reading the pack's material graphs with CUE4Parse to bake them (the converter and its .NET SDK are installed once on first use; set graphBake:false or THREENATIVE_TOOLCHAIN_AUTOINSTALL=0 to skip).",
       );
       try {
+        const engineContent = options.engineContent ?? engineContentFromEnvironment(environment);
+        if (engineContent) await assertEngineContentDirectory(engineContent);
         const dumped = await dump(options.sourceDir, {
           // The importer carries `UE_4.18`; the converter wants `4.18` and refuses anything else.
           ...(options.engine && dumpEngineArg(options.engine) ? { engine: dumpEngineArg(options.engine)! } : {}),
           environment,
           ...(options.log ? { log: options.log } : {}),
           ...(options.modernConverter ? { converterPath: options.modernConverter.path } : {}),
+          ...(engineContent ? { engineContent } : {}),
         });
-        return { graphs: dumped, invalid: dumped.invalid ?? new Map<string, string>() };
+        return {
+          graphs: dumped,
+          invalid: dumped.invalid ?? new Map<string, string>(),
+          duplicateGraphs: dumped.duplicateGraphs ?? new Map<string, string>(),
+          instances: dumped.instances ?? new Map<string, MaterialInstanceRecord>(),
+          invalidInstances: dumped.invalidInstances ?? new Map<string, string>(),
+        };
       } catch (error) {
         return { error: error instanceof Error ? error.message : String(error) };
       }
     })());
 
-  // Active BaseColor-path texture names per graph and parameter set (probe results).
-  const pathTextures = new Map<string, string[]>();
+  // Active BaseColor-path texture names per graph and parameter set (probe results); undefined when the path is unreadable.
+  const pathTextures = new Map<string, string[] | undefined>();
   // Decoded textures, shared across every section of the import.
   const rasters = new Map<string, Promise<TextureRaster | undefined>>();
   const rasterSizes = new Map<string, number>();
@@ -311,40 +620,74 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     let graph: MaterialGraph | undefined;
     const visited = new Set<string>();
     // The package the previous link's `Parent =` line named: when two packages hold a material of one name, it picks the graph.
-    let currentPackage: string | undefined;
+    // The walk opens in the material's own package, so a namesake of another package never stands in for the material itself.
+    let currentPackage: string | undefined = request.materialPackage;
+    // Why the walk stopped short of a graph: the parent's props are not exported and its qualified record cannot stand for them.
+    let unrecovered: string | undefined;
+    // Why each texture a link leaves unknown is unknown, by lower-case name. The nearest link's reason stands.
+    const unresolvedReasons = new Map<string, string>();
     for (let current: string | undefined = request.lookupName; current && chain.length < MAX_PARENT_DEPTH && !visited.has(current); ) {
       visited.add(current);
+      // The exported props win. Only a parent with none is looked up, by its exact package and object, in the qualified records.
       const text = request.readProps(current);
-      if (text) chain.push(parsePropsFile(text));
+      let link: PropsFile | undefined = text ? parsePropsFile(text) : undefined;
+      // Every link after the material itself is a parent.
+      if (link === undefined && visited.size > 1) {
+        const recovered = recoveredLink(dumped, currentPackage, current);
+        if ("reason" in recovered) unrecovered = recovered.reason;
+        // A record's own `None` is an authored null, and a null instance texture is no value: the renderer falls through to the parent
+        // (`RenderThread_GetParameterValue` in `MaterialInstanceSupport.h`), so it overrides nothing here and the parent's value stands.
+        else link = { ...recovered.link, unresolvedOverrides: [] };
+      } else if (link) {
+        // A native `None` is recovered from this identity's own record only where that record proves it; the rest keeps its reason.
+        const native = recoverUnresolvedTextures(dumped, link, currentPackage, current);
+        link = native.link;
+        for (const [key, reason] of native.reasons) if (!unresolvedReasons.has(key)) unresolvedReasons.set(key, reason);
+      }
+      if (link) chain.push(link);
       graph = graphNamed(byName, current, currentPackage);
       if (graph) break;
+      // Two or more graph files claim this exact identity, so the dump refused every one: the reason is the duplicate, never a namesake.
+      const refused = currentPackage === undefined ? undefined : dumped.duplicateGraphs.get(materialInstanceKey(currentPackage, current));
+      if (refused !== undefined) return unavailable(`graph for ${current} refused (${refused})`);
       const unreadable = dumped.invalid.get(current);
       if (unreadable !== undefined) return unavailable(`graph for ${current} unreadable (${unreadable})`);
-      current = text ? chain[chain.length - 1]!.parent : undefined;
-      currentPackage = text ? chain[chain.length - 1]!.parentPackage : undefined;
+      current = link?.parent;
+      currentPackage = link?.parentPackage;
     }
-    if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents`);
+    if (!graph) return unavailable(`no dumped graph for ${request.lookupName} or its parents${unrecovered === undefined ? "" : `: ${unrecovered}`}`);
 
+    // The emission and normal proofs read the same instance parameters as the bake, so every outcome below carries them.
+    const parameters = chainParameters(chain, unresolvedReasons);
+    const emissionZero = proveEmissionZero(graph, parameters);
+    const normalDependencies = graphNormalDependencies(graph, parameters, request.alpha);
     const effect = emissiveOnlyEffect(graph);
-    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material };
+    if (effect) return { status: "unavailable", reason: effect.reason, effect, graphMaterial: graph.material, emissionZero, normalDependencies };
     const noAlbedo = noColourOutput(graph);
-    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material };
-    const parameters = chainParameters(chain);
+    if (noAlbedo) return { status: "unavailable", reason: noAlbedo, noAlbedo, graphMaterial: graph.material, emissionZero, normalDependencies };
     if (request.probe) {
       // Unreal applies a mesh's vertex colours only where the graph reads VertexColor; glTF multiplies COLOR_0 into
       // every base colour. The importer drops COLOR_0 when the BaseColor path does not read it.
       const readable = !graph.truncated && !graph.error;
+      // Textures are reported only for a path that compiles without unsupported nodes. A partial compile reaches textures the
+      // bake never samples (those under an unsupported node), so trusting them would keep or drop a binding on evidence the
+      // bake cannot confirm; the importer then asks for the bake itself.
+      // The cut-out settles a shared switch alongside the colour, so the same graph under a different alpha has a
+      // different active path: the alpha is part of the key, not just of the probe that fills it.
+      const pathKey = `${graph.package}|${parametersKey(parameters)}|alpha:${request.alpha ?? "none"}`;
+      if (readable && !pathTextures.has(pathKey)) pathTextures.set(pathKey, graphPathTextures(graph, parameters, request.alpha));
+      const names = readable ? pathTextures.get(pathKey) : undefined;
+      // Undefined when the switch choices never settle: the classes describe no bake, so the probe must not claim the
+      // path does not read VertexColor (that would drop a mesh's COLOR_0 on an unknown path).
+      const classes = readable ? graphPathClasses(graph, "baseColor", parameters, request.alpha) : undefined;
       return {
         ...unavailable(`${graph.material} has a BaseColor output`),
+        emissionZero,
+        normalDependencies,
         ...(readable
           ? {
-              vertexColorOnBaseColor: graphPathClasses(graph, "baseColor", parameters).includes("VertexColor"),
-              baseColourTextures: (pathTextures.get(`${graph.package}|${parametersKey(parameters)}`) ??
-                (() => {
-                  const names = graphPathTextures(graph, parameters);
-                  pathTextures.set(`${graph.package}|${parametersKey(parameters)}`, names);
-                  return names;
-                })()),
+              ...(classes ? { vertexColorOnBaseColor: classes.includes("VertexColor") } : {}),
+              ...(names ? { baseColourTextures: names } : {}),
               switchOverridden: chain.some((props) => props.switchOverrides.length > 0),
             }
           : {}),
@@ -353,7 +696,13 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
 
     const surface = request.surface && graphReadsSurface(graph) ? request.surface() : undefined;
     const objectRadius = request.objectRadius && graphReadsObjectRadius(graph) ? request.objectRadius() : undefined;
-    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}|radius:${objectRadius ?? "none"}`;
+    // A flagged request that names an exactly representable direct VertexColor graph bakes a neutral residual and leaves
+    // the mesh's COLOR_0 to carry the colour: not the same result as the same assets/params asked without the flag, so
+    // the flag is part of the cache key.
+    const residual = request.directVertexColor === true && request.alpha === undefined && directVertexColorGraph(graph);
+    // Unflagged direct-VC graphs and non-direct VC graphs still compile to `unsupported` and are never memoised under
+    // the flagged key.
+    const key = `${graph.package}|${parametersKey(parameters)}|vc:${request.vertexColor?.join(",") ?? "none"}|dvc:${request.directVertexColor === true ? "1" : "0"}|alpha:${request.alpha ?? "none"}|surface:${surface ? surfaceKey(surface) : "none"}|radius:${objectRadius ?? "none"}`;
     let perAssets = bakes.get(request.assets);
     if (!perAssets) {
       perAssets = new Map();
@@ -363,43 +712,79 @@ export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undef
     if (memo) return memo;
 
     const pending = (async (): Promise<GraphBakeOutcome> => {
-      const ambiguous: string[] = [];
-      const loaded = new Set<string>();
+      const unresolved = new Map<string, string>();
+      // Notes for the engine textures this bake actually samples: a texture the graph never reaches is never named.
+      const engineNotes = new Set<string>();
+      const packEngine = engineVersionOf(options.engine);
       const result = await bakeGraph({
-        graph: graph!,
+        graph: residual ? whiteLoweredGraph(graph!) : graph!,
         output: "baseColor",
         parameters,
         size,
         allowUvSetFallback: true,
+        ...(packEngine ? { packEngine } : {}),
         // Unreal feeds white to ParticleColor outside a particle emitter.
         particleColor: [1, 1, 1, 1],
         ...(request.alpha ? { alpha: request.alpha } : {}),
         ...(request.vertexColor ? { vertexColor: request.vertexColor } : {}),
         ...(surface ? { surface } : {}),
         ...(objectRadius !== undefined ? { objectRadius } : {}),
-        loadTexture: async (reference) => {
-          const name = textureBasename(reference);
-          const path = request.assets.png.get(name) ?? (await options.exportTexture?.(name));
-          if (!path) return undefined;
-          if (request.assets.ambiguousPng?.has(name) && !loaded.has(name)) ambiguous.push(name);
-          loaded.add(name);
-          return decode(path, textureIsSrgb(request.readProps(name)));
+        loadTexture: async (objectName, reference) => {
+          const name = textureBasename(objectName);
+          let path: string | undefined;
+          let properties: string | undefined;
+          let engineSource: GraphTextureSource["engine"];
+          // The exporter is authoritative: with the full reference it owns the answer, so a same-named PNG the mesh export
+          // happens to carry is never substituted for the package the graph names. Its metadata rides with the source it
+          // selected (never `readProps(name)`, which is a namesake's). Without an exporter the caller's PNG map is the only
+          // binding, and a basename several files share proves no source, so it is refused rather than guessed.
+          if (options.exportTexture) {
+            const source = await options.exportTexture(name, reference);
+            if (typeof source === "string") path = source;
+            else if (source) {
+              path = source.path;
+              properties = source.properties;
+              engineSource = source.engine;
+            }
+          } else {
+            path = request.assets.ambiguousPng?.has(name) ? undefined : request.assets.png.get(name);
+            properties = request.readProps(name);
+          }
+          if (!path) {
+            unresolved.set(name, `${name} has no exact source`);
+            return undefined;
+          }
+          if (engineSource) {
+            const note = engineTextureNote(name, engineSource, packEngine);
+            if (note) engineNotes.add(note);
+          }
+          return decode(path, textureIsSrgb(properties));
         },
       });
       if (result.status !== "baked") {
         const particle = particleDrivenBaseColor(graph!);
-        return { ...result, graphMaterial: graph!.material, parameters, ...(particle ? { particle } : {}) };
+        // A refused texture is the reason even though the evaluator reports it only as missing: no exact source was chosen.
+        const reason = unresolved.size > 0 ? `${[...unresolved.values()].join("; ")}; no source is selected, so the base colour is not baked` : result.reason;
+        return { ...result, reason, graphMaterial: graph!.material, parameters, emissionZero, normalDependencies, ...(particle ? { particle } : {}) };
       }
       const approximations = new Set(result.approximations);
-      for (const name of ambiguous) approximations.add(`texture ${name}: ambiguous exported PNG basename; exact source pixels cannot be selected`);
-      const classes = graphPathClasses(graph!, "baseColor", parameters);
+      for (const note of engineNotes) approximations.add(note);
+      // A successful bake comes from a settled pass, so the classes are defined; an empty list is only the safe
+      // fallback for reporting, never a claim that the path has no class.
+      const classes = graphPathClasses(graph!, "baseColor", parameters, request.alpha) ?? [];
       if (classes.includes("StaticSwitchParameter") || classes.includes("StaticBoolParameter")) approximations.add(STATIC_SWITCH_NOTE);
+      // Read from the original graph, not the white-lowered copy that was baked, and cached with the residual it belongs to.
+      const pbrFactors = residual ? sourceScalarFactors(graph!) : undefined;
       const baked: GraphBakeOutcome = {
         ...result,
         approximations: [...approximations].sort(),
         confidence: approximations.size === 0 ? "exact" : "heuristic",
         graphMaterial: graph!.material,
         parameters,
+        emissionZero,
+        normalDependencies,
+        ...(residual ? { vertexColorResidual: true } : {}),
+        ...(pbrFactors ? { pbrFactors } : {}),
       };
       bakeBytes += result.png.length;
       return baked;

@@ -6,7 +6,7 @@ import { KHRMaterialsSpecular, type Specular } from "@gltf-transform/extensions"
 import { afterEach, describe, expect, it } from "vitest";
 
 import { importUnrealDirectory } from "../src/unreal/importer.js";
-import { writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fixture.js";
+import { writeFakeModernMaterialConverter, writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fixture.js";
 import { float, input, materialPackage, subsetInstance } from "./helpers/unreal-material-source.js";
 
 /**
@@ -78,7 +78,8 @@ async function importLeaf(options: { aoroTagged: boolean; specular: number }) {
     emptyExports: ["Master"],
     classes: { Mesh: ["StaticMesh"], Master: ["Material"], Instance: ["MaterialInstanceConstant"], Leaf_A: ["Texture2D"], Leaf_AORO: ["Texture2D"] },
   });
-  const report = await importUnrealDirectory({ sourceDir, outputDir, concurrency: 1, graphBake: false, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" } });
+  const modern = join(directory, "modern-converter"); await writeFakeModernMaterialConverter(modern);
+  const report = await importUnrealDirectory({ sourceDir, outputDir, concurrency: 1, graphBake: false, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" }, modernConverter: { name: "modern", path: modern, version: "fake-converter 1" } });
   const document = await new NodeIO().registerExtensions([KHRMaterialsSpecular]).read(join(outputDir, report.models[0]!.glb));
   return { report, material: document.getRoot().listMaterials()[0]! };
 }

@@ -161,6 +161,10 @@ const FORWARDED_ENVIRONMENT = [
   "GNOME_KEYRING_CONTROL",
   "DISPLAY",
   "WAYLAND_DISPLAY",
+  // Python itself reads this switch, so a child skips __pycache__ only if it arrives. Forwarded as the
+  // parent set it: CPython 3.13 keeps writing for "" and "0" and stops for "false", which a boolean
+  // re-encoding would get wrong.
+  "PYTHONDONTWRITEBYTECODE",
 ] as const;
 
 export function childEnvironment(

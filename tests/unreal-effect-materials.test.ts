@@ -27,7 +27,11 @@ const pin = (node: string, output = 0, mask: number[] | null = null) => ({ node,
 const node = (id: string, cls: string, extra: Raw = {}): Raw => ({ id, class: cls, inputs: {}, constants: {}, ...extra });
 const NO_PARAMETERS: GraphParameters = { textures: new Map(), vectors: new Map(), scalars: new Map(), switches: new Map() };
 
-function graphOf(material: string, nodes: Raw[], outputs: { baseColor?: ReturnType<typeof pin>; emissive?: ReturnType<typeof pin> }): MaterialGraph {
+function graphOf(
+  material: string,
+  nodes: Raw[],
+  outputs: { baseColor?: ReturnType<typeof pin>; emissive?: ReturnType<typeof pin>; opacityMask?: ReturnType<typeof pin> },
+): MaterialGraph {
   return materialGraphSchema.parse({
     format: 1,
     material,
@@ -40,7 +44,7 @@ function graphOf(material: string, nodes: Raw[], outputs: { baseColor?: ReturnTy
       metallic: null,
       emissive: outputs.emissive ?? null,
       opacity: null,
-      opacityMask: null,
+      opacityMask: outputs.opacityMask ?? null,
       normal: null,
       materialAttributes: null,
     },
@@ -250,6 +254,8 @@ async function importFixture(options: {
   meshPackageText?: string;
   vertexColor?: readonly [number, number, number, number];
   saturatedUv?: boolean;
+  /** Further `<name>.props.txt` files in the export: the parent instances a chain walks through. */
+  extraProps?: Record<string, string>;
 }) {
   const root = await scratch("effect-import-");
   const sourceDir = join(root, "source");
@@ -268,7 +274,12 @@ async function importFixture(options: {
     ...(options.vertexColor ? { vertexColor: options.vertexColor } : {}),
     ...(options.saturatedUv ? { saturatedUv: true } : {}),
   });
-  for (const [name, rgb] of options.textures) await writePng(join(exported, `${name}.png`), [...rgb, 255], 4);
+  for (const [name, text] of Object.entries(options.extraProps ?? {})) await writeFile(join(exported, `${name}.props.txt`), text);
+  for (const [name, rgb] of options.textures) {
+    // The texture package exists in the pack; the graph names it, so the baker exports it from the source, not from the mesh export.
+    await writeFile(join(content, `${name}.uasset`), Buffer.alloc(16));
+    await writePng(join(exported, `${name}.png`), [...rgb, 255], 4);
+  }
   const umodel = join(root, "umodel");
   await writeFakeUmodel(umodel, { exportFrom: exported, classes: { Mesh: ["StaticMesh"] } });
   const converter = join(root, "converter");
@@ -833,5 +844,251 @@ describe("importer: an instance whose static switch picks a branch the flattened
     expect(red).toBeGreaterThan(green);
     expect(section.graph).toBeUndefined();
     expect(section.limitations.join("\n")).not.toContain("dropped as base colour");
+  });
+});
+
+describe("importer: a stale flattened base colour is replaced only by a successful graph bake", () => {
+  const SWITCH_NAME = "leaf or trunk";
+  const bark = node("bark", "TextureSample", { texture: "/Game/Test/T_Bark.T_Bark", samplerType: "Color" });
+  const barkAndLeaf: [string, [number, number, number]][] = [
+    ["T_Bark", [120, 60, 30]],
+    ["T_Leaf", [30, 160, 40]],
+  ];
+
+  /** BaseColor = switch(A: T_Leaf, B: the `trunk` branch). The leaf branch is the switch's A pin. */
+  function switchMaster(trunk: Raw[], trunkPin: string, opacityMask?: ReturnType<typeof pin>): MaterialGraph {
+    return graphOf(
+      "M_Switch",
+      [
+        node("switch", "StaticSwitchParameter", {
+          inputs: { A: pin("leaf", 0, [1, 1, 1, 0]), B: pin(trunkPin, 0, [1, 1, 1, 0]) },
+          parameter: { name: SWITCH_NAME, group: "" },
+          default: true,
+          switchValue: true,
+        }),
+        node("leaf", "TextureSample", { texture: "/Game/Test/T_Leaf.T_Leaf", samplerType: "Color" }),
+        ...trunk,
+      ],
+      { baseColor: pin("switch"), ...(opacityMask ? { opacityMask } : {}) },
+    );
+  }
+
+  /** An instance (or master child) that sets the switch to `value` itself, with its own parent line. */
+  const switchOverride = (parent: string, value: boolean, blend = "BLEND_Opaque (0)", parentClass = "MaterialInstanceConstant"): string =>
+    [
+      `Parent = ${parentClass}'Content/Test/${parent}.${parent}'`,
+      `BlendMode = ${blend}`,
+      "StaticParameters =",
+      "{",
+      "    StaticSwitchParameters[1] =",
+      "    {",
+      "        StaticSwitchParameters[0] =",
+      "        {",
+      `            Value = ${value}`,
+      `            ParameterInfo = { Name=${SWITCH_NAME} }`,
+      "            bOverride = true",
+      "        }",
+      "    }",
+      "}",
+    ].join("\n");
+  /** An instance that sets nothing itself and inherits from `parent`. */
+  const inheriting = (parent: string): string => `Parent = MaterialInstanceConstant'Content/Test/${parent}.${parent}'\nBlendMode = BLEND_Opaque (0)`;
+
+  async function colourOf(material: { getBaseColorTexture(): { getImage(): Uint8Array | null } | null }): Promise<[number, number, number]> {
+    const { data } = await sharp(material.getBaseColorTexture()!.getImage()!).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    return [data[0]!, data[1]!, data[2]!];
+  }
+
+  it("follows a switch the parent instance overrides when the instance does not override it itself", async () => {
+    const { material, section } = await importFixture({
+      graph: switchMaster([bark], "bark"),
+      materialName: "MI_Leaf",
+      props: inheriting("MI_LeafParent"),
+      extraProps: { MI_LeafParent: switchOverride("M_Switch", true, "BLEND_Opaque (0)", "Material3") },
+      mat: "Diffuse=T_Bark\nOther[0]=T_Leaf\n",
+      textures: barkAndLeaf,
+    });
+    const [red, green] = await colourOf(material);
+    expect(green).toBeGreaterThan(red);
+    expect(section.graph).toMatchObject({ status: "baked" });
+    expect(section.limitations.join("\n")).toContain("T_Bark dropped as base colour");
+  });
+
+  it("lets an instance's own override beat the one its parent sets", async () => {
+    const { material, section } = await importFixture({
+      graph: switchMaster([bark], "bark"),
+      materialName: "MI_Trunk",
+      props: switchOverride("MI_LeafParent", false),
+      extraProps: { MI_LeafParent: switchOverride("M_Switch", true, "BLEND_Opaque (0)", "Material3") },
+      mat: "Diffuse=T_Bark\nOther[0]=T_Leaf\n",
+      textures: barkAndLeaf,
+    });
+    const [red, green] = await colourOf(material);
+    expect(red).toBeGreaterThan(green);
+    expect(section.graph).toBeUndefined();
+    expect(section.limitations.join("\n")).not.toContain("dropped as base colour");
+  });
+
+  it("keeps the flattened binding and says it is unverified when the selected branch cannot be baked", async () => {
+    // The trunk branch runs through SmoothThreshold, an engine function whose definition is not in the pack.
+    const gate = node("gate", "FunctionCall", {
+      function: "/Engine/Functions/Engine_MaterialFunctions02/SmoothThreshold",
+      inputs: { Input0: pin("bark", 0, [1, 1, 1, 0]) },
+    });
+    const { material, section } = await importFixture({
+      graph: switchMaster([bark, gate], "gate"),
+      materialName: "MI_Trunk",
+      props: switchOverride("M_Switch", false, "BLEND_Opaque (0)", "Material3"),
+      mat: "Diffuse=T_Leaf\nOther[0]=T_Bark\n",
+      textures: barkAndLeaf,
+    });
+    expect(material.getBaseColorTexture()).not.toBeNull();
+    expect(await colourOf(material)).toEqual([30, 160, 40]);
+    expect(section.graph).toMatchObject({ status: "unsupported" });
+    expect(section.graph?.unsupportedNodes).toContain("SmoothThreshold");
+    const limitations = section.limitations.join("\n");
+    expect(limitations).toContain("T_Leaf kept as base colour, unverified");
+    expect(limitations).toContain("could not be baked");
+    expect(limitations).not.toContain("dropped as base colour");
+    expect(limitations).not.toContain("baked from the graph");
+  });
+
+  it("takes the cut-out of the selected branch from the graph when it replaces the stale binding", async () => {
+    const mask = node("mask", "TextureSample", { texture: "/Game/Test/T_LeafMask.T_LeafMask", samplerType: "Masks" });
+    const { material, section } = await importFixture({
+      graph: switchMaster([bark, mask], "bark", pin("mask", 0, [1, 0, 0, 0])),
+      materialName: "MI_Leaf",
+      props: switchOverride("M_Switch", true, "BLEND_Masked (1)", "Material3"),
+      mat: "Diffuse=T_Bark\nOther[0]=T_Leaf\n",
+      // The mask is flat 128: the graph's own cut-out, not the flattened .mat's or a default opaque 255.
+      textures: [...barkAndLeaf, ["T_LeafMask", [128, 128, 128]]],
+    });
+    expect(section.limitations.join("\n")).toContain("T_Bark dropped as base colour");
+    expect(material.getAlphaMode()).toBe("MASK");
+    const [red, green] = await colourOf(material);
+    expect(green).toBeGreaterThan(red);
+    expect(await embeddedAlpha(material)).toEqual([128, 128]);
+  });
+
+  it("replaces the flattened albedo and its opacity when an inherited switch selects a leaf whose albedo shares the opacity's name", async () => {
+    // Diffuse=T_Bark and Opacity=T_Leaf; the switch the parent sets picks the leaf branch, whose albedo is T_Leaf too. That name is
+    // the opacity's, so it is no evidence the flattened albedo is right: a successful bake replaces both.
+    const mask = node("mask", "TextureSample", { texture: "/Game/Test/T_LeafMask.T_LeafMask", samplerType: "Masks" });
+    const { material, section } = await importFixture({
+      graph: switchMaster([bark, mask], "bark", pin("mask", 0, [1, 0, 0, 0])),
+      materialName: "MI_Leaf",
+      props: "Parent = MaterialInstanceConstant'Content/Test/MI_LeafParent.MI_LeafParent'",
+      extraProps: { MI_LeafParent: switchOverride("M_Switch", true, "BLEND_Masked (1)", "Material3") },
+      mat: "Diffuse=T_Bark\nOpacity=T_Leaf\n",
+      textures: [...barkAndLeaf, ["T_LeafMask", [128, 128, 128]]],
+    });
+    expect(section.limitations.join("\n")).toContain("T_Bark dropped as base colour");
+    expect(section.graph).toMatchObject({ status: "baked" });
+    expect(material.getAlphaMode()).toBe("MASK");
+    const [red, green] = await colourOf(material);
+    expect(green).toBeGreaterThan(red);
+    // The graph's own cut-out (flat 128), not the flattened opacity's red (T_Leaf's red is 30).
+    expect(await embeddedAlpha(material)).toEqual([128, 128]);
+  });
+});
+
+describe("importer: a static switch that blends the bound albedo with a mask (tint by mask)", () => {
+  const SWITCH = "Tint By Mask?";
+  const BASE_TINT = [1, 0.5, 0.25];
+  const MASK_TINT = [0.25, 0.5, 1];
+  const MULTI = 1;
+  const CONTRAST = 2;
+  /** A curtain-shaped master: BaseColor = TintByMask? ? lerp(ALB*baseTint, ALB*maskTint, clamp(pow(Mask.R*multi, contrast))) : ALB. */
+  function curtainMaster(): MaterialGraph {
+    const rgb = [1, 1, 1, 0];
+    return graphOf(
+      "M_Curtain",
+      [
+        node("switch", "StaticSwitchParameter", {
+          inputs: { A: pin("blend", 0, rgb), B: pin("alb", 0, rgb) },
+          parameter: { name: SWITCH, group: "" },
+          default: false,
+          switchValue: false,
+        }),
+        node("alb", "TextureSample", { texture: "/Game/Test/T_Alb.T_Alb", samplerType: "Color" }),
+        node("mask", "TextureSample", { texture: "/Game/Test/T_Mask.T_Mask", samplerType: "Masks" }),
+        node("baseTint", "VectorParameter", { parameter: { name: "Albedo Color Tint (Base)", group: "" }, default: [...BASE_TINT, 1] }),
+        node("maskTint", "VectorParameter", { parameter: { name: "Base Color Tint (Mask)", group: "" }, default: [...MASK_TINT, 1] }),
+        node("multi", "ScalarParameter", { parameter: { name: "Tint Mask Multi", group: "" }, default: MULTI }),
+        node("contrast", "ScalarParameter", { parameter: { name: "Tint Mask Contrast", group: "" }, default: CONTRAST }),
+        node("albBase", "Multiply", { inputs: { A: pin("alb", 0, rgb), B: pin("baseTint", 0, rgb) } }),
+        node("albMask", "Multiply", { inputs: { A: pin("alb", 0, rgb), B: pin("maskTint", 0, rgb) } }),
+        node("scaled", "Multiply", { inputs: { A: pin("mask", 0, [1, 0, 0, 0]), B: pin("multi") } }),
+        node("curve", "Power", { inputs: { Base: pin("scaled"), Exponent: pin("contrast") } }),
+        node("weight", "Clamp", { inputs: { Input: pin("curve") } }),
+        node("blend", "LinearInterpolate", { inputs: { A: pin("albBase", 0, rgb), B: pin("albMask", 0, rgb), Alpha: pin("weight") } }),
+      ],
+      { baseColor: pin("switch") },
+    );
+  }
+  const parentLine = (parent: string, parentClass = "Material3"): string => `Parent = ${parentClass}'Content/Test/${parent}.${parent}'\nBlendMode = BLEND_Opaque (0)`;
+  const switchRow = (value: boolean, overridden = true): string =>
+    [
+      "StaticParameters =",
+      "{",
+      "    StaticSwitchParameters[1] =",
+      "    {",
+      "        StaticSwitchParameters[0] =",
+      "        {",
+      `            Value = ${value}`,
+      `            ParameterInfo = { Name=${SWITCH} }`,
+      `            bOverride = ${overridden}`,
+      "        }",
+      "    }",
+      "}",
+    ].join("\n");
+
+  // Independent expectation: sRGB decode of the colour texture, the mask sampled linear, lerp in linear light, sRGB encode.
+  const ALBEDO = [200, 100, 50];
+  const MASK_R = 128;
+  const decode = (value: number): number => (value / 255 <= 0.04045 ? value / 255 / 12.92 : ((value / 255 + 0.055) / 1.055) ** 2.4);
+  const encode = (linear: number): number => Math.round(255 * (linear <= 0.0031308 ? 12.92 * linear : 1.055 * linear ** (1 / 2.4) - 0.055));
+  const weight = Math.min(1, Math.max(0, (MASK_R / 255) * MULTI) ** CONTRAST);
+  const tinted = ALBEDO.map((channel, index) => {
+    const albedo = decode(channel);
+    const base = albedo * BASE_TINT[index]!;
+    return encode(base + (albedo * MASK_TINT[index]! - base) * weight);
+  });
+
+  async function firstPixel(material: { getBaseColorTexture(): { getImage(): Uint8Array | null } | null }): Promise<number[]> {
+    const { data } = await sharp(material.getBaseColorTexture()!.getImage()!).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    return [data[0]!, data[1]!, data[2]!];
+  }
+
+  it.each([
+    ["the instance overrides it true", { props: `${parentLine("M_Curtain")}\n${switchRow(true)}` }, true],
+    ["a parent instance overrides it true and the instance inherits", { props: parentLine("MI_CurtainParent", "MaterialInstanceConstant"), extraProps: { MI_CurtainParent: `${parentLine("M_Curtain")}\n${switchRow(true)}` } }, true],
+    ["the instance overrides it false", { props: `${parentLine("M_Curtain")}\n${switchRow(false)}` }, false],
+    ["the instance sets true with bOverride false (it inherits the master's false)", { props: `${parentLine("M_Curtain")}\n${switchRow(true, false)}` }, false],
+    ["the instance does not list it", { props: parentLine("M_Curtain") }, false],
+    ["the instance's false beats its parent's true", { props: `${parentLine("MI_CurtainParent", "MaterialInstanceConstant")}\n${switchRow(false)}`, extraProps: { MI_CurtainParent: `${parentLine("M_Curtain")}\n${switchRow(true)}` } }, false],
+  ] satisfies [string, { props: string; extraProps?: Record<string, string> }, boolean][])("when %s", async (_case, instance, blended) => {
+    const { material, section } = await importFixture({
+      graph: curtainMaster(),
+      materialName: "MI_Curtain",
+      ...instance,
+      // UE Viewer's flattened .mat binds the albedo texture alone, whatever the switch picks.
+      mat: "Diffuse=T_Alb\n",
+      textures: [
+        ["T_Alb", ALBEDO as [number, number, number]],
+        ["T_Mask", [MASK_R, MASK_R, MASK_R]],
+      ],
+    });
+    const pixel = await firstPixel(material);
+    if (blended) {
+      expect(section.graph).toMatchObject({ status: "baked" });
+      expect(section.limitations.join("\n")).toContain("T_Alb dropped as base colour");
+      pixel.forEach((channel, index) => expect(Math.abs(channel - tinted[index]!)).toBeLessThanOrEqual(2));
+      expect(pixel).not.toEqual(ALBEDO);
+    } else {
+      expect(section.graph).toBeUndefined();
+      expect(section.limitations.join("\n")).not.toContain("dropped as base colour");
+      expect(pixel).toEqual(ALBEDO);
+    }
   });
 });

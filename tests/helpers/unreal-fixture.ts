@@ -190,8 +190,15 @@ export async function writeMeshFixture(
 export interface FakeUmodelOptions {
   /** Directory whose contents are copied into `-out=` on export. */
   readonly exportFrom?: string;
-  /** `<packageName>` → the class list `-list` reports. */
+  /** `<packageName>` → the directory copied for that package instead of `exportFrom`: a texture exported alone, apart from its mesh. */
+  readonly exportFromByPackage?: Readonly<Record<string, string>>;
+  /** `<packageName>` → the class list `-list` reports. Every row takes the package's own name as its object name. */
   readonly classes: Readonly<Record<string, readonly string[]>>;
+  /**
+   * `<packageName>` → the rows `-list` reports as (class, object name) pairs, for a package whose exports are named
+   * differently: a level's package-named World beside its Texture2D auxiliaries. Wins over `classes` for that package.
+   */
+  readonly objects?: Readonly<Record<string, readonly { readonly className: string; readonly objectName: string }[]>>;
   readonly listExitCode?: number;
   readonly exportExitCode?: number;
   readonly version?: string;
@@ -202,6 +209,12 @@ export interface FakeUmodelOptions {
   readonly corruptBuffer?: boolean;
   /** Package basenames UE Viewer recognizes but intentionally emits no files for. */
   readonly emptyExports?: readonly string[];
+  /**
+   * Models UE Viewer's output paths: an absolute `-out=` is copied into a 256-byte buffer with the package folders
+   * appended, and a longer result writes nothing, prints "Error creating file" and exits 0. `./` stays relative to the
+   * working directory. `-out=.` resolves against HOME, so the stand-in refuses it rather than writing there.
+   */
+  readonly nativeOutputPaths?: boolean;
 }
 
 export async function writeFakeUmodel(
@@ -222,27 +235,83 @@ if (argv.includes("-version")) {
 const selector = argv.filter((entry) => !entry.startsWith("-")).pop();
 const target = basename(selector || "").replace(/\.(uasset|umap)$/i, "");
 if (argv.includes("-list")) {
-  const classes = options.classes[target] || [];
+  const rows = (options.objects && options.objects[target]) || (options.classes[target] || []).map((className) => ({ className, objectName: target }));
   process.stdout.write("Found 1 game files (0 skipped) in 1 folders\\n");
-  classes.forEach((className, index) => {
-    process.stdout.write("   " + index + "    1000       10 " + className + " " + target + "\\n");
+  rows.forEach((row, index) => {
+    process.stdout.write("   " + index + "    1000       10 " + row.className + " " + row.objectName + "\\n");
   });
   process.exit(options.listExitCode || 0);
 }
 if (argv.includes("-export")) {
   if (options.exportExitCode) process.exit(options.exportExitCode);
   if ((options.emptyExports || []).includes(target)) process.exit(0);
-  if (!options.exportFrom) process.exit(0);
+  const exportFrom = (options.exportFromByPackage && options.exportFromByPackage[target]) || options.exportFrom;
+  if (!exportFrom) process.exit(0);
   const out = (argv.find((entry) => entry.indexOf("-out=") === 0) || "").slice("-out=".length);
-  const destination = join(out, options.outputSubdirectory || "Group/Package");
+  const subdirectory = options.outputSubdirectory || "Group/Package";
+  if (options.nativeOutputPaths) {
+    if (out === ".") {
+      process.stderr.write("-out=. resolves against HOME\\n");
+      process.exit(3);
+    }
+    const composed = (out === "./" ? "./" : out + "/") + subdirectory;
+    if (composed.length > 255) {
+      process.stdout.write("Error creating file " + composed + "\\n");
+      process.exit(0);
+    }
+  }
+  const destination = join(out, subdirectory);
   fs.mkdirSync(destination, { recursive: true });
-  fs.cpSync(options.exportFrom, destination, { recursive: true });
+  fs.cpSync(exportFrom, destination, { recursive: true });
   if (options.corruptBuffer) {
     for (const name of fs.readdirSync(destination)) {
       if (name.endsWith(".bin")) fs.writeFileSync(join(destination, name), Buffer.alloc(4));
     }
   }
   process.exit(0);
+}
+process.exit(0);
+`;
+  await writeFile(path, script);
+  await chmod(path, 0o755);
+}
+
+/**
+ * The modern converter as a material fallback meets it. A test whose UE Viewer export is deliberately empty
+ * (`emptyExports`) sends that material to the fallback; this stand-in answers each `--filter` package with the
+ * empty `Materials/<name>.props.txt` of a package with no texture parameters, or with `FakeModernMaterialConverterOptions.emptyExports`
+ * for a package it cannot describe at all (an empty export directory, no sidecar). Passing it explicitly keeps the
+ * fallback off the host's toolchain cache, so the result does not depend on which converter the machine has.
+ */
+export interface FakeModernMaterialConverterOptions {
+  /** Package basenames answered with no sidecar at all, unlike the default empty `props.txt`. */
+  readonly emptyExports?: readonly string[];
+  /** Directory of PNGs written under `Textures/` beside each answered sidecar: the editor thumbnails the real converter ships. */
+  readonly texturesFrom?: string;
+}
+
+export async function writeFakeModernMaterialConverter(
+  path: string,
+  options: FakeModernMaterialConverterOptions = {},
+): Promise<void> {
+  const script = `#!/usr/bin/env node
+"use strict";
+const fs = require("node:fs");
+const { basename, join } = require("node:path");
+const argv = process.argv.slice(2);
+const options = ${JSON.stringify(options)};
+if (argv.includes("--version")) { process.stdout.write("fake-converter 1\\n"); process.exit(0); }
+const exportAt = argv.indexOf("--export-dir");
+const filterAt = argv.indexOf("--filter");
+if (exportAt >= 0 && filterAt >= 0) {
+  const target = basename(argv[filterAt + 1]);
+  if ((options.emptyExports || []).includes(target)) {
+    fs.mkdirSync(argv[exportAt + 1], { recursive: true });
+    process.exit(0);
+  }
+  fs.mkdirSync(join(argv[exportAt + 1], "Materials"), { recursive: true });
+  fs.writeFileSync(join(argv[exportAt + 1], "Materials", target + ".props.txt"), "");
+  if (options.texturesFrom) fs.cpSync(options.texturesFrom, join(argv[exportAt + 1], "Textures"), { recursive: true });
 }
 process.exit(0);
 `;
@@ -335,4 +404,50 @@ process.exit(70);
 `;
   await writeFile(path, script);
   await chmod(path, 0o755);
+}
+
+/**
+ * A modern converter stub for the engine-profile tests. Every run appends its argv (one JSON array per
+ * line) to `argvLog`. A run whose `--engine` is one of `succeedOn` (`auto` names a run with none) copies
+ * each of `outputs` into its export directory; any other run leaves a partial file behind and fails the
+ * way a profile mismatch does, or with an unrelated error when `unrelated` is set.
+ */
+export async function writeEngineProfileConverter(
+  file: string,
+  options: {
+    readonly argvLog: string;
+    readonly succeedOn: string | readonly string[];
+    /** Copied into the export directory at `path`, relative to it, when the run succeeds. */
+    readonly outputs: readonly { readonly path: string; readonly fixture: string }[];
+    readonly unrelated?: boolean;
+  },
+): Promise<string> {
+  const failure = options.unrelated
+    ? "fatal: the export writer reached an unexpected end of stream"
+    : "ParserException: Invalid FString length while decoding an unversioned package";
+  const succeedOn = typeof options.succeedOn === "string" ? [options.succeedOn] : options.succeedOn;
+  await writeFile(
+    file,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const argv = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(options.argvLog)}, JSON.stringify(argv) + "\\n");
+const engineAt = argv.indexOf("--engine");
+const engine = engineAt >= 0 ? argv[engineAt + 1] : "auto";
+const out = argv[argv.indexOf("--export-dir") + 1];
+fs.mkdirSync(out, { recursive: true });
+if (!${JSON.stringify(succeedOn)}.includes(engine)) {
+  fs.writeFileSync(path.join(out, "partial-output-must-not-promote.txt"), engine);
+  console.error(${JSON.stringify(failure)});
+  process.exit(1);
+}
+for (const output of ${JSON.stringify(options.outputs)}) {
+  fs.mkdirSync(path.dirname(path.join(out, output.path)), { recursive: true });
+  fs.copyFileSync(output.fixture, path.join(out, output.path));
+}
+`,
+  );
+  await chmod(file, 0o755);
+  return file;
 }

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { Document, NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { Matrix4, Quaternion, Vector3 } from "three";
@@ -66,30 +68,54 @@ async function figure(occluder = false): Promise<Uint8Array> {
   return new NodeIO().writeBinary(document);
 }
 
-/** Share of red pixels and their centroid, as fractions of the image. */
-async function redHand(png: Uint8Array): Promise<{ share: number; x: number; y: number }> {
+type Hand = { count: number; share: number; x: number; y: number; diagnostic: string };
+
+/**
+ * Red-pixel count, share and centroid, as fractions of the image. With no red pixels the centroid is
+ * (-1, -1), a sentinel that must never be compared: see `expectRedHand`.
+ */
+async function redHand(png: Uint8Array): Promise<Hand> {
   const { data, info } = await sharp(png).raw().toBuffer({ resolveWithObject: true });
-  let count = 0, sumX = 0, sumY = 0;
-  for (let pixel = 0; pixel < info.width * info.height; pixel += 1) {
+  const pixels = info.width * info.height;
+  let count = 0, sumX = 0, sumY = 0, sumR = 0, sumG = 0, sumB = 0;
+  for (let pixel = 0; pixel < pixels; pixel += 1) {
     const offset = pixel * info.channels;
+    sumR += data[offset]!;
+    sumG += data[offset + 1]!;
+    sumB += data[offset + 2]!;
     if (data[offset]! > 110 && data[offset + 1]! < 70 && data[offset + 2]! < 70) {
       count += 1;
       sumX += pixel % info.width;
       sumY += Math.floor(pixel / info.width);
     }
   }
-  return { share: count / (info.width * info.height), x: count ? sumX / count / info.width : -1, y: count ? sumY / count / info.height : -1 };
+  const share = count / pixels;
+  const x = count ? sumX / count / info.width : -1;
+  const y = count ? sumY / count / info.height : -1;
+  const mean = [sumR, sumG, sumB].map(sum => Math.round(sum / pixels));
+  const sha256 = createHash("sha256").update(png).digest("hex");
+  const diagnostic = `redCount=${count} share=${share.toFixed(4)} centroid=(${x.toFixed(3)}, ${y.toFixed(3)}) ` +
+    `size=${info.width}x${info.height} meanRGB=(${mean.join(",")}) bytes=${png.byteLength} sha256=${sha256}`;
+  return { count, share, x, y, diagnostic };
+}
+
+/** Fails with the frame's diagnostics when it has no red pixels, rather than comparing a (-1, -1) centroid. */
+function expectRedHand(hand: Hand, label: string): void {
+  expect(hand.count, `${label} has no red hand: ${hand.diagnostic}`).toBeGreaterThan(0);
 }
 
 const options = { clipName: "Swing", times: [0, 1], angles: 1, width: 160, height: 160, timeoutMs: 20_000 };
 
 it("frames the wrist and its fingers and keeps them centred as the animation moves them", async () => {
   const bytes = await figure();
-  const whole = await renderPreview(bytes, options);
-  const close = await renderPreview(bytes, { ...options, focus: { bone: "wrist.L" } });
+  // At the 90-degree endpoint the hand leaves the fixed whole-model frame. Compare visible hands at 45 degrees.
+  const sampled = { ...options, times: [0, 0.5] };
+  const whole = await renderPreview(bytes, sampled);
+  const close = await renderPreview(bytes, { ...sampled, focus: { bone: "wrist.L" } });
   for (const index of [0, 1]) {
     const wide = await redHand(whole.images[index]!.png);
     const near = await redHand(close.images[index]!.png);
+    expectRedHand(near, `close-up ${index}`);
     expect(near.share, `close-up ${index} hand size`).toBeGreaterThan(Math.max(wide.share * 8, 0.04));
     expect(Math.abs(near.x - 0.5), `close-up ${index} horizontal centring`).toBeLessThan(0.15);
     expect(Math.abs(near.y - 0.5), `close-up ${index} vertical centring`).toBeLessThan(0.2);
@@ -97,7 +123,9 @@ it("frames the wrist and its fingers and keeps them centred as the animation mov
   // The whole-model camera does not follow the hand: its centroid moves a long way between frames.
   const first = await redHand(whole.images[0]!.png);
   const last = await redHand(whole.images[1]!.png);
-  expect(Math.hypot(first.x - last.x, first.y - last.y)).toBeGreaterThan(0.1);
+  expectRedHand(first, "whole-model frame 0");
+  expectRedHand(last, "whole-model frame 1");
+  expect(Math.hypot(first.x - last.x, first.y - last.y), `${first.diagnostic} | ${last.diagnostic}`).toBeGreaterThan(0.1);
 }, 60_000);
 
 it("rejects a focus bone that is not in the model instead of rendering the whole model", async () => {
@@ -119,10 +147,14 @@ it("keeps the camera still when the fingers move if an explicit distance is give
   const bent = await renderPreview(bytes, { ...base, pose: { bone: "knuckle.L", axis: "z", degrees: 90 } });
   const before = await redHand(rest.images[0]!.png);
   const after = await redHand(bent.images[0]!.png);
+  expectRedHand(before, "explicit distance, rest");
+  expectRedHand(after, "explicit distance, bent");
   // The red hand is skinned to the wrist, so only a camera that follows the fingertip would move it.
-  expect(Math.hypot(before.x - after.x, before.y - after.y)).toBeLessThan(0.01);
+  expect(Math.hypot(before.x - after.x, before.y - after.y), `${before.diagnostic} | ${after.diagnostic}`).toBeLessThan(0.01);
   const fitted = await renderPreview(bytes, { ...options, times: [0], focus: { bone: "wrist.L" } });
   const fittedBent = await renderPreview(bytes, { ...options, times: [0], focus: { bone: "wrist.L" }, pose: { bone: "knuckle.L", axis: "z", degrees: 90 } });
   const a = await redHand(fitted.images[0]!.png), b = await redHand(fittedBent.images[0]!.png);
-  expect(Math.hypot(a.x - b.x, a.y - b.y)).toBeGreaterThan(0.01);
+  expectRedHand(a, "fitted, rest");
+  expectRedHand(b, "fitted, bent");
+  expect(Math.hypot(a.x - b.x, a.y - b.y), `${a.diagnostic} | ${b.diagnostic}`).toBeGreaterThan(0.01);
 }, 60_000);

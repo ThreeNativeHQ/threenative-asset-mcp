@@ -236,8 +236,8 @@ describe("modern-converter instance props (Parent + CollectedTextureParameters o
   it("parsePropsFile exposes the collected entries of an instance as overrides", () => {
     const parsed = parsePropsFile(modernInstance("M_Wall", [["NRM", "T_Wall_Own_N"], ["Color", "T_Wall_Own_D"]]));
     expect(parsed.overrides).toEqual([
-      { name: "NRM", texture: "T_Wall_Own_N" },
-      { name: "Color", texture: "T_Wall_Own_D" },
+      { name: "NRM", texture: "T_Wall_Own_N", reference: tex("T_Wall_Own_N") },
+      { name: "Color", texture: "T_Wall_Own_D", reference: tex("T_Wall_Own_D") },
     ]);
     expect(parsed.collected).toHaveLength(2);
   });
@@ -245,7 +245,7 @@ describe("modern-converter instance props (Parent + CollectedTextureParameters o
   it("does not turn a root material's defaults into overrides, nor double count real overrides", () => {
     expect(parsePropsFile(masterProps([["NRM", "T_Wall_Default_N"]])).overrides).toEqual([]);
     const both = `${instanceProps("M_Wall", [["NRM", "T_Wall_Own_N"]])}\n${masterProps([["NRM", "T_Wall_Own_N"]])}`;
-    expect(parsePropsFile(both).overrides).toEqual([{ name: "NRM", texture: "T_Wall_Own_N" }]);
+    expect(parsePropsFile(both).overrides).toEqual([{ name: "NRM", texture: "T_Wall_Own_N", reference: tex("T_Wall_Own_N") }]);
   });
 
   it("binds the instance's override, not the parent's collected default", () => {

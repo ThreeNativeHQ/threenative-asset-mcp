@@ -89,7 +89,10 @@ export interface MatFile {
 
 export interface CollectedTextureParameter {
   readonly name: string;
+  /** The texture's object name. */
   readonly texture: string;
+  /** The value as the props file writes it (`Texture2D'/Game/A/T_X.T_X'`), so the package is kept too. */
+  readonly reference?: string | undefined;
 }
 
 export interface ScalarParameter {
@@ -117,6 +120,11 @@ export interface PropsFile {
    * It still replaces whatever an ancestor bound to that parameter.
    */
   readonly unresolvedOverrides: readonly string[];
+  /**
+   * Names (lower-case) of the `TextureParameterValues` entries whose `ParameterInfo` names a non-global association (a layer or
+   * blend parameter). An instance record proves only a global parameter's texture, so these are never recovered from one.
+   */
+  readonly nonGlobalTextures: readonly string[];
   readonly scalars: readonly ScalarParameter[];
   readonly scalarOverrides: readonly ScalarParameter[];
   readonly vectors: readonly VectorParameter[];
@@ -202,6 +210,7 @@ export function parsePropsFile(text: string): PropsFile {
 
   const overrides: CollectedTextureParameter[] = [];
   const unresolvedOverrides: string[] = [];
+  const nonGlobalTextures: string[] = [];
   const scalars: ScalarParameter[] = [];
   const scalarOverrides: ScalarParameter[] = [];
   const vectors: VectorParameter[] = [];
@@ -211,6 +220,7 @@ export function parsePropsFile(text: string): PropsFile {
   let collectedDepth = 0;
   let depth = 0;
   let pendingTexture: string | undefined;
+  let pendingReference: string | undefined;
   let pendingName: string | undefined;
 
   const number = "[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[Ee][-+]?\\d+)?";
@@ -283,8 +293,11 @@ export function parsePropsFile(text: string): PropsFile {
   for (const block of indexedBlocks("TextureParameterValues")) {
     if (/TextureParameterValues\[\d+\]/.test(block)) continue;
     const name = readName(block);
-    const texture = objectName(/ParameterValue\s*=\s*([^\r\n}]+)/.exec(block)?.[1] ?? "");
-    if (name && texture) overrides.push({ name, texture });
+    const value = /ParameterValue\s*=\s*([^\r\n}]+)/.exec(block)?.[1] ?? "";
+    const texture = objectName(value);
+    const association = /\bAssociation\s*=\s*(\w+)/.exec(block)?.[1];
+    if (name && association !== undefined && association !== "GlobalParameter") nonGlobalTextures.push(name.trim().toLowerCase());
+    if (name && texture) overrides.push({ name, texture, reference: value.trim() });
     else if (name && /ParameterValue\s*=\s*None\b/.test(block)) unresolvedOverrides.push(name);
   }
   const streamingTextures = indexedBlocks("TextureStreamingData")
@@ -312,16 +325,21 @@ export function parsePropsFile(text: string): PropsFile {
       inCollected = true;
       collectedDepth = depth;
       pendingTexture = undefined;
+      pendingReference = undefined;
       pendingName = undefined;
     }
     if (inCollected) {
       const texture = /^Texture\s*=\s*(.+)$/.exec(line);
-      if (texture?.[1]) pendingTexture = objectName(texture[1]);
+      if (texture?.[1]) {
+        pendingTexture = objectName(texture[1]);
+        pendingReference = texture[1].trim();
+      }
       const name = /^Name\s*=\s*(.+)$/.exec(line);
       if (name?.[1]) pendingName = name[1].trim();
       if (pendingTexture && pendingName) {
-        collected.push({ name: pendingName, texture: pendingTexture });
+        collected.push({ name: pendingName, texture: pendingTexture, reference: pendingReference });
         pendingTexture = undefined;
+        pendingReference = undefined;
         pendingName = undefined;
       }
     }
@@ -349,9 +367,11 @@ export function parsePropsFile(text: string): PropsFile {
     collected,
     // The modern converter writes an instance's own overrides as `CollectedTextureParameters`
     // (a MaterialInstance has no expression nodes, so the collected block IS its overrides; on a
-    // root Material it is the defaults). A real `TextureParameterValues` block wins; never both.
-    overrides: parent !== undefined && overrides.length === 0 ? [...collected] : overrides,
+    // root Material it is the defaults). A real `TextureParameterValues` block wins; never both,
+    // and a block whose entries are all `None` is a real block too (its collected defaults stay defaults).
+    overrides: parent !== undefined && overrides.length === 0 && unresolvedOverrides.length === 0 ? [...collected] : overrides,
     unresolvedOverrides,
+    nonGlobalTextures,
     scalars,
     scalarOverrides,
     vectors,

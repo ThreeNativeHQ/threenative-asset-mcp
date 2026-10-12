@@ -1,13 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { NodeIO, type Accessor, type Primitive } from "@gltf-transform/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
-import { toolchainCacheDir } from "../src/unreal/provision.js";
+import { modernSdkExecutable, toolchainCacheDir } from "../src/unreal/provision.js";
+import { describeWithTools } from "./helpers/require-tool.js";
 
 // Three UE5 editor-package layouts the modern converter did not read (converter 61):
 //  - TSCF_UEDELTA texture sources (UE 5.6+ default): raw pixels, row-delta filtered per tile. No PNG or
@@ -15,9 +16,9 @@ import { toolchainCacheDir } from "../src/unreal/provision.js";
 //  - The UE 5.8 compact FName array in an FMeshDescription: the static mesh had no readable source model.
 //  - A UE4-saved MaterialInstanceConstant inside a UE5 artifact: CUE4Parse throws before filling the typed
 //    TextureParameterValues, so the instance exported no textures although its tagged properties hold them.
-// The decoders are pure functions in the embedded program. When the private .NET SDK the converter build
-// installs is present, they are compiled on their own and run against synthetic data encoded here from
-// Unreal's documented tile rules; elsewhere the program-text checks still pin the wiring.
+// The decoders are pure functions in the embedded program. They are compiled on their own, against the .NET 10
+// SDK and SharpGLTF assemblies of the `modern-converter` test prerequisite, and run against synthetic data
+// encoded here from Unreal's documented tile rules. Without them the compiled suite skips locally and fails under CI=true.
 
 /** Extracts one top-level C# declaration (signature line through its matching brace) from the program. */
 function extractCSharp(program: string, signature: string): string {
@@ -27,6 +28,18 @@ function extractCSharp(program: string, signature: string): string {
   let opened = false;
   for (let index = start; index < program.length; index++) {
     const char = program[index]!;
+    // Comments first: an apostrophe in prose ("Unreal's") is not a char literal, and would hide the braces after it.
+    if (char === "/" && program[index + 1] === "/") {
+      index = program.indexOf("\n", index);
+      if (index < 0) break;
+      continue;
+    }
+    if (char === "/" && program[index + 1] === "*") {
+      const close = program.indexOf("*/", index + 2);
+      if (close < 0) break;
+      index = close + 1;
+      continue;
+    }
     if (char === '"') {
       // Skip a string literal (verbatim strings are not used in these functions).
       for (index++; index < program.length && program[index] !== '"'; index++) if (program[index] === "\\") index++;
@@ -162,20 +175,84 @@ function element(name: string, count: number, attributes: readonly Attribute[], 
   return Buffer.concat(parts);
 }
 
-function meshDescription(slotNames: readonly string[], compactNames: boolean): Buffer {
+const DEFAULT_VALUE_SIZE: Record<number, number> = { 0: 16, 1: 12, 2: 8, 3: 4, 4: 4, 5: 4 };
+
+/**
+ * An element whose allocation bits follow `live` (holes included) and whose attribute arrays each span every allocated
+ * slot, as Unreal serializes VertexInstances. `Attribute` above has one array per attribute, so a UV set needs its own.
+ */
+function maskedElement(name: string, live: readonly boolean[], attributes: readonly { name: string; kind: number; elementSize: number; arrays: readonly Buffer[] }[]): Buffer {
+  const bits = Buffer.alloc(Math.ceil(live.length / 32) * 4);
+  live.forEach((on, index) => {
+    if (on) bits.writeUInt32LE((bits.readUInt32LE((index >> 5) * 4) | (1 << (index & 31))) >>> 0, (index >> 5) * 4);
+  });
+  const parts: Buffer[] = [fstring(name), int32(1), int32(live.length), bits, int32(0, live.length, attributes.length)];
+  for (const attribute of attributes) {
+    parts.push(fstring(attribute.name), int32(attribute.kind, 1, live.length, attribute.arrays.length));
+    for (const data of attribute.arrays) parts.push(int32(1, attribute.elementSize, data.length / attribute.elementSize), data);
+    parts.push(Buffer.alloc(DEFAULT_VALUE_SIZE[attribute.kind]!), int32(0));
+  }
+  return Buffer.concat(parts);
+}
+
+/** One synthetic source model. Slot-indexed arrays span every allocated slot; `uv` has one array per UV channel. */
+interface UvMesh {
+  /** Allocation of the vertex instances, holes included (`false` slots are never read). */
+  readonly live: readonly boolean[];
+  /** The vertex of each allocated instance slot. */
+  readonly vertexOf: readonly number[];
+  /** UE centimetres, three floats per vertex. */
+  readonly positions: readonly number[];
+  readonly normals: readonly number[];
+  readonly uv: readonly (readonly number[])[];
+  /** The TextureCoordinate kind and element size; the defaults are FVector2f (kind 2, eight bytes) as Unreal writes it. */
+  readonly uvKind?: number;
+  readonly uvElementSize?: number;
+  readonly colours?: readonly number[];
+  /** Three live instances and a polygon group each. */
+  readonly triangles: readonly (readonly [number, number, number, number])[];
+  readonly slots: readonly string[];
+}
+
+function uvMeshDescription(mesh: UvMesh): Buffer {
+  const triangles = mesh.triangles.length;
+  const instance = [
+    { name: "VertexIndex", kind: 4, elementSize: 4, arrays: [int32(...mesh.vertexOf)] },
+    { name: "Normal", kind: 1, elementSize: 12, arrays: [floats(mesh.normals)] },
+    { name: "TextureCoordinate", kind: mesh.uvKind ?? 2, elementSize: mesh.uvElementSize ?? 8, arrays: mesh.uv.map((channel) => floats(channel)) },
+    ...(mesh.colours ? [{ name: "Color", kind: 0, elementSize: 16, arrays: [floats(mesh.colours)] }] : []),
+  ];
+  return Buffer.concat([
+    int32(5),
+    element("Vertices", mesh.positions.length / 3, [{ name: "Position ", kind: 1, extent: 1, elementSize: 12, data: floats(mesh.positions) }], false),
+    maskedElement("VertexInstances", mesh.live, instance),
+    element(
+      "Triangles",
+      triangles,
+      [
+        { name: "VertexInstanceIndex", kind: 4, extent: 3, elementSize: 4, data: int32(...mesh.triangles.flatMap((corners) => corners.slice(0, 3))) },
+        { name: "PolygonGroupIndex", kind: 4, extent: 1, elementSize: 4, data: int32(...mesh.triangles.map((corners) => corners[3])) },
+      ],
+      false,
+    ),
+    element("Polygons", triangles, [{ name: "ObjectName", kind: 6, names: Array(triangles).fill("piece") }], false),
+    element("PolygonGroups", mesh.slots.length, [{ name: "ImportedMaterialSlotName", kind: 6, names: mesh.slots }], false),
+  ]);
+}
+
+function meshDescription(slotNames: readonly string[], compactNames: boolean, colors?: readonly number[], vertexIndices: readonly number[] = [0, 1, 2]): Buffer {
+  const vertexInstances: Attribute[] = [
+    { name: "VertexIndex", kind: 4, extent: 1, elementSize: 4, data: int32(...vertexIndices) },
+    { name: "Normal", kind: 1, extent: 1, elementSize: 12, data: floats([0, 0, 1, 0, 0, 1, 0, 0, 1]) },
+    { name: "TextureCoordinate", kind: 2, extent: 1, elementSize: 8, data: floats([0, 0, 1, 0, 0, 1]) },
+    // MeshAttribute::VertexInstance::Color is an FVector4f (attribute kind 0, 16 bytes); it is optional, so
+    // it only appears when the package carried one.
+    ...(colors ? [{ name: "Color", kind: 0 as const, extent: 1, elementSize: 16, data: floats(colors) }] : []),
+  ];
   return Buffer.concat([
     int32(5),
     element("Vertices", 3, [{ name: "Position ", kind: 1, extent: 1, elementSize: 12, data: floats([0, 0, 0, 100, 0, 0, 0, 100, 0]) }], compactNames),
-    element(
-      "VertexInstances",
-      3,
-      [
-        { name: "VertexIndex", kind: 4, extent: 1, elementSize: 4, data: int32(0, 1, 2) },
-        { name: "Normal", kind: 1, extent: 1, elementSize: 12, data: floats([0, 0, 1, 0, 0, 1, 0, 0, 1]) },
-        { name: "TextureCoordinate", kind: 2, extent: 1, elementSize: 8, data: floats([0, 0, 1, 0, 0, 1]) },
-      ],
-      compactNames,
-    ),
+    element("VertexInstances", 3, vertexInstances, compactNames),
     element(
       "Triangles",
       1,
@@ -225,12 +302,13 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
   });
 });
 
-const DOTNET = join(toolchainCacheDir(), "modern", "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
-const haveDotnet = existsSync(DOTNET);
+// The glTF vertex-colour writer compiles against the SharpGLTF assemblies the provisioned converter ships.
+const SHARPGLTF_BIN = join(toolchainCacheDir(), "modern", "bin");
 
-describe.skipIf(!haveDotnet)("UE5 editor source decoders (compiled from the embedded program)", () => {
+describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled from the embedded program)", () => {
   let root = "";
   let harness = "";
+  let sdk = "";
   const environment = (): NodeJS.ProcessEnv => ({
     ...process.env,
     DOTNET_CLI_HOME: join(root, "home"),
@@ -243,6 +321,8 @@ describe.skipIf(!haveDotnet)("UE5 editor source decoders (compiled from the embe
   });
 
   beforeAll(async () => {
+    // The installed .NET 10 SDK, never a provisioner: a missing one fails here rather than installing into a cache.
+    sdk = await modernSdkExecutable(process.env);
     root = await mkdtemp(join(tmpdir(), "asset-mcp-cs-decoders-"));
     await mkdir(join(root, "tmp"), { recursive: true });
     const project = join(root, "project");
@@ -250,19 +330,32 @@ describe.skipIf(!haveDotnet)("UE5 editor source decoders (compiled from the embe
     await writeFile(
       join(project, "Decoders.csproj"),
       `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>` +
-        `<ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><UseSharedCompilation>false</UseSharedCompilation></PropertyGroup></Project>`,
+        `<ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><UseSharedCompilation>false</UseSharedCompilation></PropertyGroup>` +
+        `<ItemGroup>${["SharpGLTF.Core", "SharpGLTF.Runtime", "SharpGLTF.Toolkit"]
+          .map((assembly) => `<Reference Include="${assembly}"><HintPath>${join(SHARPGLTF_BIN, assembly + ".dll")}</HintPath></Reference>`)
+          .join("")}</ItemGroup>` +
+        `</Project>`,
     );
     const functions = [
       "static (int BytesPerPixel, int SampleBytes) UeDeltaPixelLayout(",
       "static void UndoUeDelta(",
       "static EditorMesh ReadMeshDescription(",
+      "static EditorMesh ReadMeshDescriptionInEitherLayout(",
+      "static void CheckActiveUvChannels(",
       // Absent before converter 61; the old reader is the single function above.
       ...(CUE4PARSE_PROGRAM.includes("static EditorMesh ReadMeshDescriptionLayout(") ? ["static EditorMesh ReadMeshDescriptionLayout("] : []),
       // Absent before converter 67.
       ...(CUE4PARSE_PROGRAM.includes("static string MaterialSidecarName(") ? ["static string MaterialSidecarName("] : []),
+      // Converter 68+: the vertex-colour writer, compiled against the SharpGLTF assemblies the modern converter ships.
+      "static void WriteEditorMeshGlb(",
+      "static System.Numerics.Vector4 EditorVertexColor(",
+      "static float SrgbVertexChannel(",
+      "static float LinearVertexChannel(",
     ].map((signature) => extractCSharp(CUE4PARSE_PROGRAM, signature));
     const record = CUE4PARSE_PROGRAM.slice(CUE4PARSE_PROGRAM.indexOf("sealed record EditorMesh("));
     const editorMesh = record.slice(0, record.indexOf(");") + 2);
+    // The comparer is a type, which must follow the statements (local functions) like the record does.
+    const comparer = CUE4PARSE_PROGRAM.includes("sealed class EditorVertexComparer") ? extractCSharp(CUE4PARSE_PROGRAM, "sealed class EditorVertexComparer") : "";
     await writeFile(
       join(project, "Program.cs"),
       `using System.Runtime.InteropServices;
@@ -283,6 +376,21 @@ else if (args[0] == "sidecar")
     Console.WriteLine(string.Join(" ", args.Skip(1).Select(claim => claim.Split('=')).Select(parts => MaterialSidecarName(owners, parts[0], parts.Length > 1 ? parts[1] : null))));`
       : `Console.WriteLine(string.Join(" ", args.Skip(1).Select(claim => claim.Split('=')[0])));`}
 }
+else if (args[0] == "colormesh")
+{
+    var mesh = ReadMeshDescription(File.ReadAllBytes(args[1]));
+    WriteEditorMeshGlb(mesh, mesh.GroupSlots.Length > 0 ? mesh.GroupSlots : new[] { "SlotA" }, "colormesh", args[2]);
+    Console.WriteLine("ok " + mesh.VertexColors.Length);
+}
+else if (args[0] == "indexed")
+{
+    // The writer keys each TEXCOORD by the index its tuple carries, not by position: source channels 0, 1 and 7 are
+    // supplied as indices 0, 1 and 7, so TEXCOORD_0, _1 and _7 are written and no set in between.
+    var source = ReadMeshDescription(File.ReadAllBytes(args[1]));
+    var sparse = source with { UvChannels = new[] { (0, source.UvChannels[0].Values), (1, source.UvChannels[1].Values), (7, source.UvChannels[7].Values) } };
+    WriteEditorMeshGlb(sparse, sparse.GroupSlots.Length > 0 ? sparse.GroupSlots : new[] { "SlotA" }, "indexed", args[2]);
+    Console.WriteLine("ok " + sparse.UvChannels.Length);
+}
 else
 {
     try
@@ -302,10 +410,11 @@ else
 }
 ${functions.join("\n")}
 ${editorMesh}
+${comparer}
 `,
     );
     try {
-      execFileSync(DOTNET, ["build", project, "-c", "Release", "-o", join(root, "bin"), "-nodeReuse:false"], {
+      execFileSync(sdk, ["build", project, "-c", "Release", "-o", join(root, "bin"), "-nodeReuse:false"], {
         env: environment(),
         stdio: "pipe",
         timeout: 240_000,
@@ -322,7 +431,7 @@ ${editorMesh}
   });
 
   const run = (...args: string[]): string =>
-    execFileSync(DOTNET, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
+    execFileSync(sdk, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
 
   it.each([
     // [format, width, height, bytes per pixel, sample bytes]
@@ -387,5 +496,249 @@ ${editorMesh}
     const file = join(root, "mesh-compact-two.bin");
     await writeFile(file, meshDescription(["SlotA", "SlotB"], true));
     expect(run("mesh", file)).toMatch(/^error NotSupportedException: FName attribute ImportedMaterialSlotName has 2 distinct names for 2 elements/);
+  });
+
+  // The mesh writer must carry a MeshDescription's vertex colours so a material that reads VertexColor renders
+  // (the Hornbeam Icon meshes), while a mesh without a colour buffer gets no COLOR_0 at all. The decoder reads
+  // the FVector4f attribute, and the writer maps it to COLOR_0 by vertex instance as the value Unreal's shader
+  // sees: the ship build packs the linear source with FLinearColor::ToFColor(true) (sRGB RGB, linear alpha, one
+  // byte) and VET_Color reads it back as byte/255 with no gamma decode. SharpGLTF stores that byte normalized.
+  describe("MeshDescription vertex colours into glTF COLOR_0", () => {
+    // Three vertex instances, each with a distinct linear RGBA. The vertex-index map is the permutation (2,0,1),
+    // so instance i sits on a different vertex than i; a writer that indexed colours by vertex rather than
+    // instance would put them in the wrong place. The export scales and swaps each position to (0,0,0), (1,0,0),
+    // (0,0,1) metres, so each colour can be read back by position. Expected values below are the packed bytes
+    // (sRGB RGB, linear alpha, nearest byte) the shader reads, computed independently of the writer.
+    const palette = [1, 0.5, 0, 0.7, 0, 1, 0.25, 0.5, 0.2, 0.4, 0.6, 0.9] as const;
+    const vertexIndices = [2, 0, 1] as const;
+
+    async function coloursByPosition(glb: string): Promise<{ attribute: Accessor; byPosition: Map<string, number[]> } | null> {
+      const document = await new NodeIO().read(glb);
+      const primitive = document.getRoot().listMeshes().flatMap((mesh) => mesh.listPrimitives())[0];
+      if (!primitive) throw new Error("the writer produced no primitive");
+      const attribute = primitive.getAttribute("COLOR_0");
+      if (!attribute) return null;
+      const positions = primitive.getAttribute("POSITION")!.getArray()!;
+      const components = attribute.getArray()!;
+      const byPosition = new Map<string, number[]>();
+      for (let vertex = 0; vertex < attribute.getCount(); vertex++) {
+        const position = [positions[vertex * 3]!, positions[vertex * 3 + 1]!, positions[vertex * 3 + 2]!].map((value) => value.toFixed(3)).join(",");
+        byPosition.set(position, [components[vertex * 4]!, components[vertex * 4 + 1]!, components[vertex * 4 + 2]!, components[vertex * 4 + 3]!]);
+      }
+      return { attribute, byPosition };
+    }
+
+    it("writes the source's per-vertex-instance colours as normalized RGBA COLOR_0", async () => {
+      const file = join(root, "mesh-colour.bin");
+      await writeFile(file, meshDescription(["SlotA"], false, palette, vertexIndices));
+      const glb = join(root, "mesh-colour.glb");
+      // The decoder reports the colour component count it read (three instances x four channels).
+      expect(run("colormesh", file, glb)).toBe("ok 12");
+
+      const result = await coloursByPosition(glb);
+      expect(result).not.toBeNull();
+      const { attribute, byPosition } = result!;
+      expect(attribute.getType()).toBe("VEC4");
+      expect(attribute.getComponentType()).toBe(5121); // UNSIGNED_BYTE
+      expect(attribute.getNormalized()).toBe(true);
+      expect(attribute.getCount()).toBe(3);
+
+      // VertexIndex (2,0,1) maps instance 1 -> vertex 0 -> (0,0,0), instance 2 -> vertex 1 -> (1,0,0), and
+      // instance 0 -> vertex 2 -> (0,0,1). Colours follow the instance, so palette order is not position order.
+      // Each packed byte is the sRGB curve of the channel (alpha linear), rounded to nearest with .5 up.
+      // Alpha 0.5 is the modern 128, not the legacy floor 127 (see the uncooked suite).
+      const expected: ReadonlyArray<readonly [string, ReadonlyArray<number>]> = [
+        ["0.000,0.000,0.000", [0, 255, 137, 128]], // linear (0, 1, 0.25, 0.5)
+        ["1.000,0.000,0.000", [124, 170, 203, 230]], // linear (0.2, 0.4, 0.6, 0.9)
+        ["0.000,0.000,1.000", [255, 188, 0, 179]], // linear (1, 0.5, 0, 0.7)
+      ];
+      for (const [position, rgba] of expected) {
+        const found = byPosition.get(position);
+        expect(found, `no vertex at ${position}`).toBeDefined();
+        rgba.forEach((channel, index) => expect(found![index]).toBe(channel));
+      }
+    });
+
+    it("writes no COLOR_0 for a MeshDescription without a Color attribute", async () => {
+      const file = join(root, "mesh-nocolour.bin");
+      await writeFile(file, meshDescription(["SlotA"], false));
+      const glb = join(root, "mesh-nocolour.glb");
+      expect(run("colormesh", file, glb)).toBe("ok 0");
+      expect(await coloursByPosition(glb)).toBeNull();
+    });
+  });
+
+  // Every UV channel the MeshDescription carries reaches the GLB at its own TEXCOORD index. Instances are packed by
+  // their full vertex (position, normal, colour and every channel), so a seam between instances that differ only in a
+  // later channel is kept, and a channel the source does not carry is not written, padded or renumbered.
+  describe("UV channels into TEXCOORD_<n>", () => {
+    // Channel k at allocated slot s: (k*16+s)/64 and (s*4+k)/64. Exact in binary, and distinct for every channel and slot.
+    const uvAt = (channel: number, slot: number): number[] => [(channel * 16 + slot) / 64, (slot * 4 + channel) / 64];
+    const channelsOf = (count: number, slots: number): number[][] =>
+      Array.from({ length: count }, (_, channel) => Array.from({ length: slots }, (_, slot) => uvAt(channel, slot)).flat());
+    // Live instances 2, 5 and 9 in 12 allocated slots: 2 sits on vertex 1, 5 on vertex 0 and 9 on vertex 2.
+    const LIVE = Array.from({ length: 12 }, (_, slot) => slot === 2 || slot === 5 || slot === 9);
+    const VERTEX_OF = Array.from({ length: 12 }, (_, slot) => (slot === 2 ? 1 : slot === 5 ? 0 : slot === 9 ? 2 : 0));
+    const POSITIONS = [0, 0, 0, 100, 0, 0, 0, 100, 0];
+    const UP = Array.from({ length: 12 }, () => [0, 0, 1]).flat();
+    const PALETTE = Array.from({ length: 12 }, (_, slot) => (slot === 2 ? [1, 0.5, 0, 0.7] : slot === 5 ? [0, 1, 0.25, 0.5] : slot === 9 ? [0.2, 0.4, 0.6, 0.9] : [1, 1, 1, 1])).flat();
+
+    async function write(name: string, mesh: UvMesh, mode: "colormesh" | "mesh" | "indexed" = "colormesh"): Promise<{ output: string; glb: string }> {
+      const file = join(root, `${name}.bin`);
+      await writeFile(file, uvMeshDescription(mesh));
+      const glb = join(root, `${name}.glb`);
+      return { output: mode === "mesh" ? run(mode, file) : run(mode, file, glb), glb };
+    }
+    async function primitiveOf(glb: string): Promise<Primitive> {
+      return (await new NodeIO().read(glb)).getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    }
+    const semanticsOf = (primitive: Primitive): string[] => primitive.listSemantics().sort();
+    const indicesOf = (primitive: Primitive): number[] => Array.from(primitive.getIndices()!.getArray()!);
+    function vec3sOf(primitive: Primitive, semantic: string): string[] {
+      const attribute = primitive.getAttribute(semantic)!;
+      const values = attribute.getArray()!;
+      return Array.from({ length: attribute.getCount() }, (_, vertex) =>
+        [values[vertex * 3]!, values[vertex * 3 + 1]!, values[vertex * 3 + 2]!].map((value) => value.toFixed(3)).join(","),
+      );
+    }
+    function texcoordsOf(primitive: Primitive, channel: number): number[][] {
+      const attribute = primitive.getAttribute(`TEXCOORD_${channel}`)!;
+      const values = attribute.getArray()!;
+      return Array.from({ length: attribute.getCount() }, (_, vertex) => [values[vertex * 2]!, values[vertex * 2 + 1]!]);
+    }
+
+    it("writes every present channel (0..7) at its own TEXCOORD index, read from the instance that owns it", async () => {
+      const { output, glb } = await write("uv-eight", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: channelsOf(8, 12), triangles: [[2, 5, 9, 0]], slots: ["SlotA"] });
+      expect(output).toBe("ok 0");
+      const primitive = await primitiveOf(glb);
+      expect(semanticsOf(primitive)).toEqual(["NORMAL", "POSITION", "TEXCOORD_0", "TEXCOORD_1", "TEXCOORD_2", "TEXCOORD_3", "TEXCOORD_4", "TEXCOORD_5", "TEXCOORD_6", "TEXCOORD_7"]);
+      // Vertices are numbered by first use (instances 2, 5, 9); positions and normals are the (x, z, y) * 0.01 conversion.
+      expect(vec3sOf(primitive, "POSITION")).toEqual(["1.000,0.000,0.000", "0.000,0.000,0.000", "0.000,0.000,1.000"]);
+      expect(vec3sOf(primitive, "NORMAL")).toEqual(["0.000,1.000,0.000", "0.000,1.000,0.000", "0.000,1.000,0.000"]);
+      expect(indicesOf(primitive)).toEqual([0, 1, 2]);
+      for (let channel = 0; channel < 8; channel++) {
+        expect(texcoordsOf(primitive, channel), `TEXCOORD_${channel}`).toEqual([uvAt(channel, 2), uvAt(channel, 5), uvAt(channel, 9)]);
+      }
+    });
+
+    it("keeps a seam between instances that differ only in a later channel", async () => {
+      // Instances 0 and 3 sit on vertex 0 with the same normal and UV0; only UV1 differs, so they stay two vertices.
+      const { output, glb } = await write("uv-seam", {
+        live: [true, true, true, true],
+        vertexOf: [0, 1, 2, 0],
+        positions: POSITIONS,
+        normals: Array.from({ length: 4 }, () => [0, 0, 1]).flat(),
+        uv: [
+          [0, 0, 1, 0, 0, 1, 0, 0],
+          [0.25, 0.5, 0.5, 0.5, 0.5, 0.75, 0.75, 0.5],
+        ],
+        triangles: [
+          [0, 1, 2, 0],
+          [3, 2, 1, 0],
+        ],
+        slots: ["SlotA"],
+      });
+      expect(output).toBe("ok 0");
+      const primitive = await primitiveOf(glb);
+      expect(vec3sOf(primitive, "POSITION")).toHaveLength(4);
+      expect(indicesOf(primitive)).toEqual([0, 1, 2, 3, 2, 1]);
+      expect(texcoordsOf(primitive, 0)).toEqual([
+        [0, 0],
+        [1, 0],
+        [0, 1],
+        [0, 0],
+      ]);
+      expect(texcoordsOf(primitive, 1)).toEqual([
+        [0.25, 0.5],
+        [0.5, 0.5],
+        [0.5, 0.75],
+        [0.75, 0.5],
+      ]);
+    });
+
+    // Native serialization stores TextureCoordinate as one dense channel array (UE 5.8.3 MeshAttributeArray.h,
+    // ArrayForChannels), so a source has no hole in the channel index space: its channels are 0..n-1, and only a trailing
+    // channel can be absent. The writer is still handed indices, and it must keep the ones it is given.
+    it("writes a supplied sparse channel set (0, 1, 7) at those indices, with no channel in between", async () => {
+      const { output, glb } = await write("uv-sparse", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: channelsOf(8, 12), triangles: [[2, 5, 9, 0]], slots: ["SlotA"] }, "indexed");
+      expect(output).toBe("ok 3");
+      const primitive = await primitiveOf(glb);
+      expect(semanticsOf(primitive)).toEqual(["NORMAL", "POSITION", "TEXCOORD_0", "TEXCOORD_1", "TEXCOORD_7"]);
+      for (const channel of [0, 1, 7]) expect(texcoordsOf(primitive, channel), `TEXCOORD_${channel}`).toEqual([uvAt(channel, 2), uvAt(channel, 5), uvAt(channel, 9)]);
+    });
+
+    it("writes only the channels a two-channel source carries", async () => {
+      const { glb } = await write("uv-two", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: channelsOf(2, 12), triangles: [[2, 5, 9, 0]], slots: ["SlotA"] });
+      const primitive = await primitiveOf(glb);
+      expect(semanticsOf(primitive)).toEqual(["NORMAL", "POSITION", "TEXCOORD_0", "TEXCOORD_1"]);
+      expect(texcoordsOf(primitive, 1)).toEqual([uvAt(1, 2), uvAt(1, 5), uvAt(1, 9)]);
+    });
+
+    it("writes no TEXCOORD for a source that carries no UV channel", async () => {
+      const { output, glb } = await write("uv-none", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: [], triangles: [[2, 5, 9, 0]], slots: ["SlotA"] });
+      expect(output).toBe("ok 0");
+      expect(semanticsOf(await primitiveOf(glb))).toEqual(["NORMAL", "POSITION"]);
+    });
+
+    it("writes COLOR_0 beside every UV channel, with the colour the instance owns", async () => {
+      const { output, glb } = await write("uv-colour", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: channelsOf(8, 12), colours: PALETTE, triangles: [[2, 5, 9, 0]], slots: ["SlotA"] });
+      expect(output).toBe("ok 48");
+      const primitive = await primitiveOf(glb);
+      expect(semanticsOf(primitive)).toEqual(["COLOR_0", "NORMAL", "POSITION", "TEXCOORD_0", "TEXCOORD_1", "TEXCOORD_2", "TEXCOORD_3", "TEXCOORD_4", "TEXCOORD_5", "TEXCOORD_6", "TEXCOORD_7"]);
+      const colour = primitive.getAttribute("COLOR_0")!;
+      expect(colour.getComponentType()).toBe(5121);
+      expect(colour.getNormalized()).toBe(true);
+      // Same packed bytes as the colour suite above: instance 2 -> (1, .5, 0, .7), 5 -> (0, 1, .25, .5), 9 -> (.2, .4, .6, .9).
+      expect(Array.from(colour.getArray()!)).toEqual([255, 188, 0, 179, 0, 255, 137, 128, 124, 170, 203, 230]);
+      expect(texcoordsOf(primitive, 7)).toEqual([uvAt(7, 2), uvAt(7, 5), uvAt(7, 9)]);
+    });
+
+    it("does not read a non-finite value in an unused hole", async () => {
+      // Slot 0 is a hole: its channel-1 value is NaN, and it is never looked at.
+      const channel1 = channelsOf(2, 12)[1]!;
+      channel1[0] = Number.NaN;
+      channel1[1] = Number.NaN;
+      const { output, glb } = await write("uv-hole-nan", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: [channelsOf(2, 12)[0]!, channel1], triangles: [[2, 5, 9, 0]], slots: ["SlotA"] });
+      expect(output).toBe("ok 0");
+      const primitive = await primitiveOf(glb);
+      expect(texcoordsOf(primitive, 1)).toEqual([uvAt(1, 2), uvAt(1, 5), uvAt(1, 9)]);
+    });
+
+    it("refuses a ninth UV channel rather than dropping or renumbering one", async () => {
+      const { output } = await write("uv-nine", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: channelsOf(9, 12), triangles: [[2, 5, 9, 0]], slots: ["SlotA"] }, "mesh");
+      expect(output).toMatch(/^error NotSupportedException: .*channel 8/);
+    });
+
+    it("refuses a channel that carries no values rather than fabricating one", async () => {
+      const { output } = await write("uv-empty", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: [channelsOf(1, 12)[0]!, []], triangles: [[2, 5, 9, 0]], slots: ["SlotA"] }, "mesh");
+      expect(output).toMatch(/^error InvalidDataException: UV channel 1 has 0 values for 12 vertex instances/);
+    });
+
+    it("refuses a TextureCoordinate that is not an FVector2f", async () => {
+      const { output } = await write(
+        "uv-kind",
+        { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uvKind: 1, uvElementSize: 12, uv: [Array.from({ length: 36 }, (_, index) => index / 64)], triangles: [[2, 5, 9, 0]], slots: ["SlotA"] },
+        "mesh",
+      );
+      expect(output).toMatch(/^error NotSupportedException: .*channel 0 is attribute kind 1/);
+    });
+
+    it("refuses a UV channel that does not span every allocated instance", async () => {
+      const short = channelsOf(1, 12)[0]!.slice(0, 12);
+      const { output } = await write("uv-short", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: [channelsOf(1, 12)[0]!, short], triangles: [[2, 5, 9, 0]], slots: ["SlotA"] }, "mesh");
+      expect(output).toMatch(/^error InvalidDataException: UV channel 1 has 6 values for 12 vertex instances/);
+    });
+
+    it("refuses a non-finite value at a live triangle corner", async () => {
+      const channel1 = channelsOf(2, 12)[1]!;
+      channel1[10] = Number.NaN; // slot 5, u
+      const { output } = await write("uv-nan", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: [channelsOf(2, 12)[0]!, channel1], triangles: [[2, 5, 9, 0]], slots: ["SlotA"] }, "mesh");
+      expect(output).toMatch(/^error InvalidDataException: UV channel 1 is not finite at vertex instance 5/);
+    });
+
+    it("refuses a triangle corner outside the allocated instances", async () => {
+      const { output } = await write("uv-corner", { live: LIVE, vertexOf: VERTEX_OF, positions: POSITIONS, normals: UP, uv: channelsOf(2, 12), triangles: [[2, 5, 12, 0]], slots: ["SlotA"] }, "mesh");
+      expect(output).toMatch(/^error InvalidDataException: Triangle 0 uses vertex instance 12 of 12/);
+    });
   });
 });

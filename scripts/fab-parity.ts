@@ -59,6 +59,14 @@ import {
   type ScorecardEntry,
   type SkippedEntry,
 } from "../src/unreal/parity-run.js";
+import {
+  describePicture,
+  pictureRecord,
+  preparePreviewPicture,
+  resumeRefusal,
+  sheetsNotDrawnAs,
+  type PreviewPicture,
+} from "../src/unreal/preview-reference-workflow.js";
 import { dumpUnrealProperties } from "../src/unreal/property-dump.js";
 import { ensureModernConverter } from "../src/unreal/provision.js";
 import {
@@ -143,6 +151,16 @@ async function main(): Promise<number> {
       return 2;
     }
   }
+
+  // The configured reference is read and verified once, here: before the lock, any directory, the Fab CLI or any download.
+  let picture: PreviewPicture;
+  try {
+    picture = await preparePreviewPicture(process.env, "unreal-like");
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return 2;
+  }
+  if (args.sheets) say(`Picture: ${describePicture(picture.identity)}`);
 
   const load1 = loadavg()[0] ?? 0;
   if (load1 > HIGH_LOAD) {
@@ -285,6 +303,16 @@ async function main(): Promise<number> {
   process.on("SIGTERM", onSignal);
 
   try {
+    if (args.resume) {
+      // Read before any Fab call, so the same entries feed this check and the selection below.
+      previousEntries = readPreviousEntries(scorecardPath);
+      // Kept sheets are never re-rendered, so a sheet drawn as another picture would silently stay in this scorecard.
+      const stale = args.sheets ? sheetsNotDrawnAs(previousEntries, picture.identity) : 0;
+      if (stale > 0) {
+        console.error(resumeRefusal(stale, picture.identity));
+        return await finish(2);
+      }
+    }
     const fabCli = new FabCli({ environment });
     try {
       await fabCli.requireAuthenticatedSession();
@@ -308,7 +336,6 @@ async function main(): Promise<number> {
 
     let todo: CorpusEntry[] = corpus.entries;
     if (args.resume) {
-      previousEntries = readPreviousEntries(scorecardPath);
       const resumed = selectResume(corpus.entries, previousEntries);
       todo = resumed.todo;
       entries = resumed.kept;
@@ -451,7 +478,7 @@ async function main(): Promise<number> {
           cue4parse = report.toolchain.modernConverter ?? cue4parse;
           entry = await scoreOne(item, base, sourceDir, report, environment, started, args.out, label, args.proof ? packProof : undefined);
           if (args.sheets) {
-            entry = { ...entry, sheet: await sheetFor(sourceDir, outputDir, report, args.out, label) };
+            entry = { ...entry, sheet: await sheetFor(sourceDir, outputDir, report, args.out, label, picture) };
             for (const warning of entry.sheet?.warnings ?? []) console.log(`WARNING ${label}: ${warning}`);
           }
         }
@@ -543,8 +570,10 @@ async function sheetFor(
   report: ImportReport,
   out: string,
   label: string,
+  picture: PreviewPicture,
 ): Promise<EntrySheet> {
   const rel = join("sheets", `${label}.jpg`);
+  // A failed sheet names no picture: nothing was drawn under one, and `--resume --sheets` refuses any sheet with an error.
   const empty = { rendered: 0, total: report.models.length, thumbnails: 0, judge: { ok: 0, suspect: 0, fail: 0 } };
   try {
     await mkdir(join(out, "sheets"), { recursive: true });
@@ -557,9 +586,14 @@ async function sheetFor(
       selection: "spread",
       ...(thumbnails.size > 0 ? { thumbnails: new Map([...thumbnails].map(([k, v]) => [join(outputDir, k), v])) } : {}),
       expectColoured: new Set([...colouredGlbKeys(report)].map((k) => join(outputDir, k))),
+      // The picture is lit by the verified local reference when one is configured, else by the approximation; the metrics and
+      // baseline stay on the neutral render.
+      pictureLighting: "unreal-like",
+      ...picture.inputs,
     });
+    const record = pictureRecord(picture, result);
     const sims = result.judge.flatMap((j) => (j.similarity === undefined ? [] : [j.similarity]));
-    writeJsonAtomic(join(out, "sheets", `${label}.json`), { sheet: rel, judge: result.judge });
+    writeJsonAtomic(join(out, "sheets", `${label}.json`), { sheet: rel, judge: result.judge, picture: record });
     return {
       path: rel,
       rendered: result.meshesRendered,
@@ -568,6 +602,7 @@ async function sheetFor(
       judge: result.judgeSummary,
       ...(blankTileWarnings(result.judge, result.thumbnailsShown).length > 0 ? { warnings: blankTileWarnings(result.judge, result.thumbnailsShown) } : {}),
       ...(sims.length > 0 ? { meanSimilarity: Math.round((sims.reduce((a, b) => a + b, 0) / sims.length) * 1000) / 1000 } : {}),
+      picture: record.identity,
     };
   } catch (error) {
     return { ...empty, path: rel, error: (error instanceof Error ? error.message : String(error)).slice(0, 300) };

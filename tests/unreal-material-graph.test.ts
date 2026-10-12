@@ -5,11 +5,15 @@ import { graphReadsSurface } from "../src/unreal/graph-baker.js";
 import {
   MATERIAL_ATTRIBUTE_GUIDS,
   bakeGraph,
+  graphNormalDependencies,
   graphPathClasses,
+  graphPathTextures,
+  proveEmissionZero,
   supportedEngineFunctions,
   supportedNodeClasses,
   type BakeResult,
   type GraphParameters,
+  type NormalDependencies,
   type TextureRaster,
 } from "../src/unreal/material-graph.js";
 
@@ -209,15 +213,9 @@ function masterGraph(options: { wrapped?: boolean; brightness?: number } = {}): 
   if (options.wrapped) {
     nodes.push(
       engineCall("ao", "MatLayerBlend_AO", { Input0: pin("fuzzy"), Input1: pin("mask", 3, [0, 0, 1, 0]) }),
-      node("fuzzy", "FunctionCall", {
-        inputs: { "Material Input": pin("bakedNormal") },
-        function: "/Game/Test/MF_FuzzyShading_JM.MF_FuzzyShading_JM",
-        outputNames: ["Result"],
-        // Inlined like the real one, with a body the evaluator must NOT follow (it reads the camera vector).
-        fn: { inputs: { "Material Input": "bakedNormal" }, outputs: ["fuzzy/make"], output: "fuzzy/make", outputNames: [""] },
-      }),
-      node("fuzzy/make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("fuzzy/camera") } }),
-      node("fuzzy/camera", "CameraVectorWS"),
+      // The pack carries no body for this fuzzy-shading function, so the name-matched view-dependent handler stands in.
+      // (A pack-local body would be inlined first; see "inlines a pack-local body before an engine-name handler".)
+      engineCall("fuzzy", "MF_FuzzyShading_JM", { "Material Input": pin("bakedNormal") }),
       engineCall("bakedNormal", "MatLayerBlend_BakedNormal", { Input0: pin("blendSolid"), Input1: pin("mask", 0, RGB_MASK) }),
     );
   }
@@ -361,7 +359,7 @@ describe("bakeGraph", () => {
       "MatLayerBlend_BakedNormal: BaseColor passed through; engine body unavailable",
       "view-dependent fuzzy shading ignored",
     ]);
-    // The wrapped chain returns the same colours as the bare blend; the camera-vector body of fuzzy shading was not followed.
+    // The wrapped chain returns the same colours as the bare blend; the pack carries no fuzzy-shading body to follow.
     const pixel = await pixelsOf(result);
     expect(pixel(3, 0)).toEqual([200, 0, 50]);
     expect(pixel(0, 3)).toEqual([142, 140, 132]);
@@ -427,17 +425,17 @@ describe("bakeGraph", () => {
     expect((await pixelsOf(result))(0, 0)).toEqual([255, 0, 0]);
   });
 
-  it("refuses a graph whose BaseColor needs another attribute of a Break node", async () => {
+  it("refuses a graph whose BaseColor needs an attribute the bake does not carry (Specular)", async () => {
     const graph = makeGraph(
       [
         node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: ["BaseColor", "Metallic", "Specular", "Roughness"] }),
         node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("c"), Roughness: pin("c") } }),
         constant3("c", [0.5, 0.5, 0.5]),
       ],
-      pin("break", 3, [1, 1, 1, 0]),
+      pin("break", 2, [1, 1, 1, 0]),
     );
     const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
-    expect(result).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Roughness"] });
+    expect(result).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Specular"] });
   });
 
   it("is unavailable when a needed texture cannot be loaded, and names it", async () => {
@@ -872,14 +870,16 @@ describe("SetMaterialAttributes, PivotPainter2FoliageShader, Blend_Overlay and C
 });
 
 describe("HueShift", () => {
-  const NOTE = "HueShift: engine body unavailable; hue rotated by Input1 as a fraction of a turn";
+  const NOTE = "HueShift: engine body unavailable; hue rotated by Input0 as a fraction of a turn";
+  const IDENTITY_NOTE = "HueShift: engine body unavailable; hue-shift identity assumed for a zero or unwired Input0";
   const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
     bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  // The order the dump serializes the call in: Input0 is the scalar shift, Input1 the colour.
   const shifted = (colour: [number, number, number], shift: number | null) =>
     bake(
       makeGraph(
         [
-          engineCall("h", "HueShift", { Input0: pin("c", 0, RGB_MASK), ...(shift === null ? {} : { Input1: pin("s") }) }),
+          engineCall("h", "HueShift", { Input1: pin("c", 0, RGB_MASK), ...(shift === null ? {} : { Input0: pin("s") }) }),
           constant3("c", colour),
           node("s", "Constant", { constants: { R: shift ?? 0 } }),
         ],
@@ -887,11 +887,34 @@ describe("HueShift", () => {
       ),
     );
 
-  it("is an exact passthrough, with no approximation, for a zero or unwired shift", async () => {
+  it("reads the serialized call (Input0 = the Hue Shift scalar, Input1 = the colour product): zero keeps the colour, a third of a turn rotates it", async () => {
+    // The call as the dump serializes it: a FunctionCall whose body is not in the pack, with its shift a ScalarParameter at the default.
+    const serialized = (shift: number) =>
+      makeGraph(
+        [
+          { ...engineCall("h", "HueShift", { Input0: pin("hs"), Input1: pin("mul") }), function: "/Engine/Functions/Engine_MaterialFunctions02/HueShift.HueShift" },
+          scalarParameter("hs", "Hue Shift", shift),
+          multiply("mul", pin("t", 0, RGB_MASK), pin("tint")),
+          textureSample("t", "T_Red"),
+          constant3("tint", [0.5, 0.5, 0.5]),
+        ],
+        pin("h", 0, RGB_MASK),
+      );
+    const textures = { T_Red: { png: await flat([255, 0, 0])(), srgb: true } };
+    // Texel (255, 0, 0) is linear red and the 0.5 tint halves it: linear 0.5 is byte 188 in the red channel alone.
+    const zero = await bake(serialized(0), textures);
+    expect((await pixelsOf(zero))(0, 0)).toEqual([encode(0.5), 0, 0]);
+    if (zero.status === "baked") expect(zero).toMatchObject({ confidence: "heuristic", approximations: [IDENTITY_NOTE] });
+    const third = await bake(serialized(1 / 3), textures);
+    expect((await pixelsOf(third))(0, 0)).toEqual([0, encode(0.5), 0]);
+    if (third.status === "baked") expect(third).toMatchObject({ confidence: "heuristic", approximations: [NOTE] });
+  });
+
+  it("keeps the colour for a zero or unwired shift, but as a heuristic: the body is unavailable, so the identity is assumed", async () => {
     for (const shift of [0, null]) {
       const result = await shifted([0.5, 0.25, 0.125], shift);
       expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.5), encode(0.25), encode(0.125)]);
-      if (result.status === "baked") expect(result).toMatchObject({ confidence: "exact", approximations: [] });
+      if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [IDENTITY_NOTE] });
     }
   });
 
@@ -913,12 +936,12 @@ describe("HueShift", () => {
     }
   });
 
-  it("works inside Multiply(HueShift(texture, constant), tint) and records the approximation once", async () => {
+  it("works inside Multiply(HueShift(constant, texture), tint) and records the approximation once", async () => {
     // Texel (255, 0, 0) is linear red; a third of a turn makes it green, and the 0.5 tint gives linear 0.5 = byte 188.
     const graph = makeGraph(
       [
         multiply("out", pin("h", 0, RGB_MASK), pin("tint")),
-        engineCall("h", "HueShift", { Input0: pin("t", 0, RGB_MASK), Input1: pin("s") }),
+        engineCall("h", "HueShift", { Input0: pin("s"), Input1: pin("t", 0, RGB_MASK) }),
         textureSample("t", "T_Red"),
         node("s", "Constant", { constants: { R: 1 / 3 } }),
         constant3("tint", [0.5, 0.5, 0.5]),
@@ -930,9 +953,149 @@ describe("HueShift", () => {
     if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [NOTE] });
   });
 
-  it("is unavailable without a colour input and listed as supported", async () => {
+  // The official body, read from explicit engine content, names its pins "Hue Shift Percentage" and "Texture", and its output does not
+  // load (`outputs: [null]`, no `error`). The production path falls through to this fallback, so the pins are found by those names too.
+  const loadedNull = (inputs: Raw) =>
+    node("h", "FunctionCall", {
+      inputs,
+      function: "/Engine/Functions/Engine_MaterialFunctions02/HueShift.HueShift",
+      outputNames: ["Result"],
+      fn: {
+        inputs: Object.fromEntries(Object.entries(inputs).map(([key, value]) => [key, value && (value as { node: string }).node])),
+        outputs: [null],
+        output: null,
+        engine: { version: "4.20", package: "/Engine/Functions/Engine_MaterialFunctions02/HueShift" },
+        outputNames: [""],
+      },
+    });
+
+  it("reads the loaded body's pins by name: a third of a turn rotates the colour, a zero shift keeps it as a heuristic", async () => {
+    const textures = { T_Red: { png: await flat([255, 0, 0])(), srgb: true } };
+    const loaded = (shift: number) =>
+      makeGraph(
+        [
+          loadedNull({ "Hue Shift Percentage": pin("hs"), Texture: pin("mul") }),
+          scalarParameter("hs", "Hue Shift", shift),
+          multiply("mul", pin("t", 0, RGB_MASK), pin("tint")),
+          textureSample("t", "T_Red"),
+          constant3("tint", [0.5, 0.5, 0.5]),
+        ],
+        pin("h", 0, RGB_MASK),
+      );
+    // Texel (255, 0, 0) is linear red and the 0.5 tint halves it: linear 0.5 is byte 188.
+    const third = await bake(loaded(1 / 3), textures);
+    expect((await pixelsOf(third))(0, 0)).toEqual([0, encode(0.5), 0]);
+    if (third.status === "baked") expect(third).toMatchObject({ confidence: "heuristic", approximations: [NOTE] });
+    const zero = await bake(loaded(0), textures);
+    expect((await pixelsOf(zero))(0, 0)).toEqual([encode(0.5), 0, 0]);
+    if (zero.status === "baked") expect(zero).toMatchObject({ confidence: "heuristic", approximations: [IDENTITY_NOTE] });
+  });
+
+  it("is unavailable on the loaded body without its Texture, and when a wired shift names a node the dump lacks", async () => {
+    const textures = { T_Red: { png: await flat([255, 0, 0])(), srgb: true } };
+    const noColour = await bake(makeGraph([loadedNull({ "Hue Shift Percentage": pin("hs"), Texture: null }), scalarParameter("hs", "Hue Shift", 1 / 3)], pin("h", 0, RGB_MASK)));
+    expect(noColour.status).toBe("unavailable");
+    // A wired shift is never the unwired identity, so its missing node is the reason, with either pin naming.
+    const missingCanonical = await bake(makeGraph([loadedNull({ "Hue Shift Percentage": pin("gone"), Texture: pin("t", 0, RGB_MASK) }), textureSample("t", "T_Red")], pin("h", 0, RGB_MASK)), textures);
+    expect(missingCanonical).toMatchObject({ status: "unavailable", reason: expect.stringContaining("missing node gone") });
+    const missingGeneric = await bake(makeGraph([engineCall("h", "HueShift", { Input0: pin("gone"), Input1: pin("t", 0, RGB_MASK) }), textureSample("t", "T_Red")], pin("h", 0, RGB_MASK)), textures);
+    expect(missingGeneric).toMatchObject({ status: "unavailable", reason: expect.stringContaining("missing node gone") });
+  });
+
+  it("refuses a wired pin it does not know, so a shift under another name never reads as unwired", async () => {
+    // The 5.8.3 manifest lists a different HueShift hash; that asset was not read, so its pin names are unverified.
+    const textures = { T_Red: { png: await flat([255, 0, 0])(), srgb: true } };
+    const renamed = (shift: ReturnType<typeof pin> | null) =>
+      makeGraph([loadedNull({ "Renamed Shift": shift, Texture: pin("t", 0, RGB_MASK) }), scalarParameter("hs", "Hue Shift", 1 / 3), textureSample("t", "T_Red")], pin("h", 0, RGB_MASK));
+    expect(await bake(renamed(pin("hs")), textures)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Renamed Shift") });
+    // The same pin left unwired is the unwired identity and changes nothing.
+    const unwired = await bake(renamed(null), textures);
+    expect((await pixelsOf(unwired))(0, 0)).toEqual([encode(1), 0, 0]);
+    if (unwired.status === "baked") expect(unwired).toMatchObject({ confidence: "heuristic", approximations: [IDENTITY_NOTE] });
+  });
+
+  it("is unavailable without a colour input, with or without a shift, and listed as supported", async () => {
     expect((await bake(makeGraph([engineCall("h", "HueShift", { Input1: null })], pin("h", 0, RGB_MASK)))).status).toBe("unavailable");
+    for (const shift of [0, 0.5]) {
+      const graph = makeGraph([engineCall("h", "HueShift", { Input0: pin("s"), Input1: null }), node("s", "Constant", { constants: { R: shift } })], pin("h", 0, RGB_MASK));
+      expect((await bake(graph)).status).toBe("unavailable");
+    }
     expect(supportedEngineFunctions()).toContain("HueShift");
+  });
+});
+
+describe("HairColor: Unreal's hair colour from melanin, redness and dye", () => {
+  const bake = (graph: MaterialGraph) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  const colourAt = async (graph: MaterialGraph): Promise<number[]> => (await pixelsOf(await bake(graph)))(0, 0);
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  /** A HairColor with the given pins, each a node of `nodes` (the HairColor is "h"). */
+  const hair = (nodes: Raw[], inputs: Raw = {}): MaterialGraph => makeGraph([node("h", "HairColor", { inputs }), ...nodes], pin("h"));
+  /** Melanin 0.6, redness 0.25 and dye (0.8, 0.5, 0.9): the sample the numbers below were calculated for. */
+  const sample = (): MaterialGraph =>
+    hair([scalar("m", 0.6), scalar("r", 0.25), constant3("d", [0.8, 0.5, 0.9])], { Melanin: pin("m"), Redness: pin("r"), DyeColor: pin("d") });
+
+  it("is a supported node class", () => {
+    expect(supportedNodeClasses()).toContain("HairColor");
+  });
+
+  it("matches an independently calculated sample", async () => {
+    // Linear values of Unreal's hair absorption formula at beta 0.3, evaluated outside the repo in float64 (python3).
+    const result = await bake(sample());
+    expect(result).toMatchObject({ status: "baked", confidence: "exact", approximations: [] });
+    expect((await pixelsOf(result))(0, 0)).toEqual([encode(0.0212556458), encode(0.00590210797), encode(0.000614527618)]);
+  });
+
+  it("unwired pins take Unreal's defaults: melanin 0.5, redness 0 and white dye", async () => {
+    const explicit = hair([scalar("m", 0.5), scalar("r", 0), constant3("d", [1, 1, 1])], { Melanin: pin("m"), Redness: pin("r"), DyeColor: pin("d") });
+    const unwired = await colourAt(hair([]));
+    expect(unwired).toEqual(await colourAt(explicit));
+    // The same formula at melanin 0.5, no redness and white dye: linear (0.0305840551, 0.0111555056, 0.00183079769).
+    expect(unwired).toEqual([encode(0.0305840551), encode(0.0111555056), encode(0.00183079769)]);
+  });
+
+  it("melanin 0 with the default dye is white", async () => {
+    expect(await colourAt(hair([scalar("m", 0)], { Melanin: pin("m") }))).toEqual([255, 255, 255]);
+  });
+
+  it("with no melanin, the dye shows its own colour", async () => {
+    const dyeOnly = hair([scalar("m", 0), constant3("d", [0.8, 0.5, 0.2])], { Melanin: pin("m"), DyeColor: pin("d") });
+    expect(await colourAt(dyeOnly)).toEqual([encode(0.8), encode(0.5), encode(0.2)]);
+  });
+
+  it("a dye channel of 0 gives 0 and leaves the other channels unchanged", async () => {
+    // An 8-bit bake cannot show a NaN (it also writes 0), so this checks that red is exactly 0 and green and blue are unchanged.
+    const dark = hair([scalar("m", 0.6), scalar("r", 0.25), constant3("d", [0, 0.5, 0.9])], { Melanin: pin("m"), Redness: pin("r"), DyeColor: pin("d") });
+    const [red, green, blue] = await colourAt(dark);
+    expect(red).toBe(0);
+    expect([green, blue]).toEqual((await colourAt(sample())).slice(1));
+  });
+
+  it("saturates melanin and redness to [0, 1]", async () => {
+    const at = (melanin: number, redness: number) => colourAt(hair([scalar("m", melanin), scalar("r", redness)], { Melanin: pin("m"), Redness: pin("r") }));
+    // Melanin below 0 is none: white.
+    expect(await at(-0.5, 0)).toEqual([255, 255, 255]);
+    // Melanin above 1 reads as 1; both are black in 8 bits, so this only guards the floor on 1 - melanin.
+    expect(await at(1.5, 0.25)).toEqual(await at(1, 0.25));
+    // Redness above 1 reads as 1: the eumelanin share 1 - redness would otherwise go negative.
+    expect(await at(0.6, 1.5)).toEqual(await at(0.6, 1));
+  });
+
+  it("a vector wired to Melanin or Redness reads its first component", async () => {
+    const vectors = hair([constant3("m", [0.6, 0.1, 0.9]), constant3("r", [0.25, 0.9, 0.1])], { Melanin: pin("m"), Redness: pin("r") });
+    const scalars = hair([scalar("m", 0.6), scalar("r", 0.25)], { Melanin: pin("m"), Redness: pin("r") });
+    expect(await colourAt(vectors)).toEqual(await colourAt(scalars));
+  });
+
+  it("a scalar wired to DyeColor broadcasts to every channel", async () => {
+    const scalarDye = hair([scalar("m", 0.6), scalar("d", 0.5)], { Melanin: pin("m"), DyeColor: pin("d") });
+    const vectorDye = hair([scalar("m", 0.6), constant3("d", [0.5, 0.5, 0.5])], { Melanin: pin("m"), DyeColor: pin("d") });
+    expect(await colourAt(scalarDye)).toEqual(await colourAt(vectorDye));
+  });
+
+  it("refuses a 2-component DyeColor, which has no float3 conversion", async () => {
+    const graph = hair([node("d", "Constant2Vector", { constants: { R: 0.5, G: 0.5 } })], { DyeColor: pin("d") });
+    expect(await bake(graph)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("HairColor.DyeColor") });
   });
 });
 
@@ -979,6 +1142,86 @@ describe("SmoothStep, SquareRoot, CrossProduct, VectorLength, RemapValueRange an
   it("SmoothStep steps per channel of a vector Value", async () => {
     const result = await bake(makeGraph([node("s", "SmoothStep", { inputs: { Value: pin("v", 0, RGB_MASK) } }), constant3("v", [0, 0.5, 1])], pin("s")));
     expect((await pixelsOf(result))(0, 0)).toEqual([encode(0), encode(0.5), encode(1)]);
+  });
+
+  // Unreal's translator settles these before any division: a Value from Max's source is 1, one from Min's source is 0,
+  // and Min and Max from one source (or equal constants) make a step. Only the ramp itself divides.
+  it("SmoothStep settles a Value from Max's source at 1, even where Min's constant equals it", async () => {
+    const graph = makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("half"), Max: pin("v"), Value: pin("v") } }), scalar("v", 0.5), scalar("half", 0.5)], pin("s"));
+    expect((await pixelsOf(await bake(graph)))(0, 0)).toEqual(grey(1));
+  });
+
+  it("SmoothStep settles a Value from Min's source at 0, and one source for all three at 0 (the Min check runs last)", async () => {
+    const fromMin = makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("v"), Value: pin("v") }, constants: { ConstMax: 1 } }), scalar("v", 0.5)], pin("s"));
+    expect((await pixelsOf(await bake(fromMin)))(0, 0)).toEqual(grey(0));
+    const oneSource = makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("v"), Max: pin("v"), Value: pin("v") } }), scalar("v", 0.5)], pin("s"));
+    expect((await pixelsOf(await bake(oneSource)))(0, 0)).toEqual(grey(0));
+  });
+
+  it("SmoothStep with Min and Max from one source steps at the threshold: below 0, at and above 1", async () => {
+    const at = (value: number) => bake(makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("lo"), Value: pin("v") } }), scalar("lo", 0.5), scalar("v", value)], pin("s")));
+    expect((await pixelsOf(await at(0.25)))(0, 0)).toEqual(grey(0));
+    expect((await pixelsOf(await at(0.5)))(0, 0)).toEqual(grey(1));
+    expect((await pixelsOf(await at(0.75)))(0, 0)).toEqual(grey(1));
+  });
+
+  it("SmoothStep with equal constant bounds steps at the threshold, from distinct constant nodes too", async () => {
+    const at = (value: number) =>
+      bake(makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }), scalar("lo", 0.5), scalar("hi", 0.5), scalar("v", value)], pin("s")));
+    expect((await pixelsOf(await at(0.25)))(0, 0)).toEqual(grey(0));
+    expect((await pixelsOf(await at(0.5)))(0, 0)).toEqual(grey(1));
+    expect((await pixelsOf(await at(0.75)))(0, 0)).toEqual(grey(1));
+  });
+
+  it("SmoothStep with reversed constant bounds folds as Unreal's constant rule: 0 below Min, 1 from Min up", async () => {
+    // Min 0.75 above Max 0.25. The runtime ramp would give 0.5 at 0.5; the constant fold is 0 there.
+    const at = (value: number) => bake(makeGraph([node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }), scalar("lo", 0.75), scalar("hi", 0.25), scalar("v", value)], pin("s")));
+    expect((await pixelsOf(await at(0.5)))(0, 0)).toEqual(grey(0));
+    expect((await pixelsOf(await at(0.8)))(0, 0)).toEqual(grey(1));
+  });
+
+  it("SmoothStep refuses the bake where Min and Max from different sources meet, rather than dividing by an epsilon", async () => {
+    // T_Lo is 64 everywhere; T_Hi is 64 at texel (0, 0) and 191 elsewhere, so the two meet at one texel.
+    const textures = {
+      T_Lo: { png: await pngOf(2, 2, () => [64, 64, 64]), srgb: false },
+      T_Hi: { png: await pngOf(2, 2, (x, y) => (x === 0 && y === 0 ? [64, 64, 64] : [191, 191, 191])), srgb: false },
+    };
+    const graph = makeGraph(
+      [node("s", "SmoothStep", { inputs: { Min: pin("lo", 0, RGB_MASK), Max: pin("hi", 0, RGB_MASK), Value: pin("v") } }), textureSample("lo", "T_Lo"), textureSample("hi", "T_Hi"), scalar("v", 0.5)],
+      pin("s"),
+    );
+    expect(await bake(graph, textures)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("SmoothStep s") });
+  });
+
+  it("SmoothStep from distinct textures that never meet keeps the HLSL ramp", async () => {
+    const textures = {
+      T_Lo: { png: await pngOf(2, 2, () => [64, 64, 64]), srgb: false },
+      T_Hi: { png: await pngOf(2, 2, () => [191, 191, 191]), srgb: false },
+    };
+    const graph = makeGraph(
+      [node("s", "SmoothStep", { inputs: { Min: pin("lo", 0, RGB_MASK), Max: pin("hi", 0, RGB_MASK), Value: pin("v") } }), textureSample("lo", "T_Lo"), textureSample("hi", "T_Hi"), scalar("v", 0.5)],
+      pin("s"),
+    );
+    // t = (0.5 - 64/255) / (191/255 - 64/255) = 0.5 exactly, and smoothstep(0.5) = 0.5.
+    expect((await pixelsOf(await bake(graph, textures)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("SmoothStep reads parameter bounds as run-time values: reversed ones ramp as HLSL does, not as a constant fold", async () => {
+    // A ScalarParameter is a uniform in Unreal, not a compile-time constant, so the constant rule never applies to it.
+    const graph = makeGraph(
+      [node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }), scalarParameter("lo", "Lo", 0.75), scalarParameter("hi", "Hi", 0.25), scalar("v", 0.5)],
+      pin("s"),
+    );
+    // t = (0.5 - 0.75) / (0.25 - 0.75) = 0.5, and smoothstep(0.5) = 0.5.
+    expect((await pixelsOf(await bake(graph)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("SmoothStep refuses equal bounds from two parameters, as it does equal bounds from distinct sources", async () => {
+    const graph = makeGraph(
+      [node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } }), scalarParameter("lo", "Lo", 0.5), scalarParameter("hi", "Hi", 0.5), scalar("v", 0.25)],
+      pin("s"),
+    );
+    expect(await bake(graph)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("SmoothStep s") });
   });
 
   it("SquareRoot is exact, and a negative input reads 0 instead of NaN", async () => {
@@ -1303,12 +1546,12 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
     expect(normal).toMatchObject({ status: "unsupported", unsupported: ["GetMaterialAttributes.Normal"] });
   });
 
-  it("BreakMaterialAttributes does not walk its input for an attribute that is not BaseColor", async () => {
+  it("BreakMaterialAttributes does not walk its input for an attribute the bake does not carry (Specular)", async () => {
     const graph = makeGraph(
-      [node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("bad") }, outputNames: ["BaseColor", "Metallic"] }), node("bad", "ReflectionVectorWS")],
-      pin("break", 1, RGB_MASK),
+      [node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("bad") }, outputNames: ["BaseColor", "Metallic", "Specular"] }), node("bad", "ReflectionVectorWS")],
+      pin("break", 2, RGB_MASK),
     );
-    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Metallic"] });
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Specular"] });
   });
 
   it("Reroute is an exact pass-through of Input", async () => {
@@ -1355,6 +1598,1263 @@ describe("SetMaterialAttributes with attributeTypes (real dump shape), Reroute, 
       if (result.status === "baked") expect(result).toMatchObject({ confidence: "heuristic", approximations: [note] });
       expect(supportedEngineFunctions()).toContain(name);
     }
+  });
+});
+
+describe("Metallic and Roughness beside BaseColor", () => {
+  const G = MATERIAL_ATTRIBUTE_GUIDS;
+  // Not in MATERIAL_ATTRIBUTE_GUIDS: it stands for an attribute the table does not name, and asserts nothing about which one.
+  const UNNAMED_GUID = "0123456789ABCDEF0123456789ABCDEF";
+  const TINT: Rgb = [0.8, 0.6, 0.4];
+  const WHITE = constant3("white", [1, 1, 1]);
+  const BREAK_OUTPUTS = ["BaseColor", "Metallic", "Specular", "Roughness"];
+  const METALLIC = 1;
+  const ROUGHNESS = 3;
+  // Constant colours are linear, so BaseColor = TINT x s is encoded channel by channel.
+  const tintTimes = (scale: number): number[] => TINT.map((channel) => encode(channel * scale));
+  const bake = (graph: MaterialGraph) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  const pixelOf = async (graph: MaterialGraph): Promise<number[]> => {
+    const result = await bake(graph);
+    expect(result.status).toBe("baked");
+    return (await pixelsOf(result))(0, 0);
+  };
+  const breakOf = (id: string, source: string): Raw =>
+    node(id, "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: BREAK_OUTPUTS });
+  const make = (id: string, scalars: Raw = {}): Raw => node(id, "MakeMaterialAttributes", { inputs: { BaseColor: pin("white"), ...scalars } });
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  // BaseColor = TINT x output `output` of the node `reader`; `nodes` holds everything else the graph needs.
+  const tinted = (reader: string, output: number, nodes: Raw[]): MaterialGraph =>
+    makeGraph([multiply("m", pin("tint"), pin(reader, output)), constant3("tint", TINT), WHITE, ...nodes], pin("m"));
+
+  it("reads Metallic from a MakeMaterialAttributes and multiplies BaseColor by it", async () => {
+    const graph = tinted("reader", METALLIC, [breakOf("reader", "make"), make("make", { Metallic: pin("metal") }), scalar("metal", 0.25)]);
+    expect(await pixelOf(graph)).toEqual(tintTimes(0.25));
+  });
+
+  it("reads Roughness from a MakeMaterialAttributes the same way", async () => {
+    const graph = tinted("reader", ROUGHNESS, [breakOf("reader", "make"), make("make", { Roughness: pin("rough") }), scalar("rough", 0.25)]);
+    expect(await pixelOf(graph)).toEqual(tintTimes(0.25));
+  });
+
+  it("takes Unreal's default for an unwired Make pin: Roughness 0.5, and Metallic 0", async () => {
+    expect(await pixelOf(tinted("reader", ROUGHNESS, [breakOf("reader", "make"), make("make")]))).toEqual(tintTimes(0.5));
+    expect(await pixelOf(tinted("reader", METALLIC, [breakOf("reader", "make"), make("make")]))).toEqual([0, 0, 0]);
+  });
+
+  it("reads a Break with no MaterialAttributes input as unknown, not as the defaults", async () => {
+    const graph = tinted("reader", ROUGHNESS, [node("reader", "BreakMaterialAttributes", { inputs: {}, outputNames: BREAK_OUTPUTS })]);
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Roughness"] });
+  });
+
+  it("changes the baked RGB when the scalar changes", async () => {
+    const at = (metallic: number) =>
+      pixelOf(tinted("reader", METALLIC, [breakOf("reader", "make"), make("make", { Metallic: pin("metal") }), scalar("metal", metallic)]));
+    expect(await at(0.25)).toEqual(tintTimes(0.25));
+    expect(await at(0.75)).toEqual(tintTimes(0.75));
+  });
+
+  it("keeps the Make's Metallic through a Set that overrides BaseColor", async () => {
+    const set = node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[1]": pin("tint") }, attributeTypes: [G.BaseColor, G.Roughness] });
+    const graph = tinted("reader", METALLIC, [breakOf("reader", "set"), set, make("make", { Metallic: pin("metal") }), scalar("metal", 0.25)]);
+    expect(await pixelOf(graph)).toEqual(tintTimes(0.25));
+  });
+
+  it("takes a Set's Roughness override over the Make's, and keeps the Make's Metallic", async () => {
+    const set = node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[2]": pin("override") }, attributeTypes: [G.BaseColor, G.Roughness] });
+    const source = [make("make", { Metallic: pin("metal"), Roughness: pin("low") }), scalar("metal", 0.25), scalar("low", 0.1), scalar("override", 0.75)];
+    expect(await pixelOf(tinted("reader", ROUGHNESS, [breakOf("reader", "set"), set, ...source]))).toEqual(tintTimes(0.75));
+    expect(await pixelOf(tinted("reader", METALLIC, [breakOf("reader", "set"), set, ...source]))).toEqual(tintTimes(0.25));
+  });
+
+  it("starts a Set with no incoming attributes from the defaults", async () => {
+    // Only BaseColor is set, so Roughness is Unreal's default 0.5.
+    const set = node("set", "SetMaterialAttributes", { inputs: { "Inputs[1]": pin("tint") }, attributeTypes: [G.BaseColor] });
+    expect(await pixelOf(tinted("reader", ROUGHNESS, [breakOf("reader", "set"), set]))).toEqual(tintTimes(0.5));
+  });
+
+  it("reads Roughness by its known GUID, and Metallic by its output name", async () => {
+    const source = [make("make", { Metallic: pin("metal"), Roughness: pin("rough") }), scalar("metal", 0.25), scalar("rough", 0.75)];
+    const byGuid = node("get", "GetMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: ["MaterialAttributes", "Roughness"], attributeTypes: [G.Roughness] });
+    const byName = node("getm", "GetMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: ["MaterialAttributes", "Metallic"] });
+    expect(await pixelOf(tinted("get", 1, [byGuid, ...source]))).toEqual(tintTimes(0.75));
+    expect(await pixelOf(tinted("getm", 1, [byName, ...source]))).toEqual(tintTimes(0.25));
+  });
+
+  it("blends Metallic by Alpha in BlendMaterialAttributes", async () => {
+    const blend = node("blend", "BlendMaterialAttributes", { inputs: { A: pin("ma"), B: pin("mb"), Alpha: pin("alpha") } });
+    const nodes = [breakOf("reader", "blend"), blend, make("ma", { Metallic: pin("m0") }), make("mb", { Metallic: pin("m1") }), scalar("m0", 0.2), scalar("m1", 0.8), scalar("alpha", 0.25)];
+    // 0.2 + (0.8 - 0.2) x 0.25
+    expect(await pixelOf(tinted("reader", METALLIC, nodes))).toEqual(tintTimes(0.35));
+  });
+
+  it("blends Metallic by Alpha through MatLayerBlend_Standard, as the attribute blend does", async () => {
+    const layer = engineCall("layer", "MatLayerBlend_Standard", { Input0: pin("ma"), Input1: pin("mb"), Input2: pin("alpha") });
+    const nodes = [breakOf("reader", "layer"), layer, make("ma", { Metallic: pin("m0") }), make("mb", { Metallic: pin("m1") }), scalar("m0", 0.2), scalar("m1", 0.8), scalar("alpha", 0.25)];
+    expect(await pixelOf(tinted("reader", METALLIC, nodes))).toEqual(tintTimes(0.35));
+  });
+
+  it("keeps Metallic and Roughness through MatLayerBlend_AO, NormalBlend and Tint", async () => {
+    const source = [make("make", { Metallic: pin("metal"), Roughness: pin("rough") }), scalar("metal", 0.25), scalar("rough", 0.75), constant3("layerTint", [0.5, 0.5, 0.5])];
+    const layers: [string, Raw][] = [
+      ["MatLayerBlend_AO", engineCall("layer", "MatLayerBlend_AO", { Input0: pin("make") })],
+      ["MatLayerBlend_NormalBlend", engineCall("layer", "MatLayerBlend_NormalBlend", { Input0: pin("make"), Input1: null })],
+      ["MatLayerBlend_Tint", engineCall("layer", "MatLayerBlend_Tint", { Input0: pin("make"), Input1: pin("layerTint") })],
+    ];
+    for (const [name, layer] of layers) {
+      expect(await pixelOf(tinted("reader", METALLIC, [breakOf("reader", "layer"), layer, ...source])), name).toEqual(tintTimes(0.25));
+      expect(await pixelOf(tinted("reader", ROUGHNESS, [breakOf("reader", "layer"), layer, ...source])), name).toEqual(tintTimes(0.75));
+    }
+  });
+
+  it("keeps Metallic through MatLayerBlend_ModulateRoughness, and names Roughness as unknown there", async () => {
+    const source = [make("make", { Metallic: pin("metal"), Roughness: pin("rough") }), scalar("metal", 0.25), scalar("rough", 0.75)];
+    const layer = () => engineCall("layer", "MatLayerBlend_ModulateRoughness", { Input0: pin("make") });
+    expect(await pixelOf(tinted("reader", METALLIC, [breakOf("reader", "layer"), layer(), ...source]))).toEqual(tintTimes(0.25));
+    expect(await bake(tinted("reader", ROUGHNESS, [breakOf("reader", "layer"), layer(), ...source]))).toMatchObject({
+      status: "unsupported",
+      unsupported: ["BreakMaterialAttributes.Roughness", "MatLayerBlend_ModulateRoughness.Roughness"],
+    });
+  });
+
+  it("takes the Roughness of a pack-local MatLayerBlend_ModulateRoughness from its own body", async () => {
+    const call = node("layer", "FunctionCall", {
+      inputs: {},
+      function: "/Game/Test/MatLayerBlend_ModulateRoughness.MatLayerBlend_ModulateRoughness",
+      outputNames: ["Result"],
+      fn: { inputs: {}, outputs: ["body"], output: "body", outputNames: [""] },
+    });
+    const nodes = [breakOf("reader", "layer"), call, make("body", { Roughness: pin("low") }), scalar("low", 0.1)];
+    expect(await pixelOf(tinted("reader", ROUGHNESS, nodes))).toEqual(tintTimes(0.1));
+  });
+
+  it("does not visit an unsupported Normal, or an unused Metallic, on a BaseColor-only path", async () => {
+    const graph = makeGraph(
+      [breakOf("reader", "make"), make("make", { Normal: pin("bad"), Metallic: pin("bad") }), node("bad", "ReflectionVectorWS"), constant3("white", [0.5, 0.5, 0.5])],
+      pin("reader", 0, RGB_MASK),
+    );
+    expect(await pixelOf(graph)).toEqual([encode(0.5), encode(0.5), encode(0.5)]);
+  });
+
+  it("fails a BaseColor path that consumes an unsupported Metallic, and names the node", async () => {
+    const graph = tinted("reader", METALLIC, [breakOf("reader", "make"), make("make", { Metallic: pin("bad") }), node("bad", "ReflectionVectorWS")]);
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["ReflectionVectorWS"] });
+  });
+
+  it("makes Metallic unknown after a Set that overrides an attribute the table does not name, and names that pin", async () => {
+    const set = node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[2]": pin("override") }, attributeTypes: [G.BaseColor, UNNAMED_GUID] });
+    const nodes = [breakOf("reader", "set"), set, make("make", { Metallic: pin("metal") }), scalar("metal", 0.25), scalar("override", 0.75)];
+    expect(await bake(tinted("reader", METALLIC, nodes))).toMatchObject({
+      status: "unsupported",
+      unsupported: ["BreakMaterialAttributes.Metallic", `SetMaterialAttributes.${UNNAMED_GUID}`],
+    });
+  });
+
+  it("does not let that unnamed override block a BaseColor-only bake", async () => {
+    const set = node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[2]": pin("override") }, attributeTypes: [G.BaseColor, UNNAMED_GUID] });
+    const graph = makeGraph(
+      [breakOf("reader", "set"), set, make("make", { Metallic: pin("metal") }), scalar("metal", 0.25), scalar("override", 0.75), WHITE],
+      pin("reader", 0, RGB_MASK),
+    );
+    expect(await pixelOf(graph)).toEqual([encode(1), encode(1), encode(1)]);
+  });
+
+  it("still reads a Roughness override beside an unnamed override pin", async () => {
+    const set = node("set", "SetMaterialAttributes", {
+      inputs: { "Inputs[0]": pin("make"), "Inputs[2]": pin("override"), "Inputs[3]": pin("rough") },
+      attributeTypes: [G.BaseColor, UNNAMED_GUID, G.Roughness],
+    });
+    expect(await pixelOf(tinted("reader", ROUGHNESS, [breakOf("reader", "set"), set, make("make"), scalar("override", 0.3), scalar("rough", 0.75)]))).toEqual(tintTimes(0.75));
+  });
+
+  it("reads a vector wired to a scalar input through its first component", async () => {
+    const nodes = [breakOf("reader", "make"), make("make", { Roughness: pin("rgb") }), constant3("rgb", [0.25, 0.9, 0.5])];
+    expect(await pixelOf(tinted("reader", ROUGHNESS, nodes))).toEqual(tintTimes(0.25));
+  });
+
+  it("reads a legacy Set's Roughness override by its pin name", async () => {
+    const set = node("set", "SetMaterialAttributes", { inputs: { MaterialAttributes: pin("make"), Roughness: pin("rough") } });
+    expect(await pixelOf(tinted("reader", ROUGHNESS, [breakOf("reader", "set"), set, make("make"), scalar("rough", 0.75)]))).toEqual(tintTimes(0.75));
+  });
+
+  // BaseColor is lazy too: reading only a scalar of a Make/Set/Blend/layer must not compile an unsupported BaseColor node.
+  it("reads Metallic from a Make whose BaseColor is unsupported", async () => {
+    const nodes = [breakOf("reader", "make"), node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("bad"), Metallic: pin("metal") } }), scalar("metal", 0.7), node("bad", "ReflectionVectorWS")];
+    expect(await pixelOf(tinted("reader", METALLIC, nodes))).toEqual(tintTimes(0.7));
+  });
+
+  it("reads Metallic through a Set whose BaseColor override is unsupported", async () => {
+    const set = node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[1]": pin("bad") }, attributeTypes: [G.BaseColor] });
+    const nodes = [breakOf("reader", "set"), set, node("make", "MakeMaterialAttributes", { inputs: { Metallic: pin("metal") } }), scalar("metal", 0.7), node("bad", "ReflectionVectorWS")];
+    expect(await pixelOf(tinted("reader", METALLIC, nodes))).toEqual(tintTimes(0.7));
+  });
+
+  it("blends Metallic without compiling an unsupported BaseColor on either side", async () => {
+    const blend = node("blend", "BlendMaterialAttributes", { inputs: { A: pin("ma"), B: pin("mb"), Alpha: pin("alpha") } });
+    const nodes = [
+      breakOf("reader", "blend"),
+      blend,
+      node("ma", "MakeMaterialAttributes", { inputs: { BaseColor: pin("bad"), Metallic: pin("m0") } }),
+      make("mb", { Metallic: pin("m1") }),
+      scalar("m0", 0.2),
+      scalar("m1", 0.8),
+      scalar("alpha", 0.25),
+      node("bad", "ReflectionVectorWS"),
+    ];
+    // 0.2 + (0.8 - 0.2) x 0.25
+    expect(await pixelOf(tinted("reader", METALLIC, nodes))).toEqual(tintTimes(0.35));
+  });
+
+  it("passes Metallic through a BaseColor writer whose colour is unsupported", async () => {
+    const layer = engineCall("layer", "MatLayerBlend_OverrideBaseColor", { Input0: pin("make"), Input1: pin("bad") });
+    const nodes = [breakOf("reader", "layer"), layer, make("make", { Metallic: pin("metal") }), scalar("metal", 0.7), node("bad", "ReflectionVectorWS")];
+    expect(await pixelOf(tinted("reader", METALLIC, nodes))).toEqual(tintTimes(0.7));
+  });
+
+  it("passes Roughness through a Tint layer whose tint is unsupported", async () => {
+    const layer = engineCall("layer", "MatLayerBlend_Tint", { Input0: pin("make"), Input1: pin("bad") });
+    const nodes = [breakOf("reader", "layer"), layer, make("make", { Roughness: pin("rough") }), scalar("rough", 0.75), node("bad", "ReflectionVectorWS")];
+    expect(await pixelOf(tinted("reader", ROUGHNESS, nodes))).toEqual(tintTimes(0.75));
+  });
+});
+
+describe("a cycle in attribute forwarding is reported, not run away", () => {
+  // A typed Set with no attributeTypes: Inputs[0] is the incoming attributes and nothing overrides them.
+  const setOf = (id: string, incoming: Raw): Raw => node(id, "SetMaterialAttributes", { inputs: { "Inputs[0]": incoming }, attributeTypes: [] });
+  const readerOf = (source: string): Raw => node("reader", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: ["BaseColor", "Metallic"] });
+  const bake = (graph: MaterialGraph) => bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  // BaseColor = TINT x Break(source).<output>, so a scalar read shows up in the baked RGB.
+  const tintedRead = (source: string, output: number, nodes: Raw[]): MaterialGraph =>
+    makeGraph([multiply("m", pin("tint"), pin("reader", output)), constant3("tint", [0.8, 0.6, 0.4]), readerOf(source), ...nodes], pin("m"));
+  // A forwarding cycle must be a diagnostic, never a RangeError from the stack.
+  const expectCycle = (result: BakeResult) => {
+    expect(result.status).not.toBe("baked");
+    expect(result).toMatchObject({ reason: expect.stringContaining("cycle") });
+  };
+
+  it("refuses a SetMaterialAttributes whose incoming pin is itself, on BaseColor", async () => {
+    expectCycle(await bake(makeGraph([setOf("set", pin("set"))], pin("set"))));
+  });
+
+  it("refuses the same self-cycle on a scalar read", async () => {
+    expectCycle(await bake(tintedRead("set", 1, [setOf("set", pin("set"))])));
+  });
+
+  it("refuses two Sets that forward their attributes to each other, on BaseColor", async () => {
+    expectCycle(await bake(makeGraph([setOf("a", pin("b")), setOf("b", pin("a"))], pin("a"))));
+  });
+
+  it("refuses the same two-node cycle on a scalar read", async () => {
+    expectCycle(await bake(tintedRead("a", 1, [setOf("a", pin("b")), setOf("b", pin("a"))])));
+  });
+});
+
+describe("attribute-scoped reads: static switches and legacy Set overrides", () => {
+  const BREAK_OUTPUTS = ["BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal"];
+  const METALLIC = 1;
+  const ROUGHNESS = 3;
+  const OPACITY_MASK = 6;
+  const TINT: Rgb = [0.8, 0.6, 0.4];
+  const MASK_BYTES = [64, 128, 191, 255];
+  const WHITE = constant3("white", [1, 1, 1]);
+  const tintTimes = (scale: number): number[] => TINT.map((channel) => encode(channel * scale));
+  const breakOf = (id: string, source: string): Raw => node(id, "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: BREAK_OUTPUTS });
+  const make = (id: string, baseColor: string, scalars: Raw = {}): Raw => node(id, "MakeMaterialAttributes", { inputs: { BaseColor: pin(baseColor), ...scalars } });
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  // The switch takes A by default. A's BaseColor samples a texture no instance binds; B's BaseColor is white.
+  const switchOf = (id: string, a: string, b: string, name: string): Raw => node(id, "StaticSwitchParameter", { inputs: { A: pin(a), B: pin(b) }, parameter: { name, group: "" }, default: true });
+  const unbound = (id: string): Raw => node(id, "TextureSampleParameter2D", { parameter: { name: "BaseTexture", group: "Base" }, default: null, texture: null, samplerType: "Color" });
+  const bad = (id: string): Raw => node(id, "ReflectionVectorWS");
+  // BaseColor = TINT x output `output` of a Break of `source`; `nodes` holds the rest of the graph.
+  const tintedRead = (source: string, output: number, nodes: Raw[]): MaterialGraph =>
+    makeGraph([multiply("m", pin("tint"), pin("reader", output)), constant3("tint", TINT), breakOf("reader", source), ...nodes], pin("m"));
+  // The colour is `baseColor`; the cut-out is the OpacityMask of a Break of `source`. `nodes` holds the rest of the graph.
+  const cutOut = (source: string, baseColor: string, nodes: Raw[]): MaterialGraph => {
+    const all = [breakOf("reader", source), ...nodes];
+    return materialGraphSchema.parse({
+      format: 1,
+      material: "M_Test",
+      package: "/Game/Test/M_Test",
+      truncated: false,
+      nodeCount: all.length,
+      outputs: { baseColor: pin(baseColor), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: pin("reader", OPACITY_MASK, [1, 0, 0, 0]), normal: null, materialAttributes: null },
+      nodes: all,
+    });
+  };
+  const bakeColour = (graph: MaterialGraph) => bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  const pixelOf = async (graph: MaterialGraph): Promise<number[]> => {
+    const result = await bakeColour(graph);
+    expect(result.status).toBe("baked");
+    return (await pixelsOf(result))(0, 0);
+  };
+  const maskTextures = async (): Promise<Record<string, Fixture>> => ({
+    T_Mask: { png: await pngOf(2, 2, (x, y) => [MASK_BYTES[y * 2 + x]!, 0, 0]), srgb: false },
+    T_Other: { png: await pngOf(2, 2, () => [255, 0, 0]), srgb: false },
+  });
+  const bakeCutOut = async (graph: MaterialGraph) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(await maskTextures()).loadTexture, size: 2, alpha: "opacityMask" });
+  // Alpha of the four texels of the 2 x 2 cut-out bake, in the order the mask fixture was written. (pixelsOf drops alpha.)
+  const alphaOf = async (result: BakeResult): Promise<number[]> => {
+    if (result.status !== "baked") throw new Error(`expected baked, got ${result.status}`);
+    const { data, info } = await sharp(result.png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const at = (x: number, y: number) => data[(y * info.width + x) * 4 + 3]!;
+    return [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+  };
+  const cutOutAlpha = async (graph: MaterialGraph): Promise<number[]> => alphaOf(await bakeCutOut(graph));
+
+  describe("a static switch probes only the attribute its read asks for", () => {
+    // Roughness is .2 on the default branch and .8 on B.
+    const roughnessSwitch = (): Raw[] => [
+      switchOf("sw", "makeA", "makeB", "UseA"),
+      make("makeA", "unbound", { Roughness: pin("roughA") }),
+      make("makeB", "white", { Roughness: pin("roughB") }),
+      unbound("unbound"),
+      WHITE,
+      scalar("roughA", 0.2),
+      scalar("roughB", 0.8),
+    ];
+
+    it("takes the Roughness of the default branch when only Roughness is read", async () => {
+      expect(await pixelOf(tintedRead("sw", ROUGHNESS, roughnessSwitch()))).toEqual(tintTimes(0.2));
+    });
+
+    it("takes the Metallic of the default branch when only Metallic is read", async () => {
+      const nodes = [
+        switchOf("sw", "makeA", "makeB", "UseA"),
+        make("makeA", "unbound", { Metallic: pin("metalA") }),
+        make("makeB", "white", { Metallic: pin("metalB") }),
+        unbound("unbound"),
+        WHITE,
+        scalar("metalA", 0.2),
+        scalar("metalB", 0.8),
+      ];
+      expect(await pixelOf(tintedRead("sw", METALLIC, nodes))).toEqual(tintTimes(0.2));
+    });
+
+    it("takes the OpacityMask of the default branch for the cut-out", async () => {
+      const nodes = [
+        switchOf("sw", "makeA", "makeB", "UseA"),
+        make("makeA", "unbound", { OpacityMask: pin("maskA") }),
+        make("makeB", "white", { OpacityMask: pin("maskB") }),
+        unbound("unbound"),
+        WHITE,
+        textureSample("maskA", "T_Mask", "LinearColor"),
+        textureSample("maskB", "T_Other", "LinearColor"),
+      ];
+      expect(await cutOutAlpha(cutOut("sw", "white", nodes))).toEqual(MASK_BYTES);
+    });
+
+    it("still probes BaseColor when BaseColor is what is read", async () => {
+      const graph = makeGraph(
+        [multiply("m", pin("tint"), pin("reader", 0, RGB_MASK)), constant3("tint", TINT), breakOf("reader", "sw"), switchOf("sw", "makeA", "makeB", "UseA"), make("makeA", "unbound"), make("makeB", "white"), unbound("unbound"), WHITE],
+        pin("m"),
+      );
+      expect(await pixelOf(graph)).toEqual(tintTimes(1));
+    });
+
+    it("an explicit switch override still wins over the probe", async () => {
+      const result = await bakeGraph({ graph: tintedRead("sw", ROUGHNESS, roughnessSwitch()), output: "baseColor", parameters: params({ switches: { usea: false } }), loadTexture: makeLoader({}).loadTexture, size: 2 });
+      expect((await pixelsOf(result))(0, 0)).toEqual(tintTimes(0.8));
+    });
+
+    it("probes BaseColor for a Break nested in a Roughness read, and keeps the outer switch on Roughness", async () => {
+      const nodes = [
+        switchOf("sw", "makeA", "makeB", "UseA"),
+        make("makeA", "unbound", { Roughness: pin("inner") }),
+        make("makeB", "white", { Roughness: pin("roughB") }),
+        breakOf("inner", "innerSwitch"),
+        switchOf("innerSwitch", "innerA", "innerB", "UseInner"),
+        make("innerA", "unbound"),
+        make("innerB", "half"),
+        constant3("half", [0.5, 0.5, 0.5]),
+        unbound("unbound"),
+        WHITE,
+        scalar("roughB", 0.8),
+      ];
+      // The inner switch takes its grey B for BaseColor, so A's Roughness is 0.5; the outer switch keeps A.
+      expect(await pixelOf(tintedRead("sw", ROUGHNESS, nodes))).toEqual(tintTimes(0.5));
+    });
+
+    it("shares one branch between the colour and the cut-out: BaseColor takes B, so the mask comes from B too", async () => {
+      const nodes = [
+        multiply("m", pin("tint"), pin("reader", 0, RGB_MASK)),
+        constant3("tint", TINT),
+        switchOf("sw", "makeA", "makeB", "UseA"),
+        make("makeA", "unbound", { OpacityMask: pin("maskA") }),
+        make("makeB", "white", { OpacityMask: pin("maskB") }),
+        unbound("unbound"),
+        WHITE,
+        textureSample("maskA", "T_Mask", "LinearColor"),
+        textureSample("maskB", "T_Other", "LinearColor"),
+      ];
+      const result = await bakeCutOut(cutOut("sw", "m", nodes));
+      expect((await pixelsOf(result))(0, 0)).toEqual(tintTimes(1));
+      expect(await alphaOf(result)).toEqual([255, 255, 255, 255]);
+    });
+  });
+
+  describe("the switch choice is settled over the colour and the cut-out, not by the first read", () => {
+    const unboundMask = (id: string): Raw =>
+      node(id, "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: null, samplerType: "LinearColor" });
+    const grey = (level: number) => [encode(level), encode(level), encode(level)];
+    const splitGraph = (colour: string, mask: string, nodes: Raw[]): MaterialGraph =>
+      materialGraphSchema.parse({
+        format: 1,
+        material: "M_Test",
+        package: "/Game/Test/M_Test",
+        truncated: false,
+        nodeCount: nodes.length,
+        outputs: { baseColor: pin(colour), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: pin(mask, OPACITY_MASK, [1, 0, 0, 0]), normal: null, materialAttributes: null },
+        nodes,
+      });
+
+    // Roughness .2 on the default branch, .8 on B; the default branch's BaseColor samples a texture no instance binds.
+    const roughnessSwitch = (): Raw[] => [
+      switchOf("sw", "makeA", "makeB", "UseA"),
+      make("makeA", "unbound", { Roughness: pin("roughA") }),
+      make("makeB", "white", { Roughness: pin("roughB") }),
+      unbound("unbound"),
+      WHITE,
+      scalar("roughA", 0.2),
+      scalar("roughB", 0.8),
+    ];
+
+    it.each(["roughness", "colour"] as const)("takes one branch for Roughness x BaseColor whichever operand is read first (%s first)", async (first) => {
+      const roughness = pin("reader", ROUGHNESS);
+      const colour = pin("reader", 0, RGB_MASK);
+      const product = first === "roughness" ? multiply("m", roughness, colour) : multiply("m", colour, roughness);
+      expect(await pixelOf(makeGraph([product, breakOf("reader", "sw"), ...roughnessSwitch()], pin("m")))).toEqual(grey(0.8));
+    });
+
+    it("a switch the colour and the cut-out both read takes one branch on their union, so the cut-out's unbound mask moves the colour", async () => {
+      // Alone the colour keeps A (its TINT is bound) and the cut-out flips to B (A's mask is unbound); the union flips to B.
+      const nodes = [
+        switchOf("sw", "makeA", "makeB", "UseA"),
+        make("makeA", "tint", { OpacityMask: pin("maskA") }),
+        make("makeB", "white", { OpacityMask: pin("maskB") }),
+        constant3("tint", TINT),
+        WHITE,
+        unboundMask("maskA"),
+        textureSample("maskB", "T_Other", "LinearColor"),
+      ];
+      const result = await bakeCutOut(cutOut("sw", "reader", nodes));
+      expect((await pixelsOf(result))(0, 0)).toEqual(grey(1));
+      expect(await alphaOf(result)).toEqual([255, 255, 255, 255]);
+    });
+
+    it("a nested switch in a branch the colour leaves keeps the choice of the reads that take it, not the trial's", async () => {
+      // The outer switch's A has an unbound texture, so B is taken and A is left. A's BaseColor reaches the inner switch only in
+      // a trial, whose BaseColor probe keeps the inner A. The cut-out reads the inner switch's mask: unbound on A, bound on B.
+      const nodes = [
+        breakOf("colourRead", "outer"),
+        breakOf("maskRead", "inner"),
+        switchOf("outer", "makeA", "makeB", "UseOuter"),
+        make("makeA", "mixed"),
+        multiply("mixed", pin("unbound"), pin("innerColour")),
+        breakOf("innerColour", "inner"),
+        make("makeB", "white"),
+        switchOf("inner", "innerA", "innerB", "UseInner"),
+        make("innerA", "white", { OpacityMask: pin("maskA") }),
+        make("innerB", "white", { OpacityMask: pin("maskB") }),
+        unbound("unbound"),
+        WHITE,
+        unboundMask("maskA"),
+        textureSample("maskB", "T_Mask", "LinearColor"),
+      ];
+      const result = await bakeCutOut(splitGraph("colourRead", "maskRead", nodes));
+      expect((await pixelsOf(result))(0, 0)).toEqual(grey(1));
+      expect(await alphaOf(result)).toEqual(MASK_BYTES);
+    });
+
+    it("refuses a switch choice that never settles, rather than looping", async () => {
+      // On A the outer switch reads the inner switch's BaseColor, unbound on the inner A, so B is taken; on B it reads the inner
+      // Roughness instead, bound on both inner branches, so A is taken again. The two configurations alternate, and the bake says so.
+      const nodes = [
+        switchOf("outer", "makeA", "makeB", "UseOuter"),
+        make("makeA", "innerBreak"),
+        make("makeB", "innerRoughColour"),
+        breakOf("innerBreak", "inner"),
+        multiply("innerRoughColour", pin("innerBreak", ROUGHNESS), pin("white")),
+        switchOf("inner", "innerA", "innerB", "UseInner"),
+        make("innerA", "unbound", { Roughness: pin("roughA") }),
+        make("innerB", "white", { Roughness: pin("roughB") }),
+        scalar("roughA", 0.2),
+        scalar("roughB", 0.8),
+        unbound("unbound"),
+        WHITE,
+      ];
+      expect(await bakeColour(makeGraph([breakOf("reader", "outer"), ...nodes], pin("reader")))).toMatchObject({
+        status: "unavailable",
+        reason: expect.stringContaining("do not settle"),
+      });
+      // The probe reports the same refusal: no classes and no textures, so a caller never reads a cycling path as one
+      // that does not read VertexColor (which would drop a painted mesh's COLOR_0).
+      const cycling = makeGraph([breakOf("reader", "outer"), ...nodes], pin("reader"));
+      expect(graphPathClasses(cycling, "baseColor")).toBeUndefined();
+      expect(graphPathTextures(cycling)).toBeUndefined();
+    });
+  });
+
+  describe("a legacy SetMaterialAttributes reads its named overrides before it looks for an incoming pin", () => {
+    // No attributeTypes and no pin named MaterialAttributes: the incoming attributes can only be found among the other pins.
+    const legacySet = (inputs: Raw): Raw => node("set", "SetMaterialAttributes", { inputs });
+
+    it("an unused unsupported Roughness or OpacityMask does not poison a BaseColor read", async () => {
+      const graph = makeGraph([breakOf("reader", "set"), legacySet({ BaseColor: pin("white"), Roughness: pin("bad"), OpacityMask: pin("bad2") }), bad("bad"), bad("bad2"), WHITE], pin("reader", 0, RGB_MASK));
+      expect(await pixelOf(graph)).toEqual([encode(1), encode(1), encode(1)]);
+    });
+
+    it("a mask-only read works with an unsupported BaseColor and Roughness override", async () => {
+      const nodes = [legacySet({ BaseColor: pin("bad"), Roughness: pin("bad2"), OpacityMask: pin("maskA") }), bad("bad"), bad("bad2"), WHITE, textureSample("maskA", "T_Mask", "LinearColor")];
+      expect(await cutOutAlpha(cutOut("set", "white", nodes))).toEqual(MASK_BYTES);
+    });
+
+    it("a consumed unsupported Roughness is still unsupported", async () => {
+      const nodes = [legacySet({ BaseColor: pin("white"), Roughness: pin("bad") }), bad("bad"), WHITE];
+      expect(await bakeColour(tintedRead("set", ROUGHNESS, nodes))).toMatchObject({ status: "unsupported", unsupported: ["ReflectionVectorWS"] });
+    });
+
+    it("an unnamed incoming attributes pin is still found, and its Roughness is read", async () => {
+      const nodes = [legacySet({ Source: pin("make"), BaseColor: pin("white") }), make("make", "white", { Roughness: pin("rough") }), scalar("rough", 0.75), WHITE];
+      expect(await pixelOf(tintedRead("set", ROUGHNESS, nodes))).toEqual(tintTimes(0.75));
+    });
+
+    it("does not visit an unused Normal or WorldPositionOffset override while it looks for an unnamed incoming pin", async () => {
+      const graph = makeGraph([breakOf("reader", "set"), legacySet({ BaseColor: pin("white"), Normal: pin("bad"), WorldPositionOffset: pin("bad2") }), bad("bad"), bad("bad2"), WHITE], pin("reader", 0, RGB_MASK));
+      expect(await pixelOf(graph)).toEqual([encode(1), encode(1), encode(1)]);
+    });
+
+    it("an unsupported unnamed source does not block a Roughness override that shadows it", async () => {
+      const graph = makeGraph([multiply("m", pin("reader", ROUGHNESS), pin("white")), breakOf("reader", "set"), legacySet({ Source: pin("bad"), Roughness: pin("roughA") }), bad("bad"), scalar("roughA", 0.2), WHITE], pin("m"));
+      expect(await pixelOf(graph)).toEqual([encode(0.2), encode(0.2), encode(0.2)]);
+    });
+  });
+
+  describe("a typed SetMaterialAttributes compiles its incoming source only for a field nothing overrides", () => {
+    const G = MATERIAL_ATTRIBUTE_GUIDS;
+    // Inputs[0] is the incoming attributes and Inputs[i] carries attributeTypes[i - 1], as in the real dump.
+    const typedSet = (inputs: Raw, attributeTypes: string[]): Raw => node("set", "SetMaterialAttributes", { inputs, attributeTypes });
+    const roughnessTimesWhite = (set: Raw, nodes: Raw[]): MaterialGraph =>
+      makeGraph([multiply("m", pin("reader", ROUGHNESS), pin("white")), breakOf("reader", "set"), set, WHITE, ...nodes], pin("m"));
+
+    it("reads an overridden Roughness while the incoming source is unsupported", async () => {
+      const set = typedSet({ "Inputs[0]": pin("bad"), "Inputs[1]": pin("roughA") }, [G.Roughness]);
+      expect(await pixelOf(roughnessTimesWhite(set, [bad("bad"), scalar("roughA", 0.2)]))).toEqual([encode(0.2), encode(0.2), encode(0.2)]);
+    });
+
+    it("reads an overridden BaseColor and Roughness while the incoming source is unsupported", async () => {
+      const set = typedSet({ "Inputs[0]": pin("bad"), "Inputs[1]": pin("white"), "Inputs[2]": pin("roughA") }, [G.BaseColor, G.Roughness]);
+      const graph = makeGraph([multiply("m", pin("reader", ROUGHNESS), pin("reader", 0, RGB_MASK)), breakOf("reader", "set"), set, bad("bad"), WHITE, scalar("roughA", 0.2)], pin("m"));
+      expect(await pixelOf(graph)).toEqual([encode(0.2), encode(0.2), encode(0.2)]);
+    });
+
+    it("still reports the unsupported incoming source when a field it supplies is read", async () => {
+      const set = typedSet({ "Inputs[0]": pin("bad"), "Inputs[1]": pin("roughA") }, [G.Roughness]);
+      const graph = makeGraph([multiply("m", pin("reader", METALLIC), pin("white")), breakOf("reader", "set"), set, bad("bad"), scalar("roughA", 0.2), WHITE], pin("m"));
+      expect(await bakeColour(graph)).toMatchObject({ status: "unsupported", unsupported: ["BreakMaterialAttributes.Metallic", "ReflectionVectorWS"] });
+    });
+  });
+});
+
+describe("a pack-local function body wins over an engine-name handler", () => {
+  const bake = (graph: MaterialGraph) => bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  const rgbOf = async (graph: MaterialGraph): Promise<number[]> => (await pixelsOf(await bake(graph)))(0, 0);
+  const GREEN = constant3("green", [0, 1, 0]);
+  const UNUSED = node("unused", "ReflectionVectorWS");
+  const breakOf = (source: string): Raw => node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: ["BaseColor"] });
+  // A call named exactly like an engine layer function, but carrying a pack-local body: Make(BaseColor = green).
+  const packed = (name: string): Raw =>
+    node("layer", "FunctionCall", {
+      function: `/Game/Test/${name}.${name}`,
+      outputNames: ["Result"],
+      fn: { inputs: {}, outputs: ["body", "unused"], output: "body", outputNames: ["", ""] },
+    });
+  const body = (inputs: Raw = {}) => node("body", "MakeMaterialAttributes", { inputs: { BaseColor: pin("green"), ...inputs } });
+
+  it("uses the body's BaseColor for a call named MatLayerBlend_Standard, not the name-matched lerp", async () => {
+    const graph = makeGraph([breakOf("layer"), packed("MatLayerBlend_Standard"), body(), GREEN, UNUSED], pin("break", 0, RGB_MASK));
+    expect(await rgbOf(graph)).toEqual([0, 255, 0]);
+  });
+
+  it("uses the body's BaseColor for a call named MatLayerBlend_Tint", async () => {
+    const graph = makeGraph([breakOf("layer"), packed("MatLayerBlend_Tint"), body(), GREEN, UNUSED], pin("break", 0, RGB_MASK));
+    expect(await rgbOf(graph)).toEqual([0, 255, 0]);
+  });
+
+  it("does not compile a body output that was not requested", async () => {
+    // outputs[1] points at an unsupported node; only output 0 is read, so the bake still succeeds.
+    const graph = makeGraph([breakOf("layer"), packed("MatLayerBlend_Standard"), body(), GREEN, UNUSED], pin("break", 0, RGB_MASK));
+    const result = await bake(graph);
+    expect(result).toMatchObject({ status: "baked" });
+    expect(result.status === "baked" && result.approximations).toEqual([]);
+  });
+
+  it("names the function rather than falling back to the name handler when the body lacks the requested output", async () => {
+    // A body defines output 0 but not output 1: requesting output 1 must not silently run the engine-name handler.
+    const call = node("layer", "FunctionCall", {
+      function: "/Game/Test/MatLayerBlend_Standard.MatLayerBlend_Standard",
+      outputNames: ["Result", "Other"],
+      fn: { inputs: {}, outputs: ["body", null], output: "body", outputNames: ["", ""] },
+    });
+    const graph = makeGraph([call, body(), GREEN], pin("layer", 1, RGB_MASK));
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: ["MatLayerBlend_Standard"] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// graphNormalDependencies: the textures the active Normal reads, which decides whether a flattened normal map is stale.
+
+const normalGraph = (nodes: Raw[], wiring: Raw = {}, extra: Raw = {}): MaterialGraph =>
+  materialGraphSchema.parse({
+    format: 1,
+    material: "M_Normal",
+    package: "/Game/Test/M_Normal",
+    truncated: false,
+    nodeCount: nodes.length,
+    outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null, ...wiring },
+    nodes,
+    ...extra,
+  });
+const normalSample = (id: string, texture: string): Raw => node(id, "TextureSample", { texture: `/Game/Test/${texture}.${texture}`, samplerType: "Normal" });
+const normalParameter = (id: string, name: string, texture: string | null): Raw =>
+  node(id, "TextureSampleParameter2D", { parameter: { name, group: "" }, default: null, texture: texture === null ? null : `/Game/Test/${texture}.${texture}`, samplerType: "Normal" });
+const storedSwitch = (id: string, name: string, a: string, b: string, stored: boolean): Raw =>
+  node(id, "StaticSwitchParameter", { inputs: { A: pin(a), B: pin(b) }, parameter: { name, group: "" }, default: stored });
+const normalMake = (id: string, source: string): Raw => node(id, "MakeMaterialAttributes", { inputs: { Normal: pin(source) } });
+const readNames = (dependencies: NormalDependencies) => (dependencies.status === "known" ? dependencies.textures.map((texture) => texture.name) : dependencies.reason);
+const FLATTEN_NORMAL = "/Engine/Functions/Engine_MaterialFunctions01/Texturing/FlattenNormal.FlattenNormal";
+
+describe("graphNormalDependencies", () => {
+  // A static switch picks the leaf normal or the bark normal the flattened .mat lists first.
+  const branchSwitch = (stored: boolean, extra: Raw = {}) =>
+    normalGraph(
+      [normalSample("leaf", "T_LeafNormal"), normalSample("bark", "T_BarkNormal"), storedSwitch("branch", "Branch", "leaf", "bark", stored), normalMake("make", "branch")],
+      { materialAttributes: pin("make") },
+      extra,
+    );
+
+  it("reads the branch a stored switch takes, so the other branch's bark map is not a dependency", () => {
+    expect(readNames(graphNormalDependencies(branchSwitch(true), params({})))).toEqual(["T_LeafNormal"]);
+    expect(readNames(graphNormalDependencies(branchSwitch(false), params({})))).toEqual(["T_BarkNormal"]);
+  });
+
+  it("takes the instance's merged switch override over the stored value", () => {
+    expect(readNames(graphNormalDependencies(branchSwitch(true), params({ switches: { branch: false } })))).toEqual(["T_BarkNormal"]);
+  });
+
+  it("follows the branch the BaseColor settled when the colour flips the same switch", () => {
+    // Its unbound A branch would make the normal unknown; the choice the colour settles (B) is the branch both read.
+    const graph = normalGraph(
+      [storedSwitch("flip", "Flip", "unbound", "albedo", true), normalParameter("unbound", "BaseTexture", null), normalSample("albedo", "T_Albedo"), normalMake("make", "flip")],
+      { baseColor: pin("flip"), materialAttributes: pin("make") },
+    );
+    expect(readNames(graphNormalDependencies(graph, params({})))).toEqual(["T_Albedo"]);
+  });
+
+  it("keeps a bark map that only a lerp's alpha, or a FlattenNormal's flatness input, reads", () => {
+    const lerp = normalGraph(
+      [normalSample("leaf", "T_LeafNormal"), normalSample("bark", "T_BarkNormal"), node("blend", "LinearInterpolate", { inputs: { A: pin("leaf"), B: pin("leaf"), Alpha: pin("bark") } })],
+      { normal: pin("blend") },
+    );
+    expect(readNames(graphNormalDependencies(lerp, params({})))).toEqual(["T_LeafNormal", "T_BarkNormal"]);
+    const flatten = normalGraph(
+      [
+        normalSample("leaf", "T_LeafNormal"),
+        normalSample("bark", "T_BarkNormal"),
+        node("flatten", "FunctionCall", { function: FLATTEN_NORMAL, inputs: { Input0: pin("leaf"), Input1: pin("bark") }, outputNames: ["Result"] }),
+      ],
+      { normal: pin("flatten") },
+    );
+    const dependencies = graphNormalDependencies(flatten, params({}));
+    expect(readNames(dependencies)).toEqual(["T_LeafNormal", "T_BarkNormal"]);
+    expect(dependencies).toMatchObject({ conservative: [expect.stringContaining("FlattenNormal")] });
+  });
+
+  it("counts a FlattenNormal call's inputs only as the engine function's Result with exactly Input0 and Input1", () => {
+    const official = { function: FLATTEN_NORMAL, inputs: { Input0: pin("leaf"), Input1: pin("bark") }, outputNames: ["Result"] };
+    const flatten = (output: number, call: Raw) =>
+      normalGraph([normalSample("leaf", "T_LeafNormal"), normalSample("bark", "T_BarkNormal"), node("flatten", "FunctionCall", call)], { normal: pin("flatten", output) });
+    expect(readNames(graphNormalDependencies(flatten(0, official), params({})))).toEqual(["T_LeafNormal", "T_BarkNormal"]);
+    // A same-named function in a pack has no body in the dump and is not the engine's: unknown, never an empty dependency list.
+    expect(graphNormalDependencies(flatten(0, { ...official, function: "/Game/Custom/FlattenNormal" }), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("no readable body"),
+    });
+    expect(graphNormalDependencies(flatten(0, { ...official, function: "/Game/Custom/FlattenNormal", inputs: {} }), params({}))).toMatchObject({ status: "unknown" });
+    expect(graphNormalDependencies(flatten(1, official), params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("output 1") });
+    expect(graphNormalDependencies(flatten(0, { ...official, outputNames: ["Other"] }), params({}))).toMatchObject({ status: "unknown" });
+    expect(graphNormalDependencies(flatten(0, { ...official, inputs: { Input0: pin("leaf") } }), params({}))).toMatchObject({ status: "unknown" });
+    expect(graphNormalDependencies(flatten(0, { ...official, inputs: { ...official.inputs, Input2: pin("leaf") } }), params({}))).toMatchObject({ status: "unknown" });
+  });
+
+  it("is unknown for a FlattenNormal call whose body is missing and whose emitter recorded an error", () => {
+    // The real emitter's shape for an engine function it could not load: the error boundary refuses the node before any rule runs.
+    const graph = normalGraph(
+      [
+        normalSample("leaf", "T_LeafNormal"),
+        normalSample("bark", "T_BarkNormal"),
+        node("flatten", "FunctionCall", {
+          function: FLATTEN_NORMAL,
+          inputs: { Input0: pin("leaf"), Input1: pin("bark") },
+          outputNames: ["Result"],
+          error: "engine content is missing: FlattenNormal has no body in the pack",
+        }),
+      ],
+      { normal: pin("flatten") },
+    );
+    expect(graphNormalDependencies(graph, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("engine content is missing") });
+  });
+
+  it("follows a function body only for the output the normal reads", () => {
+    const body = (output: number) =>
+      normalGraph(
+        [normalSample("leaf", "T_LeafNormal"), normalSample("bark", "T_BarkNormal"), node("pick", "FunctionCall", { function: "/Game/Test/MF_Pick.MF_Pick", inputs: {}, fn: { inputs: {}, outputs: ["leaf", "bark"], output: "leaf" } })],
+        { normal: pin("pick", output) },
+      );
+    expect(readNames(graphNormalDependencies(body(0), params({})))).toEqual(["T_LeafNormal"]);
+    expect(readNames(graphNormalDependencies(body(1), params({})))).toEqual(["T_BarkNormal"]);
+  });
+
+  it("reads a map that only shapes another sample's coordinates, so it is a dependency", () => {
+    // The leaf sample's UVs come from the bark map's sample: a separate pin from its inputs, which the walk must follow too.
+    const graph = normalGraph(
+      [normalSample("bark", "T_BarkNormal"), node("leaf", "TextureSample", { texture: "/Game/Test/T_LeafNormal.T_LeafNormal", samplerType: "Normal", coordinates: pin("bark") })],
+      { normal: pin("leaf") },
+    );
+    expect(readNames(graphNormalDependencies(graph, params({})))).toEqual(["T_LeafNormal", "T_BarkNormal"]);
+  });
+
+  it("names a texture in another package by its basename and its full reference", () => {
+    const graph = normalGraph([node("other", "TextureSample", { texture: "/Game/Other/T_BarkNormal.T_BarkNormal", samplerType: "Normal" })], { normal: pin("other") });
+    expect(graphNormalDependencies(graph, params({}))).toEqual({
+      status: "known",
+      textures: [{ name: "T_BarkNormal", reference: "/Game/Other/T_BarkNormal.T_BarkNormal" }],
+      conservative: [],
+    });
+  });
+
+  it("takes the nearest instance reference of a texture parameter over the graph's default", () => {
+    const graph = normalGraph([normalParameter("leaf", "Leaf", "T_LeafNormal")], { normal: pin("leaf") });
+    const instance = { ...params({}), textureReferences: new Map([["leaf", "/Game/Instance/T_Override.T_Override"]]) };
+    expect(graphNormalDependencies(graph, instance)).toEqual({
+      status: "known",
+      textures: [{ name: "T_Override", reference: "/Game/Instance/T_Override.T_Override" }],
+      conservative: [],
+    });
+  });
+
+  it("reads no texture when the graph wires no normal", () => {
+    expect(graphNormalDependencies(normalGraph([], {}), params({}))).toEqual({ status: "known", textures: [], conservative: [] });
+  });
+
+  it("is unknown, never empty, for a truncated graph, an unreadable node or an unreadable Normal output", () => {
+    expect(graphNormalDependencies(normalGraph([normalSample("leaf", "T_LeafNormal")], { normal: pin("leaf") }, { truncated: true }), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("truncated"),
+    });
+    expect(graphNormalDependencies(normalGraph([{ ...normalSample("leaf", "T_LeafNormal"), error: "could not load" }], { normal: pin("leaf") }), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("could not be read"),
+    });
+    expect(graphNormalDependencies(normalGraph([normalSample("leaf", "T_LeafNormal")], { normal: pin("leaf") }, { outputConstants: { normalError: "could not read" } }), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("normalError"),
+    });
+  });
+
+  it("is unknown for a cycle, a dangling pin, an unknown node or an unresolved function on the normal path", () => {
+    const cycle = normalGraph([node("ra", "Reroute", { inputs: { Input: pin("rb") } }), node("rb", "Reroute", { inputs: { Input: pin("ra") } })], { normal: pin("ra") });
+    expect(graphNormalDependencies(cycle, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("through itself") });
+    const dangling = normalGraph([normalMake("make", "ghost")], { materialAttributes: pin("make") });
+    expect(graphNormalDependencies(dangling, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("missing node ghost") });
+    const unknownNode = normalGraph([node("fresnel", "Fresnel")], { normal: pin("fresnel") });
+    expect(graphNormalDependencies(unknownNode, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("Fresnel") });
+    const unresolved = normalGraph([node("call", "FunctionCall", { function: "/Game/Test/MF_Missing.MF_Missing", inputs: {} })], { normal: pin("call") });
+    expect(graphNormalDependencies(unresolved, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("MF_Missing") });
+  });
+
+  it("is unknown when a texture parameter names no texture or a switch stores no value", () => {
+    const unnamed = normalGraph([normalParameter("leaf", "Leaf", null)], { normal: pin("leaf") });
+    expect(graphNormalDependencies(unnamed, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("names no texture") });
+    const unstored = normalGraph(
+      [node("sw", "StaticSwitchParameter", { inputs: { A: pin("leaf"), B: pin("leaf") }, parameter: { name: "Sw", group: "" } }), normalSample("leaf", "T_LeafNormal")],
+      { normal: pin("sw") },
+    );
+    expect(graphNormalDependencies(unstored, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("no stored value") });
+  });
+
+  it("is unknown for a static switch whose StaticBoolParameter could not be read, though its stored default is true", () => {
+    // The bool's stored default survives its read error. Neither that default nor an explicit override may pick a branch past the error.
+    const graph = normalGraph(
+      [
+        normalSample("leaf", "T_LeafNormal"),
+        normalSample("bark", "T_BarkNormal"),
+        node("flag", "StaticBoolParameter", { parameter: { name: "UseLeaf", group: "" }, default: true, error: "could not load" }),
+        node("sw", "StaticSwitch", { inputs: { A: pin("leaf"), B: pin("bark"), Value: pin("flag") } }),
+      ],
+      { normal: pin("sw") },
+    );
+    expect(graphNormalDependencies(graph, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("could not be read") });
+    expect(graphNormalDependencies(graph, params({ switches: { useleaf: false } }))).toMatchObject({ status: "unknown", reason: expect.stringContaining("could not be read") });
+  });
+
+  it.each([
+    ["a non-zero output of its StaticBoolParameter", { ...pin("flag"), output: 1 }, "output 1"],
+    ["a masked StaticBoolParameter pin", pin("flag", 0, RGB_MASK), "masked value"],
+  ])("is unknown for a static switch that reads %s, with or without an explicit override", (_label, value, reason) => {
+    // The walk reads the bool's stored default past the pin, so an output or mask the pin carries must refuse, override or not.
+    const graph = normalGraph(
+      [
+        normalSample("leaf", "T_LeafNormal"),
+        normalSample("bark", "T_BarkNormal"),
+        node("flag", "StaticBoolParameter", { parameter: { name: "UseLeaf", group: "" }, default: true }),
+        node("sw", "StaticSwitch", { inputs: { A: pin("leaf"), B: pin("bark"), Value: value } }),
+      ],
+      { normal: pin("sw") },
+    );
+    expect(graphNormalDependencies(graph, params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining(reason) });
+    expect(graphNormalDependencies(graph, params({ switches: { useleaf: false } }))).toMatchObject({ status: "unknown", reason: expect.stringContaining(reason) });
+  });
+});
+
+describe("OpacityMask", () => {
+  const G = MATERIAL_ATTRIBUTE_GUIDS;
+  const MASK = 6;
+  const BREAK_MASK = ["BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal"];
+  const TINT: Rgb = [0.8, 0.6, 0.4];
+  const WHITE = constant3("white", [1, 1, 1]);
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  const make = (id: string, pins: Raw = {}): Raw => node(id, "MakeMaterialAttributes", { inputs: { BaseColor: pin("white"), ...pins } });
+  const reader = (source: string): Raw => node("reader", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin(source) }, outputNames: BREAK_MASK });
+  const graphWith = (nodes: Raw[], outputs: Raw): MaterialGraph =>
+    materialGraphSchema.parse({
+      format: 1,
+      material: "M_Test",
+      package: "/Game/Test/M_Test",
+      truncated: false,
+      nodeCount: nodes.length,
+      outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null, ...outputs },
+      nodes,
+    });
+  // BaseColor = TINT x Break(<reader>).OpacityMask, so a mask factor shows up in the baked RGB.
+  const readScalar = (nodes: Raw[]): MaterialGraph => makeGraph([multiply("m", pin("tint"), pin("reader", MASK)), constant3("tint", TINT), WHITE, ...nodes], pin("m"));
+  const scalarBytes = async (graph: MaterialGraph): Promise<number[]> => {
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+    return (await pixelsOf(result))(0, 0);
+  };
+  const scaled = (factor: number) => TINT.map((channel) => encode(channel * factor));
+  const MASK_BYTES = [64, 128, 191, 255];
+  const maskTextures = async (): Promise<Record<string, Fixture>> => ({ T_Mask: { png: await pngOf(2, 2, (x, y) => [MASK_BYTES[y * 2 + x]!, 0, 0]), srgb: false } });
+  const bakeMask = (graph: MaterialGraph, textures: Record<string, Fixture>) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2, alpha: "opacityMask" });
+  const alphaBytes = async (result: BakeResult): Promise<number[]> => {
+    if (result.status !== "baked") throw new Error(`expected baked, got ${result.status}`);
+    const { data, info } = await sharp(result.png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const at = (x: number, y: number) => data[(y * info.width + x) * 4 + 3]!;
+    return [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+  };
+
+  it("bakes a nontrivial OpacityMask from a nested Make into the alpha channel", async () => {
+    const graph = graphWith(
+      [
+        node("brk", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: BREAK_MASK }),
+        make("make", { OpacityMask: pin("tex") }),
+        textureSample("tex", "T_Mask", "LinearColor"),
+        WHITE,
+      ],
+      { baseColor: pin("white"), opacityMask: pin("brk", MASK, [1, 0, 0, 0]) },
+    );
+    const result = await bakeMask(graph, await maskTextures());
+    expect(result.status).toBe("baked");
+    expect(await alphaBytes(result)).toEqual(MASK_BYTES);
+  });
+
+  it("takes Unreal's default for an unwired OpacityMask: 1", async () => {
+    expect(await scalarBytes(readScalar([reader("make"), make("make")]))).toEqual(scaled(1));
+  });
+
+  it("does not poison the alpha bake with an unsupported unused BaseColor or Metallic", async () => {
+    const graph = graphWith(
+      [
+        node("brk", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: BREAK_MASK }),
+        node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("bad"), Metallic: pin("bad2"), OpacityMask: pin("tex") } }),
+        textureSample("tex", "T_Mask", "LinearColor"),
+        node("bad", "ReflectionVectorWS"),
+        node("bad2", "ReflectionVectorWS"),
+        WHITE,
+      ],
+      { baseColor: pin("white"), opacityMask: pin("brk", MASK, [1, 0, 0, 0]) },
+    );
+    const result = await bakeMask(graph, await maskTextures());
+    expect(result.status).toBe("baked");
+    expect(await alphaBytes(result)).toEqual(MASK_BYTES);
+  });
+
+  it("reads OpacityMask through a Set override typed with its GUID", async () => {
+    const set = node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[1]": pin("tex") }, attributeTypes: [G.OpacityMask] });
+    const graph = graphWith(
+      [
+        node("brk", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("set") }, outputNames: BREAK_MASK }),
+        set,
+        make("make"),
+        textureSample("tex", "T_Mask", "LinearColor"),
+        WHITE,
+      ],
+      { baseColor: pin("white"), opacityMask: pin("brk", MASK, [1, 0, 0, 0]) },
+    );
+    const result = await bakeMask(graph, await maskTextures());
+    expect(result.status).toBe("baked");
+    expect(await alphaBytes(result)).toEqual(MASK_BYTES);
+  });
+
+  it("reads OpacityMask through a GetMaterialAttributes output typed with its GUID", async () => {
+    const get = node("get", "GetMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: ["MaterialAttributes", "OpacityMask"], attributeTypes: [G.OpacityMask] });
+    const graph = graphWith(
+      [get, make("make", { OpacityMask: pin("tex") }), textureSample("tex", "T_Mask", "LinearColor"), WHITE],
+      { baseColor: pin("white"), opacityMask: pin("get", 1, [1, 0, 0, 0]) },
+    );
+    const result = await bakeMask(graph, await maskTextures());
+    expect(result.status).toBe("baked");
+    expect(await alphaBytes(result)).toEqual(MASK_BYTES);
+  });
+
+  it("blends OpacityMask by Alpha in BlendMaterialAttributes", async () => {
+    const blend = node("blend", "BlendMaterialAttributes", { inputs: { A: pin("ma"), B: pin("mb"), Alpha: pin("alpha") } });
+    const nodes = [reader("blend"), blend, make("ma", { OpacityMask: pin("m0") }), make("mb", { OpacityMask: pin("m1") }), scalar("m0", 0.2), scalar("m1", 0.8), scalar("alpha", 0.25)];
+    // 0.2 + (0.8 - 0.2) x 0.25
+    expect(await scalarBytes(readScalar(nodes))).toEqual(scaled(0.35));
+  });
+
+  it("preserves OpacityMask through a known BaseColor-only writer", async () => {
+    const layer = engineCall("layer", "MatLayerBlend_OverrideBaseColor", { Input0: pin("make"), Input1: pin("red") });
+    const nodes = [reader("layer"), layer, make("make", { OpacityMask: pin("mask") }), scalar("mask", 0.3), constant3("red", [1, 0, 0])];
+    expect(await scalarBytes(readScalar(nodes))).toEqual(scaled(0.3));
+  });
+
+  it("models the mask a MatLayerBlend_Standard can change as an attribute blend", async () => {
+    const layer = engineCall("layer", "MatLayerBlend_Standard", { Input0: pin("ma"), Input1: pin("mb"), Input2: pin("alpha") });
+    const nodes = [reader("layer"), layer, make("ma", { OpacityMask: pin("m0") }), make("mb", { OpacityMask: pin("m1") }), scalar("m0", 0.2), scalar("m1", 0.8), scalar("alpha", 0.25)];
+    expect(await scalarBytes(readScalar(nodes))).toEqual(scaled(0.35));
+  });
+
+  it("reads OpacityMask written by a pack-local function body, not the name handler's incoming mask", async () => {
+    const call = node("layer", "FunctionCall", {
+      inputs: { Input0: pin("incoming") },
+      function: "/Game/Test/MatLayerBlend_Tint.MatLayerBlend_Tint",
+      outputNames: ["Result"],
+      fn: { inputs: { Input0: "incoming" }, outputs: ["body"], output: "body", outputNames: [""] },
+    });
+    const nodes = [reader("layer"), call, make("body", { OpacityMask: pin("bodyMask") }), make("incoming", { OpacityMask: pin("incomingMask") }), scalar("bodyMask", 0.3), scalar("incomingMask", 0.9)];
+    expect(await scalarBytes(readScalar(nodes))).toEqual(scaled(0.3));
+  });
+});
+
+describe("UV set indices: a malformed index is refused on the path that demands it, never read as UV0", () => {
+  const gradient = () => pngOf(4, 4, (x, y) => [40 * x + 10, 60 * y + 5, 77]);
+  const bakeWith = async (graph: MaterialGraph, allowUvSetFallback = false) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({ T_Grey: { png: await gradient(), srgb: true } }).loadTexture, size: 2, allowUvSetFallback });
+  // The schema holds no null or NaN, so these values are set after parsing, the way a corrupt dump would reach the compile.
+  /** T_Grey sampled at the TextureCoordinate `uv`, whose CoordinateIndex is `value`. */
+  const sampleAt = (value: unknown): MaterialGraph => {
+    const graph = makeGraph([textureSample("t", "T_Grey", "Color", "uv"), textureCoordinate("uv")], pin("t", 0, RGB_MASK));
+    (graph.nodes.find((n) => n.id === "uv")!.constants as Record<string, unknown>).CoordinateIndex = value;
+    return graph;
+  };
+  /** T_Grey sampled through an unwired Panner whose ConstCoordinate is `value`. */
+  const pannerAt = (value: unknown): MaterialGraph => {
+    const graph = makeGraph([textureSample("t", "T_Grey", "Color", "pan"), node("pan", "Panner", { constants: { SpeedX: 0.37 } })], pin("t", 0, RGB_MASK));
+    (graph.nodes.find((n) => n.id === "pan")!.constants as Record<string, unknown>).ConstCoordinate = value;
+    return graph;
+  };
+
+  it("refuses each malformed CoordinateIndex, with the node named, whether or not the fallback is on", async () => {
+    // Not an integer from 0 to 7: a string, a boolean, an array, null, NaN, Infinity, a fraction, a negative, and 8, the first index past the engine's channels.
+    for (const value of ["1", true, [1], null, Number.NaN, Number.POSITIVE_INFINITY, 1.5, -1, 8]) {
+      for (const fallback of [false, true]) {
+        expect(await bakeWith(sampleAt(value), fallback), `CoordinateIndex ${String(value)}, fallback ${fallback}`).toMatchObject({
+          status: "unavailable",
+          reason: expect.stringMatching(/^TextureCoordinate uv has a malformed CoordinateIndex/),
+        });
+      }
+    }
+  });
+
+  it("refuses a malformed unwired Panner ConstCoordinate, and keeps the named behaviour of a valid positive set", async () => {
+    for (const value of ["1", null, Number.NaN, 1.5, -1, 8]) {
+      expect(await bakeWith(pannerAt(value), true), `ConstCoordinate ${String(value)}`).toMatchObject({
+        status: "unavailable",
+        reason: expect.stringMatching(/^Panner pan has a malformed ConstCoordinate/),
+      });
+    }
+    expect(await bakeWith(pannerAt(1))).toMatchObject({ status: "unsupported", unsupported: ["TextureCoordinate[1]"] });
+    const relaxed = await bakeWith(pannerAt(1), true);
+    expect(relaxed).toMatchObject({ status: "baked", confidence: "heuristic" });
+    if (relaxed.status === "baked") expect(relaxed.approximations).toContain("TextureCoordinate[1] evaluated as UV0; the mesh UV set 1 is not in the material");
+  });
+
+  it("the BaseColor path probe is unreadable on a malformed set, as the bake is", () => {
+    expect(graphPathTextures(sampleAt("1"))).toBeUndefined();
+    expect(graphPathTextures(pannerAt(null))).toBeUndefined();
+  });
+
+  it("the Normal probe is unknown on a malformed set, and still reads a valid positive one", () => {
+    const normal = (index: string | number) =>
+      normalGraph(
+        [textureSample("n", "T_Normal", "Normal", "uv"), node("uv", "TextureCoordinate", { constants: { UTiling: 1, VTiling: 1, CoordinateIndex: index }, tiling: [1, 1] })],
+        { normal: pin("n") },
+      );
+    expect(graphNormalDependencies(normal("1"), params({}))).toMatchObject({
+      status: "unknown",
+      reason: expect.stringMatching(/^TextureCoordinate uv has a malformed CoordinateIndex/),
+    });
+    // A valid positive set stays readable: the probes take the same fallback the importer's bake takes.
+    expect(readNames(graphNormalDependencies(normal(1), params({})))).toEqual(["T_Normal"]);
+  });
+
+  it("a malformed index on the cut-out costs only the cut-out, named, and keeps the colour", async () => {
+    const graph = makeGraph(
+      [textureSample("t", "T_Grey", "Color", "uv"), textureCoordinate("uv"), textureSample("cut", "T_Grey", "Color", "badUv"), node("badUv", "TextureCoordinate", { constants: { UTiling: 1, VTiling: 1, CoordinateIndex: "1" }, tiling: [1, 1] })],
+      pin("t", 0, RGB_MASK),
+      { outputs: { baseColor: pin("t", 0, RGB_MASK), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: pin("cut", 0, RGB_MASK), normal: null, materialAttributes: null } },
+    );
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({ T_Grey: { png: await gradient(), srgb: true } }).loadTexture, size: 2, alpha: "opacityMask" });
+    expect(result).toMatchObject({
+      status: "baked",
+      approximations: expect.arrayContaining([expect.stringMatching(/^opacityMask could not be evaluated \(TextureCoordinate badUv has a malformed CoordinateIndex/)]),
+    });
+  });
+
+  it("keeps the named heuristic for a valid positive set", async () => {
+    for (const index of [1, 7]) {
+      expect(await bakeWith(sampleAt(index))).toMatchObject({ status: "unsupported", unsupported: [`TextureCoordinate[${index}]`] });
+      const relaxed = await bakeWith(sampleAt(index), true);
+      expect(relaxed).toMatchObject({ status: "baked", confidence: "heuristic" });
+      if (relaxed.status === "baked") expect(relaxed.approximations).toContain(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
+    }
+  });
+
+  it("keeps the UV0 pixels: an absent CoordinateIndex and an explicit 0 read the same texels", async () => {
+    const texel = (x: number, y: number): Rgb => [40 * x + 10, 60 * y + 5, 77];
+    const loader = makeLoader({ T_Grey: { png: await pngOf(4, 4, texel), srgb: true } });
+    const absent = makeGraph([textureSample("t", "T_Grey", "Color", "uv"), textureCoordinate("uv")], pin("t", 0, RGB_MASK));
+    for (const graph of [absent, sampleAt(0)]) {
+      const pixel = await pixelsOf(await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 }));
+      for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) expect(pixel(x, y)).toEqual([...texel(x, y)]);
+    }
+  });
+
+  it("a wired Panner Coordinate never reads a malformed ConstCoordinate", async () => {
+    const panned = (extra: Raw) =>
+      makeGraph([textureSample("t", "T_Grey", "Color", "pan"), node("pan", "Panner", { inputs: { Coordinate: pin("uv") }, constants: { SpeedX: 0.37, ...extra } }), textureCoordinate("uv")], pin("t", 0, RGB_MASK));
+    const clean = await pixelsOf(await bakeWith(panned({})));
+    const malformed = await pixelsOf(await bakeWith(panned({ ConstCoordinate: "1" })));
+    for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(malformed(x, y)).toEqual(clean(x, y));
+  });
+
+  it("a malformed index on a statically inactive branch does not poison the bake", async () => {
+    // The switch takes A, the UV0 sample; B samples through a malformed index the compile never reaches.
+    const graph = makeGraph(
+      [
+        withInputs(node("switch", "StaticSwitch", { switchValue: true }), { A: pin("t", 0, RGB_MASK), B: pin("bad", 0, RGB_MASK), Value: pin("flag") }),
+        boolParameter("flag", "UseUv0", true),
+        textureSample("t", "T_Grey", "Color", "uv"),
+        textureCoordinate("uv"),
+        textureSample("bad", "T_Grey", "Color", "badUv"),
+        node("badUv", "TextureCoordinate", { constants: { UTiling: 1, VTiling: 1, CoordinateIndex: "1" }, tiling: [1, 1] }),
+      ],
+      pin("switch", 0, RGB_MASK),
+    );
+    expect(await bakeWith(graph)).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+  });
+
+  describe("TextureSample and BumpOffset ConstCoordinate, and a UV set the dump found but could not read", () => {
+    const UNREADABLE_INDEX = "property CoordinateIndex (IntProperty) could not be read";
+    const UNREADABLE_CONST = "property ConstCoordinate (IntProperty) could not be read";
+    /** T_Grey sampled at the `uv` TextureCoordinate, or with no Coordinates pin when `coords` is null. `constants` are set after parsing, as `sampleAt` does. */
+    const sampleOf = (coords: string | null, constants: Raw = {}): MaterialGraph => {
+      const graph = makeGraph([textureSample("t", "T_Grey", "Color", coords), ...(coords ? [textureCoordinate(coords)] : [])], pin("t", 0, RGB_MASK));
+      Object.assign(graph.nodes.find((n) => n.id === "t")!.constants, constants);
+      return graph;
+    };
+    /** T_Grey sampled through a BumpOffset: its Coordinate is the `uv` TextureCoordinate when `wired`, else unwired and reading `constants`, set after parsing. */
+    const bumpAt = (wired: boolean, constants: Raw = {}): MaterialGraph => {
+      const graph = makeGraph(
+        [textureSample("t", "T_Grey", "Color", "bump"), node("bump", "BumpOffset", { inputs: wired ? { Coordinate: pin("uv") } : {} }), ...(wired ? [textureCoordinate("uv")] : [])],
+        pin("t", 0, RGB_MASK),
+      );
+      Object.assign(graph.nodes.find((n) => n.id === "bump")!.constants, constants);
+      return graph;
+    };
+    /** A switch that takes its A pin (the UV0 sample) and leaves `inactive` on its B pin, which the compile never reaches. */
+    const switchOver = (inactive: Raw): MaterialGraph =>
+      makeGraph(
+        [
+          withInputs(node("switch", "StaticSwitch", { switchValue: true }), { A: pin("t", 0, RGB_MASK), B: pin("bad", 0, RGB_MASK), Value: pin("flag") }),
+          boolParameter("flag", "UseUv0", true),
+          textureSample("t", "T_Grey", "Color", "uv"),
+          textureCoordinate("uv"),
+          inactive,
+        ],
+        pin("switch", 0, RGB_MASK),
+      );
+
+    it("an unwired sample reads UV0 while ConstCoordinate is absent or 0, the same texels", async () => {
+      const texel = (x: number, y: number): Rgb => [40 * x + 10, 60 * y + 5, 77];
+      const loader = makeLoader({ T_Grey: { png: await pngOf(4, 4, texel), srgb: true } });
+      for (const graph of [sampleOf(null), sampleOf(null, { ConstCoordinate: 0 })]) {
+        const pixel = await pixelsOf(await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 4 }));
+        for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) expect(pixel(x, y)).toEqual([...texel(x, y)]);
+      }
+    });
+
+    it("refuses a malformed unwired ConstCoordinate on either sample class, with or without the fallback", async () => {
+      for (const value of ["1", true, [1], null, Number.NaN, Number.POSITIVE_INFINITY, 1.5, -1, 8]) {
+        for (const fallback of [false, true]) {
+          expect(await bakeWith(sampleOf(null, { ConstCoordinate: value }), fallback), `ConstCoordinate ${String(value)}, fallback ${fallback}`).toMatchObject({
+            status: "unavailable",
+            reason: expect.stringMatching(/^TextureSample t has a malformed ConstCoordinate/),
+          });
+        }
+      }
+      const parameter = makeGraph([textureParameter("t", "Tint", "T_Grey", "Color")], pin("t", 0, RGB_MASK));
+      Object.assign(parameter.nodes[0]!.constants, { ConstCoordinate: "1" });
+      expect(await bakeWith(parameter)).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^TextureSampleParameter2D t has a malformed ConstCoordinate/) });
+    });
+
+    it("keeps a valid positive unwired ConstCoordinate strict, and the named heuristic with the fallback", async () => {
+      for (const index of [1, 7]) {
+        expect(await bakeWith(sampleOf(null, { ConstCoordinate: index }))).toMatchObject({ status: "unsupported", unsupported: [`TextureCoordinate[${index}]`] });
+        const relaxed = await bakeWith(sampleOf(null, { ConstCoordinate: index }), true);
+        expect(relaxed).toMatchObject({ status: "baked", confidence: "heuristic" });
+        if (relaxed.status === "baked") expect(relaxed.approximations).toContain(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
+      }
+    });
+
+    it("a wired Coordinates never reads ConstCoordinate, malformed or valid positive", async () => {
+      const clean = await pixelsOf(await bakeWith(sampleOf("uv")));
+      for (const value of ["1", null, 7]) {
+        const result = await bakeWith(sampleOf("uv", { ConstCoordinate: value }));
+        expect(result, `ConstCoordinate ${String(value)}`).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+        const pixel = await pixelsOf(result);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(pixel(x, y)).toEqual(clean(x, y));
+      }
+    });
+
+    it("a malformed unwired ConstCoordinate on the cut-out costs only the cut-out, named, and only when the cut-out is requested", async () => {
+      const graph = makeGraph([textureSample("t", "T_Grey", "Color"), textureSample("cut", "T_Grey", "Color")], pin("t", 0, RGB_MASK), {
+        outputs: { baseColor: pin("t", 0, RGB_MASK), roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: pin("cut", 0, RGB_MASK), normal: null, materialAttributes: null },
+      });
+      Object.assign(graph.nodes.find((n) => n.id === "cut")!.constants, { ConstCoordinate: "1" });
+      const loadTexture = makeLoader({ T_Grey: { png: await gradient(), srgb: true } }).loadTexture;
+      const request = { graph, output: "baseColor" as const, parameters: NO_PARAMETERS, loadTexture, size: 2 };
+      expect(await bakeGraph({ ...request, alpha: "opacityMask" })).toMatchObject({
+        status: "baked",
+        approximations: expect.arrayContaining([expect.stringMatching(/^opacityMask could not be evaluated \(TextureSample cut has a malformed ConstCoordinate/)]),
+      });
+      // Not requested, the cut-out is never compiled, so nothing names its set.
+      expect(await bakeGraph(request)).toMatchObject({ status: "baked", approximations: [] });
+    });
+
+    it("a malformed unwired ConstCoordinate on a statically inactive branch does not poison the bake", async () => {
+      expect(await bakeWith(switchOver({ ...textureSample("bad", "T_Grey", "Color"), constants: { ConstCoordinate: "1" } }))).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+    });
+
+    it("refuses a CoordinateIndex the dump found but could not read, and never reads it as UV0", async () => {
+      const graph = makeGraph([textureSample("t", "T_Grey", "Color", "uv"), { ...textureCoordinate("uv"), constants: { UTiling: 1, VTiling: 1, CoordinateIndexError: UNREADABLE_INDEX } }], pin("t", 0, RGB_MASK));
+      expect(await bakeWith(graph)).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^TextureCoordinate uv has an unreadable CoordinateIndex/) });
+      expect(await bakeWith(graph, true)).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^TextureCoordinate uv has an unreadable CoordinateIndex/) });
+    });
+
+    it("refuses an unreadable ConstCoordinate where a sample or Panner demands it, and costs nothing where none does", async () => {
+      const unreadable = { ConstCoordinateError: UNREADABLE_CONST };
+      expect(await bakeWith(sampleOf(null, unreadable))).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^TextureSample t has an unreadable ConstCoordinate/) });
+      const panner = makeGraph([textureSample("t", "T_Grey", "Color", "pan"), node("pan", "Panner", { constants: { SpeedX: 0.37, ...unreadable } })], pin("t", 0, RGB_MASK));
+      expect(await bakeWith(panner, true)).toMatchObject({ status: "unavailable", reason: expect.stringMatching(/^Panner pan has an unreadable ConstCoordinate/) });
+      const clean = await pixelsOf(await bakeWith(sampleOf("uv")));
+      const wired = await pixelsOf(await bakeWith(sampleOf("uv", unreadable)));
+      for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(wired(x, y)).toEqual(clean(x, y));
+      expect(await bakeWith(switchOver({ ...textureSample("bad", "T_Grey", "Color"), constants: unreadable }))).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+    });
+
+    it("an unwired BumpOffset reads UV0 while ConstCoordinate is absent or 0, the same texels as a sample of UV0", async () => {
+      const uv0 = await pixelsOf(await bakeWith(sampleOf("uv")));
+      for (const constants of [{}, { ConstCoordinate: 0 }]) {
+        const result = await bakeWith(bumpAt(false, constants));
+        expect(result, JSON.stringify(constants)).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+        const pixel = await pixelsOf(result);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(pixel(x, y)).toEqual(uv0(x, y));
+      }
+    });
+
+    it("keeps a valid positive unwired BumpOffset ConstCoordinate strict, and the named UV0 heuristic with the fallback", async () => {
+      const uv0 = await pixelsOf(await bakeWith(sampleOf("uv")));
+      for (const index of [1, 7]) {
+        expect(await bakeWith(bumpAt(false, { ConstCoordinate: index }))).toMatchObject({ status: "unsupported", unsupported: [`TextureCoordinate[${index}]`] });
+        const relaxed = await bakeWith(bumpAt(false, { ConstCoordinate: index }), true);
+        expect(relaxed).toMatchObject({ status: "baked", confidence: "heuristic" });
+        if (relaxed.status === "baked") expect(relaxed.approximations).toContain(`TextureCoordinate[${index}] evaluated as UV0; the mesh UV set ${index} is not in the material`);
+        const pixel = await pixelsOf(relaxed);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(pixel(x, y)).toEqual(uv0(x, y));
+      }
+    });
+
+    it("refuses a malformed unwired BumpOffset ConstCoordinate, with or without the fallback", async () => {
+      for (const value of ["1", true, [1], null, Number.NaN, Number.POSITIVE_INFINITY, 1.5, -1, 8]) {
+        for (const fallback of [false, true]) {
+          expect(await bakeWith(bumpAt(false, { ConstCoordinate: value }), fallback), `ConstCoordinate ${String(value)}, fallback ${fallback}`).toMatchObject({
+            status: "unavailable",
+            reason: expect.stringMatching(/^BumpOffset bump has a malformed ConstCoordinate/),
+          });
+        }
+      }
+    });
+
+    it("refuses an unreadable unwired BumpOffset ConstCoordinate, with or without the fallback", async () => {
+      for (const fallback of [false, true]) {
+        expect(await bakeWith(bumpAt(false, { ConstCoordinateError: UNREADABLE_CONST }), fallback)).toMatchObject({
+          status: "unavailable",
+          reason: expect.stringMatching(/^BumpOffset bump has an unreadable ConstCoordinate/),
+        });
+      }
+    });
+
+    it("a wired BumpOffset Coordinate never reads ConstCoordinate, malformed, unreadable or valid positive", async () => {
+      const clean = await pixelsOf(await bakeWith(bumpAt(true)));
+      for (const constants of [{ ConstCoordinate: "1" }, { ConstCoordinate: null }, { ConstCoordinate: 7 }, { ConstCoordinateError: UNREADABLE_CONST }]) {
+        const result = await bakeWith(bumpAt(true, constants));
+        expect(result, JSON.stringify(constants)).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+        const pixel = await pixelsOf(result);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) expect(pixel(x, y)).toEqual(clean(x, y));
+      }
+    });
+
+    it("a malformed unwired ConstCoordinate on a statically inactive BumpOffset does not poison the bake", async () => {
+      expect(await bakeWith(switchOver(node("bad", "BumpOffset", { constants: { ConstCoordinate: "1" } })))).toMatchObject({ status: "baked", texturesUsed: ["T_Grey"] });
+    });
+
+    it("the Normal probe refuses a malformed or unreadable set it demands, reads a valid positive one, and ignores a wired one", () => {
+      const normal = (sample: Raw, extra: Raw[] = []) => normalGraph([sample, ...extra], { normal: pin("n") });
+      const unwired = (constants: Raw) => ({ ...textureSample("n", "T_Normal", "Normal"), constants });
+      expect(graphNormalDependencies(normal(unwired({ ConstCoordinate: "1" })), params({}))).toMatchObject({
+        status: "unknown",
+        reason: expect.stringMatching(/^TextureSample n has a malformed ConstCoordinate/),
+      });
+      expect(graphNormalDependencies(normal(unwired({ ConstCoordinateError: UNREADABLE_CONST })), params({}))).toMatchObject({
+        status: "unknown",
+        reason: expect.stringMatching(/^TextureSample n has an unreadable ConstCoordinate/),
+      });
+      expect(readNames(graphNormalDependencies(normal(unwired({ ConstCoordinate: 1 })), params({})))).toEqual(["T_Normal"]);
+      const wired = { ...textureSample("n", "T_Normal", "Normal", "uv"), constants: { ConstCoordinate: "1", ConstCoordinateError: UNREADABLE_CONST } };
+      expect(readNames(graphNormalDependencies(normal(wired, [textureCoordinate("uv")]), params({})))).toEqual(["T_Normal"]);
+    });
+
+    it("the Normal probe refuses an unreadable CoordinateIndex on the coordinates it walks", () => {
+      const unreadable = { ...textureCoordinate("uv"), constants: { UTiling: 1, VTiling: 1, CoordinateIndexError: UNREADABLE_INDEX } };
+      expect(graphNormalDependencies(normalGraph([textureSample("n", "T_Normal", "Normal", "uv"), unreadable], { normal: pin("n") }), params({}))).toMatchObject({
+        status: "unknown",
+        reason: expect.stringMatching(/^TextureCoordinate uv has an unreadable CoordinateIndex/),
+      });
+    });
   });
 });
 
@@ -1653,6 +3153,162 @@ describe("standard math nodes and engine utility functions seen on real BaseColo
     for (const cls of ["SceneColor", "SceneTexture", "ViewProperty", "CameraVectorWS", "ReflectionVectorWS"]) {
       expect(await bake(makeGraph([node("u", cls)], pin("u", 0, RGB_MASK))), cls).toMatchObject({ status: "unsupported", unsupported: [cls] });
     }
+  });
+});
+
+describe("Distance: the length of A - B over the components both operands keep", () => {
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  const constant2 = (id: string, rg: [number, number]): Raw => node(id, "Constant2Vector", { constants: { R: rg[0], G: rg[1] } });
+  const constant4 = (id: string, values: number[]): Raw => node(id, "Constant4Vector", { constants: { Constant: values } });
+  const distance = (a: ReturnType<typeof pin>, b: ReturnType<typeof pin>): Raw => node("d", "Distance", { inputs: { A: a, B: b } });
+  /** The grey every channel of a scalar BaseColor encodes to. */
+  const grey = (linear: number) => [encode(linear), encode(linear), encode(linear)];
+
+  it("is the absolute difference of two scalars, whichever operand is larger", async () => {
+    const difference = (a: number, b: number) => bake(makeGraph([distance(pin("a"), pin("b")), scalar("a", a), scalar("b", b)], pin("d")));
+    expect((await pixelsOf(await difference(0.75, 0.25)))(0, 0)).toEqual(grey(0.5));
+    expect((await pixelsOf(await difference(0.25, 0.75)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("takes the length of a signed 3-4-5 difference, the same whichever operand is first", async () => {
+    // (0.3, -0.4, 0) has length 0.5: a negative component squares to the same as a positive one.
+    const signed = (a: Rgb, b: Rgb) => bake(makeGraph([distance(pin("a", 0, RGB_MASK), pin("b", 0, RGB_MASK)), constant3("a", a), constant3("b", b)], pin("d")));
+    expect((await pixelsOf(await signed([0.3, -0.4, 0], [0, 0, 0])))(0, 0)).toEqual(grey(0.5));
+    expect((await pixelsOf(await signed([0, 0, 0], [0.3, -0.4, 0])))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("counts every active component of a 2- or 4-component operand", async () => {
+    const two = bake(makeGraph([distance(pin("a"), pin("b")), constant2("a", [0.3, 0.4]), constant2("b", [0, 0])], pin("d")));
+    expect((await pixelsOf(await two))(0, 0)).toEqual(grey(0.5));
+    // sqrt(0.1² + 0.2² + 0.2² + 0.4²) is 0.5; the first three components alone would give 0.3.
+    const four = bake(makeGraph([distance(pin("a"), pin("b")), constant4("a", [0.1, 0.2, 0.2, 0.4]), constant4("b", [0, 0, 0, 0])], pin("d")));
+    expect((await pixelsOf(await four))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("broadcasts a scalar over the components of the other operand, in either order", async () => {
+    // (0.5 - 0.2, 0.5 - 0.5, 0.5 - 0.8) = (0.3, 0, -0.3), so the length is sqrt(0.18).
+    const scalarFirst = makeGraph([distance(pin("s"), pin("v", 0, RGB_MASK)), scalar("s", 0.5), constant3("v", [0.2, 0.5, 0.8])], pin("d"));
+    const vectorFirst = makeGraph([distance(pin("v", 0, RGB_MASK), pin("s")), scalar("s", 0.5), constant3("v", [0.2, 0.5, 0.8])], pin("d"));
+    expect((await pixelsOf(await bake(scalarFirst)))(0, 0)).toEqual(grey(Math.sqrt(0.18)));
+    expect((await pixelsOf(await bake(vectorFirst)))(0, 0)).toEqual(grey(Math.sqrt(0.18)));
+  });
+
+  it("reads only the components an input mask keeps", async () => {
+    // Masked to RG the operands are (0.3, 0.4) and (0, 0); the 0.9s past them are not part of the distance.
+    const masked = makeGraph([distance(pin("a", 0, [1, 1, 0, 0]), pin("b", 0, [1, 1, 0, 0])), constant4("a", [0.3, 0.4, 0.9, 0.9]), constant4("b", [0, 0, 0.9, 0])], pin("d"));
+    expect((await pixelsOf(await bake(masked)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("refuses unequal non-scalar widths in either order instead of padding the shorter operand", async () => {
+    const operands = [constant2("two", [0.3, 0.4]), constant3("three", [0, 0, 0])];
+    expect(await bake(makeGraph([distance(pin("two"), pin("three")), ...operands], pin("d")))).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Distance") });
+    expect(await bake(makeGraph([distance(pin("three"), pin("two")), ...operands], pin("d")))).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Distance") });
+  });
+
+  it("refuses an unwired operand instead of reading it as 0", async () => {
+    expect(await bake(makeGraph([node("d", "Distance", { inputs: { A: pin("a") } }), scalar("a", 0.5)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("missing an input"),
+    });
+    expect(await bake(makeGraph([node("d", "Distance", { inputs: { B: pin("b") } }), scalar("b", 0.5)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("missing an input"),
+    });
+  });
+
+  it("refuses an attributes or texture-object operand, an operand that could not be read, and an output other than 0", async () => {
+    const attributes = [node("m", "MakeMaterialAttributes", { inputs: { BaseColor: pin("c") } }), constant3("c", [1, 1, 1])];
+    expect(await bake(makeGraph([distance(pin("m"), pin("b")), ...attributes, scalar("b", 0.5)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("MaterialAttributes"),
+    });
+    const texture = node("t", "TextureObject", { texture: "/Game/Test/T_Object.T_Object" });
+    expect(await bake(makeGraph([distance(pin("t"), pin("b")), texture, scalar("b", 0.5)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("texture object"),
+    });
+    const unreadable = node("a", "Constant", { constants: { R: 0.75 }, error: "could not be read" });
+    expect(await bake(makeGraph([distance(pin("a"), pin("b")), unreadable, scalar("b", 0.25)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("could not be read"),
+    });
+    expect(await bake(makeGraph([distance(pin("a"), pin("b")), scalar("a", 0.75), scalar("b", 0.25)], pin("d", 1)))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("Distance"),
+    });
+  });
+
+  it("refuses an active difference that overflows float64, and ignores a nonfinite lane its mask drops", async () => {
+    // 1e200 - (-1e200) squares past the float64 range, so the result is refused rather than written out as a colour.
+    expect(await bake(makeGraph([distance(pin("a"), pin("b")), scalar("a", 1e200), scalar("b", -1e200)], pin("d")))).toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("not finite"),
+    });
+    // The sum's fourth lane overflows to Infinity, but the RGB mask drops it: the distance is sqrt(0.3² + 0.4²) = 0.5.
+    const sum = node("sum", "Add", { inputs: { A: pin("x"), B: pin("y") } });
+    const dropped = makeGraph(
+      [distance(pin("sum", 0, RGB_MASK), pin("zero", 0, RGB_MASK)), sum, constant4("x", [0.3, 0.4, 0, 1e308]), constant4("y", [0, 0, 0, 1e308]), constant3("zero", [0, 0, 0])],
+      pin("d"),
+    );
+    expect((await pixelsOf(await bake(dropped)))(0, 0)).toEqual(grey(0.5));
+  });
+
+  it("bakes through both operands, and the BaseColor path names both textures", async () => {
+    // Texture A is flat 128 (linear 0.2159 on every channel) and B is black, so the distance is sqrt(3) times A.
+    const textures = { T_AlbedoA: { png: await flat([128, 128, 128])(), srgb: true }, T_AlbedoB: { png: await flat([0, 0, 0])(), srgb: true } };
+    const graph = makeGraph([distance(pin("ta", 0, RGB_MASK), pin("tb", 0, RGB_MASK)), textureSample("ta", "T_AlbedoA"), textureSample("tb", "T_AlbedoB")], pin("d"));
+    const loader = makeLoader(textures);
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: loader.loadTexture, size: 2 });
+    expect((await pixelsOf(result))(0, 0)).toEqual(grey(Math.sqrt(3) * decode(128)));
+    expect(loader.requested).toEqual(expect.arrayContaining(["T_AlbedoA", "T_AlbedoB"]));
+    expect(graphPathClasses(graph, "baseColor")).toEqual(expect.arrayContaining(["Distance", "TextureSample"]));
+    expect(graphPathTextures(graph, NO_PARAMETERS)).toEqual(expect.arrayContaining(["T_AlbedoA", "T_AlbedoB"]));
+  });
+
+  it("follows both operands in the Normal walk, and refuses an output other than 0", () => {
+    const normalNodes = [distance(pin("na"), pin("nb")), normalSample("na", "T_NormalA"), normalSample("nb", "T_NormalB")];
+    const dependencies = graphNormalDependencies(normalGraph(normalNodes, { normal: pin("d") }), params({}));
+    expect(dependencies.status).toBe("known");
+    expect(readNames(dependencies)).toEqual(expect.arrayContaining(["T_NormalA", "T_NormalB"]));
+    expect(graphNormalDependencies(normalGraph(normalNodes, { normal: pin("d", 1) }), params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("Distance") });
+  });
+
+  it.each([
+    ["a missing A", [node("d", "Distance", { inputs: { B: pin("b") } }), scalar("b", 0.5)]],
+    ["a missing B", [node("d", "Distance", { inputs: { A: pin("a") } }), scalar("a", 0.5)]],
+    ["unequal widths, float2 then float3", [distance(pin("two"), pin("three")), constant2("two", [0.3, 0.4]), constant3("three", [0, 0, 0])]],
+    ["unequal widths, float3 then float2", [distance(pin("three"), pin("two")), constant2("two", [0.3, 0.4]), constant3("three", [0, 0, 0])]],
+    ["a mask that leaves 3 components against a float2", [distance(pin("four", 0, RGB_MASK), pin("two")), constant4("four", [0.3, 0.4, 0.5, 0]), constant2("two", [0, 0])]],
+    ["an attributes operand", [distance(pin("m"), pin("b")), node("m", "MakeMaterialAttributes", { inputs: { BaseColor: pin("c") } }), constant3("c", [1, 1, 1]), scalar("b", 0.5)]],
+    ["a texture-object operand", [distance(pin("t"), pin("b")), node("t", "TextureObject", { texture: "/Game/Test/T_Object.T_Object" }), scalar("b", 0.5)]],
+    ["an unreadable operand", [distance(pin("a"), pin("b")), node("a", "Constant", { constants: { R: 0.75 }, error: "could not be read" }), scalar("b", 0.25)]],
+  ])("refuses %s in the Normal walk, as the compile refuses the same Distance", async (_label, nodes) => {
+    expect(graphNormalDependencies(normalGraph(nodes, { normal: pin("d") }), params({}))).toMatchObject({ status: "unknown" });
+    expect(await bake(makeGraph(nodes, pin("d")))).toMatchObject({ status: "unavailable" });
+  });
+
+  it("follows a masked operand at the width its mask leaves", async () => {
+    // The RG of the four-component operand is a float2, so it pairs with the float2 and both the walk and the bake take it.
+    const nodes = [distance(pin("four", 0, [1, 1, 0, 0]), pin("two")), constant4("four", [0.3, 0.4, 0.9, 0.9]), constant2("two", [0, 0])];
+    expect(graphNormalDependencies(normalGraph(nodes, { normal: pin("d") }), params({}))).toEqual({ status: "known", textures: [], conservative: [] });
+    expect(await bake(makeGraph(nodes, pin("d")))).toMatchObject({ status: "baked" });
+  });
+
+  it("refuses a Normal Distance with an operand the compile cannot evaluate, since that operand's width is unknown", async () => {
+    // A collection parameter with no readable default is unsupported and reads as one scalar, so the pair could still be a width mismatch.
+    const nodes = [
+      distance(pin("cp"), pin("b")),
+      node("cp", "CollectionParameter", { parameter: { name: "Width", group: "" }, default: null, collection: "/Game/Test/MPC_Test.MPC_Test" }),
+      scalar("b", 0.5),
+    ];
+    expect(graphNormalDependencies(normalGraph(nodes, { normal: pin("d") }), params({}))).toMatchObject({ status: "unknown", reason: expect.stringContaining("cannot evaluate") });
+    expect(await bake(makeGraph(nodes, pin("d")))).toMatchObject({ status: "unsupported", unsupported: ["CollectionParameter"] });
+  });
+
+  it("is a supported node class", () => {
+    expect(supportedNodeClasses()).toContain("Distance");
   });
 });
 
@@ -2445,5 +4101,600 @@ describe("CollectionParameter", () => {
     expect(CUE4PARSE_PROGRAM).toContain('className == "CollectionParameter"');
     expect(CUE4PARSE_PROGRAM).toContain('"ScalarParameters"');
     expect(CUE4PARSE_PROGRAM).toContain('"VectorParameters"');
+  });
+});
+
+describe("HeightLerp, SmoothThreshold and graphPathTextures", () => {
+  const HEIGHT_LERP = "/Engine/Functions/Engine_MaterialFunctions02/Texturing/HeightLerp.HeightLerp";
+  const SMOOTH_THRESHOLD = "/Engine/Functions/Engine_MaterialFunctions02/SmoothThreshold";
+  const bake = (graph: MaterialGraph, textures: Record<string, Fixture> = {}) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader(textures).loadTexture, size: 2 });
+  // A grey 2x2 height map: the left column is 64, the right 255. A Masks sampler reads it raw, so H = 64/255 and 1.
+  const heightMap = async (): Promise<Record<string, Fixture>> => ({
+    T_Height: { png: await pngOf(2, 2, (x) => (x === 0 ? [64, 64, 64] : [255, 255, 255])), srgb: false },
+  });
+  // A HeightLerp call as the dump has it: no function body, pins as the UE 4.27 texturing docs name them.
+  // A = red and B = blue (linear); the height is the texture's red channel.
+  const heightLerp = (phase: number, contrast: number, reference = HEIGHT_LERP): Raw[] => [
+    node("hl", "FunctionCall", {
+      inputs: { A: pin("a"), B: pin("b"), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin("contrast") },
+      function: reference,
+      outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+    }),
+    constant3("a", [1, 0, 0]),
+    constant3("b", [0, 0, 1]),
+    node("phase", "Constant", { constants: { R: phase } }),
+    textureSample("height", "T_Height", "Masks"),
+    node("contrast", "Constant", { constants: { R: contrast } }),
+  ];
+
+  // The same call with A, B and Contrast fed by the named nodes, so a test can wire an unsupported node to a pin the output does not
+  // read. SmoothThreshold has no public definition, so the "gate" node stays unsupported wherever it is read.
+  const heightLerpFed = (from: { a: string; b: string; contrast: string }): Raw[] => [
+    node("hl", "FunctionCall", {
+      inputs: { A: pin(from.a), B: pin(from.b), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin(from.contrast) },
+      function: HEIGHT_LERP,
+      outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+    }),
+    constant3("a", [1, 0, 0]),
+    constant3("b", [0, 0, 1]),
+    node("phase", "Constant", { constants: { R: 0.5 } }),
+    textureSample("height", "T_Height", "Masks"),
+    node("contrast", "Constant", { constants: { R: 0.2 } }),
+    node("gate", "FunctionCall", { function: SMOOTH_THRESHOLD }),
+  ];
+
+  it("HeightLerp Results at Transition Phase 0.5 is the standard lerp of A and B by the height", async () => {
+    const result = await bake(makeGraph(heightLerp(0.5, 0), pin("hl", 0, RGB_MASK)), await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    // Contrast 0 makes Alpha the height itself, so Results = (1 - H, 0, H) in linear light, encoded per channel.
+    for (const [x, height] of [[0, 64 / 255], [1, 1]] as const) expect(pixel(x, 0)).toEqual([encode(1 - height), 0, encode(height)]);
+  });
+
+  it("HeightLerp reads its pins by position when the dump names them Input0 to Input4, as the Spruce dump does", async () => {
+    const positional: Raw[] = [
+      node("hl", "FunctionCall", {
+        inputs: { Input0: pin("a"), Input1: pin("b"), Input2: pin("phase"), Input3: pin("height", 0, [1, 0, 0, 0]), Input4: pin("contrast") },
+        function: HEIGHT_LERP,
+        outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+      }),
+      constant3("a", [1, 0, 0]),
+      constant3("b", [0, 0, 1]),
+      node("phase", "Constant", { constants: { R: 0.5 } }),
+      textureSample("height", "T_Height", "Masks"),
+      node("contrast", "Constant", { constants: { R: 0 } }),
+    ];
+    const result = await bake(makeGraph(positional, pin("hl", 0, RGB_MASK)), await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    for (const [x, height] of [[0, 64 / 255], [1, 1]] as const) expect(pixel(x, 0)).toEqual([encode(1 - height), 0, encode(height)]);
+  });
+
+  it("HeightLerp Alpha output (index 1) applies CheapContrast to the height, as the CheapContrast node does", async () => {
+    const textures = await heightMap();
+    const alpha = await pixelsOf(await bake(makeGraph(heightLerp(0.5, 0.2), pin("hl", 1)), textures));
+    const cheap = await pixelsOf(
+      await bake(
+        makeGraph(
+          [engineCall("cc", "CheapContrast", { In: pin("height", 0, RGB_MASK), Contrast: pin("contrast") }), textureSample("height", "T_Height", "Masks"), node("contrast", "Constant", { constants: { R: 0.2 } })],
+          pin("cc", 0, RGB_MASK),
+        ),
+        textures,
+      ),
+    );
+    // Contrast 0.2 keeps the dark column between the clamps, so the stretch is exercised (1.5 would clamp both columns to 0 and 1).
+    expect(alpha(0, 0)[0]).not.toBe(alpha(1, 0)[0]);
+    for (const x of [0, 1]) expect(alpha(x, 0)).toEqual(cheap(x, 0));
+  });
+
+  it("HeightLerp Lerp Alpha No Contrast output (index 2) is the raw height whatever the contrast", async () => {
+    const result = await bake(makeGraph(heightLerp(0.5, 1.5), pin("hl", 2)), await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(64 / 255), encode(64 / 255), encode(64 / 255)]);
+    expect(pixel(1, 0)).toEqual([255, 255, 255]);
+  });
+
+  it("HeightLerp at a Transition Phase other than 0.5 stays unsupported", async () => {
+    const result = await bake(makeGraph(heightLerp(0.3, 0), pin("hl", 0, RGB_MASK)), await heightMap());
+    expect(result).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining([expect.stringMatching(/^HeightLerp/)]) });
+  });
+
+  it("HeightLerp Alpha evaluates without A or B, so an unsupported node wired to them is not reported", async () => {
+    const textures = await heightMap();
+    const clean = await pixelsOf(await bake(makeGraph(heightLerp(0.5, 0.2), pin("hl", 1)), textures));
+    const gated = await bake(makeGraph(heightLerpFed({ a: "gate", b: "gate", contrast: "contrast" }), pin("hl", 1)), textures);
+    expect(gated).toMatchObject({ status: "baked" });
+    const pixel = await pixelsOf(gated);
+    for (const x of [0, 1]) expect(pixel(x, 0)).toEqual(clean(x, 0));
+  });
+
+  it("HeightLerp Lerp Alpha No Contrast evaluates without A, B or Contrast", async () => {
+    const result = await bake(makeGraph(heightLerpFed({ a: "gate", b: "gate", contrast: "gate" }), pin("hl", 2)), await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(64 / 255), encode(64 / 255), encode(64 / 255)]);
+    expect(pixel(1, 0)).toEqual([255, 255, 255]);
+  });
+
+  it("HeightLerp Results and Alpha still report an unsupported node on a pin they read", async () => {
+    const textures = await heightMap();
+    const results = await bake(makeGraph(heightLerpFed({ a: "gate", b: "b", contrast: "contrast" }), pin("hl", 0, RGB_MASK)), textures);
+    const alpha = await bake(makeGraph(heightLerpFed({ a: "a", b: "b", contrast: "gate" }), pin("hl", 1)), textures);
+    expect(results).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining(["SmoothThreshold"]) });
+    expect(alpha).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining(["SmoothThreshold"]) });
+  });
+
+  it("HeightLerp evaluates the pack's own body when it carries one, instead of the engine function", async () => {
+    // A body on the called output wins: the engine's lerp of A and B is not evaluated, so the body's colour is what bakes.
+    const call = node("hl", "FunctionCall", {
+      inputs: { A: pin("a"), B: pin("b"), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin("contrast") },
+      function: HEIGHT_LERP,
+      outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+      fn: { inputs: {}, outputs: ["hl/body"], output: "hl/body", outputNames: [""] },
+    });
+    const graph = makeGraph([call, constant3("hl/body", [0.25, 0.5, 0.75]), ...heightLerp(0.5, 0).slice(1)], pin("hl", 0, RGB_MASK));
+    const result = await bake(graph, await heightMap());
+    expect(result.status).toBe("baked");
+    const pixel = await pixelsOf(result);
+    expect(pixel(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+  });
+
+  it("HeightLerp from a pack or another engine path with no body is unsupported, not the engine's lerp", async () => {
+    for (const reference of ["/Game/Custom/HeightLerp.HeightLerp", "/Engine/Custom/Texturing/HeightLerp.HeightLerp"]) {
+      const result = await bake(makeGraph(heightLerp(0.5, 0, reference), pin("hl", 0, RGB_MASK)), await heightMap());
+      expect(result, reference).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining([expect.stringMatching(/^HeightLerp/)]) });
+    }
+  });
+
+  it("HeightLerp from a pack body that lacks the requested output is unsupported, not the engine's lerp", async () => {
+    // The body has Results only. Results bakes from it; Alpha is the pack's to define, so the engine's Alpha does not stand in for it.
+    const withBodyOnResults = (): Raw[] => [
+      node("hl", "FunctionCall", {
+        inputs: { A: pin("a"), B: pin("b"), "Transition Phase": pin("phase"), "Height Texture": pin("height", 0, [1, 0, 0, 0]), Contrast: pin("contrast") },
+        function: "/Game/Custom/HeightLerp.HeightLerp",
+        outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"],
+        fn: { inputs: {}, outputs: ["hl/body", null, null], output: "hl/body", outputNames: ["Results", "Alpha", "Lerp Alpha No Contrast"] },
+      }),
+      constant3("hl/body", [0.25, 0.5, 0.75]),
+      ...heightLerp(0.5, 0).slice(1),
+    ];
+    const results = await bake(makeGraph(withBodyOnResults(), pin("hl", 0, RGB_MASK)), await heightMap());
+    expect(results.status).toBe("baked");
+    const pixel = await pixelsOf(results);
+    expect(pixel(0, 0)).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    const alpha = await bake(makeGraph(withBodyOnResults(), pin("hl", 1)), await heightMap());
+    expect(alpha).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining([expect.stringMatching(/^HeightLerp/)]) });
+  });
+
+  it("HeightLerp recognizes the engine's reference in Unreal's MaterialFunction export form", async () => {
+    const textures = await heightMap();
+    const plain = await pixelsOf(await bake(makeGraph(heightLerp(0.5, 0), pin("hl", 0, RGB_MASK)), textures));
+    const exported = await bake(makeGraph(heightLerp(0.5, 0, `MaterialFunction'${HEIGHT_LERP}'`), pin("hl", 0, RGB_MASK)), textures);
+    expect(exported.status).toBe("baked");
+    const pixel = await pixelsOf(exported);
+    for (const x of [0, 1]) expect(pixel(x, 0)).toEqual(plain(x, 0));
+  });
+
+  it("SmoothThreshold stays unsupported (no public definition available)", async () => {
+    const graph = makeGraph(
+      [node("st", "FunctionCall", { inputs: { Input: pin("height", 0, RGB_MASK) }, function: SMOOTH_THRESHOLD }), textureSample("height", "T_Height", "Masks")],
+      pin("st"),
+    );
+    expect(await bake(graph)).toMatchObject({ status: "unsupported", unsupported: expect.arrayContaining(["SmoothThreshold"]) });
+  });
+
+  it("graphPathTextures reports no textures when the BaseColor path reads an unsupported node", () => {
+    // Positive control first: a readable path names its texture, so the undefined below comes from the unsupported node.
+    expect(graphPathTextures(makeGraph([textureSample("bark", "T_Bark")], pin("bark", 0, RGB_MASK)))).toEqual(["T_Bark"]);
+    const blocked = makeGraph(
+      [multiply("m", pin("bark", 0, RGB_MASK), pin("st")), textureSample("bark", "T_Bark"), node("st", "FunctionCall", { function: SMOOTH_THRESHOLD })],
+      pin("m", 0, RGB_MASK),
+    );
+    expect(graphPathTextures(blocked)).toBeUndefined();
+  });
+
+  it("supportedEngineFunctions lists HeightLerp", () => {
+    expect(supportedEngineFunctions()).toContain("HeightLerp");
+    expect(supportedEngineFunctions()).not.toContain("SmoothThreshold");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// The emission proof: a graph emits nothing for an instance only when every candidate is a uniform constant zero, on a
+// complete readable body, under the instance's switches. BaseColor and the other pins are not read for it.
+
+describe("proveEmissionZero", () => {
+  const EMISSIVE_GUID = MATERIAL_ATTRIBUTE_GUIDS.EmissiveColor;
+  const BASE_COLOR_GUID = MATERIAL_ATTRIBUTE_GUIDS.BaseColor;
+  const NORMAL_GUID = MATERIAL_ATTRIBUTE_GUIDS.Normal;
+  const WPO_GUID = MATERIAL_ATTRIBUTE_GUIDS.WorldPositionOffset;
+  const BREAK_OUTPUTS = ["BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal"];
+  type Out = ReturnType<typeof pin> | null;
+
+  function emission(nodes: Raw[], outputs: { emissive?: Out; materialAttributes?: Out; baseColor?: Out } = {}, extra: Raw = {}): MaterialGraph {
+    return materialGraphSchema.parse({
+      format: 1,
+      material: "M_Emission",
+      package: "/Game/Test/M_Emission",
+      truncated: false,
+      nodeCount: nodes.length,
+      outputs: { baseColor: null, roughness: null, metallic: null, emissive: null, opacity: null, opacityMask: null, normal: null, materialAttributes: null, ...outputs },
+      nodes,
+      ...extra,
+    });
+  }
+  const glow = (id = "glow") => vectorParameter(id, "EmissiveColor", [1, 1, 1, 0]);
+  const zero = (id = "zero") => constant3(id, [0, 0, 0]);
+  const scalar = (id: string, value: number) => node(id, "Constant", { constants: { R: value } });
+  const makeAttrs = (id: string, emissive: string | null) =>
+    node(id, "MakeMaterialAttributes", { inputs: { EmissiveColor: emissive === null ? null : pin(emissive) } });
+  // The Jungle architecture master: EmissiveColor is the Emissive switch (A: the glow, B: a zero constant) and BaseColor sits
+  // on a node no evaluator reads. The stored default decides unless an instance overrides the switch.
+  const jungle = (stored: boolean) =>
+    emission(
+      [
+        glow(),
+        zero(),
+        node("switch", "StaticSwitchParameter", { parameter: { name: "Emissive", group: "6 Emissive" }, default: stored, switchValue: stored, inputs: { A: pin("glow"), B: pin("zero") } }),
+        node("dormant", "UnknownFunctionClass"),
+        node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("dormant"), EmissiveColor: pin("switch"), Normal: pin("dormant") } }),
+      ],
+      { materialAttributes: pin("make") },
+    );
+
+  it("proves the Jungle shape zero: the stored Emissive switch is off, and BaseColor's unsupported node is never read for it", async () => {
+    expect(proveEmissionZero(jungle(false), params({}))).toEqual({ zero: true, summary: expect.any(String) });
+    // The same graph's BaseColor is unsupported, so the bake refuses while the emission is still proved.
+    const baked = await bakeGraph({ graph: jungle(false), output: "baseColor", parameters: params({}), loadTexture: makeLoader({}).loadTexture });
+    expect(baked.status).toBe("unsupported");
+  });
+
+  it("follows the instance's override of the Emissive switch, whichever way the stored default points", () => {
+    expect(proveEmissionZero(jungle(false), params({ switches: { emissive:true } }))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(jungle(true), params({ switches: { emissive:false } }))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(jungle(true), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("requires both candidates to be zero once attributes are wired: a zero legacy Emissive and a glowing attribute do not prove", () => {
+    const withAttrs = (emissive: string | null, attributeEmissive: string) =>
+      emission([glow(), zero(), makeAttrs("make", attributeEmissive)], { emissive: emissive === null ? null : pin(emissive), materialAttributes: pin("make") });
+    expect(proveEmissionZero(withAttrs("glow", "zero"), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(withAttrs("zero", "glow"), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(withAttrs("zero", "zero"), params({}))).toMatchObject({ zero: true });
+    // An unwired legacy Emissive is Unreal's zero default, so the attributes decide alone.
+    expect(proveEmissionZero(withAttrs(null, "zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(withAttrs(null, "glow"), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("takes the legacy Emissive alone when no attributes are wired, and zero when nothing is wired", () => {
+    expect(proveEmissionZero(emission([zero()], { emissive: pin("zero") }), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(emission([glow()], { emissive: pin("glow") }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}), params({}))).toMatchObject({ zero: true });
+  });
+
+  it("refuses a truncated, errored, miscounted or dangling body", () => {
+    const wired = [zero(), makeAttrs("make", "zero")];
+    const outputs = { materialAttributes: pin("make") };
+    expect(proveEmissionZero(emission(wired, outputs, { truncated: true }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission(wired, outputs, { error: "dump failed" }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission(wired, outputs, { nodeCount: wired.length + 1 }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission(wired, { materialAttributes: pin("gone") }), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("refuses an attribute forwarding cycle instead of running away", () => {
+    // BaseColor is the only overridden field, so EmissiveColor is read through the cycle.
+    const cyclic = emission(
+      [
+        zero(),
+        node("a", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("b"), "Inputs[1]": pin("zero") }, attributeTypes: [BASE_COLOR_GUID] }),
+        node("b", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("a"), "Inputs[1]": pin("zero") }, attributeTypes: [BASE_COLOR_GUID] }),
+      ],
+      { materialAttributes: pin("a") },
+    );
+    expect(proveEmissionZero(cyclic, params({}))).toMatchObject({ zero: false });
+  });
+
+  it("refuses a nonconstant EmissiveColor, even one that multiplies to zero", () => {
+    const sampled = emission(
+      [textureSample("tex", "T_Mask"), zero(), node("mul", "Multiply", { inputs: { A: pin("tex", 0, RGB_MASK), B: pin("zero") } }), makeAttrs("make", "mul")],
+      { materialAttributes: pin("make") },
+    );
+    expect(proveEmissionZero(sampled, params({}))).toMatchObject({ zero: false });
+  });
+
+  it("lets a Set override the incoming EmissiveColor: a zero override over a glowing Make proves, a glowing one over a zero Make does not", () => {
+    const over = (incoming: string, override: string) =>
+      emission(
+        [glow(), zero(), makeAttrs("make", incoming), node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[1]": pin(override) }, attributeTypes: [EMISSIVE_GUID] })],
+        { materialAttributes: pin("set") },
+      );
+    expect(proveEmissionZero(over("glow", "zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(over("zero", "glow"), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("lerps the emission through BlendMaterialAttributes: zero at both ends proves, a glowing end does not", () => {
+    const blend = (top: string) =>
+      emission(
+        [
+          glow(),
+          zero(),
+          node("alpha", "Constant", { constants: { R: 0.5 } }),
+          makeAttrs("base", "zero"),
+          makeAttrs("top", top),
+          node("blend", "BlendMaterialAttributes", { inputs: { A: pin("base"), B: pin("top"), Alpha: pin("alpha") } }),
+        ],
+        { materialAttributes: pin("blend") },
+      );
+    expect(proveEmissionZero(blend("zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(blend("glow"), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("reads the emission through BreakMaterialAttributes and GetMaterialAttributes", () => {
+    const source = (emissive: string) => [glow(), zero(), makeAttrs("make", emissive)];
+    const broken = (emissive: string) =>
+      emission([...source(emissive), node("break", "BreakMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: BREAK_OUTPUTS })], {
+        emissive: pin("break", 4),
+      });
+    expect(proveEmissionZero(broken("zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(broken("glow"), params({}))).toMatchObject({ zero: false });
+    const got = (emissive: string) =>
+      emission(
+        [...source(emissive), node("get", "GetMaterialAttributes", { inputs: { MaterialAttributes: pin("make") }, outputNames: ["EmissiveColor"], attributeTypes: [EMISSIVE_GUID] })],
+        { emissive: pin("get") },
+      );
+    expect(proveEmissionZero(got("zero"), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(got("glow"), params({}))).toMatchObject({ zero: false });
+  });
+
+  it("never lets a BaseColor flip decide a switch the emission shares: the stored branch decides, or the instance's override", () => {
+    // BaseColor and EmissiveColor read one Emissive switch. Its stored-on branch samples an unbound texture, the case the legacy
+    // BaseColor flip judges by, and the flip would pick the zero branch. The emission must not take that branch.
+    const shared = (stored: boolean) =>
+      emission(
+        [
+          node("mask", "TextureSampleParameter2D", { parameter: { name: "Mask", group: "" }, default: null, texture: null, samplerType: "Masks" }),
+          glow(),
+          zero(),
+          node("tinted", "Multiply", { inputs: { A: pin("mask", 0, RGB_MASK), B: pin("glow") } }),
+          node("switch", "StaticSwitchParameter", { parameter: { name: "Emissive", group: "" }, default: stored, switchValue: stored, inputs: { A: pin("tinted"), B: pin("zero") } }),
+          node("make", "MakeMaterialAttributes", { inputs: { BaseColor: pin("switch"), EmissiveColor: pin("switch") } }),
+        ],
+        { materialAttributes: pin("make") },
+      );
+    expect(proveEmissionZero(shared(true), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(shared(true), params({ switches: { emissive:false } }))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(shared(false), params({}))).toMatchObject({ zero: true });
+  });
+
+  it("does not read an unsupported Normal or WorldPositionOffset pin for the emission", () => {
+    const graph = emission(
+      [
+        zero(),
+        node("weird", "UnknownFunctionClass"),
+        makeAttrs("make", "zero"),
+        node("set", "SetMaterialAttributes", { inputs: { "Inputs[0]": pin("make"), "Inputs[1]": pin("weird"), "Inputs[2]": pin("weird") }, attributeTypes: [NORMAL_GUID, WPO_GUID] }),
+      ],
+      { materialAttributes: pin("set") },
+    );
+    expect(proveEmissionZero(graph, params({}))).toMatchObject({ zero: true });
+  });
+
+  it("refuses an EmissiveColor whose source the evaluator cannot read", () => {
+    const graph = emission([node("weird", "UnknownFunctionClass"), makeAttrs("make", "weird")], { materialAttributes: pin("make") });
+    expect(proveEmissionZero(graph, params({}))).toMatchObject({ zero: false });
+  });
+
+  // Equal bounds from two parameters: the bake knows both values, so the ramp runs at compile time. Its zero span is refused (the
+  // GPU's result there is undefined) and writes a 0 that reads as uniform. The refusal must stop the proof on either candidate: the
+  // dump does not say which one Unreal reads, so a clean zero on the other settles nothing.
+  const equalBoundsStep = () => [scalarParameter("lo", "Lo", 0.5), scalarParameter("hi", "Hi", 0.5), scalar("v", 0.25), node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("hi"), Value: pin("v") } })];
+
+  it("refuses an emissive SmoothStep whose equal Min and Max are two parameters, on the legacy Emissive pin", () => {
+    expect(proveEmissionZero(emission(equalBoundsStep(), { emissive: pin("s") }), params({}))).toMatchObject({ zero: false, reason: expect.stringContaining("SmoothStep s") });
+  });
+
+  it("refuses the same SmoothStep on the MaterialAttributes candidate, beside a clean zero legacy Emissive", () => {
+    const attributes = emission([...equalBoundsStep(), zero(), makeAttrs("make", "s")], { emissive: pin("zero"), materialAttributes: pin("make") });
+    expect(proveEmissionZero(attributes, params({}))).toMatchObject({ zero: false, reason: expect.stringContaining("SmoothStep s") });
+  });
+
+  // Controls the new refusal must leave alone: a plain constant zero, and a SmoothStep whose Min, Max and Value share one source,
+  // which Unreal settles to 0 before any division. Neither records a refusal.
+  it("still proves zero for an ordinary constant zero and for a SmoothStep whose Min, Max and Value share one parameter", () => {
+    expect(proveEmissionZero(emission([zero()], { emissive: pin("zero") }), params({}))).toMatchObject({ zero: true });
+    const shared = [scalarParameter("lo", "Lo", 0.5), node("s", "SmoothStep", { inputs: { Min: pin("lo"), Max: pin("lo"), Value: pin("lo") } })];
+    expect(proveEmissionZero(emission(shared, { emissive: pin("s") }), params({}))).toMatchObject({ zero: true });
+  });
+
+  // The adapter records an editor UseConstant output in `outputConstants`, not as a node, and an output it could not read under
+  // `<output>Error`. A graph with every pin unwired but a nonzero stored constant emits light, and the proof must refuse it.
+  it("refuses a nonzero stored EmissiveColor constant on an otherwise unwired graph (the adapter's actual shape)", () => {
+    const graph = emission([], {}, { outputConstants: { emissive: [1, 1, 1] } });
+    expect(proveEmissionZero(graph, params({}))).toMatchObject({ zero: false });
+  });
+
+  it("honours a stored constant that is exactly zero, and an absent constant, as Unreal's own zero", () => {
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: [0, 0, 0] } }), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: 0 } }), params({}))).toMatchObject({ zero: true });
+    expect(proveEmissionZero(emission([], {}), params({}))).toMatchObject({ zero: true });
+  });
+
+  it("refuses an emission candidate output the adapter could not read or a stored constant it cannot interpret", () => {
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissiveError: "property EmissiveColor could not be read" } }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { materialAttributesError: "property MaterialAttributes could not be read" } }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { materialAttributes: [0, 0, 0, 1] } }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: "black" } }), params({}))).toMatchObject({ zero: false });
+    expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: [0, 0, 1] } }), params({}))).toMatchObject({ zero: false });
+  });
+});
+
+// UMaterialExpressionIf, from UE 4.19.2 `UMaterialExpressionIf::Compile` and `FHLSLMaterialTranslator::If`. A and B are
+// compiled as scalars here (a vector one is refused by name). A >= B picks AGreaterThanB, else ALessThanB. A wired AEqualsB
+// replaces the pick when `abs(A - B) > EqualsThreshold` is false (so a NaN difference takes it); an unwired AEqualsB ignores
+// it (and the threshold). B unwired is ConstB. A, AGreaterThanB and ALessThanB are required. The branches may be vectors;
+// the result takes their arithmetic type (`GetArithmeticResultType`): a scalar branch broadcasts, two nonscalar branches
+// must share a width.
+describe("MaterialExpressionIf", () => {
+  const bakeGraphOf = (graph: MaterialGraph) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  const bake = (nodes: Raw[]) => bakeGraphOf(makeGraph(nodes, pin("i", 0, RGB_MASK)));
+  const rgb = async (nodes: Raw[]) => (await pixelsOf(await bake(nodes)))(0, 0);
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  const ifNode = (inputs: Raw, constants: Raw = {}): Raw => node("i", "If", { inputs, constants });
+  const red = (id: string) => constant3(id, [1, 0, 0]);
+  const green = (id: string) => constant3(id, [0, 1, 0]);
+  const blue = (id: string) => constant3(id, [0, 0, 1]);
+  const branches = { AGreaterThanB: pin("g", 0, RGB_MASK), ALessThanB: pin("l", 0, RGB_MASK) };
+  const vector2 = (id: string, r: number, g: number): Raw => node(id, "Constant2Vector", { constants: { R: r, G: g } });
+  // A non-finite constant the C# dumper never writes (it maps one to 0), so this sets it on the parsed graph in memory.
+  const withConstant = (nodes: Raw[], id: string, constants: Record<string, number>): MaterialGraph => {
+    const graph = makeGraph(nodes, pin("i", 0, RGB_MASK));
+    Object.assign(graph.nodes.find((entry) => entry.id === id)!.constants, constants);
+    return graph;
+  };
+
+  it("registers the If node class", () => {
+    expect(supportedNodeClasses()).toContain("If");
+  });
+
+  it("picks AGreaterThanB when A >= B and ALessThanB otherwise", async () => {
+    expect(await rgb([ifNode({ A: pin("a"), B: pin("b"), ...branches }), scalar("a", 0.75), scalar("b", 0.5), red("g"), green("l")])).toEqual([255, 0, 0]);
+    expect(await rgb([ifNode({ A: pin("a"), B: pin("b"), ...branches }), scalar("a", 0.25), scalar("b", 0.5), red("g"), green("l")])).toEqual([0, 255, 0]);
+  });
+
+  it("uses a wired AEqualsB when |A - B| is within EqualsThreshold", async () => {
+    const nodes = (a: number, b: number) => [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", a), scalar("b", b), red("g"), green("l"), blue("e")];
+    expect(await rgb(nodes(0.5, 0.5))).toEqual([0, 0, 255]);
+    // A difference above the default 0.00001 falls back to the comparison (here A < B, so the less branch).
+    expect(await rgb(nodes(0.5, 0.25))).toEqual([255, 0, 0]);
+    expect(await rgb(nodes(0.25, 0.5))).toEqual([0, 255, 0]);
+  });
+
+  it("ignores AEqualsB and EqualsThreshold when AEqualsB is unwired", async () => {
+    // A == B, yet with no equality branch the comparison still selects the greater branch and the huge threshold does nothing.
+    expect(await rgb([ifNode({ A: pin("a"), B: pin("b"), ...branches }, { EqualsThreshold: 100 }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l")])).toEqual([255, 0, 0]);
+  });
+
+  it("honours a nonzero EqualsThreshold", async () => {
+    const nodes = (threshold: number) => [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }, { EqualsThreshold: threshold }), scalar("a", 0.5), scalar("b", 0.500005), red("g"), green("l"), blue("e")];
+    expect(await rgb(nodes(0.01))).toEqual([0, 0, 255]);
+    expect(await rgb(nodes(0.000001))).toEqual([0, 255, 0]);
+  });
+
+  it("uses ConstB, default 0, for an unwired B", async () => {
+    expect(await rgb([ifNode({ A: pin("a"), ...branches }), scalar("a", 0.5), red("g"), green("l")])).toEqual([255, 0, 0]);
+    expect(await rgb([ifNode({ A: pin("a"), ...branches }, { ConstB: 1 }), scalar("a", 0.5), red("g"), green("l")])).toEqual([0, 255, 0]);
+  });
+
+  it("takes the branches' dimensionality, so a vector branch stays a vector and a scalar branch broadcasts", async () => {
+    expect(await rgb([ifNode({ A: pin("a"), B: pin("b"), ...branches }), scalar("a", 1), scalar("b", 0), constant3("g", [0.25, 0.5, 0.75]), constant3("l", [1, 1, 1])])).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    const scalarBranch = [ifNode({ A: pin("a"), B: pin("b"), AGreaterThanB: pin("g"), ALessThanB: pin("l") }), scalar("a", 1), scalar("b", 0), scalar("g", 0.25), scalar("l", 0.75)];
+    expect(await rgb(scalarBranch)).toEqual([encode(0.25), encode(0.25), encode(0.25)]);
+  });
+
+  it("refuses a required input that is missing", async () => {
+    expect(await bake([ifNode({ AGreaterThanB: pin("g"), ALessThanB: pin("l") }), red("g"), green("l")])).toMatchObject({ status: "unavailable", reason: expect.stringContaining("has no A input") });
+    expect(await bake([ifNode({ A: pin("a"), ALessThanB: pin("l") }), scalar("a", 0.5), green("l")])).toMatchObject({ status: "unavailable", reason: expect.stringContaining("has no AGreaterThanB input") });
+    expect(await bake([ifNode({ A: pin("a"), AGreaterThanB: pin("g") }), scalar("a", 0.5), red("g")])).toMatchObject({ status: "unavailable", reason: expect.stringContaining("has no ALessThanB input") });
+  });
+
+  it("refuses a vector A or B by name rather than taking its first channel", async () => {
+    const vectorA = [ifNode({ A: pin("a", 0, RGB_MASK), B: pin("b"), ...branches }), constant3("a", [0.5, 0.5, 0.5]), scalar("b", 0), red("g"), green("l")];
+    expect(await bake(vectorA)).toMatchObject({ status: "unsupported", unsupported: ["If.A(vector)"] });
+    const vectorB = [ifNode({ A: pin("a"), B: pin("b", 0, RGB_MASK), ...branches }), scalar("a", 0.5), constant3("b", [0, 0, 0]), red("g"), green("l")];
+    expect(await bake(vectorB)).toMatchObject({ status: "unsupported", unsupported: ["If.B(vector)"] });
+  });
+
+  it("broadcasts a scalar branch beside a vector branch", async () => {
+    // The scalar is a masked channel: a constant scalar is replicated across all lanes, so it would pass without broadcasting.
+    const nodes = (a: number, b: number) => [ifNode({ A: pin("a"), B: pin("b"), AGreaterThanB: pin("g"), ALessThanB: pin("l", 0, [1, 0, 0, 0]) }), scalar("a", a), scalar("b", b), constant3("g", [0.25, 0.5, 0.75]), constant3("l", [0.9, 0.2, 0.3])];
+    // A >= B: the vector greater branch keeps its three channels.
+    expect(await rgb(nodes(1, 0))).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    // A < B: the scalar less branch (its R channel alone) broadcasts across the vector result.
+    expect(await rgb(nodes(0, 1))).toEqual([encode(0.9), encode(0.9), encode(0.9)]);
+  });
+
+  it("refuses nonscalar branches whose vector widths differ", async () => {
+    // GetArithmeticResultType errors on float2 next to float3; a named refusal beats reading past the shorter branch.
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AGreaterThanB: pin("g"), ALessThanB: pin("l") }), scalar("a", 1), scalar("b", 0), vector2("g", 1, 0), constant3("l", [0, 1, 0])];
+    expect(await bake(nodes)).toMatchObject({ status: "unsupported", unsupported: ["If.AGreaterThanB/ALessThanB(vector width mismatch)"] });
+  });
+
+  it("refuses an AEqualsB branch whose width is incompatible with the comparison", async () => {
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e"), AGreaterThanB: pin("g"), ALessThanB: pin("l") }), scalar("a", 1), scalar("b", 0), constant3("g", [1, 0, 0]), constant3("l", [0, 1, 0]), vector2("e", 0, 0)];
+    expect(await bake(nodes)).toMatchObject({ status: "unsupported", unsupported: ["If.AEqualsB/ALessThanB(vector width mismatch)"] });
+  });
+
+  it("selects per texel from a varying masked-U TextureCoordinate condition", async () => {
+    // Output pixel x samples u = (x + 0.5) / 4: 0.125, 0.375, 0.625, 0.875. Against B = 0.375 the condition spans
+    // less, equality (the default threshold catches the exact hit) and greater across one row.
+    const graph = makeGraph(
+      [ifNode({ A: pin("uv", 0, [1, 0, 0, 0]), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), textureCoordinate("uv"), scalar("b", 0.375), red("g"), green("l"), blue("e")],
+      pin("i", 0, RGB_MASK),
+    );
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 4 });
+    const pixel = await pixelsOf(result);
+    expect([0, 1, 2, 3].map((x) => pixel(x, 0))).toEqual([[0, 255, 0], [0, 0, 255], [255, 0, 0], [255, 0, 0]]);
+  });
+
+  it("uses the default EqualsThreshold near its inside and outside boundary", async () => {
+    const nodes = (b: number) => [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", 0.5), scalar("b", b), red("g"), green("l"), blue("e")];
+    // |A - B| just inside the default 0.00001: the equality branch. Just outside: the comparison decides.
+    expect(await rgb(nodes(0.500005))).toEqual([0, 0, 255]);
+    expect(await rgb(nodes(0.50002))).toEqual([0, 255, 0]);
+    expect(await rgb(nodes(0.499995))).toEqual([0, 0, 255]);
+    expect(await rgb(nodes(0.49998))).toEqual([255, 0, 0]);
+  });
+
+  it("never takes the equality branch under a negative threshold", async () => {
+    // |A - B| = 0, yet `abs(A - B) > -1` is true, so the comparison (A >= B) picks the greater branch.
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }, { EqualsThreshold: -1 }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l"), blue("e")];
+    expect(await rgb(nodes)).toEqual([255, 0, 0]);
+  });
+
+  it("takes the equality branch when the difference is NaN", async () => {
+    // A = B = +inf, so abs(A - B) is NaN and `abs(A - B) > T` is false, selecting AEqualsB; a `<=` predicate would
+    // instead pick the comparison. The C# dumper never writes Infinity (it maps one to 0), so this sets it in memory.
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", 0), scalar("b", 0), red("g"), green("l"), blue("e")];
+    const graph = makeGraph(nodes, pin("i", 0, RGB_MASK));
+    for (const id of ["a", "b"]) Object.assign(graph.nodes.find((entry) => entry.id === id)!.constants, { R: Number.POSITIVE_INFINITY });
+    expect((await pixelsOf(await bakeGraphOf(graph)))(0, 0)).toEqual([0, 0, 255]);
+  });
+
+  it("refuses a non-finite ConstB rather than using it as a constant", async () => {
+    const nodes = [ifNode({ A: pin("a"), ...branches }), scalar("a", 0.5), red("g"), green("l")];
+    expect(await bakeGraphOf(withConstant(nodes, "i", { ConstB: Number.POSITIVE_INFINITY }))).toMatchObject({ status: "unsupported", unsupported: ["If.ConstB(non-finite)"] });
+  });
+
+  it("refuses a non-finite EqualsThreshold rather than using it as a constant", async () => {
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l"), blue("e")];
+    expect(await bakeGraphOf(withConstant(nodes, "i", { EqualsThreshold: Number.NaN }))).toMatchObject({ status: "unsupported", unsupported: ["If.EqualsThreshold(non-finite)"] });
+  });
+
+  it("refuses a stored constant that is present but not a finite number, rather than falling back to its default", async () => {
+    // The dumper omits an absent constant and writes only finite numbers, so a string or null here is a malformed graph.
+    const unwiredB = makeGraph([ifNode({ A: pin("a"), ...branches }), scalar("a", 0.5), red("g"), green("l")], pin("i", 0, RGB_MASK));
+    Object.assign(unwiredB.nodes.find((entry) => entry.id === "i")!.constants, { ConstB: "0.25" });
+    expect(await bakeGraphOf(unwiredB)).toMatchObject({ status: "unsupported", unsupported: ["If.ConstB(non-finite)"] });
+    const wiredEquals = makeGraph([ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l"), blue("e")], pin("i", 0, RGB_MASK));
+    Object.assign(wiredEquals.nodes.find((entry) => entry.id === "i")!.constants, { EqualsThreshold: null });
+    expect(await bakeGraphOf(wiredEquals)).toMatchObject({ status: "unsupported", unsupported: ["If.EqualsThreshold(non-finite)"] });
+  });
+
+  it("propagates a wired B or AEqualsB that cannot compile, rather than using ConstB or the default threshold", async () => {
+    expect(await bake([ifNode({ A: pin("a"), B: pin("missing"), ...branches }, { ConstB: 0.25 }), scalar("a", 0.5), red("g"), green("l")])).toMatchObject({ status: "unavailable", reason: expect.stringContaining("missing node missing") });
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("missing"), ...branches }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l")];
+    expect(await bake(nodes)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("missing node missing") });
+  });
+
+  it("broadcasts a scalar greater branch and a scalar AEqualsB across a vector less branch", async () => {
+    // Masked scalars (R channel alone), for the same reason as the case above.
+    const nodes = (a: number, b: number) => [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, [1, 0, 0, 0]), AGreaterThanB: pin("g", 0, [1, 0, 0, 0]), ALessThanB: pin("l") }), scalar("a", a), scalar("b", b), constant3("g", [0.9, 0.2, 0.3]), constant3("l", [0.25, 0.5, 0.75]), constant3("e", [0.1, 0.2, 0.3])];
+    // Equal: the scalar AEqualsB fills all three channels. A > B: the scalar greater branch does. A < B: the vector keeps its channels.
+    expect(await rgb(nodes(0.5, 0.5))).toEqual([encode(0.1), encode(0.1), encode(0.1)]);
+    expect(await rgb(nodes(1, 0))).toEqual([encode(0.9), encode(0.9), encode(0.9)]);
+    expect(await rgb(nodes(0, 1))).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
   });
 });

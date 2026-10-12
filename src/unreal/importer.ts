@@ -1,11 +1,11 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { copyFile, readdir, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createReadStream, readFileSync, statfs } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Root, type Texture } from "@gltf-transform/core";
+import { BufferUtils, Document, NodeIO, TextureInfo, VertexLayout, type Material, type Primitive, type Root, type Texture } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsSpecular, KHRMaterialsUnlit } from "@gltf-transform/extensions";
 import { attachPsaAnimations, parsePsa, type PsaFile } from "./psa.js";
 
@@ -22,8 +22,10 @@ import {
 import { readPackageCooking, readPackageObjectNames } from "./cooking.js";
 import { decodeMaterialPackage, type SourcePackage } from "./source-material-package.js";
 import { reduceSourceMaterial, sameSourceCoordinates, type SourceMaterial } from "./source-material.js";
+import { promoteRgba16fDataTexture } from "./data-texture-promotion.js";
 import { decodeGroomPayload, groomSidecar, type GroomStrands } from "./grooms.js";
 import { ImportError } from "./errors.js";
+import { dumpEngineArg } from "../fab/routes.js";
 import { extractUnrealFonts } from "./fonts.js";
 import { parseOfflineFontDescriptor, writeOfflineFont } from "./bitmap-fonts.js";
 import {
@@ -41,7 +43,9 @@ import {
   type PaperTileMapDescriptor,
   type PaperTileSetDescriptor,
 } from "./paper-tilemaps.js";
-import { createGraphBaker, type GraphBakeRequest, type GraphBaker } from "./graph-baker.js";
+import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphPbrFactors, type GraphTextureSource } from "./graph-baker.js";
+import { dumpMaterialGraphs } from "./graph-dump.js";
+import { assertEngineContentDirectory, canonicalEngineReference, engineContentFromEnvironment, isEngineReference, type EngineContentConfig } from "./engine-content.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
 import {
@@ -49,15 +53,16 @@ import {
   type ImportedScene,
   parseUnrealSceneSource,
 } from "./scenes.js";
-import { viewDependentNodes } from "./material-graph.js";
+import { viewDependentNodes, type NormalDependencies } from "./material-graph.js";
 import { rasteriseSurfaceNormals, type SurfaceNormals, type SurfaceTriangles } from "./surface-normals.js";
 import { readMeshMaterialPackages, remapMeshFileSectionMaterials } from "./static-mesh-sections.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
+import { runUmodelExport } from "./umodel-export.js";
 
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 89;
+export const IMPORTER_VERSION = 112;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -157,6 +162,8 @@ export interface ImportedMaterialSection {
     readonly unsupportedNodes: readonly string[];
     readonly approximations: readonly string[];
     readonly reason?: string;
+    /** True when the bake lowered a direct BaseColor->VertexColor graph to a neutral white residual (see the limitation). */
+    readonly vertexColorResidual?: boolean;
   };
 }
 
@@ -236,6 +243,28 @@ export interface ImportedDataAsset {
   readonly json: string;
   readonly bytes: number;
   readonly sha256: string;
+}
+
+/**
+ * A standalone Texture2D whose source is RGBA16F. The binary holds the stored little-endian half-float R, G, B, A samples,
+ * unchanged, and the manifest names the source package and its hashes. `threenative-asset-mcp/data-texture` loads the pair:
+ * it checks the manifest against the binary before it builds the texture.
+ */
+export interface ImportedDataTexture {
+  readonly name: string;
+  readonly package: string;
+  /** Raw binary, relative to the promoted output directory. */
+  readonly data: string;
+  /** Manifest beside the binary: source identity, layout and hashes. */
+  readonly manifest: string;
+  readonly format: "RGBA16F";
+  readonly threeTexture: "DataTexture";
+  readonly width: number;
+  readonly height: number;
+  readonly bytes: number;
+  readonly sha256: string;
+  /** SHA-256 of the source package file set. A consumer that expects a given source pins this value. */
+  readonly sourceSha256: string;
 }
 
 export interface ImportedTextureStack {
@@ -357,6 +386,7 @@ export interface ImportReport {
     readonly audio: number;
     readonly dataAssets: number;
     readonly textureStacks: number;
+    readonly dataTextures: number;
     readonly fonts: number;
     readonly bitmapFonts: number;
     readonly sprites: number;
@@ -373,6 +403,7 @@ export interface ImportReport {
   readonly audio: readonly ImportedAudio[];
   readonly dataAssets: readonly ImportedDataAsset[];
   readonly textureStacks: readonly ImportedTextureStack[];
+  readonly dataTextures: readonly ImportedDataTexture[];
   readonly fonts: readonly ImportedFont[];
   readonly bitmapFonts: readonly ImportedBitmapFont[];
   readonly sprites: readonly ImportedSprite[];
@@ -406,6 +437,13 @@ export interface ImportUnrealRequest {
   readonly outputDir: string;
   readonly listingId?: string | undefined;
   readonly engine?: string | undefined;
+  /**
+   * The `UE_x.y` a Fab artifact's packages are read as: its oldest listed engine, a guess at the format rather than the
+   * saved tag. Every modern converter decode of the pack, graph dump included, tries it first when it names a fallback
+   * profile, and the cache key carries that profile. An `engine` the request names still wins on the routes that take one.
+   * Engine content keeps its own configured version.
+   */
+  readonly formatHint?: string | undefined;
   readonly sourceKind?: "local-directory" | "fab-listing";
   readonly authenticatedDownload?: boolean;
   readonly fabcliVersion?: string | undefined;
@@ -561,6 +599,15 @@ export async function hashSourceTree(
   return `sha256:${hash.digest("hex")}`;
 }
 
+/**
+ * The identity of an explicitly configured engine content root: its path, its Unreal version, and every byte under it.
+ * Adding, changing or moving an engine body changes the fingerprint, so a cached import cannot reuse stale graph bakes.
+ */
+export async function engineContentIdentity(config: EngineContentConfig): Promise<{ root: string; version: string; fingerprint: string }> {
+  await assertEngineContentDirectory(config);
+  return { root: config.dir, version: config.version, fingerprint: await hashSourceTree(config.dir, await listFiles(config.dir)) };
+}
+
 /** Rejects any generated name that would escape the directory it is written into. */
 export function assertContained(root: string, candidate: string): string {
   const full = resolve(root, candidate);
@@ -573,6 +620,19 @@ export function assertContained(root: string, candidate: string): string {
   }
   return full;
 }
+
+/** An RGBA16F texture the raw route wrote: the isolated run that holds its manifest and binary, and the package's own key. */
+interface DataTextureSource {
+  readonly converterOutput: string;
+  readonly selector: string;
+  /** The PNG failure the raw route answers, as the report states it. */
+  readonly pngFailure: string;
+}
+
+/** The raw route's answer for one package: the texture it wrote, or the failure with the PNG cause first. */
+type RawFallback =
+  | { readonly entry: PackageClassification; readonly reason: string }
+  | { readonly entry: PackageClassification; readonly dataTexture: DataTextureSource };
 
 interface PackageClassification {
   readonly package: string;
@@ -594,21 +654,34 @@ interface PackageClassification {
   readonly needsModernConverter: boolean;
   /** A texture package whose mip generation setting is `TMGS_NoMipmaps` (see `PackageCooking.noMipmapsHint`). */
   readonly noMipmaps?: boolean;
+  /**
+   * Texture2D exports beside a package-named World. They are not the package's texture, and the native list gives no outer
+   * that would name the object owning them, so they are reported by name and never exported.
+   */
+  readonly auxiliaryTextures?: readonly string[];
   readonly error: string | undefined;
 }
 
 const LIST_LINE = /^\s*\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)\s+(\S+)\s*$/;
 
-export function parseUmodelList(stdout: string): { classes: string[]; objects: string[] } {
+/** One `-list` row. Its object name tells a package's own object (named after the package) from an auxiliary export. */
+export interface UmodelListEntry {
+  readonly className: string;
+  readonly objectName: string;
+}
+
+export function parseUmodelList(stdout: string): { classes: string[]; objects: string[]; entries: UmodelListEntry[] } {
   const classes: string[] = [];
   const objects: string[] = [];
+  const entries: UmodelListEntry[] = [];
   for (const line of stdout.split(/\r?\n/)) {
     const match = LIST_LINE.exec(line);
     if (!match?.[1] || !match[2]) continue;
     classes.push(match[1]);
     objects.push(match[2]);
+    entries.push({ className: match[1], objectName: match[2] });
   }
-  return { classes, objects };
+  return { classes, objects, entries };
 }
 
 async function mapWithConcurrency<T, R>(
@@ -644,11 +717,70 @@ interface ExportedAssets {
   readonly matAll?: ReadonlyMap<string, readonly string[]>;
   readonly propsAll?: ReadonlyMap<string, readonly string[]>;
   readonly png: Map<string, string>;
+  /**
+   * Every physical PNG file that carried a basename, in index order. `png` is the chosen representative;
+   * `ambiguousPng` names only the basenames whose files hold different bytes.
+   */
+  readonly pngAll?: ReadonlyMap<string, readonly string[]>;
   /** Basenames with multiple physical PNG producers cannot establish an exact source binding. */
   readonly ambiguousPng?: ReadonlySet<string>;
   readonly audio: Map<string, string>;
   /** Embedded MetaHuman DNA blobs, keyed by the mesh whose export promoted them. */
   readonly dna: Map<string, string>;
+}
+
+/** Content hash of a PNG, or a per-path sentinel when it cannot be read (so unreadable files never look identical). */
+async function pngDigest(path: string): Promise<string> {
+  try {
+    return createHash("sha256").update(await readFile(path)).digest("hex");
+  } catch {
+    return `unreadable:${path}`;
+  }
+}
+
+/**
+ * True when every path exists and holds the same bytes. One unreadable or absent copy means identity cannot be
+ * proven, so the duplicate stays ambiguous; only a proof of identical bytes makes it one source.
+ */
+async function identicalByContent(paths: readonly string[]): Promise<boolean> {
+  let digest: string | undefined;
+  for (const path of paths) {
+    const current = await pngDigest(path);
+    if (current.startsWith("unreadable:")) return false;
+    if (digest === undefined) { digest = current; continue; }
+    if (current !== digest) return false;
+  }
+  return digest !== undefined;
+}
+
+/**
+ * One deterministic path among same-named PNG exports, or undefined unless they hold the same bytes. Identity is proven
+ * on the exported pixels only: source package files can match while their texture data differs.
+ */
+async function representativeWhenIdentical(paths: readonly string[]): Promise<string | undefined> {
+  const sorted = [...new Set(paths)].sort();
+  if (sorted.length === 0) return undefined;
+  if (sorted.length === 1) return sorted[0];
+  return (await identicalByContent(sorted)) ? sorted[0] : undefined;
+}
+
+/**
+ * Chooses one path per PNG basename and reports a basename `ambiguous` only when its candidate files hold
+ * different bytes. Several folders can export one source texture (UE Viewer writes it once per material);
+ * those copies are one source, not a conflict. The representative is the first path in sorted order, so the
+ * pick is deterministic across hosts.
+ */
+async function resolvePngByContent(candidates: ReadonlyMap<string, readonly string[]>): Promise<{ png: Map<string, string>; ambiguousPng: Set<string> }> {
+  const png = new Map<string, string>();
+  const ambiguousPng = new Set<string>();
+  for (const [name, paths] of candidates) {
+    const sorted = [...new Set(paths)].sort();
+    const first = sorted[0];
+    if (first === undefined) continue;
+    png.set(name, first);
+    if (sorted.length > 1 && !(await identicalByContent(sorted))) ambiguousPng.add(name);
+  }
+  return { png, ambiguousPng };
 }
 
 async function indexExported(root: string): Promise<ExportedAssets> {
@@ -658,8 +790,7 @@ async function indexExported(root: string): Promise<ExportedAssets> {
   const props = new Map<string, string>();
   const matAll = new Map<string, string[]>();
   const propsAll = new Map<string, string[]>();
-  const png = new Map<string, string>();
-  const ambiguousPng = new Set<string>();
+  const pngAll = new Map<string, string[]>();
   const audio = new Map<string, string>();
   const dna = new Map<string, string>();
   const collect = (all: Map<string, string[]>, key: string, path: string): void => {
@@ -673,11 +804,12 @@ async function indexExported(root: string): Promise<ExportedAssets> {
     else if (name.endsWith(".mat")) { const key = name.slice(0, -".mat".length); mat.set(key, file.path); collect(matAll, key, file.path); }
     else if (name.endsWith(".gltf")) gltf.set(name.slice(0, -".gltf".length), file.path);
     else if (name.endsWith(".psa")) psa.set(name.slice(0, -".psa".length), file.path);
-    else if (name.endsWith(".png")) { const stem = name.slice(0, -".png".length); if (png.has(stem)) ambiguousPng.add(stem); png.set(stem, file.path); }
+    else if (name.endsWith(".png")) collect(pngAll, name.slice(0, -".png".length), file.path);
     else if (name.endsWith(".dna")) dna.set(name.slice(0, -".dna".length), file.path);
     else if (/\.(?:wav|ogg|mp3|flac)$/i.test(name)) audio.set(name.slice(0, name.lastIndexOf(".")), file.path);
   }
-  return { gltf, psa, mat, props, matAll, propsAll, png, ambiguousPng, audio, dna };
+  const { png, ambiguousPng } = await resolvePngByContent(pngAll);
+  return { gltf, psa, mat, props, matAll, propsAll, png, pngAll, ambiguousPng, audio, dna };
 }
 
 function mergeCandidates(
@@ -744,11 +876,54 @@ function packageDirectoryOverlap(file: string, packagePath: string): number {
   return overlap;
 }
 
-/** The one copy that shares the most trailing directories with the named package; undefined on no overlap or a tie. */
+/**
+ * The one copy that shares the most trailing directories with the named package; undefined on no overlap or a tie. This is
+ * a heuristic that orders material copies, not proof of which package is named: graph textures match whole package paths
+ * (`gamePackageOfSource`).
+ */
 function copyInPackage(copies: readonly string[], packagePath: string): string | undefined {
   const scored = copies.map((copy) => ({ copy, overlap: packageDirectoryOverlap(copy, packagePath) })).sort((a, b) => b.overlap - a.overlap);
   const [best, next] = scored;
   return best !== undefined && best.overlap > 0 && best.overlap > (next?.overlap ?? 0) ? best.copy : undefined;
+}
+
+/**
+ * The `/Game` mount prefixes a source root holds, relative to that root. The pack's `Content` folder mounts as `/Game`,
+ * so `<root>/Content/...` is `Content`, `<root>/X/Content/...` is a single wrapped project's `X/Content`, and a root that
+ * is itself `Content` is the empty prefix. A deeper `Content` (a plugin or nested package) is not a Game mount. A Fab
+ * staging download dir often wraps the project, so this finds `Paragon/Content` rather than requiring `Content` at the
+ * top; several wrapped projects give several prefixes, which a reference cannot tell apart (see `gamePackageOfSource`).
+ */
+function contentMounts(root: string, files: readonly string[]): string[] {
+  if (basename(root).toLowerCase() === "content") return [""];
+  const mounts = new Set<string>();
+  for (const file of files) {
+    const segments = relative(root, file).split(sep);
+    const index = segments.findIndex((segment) => segment.toLowerCase() === "content");
+    if (index === 0) mounts.add("Content");
+    else if (index === 1) mounts.add(`${segments[0]}/Content`);
+  }
+  return [...mounts];
+}
+
+/**
+ * The `/Game` package a source file holds under `mount`, in the form `texturePackageKey` gives: with mount `Content`,
+ * `<root>/Content/A/T_X.uasset` is `game/a/t_x`. A file outside the mount names no package: undefined.
+ */
+function gamePackageOfSource(root: string, file: string, mount: string): string | undefined {
+  const within = relative(root, file).split(sep).join("/");
+  const prefix = mount.toLowerCase();
+  if (prefix === "") {
+    // The root itself is the `Content` folder: only a path that stays inside it names a package.
+    if (within === ".." || within.startsWith("../")) return undefined;
+  } else if (!within.toLowerCase().startsWith(`${prefix}/`)) {
+    // The file must sit under the mount, not merely share its leading characters: `Derived/A/T_X` is not
+    // `Content/A/T_X`, however the old fixed-length slice would fall.
+    return undefined;
+  }
+  const after = prefix === "" ? within : within.slice(mount.length + 1);
+  const stem = after.slice(0, after.length - extname(after).length);
+  return stem.length > 0 ? `game/${stem.toLowerCase()}` : undefined;
 }
 
 const parentScoped = new WeakMap<ExportedAssets, Map<string, ExportedAssets>>();
@@ -806,10 +981,40 @@ function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAss
     matAll: mergeCandidates(left.matAll, right.matAll),
     propsAll: mergeCandidates(left.propsAll, right.propsAll),
     png: merge(left.png, right.png),
+    pngAll: mergeCandidates(left.pngAll, right.pngAll),
     ambiguousPng,
     audio: merge(left.audio, right.audio),
     dna: merge(left.dna, right.dna),
   };
+}
+
+/**
+ * Re-resolves the PNG index from every candidate a merge collected: byte-identical copies of one basename
+ * collapse to a single representative, while copies holding different bytes stay `ambiguous`. Without this a
+ * texture exported into two folders would be a conflict even when both copies are the very same image.
+ */
+async function refreshPngIndex(assets: ExportedAssets): Promise<ExportedAssets> {
+  if (assets.pngAll === undefined) return assets;
+  const { png, ambiguousPng } = await resolvePngByContent(assets.pngAll);
+  return { ...assets, png, ambiguousPng };
+}
+
+// Some material exports carry editor previews. Prefer a larger export from the unique source package,
+// preserving existing choices when a name is ambiguous.
+async function preferStandaloneResolution(assets: ExportedAssets, standalone: ReadonlyMap<string, string>): Promise<ExportedAssets> {
+  const sharp = (await import("sharp")).default;
+  const pixels = async (path: string): Promise<number> => {
+    // An unreadable PNG counts as empty: it never wins, and the packager reports it where it binds it.
+    const metadata = await sharp(path, { limitInputPixels: 268_435_456, unlimited: true }).metadata().catch(() => undefined);
+    return (metadata?.width ?? 0) * (metadata?.height ?? 0);
+  };
+  let png: Map<string, string> | undefined;
+  for (const [name, exported] of standalone) {
+    const indexed = assets.png.get(name);
+    if (indexed === undefined || indexed === exported || assets.ambiguousPng?.has(name)) continue;
+    if ((await pixels(exported)) > (await pixels(indexed))) (png ??= new Map(assets.png)).set(name, exported);
+  }
+  return png === undefined ? assets : { ...assets, png };
 }
 
 async function indexGlbs(root: string): Promise<Map<string, string>> {
@@ -848,6 +1053,31 @@ function isEngineProfileMismatch(output: string): boolean {
 }
 
 /**
+ * The `--engine` profile a `UE_x.y` format hint names, when it is one of the modern converter's fallback profiles. The selector is
+ * parsed as every other one is (`dumpEngineArg`), so a padded hint is the hint it names and a malformed one is no hint at all.
+ */
+function modernHintProfile(formatHint: string | undefined): string | undefined {
+  const profile = formatHint === undefined ? undefined : dumpEngineArg(formatHint);
+  return profile !== undefined && (MODERN_ENGINE_FALLBACKS as readonly string[]).includes(profile) ? profile : undefined;
+}
+
+/**
+ * The graph dump under a format hint: the hinted profile first, then the one unhinted run the dump made before hints existed, and
+ * only after a profile mismatch. An engine the request names is the one profile the dump runs, and the hint does not override it.
+ */
+function dumpGraphsUnderHint(profile: string): typeof dumpMaterialGraphs {
+  return async (sourceDir, options = {}) => {
+    if (options.engine !== undefined) return dumpMaterialGraphs(sourceDir, options);
+    try {
+      return await dumpMaterialGraphs(sourceDir, { ...options, engine: profile });
+    } catch (error) {
+      if (!isEngineProfileMismatch(error instanceof Error ? error.message : String(error))) throw error;
+      return dumpMaterialGraphs(sourceDir, options);
+    }
+  };
+}
+
+/**
  * The converter explains a texture it could not write on stderr (`threenative-texture-failure
  * <name>: <reason>; <evidence>`), ahead of the generic "no output" exception. Surfacing that line
  * turns a bare exit code into a stated pack limitation, such as pixel data that is not in the pack.
@@ -860,6 +1090,14 @@ export function modernConverterFailureCause(output: { readonly stdout: string; r
   const trimmed = cause?.trim();
   if (!trimmed) return undefined;
   return trimmed.length > 800 ? `${trimmed.slice(0, 800)}…` : trimmed;
+}
+
+/**
+ * The converter's "no decodable pixel data" for this texture, on an RGBA16F source (`sourceFormat=` evidence, with or
+ * without the enum's type prefix). That is the one PNG failure the raw RGBA16F route answers; any other format is not.
+ */
+function isRgba16fPngFailure(cause: string | undefined, name: string): boolean {
+  return cause !== undefined && cause.startsWith(`${name}: no decodable pixel data`) && /sourceFormat=(?:\w+::)?TSF_RGBA16F\b/.test(cause);
 }
 
 /**
@@ -918,8 +1156,10 @@ async function runModernConverter(
   outputDir: string,
   tailArgs: readonly string[],
   limits: { readonly timeoutMs: number; readonly maxOutputBytes: number },
+  hintProfile?: string,
 ) {
-  const attempts: (typeof MODERN_ENGINE_FALLBACKS[number] | undefined)[] = [undefined, ...MODERN_ENGINE_FALLBACKS];
+  // The hinted profile goes first, and the Set drops the repeat the fallbacks would otherwise run again.
+  const attempts = [...new Set<string | undefined>([hintProfile, undefined, ...MODERN_ENGINE_FALLBACKS])];
   let last: Awaited<ReturnType<typeof runBounded>> | undefined;
   for (const engine of attempts) {
     const attempt = `${outputDir}.engine-${engine ?? "auto"}`;
@@ -1469,23 +1709,93 @@ function usesVertexColors(root: ReturnType<Document["getRoot"]>, material: Mater
 }
 
 /** Glass, mirror and light sections keep their named PBR fallbacks; no graph bake is attempted for them. */
-/** True when any link of the instance chain starting at `name` overrides a static switch. */
-function chainOverridesSwitch(name: string, readProps: (name: string) => string | undefined): boolean {
+/**
+ * What the exported instance chain from `name` says about static switches. `overridden`: a link overrides one. `incomplete`: a
+ * parent the chain names has no exported props, so the switches it inherits are not in the export; the graph baker reads them
+ * from the qualified instance records, and the caller probes it. `clean`: every link read and none overrides a switch.
+ */
+function chainSwitchEvidence(name: string, readProps: (name: string) => string | undefined): "overridden" | "incomplete" | "clean" {
   const visited = new Set<string>();
-  for (let current: string | undefined = name; current && visited.size < 16 && !visited.has(current); ) {
+  let current: string | undefined = name;
+  // The package the previous link's `Parent =` line named, when it names one.
+  let named: string | undefined;
+  for (let depth = 0; current && visited.size < 16 && !visited.has(current); depth += 1) {
     visited.add(current);
     const text = readProps(current);
-    if (!text) return false;
+    // The material's own props are optional evidence. A parent without props makes the chain incomplete only when the pack could hold
+    // it: an engine master has no qualified record to read, so a probe could not settle its switches either.
+    if (!text) return depth === 0 || (named !== undefined && isEngineReference(named)) ? "clean" : "incomplete";
     const props = parsePropsFile(text);
-    if (props.switchOverrides.length > 0) return true;
+    if (props.switchOverrides.length > 0) return "overridden";
     current = props.parent;
+    named = props.parentPackage;
   }
-  return false;
+  return "clean";
 }
 
 function hasNamedFallback(materialName: string): boolean {
   const lower = materialName.toLowerCase();
   return lower.includes("glass") || lower.includes("mirror") || /(?:^|_)light(?:_|$)/.test(lower);
+}
+
+/**
+ * Whether the graph's active Normal proves the flattened normal maps stale: a known proof that names none of them (a namesake in another
+ * package counts as the same texture). The input glTF material's own normal map is judged on its own identity (`inputNormalVerdict`).
+ */
+function normalProvenStale(proof: NormalDependencies | undefined, flattened: readonly string[]): boolean {
+  if (proof?.status !== "known" || flattened.length === 0) return false;
+  return flattened.every((name) => proof.textures.every((texture) => texture.name.toLowerCase() !== name.toLowerCase()));
+}
+
+/** The basename of a glTF texture's name or URI, without its image extension: the only part of a source name the match uses. */
+function textureBaseName(value: string | null | undefined): string {
+  return (value ?? "").split(/[\\/]/).pop()!.replace(/\.(png|jpe?g|tga|dds|webp|bmp)$/i, "");
+}
+
+/**
+ * The input glTF material's own normal map, judged on its identity (its name and URI, by basename) against the graph's active Normal
+ * and the flattened normal the proof dropped (`dropped`). A known proof that reads no texture clears it. A name the graph reads keeps
+ * it, matched by basename only. The name of a dropped flattened normal clears it, since that texture is proved absent. Any other name,
+ * or none, keeps it unverified.
+ */
+function inputNormalVerdict(proof: NormalDependencies | undefined, names: readonly string[], dropped: readonly string[]): { readonly cleared: boolean; readonly note: string } {
+  const identities = names.map(textureBaseName).filter((name) => name !== "");
+  const label = identities[0] ?? "The input glTF normal";
+  if (proof?.status !== "known") return { cleared: false, note: `${label} kept as the normal map, unverified: ${proof?.reason ?? "the graph's active Normal was not read"}.` };
+  if (proof.textures.length === 0) return { cleared: true, note: `${label} is omitted: the graph's active Normal reads no texture.` };
+  const reads = proof.textures.map((texture) => texture.name).join(", ");
+  const lower = identities.map((identity) => identity.toLowerCase());
+  if (proof.textures.some((texture) => lower.includes(texture.name.toLowerCase()))) {
+    return { cleared: false, note: `${label} kept as the input normal map: the graph's active Normal reads a texture of that name (matched by basename only, so a namesake in another package would match too).` };
+  }
+  if (dropped.some((name) => lower.includes(name.toLowerCase()))) {
+    return { cleared: true, note: `${label} is omitted with the stale flattened normal: the graph's active Normal reads ${reads}.` };
+  }
+  return { cleared: false, note: `${label} kept as the normal map, unverified: it matches neither a texture the graph's active Normal reads (${reads}) nor the dropped flattened normal.` };
+}
+
+/**
+ * Embeds an identical texture once. The importer keys a file-backed texture by its absolute source path, so the same PNG
+ * exported into two isolated folders became two images. glTF-Transform's `dedup` compares bytes and MIME type (names only
+ * under `keepUniqueNames`) but never extras or extensions, so this keeps a narrow index per document: a texture merges only
+ * into a texture with the same name, MIME type and extras, no extensions, and byte-equal content. Only textures move;
+ * TextureInfo samplers, texCoords and factors stay with their materials.
+ */
+function embedIdenticalTextures(document: Document): void {
+  const firstByKey = new Map<string, Texture>();
+  const duplicates: [duplicate: Texture, survivor: Texture][] = [];
+  for (const texture of document.getRoot().listTextures()) {
+    const image = texture.getImage();
+    if (!image || texture.listExtensions().length > 0) continue;
+    const key = [texture.getName(), texture.getMimeType(), JSON.stringify(texture.getExtras()), createHash("sha256").update(image).digest("hex")].join("\0");
+    const first = firstByKey.get(key);
+    if (!first) firstByKey.set(key, texture);
+    else if (BufferUtils.equals(first.getImage()!, image)) duplicates.push([texture, first]);
+  }
+  for (const [duplicate, survivor] of duplicates) {
+    for (const parent of duplicate.listParents()) if (parent.propertyType !== "Root") parent.swap(duplicate, survivor);
+    duplicate.dispose();
+  }
 }
 
 export async function packageGlb(options: {
@@ -1497,6 +1807,11 @@ export async function packageGlb(options: {
    * share. Merged over the mesh's own index, so the material's parents still resolve.
    */
   readonly importedMaterialAssets?: ReadonlyMap<string, ExportedAssets> | undefined;
+  /**
+   * The source package of a section, by the section's glTF material name, when the caller knows it exactly (a material library's
+   * sections, each named by its own package path). The graph walk opens there before the lookup-name table; never a basename guess.
+   */
+  readonly sectionMaterialPackages?: ReadonlyMap<string, string> | undefined;
   readonly glbPath: string;
   readonly assets: ExportedAssets;
   readonly maxTextureSize: number | undefined;
@@ -1647,9 +1962,13 @@ export async function packageGlb(options: {
         reason: `${lookupName} has BlendMode ${resolved.sourceBlendMode.slice("BLEND_".length)}: the renderer draws its Emissive only (${resolved.sourceBlendMode === "BLEND_Additive" ? "added to" : "multiplied with"} the scene), so BaseColor is never read and the package has no albedo for it`,
       };
     }
+    // The package the section's own source names (a library section), else the mesh's import table: the graph walk opens there
+    // (see `GraphBakeRequest.materialPackage`).
+    const importedPackage = options.sectionMaterialPackages?.get(name) ?? options.materialPackages?.get(lookupName.toLowerCase());
     const graphRequest = (probe: boolean): GraphBakeRequest => ({
       materialName: material.getName(),
       lookupName,
+      ...(importedPackage !== undefined ? { materialPackage: importedPackage } : {}),
       assets: materialAssets,
       probe,
       // A translucent or masked section keeps its cut-out in the graph's Opacity or OpacityMask pin.
@@ -1657,6 +1976,10 @@ export async function packageGlb(options: {
       // Unreal feeds white to VertexColor for a mesh without a colour buffer. One painted primitive using the
       // section makes that claim false, so then VertexColor stays unsupported and is named in the report.
       ...(usesVertexColors(root, material) ? {} : { vertexColor: [1, 1, 1, 1] as const }),
+      // A painted, OPAQUE section keeps its COLOR_0: the mesh carries the colour the graph's VertexColor reads. The
+      // flag lets the baker accept a graph whose BaseColor is that node's RGB exactly, baking a neutral white residual
+      // while COLOR_0 stays authoritative. A translucent section may blend vertex alpha, so it is not flagged.
+      ...(resolved.alphaMode === "OPAQUE" && usesVertexColors(root, material) ? { directVertexColor: true } : {}),
       surface: () => surfaceOf(root, material),
       objectRadius: () => {
         if (meshRadius === undefined) meshRadius = objectRadiusOf(root, options.geometryScale) ?? null;
@@ -1710,23 +2033,53 @@ export async function packageGlb(options: {
         };
       }
     }
-    // The flattened `.mat` lists the first texture of each class, which is not the branch a static switch picks: a
-    // winter spruce's trunk, branch and leaf instances all flattened to the bark atlas. When the instance chain
-    // overrides a switch and the graph's active BaseColor path never samples the bound texture, the binding is stale;
-    // it is dropped so the graph baker (below) supplies the colour the chosen branch actually reads.
-    if (options.graphBaker && !hasNamedFallback(material.getName()) && chainOverridesSwitch(lookupName, graphRequest(true).readProps)) {
+    // The flattened `.mat` lists the first texture of each class, which is not the branch the instance's parameters pick: a
+    // winter spruce's trunk, branch and leaf instances all flattened to the bark atlas, and a recovered parent's texture override
+    // moves the active texture with no switch involved. When the probe proves the graph's active BaseColor path does not sample
+    // the bound texture, the binding is stale. It is replaced only by a bake of that path that succeeds (its cut-out included,
+    // through the graph block below). A bake that fails keeps the flattened binding and reports it unverified: nothing here claims
+    // a replacement it did not make.
+    let graphReport: ImportedMaterialSection["graph"];
+    const switchEvidence = options.graphBaker && !hasNamedFallback(material.getName()) ? chainSwitchEvidence(lookupName, graphRequest(true).readProps) : "clean";
+    if (options.graphBaker && switchEvidence !== "clean") {
       const staleBase = resolved.bindings.find((binding) => binding.slot === "baseColor" && binding.source !== "graph");
-      if (staleBase) {
-        const probed = await options.graphBaker(graphRequest(true));
-        const active = probed.baseColourTextures?.map((texture) => texture.toLowerCase());
-        const bound = [staleBase.texture, staleBase.secondaryTexture].filter((texture): texture is string => texture !== undefined);
-        if (probed.switchOverridden && active && active.length > 0 && !bound.some((texture) => active.includes(texture.toLowerCase()))) {
+      // Only the primary albedo decides staleness. The secondary texture is the flattened opacity map, which can share a name
+      // with a texture the active branch blends into its base colour; that match would keep the wrong albedo.
+      const probed = staleBase ? await options.graphBaker(graphRequest(true)) : undefined;
+      const active = probed?.baseColourTextures?.map((texture) => texture.toLowerCase());
+      // A known active path decides alone, whatever the switches: a bound texture it does not sample is stale, and one it samples stands
+      // with no note. The probe settled that path with the whole chain's parameters (a recovered parent's included), so it proves the
+      // exclusion without any switch override. Only an unknown path is judged by the switches; with none overridden it stands unjudged.
+      const bound = staleBase?.texture.toLowerCase();
+      const stale = bound !== undefined && (active ? !active.includes(bound) : probed?.switchOverridden !== false);
+      // A bound texture the path does sample is still only part of the colour when a switch the chain itself overrides picks a branch
+      // that blends it with other textures (a tint-by-mask lerp): the flattened binding is that albedo alone. Without an override the
+      // path is the master's default and the binding stands as before.
+      const partial = bound !== undefined && active !== undefined && active.length > 1 && active.includes(bound) && probed?.switchOverridden === true;
+      if (staleBase && (stale || partial)) {
+        const baked = await options.graphBaker(graphRequest(false));
+        if (baked.status === "baked") {
+          // texturesUsed lists the base colour's samples only (the cut-out compiles separately), so the same primary test applies.
+          if (partial || !baked.texturesUsed.some((used) => used.toLowerCase() === staleBase.texture.toLowerCase())) {
+            resolved = {
+              ...resolved,
+              bindings: resolved.bindings.filter((binding) => binding.slot !== "baseColor"),
+              limitations: [
+                ...resolved.limitations,
+                `${staleBase.texture} dropped as base colour: the instance's parameters (static switches and texture overrides, a recovered parent's included) select a graph branch that samples ${baked.texturesUsed.join(", ")}, so the colour is baked from the graph.`,
+              ],
+            };
+          }
+        } else {
+          graphReport =
+            baked.status === "unsupported"
+              ? { status: "unsupported", unsupportedNodes: [...baked.unsupported], approximations: [], reason: baked.reason }
+              : { status: "unavailable", unsupportedNodes: [], approximations: [], reason: baked.reason };
           resolved = {
             ...resolved,
-            bindings: resolved.bindings.filter((binding) => binding.slot !== "baseColor"),
             limitations: [
               ...resolved.limitations,
-              `${staleBase.texture} dropped as base colour: the instance's static switches select a graph branch that samples ${[...new Set(probed.baseColourTextures)].join(", ")}, so the colour is baked from the graph.`,
+              `${staleBase.texture} kept as base colour, unverified: the instance's parameters (static switches or texture overrides) may select a graph branch the flattened .mat does not show, and that branch could not be baked (${baked.reason}).`,
             ],
           };
         }
@@ -1786,6 +2139,66 @@ export async function packageGlb(options: {
     material.setAlphaMode(resolved.alphaMode);
     if (resolved.alphaMode === "MASK") material.setAlphaCutoff(resolved.alphaCutoff ?? 0.333);
     material.setDoubleSided(resolved.doubleSided);
+
+    // The resolver promotes the parent's EmissiveColor vector and binds any Emissive texture whether or not the graph's Emissive
+    // switch reaches them. The input glTF material can also carry its own emissive factor or texture (the converter's, not the
+    // resolver's), so both sources trigger the probe. Unreal draws none of them when the graph's emission is zero, so they are
+    // dropped on that source proof alone (`proveEmissionZero`, on the instance's overrides). An effect keeps its emission, a named
+    // fallback keeps its own, and an unknown proof leaves the material as it came. Clearing the section's own slots before the
+    // bindings are attached also keeps the factor from being set again by an emissive texture's attachment.
+    const staleEmission =
+      resolved.bindings.some((binding) => binding.slot === "emissive") ||
+      (resolved.emissiveFactor?.some((channel) => channel > 0) ?? false) ||
+      material.getEmissiveTexture() !== null ||
+      material.getEmissiveFactor().some((channel) => channel > 0);
+    if (staleEmission && effect === undefined && options.graphBaker && !hasNamedFallback(material.getName())) {
+      const probed = await options.graphBaker(graphRequest(true));
+      const proof = probed.emissionZero;
+      if (proof?.zero === true && probed.effect === undefined && probed.noAlbedo === undefined) {
+        resolved = {
+          ...resolved,
+          emissiveFactor: undefined,
+          bindings: resolved.bindings.filter((binding) => binding.slot !== "emissive"),
+          limitations: [...resolved.limitations, `source-proven zero emission: ${proof.summary}; the stale emissive factor and emissive bindings are dropped.`],
+        };
+        // The resolver metadata never saw the input material's own emissive slots, so remove those explicitly.
+        material.setEmissiveFactor([0, 0, 0]);
+        material.setEmissiveTexture(null);
+      }
+    }
+
+    // The flattened `.mat` normal map is the first normal texture of its class, and a switch-driven material does not always read it: a
+    // foliage material's branch and leaf instances can all flatten to the bark normal. The graph's active Normal proves it stale only when
+    // the textures it reads name none of it (`normalDependencies`). That proof drops the binding; an unknown proof keeps the map and says it
+    // is unverified. The input glTF material's own normal map is judged on its identity (`inputNormalVerdict`), so a stale binding does not
+    // take a valid input map with it. An input map is judged only when no flattened normal stays attached to the normal slot.
+    const flattenedNormals = resolved.bindings.filter((binding) => binding.slot === "normal").map((binding) => binding.texture);
+    const inputNormal = material.getNormalTexture();
+    if ((flattenedNormals.length > 0 || inputNormal !== null) && options.graphBaker && !hasNamedFallback(material.getName())) {
+      const proof = (await options.graphBaker(graphRequest(true))).normalDependencies;
+      const stale = normalProvenStale(proof, flattenedNormals) ? flattenedNormals : [];
+      const attached = flattenedNormals.length > 0 && stale.length === 0;
+      const input = inputNormal !== null && !attached ? inputNormalVerdict(proof, [inputNormal.getName(), inputNormal.getURI()], stale) : undefined;
+      if (input?.cleared) material.setNormalTexture(null);
+      if (stale.length > 0) {
+        const reads = proof?.status === "known" && proof.textures.length > 0 ? proof.textures.map((texture) => texture.name).join(", ") : "no texture";
+        const kept = input !== undefined && !input.cleared ? "; the section keeps its input glTF normal map" : ", so the section has no normal map";
+        resolved = {
+          ...resolved,
+          bindings: resolved.bindings.filter((binding) => binding.slot !== "normal"),
+          limitations: [
+            ...resolved.limitations,
+            `${stale.join(", ")} is a stale flattened normal, omitted: the graph's active Normal reads ${reads}. The authored normal composition is not reconstructed${kept}.`,
+          ],
+        };
+      } else if (flattenedNormals.length > 0 && proof?.status === "unknown") {
+        resolved = {
+          ...resolved,
+          limitations: [...resolved.limitations, `${flattenedNormals.join(", ")} kept as the normal map, unverified: ${proof.reason}.`],
+        };
+      }
+      if (input) resolved = { ...resolved, limitations: [...resolved.limitations, input.note] };
+    }
 
     const ordered = [...resolved.bindings].sort(
       (left, right) => SLOT_ORDER.indexOf(left.slot) - SLOT_ORDER.indexOf(right.slot),
@@ -1883,7 +2296,8 @@ export async function packageGlb(options: {
     // PRD-538: colour that exists only in the material graph. Glass, mirrors and lights keep their named
     // fallbacks; everything else that has no base-colour texture asks the graph baker.
     const graphBindings: MaterialTextureBinding[] = [];
-    let graphReport: ImportedMaterialSection["graph"];
+    // The literal Roughness/Metallic of a proved residual bake (see `sourceScalarFactors`), applied once the factors below are set.
+    let sourceFactors: GraphPbrFactors | undefined;
     if (material.getBaseColorTexture() === null && options.graphBaker && !hasNamedFallback(material.getName())) {
       const outcome = await options.graphBaker(graphRequest(false));
       if (outcome.effect && !effect) effect = { kind: "emissive", reason: outcome.effect.reason };
@@ -1907,6 +2321,14 @@ export async function packageGlb(options: {
         attachTexture(material, binding, texture);
         graphBindings.push(binding);
         packagingLimitations.push(...outcome.approximations);
+        if (outcome.vertexColorResidual) {
+          // The mesh's COLOR_0 supplies the colour; the white PNG only makes glTF's product reproduce Unreal exactly.
+          // baseColorFactor stays white, so the residual is the identity and no tint or 0.8 fallback is applied.
+          packagingLimitations.push(
+            `${material.getName()}'s graph wires BaseColor directly to VertexColor: the mesh's COLOR_0 supplies the base colour and the baked white graph base colour is a neutral residual factor, so a glTF client reproduces Unreal's colour.`,
+          );
+          sourceFactors = outcome.pbrFactors;
+        }
         const viewDependent = viewDependentNodes(outcome.approximations);
         if (viewDependent.length > 0) {
           packagingLimitations.push(
@@ -1922,7 +2344,13 @@ export async function packageGlb(options: {
             `Opacity is a binary cut-out (${(outcome.alpha.opaqueShare * 100).toFixed(0)}% of texels opaque): exported as alphaMode MASK instead of BLEND, because blended overlapping cards render grey and unsorted.`,
           );
         }
-        graphReport = { status: "baked", confidence: outcome.confidence, unsupportedNodes: [], approximations: [...outcome.approximations] };
+        graphReport = {
+          status: "baked",
+          confidence: outcome.confidence,
+          unsupportedNodes: [],
+          approximations: [...outcome.approximations],
+          ...(outcome.vertexColorResidual ? { vertexColorResidual: true } : {}),
+        };
       } else if (outcome.status === "unsupported") {
         graphReport = { status: "unsupported", unsupportedNodes: [...outcome.unsupported], approximations: [], reason: outcome.reason };
       } else {
@@ -1958,9 +2386,12 @@ export async function packageGlb(options: {
       if (resolved.baseColorFactor[3] < 1 && material.getAlphaMode() === "OPAQUE") {
         material.setAlphaMode("BLEND");
       }
-    } else if (resolved.baseColorFactor && resolved.baseColorFactor[3] < 1) {
+    } else if (resolved.baseColorFactor && resolved.baseColorFactor[3] < 1 && graphReport?.vertexColorResidual !== true) {
       // A baked graph already contains its tints (multiplying the instance's colour in again would apply them twice)
       // and an emissive effect has no albedo tint to apply, but the instance's opacity still holds. Only alpha carries over.
+      // A direct VertexColor residual is the exception: the graph wires no opacity path, so an unused instance scalar
+      // Opacity (or tint alpha) must not lower an OPAQUE section to BLEND — that would make COLOR_0's alpha decide
+      // visibility. The mesh's COLOR_0 stays authoritative and the factor stays the identity white.
       const [r, g, b] = material.getBaseColorFactor();
       material.setBaseColorFactor([r, g, b, resolved.baseColorFactor[3]]);
       if (material.getAlphaMode() === "OPAQUE") material.setAlphaMode("BLEND");
@@ -1983,6 +2414,25 @@ export async function packageGlb(options: {
       }
     }
     if (resolved.roughnessFactor !== undefined) material.setRoughnessFactor(resolved.roughnessFactor);
+    if (sourceFactors) {
+      // The graph's own constant replaces the instance scalar and the neutral fallback. A bound metallicRoughness texture would
+      // be multiplied by a factor, so there the constant is not applied and the texture's own values stand.
+      const constants = [
+        ...(sourceFactors.roughness !== undefined ? [`Roughness ${sourceFactors.roughness}`] : []),
+        ...(sourceFactors.metallic !== undefined ? [`Metallic ${sourceFactors.metallic}`] : []),
+      ].join(", ");
+      if (material.getMetallicRoughnessTexture() === null) {
+        if (sourceFactors.metallic !== undefined) material.setMetallicFactor(sourceFactors.metallic);
+        if (sourceFactors.roughness !== undefined) material.setRoughnessFactor(sourceFactors.roughness);
+        packagingLimitations.push(
+          `Source graph ${constants}: literal Constant(s) wired straight to the output; the glTF factor(s) are set to them, and no packed metallicRoughness texture is bound to multiply.`,
+        );
+      } else {
+        packagingLimitations.push(
+          `Source graph ${constants}: a literal Constant, but this section binds a packed metallicRoughness texture, so the constant is not applied and that texture's values stand. They are not claimed to match Unreal.`,
+        );
+      }
+    }
     // Unreal's `Specular` input is a dielectric F0 of 0.08 x Specular (0.5 gives the glTF default 0.04). A matte foliage
     // master with Specular 0.1 has F0 0.008, a fifth of glTF's default, so leaving the default adds a pale sheen that
     // washes the green out. Only a constant is applied; 0.5 (the engine default) changes nothing.
@@ -2093,8 +2543,8 @@ export async function packageGlb(options: {
       conflictingMorphDeltas += seams.conflicting;
 
       if (options.keepAllUvSets) continue;
-      // UE Viewer emits every Unreal UV channel, including lightmap sets no runtime material
-      // reads. They are pure size in a source asset that a compiler will copy again.
+      // The lossy policy, for a caller that wants a runtime-only copy. UE Viewer emits every Unreal UV channel, including
+      // lightmap sets no bound material reads; the importer keeps them as authored source data (`keepAllUvSets: true`).
       for (let set = 1; set < 8; set += 1) {
         const material = primitive.getMaterial();
         const usedInfos = material ? [material.getBaseColorTextureInfo(), material.getNormalTextureInfo(), material.getMetallicRoughnessTextureInfo(), material.getEmissiveTextureInfo(), material.getOcclusionTextureInfo()] : [];
@@ -2109,6 +2559,7 @@ export async function packageGlb(options: {
     }
   }
 
+  embedIdenticalTextures(document);
   await mkdir(dirname(options.glbPath), { recursive: true });
   await io.write(options.glbPath, document);
 
@@ -2449,6 +2900,13 @@ export async function importUnrealDirectory(
   const sourceHash = await hashSourceTree(sourceDir, files);
 
   const umodel = request.umodel ?? (await ensureUmodel(environment, log));
+  // Engine content decides what a pack's /Engine/ function bodies evaluate to, so its root, version and bytes key the cache.
+  // Read only when graph baking can use it; without it the key is the one it was before engine content existed.
+  const engineContent = request.graphBake !== false ? engineContentFromEnvironment(environment) : undefined;
+  const engineContentKey = engineContent ? await engineContentIdentity(engineContent) : undefined;
+  // The format hint picks the profile every modern decode tries first, so a supported one is part of the identity. A missing or
+  // unsupported hint is no hint at all: its key is the one it had before the hint existed.
+  const formatProfile = modernHintProfile(request.formatHint);
   const cacheKey = createHash("sha256")
     .update(
       JSON.stringify({
@@ -2462,6 +2920,8 @@ export async function importUnrealDirectory(
         maxTextureSize: request.maxTextureSize ?? null,
         only: request.onlyPackages ? [...request.onlyPackages].sort() : null,
         lods: lodsArg ?? null,
+        ...(engineContentKey ? { engineContent: engineContentKey } : {}),
+        ...(formatProfile ? { formatProfile } : {}),
         uncookedConverter: request.uncookedConverter?.version ?? null,
         modernConverter: request.modernConverter?.version ?? null,
       }),
@@ -2577,7 +3037,7 @@ export async function importUnrealDirectory(
         [`-path=${sourceDir}`, "-list", entry.selector],
         { timeoutMs: 300_000, maxOutputBytes: 16 * 1024 * 1024 },
       );
-      const { classes } = parseUmodelList(run.stdout);
+      const { classes, entries } = parseUmodelList(run.stdout);
       const cooking = await readPackageCooking(entry.file);
       if (cooking?.materialHint && !classes.some((className) => className === "Material" || className === "MaterialInstanceConstant")) classes.push("Material");
       if (cooking?.levelHint && !classes.includes("Level")) classes.push("Level");
@@ -2592,7 +3052,12 @@ export async function importUnrealDirectory(
       // the package, its classes win: a material instance names Texture2D and carries
       // AssetImportData too, and reading that as a texture drops the material entirely.
       const listed = run.code === 0 && classes.length > 0;
-      const hasTexture = !isMapBuildData && (classes.includes("Texture2D") || (!listed && cooking?.textureHint === true));
+      // A World named after its package is that package's own object, so it decides what the package is. The Texture2D
+      // exports beside it are auxiliaries (see `auxiliaryTextures`), never this package's texture. The match is exact on the
+      // package's own name, so a World with any other name does not claim the package.
+      const ownsWorld = run.code === 0 && entries.some((item) => item.className === "World" && item.objectName === entry.package);
+      const auxiliaryTextures = ownsWorld ? entries.filter((item) => item.className === "Texture2D").map((item) => item.objectName) : [];
+      const hasTexture = !isMapBuildData && !ownsWorld && (classes.includes("Texture2D") || (!listed && cooking?.textureHint === true));
       // MapBuildDataRegistry owns transient reflection-capture cubes that are tied to baked level
       // lighting. They are not standalone environment assets and cannot be meaningfully reused.
       const hasCubemap =
@@ -2645,6 +3110,7 @@ export async function importUnrealDirectory(
         hasGroom,
         needsModernConverter,
         ...(hasTexture && cooking?.noMipmapsHint === true ? { noMipmaps: true } : {}),
+        ...(auxiliaryTextures.length > 0 ? { auxiliaryTextures } : {}),
         error:
           run.code === 0 || needsModernConverter || nonImportableClass !== undefined || hasFont || paperClass !== undefined || cooking?.levelHint === true
             ? undefined
@@ -2680,6 +3146,14 @@ export async function importUnrealDirectory(
   const externalActorEntries = classifiedAll.filter((entry) => isWorldPartitionExternalPackage(entry.package));
   const externalActorFiles = new Set(externalActorEntries.map((entry) => entry.file));
   const classified = classifiedAll.filter((entry) => !externalActorFiles.has(entry.file));
+  // Auxiliaries of a package-named World are never exported, whichever route the level takes, so the report names them.
+  for (const entry of classified) {
+    if (entry.auxiliaryTextures === undefined) continue;
+    const count = entry.auxiliaryTextures.length;
+    warnings.push(
+      `${entry.package} carries ${count} auxiliary Texture2D export${count === 1 ? "" : "s"} (${summarizeClasses(entry.auxiliaryTextures)}) that ${count === 1 ? "is" : "are"} not exported: the native list does not give ${count === 1 ? "its" : "their"} owner, so ownership stays unverified.`,
+    );
+  }
   /** Texture basenames the editor builds no mip chain for; their sampler must not average them either. */
   const noMipmapTextures: ReadonlySet<string> = new Set(
     classified.filter((entry) => entry.noMipmaps === true).map((entry) => basename(entry.package, extname(entry.package))),
@@ -2809,11 +3283,81 @@ export async function importUnrealDirectory(
   let textureExports: Promise<unknown> = Promise.resolve();
   let textureExportCount = 0;
   let graphTextureConverter: Promise<ExternalTool> | undefined;
-  const exportedTextures = new Map<string, Promise<string | undefined>>();
-  const exportTexture = (name: string): Promise<string | undefined> => {
-    const known = exportedTextures.get(name);
+  const exportedTextures = new Map<string, Promise<GraphTextureSource | undefined>>();
+  // Standalone Texture2D exports already on disk (duplicate names exported into isolated folders, and the modern
+  // converter's group), keyed by the source package each came from. The graph baker reuses one instead of
+  // re-exporting it. The key is the source file, never the export folder: UE Viewer's folder layout does not say
+  // which package an output holds. Filled by the standalone texture phases, which run before any graph bake.
+  const standaloneBySource = new Map<string, GraphTextureSource>();
+  // The `/Game` mounts the source root holds; resolved once, since a pack with several of them cannot say which one a
+  // `/Game/...` reference means. A Fab staging dir wraps a single project (`Paragon/Content`), which is one mount.
+  let graphMounts: string[] | undefined;
+  const exportTexture = (name: string, reference?: string): Promise<GraphTextureSource | undefined> => {
+    // Two graphs can name different packages of one object name, so an answer belongs to the name and package together.
+    // An /Engine/ reference keys by its own spelling: the folded package key would make two spellings of it one answer.
+    const engine = reference !== undefined && isEngineReference(reference) ? reference : undefined;
+    const wanted = reference === undefined ? undefined : (engine ?? texturePackageKey(reference));
+    const cacheKey = `${name}\0${wanted ?? ""}`;
+    const known = exportedTextures.get(cacheKey);
     if (known) return known;
-    const run = textureExports.then(async (): Promise<string | undefined> => {
+    const nextDirectory = (): string => join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
+    // The isolated export's own `.props.txt` is the exact source's metadata, never a same-named package's: the sRGB decode then
+    // follows the selector this call resolved. `indexExported` reads it if the exporter wrote one.
+    const indexedSource = async (isolated: string): Promise<GraphTextureSource | undefined> => {
+      const exported = await indexExported(isolated);
+      const path = exported.png.get(name);
+      if (!path) return undefined;
+      const propsPath = exported.props.get(name);
+      const properties = propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
+      return properties === undefined ? { path } : { path, properties };
+    };
+    // PRD-538: an /Engine/ reference is answered by the configured engine content, exactly, or not at all. It never falls back to a
+    // pack package (a namesake, or a same-named PNG the mesh export carried, is another texture). The converter runs once, on the
+    // configured root and version rather than the pack's label, so no version fallback can decode the package under another engine.
+    const exportEngineTexture = async (reference: string): Promise<GraphTextureSource | undefined> => {
+      const canonical = canonicalEngineReference(reference);
+      if (canonical === undefined || canonical.object !== name) {
+        log(`Graph texture ${name}: ${reference} is not an exact /Engine/ texture reference; not exported.`);
+        return undefined;
+      }
+      if (engineContent === undefined || engineContentKey === undefined) {
+        log(`Graph texture ${name}: ${canonical.package} is engine content, and no engine content is configured; not exported.`);
+        return undefined;
+      }
+      // One converter run per engine package. The key carries the engine's own bytes, so another engine's export never answers it.
+      const sourceKey = `engine:${engineContentKey.fingerprint}:${canonical.package}`;
+      const reused = standaloneBySource.get(sourceKey);
+      if (reused !== undefined) return reused;
+      const isolated = nextDirectory();
+      try {
+        graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
+        const converter = await graphTextureConverter;
+        // One run, never runModernConverter's version fallbacks: the configured root and version are the only inputs.
+        const converted = await runBounded(
+          converter.path,
+          [engineContent.dir, "--export-dir", isolated, "--exact-reference", canonical.reference, "--engine", engineContent.version],
+          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        );
+        if (converted.code !== 0) {
+          const cause = modernConverterFailureCause(converted);
+          log(`Graph texture ${name}: the Engine content converter exited ${converted.code}${cause ? `: ${cause}` : "."}`);
+          return undefined;
+        }
+        const source = await indexedSource(isolated);
+        if (!source) {
+          log(`Graph texture ${name}: the Engine content converter wrote no PNG.`);
+          return undefined;
+        }
+        const sourced: GraphTextureSource = { ...source, engine: { version: engineContent.version, package: canonical.package } };
+        standaloneBySource.set(sourceKey, sourced);
+        return sourced;
+      } catch (error) {
+        log(`Graph texture ${name}: Engine content export failed (${error instanceof Error ? error.message : String(error)}).`);
+        return undefined;
+      }
+    };
+    const run = textureExports.then(async (): Promise<GraphTextureSource | undefined> => {
+      if (engine !== undefined) return exportEngineTexture(engine);
       if (!textureIndex) {
         textureIndex = new Map();
         for (const file of packages) {
@@ -2822,29 +3366,48 @@ export async function importUnrealDirectory(
           textureIndex.set(stem, [...(textureIndex.get(stem) ?? []), file.path]);
         }
       }
-      const matches = textureIndex.get(name) ?? [];
-      // Two packages of one name cannot say which pixels the material meant.
-      if (matches.length !== 1) {
-        log(`Graph texture ${name}: ${matches.length === 0 ? "no source package" : "ambiguous source packages"}; not exported.`);
+      const sorted = [...new Set(textureIndex.get(name) ?? [])].sort();
+      if (sorted.length === 0) {
+        log(`Graph texture ${name}: no source package; not exported.`);
         return undefined;
       }
-      const selector = relative(sourceDir, matches[0]!).split(sep).join("/").slice(0, -extname(matches[0]!).length);
-      const nextDirectory = (): string => join(staging, "graph-textures", String(textureExportCount++).padStart(5, "0"));
-      const viaUmodel = async (): Promise<string | undefined> => {
+      if (wanted === undefined && sorted.length > 1) {
+        // Nothing names a package: several same-named packages are one source only if every one exported the
+        // same bytes AND every one's own sidecar decodes them the same way. Equal PNGs under different sRGB
+        // flags sample differently, so an arbitrary pick is invalid; a duplicate with no sidecar at all leaves
+        // its flag unknown, which cannot prove equality either. `textureIsSrgb` is the baker's own flag parser,
+        // so a sidecar that states no override reads as Unreal's default (true) on both sides.
+        const exports = sorted.map((source) => standaloneBySource.get(source));
+        const paths = exports.map((source) => source?.path);
+        const first = exports[0]?.properties;
+        const sameDecode =
+          first !== undefined && exports.every((source) => source?.properties !== undefined && textureIsSrgb(source.properties) === textureIsSrgb(first));
+        const identical =
+          sameDecode && paths.every((png): png is string => png !== undefined) ? await representativeWhenIdentical(paths) : undefined;
+        if (identical === undefined) log(`Graph texture ${name}: ${sorted.length} source packages and no package reference; not exported.`);
+        return identical === undefined ? undefined : exports[0];
+      }
+      // A package reference names one package, found by its path in the pack, and nothing else answers for it: a namesake or
+      // identical bytes elsewhere may be a different texture, and the reference may name a package this pack does not hold.
+      // A root that wraps several Game mounts cannot say which one a reference means, so `qualified` names none of them.
+      graphMounts ??= contentMounts(sourceDir, packages.map((entry) => entry.path));
+      const qualified = (source: string): string | undefined =>
+        graphMounts!.length === 1 ? gamePackageOfSource(sourceDir, source, graphMounts![0]!) : undefined;
+      const exact = wanted === undefined ? sorted : sorted.filter((source) => qualified(source) === wanted);
+      if (exact.length !== 1) {
+        log(`Graph texture ${name}: ${exact.length === 0 ? `no source package is ${wanted}` : `${exact.length} source packages are ${wanted}`}; not exported.`);
+        return undefined;
+      }
+      const chosen = exact[0]!;
+      const reused = standaloneBySource.get(chosen);
+      if (reused !== undefined) return reused;
+      const selector = relative(sourceDir, chosen).split(sep).join("/").slice(0, -extname(chosen).length);
+      const viaUmodel = async (): Promise<GraphTextureSource | undefined> => {
         const isolated = nextDirectory();
-        // UE Viewer silently writes nothing when the output path grows past ~256 characters, and the
-        // package's own folders are appended to it. A deep staging path is reached through a short
-        // symlink (removed below); the files still land inside the staging directory.
-        let link: string | undefined;
+        // Exported from inside `isolated` with `-out=./`, so a deep staging path cannot cost the files (runUmodelExport).
         try {
           await mkdir(isolated, { recursive: true });
-          let out = isolated;
-          if (isolated.length > 120) {
-            link = join(tmpdir(), `tn-gt-${randomBytes(6).toString("hex")}`);
-            await symlink(isolated, link);
-            out = link;
-          }
-          const exportRun = await runBounded(umodel.path, [`-path=${sourceDir}`, "-export", "-png", `-out=${out}`, selector], {
+          const exportRun = await runUmodelExport(umodel.path, sourceDir, isolated, ["-png"], selector, {
             timeoutMs: 300_000,
             maxOutputBytes: 32 * 1024 * 1024,
           });
@@ -2852,19 +3415,17 @@ export async function importUnrealDirectory(
             log(`Graph texture ${name}: UE Viewer exited ${exportRun.code}.`);
             return undefined;
           }
-          const png = (await indexExported(isolated)).png.get(name);
-          if (!png) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
-          return png;
+          const source = await indexedSource(isolated);
+          if (!source) log(`Graph texture ${name}: UE Viewer wrote no PNG.`);
+          return source;
         } catch (error) {
           log(`Graph texture ${name}: export failed (${error instanceof Error ? error.message : String(error)}).`);
           return undefined;
-        } finally {
-          if (link) await rm(link, { force: true });
         }
       };
       // UE5 packages are unreadable to UE Viewer: the modern converter decodes the one package into
       // its own staging directory (it names every texture Textures/<name>.png, hence the isolation).
-      const viaConverter = async (): Promise<string | undefined> => {
+      const viaConverter = async (): Promise<GraphTextureSource | undefined> => {
         try {
           graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
           const converter = await graphTextureConverter;
@@ -2872,29 +3433,30 @@ export async function importUnrealDirectory(
           const converted = await runModernConverter(converter.path, sourceDir, isolated, ["--filter", selector], {
             timeoutMs: 1_800_000,
             maxOutputBytes: 32 * 1024 * 1024,
-          });
+          }, formatProfile);
           if (converted.code !== 0) {
             const cause = modernConverterFailureCause(converted);
             log(`Graph texture ${name}: the modern converter exited ${converted.code}${cause ? `: ${cause}` : "."}`);
             return undefined;
           }
-          const png = (await indexExported(isolated)).png.get(name);
-          if (!png) log(`Graph texture ${name}: the modern converter wrote no PNG.`);
-          return png;
+          const source = await indexedSource(isolated);
+          if (!source) log(`Graph texture ${name}: the modern converter wrote no PNG.`);
+          return source;
         } catch (error) {
           log(`Graph texture ${name}: modern export failed (${error instanceof Error ? error.message : String(error)}).`);
           return undefined;
         }
       };
-      const modernHeader = (await readPackageCooking(matches[0]!)).legacyFileVersion;
+      const modernHeader = (await readPackageCooking(chosen)).legacyFileVersion;
       if (modernHeader !== undefined && modernHeader <= -8) return viaConverter();
       return (await viaUmodel()) ?? viaConverter();
     });
     textureExports = run;
-    exportedTextures.set(name, run);
+    exportedTextures.set(cacheKey, run);
     return run;
   };
   // PRD-538: lazy, so a run that never meets a colourless section never provisions or spawns the converter.
+  // The same engine content the cache key was computed from, so the bake can never read a different root than the one keyed.
   const graphBaker = request.graphBake === false ? undefined : createGraphBaker({
     exportTexture,
     sourceDir,
@@ -2903,6 +3465,8 @@ export async function importUnrealDirectory(
     log,
     modernConverter: request.modernConverter,
     maxTextureSize: request.maxTextureSize,
+    engineContent,
+    ...(formatProfile ? { dumpGraphs: dumpGraphsUnderHint(formatProfile) } : {}),
   });
   const soundPackages = classified.filter((entry) => entry.hasSound && !entry.error);
   const dataPackages = classified.filter((entry) => entry.dataClass !== undefined && !entry.error);
@@ -3071,11 +3635,10 @@ export async function importUnrealDirectory(
     out: string,
   ): Promise<string | undefined> => {
     const run = () =>
-      runBounded(
-        umodel.path,
-        [`-path=${sourceDir}`, "-export", "-gltf", "-png", "-nooverwrite", `-out=${out}`, entry.selector],
-        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
-      );
+      runUmodelExport(umodel.path, sourceDir, out, ["-gltf", "-png", "-nooverwrite"], entry.selector, {
+        timeoutMs: 1_800_000,
+        maxOutputBytes: 32 * 1024 * 1024,
+      });
     try {
       // UE Viewer occasionally exits non-zero for one package under filesystem pressure even
       // though the same read-only export succeeds immediately afterward. One bounded retry keeps
@@ -3116,6 +3679,10 @@ export async function importUnrealDirectory(
     materialNameCounts.set(name, (materialNameCounts.get(name) ?? 0) + 1);
   }
   const materialAssetsByFile = new Map<string, ExportedAssets>();
+  // UE Viewer exit 0 exports that carry no sidecar named after the package they were asked for. Kept
+  // isolated so that, only if the modern converter also has nothing to say, the package can still be
+  // promoted as a truthful named/neutral fallback instead of dropped.
+  const legacyEmptyMaterialExports = new Map<string, ExportedAssets>();
   const materialFallbackPackages: PackageClassification[] = [];
   const materialsNeedingExport = materialPackages.filter((entry) => {
     if (entry.needsModernConverter) return false;
@@ -3134,11 +3701,10 @@ export async function importUnrealDirectory(
       const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
       await mkdir(isolated, { recursive: true });
       try {
-        const run = await runBounded(
-          umodel.path,
-          [`-path=${sourceDir}`, "-export", "-png", `-out=${isolated}`, entry.selector],
-          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
-        );
+        const run = await runUmodelExport(umodel.path, sourceDir, isolated, ["-png"], entry.selector, {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 32 * 1024 * 1024,
+        });
         if (run.code !== 0) return { entry, reason: `UE Viewer material export exited ${run.code}.` };
         const exported = await indexExported(isolated);
         // UE Viewer intentionally ignores a Material whose graph has no texture parameters.
@@ -3153,13 +3719,22 @@ export async function importUnrealDirectory(
       }
     });
     for (const result of results) {
-      if (result.exported) {
+      const name = basename(result.entry.package, extname(result.entry.package));
+      // UE Viewer exits 0 for a Material whose graph it cannot express (an instance with no
+      // recognised parameters, for example) while writing no `.mat`/`.props.txt` for the package
+      // it was asked to export. An unrelated sibling's metadata does not prove this package
+      // succeeded, so require evidence keyed by the material's own basename before accepting it;
+      // otherwise let the modern converter try, exactly as for a failed export.
+      if (result.exported && (result.exported.mat.has(name) || result.exported.props.has(name))) {
         materialAssetsByFile.set(result.entry.file, result.exported);
         // A unique material exported here may also be referenced by a mesh whose export omitted
         // it. Duplicate names deliberately remain package-local.
-        const name = basename(result.entry.package, extname(result.entry.package));
         if (materialNameCounts.get(name) === 1) assets = mergeExported(assets, result.exported);
       } else {
+        // UE Viewer exited 0 but wrote no sidecar named after this package. Remember its isolated
+        // export; if the modern converter is also empty, that is the only honest evidence the pack
+        // has no PBR metadata, and the package can still become a named/neutral fallback.
+        if (result.exported) legacyEmptyMaterialExports.set(result.entry.file, result.exported);
         materialFallbackPackages.push(result.entry);
       }
     }
@@ -3169,6 +3744,27 @@ export async function importUnrealDirectory(
   // walking meshes when the package basename is unique; duplicate names must be exported into
   // isolated directories or UE Viewer's basename lookup would silently select the first one.
   const textureSources = new Map<string, string>();
+  const dataTextureSources = new Map<string, DataTextureSource>();
+  // The raw route for an RGBA16F texture whose PNG export failed to encode it. Both the UE Viewer path and the modern path
+  // come here, and only for that encoding failure: the caller decides which failures qualify, and this keeps the PNG cause
+  // in front of whatever the raw route says. A run that cannot start is a failure too, with its own message.
+  const rgba16fFallback = async (
+    entry: PackageClassification,
+    outputDir: string,
+    pngFailure: string,
+    run: (outputDir: string) => Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string }>,
+  ): Promise<RawFallback> => {
+    try {
+      const converted = await run(outputDir);
+      if (converted.code !== 0) {
+        const cause = modernConverterFailureCause(converted);
+        return { entry, reason: `${pngFailure} The raw RGBA16F route refused it${cause ? `: ${cause}` : "."}` };
+      }
+      return { entry, dataTexture: { converterOutput: outputDir, selector: entry.selector, pngFailure } };
+    } catch (error) {
+      return { entry, reason: `${pngFailure} The raw RGBA16F route could not run: ${error instanceof Error ? error.message : "unknown error"}` };
+    }
+  };
   const cubemapSources = new Map<string, string>();
   const audioSources = new Map<string, string>();
   const dataSources = new Map<string, string>();
@@ -3200,25 +3796,45 @@ export async function importUnrealDirectory(
     // UE Viewer uses process-global image codecs that can intermittently leave empty PNGs when
     // several exporter processes run together. Keep this narrow phase serial; packaging remains
     // concurrent and deterministic after all source images are complete.
+    // A legacy PNG export that cannot encode a texture is retried once on the raw data route, which exports RGBA16F as
+    // stored. Only a PNG failure earns that retry: a toolchain error or any other failure stays a failure.
+    const rawFallback = (entry: PackageClassification, index: number, pngFailure: string): Promise<RawFallback> =>
+      rgba16fFallback(entry, join(standaloneRaw, `${String(index).padStart(5, "0")}-rgba16f`), pngFailure, async (converterOutput) => {
+        await mkdir(converterOutput, { recursive: true });
+        graphTextureConverter ??= request.modernConverter ? Promise.resolve(request.modernConverter) : ensureModernConverter(environment, log);
+        const converter = await graphTextureConverter;
+        const limits = { timeoutMs: 1_800_000, maxOutputBytes: 16 * 1024 * 1024 };
+        // With no engine named, a hint that names a fallback profile is tried first and the fallbacks follow, as on the other modern
+        // decodes. An engine the request names is the one profile this route runs, and the hint does not override it. With neither,
+        // the single run is unchanged.
+        if (request.engine === undefined && formatProfile !== undefined) {
+          return runModernConverter(converter.path, sourceDir, converterOutput, ["--data-texture", entry.selector], limits, formatProfile);
+        }
+        // The CUE4Parse route reads a UE4 package as the latest UE4 unless its engine is named: the request's `UE_4.19` selector.
+        const engineArgs = request.engine === undefined ? [] : ["--engine", request.engine.slice("UE_".length)];
+        return runBounded(converter.path, [sourceDir, "--export-dir", converterOutput, "--data-texture", entry.selector, ...engineArgs], limits);
+      });
     const results = await mapWithConcurrency(texturesNeedingExport, 1, async (entry, index) => {
       const name = basename(entry.package, extname(entry.package));
       const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
       await mkdir(isolated, { recursive: true });
       try {
-        const run = await runBounded(
-          umodel.path,
-          [`-path=${sourceDir}`, "-export", "-png", `-out=${isolated}`, entry.selector],
-          { timeoutMs: 1_800_000, maxOutputBytes: 16 * 1024 * 1024 },
-        );
+        const run = await runUmodelExport(umodel.path, sourceDir, isolated, ["-png"], entry.selector, {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 16 * 1024 * 1024,
+        });
         if (run.code !== 0) {
-          return { entry, reason: `UE Viewer texture export exited ${run.code}.` };
+          return await rawFallback(entry, index, `UE Viewer texture export exited ${run.code}.`);
         }
-        const emitted = (await listFiles(isolated)).find(
+        const files = await listFiles(isolated);
+        const emitted = files.find(
           (file) => basename(file.path).toLowerCase() === `${name}.png`.toLowerCase(),
         );
-        return emitted
-          ? { entry, source: emitted.path }
-          : { entry, reason: "UE Viewer recognized Texture2D but produced no PNG." };
+        if (!emitted) return await rawFallback(entry, index, "UE Viewer recognized Texture2D but produced no PNG.");
+        // UE Viewer writes the texture's own `.props.txt` beside the PNG; its `SRGB` is the exact source's metadata.
+        const propsFile = files.find((file) => basename(file.path).toLowerCase() === `${name}.props.txt`.toLowerCase());
+        const properties = propsFile === undefined ? undefined : readMaterialSidecar(propsFile.path);
+        return { entry, source: emitted.path, ...(properties === undefined ? {} : { properties }) };
       } catch (error) {
         return {
           entry,
@@ -3227,8 +3843,12 @@ export async function importUnrealDirectory(
       }
     });
     for (const result of results) {
-      if (result.source) textureSources.set(result.entry.file, result.source);
-      else failed.push({ package: result.entry.package, reason: result.reason ?? "Texture export failed." });
+      if ("source" in result) {
+        textureSources.set(result.entry.file, result.source);
+        standaloneBySource.set(result.entry.file, result.properties === undefined ? { path: result.source } : { path: result.source, properties: result.properties });
+      } else if ("dataTexture" in result) {
+        dataTextureSources.set(result.entry.file, result.dataTexture);
+      } else failed.push({ package: result.entry.package, reason: result.reason ?? "Texture export failed." });
     }
   }
 
@@ -3242,11 +3862,10 @@ export async function importUnrealDirectory(
       const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
       await mkdir(isolated, { recursive: true });
       try {
-        const run = await runBounded(
-          umodel.path,
-          [`-path=${sourceDir}`, "-export", "-sounds", `-out=${isolated}`, entry.selector],
-          { timeoutMs: 1_800_000, maxOutputBytes: 16 * 1024 * 1024 },
-        );
+        const run = await runUmodelExport(umodel.path, sourceDir, isolated, ["-sounds"], entry.selector, {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 16 * 1024 * 1024,
+        });
         if (run.code !== 0) return { entry, reason: `UE Viewer sound export exited ${run.code}.` };
         const emitted = (await listFiles(isolated)).find(
           (file) => basename(file.path, extname(file.path)).toLowerCase() === name.toLowerCase() &&
@@ -3275,18 +3894,10 @@ export async function importUnrealDirectory(
     log(`Exporting ${animationPackages.length} standalone animation packages as ActorX PSA…`);
     const animationFailures = await mapWithConcurrency(animationPackages, 1, async (entry) => {
       try {
-        const run = await runBounded(
-          umodel.path,
-          [
-            `-path=${sourceDir}`,
-            "-export",
-            "-psk",
-            "-nooverwrite",
-            `-out=${animationRaw}`,
-            entry.selector,
-          ],
-          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
-        );
+        const run = await runUmodelExport(umodel.path, sourceDir, animationRaw, ["-psk", "-nooverwrite"], entry.selector, {
+          timeoutMs: 1_800_000,
+          maxOutputBytes: 32 * 1024 * 1024,
+        });
         if (run.code === 0) return undefined;
         // UE Viewer prints its reason last; without it every failure reads the same.
         const diagnostic = `${run.stdout}\n${run.stderr}`.trim().split(/\r?\n/).filter((line) => line.trim()).at(-1)?.trim();
@@ -3434,7 +4045,7 @@ export async function importUnrealDirectory(
     const converted = await runModernConverter(modernConverter.path, sourceDir, modernRaw, args, {
       timeoutMs: 1_800_000,
       maxOutputBytes: 64 * 1024 * 1024,
-    });
+    }, formatProfile);
     if (converted.code !== 0) {
       // A static mesh old enough for UE Viewer never needed the modern converter, so one
       // converter crash must not take a mesh UE Viewer can read down with it. That fallback is only
@@ -3476,7 +4087,7 @@ export async function importUnrealDirectory(
         const run = await runModernConverter(modernConverter!.path, sourceDir, isolated, ["--filter", entry.selector], {
           timeoutMs: 1_800_000,
           maxOutputBytes: 64 * 1024 * 1024,
-        });
+        }, formatProfile);
         const glb = run.code === 0 ? (await indexGlbs(isolated)).get(basename(entry.package, extname(entry.package))) : undefined;
         isolatedMeshGlbs.set(entry.file, glb);
       });
@@ -3532,23 +4143,38 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
+      // The raw route answers one failure: the converter could not encode this texture as a PNG. That is its own "no decodable
+      // pixel data" for this package, or an exit with no PNG at all. Any other failure is reported as it is, without a retry.
+      const rawRoute = (pngFailure: string): Promise<RawFallback> =>
+        rgba16fFallback(entry, join(modernTextureRoot, `${String(index).padStart(5, "0")}-rgba16f`), pngFailure, (converterOutput) =>
+          runModernConverter(modernConverter!.path, sourceDir, converterOutput, ["--data-texture", entry.selector], {
+            timeoutMs: 1_800_000,
+            maxOutputBytes: 32 * 1024 * 1024,
+          }, formatProfile),
+        );
       if (converted.code !== 0) {
         const cause = modernConverterFailureCause(converted);
-        return { entry, reason: `The modern UE5 texture converter exited ${converted.code}${cause ? `: ${cause}` : "."}` };
+        const reason = `The modern UE5 texture converter exited ${converted.code}${cause ? `: ${cause}` : "."}`;
+        return isRgba16fPngFailure(cause, name) ? await rawRoute(reason) : { entry, reason };
       }
       const exported = await indexExported(isolated);
       const source = exported.png.get(name);
-      return source
-        ? { entry, source, exported }
-        : { entry, reason: "The modern UE5 texture converter produced no PNG for this package." };
+      if (!source) return await rawRoute("The modern UE5 texture converter produced no PNG for this package.");
+      const propsPath = exported.props.get(name);
+      const properties = propsPath === undefined ? undefined : readMaterialSidecar(propsPath);
+      return { entry, source, exported, ...(properties === undefined ? {} : { properties }) };
     });
     for (const result of results) {
-      if (result.exported) {
+      if ("exported" in result) {
         // Material texture bindings resolve by name, so the isolated exports still feed the
         // shared index exactly as the batched run used to.
         assets = mergeExported(assets, result.exported);
-        textureSources.set(result.entry.file, result.source!);
+        textureSources.set(result.entry.file, result.source);
+        standaloneBySource.set(result.entry.file, result.properties === undefined ? { path: result.source } : { path: result.source, properties: result.properties });
+      } else if ("dataTexture" in result) {
+        dataTextureSources.set(result.entry.file, result.dataTexture);
       } else {
         failed.push({ package: result.entry.package, reason: result.reason ?? "Modern texture conversion failed." });
       }
@@ -3573,6 +4199,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, spriteDescriptors: [] as string[], modelSources: [] as { name: string; glb: string }[], reason: `The modern level converter exited ${converted.code}.` };
       const emitted = await listFiles(isolated);
@@ -3613,6 +4240,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 },
+        formatProfile,
       );
       // A logic-only Blueprint (event graph, no mesh or light components) converts to nothing;
       // the converter says so explicitly, and that is content with nothing to place, not a failure.
@@ -3658,18 +4286,37 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, reason: `The modern Material converter exited ${converted.code}.` };
       const exported = await indexExported(isolated);
       return exported.mat.has(name) || exported.props.has(name)
         ? { entry, exported }
-        : { entry, reason: "The modern Material converter produced no metadata." };
+        : { entry, empty: true as const };
     });
     for (const result of results) {
-      if (result.exported) {
+      if ("exported" in result) {
         materialAssetsByFile.set(result.entry.file, result.exported);
         const name = basename(result.entry.package, extname(result.entry.package));
         if (materialNameCounts.get(name) === 1) assets = mergeExported(assets, result.exported);
+      } else if ("empty" in result && result.empty) {
+        // Both exporters ran and neither supplied a sidecar for this package. Promote the original
+        // isolated UE Viewer export as-is: it carries no sidecar named after the package, so
+        // resolveMaterial honestly reports resolved:false and falls back to a named or neutral
+        // swatch rather than claiming a decoded parent.
+        const prior = legacyEmptyMaterialExports.get(result.entry.file);
+        if (prior) {
+          const name = basename(result.entry.package, extname(result.entry.package));
+          materialAssetsByFile.set(result.entry.file, prior);
+          warnings.push(
+            `Both the modern converter and UE Viewer supplied no PBR metadata for ${name}; it is kept as a named or neutral reusable fallback without a decoded parent.`,
+          );
+        } else {
+          failed.push({
+            package: result.entry.package,
+            reason: "The modern Material converter produced no metadata and UE Viewer had no successful export for this package.",
+          });
+        }
       } else {
         failed.push({ package: result.entry.package, reason: result.reason ?? "Modern Material conversion failed." });
       }
@@ -3690,6 +4337,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, reason: `The modern UE5 sound converter exited ${converted.code}.` };
       const exported = await indexExported(isolated);
@@ -3723,6 +4371,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, reason: `The TextureCube converter exited ${converted.code}.` };
       const source = (await listFiles(isolated)).find((file) =>
@@ -3756,6 +4405,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) {
         const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));
@@ -3791,6 +4441,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) {
         const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));
@@ -3826,6 +4477,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) return { entry, reason: `The offline font converter exited ${converted.code}.` };
       const descriptor = (await listFiles(isolated)).find((file) =>
@@ -3853,6 +4505,7 @@ export async function importUnrealDirectory(
         isolated,
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        formatProfile,
       );
       if (converted.code !== 0) {
         const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));
@@ -3908,6 +4561,7 @@ export async function importUnrealDirectory(
   const audio: ImportedAudio[] = [];
   const dataAssets: ImportedDataAsset[] = [];
   const textureStacks: ImportedTextureStack[] = [];
+  const dataTextures: ImportedDataTexture[] = [];
   const fonts: ImportedFont[] = [];
   const bitmapFonts: ImportedBitmapFont[] = [];
   const sprites: ImportedSprite[] = [];
@@ -3930,6 +4584,18 @@ export async function importUnrealDirectory(
   const attachedPsa = new Set<string>();
   const existingPsa = new Set<string>();
   const incompatiblePsa = new Set<string>();
+
+  // Copies of one texture name that separate exports wrote collapse to one source when their bytes match, so a
+  // texture exported into two folders is not a conflict when both copies are the very same image.
+  assets = await refreshPngIndex(assets);
+  // A Texture2D package whose name no other package shares is one source: its own export is the full-resolution decode.
+  const standalonePng = new Map<string, string>();
+  for (const entry of texturePackages) {
+    const name = basename(entry.package, extname(entry.package));
+    const exported = textureSources.get(entry.file);
+    if (exported !== undefined && textureNameCounts.get(name) === 1) standalonePng.set(name, exported);
+  }
+  assets = await preferStandaloneResolution(assets, standalonePng);
 
   // Material packages by `/Game/...` path, for names several packages share: their isolated exports are the only
   // copy of each that no other package overwrote.
@@ -4017,7 +4683,7 @@ export async function importUnrealDirectory(
             glbPath,
             assets,
             maxTextureSize: request.maxTextureSize,
-            keepAllUvSets: false,
+            keepAllUvSets: true,
             imageCache,
             copyright,
             sidecars,
@@ -4147,7 +4813,7 @@ export async function importUnrealDirectory(
           glbPath,
           assets: source.assets,
           maxTextureSize: request.maxTextureSize,
-          keepAllUvSets: false,
+          keepAllUvSets: true,
           imageCache,
           copyright,
           sidecars,
@@ -4247,16 +4913,25 @@ export async function importUnrealDirectory(
             materialAssetsByFile.get(entry.file) ?? assets,
           ]),
         );
+        // Each section's own package, from its file's `Content` folder (the mapping the source reader uses). A file outside one names no
+        // package, so its section keeps the by-name lookup: a basename is never promoted to a package here.
+        const sectionMaterialPackages = new Map(
+          materialEntries.flatMap(({ entry, libraryName }) => {
+            const location = sourceLocation(entry.file);
+            return location ? [[libraryName, location.path] as const] : [];
+          }),
+        );
         const packaged = await packageGlb({
           gltfPath: source,
           glbPath,
           assets,
           maxTextureSize: request.maxTextureSize,
-          keepAllUvSets: false,
+          keepAllUvSets: true,
           imageCache,
           copyright,
           materialLookupNames: lookupNames,
           materialAssets: isolatedAssets,
+          sectionMaterialPackages,
           sourceMaterial: (name) => {
             const entry = materialEntries.find((e) => e.libraryName === name)?.entry;
             return entry ? sourceForLibraryFile(entry.file) : undefined;
@@ -4348,6 +5023,35 @@ export async function importUnrealDirectory(
       }
     }
     if (textures.length > 0) log(`Promoted ${textures.length} standalone Texture2D PNGs.`);
+
+    // RGBA16F textures the PNG exporters could not encode: the binary and its manifest move together, under the qualified path.
+    for (const entry of texturePackages) {
+      const source = dataTextureSources.get(entry.file);
+      if (!source) continue;
+      const relativeBase = `data-textures/${entry.package.slice(0, -extname(entry.package).length)}`;
+      try {
+        dataTextures.push(await promoteRgba16fDataTexture({
+          converterOutput: source.converterOutput,
+          sourceDir,
+          selector: source.selector,
+          promotionDir: promotion,
+          relativeBase,
+          package: entry.package,
+        }));
+      } catch (error) {
+        failed.push({
+          package: entry.package,
+          reason: `RGBA16F data texture packaging failed (${source.pngFailure}): ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (dataTextures.length > 0) {
+      log(`Promoted ${dataTextures.length} RGBA16F data texture${dataTextures.length === 1 ? "" : "s"}.`);
+      warnings.push(
+        `${dataTextures.length} RGBA16F texture${dataTextures.length === 1 ? " was" : "s were"} kept as raw half-float data, because the PNG exporters cannot encode the format. ` +
+          "Their values are stored, not decoded: no PivotPainter, classifier, source UV, graph or WPO semantics are applied, and no material is bound to them.",
+      );
+    }
 
     for (const entry of cubemapPackages) {
       const source = cubemapSources.get(entry.file);
@@ -4940,13 +5644,14 @@ export async function importUnrealDirectory(
       bitmapFonts.length === 0 &&
       sprites.length === 0 &&
       flipbooks.length === 0 &&
-      strands.length === 0
+      strands.length === 0 &&
+      dataTextures.length === 0
     ) {
       const reasons = failed.slice(0, 5).map((entry) => `${entry.package}: ${entry.reason}`);
       const more = failed.length > reasons.length ? ` (+${failed.length - reasons.length} more)` : "";
       throw new ImportError(
         "UNREAL_EXPORT_EMPTY",
-        "No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene; nothing was promoted." +
+        "No package produced a valid model, texture, RGBA16F data texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene; nothing was promoted." +
           (reasons.length > 0 ? ` Failures — ${reasons.join("; ")}${more}.` : ""),
       );
     }
@@ -5048,6 +5753,7 @@ export async function importUnrealDirectory(
         audio: audio.length,
         dataAssets: dataAssets.length,
         textureStacks: textureStacks.length,
+        dataTextures: dataTextures.length,
         fonts: fonts.length,
         bitmapFonts: bitmapFonts.length,
         sprites: sprites.length,
@@ -5064,6 +5770,7 @@ export async function importUnrealDirectory(
       audio,
       dataAssets,
       textureStacks,
+      dataTextures,
       fonts,
       bitmapFonts,
       sprites,
@@ -5084,7 +5791,7 @@ export async function importUnrealDirectory(
     // The staging PNGs are still on disk here and are removed in `finally`.
     if (request.proofSources) await request.proofSources(proofByGlb, report);
     log(
-      `Promoted ${models.length} model GLB${models.length === 1 ? "" : "s"}, ${textures.length} texture PNG${textures.length === 1 ? "" : "s"}, ${cubemaps.length} cubemap environment map${cubemaps.length === 1 ? "" : "s"}, ${textureStacks.length} multidimensional texture stack${textureStacks.length === 1 ? "" : "s"}, ${standaloneMaterials.length} material asset${standaloneMaterials.length === 1 ? "" : "s"}, ${audio.length} audio file${audio.length === 1 ? "" : "s"}, ${fonts.length} font face${fonts.length === 1 ? "" : "s"}, ${bitmapFonts.length} bitmap font${bitmapFonts.length === 1 ? "" : "s"}, ${sprites.length} sprite GLB${sprites.length === 1 ? "" : "s"}, ${flipbooks.length} flipbook manifest${flipbooks.length === 1 ? "" : "s"}, ${dataAssets.length} data JSON file${dataAssets.length === 1 ? "" : "s"}, and ${scenes.length} scene GLB${scenes.length === 1 ? "" : "s"} to ${outputDir}.`,
+      `Promoted ${models.length} model GLB${models.length === 1 ? "" : "s"}, ${textures.length} texture PNG${textures.length === 1 ? "" : "s"}, ${dataTextures.length} RGBA16F data texture${dataTextures.length === 1 ? "" : "s"}, ${cubemaps.length} cubemap environment map${cubemaps.length === 1 ? "" : "s"}, ${textureStacks.length} multidimensional texture stack${textureStacks.length === 1 ? "" : "s"}, ${standaloneMaterials.length} material asset${standaloneMaterials.length === 1 ? "" : "s"}, ${audio.length} audio file${audio.length === 1 ? "" : "s"}, ${fonts.length} font face${fonts.length === 1 ? "" : "s"}, ${bitmapFonts.length} bitmap font${bitmapFonts.length === 1 ? "" : "s"}, ${sprites.length} sprite GLB${sprites.length === 1 ? "" : "s"}, ${flipbooks.length} flipbook manifest${flipbooks.length === 1 ? "" : "s"}, ${dataAssets.length} data JSON file${dataAssets.length === 1 ? "" : "s"}, and ${scenes.length} scene GLB${scenes.length === 1 ? "" : "s"} to ${outputDir}.`,
     );
     return report;
   } catch (error) {

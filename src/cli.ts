@@ -114,7 +114,7 @@ export async function runImportCli(
     return { exitCode: 0, stdout: `${JSON.stringify(summary, null, 2)}\n`, stderr: "" };
   }
   const lines = [
-    `Imported ${summary.counts.exported} meshes, ${summary.counts.cubemaps} cubemaps, ${summary.counts.textureStacks} texture stacks, ${summary.counts.fonts} web fonts, ${summary.counts.bitmapFonts} bitmap fonts, ${summary.counts.sprites} sprites, ${summary.counts.flipbooks} flipbooks, ${summary.counts.dataAssets} data assets, and ${summary.counts.scenes} scenes into ${relative(process.cwd(), resolve(summary.outputDir)) || "."}`,
+    `Imported ${summary.counts.exported} meshes, ${summary.counts.cubemaps} cubemaps, ${summary.counts.textureStacks} texture stacks, ${summary.counts.dataTextures} RGBA16F data textures, ${summary.counts.fonts} web fonts, ${summary.counts.bitmapFonts} bitmap fonts, ${summary.counts.sprites} sprites, ${summary.counts.flipbooks} flipbooks, ${summary.counts.dataAssets} data assets, and ${summary.counts.scenes} scenes into ${relative(process.cwd(), resolve(summary.outputDir)) || "."}`,
     `Materials: ${summary.materials} (${summary.materialCoverage.textured}/${summary.materialCoverage.sections} sections textured, ${summary.materialCoverage.exact} exact, ${summary.materialCoverage.heuristic} heuristic, ${summary.materialCoverage.unsupported} unsupported)`,
     `Skipped ${summary.counts.skipped}, failed ${summary.counts.failed}. Report: ${summary.reportPath}`,
     ...summary.warnings.map((warning) => `warning: ${warning}`),

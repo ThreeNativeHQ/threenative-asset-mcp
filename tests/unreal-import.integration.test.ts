@@ -29,10 +29,11 @@ import {
   uncookedMeshRoute,
   validateGlb,
 } from "../src/unreal/importer.js";
+import { ENGINE_CONTENT_DIR_ENV, ENGINE_CONTENT_VERSION_ENV } from "../src/unreal/engine-content.js";
 import { childEnvironment, resolveExecutable, ToolchainError } from "../src/unreal/toolchain.js";
 import { patchUncookedPackageVersionGates, UEVIEWER_SOURCE } from "../src/unreal/provision.js";
 import { runImportCli } from "../src/cli.js";
-import { writeFakeUmodel, writeMeshFixture, writePng, writePsaFixture, writeWavFixture } from "./helpers/unreal-fixture.js";
+import { writeEngineProfileConverter, writeFakeModernMaterialConverter, writeFakeUmodel, writeMeshFixture, writePng, writePsaFixture, writeWavFixture } from "./helpers/unreal-fixture.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -346,8 +347,8 @@ describe("UE Viewer material metadata", () => {
     expect(parsed.blendMode).toBe("BLEND_Masked");
     expect(parsed.opacityMaskClipValue).toBeCloseTo(0.4);
     expect(parsed.collected).toEqual([
-      { name: "Diffuse", texture: "T_Leaf_Atlas" },
-      { name: "Normal", texture: "T_Leaf_N" },
+      { name: "Diffuse", texture: "T_Leaf_Atlas", reference: "Texture2D'Content/Game/T_Leaf_Atlas.T_Leaf_Atlas'" },
+      { name: "Normal", texture: "T_Leaf_N", reference: "Texture2D'Content/Game/T_Leaf_N.T_Leaf_N'" },
     ]);
   });
 
@@ -371,8 +372,8 @@ TextureParameterValues[2] =
 `);
     expect(parsed.parent).toBe("M_Master");
     expect(parsed.overrides).toEqual([
-      { name: "NRM", texture: "T_Pillar_N" },
-      { name: "Mask", texture: "T_Pillar_M" },
+      { name: "NRM", texture: "T_Pillar_N", reference: "Texture2D'Content/Game/T_Pillar_N.T_Pillar_N'" },
+      { name: "Mask", texture: "T_Pillar_M", reference: "Texture2D'Content/Game/T_Pillar_M.T_Pillar_M'" },
     ]);
   });
 
@@ -519,7 +520,7 @@ TwoSided = false
  ParameterValue = Texture2D'T_New_N.T_New_N'
  ParameterName = None
 }`);
-    expect(parsed.overrides).toEqual([{ name: "Normal", texture: "T_New_N" }]);
+    expect(parsed.overrides).toEqual([{ name: "Normal", texture: "T_New_N", reference: "Texture2D'T_New_N.T_New_N'" }]);
   });
 
   const sharedGraph = `Diffuse=Moss_A\nNormal=Bark_N\nOther[0]=Moss_N\nOther[1]=Bark_A_\nOther[2]=Branch_A\nOther[3]=Branch_N\nOther[4]=Leaf_A_02\nOther[5]=Leaf_N\nOther[6]=Leaf_O\n`;
@@ -1489,6 +1490,433 @@ fs.copyFileSync(${JSON.stringify(converterFixture)}, path.join(out, "Meshes", "S
     await expect(stat(join(workspace.outputDir, "partial-output-must-not-promote.txt"))).rejects.toThrow();
   });
 
+  describe("modern converter format hint", () => {
+    /**
+     * Imports one UE 5 static mesh, which only the modern converter can decode, through the engine-profile stub.
+     * Returns the `--engine` of every run in order (`auto` when none is given).
+     */
+    async function importUe5StaticMesh(options: {
+      readonly formatHint?: string;
+      readonly succeedOn: string;
+      readonly unrelated?: boolean;
+      readonly engineContent?: boolean;
+    }): Promise<{ engines: string[]; report: Awaited<ReturnType<typeof importUnrealDirectory>> }> {
+      const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+      const header = Buffer.alloc(32);
+      header.writeUInt32LE(0x9e2a83c1, 0);
+      header.writeInt32LE(-9, 4);
+      await writeFile(
+        join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset"),
+        Buffer.concat([header, Buffer.from("StaticMesh\0Default__StaticMesh\0")]),
+      );
+      const fixture = join(workspace.sourceDir, "..", "profile-static.glb");
+      await new NodeIO().write(fixture, await new NodeIO().read(join(workspace.sourceDir, "..", "exported", "SM_Rock.gltf")));
+      const argvLog = join(workspace.sourceDir, "..", "profile-argv.log");
+      const converter = await writeEngineProfileConverter(join(workspace.sourceDir, "..", "profile-converter"), {
+        argvLog,
+        succeedOn: options.succeedOn,
+        outputs: [{ path: "Meshes/SM_Rock.glb", fixture }],
+        unrelated: options.unrelated ?? false,
+      });
+      const environment: NodeJS.ProcessEnv = { ...workspace.environment };
+      if (options.engineContent) {
+        const dir = join(workspace.sourceDir, "..", "engine-content");
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, "Engine.uasset"), "engine content");
+        environment[ENGINE_CONTENT_DIR_ENV] = dir;
+        // A version the fallbacks carry: coupling it to the decoder would then show as the first attempt.
+        environment[ENGINE_CONTENT_VERSION_ENV] = "5.6";
+      }
+
+      const report = await importUnrealDirectory({
+        sourceDir: workspace.sourceDir,
+        outputDir: workspace.outputDir,
+        environment,
+        umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+        modernConverter: { name: "modern", path: converter, version: "Test engine profiles" },
+        onlyPackages: ["SM_Rock"],
+        ...(options.formatHint === undefined ? {} : { formatHint: options.formatHint }),
+      });
+      const runs = (await readFile(argvLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
+      return {
+        engines: runs.map((argv) => (argv.includes("--engine") ? argv[argv.indexOf("--engine") + 1]! : "auto")),
+        report,
+      };
+    }
+
+    it("runs the hinted profile first and stops once it decodes", async () => {
+      const run = await importUe5StaticMesh({ formatHint: "UE_5.0", succeedOn: "5.0" });
+      expect(run.engines).toEqual(["5.0"]);
+      expect(run.report.failed).toEqual([]);
+      expect(run.report.models[0]).toMatchObject({ name: "SM_Rock" });
+    });
+
+    it("retries a profile mismatch under auto, not under the hinted profile again", async () => {
+      const run = await importUe5StaticMesh({ formatHint: "UE_5.1", succeedOn: "auto" });
+      expect(run.engines).toEqual(["5.1", "auto"]);
+    });
+
+    it("walks auto and then the fallbacks in order, without repeating the hinted profile", async () => {
+      const run = await importUe5StaticMesh({ formatHint: "UE_5.7", succeedOn: "5.0" });
+      expect(run.engines).toEqual(["5.7", "auto", "5.6", "5.5", "5.4", "5.3", "5.2", "5.1", "5.0"]);
+    });
+
+    it("keeps the unhinted order when the hint is missing or names no fallback profile", async () => {
+      for (const formatHint of [undefined, "UE_4.18", "UE_5.8"]) {
+        const run = await importUe5StaticMesh({ ...(formatHint === undefined ? {} : { formatHint }), succeedOn: "5.6" });
+        expect(run.engines, formatHint).toEqual(["auto", "5.7", "5.6"]);
+      }
+    });
+
+    it("does not retry a failure that is not a profile mismatch", async () => {
+      // Not repeated under auto: the converter's failure is reported, and UE Viewer supplies the mesh.
+      const run = await importUe5StaticMesh({ formatHint: "UE_5.1", succeedOn: "auto", unrelated: true });
+      expect(run.engines).toEqual(["5.1"]);
+      expect(run.report.warnings.join("\n")).toMatch(/modern UE5 asset converter exited 1/);
+    });
+
+    it("never takes the engine content version as the decoder hint", async () => {
+      const hinted = await importUe5StaticMesh({ formatHint: "UE_5.1", succeedOn: "auto", engineContent: true });
+      expect(hinted.engines).toEqual(["5.1", "auto"]);
+      expect(hinted.report.failed).toEqual([]);
+      const unhinted = await importUe5StaticMesh({ succeedOn: "auto", engineContent: true });
+      expect(unhinted.engines).toEqual(["auto"]);
+    });
+
+    /** Every converter run, in order, as its argv (the argv log holds one JSON array per line). */
+    async function converterRuns(argvLog: string): Promise<string[][]> {
+      return (await readFile(argvLog, "utf8").catch(() => ""))
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as string[]);
+    }
+
+    /** The `--engine` a run was given, `auto` for a run given none. */
+    function engineOf(argv: readonly string[]): string {
+      return argv.includes("--engine") ? argv[argv.indexOf("--engine") + 1]! : "auto";
+    }
+
+    /** The `--filter` selector a run was given, when it was given one. */
+    function filterOf(argv: readonly string[]): string | undefined {
+      return argv.includes("--filter") ? argv[argv.indexOf("--filter") + 1] : undefined;
+    }
+
+    /** The `--engine` of the first run each `--filter` selector was given. */
+    function firstEngineByFilter(runs: readonly string[][]): Record<string, string> {
+      const first: Record<string, string> = {};
+      for (const argv of runs) {
+        const filter = filterOf(argv);
+        if (filter !== undefined && first[filter] === undefined) first[filter] = engineOf(argv);
+      }
+      return first;
+    }
+
+    /** A package head: the magic, the legacy version (-9 for UE 5, -7 for UE 4) and a NUL-terminated name table. */
+    function packageHead(legacyVersion: -7 | -9, names: readonly string[]): Buffer {
+      const header = Buffer.alloc(32);
+      header.writeUInt32LE(0x9e2a83c1, 0);
+      header.writeInt32LE(legacyVersion, 4);
+      return Buffer.concat([header, Buffer.from(names.map((name) => `${name}\0`).join(""))]);
+    }
+
+    /** A GLB of one rock mesh, the file a converter run copies out as `Meshes/SM_Rock.glb`. */
+    async function rockGlb(): Promise<string> {
+      const root = await temporaryDirectory();
+      await writeMeshFixture(join(root, "exported"), {
+        name: "SM_Rock",
+        materialName: "M_Rock",
+        mat: ROCK_MAT,
+        props: ROCK_PROPS,
+        textures: ["T_Rock_D_R", "T_Rock_N", "T_Rock_Extra"],
+      });
+      await new NodeIO().write(join(root, "SM_Rock.glb"), await new NodeIO().read(join(root, "exported", "SM_Rock.gltf")));
+      return join(root, "SM_Rock.glb");
+    }
+
+    /** A PNG a converter run copies out as `Textures/T_Modern.png`. */
+    async function texturePng(): Promise<string> {
+      const root = await temporaryDirectory();
+      await writePng(join(root, "T_Modern.png"), [200, 120, 40, 255]);
+      return join(root, "T_Modern.png");
+    }
+
+    interface ConverterPack {
+      readonly root: string;
+      readonly sourceDir: string;
+      readonly outputDir: string;
+      readonly environment: NodeJS.ProcessEnv;
+      readonly umodel: { readonly name: "umodel"; readonly path: string; readonly version: string };
+      readonly modernConverter: { readonly name: "modern"; readonly path: string; readonly version: string };
+      readonly argvLog: string;
+    }
+
+    /**
+     * A pack of exactly `packages`, so every converter run is one of their own. UE Viewer lists `classes` (none by default),
+     * and `listExitCode` 1 fails its listing, which leaves a UE 5 package to the modern converter. The modern converter
+     * succeeds on `succeedOn`, copying `outputs` into the run's export directory.
+     */
+    async function packOf(options: {
+      readonly packages: Readonly<Record<string, Buffer>>;
+      readonly succeedOn: string | readonly string[];
+      readonly outputs?: readonly { readonly path: string; readonly fixture: string }[];
+      readonly classes?: Readonly<Record<string, readonly string[]>>;
+      readonly listExitCode?: number;
+      readonly exportExitCode?: number;
+    }): Promise<ConverterPack> {
+      const root = await temporaryDirectory();
+      const sourceDir = join(root, "pack");
+      for (const [relative, bytes] of Object.entries(options.packages)) {
+        await mkdir(dirname(join(sourceDir, relative)), { recursive: true });
+        await writeFile(join(sourceDir, relative), bytes);
+      }
+      await mkdir(join(root, "exported"), { recursive: true });
+      const umodel = join(root, "umodel");
+      await writeFakeUmodel(umodel, {
+        exportFrom: join(root, "exported"),
+        classes: options.classes ?? {},
+        listExitCode: options.listExitCode ?? 1,
+        ...(options.exportExitCode === undefined ? {} : { exportExitCode: options.exportExitCode }),
+      });
+      const argvLog = join(root, "converter-argv.log");
+      const converter = await writeEngineProfileConverter(join(root, "modern-converter"), {
+        argvLog,
+        succeedOn: options.succeedOn,
+        outputs: options.outputs ?? [],
+      });
+      return {
+        root,
+        sourceDir,
+        outputDir: join(root, "game", "assets", "fab", "pack"),
+        environment: {
+          ...process.env,
+          THREENATIVE_UMODEL_PATH: umodel,
+          THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache"),
+          THREENATIVE_TOOLCHAIN_AUTOINSTALL: "0",
+        },
+        umodel: { name: "umodel", path: umodel, version: "Test" },
+        modernConverter: { name: "modern", path: converter, version: "Test engine profiles" },
+        argvLog,
+      };
+    }
+
+    /** One import of `pack`, into its own output directory unless another is named. */
+    function importPack(
+      pack: ConverterPack,
+      options: { readonly outputDir?: string; readonly formatHint?: string; readonly engine?: string } = {},
+    ) {
+      return importUnrealDirectory({
+        sourceDir: pack.sourceDir,
+        outputDir: options.outputDir ?? pack.outputDir,
+        environment: pack.environment,
+        umodel: pack.umodel,
+        modernConverter: pack.modernConverter,
+        ...(options.formatHint === undefined ? {} : { formatHint: options.formatHint }),
+        ...(options.engine === undefined ? {} : { engine: options.engine }),
+      });
+    }
+
+    /**
+     * A modern converter whose PNG route fails on an RGBA16F texture's encoding, the failure the raw route answers, and whose
+     * `--data-texture` route refuses the texture. Neither answer is a profile mismatch, so each route makes one run.
+     */
+    function rgba16fRefusalScript(argvLog: string): string {
+      return `#!/usr/bin/env node
+"use strict";
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(argv) + "\\n");
+if (argv.includes("--data-texture")) {
+  process.stderr.write("threenative-texture-failure T_Modern: the raw route refuses this fixture\\n");
+  process.exit(1);
+}
+process.stderr.write("threenative-texture-failure T_Modern: no decodable pixel data; platformFormat=PF_FloatRGBA, mips=1, firstMipBulk=-1, compression=TC_Default, srgb=True, sourceFormat=TSF_RGBA16F, sourceCompression=TSCF_None, editorPayload=none, exportErrors=[], payload=[]\\n");
+process.exit(1);
+`;
+    }
+
+    /** A UE 4 texture whose UE Viewer export fails, so it reaches the standalone raw route. No converter run succeeds. */
+    function rawRoutePack(): Promise<ConverterPack> {
+      return packOf({
+        packages: { "Content/Game/T_Standalone.uasset": packageHead(-7, ["Texture2D", "Default__Texture2D", "TextureSource"]) },
+        classes: { T_Standalone: ["Texture2D"] },
+        listExitCode: 0,
+        exportExitCode: 1,
+        succeedOn: [],
+      });
+    }
+
+    it("keys the cache by the effective hint, so a changed profile is never answered by another profile's decode", async () => {
+      const pack = await packOf({
+        packages: { "Content/Game/SM_Rock.uasset": packageHead(-9, ["StaticMesh", "Default__StaticMesh"]) },
+        succeedOn: ["auto", "5.0", "5.1"],
+        outputs: [{ path: "Meshes/SM_Rock.glb", fixture: await rockGlb() }],
+      });
+      const first = await importPack(pack, { formatHint: "UE_5.1" });
+      expect(first.reused).toBe(false);
+      expect((await converterRuns(pack.argvLog)).map(engineOf)).toEqual(["5.1"]);
+
+      // The identical hint answers from the import already in the output directory: no converter run.
+      expect((await importPack(pack, { formatHint: "UE_5.1" })).reused).toBe(true);
+      expect((await converterRuns(pack.argvLog)).map(engineOf)).toEqual(["5.1"]);
+
+      // A changed hint is a different import. This importer never overwrites one, so it is refused, not reused.
+      await expect(importPack(pack, { formatHint: "UE_5.0" })).rejects.toMatchObject({ code: "UNREAL_OUTPUT_COLLISION" });
+      expect((await converterRuns(pack.argvLog)).map(engineOf)).toEqual(["5.1"]);
+
+      // In a new output directory the changed profile decodes again, with its own profile first.
+      const changed = await importPack(pack, { formatHint: "UE_5.0", outputDir: join(pack.root, "changed") });
+      expect(changed.reused).toBe(false);
+      expect((await converterRuns(pack.argvLog)).map(engineOf)).toEqual(["5.1", "5.0"]);
+
+      // A hint that names no fallback profile has the identity of no hint: the unhinted import answers both.
+      const plain = await importPack(pack, { outputDir: join(pack.root, "plain") });
+      expect(plain.reused).toBe(false);
+      expect((await importPack(pack, { formatHint: "UE_4.18", outputDir: join(pack.root, "plain") })).reused).toBe(true);
+      expect((await importPack(pack, { formatHint: "UE_5.8", outputDir: join(pack.root, "plain") })).reused).toBe(true);
+      expect((await importPack(pack, { formatHint: "not-an-engine", outputDir: join(pack.root, "plain") })).reused).toBe(true);
+      expect((await converterRuns(pack.argvLog)).map(engineOf)).toEqual(["5.1", "5.0", "auto"]);
+    });
+
+    it("reads a hint with surrounding whitespace as the supported hint it names: the same first profile, the same cache identity", async () => {
+      const pack = await packOf({
+        packages: { "Content/Game/SM_Rock.uasset": packageHead(-9, ["StaticMesh", "Default__StaticMesh"]) },
+        succeedOn: ["auto", "5.0", "5.1"],
+        outputs: [{ path: "Meshes/SM_Rock.glb", fixture: await rockGlb() }],
+      });
+      expect((await importPack(pack, { formatHint: "UE_5.1" })).reused).toBe(false);
+      expect((await importPack(pack, { formatHint: " UE_5.1\n" })).reused).toBe(true);
+      const padded = await importPack(pack, { formatHint: "\tUE_5.0 ", outputDir: join(pack.root, "padded") });
+      expect(padded.reused).toBe(false);
+      expect((await converterRuns(pack.argvLog)).map(engineOf)).toEqual(["5.1", "5.0"]);
+    });
+
+    it("hands the hint to each same-named mesh, decoded again on its own, before any fallback", async () => {
+      const pack = await packOf({
+        packages: {
+          "Content/Game/Rocks/SM_Rock.uasset": packageHead(-9, ["StaticMesh", "Default__StaticMesh"]),
+          "Content/Game/Stones/SM_Rock.uasset": packageHead(-9, ["StaticMesh", "Default__StaticMesh"]),
+        },
+        succeedOn: "5.1",
+        outputs: [{ path: "Meshes/SM_Rock.glb", fixture: await rockGlb() }],
+      });
+      const report = await importPack(pack, { formatHint: "UE_5.1" });
+      const runs = await converterRuns(pack.argvLog);
+      // The batched run first, then one run per package that shares the name, each filtered to its own path.
+      expect(filterOf(runs[0]!)).toBeUndefined();
+      expect(runs.slice(1).map(filterOf).sort()).toEqual(["Content/Game/Rocks/SM_Rock", "Content/Game/Stones/SM_Rock"]);
+      expect(runs.map(engineOf)).toEqual(["5.1", "5.1", "5.1"]);
+      expect(report.failed).toEqual([]);
+    });
+
+    it("keeps auto first for every same-named mesh when the hint is missing or names no fallback profile", async () => {
+      for (const formatHint of [undefined, "UE_4.18", "UE_5.8"]) {
+        const pack = await packOf({
+          packages: {
+            "Content/Game/Rocks/SM_Rock.uasset": packageHead(-9, ["StaticMesh", "Default__StaticMesh"]),
+            "Content/Game/Stones/SM_Rock.uasset": packageHead(-9, ["StaticMesh", "Default__StaticMesh"]),
+          },
+          succeedOn: "auto",
+          outputs: [{ path: "Meshes/SM_Rock.glb", fixture: await rockGlb() }],
+        });
+        await importPack(pack, formatHint === undefined ? {} : { formatHint });
+        expect((await converterRuns(pack.argvLog)).map(engineOf), String(formatHint)).toEqual(["auto", "auto", "auto"]);
+      }
+    });
+
+    it("hands the hint to a standalone UE 5 texture, which is decoded on its own", async () => {
+      const pack = await packOf({
+        packages: { "Content/Game/T_Modern.uasset": packageHead(-9, ["Texture2D", "Default__Texture2D", "TextureSource"]) },
+        succeedOn: "5.1",
+        outputs: [{ path: "Textures/T_Modern.png", fixture: await texturePng() }],
+      });
+      const report = await importPack(pack, { formatHint: "UE_5.1" });
+      const runs = await converterRuns(pack.argvLog);
+      expect(runs.map(filterOf)).toEqual(["Content/Game/T_Modern"]);
+      expect(runs.map(engineOf)).toEqual(["5.1"]);
+      expect(report.failed).toEqual([]);
+    });
+
+    it("keeps auto first for a standalone UE 5 texture when the hint is missing or names no fallback profile", async () => {
+      for (const formatHint of [undefined, "UE_4.18", "UE_5.8"]) {
+        const pack = await packOf({
+          packages: { "Content/Game/T_Modern.uasset": packageHead(-9, ["Texture2D", "Default__Texture2D", "TextureSource"]) },
+          succeedOn: "auto",
+          outputs: [{ path: "Textures/T_Modern.png", fixture: await texturePng() }],
+        });
+        await importPack(pack, formatHint === undefined ? {} : { formatHint });
+        expect((await converterRuns(pack.argvLog)).map(engineOf), String(formatHint)).toEqual(["auto"]);
+      }
+    });
+
+    it("hands the hint to a standalone texture's raw route, which then walks the profiles the other decodes do", async () => {
+      const pack = await rawRoutePack();
+      // No run succeeds, so nothing is promoted; the argv is the evidence.
+      await expect(importPack(pack, { formatHint: "UE_5.1" })).rejects.toMatchObject({ code: "UNREAL_EXPORT_EMPTY" });
+      const runs = await converterRuns(pack.argvLog);
+      expect(runs.every((argv) => argv.includes("--data-texture"))).toBe(true);
+      expect(runs.map(engineOf)).toEqual(["5.1", "auto", "5.7", "5.6", "5.5", "5.4", "5.3", "5.2", "5.0"]);
+    });
+
+    it("keeps the single auto run of a standalone texture's raw route when the hint is missing or names no fallback profile", async () => {
+      for (const formatHint of [undefined, "UE_4.18"]) {
+        const pack = await rawRoutePack();
+        await expect(importPack(pack, formatHint === undefined ? {} : { formatHint })).rejects.toMatchObject({ code: "UNREAL_EXPORT_EMPTY" });
+        expect((await converterRuns(pack.argvLog)).map(engineOf), formatHint).toEqual(["auto"]);
+      }
+    });
+
+    it("keeps the request's own engine on a standalone texture's raw route, which the hint does not override", async () => {
+      const pack = await rawRoutePack();
+      await expect(importPack(pack, { engine: "UE_4.19", formatHint: "UE_5.1" })).rejects.toMatchObject({ code: "UNREAL_EXPORT_EMPTY" });
+      expect((await converterRuns(pack.argvLog)).map(engineOf)).toEqual(["4.19"]);
+    });
+
+    it("hands the hint to a UE 5 texture's raw RGBA16F route, which runs after its PNG route under the same profile", async () => {
+      const pack = await packOf({
+        packages: { "Content/Game/T_Modern.uasset": packageHead(-9, ["Texture2D", "Default__Texture2D", "TextureSource"]) },
+        succeedOn: [],
+      });
+      await writeFile(pack.modernConverter.path, rgba16fRefusalScript(pack.argvLog));
+      await chmod(pack.modernConverter.path, 0o755);
+      const route = (argv: readonly string[]) => (argv.includes("--data-texture") ? "raw" : "png");
+      await expect(importPack(pack, { formatHint: "UE_5.1" })).rejects.toMatchObject({ code: "UNREAL_EXPORT_EMPTY" });
+      expect((await converterRuns(pack.argvLog)).map((argv) => [route(argv), engineOf(argv)])).toEqual([["png", "5.1"], ["raw", "5.1"]]);
+
+      await expect(importPack(pack, { outputDir: join(pack.root, "plain") })).rejects.toMatchObject({ code: "UNREAL_EXPORT_EMPTY" });
+      expect((await converterRuns(pack.argvLog)).slice(2).map((argv) => [route(argv), engineOf(argv)])).toEqual([["png", "auto"], ["raw", "auto"]]);
+    });
+
+    it("hands the hint to every other modern decode, so each package's first run carries it", async () => {
+      const packages = {
+        "Content/Game/S_Hit.uasset": packageHead(-9, ["SoundWave", "Default__SoundWave", "AssetImportData"]),
+        "Content/Game/TC_Sky.uasset": packageHead(-9, ["TextureCube", "Default__TextureCube", "AssetImportData"]),
+        "Content/Game/DT_Items.uasset": packageHead(-9, ["DataTable", "Default__DataTable"]),
+        "Content/Game/VT_Volume.uasset": packageHead(-9, ["VolumeTexture", "Default__VolumeTexture"]),
+        "Content/Game/MI_Rock.uasset": packageHead(-9, ["MaterialEditorOnlyData", "Default__MaterialInstanceConstant"]),
+        "Content/Game/BP_Prefab.uasset": packageHead(-9, ["BlueprintGeneratedClass", "SimpleConstructionScript", "Default__BP_Prefab_C"]),
+        "Content/Game/L_Test.umap": packageHead(-9, ["PersistentLevel", "WorldSettings"]),
+        "Content/Game/PS_Sprite.uasset": packageHead(-9, ["PaperSprite", "Default__PaperSprite"]),
+        // A font is also a Texture2D atlas, so its first run may be the texture route's; both routes carry the hint.
+        "Content/Game/F_Test.uasset": packageHead(-9, ["Font", "Texture2D", "Default__Font"]),
+      };
+      const pack = await packOf({
+        packages,
+        succeedOn: [],
+        classes: { PS_Sprite: ["PaperSprite"], F_Test: ["Font", "Texture2D"] },
+      });
+      // No decode succeeds, so nothing is promoted and the import is refused; the argv is the evidence.
+      await expect(importPack(pack, { formatHint: "UE_5.1" })).rejects.toMatchObject({ code: "UNREAL_EXPORT_EMPTY" });
+      const hinted = await converterRuns(pack.argvLog);
+      const selectors = ["S_Hit", "TC_Sky", "DT_Items", "VT_Volume", "MI_Rock", "BP_Prefab", "L_Test", "PS_Sprite", "F_Test"].map((name) => `Content/Game/${name}`);
+      expect(firstEngineByFilter(hinted)).toEqual(Object.fromEntries(selectors.map((selector) => [selector, "5.1"])));
+
+      await expect(importPack(pack, { outputDir: join(pack.root, "plain") })).rejects.toMatchObject({ code: "UNREAL_EXPORT_EMPTY" });
+      const plain = (await converterRuns(pack.argvLog)).slice(hinted.length);
+      expect(firstEngineByFilter(plain)).toEqual(Object.fromEntries(selectors.map((selector) => [selector, "auto"])));
+    });
+  });
+
   it("keeps the actionable .usmap diagnostic when the modern converter prints a stack trace", async () => {
     const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
     const sourceMesh = join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset");
@@ -1540,11 +1968,14 @@ process.exit(1);
       Buffer.concat([header, Buffer.from("AssetImportData\0Texture2D\0MaterialInstanceConstant\0")]),
     );
 
+    const modern = join(workspace.sourceDir, "..", "modern-converter");
+    await writeFakeModernMaterialConverter(modern);
     const report = await importUnrealDirectory({
       sourceDir: workspace.sourceDir,
       outputDir: workspace.outputDir,
       environment: workspace.environment,
       umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: modern, version: "fake-converter 1" },
       onlyPackages: ["SM_Rock", "MI_Rock"],
     });
 
@@ -2674,11 +3105,14 @@ for (const face of Object.keys(faces)) {
     });
     await writeFile(join(workspace.sourceDir, "Content", "Game", "M_Glass.uasset"), "glass");
 
+    const modern = join(workspace.sourceDir, "..", "modern-converter");
+    await writeFakeModernMaterialConverter(modern, { emptyExports: ["M_Glass"] });
     const report = await importUnrealDirectory({
       sourceDir: workspace.sourceDir,
       outputDir: workspace.outputDir,
       environment: workspace.environment,
       umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: modern, version: "fake-converter 1" },
     });
 
     expect(report.counts).toMatchObject({ materialAssets: 1, failed: 0 });
@@ -2710,7 +3144,7 @@ for (const face of Object.keys(faces)) {
     expect(interleavedBufferViews(await readFile(join(workspace.outputDir, model.glb)))).toBe(0);
   });
 
-  it("drops UE Viewer's all-zero tangents and its lightmap UV sets", async () => {
+  it("drops UE Viewer's all-zero tangents and keeps its lightmap UV sets", async () => {
     const workspace = await unrealWorkspace({ degenerateTangents: true });
     const report = await importUnrealDirectory({
       sourceDir: workspace.sourceDir,
@@ -2719,15 +3153,16 @@ for (const face of Object.keys(faces)) {
       umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
     });
     expect(report.warnings.join(" ")).toMatch(/zero-length TANGENT/);
-    expect(report.warnings.join(" ")).toMatch(/extra UV channels/);
+    expect(report.warnings.join(" ")).not.toMatch(/extra UV channels/);
 
     const model = report.models[0];
     if (!model) throw new Error("expected one model");
     const document = await new NodeIO().read(join(workspace.outputDir, model.glb));
     const primitive = document.getRoot().listMeshes()[0]?.listPrimitives()[0];
     expect(primitive?.getAttribute("TANGENT")).toBeNull();
-    expect(primitive?.getAttribute("TEXCOORD_1")).toBeNull();
-    expect(primitive?.getAttribute("TEXCOORD_0")).not.toBeNull();
+    // Both sets are authored source data and carry their exact values; the fixture's UV1 equals its UV0.
+    expect(Array.from(primitive?.getAttribute("TEXCOORD_0")?.getArray() ?? [])).toEqual([0, 0, 1, 0, 0, 1]);
+    expect(Array.from(primitive?.getAttribute("TEXCOORD_1")?.getArray() ?? [])).toEqual([0, 0, 1, 0, 0, 1]);
   });
 
   it("renames a section UE Viewer could not resolve and never calls it textured", async () => {
@@ -2800,7 +3235,7 @@ for (const face of Object.keys(faces)) {
         environment: workspace.environment,
         umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
       }),
-    ).rejects.toThrow(/No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene/);
+    ).rejects.toThrow(/No package produced a valid model, texture, RGBA16F data texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene/);
     await expect(stat(workspace.outputDir)).rejects.toThrow();
   });
 

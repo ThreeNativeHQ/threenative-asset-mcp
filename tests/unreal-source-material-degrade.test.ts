@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { importUnrealDirectory } from "../src/unreal/importer.js";
-import { writeFakeUmodel, writeMeshFixture } from "./helpers/unreal-fixture.js";
+import { writeFakeModernMaterialConverter, writeFakeUmodel, writeMeshFixture } from "./helpers/unreal-fixture.js";
 import { float, input, materialPackage, subsetInstance, subsetMaster } from "./helpers/unreal-material-source.js";
 
 const directories: string[] = [];
@@ -35,7 +35,8 @@ it.each(Object.keys(corruptions) as (keyof typeof corruptions)[])("degrades an u
   }
   const tool = join(directory, "umodel");
   await writeFakeUmodel(tool, { exportFrom: fixture, emptyExports: ["Master", "Instance", "Bad"], classes: { MeshBadOne: ["StaticMesh"], MeshBadTwo: ["StaticMesh"], MeshGood: ["StaticMesh"], Master: ["Material"], Instance: ["MaterialInstanceConstant"], Bad: [kind === "parent cycle" ? "MaterialInstanceConstant" : "Material"] } });
-  const report = await importUnrealDirectory({ sourceDir, outputDir, concurrency: 1, graphBake: false, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" } });
+  const modern = join(directory, "modern-converter"); await writeFakeModernMaterialConverter(modern);
+  const report = await importUnrealDirectory({ sourceDir, outputDir, concurrency: 1, graphBake: false, freeSpaceBytes: 30_000_000_000, umodel: { name: "umodel", path: tool, version: "fixture" }, modernConverter: { name: "modern", path: modern, version: "fake-converter 1" } });
   expect(report.failed).toEqual([]);
   expect(report.models.map((m) => m.name).sort()).toEqual(["MeshBadOne", "MeshBadTwo", "MeshGood"]);
   for (const name of ["MeshBadOne", "MeshBadTwo"]) {

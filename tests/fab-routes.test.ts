@@ -34,11 +34,12 @@ describe("dumpEngineArg", () => {
     expect(dumpEngineArg("UE_4.27")).toBe("4.27");
     expect(dumpEngineArg("UE_5.0")).toBe("5.0");
     expect(dumpEngineArg("UE_5.7")).toBe("5.7");
+    expect(dumpEngineArg("UE_5.8")).toBe("5.8");
   });
 
   it("returns undefined for versions it does not accept", () => {
     expect(dumpEngineArg("UE_4.28")).toBeUndefined();
-    expect(dumpEngineArg("UE_5.8")).toBeUndefined();
+    expect(dumpEngineArg("UE_5.9")).toBeUndefined();
     expect(dumpEngineArg("UE_6.0")).toBeUndefined();
     expect(dumpEngineArg("junk")).toBeUndefined();
   });

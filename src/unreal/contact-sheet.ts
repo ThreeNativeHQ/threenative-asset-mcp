@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createServer, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -10,6 +11,14 @@ import { createBrowserTempDir } from "../browser-temp.js";
 import { measureFidelity, withoutFloorShadow, type FidelityMetrics } from "./render-fidelity.js";
 import { colourSimilarity, decodeRgba, maskFillRatio, objectMask, type RgbaImage } from "./image-diff.js";
 import { judgeRender, type JudgeStats, type Verdict } from "./visual-judge.js";
+import {
+  applyThumbnailReferenceLighting,
+  assertThumbnailSourceRadiance,
+  prepareThumbnailSourceEnvironment,
+  type ThumbnailEnvironmentSource,
+  type ThumbnailSourceRadiance,
+} from "./thumbnail-lighting.js";
+import { createThumbnailReferenceFloor, type ThumbnailGridSource, type ThumbnailSourceGrid } from "./thumbnail-floor.js";
 
 const require = createRequire(import.meta.url);
 const THREE_ROOT = dirname(dirname(require.resolve("three")));
@@ -19,6 +28,57 @@ const HEADER = 30;
 const CAPTION = 84;
 const BACKGROUND = { r: 128, g: 128, b: 128 };
 const PANEL = { r: 30, g: 31, b: 36 };
+
+/**
+ * How the sheet's picture (the "AFTER IMPORT" tile) is lit. `neutral` is the flat three.js light the metrics are
+ * measured under. `unreal-like` uses UE 4.19.2's three world-space reference directions/intensities, the old approximate
+ * hemisphere fill and source floor math over a procedural checker approximation. This hybrid lacks the authored cubemap
+ * and Grid pixels; the saved editor/config and camera are unknown, and Three shadows differ. The judge's numbers are always
+ * measured on the `neutral` render.
+ */
+export type PictureLighting = "neutral" | "unreal-like";
+/** The fixed camera every render pass shares (so a change of lighting is the only difference between passes). */
+export const PICTURE_CAMERA = Object.freeze({ fov: 40, direction: [1, 0.75, 1.2] as const, fit: 1.05 });
+/**
+ * Renderer state of every `unreal-like` picture pass: UE 4.19 filmic at exposure 1, approximated by Three's ACES, and the primary's
+ * requested PCFSoftShadowMap (Three 0.185.1 renders this as PCFShadowMap). The page consumes these configured values.
+ */
+export const PICTURE_RENDERER = Object.freeze({ toneMapping: "ACESFilmicToneMapping", toneMappingExposure: 1, shadowMapType: "PCFSoftShadowMap" });
+/**
+ * Revision of the `unreal-like` picture contract: its lights, camera, tone mapping, floor and source handling. Bump it whenever
+ * one of those changes, so a stored picture is never taken for one this renderer would draw (`preview-reference-workflow.ts`).
+ */
+export const PICTURE_CONTRACT_REVISION = 1;
+
+/**
+ * Source metadata of the environment that actually lit a picture, with a digest of the radiance it was given. The
+ * radiance itself is never reported. Provenance is the caller's claim, not verified here.
+ */
+export interface SourceEnvironmentReport {
+  readonly source: ThumbnailEnvironmentSource;
+  readonly width: number;
+  readonly height: number;
+  /** SHA-256 of the decoded radiance as supplied (float32 bytes, before orientation or intensity). */
+  readonly radianceSha256: string;
+  /** Orientation and intensity the browser applied (`prepareThumbnailSourceEnvironment`). */
+  readonly rotationY: number;
+  readonly intensity: number;
+  /** The approximations the browser applied, stated as the helper states them (PMREM and radiometry are not exact UE). */
+  readonly limitations: readonly string[];
+}
+
+/**
+ * The Grid the picture's floor sampled, with a digest of its RGBA8 bytes as supplied. Only dimensions and the three provenance fields
+ * are reported, never the pixels. Present only when the Grid was applied; `limitations` are the approximations the browser stated.
+ */
+export interface SourceGridReport {
+  readonly source: ThumbnailGridSource;
+  readonly width: number;
+  readonly height: number;
+  /** SHA-256 of the RGBA8 bytes as supplied (before the browser saw them). */
+  readonly rgbaSha256: string;
+  readonly limitations: readonly string[];
+}
 
 export interface ContactSheetOptions {
   /** One imported GLB per entry; the file name (without `.glb`) is the tile label. */
@@ -48,6 +108,30 @@ export interface ContactSheetOptions {
    * fidelity metric. Derived from licensed packs: local-only, never commit.
    */
   dumpTilesDir?: string;
+  /**
+   * Lighting of the sheet's picture only. `neutral` (default) keeps every existing caller and golden unchanged.
+   * `unreal-like` adds a supersampled picture with three UE 4.19.2 reference lights plus approximate hemisphere fill
+   * (authored cubemap absent, or the supplied `sourceEnvironment` in its place), and source floor math with a procedural
+   * Grid approximation; the judge's metrics stay on the neutral render.
+   */
+  pictureLighting?: PictureLighting;
+  /**
+   * Deterministic test seam: tile indices the `unreal-like` pass must fail, so a tile that rendered in the neutral
+   * pass but fails the lit pass is reported instead of silently drawn blank. Never set in production.
+   */
+  litFailureProbe?: readonly number[];
+  /**
+   * Caller-supplied decoded linear HDR radiance that lights the `unreal-like` picture in place of the hemisphere fill.
+   * Never fetched or guessed here. It is refused before any file is read or browser starts when malformed, and it is
+   * ignored under `neutral` lighting, so the neutral sheet and judge stay byte-identical.
+   */
+  sourceEnvironment?: ThumbnailSourceRadiance;
+  /**
+   * Caller-supplied RGBA8 pixels of the Grid material that the `unreal-like` floor samples in place of the procedural checker. Never
+   * fetched or guessed here. Refused before any file is read or browser starts when malformed, and ignored under `neutral` lighting,
+   * so the neutral sheet and judge stay byte-identical.
+   */
+  sourceGrid?: ThumbnailSourceGrid;
 }
 
 export interface TileJudgement {
@@ -82,6 +166,10 @@ export interface ContactSheetResult {
   judgeSummary: { ok: number; suspect: number; fail: number };
   /** Pieces drawn with an Unreal thumbnail beside them. */
   thumbnailsShown: number;
+  /** Present only when a supplied source environment lit the picture. */
+  sourceEnvironment?: SourceEnvironmentReport;
+  /** Present only when a supplied source Grid was applied to the picture's floor. */
+  sourceGrid?: SourceGridReport;
 }
 
 interface Candidate {
@@ -166,8 +254,136 @@ function serve(response: ServerResponse, bytes: Uint8Array, type: string): void 
   response.end(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
 }
 
-function pageHtml(tileSize: number, count: number, columns: number, rows: number, supersample: number): string {
-  const payload = JSON.stringify({ tile: tileSize, count, columns, rows, ss: supersample });
+/** Served from one fixed path on a render's ephemeral localhost server; the radiance never appears in the page. */
+const ENVIRONMENT_RADIANCE_PATH = "/environment/radiance.f32";
+
+/** A validated private copy of a caller's radiance: the only form the browser is ever given. */
+interface SourceEnvironmentSnapshot {
+  readonly width: number;
+  readonly height: number;
+  readonly rgb: Float32Array;
+  readonly source: ThumbnailEnvironmentSource;
+  readonly radianceSha256: string;
+}
+
+/** What the browser reports after `prepareThumbnailSourceEnvironment` ran on the snapshot. */
+interface AppliedSourceEnvironment {
+  readonly rotationY: number;
+  readonly intensity: number;
+  readonly limitations: readonly string[];
+}
+
+/**
+ * Refuses a bad environment before any browser starts. It copies first and validates the copy, so the bytes served and
+ * digested are exactly the bytes that passed. Only the declared source fields are copied, by value: a spread would carry
+ * any extra key (an array, say) into the report and the page. Synchronous: callers take the snapshot before their first await.
+ */
+function snapshotSourceEnvironment(input: ThumbnailSourceRadiance): SourceEnvironmentSnapshot {
+  if (!(input.rgb instanceof Float32Array)) throw new Error("source environment radiance must be a Float32Array");
+  // A missing source reads as undefined fields, so the provenance validation (not a TypeError) refuses it.
+  const { reference, engine, bytesSha256, layout, radianceDecode } = (input.source ?? {}) as Partial<ThumbnailEnvironmentSource>;
+  const snapshot = {
+    width: input.width,
+    height: input.height,
+    rgb: new Float32Array(input.rgb),
+    source: Object.freeze({ reference, engine, bytesSha256, layout, radianceDecode }) as ThumbnailEnvironmentSource,
+  };
+  assertThumbnailSourceRadiance(snapshot);
+  const bytes = new Uint8Array(snapshot.rgb.buffer, snapshot.rgb.byteOffset, snapshot.rgb.byteLength);
+  return { ...snapshot, radianceSha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
+function describeSourceEnvironment(snapshot: SourceEnvironmentSnapshot, applied: AppliedSourceEnvironment): SourceEnvironmentReport {
+  return {
+    source: { ...snapshot.source },
+    width: snapshot.width,
+    height: snapshot.height,
+    radianceSha256: snapshot.radianceSha256,
+    rotationY: applied.rotationY,
+    intensity: applied.intensity,
+    limitations: [...applied.limitations],
+  };
+}
+
+/** Served from the same ephemeral server as the radiance, from its own fixed path: the Grid bytes never appear in the page. */
+const GRID_RGBA_PATH = "/grid/source.rgba";
+
+/** A validated private copy of a caller's Grid pixels: the only form the browser is ever given. */
+interface SourceGridSnapshot {
+  readonly width: number;
+  readonly height: number;
+  readonly rgba: Uint8Array;
+  readonly source: ThumbnailGridSource;
+  readonly rgbaSha256: string;
+}
+
+/** What the browser reports after the floor was built on the snapshot. */
+interface AppliedSourceGrid {
+  readonly limitations: readonly string[];
+}
+
+/**
+ * Refuses a bad Grid before any browser starts. It copies first and validates the copy, so the bytes served and digested are exactly
+ * the bytes that passed. Only the three declared provenance fields are copied: an extra key never reaches the page or the report.
+ * Synchronous: callers take the snapshot before their first await.
+ */
+function snapshotSourceGrid(input: ThumbnailSourceGrid): SourceGridSnapshot {
+  if (!(input.rgba instanceof Uint8Array)) throw new Error("source Grid rgba must be a Uint8Array");
+  const { width, height } = input;
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 || input.rgba.length !== width * height * 4) {
+    throw new Error("source Grid needs positive whole dimensions and exactly width*height*4 RGBA8 bytes");
+  }
+  // A missing source reads as undefined fields, so the provenance check (not a TypeError) refuses it.
+  const { reference, engine, bytesSha256 } = (input.source ?? {}) as Partial<ThumbnailGridSource>;
+  if (typeof reference !== "string" || !reference || typeof engine !== "string" || !engine || typeof bytesSha256 !== "string" || !/^[a-f0-9]{64}$/i.test(bytesSha256)) {
+    throw new Error("source Grid needs a reference, engine and SHA-256 provenance");
+  }
+  const rgba = new Uint8Array(input.rgba);
+  return {
+    width,
+    height,
+    rgba,
+    source: Object.freeze({ reference, engine, bytesSha256 }),
+    rgbaSha256: createHash("sha256").update(rgba).digest("hex"),
+  };
+}
+
+function describeSourceGrid(snapshot: SourceGridSnapshot, applied: AppliedSourceGrid): SourceGridReport {
+  return {
+    source: { ...snapshot.source },
+    width: snapshot.width,
+    height: snapshot.height,
+    rgbaSha256: snapshot.rgbaSha256,
+    limitations: [...applied.limitations],
+  };
+}
+
+function pageHtml(
+  tileSize: number,
+  count: number,
+  columns: number,
+  rows: number,
+  supersample: number,
+  lighting: PictureLighting,
+  shadows: boolean,
+  litFailureProbe: readonly number[],
+  environment: SourceEnvironmentSnapshot | undefined,
+  grid: SourceGridSnapshot | undefined,
+): string {
+  // Only dimensions and provenance are serialized; `<` is escaped so caller-supplied strings cannot close the script.
+  const payload = JSON.stringify({
+    tile: tileSize,
+    count,
+    columns,
+    rows,
+    ss: supersample,
+    lighting,
+    shadows,
+    litFailureProbe,
+    environment: environment === undefined ? null : { width: environment.width, height: environment.height, source: environment.source },
+    renderer: PICTURE_RENDERER,
+    grid: grid === undefined ? null : { width: grid.width, height: grid.height, source: grid.source },
+  }).replace(/</g, "\\u003c");
   return `<!doctype html><html><body>
 <script type="importmap">{"imports":{"three":"/three.module.js","three/addons/":"/jsm/"}}</script>
 <script type="module">
@@ -176,17 +392,58 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 const options = ${payload};
 const size = options.tile;
+const lit = options.lighting === 'unreal-like';
+const shadows = options.shadows !== false;
+const applyThumbnailReferenceLighting = ${applyThumbnailReferenceLighting.toString()};
+const createThumbnailReferenceFloor = ${createThumbnailReferenceFloor.toString()};
+const assertThumbnailSourceRadiance = ${assertThumbnailSourceRadiance.toString()};
+const prepareThumbnailSourceEnvironment = ${prepareThumbnailSourceEnvironment.toString()};
 try {
   const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+  // UE4.19 thumbnail defaults enable filmic at exposure 1; Three ACES is an approximation, confined to the picture pass.
+  renderer.toneMapping = lit ? THREE[options.renderer.toneMapping] : THREE.NoToneMapping;
+  renderer.toneMappingExposure = options.renderer.toneMappingExposure;
   renderer.setPixelRatio(options.ss);
   renderer.setSize(size, size);
   renderer.setClearColor(0x808080, 1);
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x808080);
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.2));
-  const light = new THREE.DirectionalLight(0xffffff, 2.4);
-  light.position.set(2, 4, 3);
-  scene.add(light);
+  let key;
+  let referenceRig;
+  let referenceFloor;
+  let groundMaterial;
+  let sourceEnvironment;
+  let gridTexture;
+  if (lit) {
+    // Source reference directions/intensities; the old approximate hemisphere stands in unless a source environment is supplied.
+    if (options.environment) {
+      const response = await fetch('${ENVIRONMENT_RADIANCE_PATH}');
+      if (!response.ok) throw new Error('source environment fetch failed: ' + response.status);
+      sourceEnvironment = prepareThumbnailSourceEnvironment(THREE, { ...options.environment, rgb: new Float32Array(await response.arrayBuffer()) });
+    }
+    referenceRig = applyThumbnailReferenceLighting(THREE, scene, { shadows, sourceEnvironment });
+    key = referenceRig.primary;
+    if (shadows) {
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE[options.renderer.shadowMapType];
+    }
+    if (options.grid) {
+      // The Grid bytes come from their own fixed endpoint. The floor helper does the sRGB, repeat and filter setup; the caller owns the texture.
+      const response = await fetch('${GRID_RGBA_PATH}');
+      if (!response.ok) throw new Error('source Grid fetch failed: ' + response.status);
+      gridTexture = new THREE.DataTexture(new Uint8Array(await response.arrayBuffer()), options.grid.width, options.grid.height, THREE.RGBAFormat, THREE.UnsignedByteType);
+      gridTexture.flipY = false;
+      referenceFloor = createThumbnailReferenceFloor(THREE, { texture: gridTexture, source: options.grid.source });
+    } else {
+      referenceFloor = createThumbnailReferenceFloor(THREE);
+    }
+    groundMaterial = referenceFloor.material;
+  } else {
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.2));
+    const light = new THREE.DirectionalLight(0xffffff, 2.4);
+    light.position.set(2, 4, 3);
+    scene.add(light);
+  }
   const camera = new THREE.PerspectiveCamera(40, 1, 0.001, 100000);
   const loader = new GLTFLoader();
   loader.setMeshoptDecoder(MeshoptDecoder);
@@ -204,7 +461,9 @@ try {
     }
   });
   for (let i = 0; i < options.count; i++) {
+    let ground;
     try {
+      if (lit && options.litFailureProbe.includes(i)) throw new Error('lit failure probe');
       const gltf = await Promise.race([loader.loadAsync('/glb/' + i + '.glb'), timeout(30000)]);
       const model = gltf.scene;
       scene.add(model);
@@ -218,15 +477,48 @@ try {
       camera.position.copy(center).addScaledVector(direction, distance);
       camera.near = distance / 100; camera.far = distance * 10; camera.updateProjectionMatrix();
       camera.lookAt(center);
+      if (lit) {
+        // Ground, key light and shadow camera all scale to this model's bounds; nothing assumes a fixed unit size.
+        model.traverse((o) => { if (o.isMesh) { o.castShadow = shadows; o.receiveShadow = true; } });
+        // Large enough that its far edge stays outside the framing (a small plane's near edge showed as a triangle).
+        const groundSize = radius * 128;
+        ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), groundMaterial);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.set(center.x, box.min.y, center.z);
+        ground.receiveShadow = true;
+        // The material reads absolute world XZ in metres: its source period never follows object bounds.
+        scene.add(ground);
+        // Placement follows model bounds, but the three light directions never follow the camera.
+        referenceRig.place(center, radius);
+        if (shadows) {
+          const shadowCamera = key.shadow.camera;
+          const half = radius * 3;
+          shadowCamera.left = -half; shadowCamera.right = half;
+          shadowCamera.top = half; shadowCamera.bottom = -half;
+          shadowCamera.near = radius * 0.1; shadowCamera.far = radius * 24;
+          shadowCamera.updateProjectionMatrix();
+          key.shadow.normalBias = radius * 0.01;
+        }
+      }
       renderer.render(scene, camera);
       context.drawImage(renderer.domElement, (i % options.columns) * size, Math.floor(i / options.columns) * size, size, size);
+      if (ground) { scene.remove(ground); ground.geometry.dispose(); }
       scene.remove(model); dispose(model);
       tiles.push({ ok: true });
     } catch (error) {
+      if (ground) { scene.remove(ground); ground.geometry.dispose(); }
       tiles.push({ ok: false, error: String(error && error.message || error) });
     }
   }
-  window.__result = { ok: true, tiles, dataUrl: sheet.toDataURL('image/png') };
+  if (referenceFloor) referenceFloor.dispose();
+  // The floor helper never disposes a texture the caller supplied, so the Grid texture is released here, after the last render.
+  if (gridTexture) gridTexture.dispose();
+  if (sourceEnvironment) { scene.environment = null; sourceEnvironment.texture.dispose(); }
+  window.__result = {
+    ok: true, tiles, dataUrl: sheet.toDataURL('image/png'),
+    ...(sourceEnvironment ? { environment: { rotationY: sourceEnvironment.rotationY, intensity: sourceEnvironment.intensity, limitations: sourceEnvironment.limitations } } : {}),
+    ...(gridTexture ? { grid: { limitations: referenceFloor.limitations } } : {}),
+  };
 } catch (error) {
   window.__result = { ok: false, error: String(error) };
 }
@@ -244,6 +536,10 @@ function clip(text: string, max: number): string {
 interface RenderedGrid {
   png: Buffer;
   rendered: boolean[];
+  /** Present only when the lit pass was given a source environment and applied it. */
+  environment?: AppliedSourceEnvironment;
+  /** Present only when the lit pass was given a source Grid and applied it. */
+  grid?: AppliedSourceGrid;
 }
 
 async function renderGrid(
@@ -254,8 +550,18 @@ async function renderGrid(
   timeoutMs: number,
   /** Render at this multiple of the tile size and box-filter down (1 = the plain alpha-tested render). */
   supersample = 1,
+  /** Default `neutral`: the flat light the fidelity metrics are measured under. */
+  lighting: PictureLighting = "neutral",
+  /** Default true; only meaningful with `unreal-like` (the deterministic shadow control). */
+  shadows = true,
+  /** Deterministic test seam; tile indices the lit pass must fail. */
+  litFailureProbe: readonly number[] = [],
+  /** Validated radiance for the lit pass only; served from one fixed path, never embedded in the page. */
+  environment?: SourceEnvironmentSnapshot,
+  /** Validated Grid pixels for the lit pass only; served from their own fixed path, never embedded in the page. */
+  grid?: SourceGridSnapshot,
 ): Promise<RenderedGrid> {
-  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample), "utf8");
+  const html = Buffer.from(pageHtml(tile, selected.length, columns, rows, supersample, lighting, shadows, litFailureProbe, environment, grid), "utf8");
   const server = createServer((request, response) => {
     const url = (request.url ?? "/").split("?")[0]!;
     const glb = /^\/glb\/(\d+)\.glb$/.exec(url);
@@ -268,7 +574,11 @@ async function renderGrid(
         },
       );
     if (url === "/" || url === "/index.html") serve(response, html, "text/html");
-    else if (glb && selected[Number(glb[1])]) {
+    else if (environment !== undefined && url === ENVIRONMENT_RADIANCE_PATH) {
+      serve(response, new Uint8Array(environment.rgb.buffer, environment.rgb.byteOffset, environment.rgb.byteLength), "application/octet-stream");
+    } else if (grid !== undefined && url === GRID_RGBA_PATH) {
+      serve(response, grid.rgba, "application/octet-stream");
+    } else if (glb && selected[Number(glb[1])]) {
       void send(readFile(selected[Number(glb[1])]!.path), "model/gltf-binary");
     } else if (url.startsWith("/jsm/")) {
       void send(
@@ -311,13 +621,21 @@ async function renderGrid(
     );
     const raw = (await page.evaluate(
       () => (window as unknown as { __result: unknown }).__result,
-    )) as { ok: boolean; error?: string; tiles?: { ok: boolean }[]; dataUrl?: string };
+    )) as { ok: boolean; error?: string; tiles?: { ok: boolean }[]; dataUrl?: string; environment?: AppliedSourceEnvironment; grid?: AppliedSourceGrid };
     if (!raw.ok || raw.dataUrl === undefined) {
       throw new Error(`contact sheet render failed: ${raw.error ?? pageErrors.join("; ")}`);
+    }
+    if (environment !== undefined && raw.environment === undefined) {
+      throw new Error("contact sheet render did not apply the source environment");
+    }
+    if (grid !== undefined && raw.grid === undefined) {
+      throw new Error("contact sheet render did not apply the source Grid");
     }
     return {
       png: Buffer.from(raw.dataUrl.split(",")[1] ?? "", "base64"),
       rendered: (raw.tiles ?? []).map((entry) => entry.ok),
+      ...(raw.environment !== undefined ? { environment: raw.environment } : {}),
+      ...(raw.grid !== undefined ? { grid: raw.grid } : {}),
     };
   } finally {
     await browser?.close().catch(() => undefined);
@@ -333,6 +651,10 @@ export interface RenderedTiles {
   tiles: RgbaImage[];
   /** Whether each input rendered a model. */
   rendered: boolean[];
+  /** Present only when a supplied source environment lit these tiles. */
+  sourceEnvironment?: SourceEnvironmentReport;
+  /** Present only when a supplied source Grid was applied to these tiles' floor. */
+  sourceGrid?: SourceGridReport;
 }
 
 /**
@@ -348,6 +670,14 @@ export async function renderTiles(options: {
   readonly timeoutMs?: number;
   /** Render at this multiple of the tile and box-filter down; default 1. */
   readonly supersample?: number;
+  /** Default `neutral`, which is what the committed goldens are. `unreal-like` is a picture-only approximation. */
+  readonly lighting?: PictureLighting;
+  /** Default true; with `unreal-like`, false keeps the fill, key and ground but drops the cast shadow (a control). */
+  readonly shadows?: boolean;
+  /** Lights the `unreal-like` tiles in place of the hemisphere fill; see `ContactSheetOptions.sourceEnvironment`. */
+  readonly sourceEnvironment?: ThumbnailSourceRadiance;
+  /** Grid for the `unreal-like` floor in place of the procedural checker; see `ContactSheetOptions.sourceGrid`. */
+  readonly sourceGrid?: ThumbnailSourceGrid;
 }): Promise<RenderedTiles> {
   const tile = Math.max(16, Math.round(options.tile ?? 160));
   const paths = options.glbPaths;
@@ -359,12 +689,32 @@ export async function renderTiles(options: {
     score: 0,
     failed: false,
   }));
-  const grid = await renderGrid(candidates, tile, columns, rows, options.timeoutMs ?? 180_000, options.supersample ?? 1);
+  // Taken before the browser starts; only the unreal-like tiles are lit by it.
+  const environment = options.sourceEnvironment === undefined ? undefined : snapshotSourceEnvironment(options.sourceEnvironment);
+  const sourceGrid = options.sourceGrid === undefined ? undefined : snapshotSourceGrid(options.sourceGrid);
+  const lighting = options.lighting ?? "neutral";
+  const grid = await renderGrid(
+    candidates,
+    tile,
+    columns,
+    rows,
+    options.timeoutMs ?? 180_000,
+    options.supersample ?? 1,
+    lighting,
+    options.shadows ?? true,
+    [],
+    lighting === "unreal-like" ? environment : undefined,
+    lighting === "unreal-like" ? sourceGrid : undefined,
+  );
   const decoded = await decodeRgba(grid.png);
   return {
     png: grid.png,
     rendered: grid.rendered,
     tiles: paths.map((_, index) => cutTile(decoded, tile, index % columns, Math.floor(index / columns))),
+    ...(environment !== undefined && grid.environment !== undefined
+      ? { sourceEnvironment: describeSourceEnvironment(environment, grid.environment) }
+      : {}),
+    ...(sourceGrid !== undefined && grid.grid !== undefined ? { sourceGrid: describeSourceGrid(sourceGrid, grid.grid) } : {}),
   };
 }
 
@@ -408,6 +758,10 @@ export async function renderContactSheet(
   const timeoutMs = options.timeoutMs ?? 180_000;
   const meshesTotal = options.glbPaths.length;
   const withThumbnails = options.thumbnails !== undefined;
+  const pictureLighting = options.pictureLighting ?? "neutral";
+  // Taken before any file is read or browser starts; only the unreal-like picture is lit by it.
+  const environment = options.sourceEnvironment === undefined ? undefined : snapshotSourceEnvironment(options.sourceEnvironment);
+  const sourceGrid = options.sourceGrid === undefined ? undefined : snapshotSourceGrid(options.sourceGrid);
 
   const all: Candidate[] = await Promise.all(
     options.glbPaths.map(async (path) => {
@@ -437,19 +791,41 @@ export async function renderContactSheet(
   let rendered: boolean[] = [];
   let gridPng: Buffer | undefined;
   let shapeGridPng: Buffer | undefined;
+  let pictureLightPng: Buffer | undefined;
+  let pictureEnvironment: AppliedSourceEnvironment | undefined;
+  let pictureGrid: AppliedSourceGrid | undefined;
   const loadable = selected.filter((c) => !c.failed);
   if (loadable.length > 0) {
     // Failed candidates are not sent to the browser; keep their cells blank in place.
     const cells = selected.map((c) => (c.failed ? { ...c, path: "" } : c));
     const grid = await renderGrid(cells, tile, columns, rows, timeoutMs);
     gridPng = grid.png;
+    const neutralRendered = grid.rendered.map((ok, index) => ok && !selected[index]!.failed);
     // An alpha-tested cut-out has hard edges at 1x while Unreal's thumbnail is anti-aliased, so thin needles read sparser
     // than they are. The silhouette-mass measure and the sheet picture use a 2x supersampled render; colour stays at 1x.
     if (withThumbnails) {
       const shape = await renderGrid(cells, tile, columns, rows, timeoutMs, SHAPE_SUPERSAMPLE);
       shapeGridPng = shape.png;
     }
-    rendered = grid.rendered.map((ok, index) => ok && !selected[index]!.failed);
+    // The lit picture is a separate supersampled pass; it never replaces the neutral pixels the judge measures.
+    if (pictureLighting === "unreal-like") {
+      const picture = await renderGrid(cells, tile, columns, rows, timeoutMs, SHAPE_SUPERSAMPLE, "unreal-like", true, options.litFailureProbe ?? [], environment, sourceGrid);
+      pictureLightPng = picture.png;
+      pictureEnvironment = picture.environment;
+      pictureGrid = picture.grid;
+      // A tile the neutral pass rendered but the lit pass dropped would otherwise be drawn blank while the neutral
+      // counts and judge still call it a success. Never substitute the neutral pixels: name the tile and fail.
+      const dropped = selected
+        .map((candidate, index) => ({ candidate, index }))
+        .filter(({ index }) => neutralRendered[index] === true && picture.rendered[index] !== true);
+      if (dropped.length > 0) {
+        throw new Error(
+          `unreal-like picture pass failed for ${dropped.map(({ candidate, index }) => `tile ${index} "${candidate.name}"`).join(", ")} ` +
+            "while the neutral render succeeded; refusing to draw a blank AFTER IMPORT tile",
+        );
+      }
+    }
+    rendered = neutralRendered;
   }
   const meshesRendered = rendered.filter(Boolean).length;
   const meshesFailed = count - meshesRendered;
@@ -561,8 +937,22 @@ export async function renderContactSheet(
     }
   }
 
+  // The "no authored cubemap" caption is only true while the hemisphere fill stands in for the environment.
+  const applied = environment !== undefined && pictureEnvironment !== undefined ? describeSourceEnvironment(environment, pictureEnvironment) : undefined;
+  const lightingNote = applied === undefined ? "approximate hemisphere; no authored cubemap" : "supplied source environment (PMREM approximation)";
+  const appliedGrid = sourceGrid !== undefined && pictureGrid !== undefined ? describeSourceGrid(sourceGrid, pictureGrid) : undefined;
+  // Names what the floor actually sampled. Without a supplied Grid the caption keeps its procedural wording.
+  const floorNote = appliedGrid === undefined ? "procedural Grid approximation" : "actual source Grid pixels (filtering approximated)";
+  const afterImportLine =
+    pictureLighting === "unreal-like"
+      ? `AFTER IMPORT: UE4.19.2 lights + ${lightingNote}.`
+      : "Each tile: ORIGINAL = Unreal editor thumbnail of that asset | AFTER IMPORT = our GLB, neutral light.";
+  const scoreLine =
+    pictureLighting === "unreal-like"
+      ? `Source floor math; ${floorNote}. Current camera; primary-only PCF shadows. Scores: neutral view.`
+      : "Colour similarity compares object colour only (camera and lighting differ). It is not a match score.";
   const header = withThumbnails ? REFERENCE_BAND : HEADER;
-  const caption = withThumbnails ? CAPTION + 14 : CAPTION;
+  const caption = (withThumbnails ? CAPTION + 14 : CAPTION) + (!withThumbnails && pictureLighting === "unreal-like" ? 36 : 0);
   const width = Math.max(galleryWidth + gridWidth, withThumbnails ? 760 : 0);
   const height = header + bodyHeight + caption;
   const gridLeft = galleryWidth;
@@ -571,12 +961,13 @@ export async function renderContactSheet(
   const svg: string[] = [];
   if (withThumbnails) {
     const referenceLeft = galleryPanel === undefined ? 10 : 10 + 240 + 12;
+    const noteWidth = Math.max(40, Math.floor((width - referenceLeft) / 6.6));
     svg.push(
       text(referenceLeft, 28, 15, "#e8e8ee", clip(options.title, 70), 'font-weight="bold"'),
       ...(options.subtitle !== undefined ? [text(referenceLeft, 50, 12, "#c8c8d4", clip(options.subtitle, 110))] : []),
       text(referenceLeft, 74, 12, "#9a9aaa", galleryPanel === undefined ? "no gallery image" : "Fab gallery image at left: reference only, a lit full scene"),
-      text(referenceLeft, 94, 12, "#9a9aaa", "Each tile: ORIGINAL = Unreal editor thumbnail of that asset | AFTER IMPORT = our GLB, neutral light."),
-      text(referenceLeft, 112, 12, "#9a9aaa", "Colour similarity compares object colour only (camera and lighting differ). It is not a match score."),
+      text(referenceLeft, 94, 12, "#9a9aaa", clip(afterImportLine, noteWidth)),
+      text(referenceLeft, 112, 12, "#9a9aaa", clip(scoreLine, noteWidth)),
     );
   } else {
     svg.push(
@@ -654,6 +1045,13 @@ export async function renderContactSheet(
       `visual judge: ${judgeSummary.ok} ok, ${judgeSummary.suspect} suspect, ${judgeSummary.fail} fail (green, amber, red dot)`,
     ),
   );
+  if (!withThumbnails && pictureLighting === "unreal-like") {
+    const noteWidth = Math.floor(width / 6.6);
+    svg.push(
+      text(10, bottom + 108, 12, "#9a9aaa", clip(`UE4.19.2 lights + ${lightingNote}${appliedGrid === undefined ? "" : "; actual source Grid pixels"}.`, noteWidth)),
+      text(10, bottom + 124, 12, "#9a9aaa", clip("Current camera; editor/config unknown; primary-only PCF. Scores: neutral.", noteWidth)),
+    );
+  }
 
   if (galleryPanel !== undefined) {
     layers.push(
@@ -662,8 +1060,9 @@ export async function renderContactSheet(
         : { input: galleryPanel, left: 0, top: header + Math.floor((bodyHeight - galleryHeight) / 2) },
     );
   }
-  // The picture shows the supersampled tiles when there are any (the thumbnail beside it is anti-aliased).
-  const pictureGridPng = shapeGridPng ?? gridPng;
+  // The picture shows the supersampled tiles when there are any (the thumbnail beside it is anti-aliased). With
+  // unreal-like lighting it shows a separate lit pass; the judge's metrics above stay on the neutral render.
+  const pictureGridPng = pictureLightPng ?? shapeGridPng ?? gridPng;
   if (pictureGridPng !== undefined) {
     if (withThumbnails) {
       // The browser grid is `columns` tiles wide; move each render beside its thumbnail.
@@ -707,5 +1106,7 @@ export async function renderContactSheet(
     judge,
     judgeSummary,
     thumbnailsShown: thumbnailTiles.filter((t) => t !== undefined).length,
+    ...(applied !== undefined ? { sourceEnvironment: applied } : {}),
+    ...(appliedGrid !== undefined ? { sourceGrid: appliedGrid } : {}),
   };
 }

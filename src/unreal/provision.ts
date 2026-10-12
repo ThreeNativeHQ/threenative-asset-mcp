@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  type BoundedRunResult,
   type ExternalTool,
   ToolchainError,
   assertSupportedHost,
@@ -13,10 +14,12 @@ import {
 } from "./toolchain.js";
 import {
   CUE4PARSE_PATCH,
+  CUE4PARSE_ENGINE_CONTENT,
   CUE4PARSE_PROGRAM,
   CUE4PARSE_PROJECT,
   CUE4PARSE_SOURCE,
 } from "./cue4parse-adapter.js";
+import { publishExecutable, runCandidate } from "./executable-publish.js";
 
 /**
  * The two external executables install themselves on first use. The PRD that specified this flow
@@ -52,10 +55,148 @@ export function toolchainCacheDir(
 export const UEVIEWER_SOURCE = Object.freeze({
   repository: "https://github.com/gildor2/UEViewer.git",
   commit: "a0bfb468d42be831b126632fd8a0ae6b3614f981",
-  prebuiltLinux: "https://www.gildor.org/down/47/umodel/umodel_linux.tar.gz",
   prebuiltWindows: "https://www.gildor.org/down/47/umodel/umodel_win32.zip",
   referer: "https://www.gildor.org/en/projects/umodel",
 });
+
+/**
+ * UE Viewer's Boolean-tag fix, applied to the pinned source before `build.sh`. The upstream reads a Boolean tag as
+ * `Ar << (byte&)Tag.BoolValue`, which writes one byte into an int and leaves the upper bytes as they were, so a
+ * serialized `false` reads as `true` wherever they are non-zero. The fixed build prints its markers on `-version`: those
+ * lines are the only evidence a binary carries the fixes. A path, a cache directory or a prebuilt is not.
+ */
+export const UMODEL_BOOLTAGS = Object.freeze({
+  marker: "ThreeNative-UModel-BoolTags-1",
+  /** Versioned by the whole patch set, so a Boolean-tag-only build in the previous directory is never reused. */
+  cacheDir: "umodel-booltags-2",
+});
+
+/** UE Viewer's normal-packing fix (see {@link patchUmodelNormalPacking}); its marker is printed beside the Boolean-tag one. */
+export const UMODEL_NORMALPACK = Object.freeze({
+  marker: "ThreeNative-UModel-NormalPack-1",
+});
+
+/** Whether `-version` text carries both fixes. The Boolean-tag marker alone is a build from before normal packing. */
+export function umodelCorrected(text: string): boolean {
+  return text.includes(UMODEL_BOOLTAGS.marker) && text.includes(UMODEL_NORMALPACK.marker);
+}
+
+/** The owned cache location of the Boolean-tag-fixed UE Viewer build. */
+export function umodelBoolTagsPath(environment: NodeJS.ProcessEnv = process.env): string {
+  return join(toolchainCacheDir(environment), UMODEL_BOOLTAGS.cacheDir, process.platform === "win32" ? "umodel.exe" : "umodel");
+}
+
+const UMODEL_BOOL_ALIAS = /Ar << \(byte&\)Tag\.BoolValue;([ \t]*)\/\/ byte/g;
+const UMODEL_BOOL_LOCAL = /\{ byte SerializedBool; Ar << SerializedBool; Tag\.BoolValue = SerializedBool; \}([ \t]*)\/\/ byte/g;
+
+/**
+ * Reads a Boolean tag into a local byte and then assigns the whole int. The upstream form writes the byte into the low
+ * end of `Tag.BoolValue` and keeps the upper bytes, so a serialized `false` reads as `true` wherever they are non-zero.
+ * Both Boolean sites are rewritten (UE4, and UE3 from object version 673); the UE3 < 673 full-int read is left alone.
+ * The sites are single-line, so the match does not depend on the file's line endings.
+ */
+export function patchUmodelBoolTagDeserialization(source: string): string {
+  const unpatched = source.match(UMODEL_BOOL_ALIAS)?.length ?? 0;
+  const patched = source.match(UMODEL_BOOL_LOCAL)?.length ?? 0;
+  if (unpatched === 0 && patched === 2) return source;
+  if (unpatched !== 2 || patched !== 0) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The pinned UE Viewer source has ${unpatched} unpatched and ${patched} patched Boolean tag sites, not the 2 expected; the patch was not applied.`,
+    );
+  }
+  return source.replace(UMODEL_BOOL_ALIAS, "{ byte SerializedBool; Ar << SerializedBool; Tag.BoolValue = SerializedBool; }$1// byte");
+}
+
+/**
+ * Adds both markers to UE Viewer's `-version` output on the lines after its banner, the Boolean-tag line first. A source
+ * that already carries only the Boolean-tag line gets the normal-packing line beside it. The new lines take the file's
+ * own line endings (upstream's Main.cpp is CRLF), and a second application changes nothing.
+ */
+export function patchUmodelVersionMarker(source: string): string {
+  const booleanLine = `\tappPrintf("${UMODEL_BOOLTAGS.marker}\\n");`;
+  const normalLine = `\tappPrintf("${UMODEL_NORMALPACK.marker}\\n");`;
+  const crlf = source.includes("\r\n");
+  const text = source.replace(/\r\n/g, "\n");
+  const hasBoolean = text.includes(booleanLine);
+  const hasNormal = text.includes(normalLine);
+  if (hasBoolean && hasNormal) return source;
+  const banner = "\t\t\tGBuildString, GCopyrightString, GLicenseString, GUmodelHomepage\n\t);\n";
+  const anchor = hasBoolean ? `${booleanLine}\n` : banner;
+  if (hasNormal || text.split(anchor).length !== 2) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      "The pinned UE Viewer source no longer matches the version banner, or carries a marker out of order; the markers were not added.",
+    );
+  }
+  const patched = text.replace(
+    anchor,
+    hasBoolean ? `${anchor}${normalLine}\n` : `${anchor}${booleanLine}\n${normalLine}\n`,
+  );
+  return crlf ? patched.replace(/\n/g, "\r\n") : patched;
+}
+
+/** UnMesh4.cpp's vertex loop as upstream a0bfb468 writes it: the normal is packed only inside the tangent guard. */
+const UMODEL_NORMAL_PACK_UPSTREAM = [
+  "\t\t\t// Pack normals",
+  "\t\t\tif (Lod->HasNormals)",
+  "\t\t\t{",
+  "\t\t\t\tCVec3 Normal = CVT(RawMesh.WedgeNormal[i]);",
+  "\t\t\t\tif (Lod->HasTangents)",
+  "\t\t\t\t{",
+  "\t\t\t\t\tCVec3 Tangent = CVT(RawMesh.WedgeTangent[i]);",
+  "\t\t\t\t\tCVec3 Binormal = CVT(RawMesh.WedgeBinormal[i]);",
+  "\t\t\t\t\tPack(V.Normal, Normal);",
+  "\t\t\t\t\tPack(V.Tangent, Tangent);",
+  "\t\t\t\t\tCVec3 ComputedBinormal;",
+  "\t\t\t\t\tcross(Normal, Tangent, ComputedBinormal);",
+  "\t\t\t\t\tfloat Sign = dot(Binormal, ComputedBinormal);",
+  "\t\t\t\t\tV.Normal.SetW(Sign > 0 ? 1.0f : -1.0f);",
+  "\t\t\t\t}",
+  "\t\t\t}",
+].join("\n");
+
+/** The same loop with the normal packed before the tangent guard. The handedness sign stays inside that guard. */
+const UMODEL_NORMAL_PACK_FIXED = [
+  "\t\t\t// Pack normals",
+  "\t\t\tif (Lod->HasNormals)",
+  "\t\t\t{",
+  "\t\t\t\tCVec3 Normal = CVT(RawMesh.WedgeNormal[i]);",
+  "\t\t\t\tPack(V.Normal, Normal);",
+  "\t\t\t\tif (Lod->HasTangents)",
+  "\t\t\t\t{",
+  "\t\t\t\t\tCVec3 Tangent = CVT(RawMesh.WedgeTangent[i]);",
+  "\t\t\t\t\tCVec3 Binormal = CVT(RawMesh.WedgeBinormal[i]);",
+  "\t\t\t\t\tPack(V.Tangent, Tangent);",
+  "\t\t\t\t\tCVec3 ComputedBinormal;",
+  "\t\t\t\t\tcross(Normal, Tangent, ComputedBinormal);",
+  "\t\t\t\t\tfloat Sign = dot(Binormal, ComputedBinormal);",
+  "\t\t\t\t\tV.Normal.SetW(Sign > 0 ? 1.0f : -1.0f);",
+  "\t\t\t\t}",
+  "\t\t\t}",
+].join("\n");
+
+/**
+ * UE Viewer exports a mesh that has normals but no tangents with zero normals: `Pack(V.Normal, Normal)` sits inside the
+ * tangent guard. The fix moves that one `Pack` ahead of the guard and leaves the tangent, the sign and everything else
+ * alone. The block must match exactly, once: an upstream that differs refuses the build rather than shipping the bug.
+ * A second application changes nothing, and the file's CRLF line endings are kept.
+ */
+export function patchUmodelNormalPacking(source: string): string {
+  const crlf = source.includes("\r\n");
+  const text = source.replace(/\r\n/g, "\n");
+  const upstream = text.split(UMODEL_NORMAL_PACK_UPSTREAM).length - 1;
+  const fixed = text.split(UMODEL_NORMAL_PACK_FIXED).length - 1;
+  if (upstream === 0 && fixed === 1) return source;
+  if (upstream !== 1 || fixed !== 0) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The pinned UE Viewer source has ${upstream} unpatched and ${fixed} patched normal packing blocks, not one of each; the patch was not applied.`,
+    );
+  }
+  const patched = text.replace(UMODEL_NORMAL_PACK_UPSTREAM, UMODEL_NORMAL_PACK_FIXED);
+  return crlf ? patched.replace(/\n/g, "\r\n") : patched;
+}
 
 export const FABCLI_RELEASE = Object.freeze({
   tag: "v0.1.0",
@@ -68,8 +209,25 @@ export const FABCLI_RELEASE = Object.freeze({
 /** GPL-3.0-or-later command-line converter, always executed out-of-process. */
 export const UNCOOKED_CONVERTER = Object.freeze({
   package: "unreal-assets-to-glb==4.27.2.0",
-  version: "4.27.2.0+threenative.7",
+  version: "4.27.2.0+threenative.11",
 });
+
+/**
+ * The flag the patched converter answers with its own pinned revision. The pip distribution only
+ * knows the upstream `4.27.2.0`, and its `--version` is upstream's, so our revision is a distinct
+ * flag the provisioner stamps in; nothing derives it from the package metadata.
+ */
+export const UNCOOKED_REVISION_FLAG = "--threenative-version";
+
+/** The owned cache location of the uncooked converter's console script. */
+export function uncookedConverterPath(environment: NodeJS.ProcessEnv = process.env): string {
+  return join(
+    toolchainCacheDir(environment),
+    "uncooked",
+    "venv",
+    process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
+  );
+}
 
 export interface ProvisionLog {
   (message: string): void;
@@ -143,67 +301,77 @@ async function canRun(executable: string, args: readonly string[], marker: RegEx
 }
 
 /**
- * Installs UE Viewer into the toolchain cache. Gildor publishes a 32-bit Linux build that most
- * current distributions cannot load (libpng12, 32-bit SDL2), so the prebuilt is only ever tried,
- * never trusted: whatever it does, the source build is the fallback that actually produces a
- * runnable binary on a modern host.
+ * The uncooked converter's `--help` is its ABI probe, and a run passes only when it exits 0 and prints
+ * both markers. `canRun` reads the text alone, so an install that prints the markers and then fails
+ * would pass it. Scoped here rather than changed in `canRun`, which UE Viewer's probe also uses and
+ * whose exit semantics differ.
  */
-export async function provisionUmodel(
-  environment: NodeJS.ProcessEnv = process.env,
-  log: ProvisionLog = silent,
-): Promise<string> {
-  assertSupportedHost();
-  const cache = join(toolchainCacheDir(environment), "umodel");
-  await mkdir(cache, { recursive: true });
-  const installed = join(cache, process.platform === "win32" ? "umodel.exe" : "umodel");
+function uncookedHelpAccepted(run: BoundedRunResult): boolean {
+  const help = `${run.stdout}\n${run.stderr}`;
+  return run.code === 0 && /UE 4\.27 UAsset Parser/.test(help) && /gpu instances\/landscapes/.test(help);
+}
 
+/** Whether the executable at `path` passes {@link uncookedHelpAccepted}; one that cannot start does not. */
+async function uncookedHelpRuns(path: string): Promise<boolean> {
+  try {
+    return uncookedHelpAccepted(await runBounded(path, ["--help"], { timeoutMs: 30_000 }));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Test-only substitution for the patched source build. It must leave a UE Viewer binary at `destination`, and the
+ * provisioner still requires that binary to print both markers. Production callers never pass it, so tests neither
+ * download nor build.
+ */
+export interface UmodelProvisionHooks {
+  readonly build?: (destination: string, log: ProvisionLog) => Promise<void>;
+}
+
+/**
+ * Whether the binary at `path` exits 0 on `-version` and prints both fix markers. This is the attestation that gates
+ * reuse of the owned build and its publication.
+ */
+export async function umodelCorrectedAt(path: string): Promise<boolean> {
+  const text = await runCandidate(path, ["-version"]);
+  return text !== undefined && umodelCorrected(text);
+}
+
+/**
+ * Applies one source patch to a file of the pinned source tree. A missing file refuses the build: a patch that quietly
+ * did nothing would ship the bug under a fixed label.
+ */
+async function patchUmodelSource(root: string, relative: string, patch: (source: string) => string): Promise<void> {
+  const path = join(root, ...relative.split("/"));
+  const source = await readFile(path, "utf8").catch(() => undefined);
+  if (source === undefined) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The pinned UE Viewer source has no ${relative}; the Boolean tag patch cannot be applied.`,
+    );
+  }
+  await writeFile(path, patch(source));
+}
+
+/**
+ * Applies the three UE Viewer fixes to a checkout of the pinned source. Its paths are the repository's own: `Unreal/` and
+ * `UmodelTool/` sit at the root, with no `src/` above them. Exported for the layout regression test only.
+ */
+export async function patchUmodelSourceTree(checkoutRoot: string): Promise<void> {
+  await patchUmodelSource(checkoutRoot, "Unreal/UnObject.cpp", patchUmodelBoolTagDeserialization);
+  await patchUmodelSource(checkoutRoot, "UmodelTool/Main.cpp", patchUmodelVersionMarker);
+  await patchUmodelSource(checkoutRoot, "Unreal/UnrealMesh/UnMesh4.cpp", patchUmodelNormalPacking);
+}
+
+/**
+ * Builds the pinned source with both fixes applied before `build.sh` compiles anything, and publishes the binary to
+ * `installed` only once it prints both markers (see `publishExecutable`). Linux only.
+ */
+async function buildPatchedUmodel(installed: string, log: ProvisionLog): Promise<void> {
   const staging = await mkdtemp(join(tmpdir(), "tn-umodel-"));
   try {
-    const isWindows = process.platform === "win32";
-    const archive = join(staging, isWindows ? "umodel.zip" : "umodel.tar.gz");
-    // The Linux prebuilt is a 32-bit i386 ELF. Without the i386 loader it cannot even start, so a
-    // 64-bit-only host goes straight to the source build instead of downloading it to find out.
-    const prebuiltRunnable =
-      isWindows || (await access("/lib/ld-linux.so.2").then(() => true, () => false));
-    if (!prebuiltRunnable) {
-      log("UE Viewer's Linux prebuilt is 32-bit and this host has no i386 loader; building from source.");
-    } else {
-      log("Downloading UE Viewer prebuilt binary…");
-      try {
-        await fetchToFile(
-          isWindows ? UEVIEWER_SOURCE.prebuiltWindows : UEVIEWER_SOURCE.prebuiltLinux,
-          archive,
-          { referer: UEVIEWER_SOURCE.referer },
-        );
-        const unpacked = join(staging, "prebuilt");
-        if (isWindows) await extractZip(archive, unpacked);
-        else await extractTarGz(archive, unpacked);
-        const candidate = join(unpacked, isWindows ? "umodel.exe" : "umodel");
-        await chmod(candidate, 0o755).catch(() => {});
-        if (await canRun(candidate, ["-version"], /UE Viewer/i)) {
-          await rename(candidate, installed).catch(async () => {
-            await writeFile(installed, await readFile(candidate));
-            await chmod(installed, 0o755);
-          });
-          log(`Installed prebuilt UE Viewer at ${installed}`);
-          return installed;
-        }
-        log("Prebuilt UE Viewer cannot run on this host; building from source.");
-      } catch (error) {
-        log(
-          `Prebuilt UE Viewer unavailable (${error instanceof Error ? error.name : "error"}); building from source.`,
-        );
-      }
-    }
-
-    if (process.platform !== "linux") {
-      throw new ToolchainError(
-        "UNREAL_TOOL_UNUSABLE",
-        "UE Viewer could not be installed automatically on this host. Install it from https://www.gildor.org/en/projects/umodel and set THREENATIVE_UMODEL_PATH.",
-      );
-    }
-
-    log("Building UE Viewer from source (one time, ~2 minutes)…");
+    log("Building UE Viewer from source with the Boolean tag and normal packing fixes (one time, ~2 minutes)…");
     const source = join(staging, "UEViewer");
     await mkdir(source, { recursive: true });
     const initialized = await runBounded("git", ["init", "--quiet"], {
@@ -234,6 +402,7 @@ export async function provisionUmodel(
         "The pinned UE Viewer source commit could not be fetched. Install umodel manually and set THREENATIVE_UMODEL_PATH.",
       );
     }
+    await patchUmodelSourceTree(source);
     const build = await runBounded("./build.sh", [], {
       cwd: source,
       timeoutMs: 1_800_000,
@@ -243,10 +412,83 @@ export async function provisionUmodel(
     if (build.code !== 0 || !(await canRun(built, ["-version"], /UE Viewer/i))) {
       throw new ToolchainError("UNREAL_TOOL_UNUSABLE", umodelBuildFailure(`${build.stdout}\n${build.stderr}`));
     }
-    await writeFile(installed, await readFile(built));
-    await chmod(installed, 0o755);
-    log(`Built UE Viewer at ${installed}`);
-    return installed;
+    await publishExecutable(built, installed, umodelCorrectedAt);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Installs the patched UE Viewer into its own cache, apart from every unpatched build, and accepts it only when it prints
+ * both markers.
+ */
+async function provisionPatchedUmodel(
+  environment: NodeJS.ProcessEnv,
+  log: ProvisionLog,
+  hooks: UmodelProvisionHooks,
+): Promise<string> {
+  await mkdir(join(toolchainCacheDir(environment), UMODEL_BOOLTAGS.cacheDir), { recursive: true });
+  const installed = umodelBoolTagsPath(environment);
+  if (hooks.build) {
+    await hooks.build(installed, log);
+  } else {
+    await buildPatchedUmodel(installed, log);
+  }
+  if (!(await umodelCorrectedAt(installed))) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The UE Viewer build at "${installed}" does not print ${UMODEL_BOOLTAGS.marker} and ${UMODEL_NORMALPACK.marker}, so it does not carry both fixes.`,
+    );
+  }
+  log(`Installed UE Viewer with the Boolean tag and normal packing fixes at ${installed}`);
+  return installed;
+}
+
+/**
+ * Installs UE Viewer for this host. Linux builds the pinned source with both source fixes, the only build this module
+ * treats as correct. Windows downloads the upstream prebuilt, which lacks the fix: it goes to the legacy cache and is
+ * reported as unverified. Other hosts have no automated install.
+ */
+export async function provisionUmodel(
+  environment: NodeJS.ProcessEnv = process.env,
+  log: ProvisionLog = silent,
+  hooks: UmodelProvisionHooks = {},
+): Promise<string> {
+  assertSupportedHost();
+  if (process.platform === "linux") return await provisionPatchedUmodel(environment, log, hooks);
+  if (process.platform !== "win32") {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      "UE Viewer could not be installed automatically on this host. Install it from https://www.gildor.org/en/projects/umodel and set THREENATIVE_UMODEL_PATH.",
+    );
+  }
+  const cache = join(toolchainCacheDir(environment), "umodel");
+  await mkdir(cache, { recursive: true });
+  const installed = join(cache, "umodel.exe");
+  const staging = await mkdtemp(join(tmpdir(), "tn-umodel-"));
+  try {
+    const archive = join(staging, "umodel.zip");
+    log("Downloading UE Viewer prebuilt binary…");
+    try {
+      await fetchToFile(UEVIEWER_SOURCE.prebuiltWindows, archive, { referer: UEVIEWER_SOURCE.referer });
+      const unpacked = join(staging, "prebuilt");
+      await extractZip(archive, unpacked);
+      const candidate = join(unpacked, "umodel.exe");
+      if (await canRun(candidate, ["-version"], /UE Viewer/i)) {
+        await rename(candidate, installed).catch(async () => {
+          await writeFile(installed, await readFile(candidate));
+        });
+        log(`Installed prebuilt UE Viewer at ${installed}; it lacks the Boolean tag fix, so it is reported unverified.`);
+        return installed;
+      }
+      log("Prebuilt UE Viewer cannot run on this host.");
+    } catch (error) {
+      log(`Prebuilt UE Viewer unavailable (${error instanceof Error ? error.name : "error"}).`);
+    }
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      "UE Viewer could not be installed automatically on this host. Install it from https://www.gildor.org/en/projects/umodel and set THREENATIVE_UMODEL_PATH.",
+    );
   } finally {
     await rm(staging, { recursive: true, force: true });
   }
@@ -359,8 +601,10 @@ async function pythonExecutable(environment: NodeJS.ProcessEnv): Promise<string>
 }
 
 function replaceRequired(source: string, before: string, after: string, label: string): string {
+  // `after` contains `before` for the append-style patches, so check it first: a second application is
+  // a no-op rather than appending the inserted lines again.
+  if (source.includes(after)) return source;
   if (!source.includes(before)) {
-    if (source.includes(after)) return source;
     throw new ToolchainError(
       "UNREAL_TOOL_UNUSABLE",
       `The pinned uncooked converter no longer matches the verified ${label} patch.`,
@@ -377,101 +621,311 @@ export function patchUncookedPackageVersionGates(source: string): string {
 }
 
 /**
- * Installs the GPL converter in its own virtual environment and applies narrow compatibility
- * fixes to that external program. The fixes preserve uncooked-package PersistentGuid fields,
- * preserve numbered FNames (M_Wood_2), and make --skip-textures actually skip its multi-gigabyte
- * pixel cache. A fourth patch exposes its existing level parser as bounded JSON instead of starting
- * a preview web server. The fifth patch merges serialized Blueprint component templates into
- * placed level instances; it does not execute Blueprint bytecode. A sixth patch decodes bounded
- * UE4 ISM/HISM/foliage matrix arrays for standards-based GPU instancing. A seventh patch decodes
- * editor LandscapeComponent heightmaps from their package-relative bulk payloads. No converter
- * code is linked into this Node package.
+ * Teaches the uncooked MeshDescription parser to read the per-vertex-instance ``Color`` attribute,
+ * which ``extract_geometry`` read as Normal/TextureCoordinate only and dropped. Unreal's editor meshes
+ * (the Hornbeam UE 5.1 foliage icons) store a linear FVector4f here; a material that samples VertexColor
+ * multiplies it into the base colour, so without it those pieces render as the material's untinted
+ * default.
+ *
+ * Like ``Normal`` and ``TextureCoordinate``, the ``Color`` attribute is a ``TArray`` indexed by
+ * vertex-instance *element* ID: Unreal serializes it over the allocated slots, so holes between live
+ * instances are retained and ``color_values[vi]`` is instance ``vi``'s colour. It is therefore returned
+ * as read (never re-zipped through the live-id list), and only when the serialized array matches the
+ * source's allocated slot count (``num_elements``) and spans every live instance. A truncated array or
+ * an instance id past its end cannot be trusted, so no colour is written rather than a fabricated white
+ * for a malformed record. Mirrors the cooked writer (`EditorVertexColor`) in `cue4parse-adapter.ts`.
  */
-export async function provisionUncookedConverter(
-  environment: NodeJS.ProcessEnv = process.env,
-  log: ProvisionLog = silent,
-): Promise<string> {
-  assertSupportedHost();
-  const cache = join(toolchainCacheDir(environment), "uncooked");
-  const venv = join(cache, "venv");
-  const executable = join(
-    venv,
-    process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
+export function patchUncookedMeshDescriptionColors(source: string): string {
+  source = replaceRequired(
+    source,
+    `    # --- Normals (per vertex instance, FVector) ---
+    normals = []
+    normal_entry = vi_attrs.get('Normal')
+    if normal_entry and normal_entry['type'] == 1 and normal_entry['arrays']:
+        normals = _bulk_floats(normal_entry, 3)
+
+    # --- UV channels (per vertex instance, FVector2D) ---`,
+    `    # --- Normals (per vertex instance, FVector) ---
+    normals = []
+    normal_entry = vi_attrs.get('Normal')
+    if normal_entry and normal_entry['type'] == 1 and normal_entry['arrays']:
+        normals = _bulk_floats(normal_entry, 3)
+
+    # --- Vertex colours (per vertex instance, FVector4) ---
+    # Indexed by vertex-instance ID (holes retained), so it is used as read. Accept it only when the
+    # array matches the source's allocated slot count and every live instance is inside it; otherwise
+    # leave it empty so no COLOR_0 (and no invented white) is written for a malformed record.
+    colors = []
+    color_entry = vi_attrs.get('Color')
+    if color_entry and color_entry['type'] == 0 and color_entry['arrays']:
+        color_values = _bulk_floats(color_entry, 4)
+        allocated = color_entry.get('num_elements')
+        if (isinstance(allocated, int) and allocated > 0 and vi_ids
+                and len(color_values) == allocated and max(vi_ids) < allocated):
+            colors = color_values
+
+    # --- UV channels (per vertex instance, FVector2D) ---`,
+    "uncooked vertex colours",
   );
-  const python = await pythonExecutable(environment);
-  const safeEnvironment = childEnvironment(environment);
-  // Python console scripts embed the interpreter's absolute path in their shebang, so a venv
-  // cannot be built in /tmp and renamed. Build at its final path and remove it on any failure.
-  await rm(venv, { recursive: true, force: true });
-  await mkdir(cache, { recursive: true });
-  try {
-    log(`Installing uncooked Unreal converter ${UNCOOKED_CONVERTER.package}…`);
-    const create = await runBounded(python, ["-m", "venv", venv], {
-      timeoutMs: 300_000,
-      environment: safeEnvironment,
-    });
-    if (create.code !== 0) {
-      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "Python could not create the converter virtual environment.");
-    }
-    const stagedPython = join(venv, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
-    const install = await runBounded(
-      stagedPython,
-      ["-m", "pip", "install", "--disable-pip-version-check", UNCOOKED_CONVERTER.package],
-      { timeoutMs: 900_000, maxOutputBytes: 32 * 1024 * 1024, environment: safeEnvironment },
-    );
-    if (install.code !== 0) {
-      throw new ToolchainError(
-        "UNREAL_TOOL_UNUSABLE",
-        `Installing ${UNCOOKED_CONVERTER.package} failed (pip exit ${install.code}).`,
-        true,
-      );
-    }
-    const locate = await runBounded(
-      stagedPython,
-      ["-c", "import pathlib,uasset; print(pathlib.Path(uasset.__file__).parent)"],
-      { timeoutMs: 30_000, environment: safeEnvironment },
-    );
-    const moduleDir = locate.stdout.trim();
-    if (locate.code !== 0 || !moduleDir) {
-      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The installed converter package could not be located.");
-    }
+  return replaceRequired(
+    source,
+    `        'normals': normals,
+        'uvs': uv_channels,`,
+    `        'normals': normals,
+        'colors': colors,
+        'uvs': uv_channels,`,
+    "uncooked vertex colours in geometry",
+  );
+}
 
-    const packagePath = join(moduleDir, "package.py");
-    let packageSource = patchUncookedPackageVersionGates(
-      (await readFile(packagePath, "utf8")).replace(/\r\n/g, "\n"),
-    );
-    packageSource = replaceRequired(
-      packageSource,
-      `        # 24. PersistentGuid (ObjectVersion >= VER_UE4_ADDED_PACKAGE_OWNER) - SKIPPED for cooked packages\n        # 25. OwnerPersistentGuid (VER_UE4_ADDED_PACKAGE_OWNER <= ObjectVersion < VER_UE4_NON_OUTER_PACKAGE_IMPORT) - SKIPPED for cooked packages\n        # Note: These editor-only fields may not be present in some packages`,
-      `        # 24. PersistentGuid exists when editor-only data was not filtered.\n        if (self.package_flags & 0x80000000) == 0 and self.file_version_ue4 >= VER_UE4_ADDED_PACKAGE_OWNER:\n            r.skip(16)\n\n        # 25. OwnerPersistentGuid existed for one package-version window.\n        if ((self.package_flags & 0x80000000) == 0 and\n                VER_UE4_ADDED_PACKAGE_OWNER <= self.file_version_ue4 < VER_UE4_NON_OUTER_PACKAGE_IMPORT):\n            r.skip(16)`,
-      "uncooked package-header",
-    );
-    packageSource = replaceRequired(
-      packageSource,
-      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            if has_package_name:`,
-      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            if has_package_name:`,
-      "numbered import FName",
-    );
-    packageSource = replaceRequired(
-      packageSource,
-      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            entry.object_flags`,
-      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            entry.object_flags`,
-      "numbered export FName",
-    );
-    await writeFile(packagePath, packageSource);
+/**
+ * Carries the decoded per-vertex-instance colours and every UV channel from `StaticMesh.from_package`
+ * through the GLB writer. Colours become `COLOR_0`: only the uncooked branch fills `mesh.colors`, the
+ * cooked/fallback branch leaves it empty, and an empty buffer writes no `COLOR_0` at all. The accessor is
+ * normalized UNSIGNED_BYTE RGBA holding the packed value Unreal's shader reads (sRGB RGB, linear alpha),
+ * matching the cooked writer. UV channels become `TEXCOORD_<n>`, one per channel the source carries, at
+ * its own index: a channel is never padded with zeros or renumbered. A channel set the writer cannot carry
+ * exactly (more than eight, or not covering every active vertex instance, non-finite there, or addressed by a
+ * negative index) refuses the export rather than writing a guess. Every triangle corner is also bounds-checked
+ * before its position is read, with or without UVs: an instance outside the vertex-instance map, or a mapped
+ * vertex outside the position array, refuses the export rather than being read from the end or zero-filled.
+ */
+export function patchUncookedMeshColorExport(source: string): string {
+  source = replaceRequired(
+    source,
+    `        self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels`,
+    `        self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels
+        # Per vertex instance, linear RGBA from the source's Color attribute; empty when absent.
+        self.colors: List[Optional[Tuple[float, float, float, float]]] = []`,
+    "StaticMesh colours field",
+  );
+  source = replaceRequired(
+    source,
+    `                mesh.uvs = geo['uvs']
+                mesh.triangles = geo['triangles']`,
+    `                mesh.uvs = geo['uvs']
+                mesh.colors = geo.get('colors') or []
+                mesh.triangles = geo['triangles']`,
+    "StaticMesh colours transport",
+  );
+  source = replaceRequired(
+    source,
+    `def export_glb(mesh: StaticMesh, filepath: str`,
+    `def _uv_values_at(uv_index, channel, vertex_instances):
+    """The (u, v) of one UV channel at each vertex instance of a primitive, read at that instance's own index.
 
-    const cliPath = join(moduleDir, "cli.py");
-    let cliSource = (await readFile(cliPath, "utf8")).replace(/\r\n/g, "\n");
-    cliSource = replaceRequired(
-      cliSource,
-      `    base_color_textures = [(fp, n) for fp, n in textures]  # export ALL textures`,
-      `    base_color_textures = [] if skip_textures else [(fp, n) for fp, n in textures]`,
-      "skip-textures",
-    );
-    cliSource = replaceRequired(
-      cliSource,
-      `def find_umap_path(input_dir, umap_filename):`,
-      `def export_scene_jsons(input_dir, output_dir):
+    A channel that does not cover every vertex instance, or holds a non-finite value at one, is refused
+    rather than padded with zeros: the mesh is then not exported. A negative index is refused too, since
+    Python would read it from the end of the channel and take another instance's coordinate.
+    """
+    values = []
+    for vi in vertex_instances:
+        if vi < 0:
+            raise ValueError(f"vertex instance {vi} is negative, so UV channel {uv_index} cannot be read there")
+        if vi >= len(channel):
+            raise ValueError(f"UV channel {uv_index} has {len(channel)} values and does not cover vertex instance {vi}")
+        u, v = channel[vi]
+        if not (np.isfinite(u) and np.isfinite(v)):
+            raise ValueError(f"UV channel {uv_index} is not finite at vertex instance {vi}")
+        values.append((u, v))
+    return values
+
+
+def export_glb(mesh: StaticMesh, filepath: str`,
+    "UV channel helper",
+  );
+  source = replaceRequired(
+    source,
+    `    uvs = mesh.uvs[0] if mesh.uvs else []
+    has_normals = bool(mesh.normals)
+    has_uvs = bool(uvs)`,
+    `    if len(mesh.uvs) > 8:
+        raise ValueError(f"mesh has {len(mesh.uvs)} UV channels; Unreal allows 8")
+    has_normals = bool(mesh.normals)
+    has_colors = bool(mesh.colors)`,
+    "GLB colour and UV presence",
+  );
+  source = replaceRequired(
+    source,
+    `                    v_idx = mesh.vi_to_vertex[vi] if vi < len(mesh.vi_to_vertex) else vi
+                    pos = mesh.vertices[v_idx] if v_idx < len(mesh.vertices) else (0.0, 0.0, 0.0)`,
+    `                    # Every triangle corner is checked before its position or normal is read, with or without UVs:
+                    # an instance outside the map, or a mapped vertex outside the position array, refuses the export.
+                    # Python would otherwise take a negative index from the end, and zero-fill a past-the-end one.
+                    if not 0 <= vi < len(mesh.vi_to_vertex):
+                        raise ValueError(f"vertex instance {vi} is outside the mesh's {len(mesh.vi_to_vertex)} mapped instances")
+                    v_idx = mesh.vi_to_vertex[vi]
+                    if not 0 <= v_idx < len(mesh.vertices):
+                        raise ValueError(f"vertex instance {vi} maps to vertex {v_idx}, outside the mesh's {len(mesh.vertices)} vertices")
+                    pos = mesh.vertices[v_idx]`,
+    "GLB vertex instance bounds",
+  );
+  source = replaceRequired(
+    source,
+    `                    # UV — no V-flip needed: UE5 stores textures top-to-bottom
+                    # (same as PNG/glTF), and the UV coordinate (0,0) already
+                    # maps to the first pixel row in both engines.
+                    if has_uvs and vi < len(uvs):
+                        u, v = uvs[vi]
+                    else:
+                        u, v = 0.0, 0.0
+
+                    local_verts.append((px, py, pz, nx, ny, nz, u, v))`,
+    `                    # Colour — per vertex instance; Unreal's default white when the mesh has no
+                    # colour buffer or the instance is outside it.
+                    if has_colors and vi < len(mesh.colors) and mesh.colors[vi] is not None:
+                        cr, cg, cb, ca = mesh.colors[vi]
+                    else:
+                        cr, cg, cb, ca = 1.0, 1.0, 1.0, 1.0
+
+                    local_verts.append((px, py, pz, nx, ny, nz, cr, cg, cb, ca))`,
+    "GLB per-instance colour",
+  );
+  source = replaceRequired(
+    source,
+    `        pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
+        norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
+        uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)`,
+    `        pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
+        norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
+        color_arr = np.array([(v[6], v[7], v[8], v[9]) for v in local_verts], dtype=np.float32)`,
+    "GLB colour array",
+  );
+  source = replaceRequired(
+    source,
+    `    COMP_FLOAT = 5126
+    COMP_UNSIGNED_SHORT = 5123
+    COMP_UNSIGNED_INT = 5125`,
+    `    COMP_FLOAT = 5126
+    COMP_UNSIGNED_SHORT = 5123
+    COMP_UNSIGNED_INT = 5125
+    COMP_UNSIGNED_BYTE = 5121`,
+    "GLB unsigned-byte component type",
+  );
+  source = replaceRequired(
+    source,
+    `        # UV accessor
+        uv_acc = None
+        if has_uvs:
+            uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
+            uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
+
+        # Index accessor`,
+    `        # UV accessors — one per channel the source carries, at its own TEXCOORD index. Each channel is read
+        # at the vertex instance of every local vertex (vi_to_local, the mapping position and normal use), so
+        # instances that differ only in a later channel keep separate vertices, and an absent channel is not
+        # written. UE stores (0,0) at the first pixel row in both engines, so no V-flip is needed.
+        vertex_instances = list(vi_to_local)
+        uv_accessors = []
+        for uv_index, channel in enumerate(mesh.uvs):
+            uv_values = _uv_values_at(uv_index, channel, vertex_instances)
+            uv_bv = _add_buffer_view(np.array(uv_values, dtype=np.float32).tobytes(), target=ARRAY_BUFFER)
+            uv_accessors.append((uv_index, _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")))
+
+        # Vertex colour accessor — normalized UNSIGNED_BYTE RGBA in the channel order Unreal's shader
+        # reads. The source's Color is a linear FVector4, but the static-mesh build packs it with
+        # FLinearColor::ToFColor(true): sRGB-encode RGB (standard .0031308 breakpoint), keep alpha linear,
+        # then floor(channel * 255.999). VET_Color reads that byte / 255 with no gamma decode, so COLOR_0
+        # carries the shader value, not the raw linear source.
+        color_acc = None
+        if has_colors:
+            rgb = np.clip(color_arr[:, :3], 0.0, 1.0)
+            srgb = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(rgb, 1.0 / 2.4) - 0.055)
+            alpha = np.clip(color_arr[:, 3:4], 0.0, 1.0)
+            packed = np.concatenate([srgb, alpha], axis=1)
+            color_bytes = np.clip(np.floor(packed * 255.999), 0.0, 255.0).astype(np.uint8).tobytes()
+            color_bv = _add_buffer_view(color_bytes, target=ARRAY_BUFFER)
+            color_acc = _add_accessor(color_bv, COMP_UNSIGNED_BYTE, num_verts, "VEC4")
+            accessors[color_acc].normalized = True
+
+        # Index accessor`,
+    "GLB UV and colour accessors",
+  );
+  return replaceRequired(
+    source,
+    `        if uv_acc is not None:
+            prim.attributes.TEXCOORD_0 = uv_acc
+        prim.indices = idx_acc`,
+    `        for uv_index, uv_acc in uv_accessors:
+            setattr(prim.attributes, 'TEXCOORD_%d' % uv_index, uv_acc)
+        if color_acc is not None:
+            prim.attributes.COLOR_0 = color_acc
+        prim.indices = idx_acc`,
+    "GLB attributes",
+  );
+}
+
+/**
+ * Stamps the pinned revision onto the installed CLI as an argparse `version` action. The resolver
+ * reads this revision back from the concrete executable, so a cache entry installed before this
+ * feature — or one whose patches predate it — is detected stale and re-provisioned rather than being
+ * reported as the current build. `--version` still answers the upstream pip version, which is why
+ * this is a separate flag.
+ */
+export function patchUncookedCliRevision(source: string): string {
+  return replaceRequired(
+    source,
+    `    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )`,
+    `    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )
+    parser.add_argument(
+        '--threenative-version',
+        action='version',
+        version='${UNCOOKED_CONVERTER.version}',
+        help='Print the threenative-pinned converter revision and exit'
+    )`,
+    "threenative revision flag",
+  );
+}
+
+/**
+ * Applies the converter's compatibility patches to an installed `uasset` package, in the order the
+ * provisioner has always applied them. Each patch is idempotent and throws when its anchor is missing, so a
+ * drifted upstream is refused rather than half-patched. The provisioner runs this on a fresh pip install; the
+ * colour harness runs it on a pristine copy of the pinned wheel, so both exercise the same sequence.
+ */
+export async function patchUncookedModuleSources(moduleDir: string): Promise<void> {
+  const packagePath = join(moduleDir, "package.py");
+  let packageSource = patchUncookedPackageVersionGates(
+    (await readFile(packagePath, "utf8")).replace(/\r\n/g, "\n"),
+  );
+  packageSource = replaceRequired(
+    packageSource,
+    `        # 24. PersistentGuid (ObjectVersion >= VER_UE4_ADDED_PACKAGE_OWNER) - SKIPPED for cooked packages\n        # 25. OwnerPersistentGuid (VER_UE4_ADDED_PACKAGE_OWNER <= ObjectVersion < VER_UE4_NON_OUTER_PACKAGE_IMPORT) - SKIPPED for cooked packages\n        # Note: These editor-only fields may not be present in some packages`,
+    `        # 24. PersistentGuid exists when editor-only data was not filtered.\n        if (self.package_flags & 0x80000000) == 0 and self.file_version_ue4 >= VER_UE4_ADDED_PACKAGE_OWNER:\n            r.skip(16)\n\n        # 25. OwnerPersistentGuid existed for one package-version window.\n        if ((self.package_flags & 0x80000000) == 0 and\n                VER_UE4_ADDED_PACKAGE_OWNER <= self.file_version_ue4 < VER_UE4_NON_OUTER_PACKAGE_IMPORT):\n            r.skip(16)`,
+    "uncooked package-header",
+  );
+  packageSource = replaceRequired(
+    packageSource,
+    `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            if has_package_name:`,
+    `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            if has_package_name:`,
+    "numbered import FName",
+  );
+  packageSource = replaceRequired(
+    packageSource,
+    `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            entry.object_flags`,
+    `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            entry.object_flags`,
+    "numbered export FName",
+  );
+  await writeFile(packagePath, packageSource);
+
+  const cliPath = join(moduleDir, "cli.py");
+  let cliSource = (await readFile(cliPath, "utf8")).replace(/\r\n/g, "\n");
+  cliSource = replaceRequired(
+    cliSource,
+    `    base_color_textures = [(fp, n) for fp, n in textures]  # export ALL textures`,
+    `    base_color_textures = [] if skip_textures else [(fp, n) for fp, n in textures]`,
+    "skip-textures",
+  );
+  cliSource = replaceRequired(
+    cliSource,
+    `def find_umap_path(input_dir, umap_filename):`,
+    `def export_scene_jsons(input_dir, output_dir):
     """Write bounded, non-interactive level data for the Node importer."""
     import math
     import struct
@@ -961,15 +1415,15 @@ export async function provisionUncookedConverter(
 
 
 def find_umap_path(input_dir, umap_filename):`,
-      "scene-json exporter",
-    );
-    cliSource = replaceRequired(
-      cliSource,
-      `    parser.add_argument(
+    "scene-json exporter",
+  );
+  cliSource = replaceRequired(
+    cliSource,
+    `    parser.add_argument(
         '--filter', metavar='SUBSTRING', dest='mesh_filter',
         help='Only export meshes whose name contains this substring (case-insensitive)'
     )`,
-      `    parser.add_argument(
+    `    parser.add_argument(
         '--filter', metavar='SUBSTRING', dest='mesh_filter',
         help='Only export meshes whose name contains this substring (case-insensitive)'
     )
@@ -977,36 +1431,125 @@ def find_umap_path(input_dir, umap_filename):`,
         '--scene-json-dir', metavar='DIR',
         help='Write parsed .umap actors/lights/blueprint components/gpu instances/landscapes as JSON without starting the preview server'
     )`,
-      "scene-json argument",
-    );
-    cliSource = replaceRequired(
-      cliSource,
-      `    else:
+    "scene-json argument",
+  );
+  cliSource = patchUncookedCliRevision(cliSource);
+  cliSource = replaceRequired(
+    cliSource,
+    `    else:
         print("Skipping export (using existing Export/ directory)")
 
     # Preview if requested`,
-      `    else:
+    `    else:
         print("Skipping export (using existing Export/ directory)")
 
     if args.scene_json_dir:
         export_scene_jsons(input_dir, os.path.abspath(args.scene_json_dir))
 
     # Preview if requested`,
-      "scene-json invocation",
-    );
-    await writeFile(cliPath, cliSource);
+    "scene-json invocation",
+  );
+  await writeFile(cliPath, cliSource);
 
-    const meshPath = join(moduleDir, "mesh.py");
-    let meshSource = (await readFile(meshPath, "utf8")).replace(/\r\n/g, "\n");
-    meshSource = replaceRequired(
-      meshSource,
-      `        mat = Material()\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
-      `        mat = Material()\n        if mesh.material_slots:\n            slot_idx = (mesh.section_info_map[mat_idx]\n                        if mesh.section_info_map and mat_idx < len(mesh.section_info_map)\n                        else mat_idx)\n            if slot_idx < len(mesh.material_slots):\n                mat.name = mesh.material_slots[slot_idx][1]\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
-      "material names",
-    );
-    await writeFile(meshPath, meshSource);
+  const uncookedMeshPath = join(moduleDir, "uncooked_mesh.py");
+  let uncookedMeshSource = (await readFile(uncookedMeshPath, "utf8")).replace(/\r\n/g, "\n");
+  uncookedMeshSource = patchUncookedMeshDescriptionColors(uncookedMeshSource);
+  await writeFile(uncookedMeshPath, uncookedMeshSource);
 
-    if (!(await canRun(executable, ["--help"], /gpu instances\/landscapes/))) {
+  const meshPath = join(moduleDir, "mesh.py");
+  let meshSource = (await readFile(meshPath, "utf8")).replace(/\r\n/g, "\n");
+  meshSource = replaceRequired(
+    meshSource,
+    `        mat = Material()\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
+    `        mat = Material()\n        if mesh.material_slots:\n            slot_idx = (mesh.section_info_map[mat_idx]\n                        if mesh.section_info_map and mat_idx < len(mesh.section_info_map)\n                        else mat_idx)\n            if slot_idx < len(mesh.material_slots):\n                mat.name = mesh.material_slots[slot_idx][1]\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
+    "material names",
+  );
+  meshSource = patchUncookedMeshColorExport(meshSource);
+  await writeFile(meshPath, meshSource);
+}
+
+/**
+ * Test-only substitution for the pip install. Production callers never pass it; a unit test uses it
+ * so an upgrade of a stale owned cache can be exercised without running pip or touching the network.
+ * The hook must leave `executable` runnable: answering `--help` with the ABI marker and
+ * `--threenative-version` with `UNCOOKED_CONVERTER.version`.
+ */
+export interface UncookedProvisionHooks {
+  readonly install?: (executable: string, environment: NodeJS.ProcessEnv, log: ProvisionLog) => Promise<void>;
+}
+
+/**
+ * Installs the GPL converter in its own virtual environment and applies narrow compatibility
+ * fixes to that external program. The fixes preserve uncooked-package PersistentGuid fields,
+ * preserve numbered FNames (M_Wood_2), and make --skip-textures actually skip its multi-gigabyte
+ * pixel cache. A fourth patch exposes its existing level parser as bounded JSON instead of starting
+ * a preview web server. The fifth patch merges serialized Blueprint component templates into
+ * placed level instances; it does not execute Blueprint bytecode. A sixth patch decodes bounded
+ * UE4 ISM/HISM/foliage matrix arrays for standards-based GPU instancing. A seventh patch decodes
+ * editor LandscapeComponent heightmaps from their package-relative bulk payloads. An eighth stamps
+ * the pinned threenative revision onto the CLI so the resolver can tell a stale install from the
+ * current one. No converter code is linked into this Node package.
+ */
+export async function provisionUncookedConverter(
+  environment: NodeJS.ProcessEnv = process.env,
+  log: ProvisionLog = silent,
+  hooks: UncookedProvisionHooks = {},
+): Promise<string> {
+  assertSupportedHost();
+  const cache = join(toolchainCacheDir(environment), "uncooked");
+  const venv = join(cache, "venv");
+  const executable = uncookedConverterPath(environment);
+
+  if (hooks.install) {
+    await hooks.install(executable, environment, log);
+    if (!(await uncookedHelpRuns(executable))) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
+    }
+    log(`Installed uncooked Unreal converter at ${executable}`);
+    return executable;
+  }
+
+  const python = await pythonExecutable(environment);
+  const safeEnvironment = childEnvironment(environment);
+  // Python console scripts embed the interpreter's absolute path in their shebang, so a venv
+  // cannot be built in /tmp and renamed. Build at its final path and remove it on any failure.
+  await rm(venv, { recursive: true, force: true });
+  await mkdir(cache, { recursive: true });
+  try {
+    log(`Installing uncooked Unreal converter ${UNCOOKED_CONVERTER.package}…`);
+    const create = await runBounded(python, ["-m", "venv", venv], {
+      timeoutMs: 300_000,
+      environment: safeEnvironment,
+    });
+    if (create.code !== 0) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "Python could not create the converter virtual environment.");
+    }
+    const stagedPython = join(venv, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+    const install = await runBounded(
+      stagedPython,
+      ["-m", "pip", "install", "--disable-pip-version-check", UNCOOKED_CONVERTER.package],
+      { timeoutMs: 900_000, maxOutputBytes: 32 * 1024 * 1024, environment: safeEnvironment },
+    );
+    if (install.code !== 0) {
+      throw new ToolchainError(
+        "UNREAL_TOOL_UNUSABLE",
+        `Installing ${UNCOOKED_CONVERTER.package} failed (pip exit ${install.code}).`,
+        true,
+      );
+    }
+    const locate = await runBounded(
+      stagedPython,
+      ["-c", "import pathlib,uasset; print(pathlib.Path(uasset.__file__).parent)"],
+      { timeoutMs: 30_000, environment: safeEnvironment },
+    );
+    const moduleDir = locate.stdout.trim();
+    if (locate.code !== 0 || !moduleDir) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The installed converter package could not be located.");
+    }
+
+    await patchUncookedModuleSources(moduleDir);
+
+    if (!(await uncookedHelpRuns(executable))) {
       throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
     }
     log(`Installed uncooked Unreal converter at ${executable}`);
@@ -1098,6 +1641,7 @@ export async function provisionModernConverter(
     const project = join(adapter, "ThreeNativeConverter.csproj");
     await writeFile(project, CUE4PARSE_PROJECT);
     await writeFile(join(adapter, "Program.cs"), CUE4PARSE_PROGRAM);
+    await writeFile(join(adapter, "EngineContent.cs"), CUE4PARSE_ENGINE_CONTENT);
     await rm(bin, { recursive: true, force: true });
     const runtime = process.platform === "win32"
       ? process.arch === "arm64" ? "win-arm64" : "win-x64"
@@ -1118,50 +1662,129 @@ export async function provisionModernConverter(
   }
 }
 
-async function resolveOrProvision(
-  name: "umodel" | "fabcli" | "uncooked" | "modern",
+/**
+ * Reads the revision the installed converter reports on `--threenative-version`. An install from
+ * before the revision patch rejects the flag and exits non-zero, so this is undefined — deliberately
+ * not the pip package's upstream `--version`, which is not our revision.
+ */
+async function readUncookedRevision(path: string): Promise<string | undefined> {
+  try {
+    const run = await runBounded(path, [UNCOOKED_REVISION_FLAG], { timeoutMs: 30_000 });
+    if (run.code !== 0) return undefined;
+    return `${run.stdout}\n${run.stderr}`
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The uncooked resolver is revision-aware. An explicit override or a PATH tool is the user's and is
+ * never overwritten: a wrong or absent revision is rejected with how to fix it. The owned cache is
+ * verified the same way, and a stale entry is re-provisioned only when auto-install is enabled.
+ */
+async function resolveOrProvisionUncooked(
   environment: NodeJS.ProcessEnv,
   log: ProvisionLog,
+  hooks: UncookedProvisionHooks,
 ): Promise<string> {
   try {
-    const found = await resolveExecutable(name, environment);
+    const found = await resolveExecutable("uncooked", environment);
+    const revision = await readUncookedRevision(found);
+    if (revision === UNCOOKED_CONVERTER.version) return found;
+    const override = environment.THREENATIVE_UNCOOKED_CONVERTER_PATH?.trim();
+    const reported = revision ? `threenative revision ${revision}` : "no threenative revision";
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      override
+        ? `THREENATIVE_UNCOOKED_CONVERTER_PATH points at "${found}", which reports ${reported}, not the required ${UNCOOKED_CONVERTER.version}. Unset it so the importer can provision a compatible converter.`
+        : `"${found}" on PATH reports ${reported}, not the required ${UNCOOKED_CONVERTER.version}. Remove it from PATH so the importer can provision a compatible converter.`,
+    );
+  } catch (error) {
+    if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
+    const cached = uncookedConverterPath(environment);
+    const revision = await readUncookedRevision(cached);
+    const hasHelp = await uncookedHelpRuns(cached);
+    // Both must hold: the help ABI alone passes on an install too old to carry the revision flag, which
+    // is exactly the stale cache this guards against, and a revision alone does not prove it runs.
+    if (revision === UNCOOKED_CONVERTER.version && hasHelp) return cached;
+    if (!autoInstallEnabled(environment)) {
+      if (!hasHelp && revision === undefined) throw error;
+      const state = revision === UNCOOKED_CONVERTER.version
+        ? "not runnable: its --help must exit 0 and print the converter's markers"
+        : revision ? `threenative revision ${revision}` : "not the pinned revision";
+      throw new ToolchainError(
+        "UNREAL_TOOL_UNUSABLE",
+        `The provisioned uncooked converter at "${cached}" is ${state}; expected ${UNCOOKED_CONVERTER.version}. Set THREENATIVE_TOOLCHAIN_AUTOINSTALL=1 (the default) and retry to re-provision it.`,
+      );
+    }
+    log(`Re-provisioning the uncooked converter: the cache is not a runnable ${UNCOOKED_CONVERTER.version} converter.`);
+    return await provisionUncookedConverter(environment, log, hooks);
+  }
+}
+
+/**
+ * UE Viewer's resolver. An explicit override is the user's and comes first. Without one, a build in the versioned cache
+ * that exits 0 and prints both markers wins over PATH. PATH and the owned legacy cache usually hold unpatched builds:
+ * a runnable PATH build is used whatever auto-install says, and reported unverified unless it prints both markers.
+ * Without a runnable PATH build, auto-install on Linux builds the patched UE Viewer and upgrades a runnable legacy
+ * build; other hosts keep a runnable legacy build, reported unverified. A failed upgrade throws; it never falls back
+ * to a build known to decode Boolean tags wrongly or to export zero normals.
+ */
+async function resolveOrProvisionUmodel(
+  environment: NodeJS.ProcessEnv,
+  log: ProvisionLog,
+  hooks: UmodelProvisionHooks,
+): Promise<string> {
+  const override = environment.THREENATIVE_UMODEL_PATH?.trim();
+  const versioned = umodelBoolTagsPath(environment);
+  if (!override && (await umodelCorrectedAt(versioned))) return versioned;
+  try {
+    const found = await resolveExecutable("umodel", environment);
     // A PATH umodel is whatever the user happened to install; the 2022 upstream release rejects
     // `-psk`, which every animation export passes. An explicit override stays the user's call.
-    if (name !== "umodel" || environment.THREENATIVE_UMODEL_PATH?.trim() || (await canRun(found, UMODEL_PROBE, /UE Viewer/i))) {
-      return found;
-    }
+    if (override || (await canRun(found, UMODEL_PROBE, /UE Viewer/i))) return found;
     log(`Ignoring ${found}: that UE Viewer build does not accept -psk.`);
     throw new ToolchainError("UNREAL_TOOL_NOT_FOUND", `${found} does not accept -psk; no capable UE Viewer was found.`);
   } catch (error) {
     if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
-    const cached = name === "uncooked"
-      ? join(
-          toolchainCacheDir(environment),
-          "uncooked",
-          "venv",
-          process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
-        )
-      : name === "modern"
-        ? join(toolchainCacheDir(environment), "modern", "bin", process.platform === "win32" ? "ThreeNativeConverter.exe" : "ThreeNativeConverter")
-        : join(
-          toolchainCacheDir(environment),
-          name,
-          process.platform === "win32" ? `${name}.exe` : name,
-        );
-    const marker = name === "umodel"
-      ? /UE Viewer/i
-      : name === "fabcli"
-        ? /fabcli/i
-        : name === "modern"
-          ? new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-          : /gpu instances\/landscapes/;
-    const probe = name === "umodel" ? UMODEL_PROBE : name === "fabcli" ? ["--version"] : name === "modern" ? ["--version"] : ["--help"];
-    if (await canRun(cached, probe, marker)) return cached;
+    const legacy = join(toolchainCacheDir(environment), "umodel", process.platform === "win32" ? "umodel.exe" : "umodel");
+    const legacyRuns = await canRun(legacy, UMODEL_PROBE, /UE Viewer/i);
+    if (!autoInstallEnabled(environment)) {
+      if (legacyRuns) return legacy;
+      throw error;
+    }
+    // Only Linux can build the fix here. Elsewhere the legacy build is the only automated option, reported unverified.
+    if (legacyRuns && process.platform !== "linux") return legacy;
+    return await provisionUmodel(environment, log, hooks);
+  }
+}
+
+async function resolveOrProvision(
+  name: "fabcli" | "modern",
+  environment: NodeJS.ProcessEnv,
+  log: ProvisionLog,
+): Promise<string> {
+  try {
+    return await resolveExecutable(name, environment);
+  } catch (error) {
+    if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
+    const cached = name === "modern"
+      ? join(toolchainCacheDir(environment), "modern", "bin", process.platform === "win32" ? "ThreeNativeConverter.exe" : "ThreeNativeConverter")
+      : join(
+        toolchainCacheDir(environment),
+        name,
+        process.platform === "win32" ? `${name}.exe` : name,
+      );
+    const marker = name === "fabcli"
+      ? /fabcli/i
+      : new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    if (await canRun(cached, ["--version"], marker)) return cached;
     if (!autoInstallEnabled(environment)) throw error;
-    if (name === "umodel") return await provisionUmodel(environment, log);
     if (name === "fabcli") return await provisionFabcli(environment, log);
-    if (name === "modern") return await provisionModernConverter(environment, log);
-    return await provisionUncookedConverter(environment, log);
+    return await provisionModernConverter(environment, log);
   }
 }
 
@@ -1170,13 +1793,17 @@ const UMODEL_VERSION = /^UE Viewer.*$\n^(Compiled .*)$/m;
 /** Prints the banner only when the build parses `-psk`; older builds fail the command line first. */
 export const UMODEL_PROBE = ["-export", "-psk", "-version"] as const;
 
-/** UE Viewer, resolved from the environment, PATH, the toolchain cache, or a fresh install. */
+/**
+ * UE Viewer, resolved from the environment, the Boolean-tag cache, PATH, the legacy cache, or a fresh install. The
+ * version says whether the binary prints both fix markers, so provenance travels with the tool.
+ */
 export async function ensureUmodel(
   environment: NodeJS.ProcessEnv = process.env,
   log: ProvisionLog = silent,
+  hooks: UmodelProvisionHooks = {},
 ): Promise<ExternalTool> {
   assertSupportedHost();
-  const path = await resolveOrProvision("umodel", environment, log);
+  const path = await resolveOrProvisionUmodel(environment, log, hooks);
   const run = await runBounded(path, UMODEL_PROBE, { timeoutMs: 30_000 });
   const text = `${run.stdout}\n${run.stderr}`;
   if (!/UE Viewer/i.test(text)) {
@@ -1187,11 +1814,18 @@ export async function ensureUmodel(
         : `"${path}" does not identify itself as UE Viewer (umodel).`,
     );
   }
-  return {
-    name: "umodel",
-    path,
-    version: UMODEL_VERSION.exec(text)?.[1]?.trim() ?? "UE Viewer (unversioned)",
-  };
+  if (run.code !== 0) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `"${path}" fails with exit code ${run.code} on -version, so its banner and markers do not show that it works.`,
+    );
+  }
+  const banner = UMODEL_VERSION.exec(text)?.[1]?.trim() ?? "UE Viewer (unversioned)";
+  const missing = [UMODEL_BOOLTAGS.marker, UMODEL_NORMALPACK.marker].filter((marker) => !text.includes(marker));
+  const provenance = missing.length === 0
+    ? `${UMODEL_BOOLTAGS.marker} and ${UMODEL_NORMALPACK.marker} parser-verified`
+    : `unverified: no ${missing.join(" or no ")} marker, so Boolean tags or normal packing may be wrong`;
+  return { name: "umodel", path, version: `${banner}; ${provenance}` };
 }
 
 /** FabCLI, resolved the same way. Installing it never logs in — that stays the user's act. */
@@ -1216,14 +1850,24 @@ export async function ensureFabcli(
 export async function ensureUncookedConverter(
   environment: NodeJS.ProcessEnv = process.env,
   log: ProvisionLog = silent,
+  hooks: UncookedProvisionHooks = {},
 ): Promise<ExternalTool> {
   assertSupportedHost();
-  const path = await resolveOrProvision("uncooked", environment, log);
+  const path = await resolveOrProvisionUncooked(environment, log, hooks);
   const run = await runBounded(path, ["--help"], { timeoutMs: 30_000 });
-  if (!/UE 4\.27 UAsset Parser/.test(`${run.stdout}${run.stderr}`) || !/gpu instances\/landscapes/.test(`${run.stdout}${run.stderr}`)) {
+  if (!uncookedHelpAccepted(run)) {
     throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected uncooked Unreal converter.`);
   }
-  return { name: "uncooked", path, version: UNCOOKED_CONVERTER.version };
+  // The report records the revision actually read back from the concrete executable, never the
+  // constant: an external tool that somehow still does not match cannot be labelled as current.
+  const revision = await readUncookedRevision(path);
+  if (revision !== UNCOOKED_CONVERTER.version) {
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `"${path}" does not report the pinned threenative revision ${UNCOOKED_CONVERTER.version}${revision ? ` (it reports ${revision})` : ""}.`,
+    );
+  }
+  return { name: "uncooked", path, version: revision };
 }
 
 export async function ensureModernConverter(
@@ -1237,4 +1881,17 @@ export async function ensureModernConverter(
     throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected modern Unreal converter.`);
   }
   return { name: "modern", path, version: CUE4PARSE_SOURCE.version };
+}
+
+/**
+ * The .NET 10 SDK that builds the modern converter, found without installing one: the host's `dotnet` or the copy the
+ * provisioner cached. A test that compiles against the pinned CUE4Parse source uses it; a missing SDK is a provisioning
+ * failure, so the test refuses rather than installing from inside a test.
+ */
+export async function modernSdkExecutable(environment: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const host = await runBounded("dotnet", ["--version"], { timeoutMs: 30_000, environment: childEnvironment(environment) }).catch(() => undefined);
+  if (host?.code === 0 && /^10\./.test(host.stdout.trim())) return "dotnet";
+  const cached = join(toolchainCacheDir(environment), "modern", "dotnet", process.platform === "win32" ? "dotnet.exe" : "dotnet");
+  if (await canRun(cached, ["--version"], /^10\./m)) return cached;
+  throw new ToolchainError("UNREAL_TOOL_NOT_FOUND", "The .NET 10 SDK that builds the modern Unreal converter is missing; run npm run provision:toolchain.");
 }

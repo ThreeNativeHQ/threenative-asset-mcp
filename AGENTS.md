@@ -55,10 +55,14 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
 
 - **FabCLI**: release archives wrap the binary in `fabcli-<tag>-<platform>/`. Look inside archives
   with `findArchiveEntry`; never assume the root layout.
-- **UE Viewer**: the Linux prebuilt from gildor.org is a 32-bit i386 ELF, unrunnable without the
-  i386 loader, so 64-bit-only hosts build from source. The build needs `g++`, `perl`, `zlib1g-dev`,
-  `libpng-dev` and `libsdl2-dev`. `umodelBuildFailure` reads the compiler output and names the
-  missing package; keep that mapping current rather than listing guesses.
+- **UE Viewer**: Linux never downloads the gildor.org prebuilt (a 32-bit i386 ELF, unrunnable without
+  the i386 loader). It builds the pinned source with both fixes, `UMODEL_BOOLTAGS` and `UMODEL_NORMALPACK`;
+  Windows takes the upstream prebuilt, which has neither and is reported unverified. A binary counts as
+  corrected only when `-version` exits 0 and prints both markers (`umodelCorrected`). The patched build lives in the
+  `umodel-booltags-2` cache, so a Boolean-tag-only build in `-1` is never reused, and it is published by a
+  temp file and rename beside its destination (`publishExecutable`), never written over a running binary.
+  The build needs `g++`, `perl`, `zlib1g-dev`, `libpng-dev` and `libsdl2-dev`. `umodelBuildFailure` reads
+  the compiler output and names the missing package; keep that mapping current rather than listing guesses.
 - The uncooked converter provisions a Python venv; the modern converter installs a private .NET SDK
   and publishes CUE4Parse. Neither needs root.
 - The `Fresh toolchain` workflow provisions all four from an empty cache in `debian:13` (weekly,
@@ -66,6 +70,17 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   provisioning can break between runs. FabCLI also needs `libwebkit2gtk-4.1-0` at runtime.
 
 ## Fab and Unreal imports
+
+- **Local official engine reference:** `/home/joao/projects/UnrealEngine-5.8.3`, tag
+  `5.8.3-release`, commit `396c9f059903aed5fec78ecd3d437a40c6415368`. This is a shallow,
+  blob-filtered sparse clone made through authenticated `gh`; expand the sparse paths when needed.
+  Use it to verify importer semantics (MeshDescription colours, vertex buffers/shaders, material
+  expressions, texture decoding) and locate engine material-function dependencies. Engine content
+  assets require separate dependency retrieval; no full Setup or engine build is implied. Keep
+  Epic source/assets local and record provenance rather than copying them into this repo. If the
+  needed behavior is binary-only, João requires **DeepSeek v4.1 Flash using the REA repo**; locate
+  its workflow/toolkit through `/home/joao/projects/unreal-rea-docs`. `/home/joao/UE58` is only a
+  partial binary installation. Verify visual results with the judge and contact sheets by eye.
 
 - **Login is the user's.** The MCP never signs in. For an agent session with no display, run
   `fabcli auth login --manual` under a pseudo-terminal (it refuses a non-TTY stdin). The user opens
@@ -151,3 +166,11 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   pack's mean fidelity falls more than 2 points, its worst piece more than 6, its failing tiles rise, or compared
   pieces drop; `update` only ever ratchets numbers up. Run `check` after every sweep before merging a fix, so a fix
   for one pack cannot silently undo another.
+
+## Comparison preview contract
+
+- Preserve the approved Unreal-like picture environment for before/after comparison sheets: UE4.19 reference world-space lights, source-environment orientation and intensity, source floor response and ACES exposure1. Keep the camera/framing policy consistent across a comparison. Never tune lighting or exposure per asset to improve a score.
+- Actual reference cubemap and Grid inputs are caller-supplied/local-only. Record their provenance and computed input digests. Label the hemisphere/procedural-floor fallback as an approximation; do not present it as the identical reference environment. Licensed assets are never bundled or auto-fetched by the renderer.
+- Keep neutral metric renders independent of picture lighting. Hardening must exercise the actual public renderer with synthetic HDR and asymmetric raster inputs: orientation, HDR values above1, light directions/intensities, floor scale/response, filmic exposure, cast shadows, input snapshot isolation, repeated renders and neutral/judge identity. Configuration changes require source-backed review and comparison evidence; licensed packs never become test fixtures. Validate guards with deliberate exposure, environment orientation, texture colour-space/orientation and floor-period mutations; a configuration-only assertion is insufficient. Resume comparison runs only with matching picture-contract and reference-input digests.
+- A configured `THREENATIVE_UNREAL_PREVIEW_REFERENCE` is read once per command, before any download, and an invalid one fails setup. Every picture records its `identity` (`PICTURE_CONTRACT`, kind `local-reference`, `fallback` or `neutral`, and digests); `--resume --sheets` refuses any stored sheet whose identity is missing or different.
+- Bump `PICTURE_CONTRACT_REVISION` (`contact-sheet.ts`) whenever the unreal-like picture's lights, camera, tone mapping, floor or source handling change, so stored pictures stop matching.

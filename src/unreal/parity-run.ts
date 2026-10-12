@@ -22,6 +22,7 @@ import { z } from "zod";
 import type { FabOwnedListing } from "../fab/fabcli.js";
 import { compareEngines, decoderRoute, oldestEngine } from "../fab/routes.js";
 import type { MissAttribution, PackScore } from "./parity.js";
+import type { PictureIdentity } from "./preview-reference-workflow.js";
 import { textureIdentityReason, type CrossDecodeProof, type TextureProof } from "./texture-proof.js";
 
 export type ParityRoute = "umodel" | "mesh-description" | "cue4parse" | "unknown";
@@ -36,6 +37,14 @@ export const SIZE_EXCLUDED_PREFIXES: readonly string[] = ["4898e707", "0281d63e"
 export const SIZE_SKIP_REASON = "skipped: size";
 export const LISTING_PREFIX_LENGTH = 8;
 
+/**
+ * A UID-less owned listing cannot be swept: FabCLI is invoked by listing UID, the explicit catalog
+ * route (asset id + namespace) is not wired, and no licence was read for it. Its artifacts are
+ * reported as skipped rather than dropped silently.
+ */
+export const NO_LISTING_UID_REASON =
+  "no listing UID; explicit catalog route is not wired and licence is unverified";
+
 export interface CorpusEntry {
   readonly listingId: string;
   readonly title: string;
@@ -46,9 +55,10 @@ export interface CorpusEntry {
 }
 
 export interface SkippedEntry {
-  readonly listingId: string;
+  /** Absent for a UID-less owned listing (its artifact(s) are reported individually). */
+  readonly listingId?: string;
   readonly title: string;
-  /** Set for an artifact the per-route dedupe dropped; absent for a whole listing skipped by size. */
+  /** Set for an artifact a per-route dedupe or UID-less listing dropped; absent for a size skip. */
   readonly artifactId?: string;
   readonly reason: string;
 }
@@ -130,6 +140,8 @@ export interface EntrySheet {
    * (it has an editor thumbnail) means a model that renders as nothing and still scores PASS.
    */
   readonly warnings?: readonly string[];
+  /** What lit the sheet (`preview-reference-workflow.ts`). `--resume --sheets` keeps this sheet only when it matches. */
+  readonly picture?: PictureIdentity;
 }
 
 /** The judge's reason for an empty render (`judgeRender`). */
@@ -305,19 +317,35 @@ export function routeFor(engine: string | undefined): ParityRoute {
  * listed wins a full tie). The rest are returned in `skipped` with the artifact that stands for
  * them. `allArtifacts`, a named `artifact` and a named listing all keep every artifact. A listing
  * the caller named explicitly is never size-excluded: asking for City Sample by id is a decision,
- * not an accident.
+ * not an accident. A UID-less owned listing is never addressed; in whole-library coverage each of
+ * its artifacts the selection matches is reported as skipped (`NO_LISTING_UID_REASON`), while an
+ * explicit `--listing` shard, which names ids, leaves it out entirely.
  */
 export function buildCorpus(
   owned: readonly FabOwnedListing[],
   options: CorpusOptions,
 ): { readonly entries: CorpusEntry[]; readonly skipped: SkippedEntry[] } {
   const wanted = new Set(options.listings.map((id) => id.toLowerCase()));
+  const explicit = wanted.size > 0;
   const entries: CorpusEntry[] = [];
   const skipped: SkippedEntry[] = [];
   for (const listing of owned) {
+    if (listing.unrealArtifacts.length === 0) continue;
     const listingId = listing.listingId;
-    if (listingId === undefined || listing.unrealArtifacts.length === 0) continue;
-    const explicit = wanted.size > 0;
+    if (listingId === undefined) {
+      // Whole-library coverage only: a --listing shard names ids, so this listing is unrelated to it.
+      if (!explicit) {
+        for (const artifact of listing.unrealArtifacts) {
+          if (options.artifact !== undefined && artifact.artifactId !== options.artifact) continue;
+          skipped.push({
+            title: listing.title,
+            artifactId: artifact.artifactId,
+            reason: NO_LISTING_UID_REASON,
+          });
+        }
+      }
+      continue;
+    }
     if (explicit && !wanted.has(listingId.toLowerCase())) continue;
     if (
       !explicit &&
@@ -666,38 +694,65 @@ export function s4DeltaLine(delta: S4Delta): string {
   return `S4 misses: ${delta.baseline} → ${delta.now} (${pct} change)`;
 }
 
+/** Entries with no colour result by design: errored, unverified, or skipped (nothing to import). */
+const NO_COLOUR_STATUSES = new Set<unknown>(["error", "unverified", "skipped"]);
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** A miss count the baseline can add: a finite, nonnegative integer (`1e400` parses to Infinity). */
+const isMissCount = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value >= 0;
+
+/** `colour.missesTotal` from the per-pack file beside a scorecard, or undefined when it cannot be read. */
+function packMissesTotal(scorecard: string, item: Record<string, unknown>): unknown {
+  if (typeof item.listingId !== "string" || typeof item.artifactId !== "string") return undefined;
+  try {
+    const label = `${item.listingId.slice(0, LISTING_PREFIX_LENGTH)}-${item.artifactId}`;
+    const pack: unknown = JSON.parse(readFileSync(join(dirname(scorecard), "packs", `${label}.json`), "utf8"));
+    return isRecord(pack) && isRecord(pack.colour) ? pack.colour.missesTotal : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * The S4 miss total of a baseline scorecard file. Reads `summary.s4Misses`, else sums the entries,
- * and for entries from before PRD-538 falls back to `colour.missesTotal` in the per-pack file
- * `packs/<listing8>-<artifact>.json` beside the scorecard. Null when any pack cannot be counted:
- * a partial count would make the delta look better than it is.
+ * The S4 miss total of a baseline scorecard file. Reads `summary.s4Misses` when it records a count, else sums
+ * the entries, and for entries from before PRD-538 falls back to `colour.missesTotal` in the per-pack file
+ * `packs/<listing8>-<artifact>.json` beside the scorecard. Null when the file is not a scorecard, or a count
+ * is missing or not a finite nonnegative integer: a partial count would make the delta look better than it is.
  */
 export function readBaselineS4Misses(path: string): number | null {
-  let parsed: { entries?: ScorecardEntry[]; summary?: { s4Misses?: number | null } };
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8")) as typeof parsed;
+    parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch {
     return null;
   }
-  const recorded = parsed.summary?.s4Misses;
-  if (typeof recorded === "number") return recorded;
+  if (!isRecord(parsed)) return null;
+  const { summary } = parsed;
+  if (summary !== undefined && !isRecord(summary)) return null;
+  const recorded = summary?.s4Misses;
+  // null means the entries predate the count, so the entries are summed instead.
+  if (recorded !== undefined && recorded !== null) return isMissCount(recorded) ? recorded : null;
+  // Without a recorded count the entries are the only evidence. A file with neither (a corpus supervisor
+  // summary, say) is not a scorecard and must not read as zero.
+  if (!Array.isArray(parsed.entries)) return null;
   let total = 0;
-  for (const item of parsed.entries ?? []) {
-    const s4 = item.summary?.s4;
-    if (!s4) continue; // errored or unverified entries have no colour result
-    let misses = s4.missesTotal;
-    if (misses === undefined) {
-      try {
-        const label = `${item.listingId.slice(0, LISTING_PREFIX_LENGTH)}-${item.artifactId}`;
-        const pack = JSON.parse(readFileSync(join(dirname(path), "packs", `${label}.json`), "utf8")) as {
-          colour?: { missesTotal?: number };
-        };
-        misses = pack.colour?.missesTotal;
-      } catch {
-        misses = undefined;
-      }
+  for (const item of parsed.entries) {
+    if (!isRecord(item)) return null;
+    const { summary: entrySummary } = item;
+    if (entrySummary !== undefined && entrySummary !== null && !isRecord(entrySummary)) return null;
+    const s4 = entrySummary?.s4;
+    if (s4 === undefined || s4 === null) {
+      if (NO_COLOUR_STATUSES.has(item.status)) continue;
+      // A verified pack without a colour result cannot be counted, and skipping it would make the total partial.
+      return null;
     }
-    if (typeof misses !== "number") return null;
+    if (!isRecord(s4)) return null;
+    let misses = s4.missesTotal;
+    if (misses === undefined) misses = packMissesTotal(path, item);
+    if (!isMissCount(misses)) return null;
     total += misses;
   }
   return total;
@@ -765,7 +820,11 @@ export function carriedOverEntries(
   skipped: readonly SkippedEntry[],
 ): ScorecardEntry[] {
   const skippedKeys = new Set(
-    skipped.flatMap((entry) => (entry.artifactId === undefined ? [] : [entryKey({ ...entry, artifactId: entry.artifactId })])),
+    skipped.flatMap((entry) =>
+      entry.listingId === undefined || entry.artifactId === undefined
+        ? []
+        : [entryKey({ listingId: entry.listingId, artifactId: entry.artifactId })],
+    ),
   );
   return previous.filter((entry) => isSettled(entry) && skippedKeys.has(entryKey(entry)));
 }
@@ -1028,10 +1087,12 @@ Options:
   --sheets               Contact sheet per pack (default on): <out>/sheets/<listing8>-<artifact>.jpg,
                          each piece's Unreal editor thumbnail beside its render, with a visual-judge
                          verdict per tile (white, ghost, specks, washed out, colour similarity)
+                         Lit by THREENATIVE_UNREAL_PREVIEW_REFERENCE (a local profile) when it is set.
   --no-sheets            Skip the sheets
   -h, --help             Print this help
 
-Exit codes: 0 done, 1 error, 2 Fab session/download failure (partial scorecard written), 130 interrupted.`;
+Exit codes: 0 done, 1 error, 2 bad input (invalid reference, or a --resume --sheets refusal) or Fab
+session/download failure (partial scorecard written), 130 interrupted.`;
 
 export function parseParityArgs(argv: readonly string[]): ParityArgs {
   let corpus: "library" = "library";

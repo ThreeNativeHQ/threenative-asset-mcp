@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, onTestFinished } from "vitest";
 import { CUE4PARSE_PROGRAM, CUE4PARSE_SOURCE } from "../src/unreal/cue4parse-adapter.js";
-import { dumpMaterialGraphs, materialGraphSchema, readMaterialGraph } from "../src/unreal/graph-dump.js";
+import { dumpMaterialGraphs, materialGraphSchema, materialInstanceKey, readMaterialGraph } from "../src/unreal/graph-dump.js";
 
 async function scratch(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "tn-graph-dump-test-"));
@@ -128,7 +128,7 @@ describe("--dump-graphs converter mode", () => {
   it("is wired into the embedded program and the converter version is bumped", () => {
     expect(CUE4PARSE_PROGRAM).toContain("--dump-graphs");
     expect(CUE4PARSE_PROGRAM).toContain(".graph.json");
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.67");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.78");
     // The embedded program prints the same string `canRun` waits for, so a stale binary is rebuilt.
     expect(CUE4PARSE_PROGRAM).toContain(`threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
   });
@@ -378,5 +378,169 @@ for (const [name, text] of Object.entries(${JSON.stringify(files)})) writeFileSy
       expect(message).toMatch(/unexpected shape: nodes\[12\]\.inputs\.A\.output: /);
       expect(message.length).toBeLessThan(300);
     });
+  });
+});
+
+describe("instance records beside the graphs (converter 74)", () => {
+  // What the converter writes for an instance with a complete chain: its own overrides as UE Viewer blocks, the qualified parent.
+  const record = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    format: 1,
+    kind: "materialInstance",
+    package: "/Game/Test/MI_Child",
+    object: "MI_Child",
+    parent: { package: "/Game/Test/MI_Mid", object: "MI_Mid" },
+    complete: true,
+    props:
+      "Parent = Material'/Game/Test/MI_Mid.MI_Mid'\nScalarParameterValues[0] =\n{\n    ParameterValue = 0\n    ParameterInfo =\n    {\n        Name = Roughness\n    }\n}\n",
+    refusal: null,
+    ...overrides,
+  });
+  // A converter that writes the given values into its --dump-graphs directory, as the converter does.
+  const writingConverter = async (dir: string, files: Record<string, unknown>): Promise<string> =>
+    fakeConverter(
+      dir,
+      `import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const out = process.argv[process.argv.indexOf("--dump-graphs") + 1];
+const files = ${JSON.stringify(files)};
+for (const [name, value] of Object.entries(files)) writeFileSync(join(out, name), typeof value === "string" ? value : JSON.stringify(value));`,
+    );
+
+  it("exposes a usable record by its qualified identity, beside the graphs and never as a graph", async () => {
+    const dir = await scratch();
+    const converter = await writingConverter(dir, { "M_Master.graph.json": maskTintGraph("M_Master"), "MI_Child.instance.json": record() });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect([...graphs.keys()]).toEqual(["M_Master"]);
+    expect(graphs.invalid?.size ?? 0).toBe(0);
+    expect(Object.keys(graphs)).toEqual([]);
+    const instances = [...(graphs.instances?.values() ?? [])];
+    expect(instances).toHaveLength(1);
+    expect(instances[0]).toMatchObject({
+      package: "/Game/Test/MI_Child",
+      object: "MI_Child",
+      parent: { package: "/Game/Test/MI_Mid", object: "MI_Mid" },
+      complete: true,
+    });
+    expect(graphs.invalidInstances?.size ?? 0).toBe(0);
+  });
+
+  it("refuses a record outside the /Game mount as cross-mount, and keeps the reason", async () => {
+    const dir = await scratch();
+    const converter = await writingConverter(dir, { "MI_Engine.instance.json": record({ package: "/Engine/Test/MI_Engine", object: "MI_Engine" }) });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect(graphs.instances?.size ?? 0).toBe(0);
+    expect([...(graphs.invalidInstances?.values() ?? [])]).toEqual([expect.stringMatching(/outside the \/Game mount/)]);
+  });
+
+  it("refuses a malformed record and says what is wrong with its shape", async () => {
+    const dir = await scratch();
+    const converter = await writingConverter(dir, { "MI_Bad.instance.json": { format: 1, kind: "materialInstance", package: "/Game/Test/MI_Bad", object: "MI_Bad" } });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect(graphs.instances?.size ?? 0).toBe(0);
+    expect([...(graphs.invalidInstances?.values() ?? [])]).toEqual([expect.stringMatching(/unexpected shape/)]);
+  });
+
+  it("refuses two records that claim one identity, as one identity with one reason", async () => {
+    const dir = await scratch();
+    const converter = await writingConverter(dir, { "MI_Child.instance.json": record(), "MI_Child__2.instance.json": record() });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect(graphs.instances?.size ?? 0).toBe(0);
+    // One identity, one reason: the baker looks a record up by its exact identity.
+    expect([...(graphs.invalidInstances?.values() ?? [])]).toEqual([expect.stringMatching(/duplicate identity/)]);
+  });
+
+  it("keeps a converter refusal out of the usable records and reports its text", async () => {
+    const dir = await scratch();
+    const refusal = "ScalarParameterValues row is a LayerParameter parameter, and only global parameters are supported";
+    const converter = await writingConverter(dir, { "MI_Child.instance.json": record({ complete: false, props: null, refusal }) });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect(graphs.instances?.size ?? 0).toBe(0);
+    expect([...(graphs.invalidInstances?.values() ?? [])]).toEqual([expect.stringMatching(/LayerParameter/)]);
+  });
+
+  it("refuses a Parent line that disagrees with the record's parent identity", async () => {
+    const dir = await scratch();
+    const converter = await writingConverter(dir, { "MI_Child.instance.json": record({ props: "Parent = Material'/Game/Test/Other.Other'\n" }) });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect(graphs.instances?.size ?? 0).toBe(0);
+    expect([...(graphs.invalidInstances?.values() ?? [])]).toEqual([expect.stringMatching(/Parent/)]);
+  });
+
+  it("refuses an oversized props text by its field, not by a zod dump", async () => {
+    const dir = await scratch();
+    const converter = await writingConverter(dir, { "MI_Child.instance.json": record({ props: "x".repeat(600 * 1024) }) });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect(graphs.instances?.size ?? 0).toBe(0);
+    const [reason] = [...(graphs.invalidInstances?.values() ?? [])];
+    expect(reason).toMatch(/^.*props/);
+    expect(reason!.length).toBeLessThanOrEqual(200);
+  });
+});
+
+// A record's identity keeps its mount: /Game/ and Content/ name the pack's one mount, /Engine/ is never the pack's, and a path with
+// no mount is no pack package.
+describe("material instance identity keeps the mount", () => {
+  it("does not read /Engine/A/MI_Mid as the pack's /Game/Engine/A/MI_Mid", () => {
+    expect(materialInstanceKey("/Engine/A/MI_Mid", "MI_Mid")).not.toBe(materialInstanceKey("/Game/Engine/A/MI_Mid", "MI_Mid"));
+  });
+
+  it("does not read an unmounted package as the pack's /Game/ package of the same path", () => {
+    expect(materialInstanceKey("SoulCave/A/MI_Mid", "MI_Mid")).not.toBe(materialInstanceKey("/Game/SoulCave/A/MI_Mid", "MI_Mid"));
+  });
+
+  it("reads Content/ and /Game/ as one mount, whatever the case", () => {
+    expect(materialInstanceKey("Content/A/MI_Mid", "MI_Mid")).toBe(materialInstanceKey("/Game/A/MI_Mid", "MI_Mid"));
+    expect(materialInstanceKey("/game/a/mi_mid", "MI_MID")).toBe(materialInstanceKey("/Game/A/MI_Mid", "MI_Mid"));
+  });
+});
+
+// Graph files that claim one exact identity (package and object; case and Content/ spellings are one identity) are all refused when the dump
+// is read. The map never keeps the last of them by overwriting, and a namesake of another package never stands in for them.
+describe("duplicate graph identities are refused when the dump is read", () => {
+  const writingGraphs = async (dir: string, files: Record<string, unknown>): Promise<string> =>
+    fakeConverter(
+      dir,
+      `import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const out = process.argv[process.argv.indexOf("--dump-graphs") + 1];
+const files = ${JSON.stringify(files)};
+for (const [name, value] of Object.entries(files)) writeFileSync(join(out, name), JSON.stringify(value));`,
+    );
+
+  it("keeps the unique namesake and no claimant of a duplicated identity, when the namesake sorts first", async () => {
+    const dir = await scratch();
+    const converter = await writingGraphs(dir, {
+      "a-wrong.graph.json": { ...maskTintGraph("M_Master"), package: "/Game/Other/M_Master" },
+      "b-exact.graph.json": { ...maskTintGraph("M_Master"), package: "/Game/Required/M_Master" },
+      "c-duplicate.graph.json": { ...maskTintGraph("M_Master"), package: "/Game/Required/M_Master" },
+    });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect([...graphs.values()].map((graph) => graph.package)).toEqual(["/Game/Other/M_Master"]);
+  });
+
+  it("counts a Content/ alias and a case variant as claims of the same identity", async () => {
+    const dir = await scratch();
+    const converter = await writingGraphs(dir, {
+      "a.graph.json": { ...maskTintGraph("M_Master"), package: "/Game/Required/M_Master" },
+      "b.graph.json": { ...maskTintGraph("M_Master"), package: "/Content/Required/M_Master" },
+      "c.graph.json": { ...maskTintGraph("M_Master"), package: "/game/required/m_master" },
+    });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect([...graphs.values()]).toEqual([]);
+  });
+
+  it("keeps each unique identity, including a same-named master of another package beside a refused pair", async () => {
+    const dir = await scratch();
+    const converter = await writingGraphs(dir, {
+      "a.graph.json": { ...maskTintGraph("M_Master"), package: "/Game/Required/M_Master" },
+      "b.graph.json": { ...maskTintGraph("M_Master"), package: "/Game/Required/M_Master" },
+      "c.graph.json": { ...maskTintGraph("M_Master"), package: "/Game/Other/M_Master" },
+      "d.graph.json": { ...maskTintGraph("M_Slave"), package: "/Game/Required/M_Slave" },
+    });
+    const graphs = await dumpMaterialGraphs("/some/source", { converterPath: converter });
+    expect([...graphs.values()].map((graph) => `${graph.package}.${graph.material}`).sort()).toEqual([
+      "/Game/Other/M_Master.M_Master",
+      "/Game/Required/M_Slave.M_Slave",
+    ]);
   });
 });

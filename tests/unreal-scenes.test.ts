@@ -13,7 +13,7 @@ import {
   unrealTransformToGltfMatrix,
   type UnrealSceneSource,
 } from "../src/unreal/scenes.js";
-import { validateGlb } from "../src/unreal/importer.js";
+import { interleavedBufferViews, validateGlb } from "../src/unreal/importer.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -366,5 +366,51 @@ describe("Unreal level conversion", () => {
     expect(manifest.actors[0].model).toBe("Models/SM_Desk.glb");
     expect(manifest.instanceGroups[0].matrices).toHaveLength(2);
     expect(manifest.generatedEnginePrimitives).toEqual(["Plane"]);
+  });
+});
+
+describe("authored UV sets in a reconstructed scene", () => {
+  it("keeps every UV set on scene primitives without an interleaved buffer view", async () => {
+    const outputRoot = await mkdtemp(join(tmpdir(), "tn-scene-uv-"));
+    temporaryDirectories.push(outputRoot);
+    await mkdir(join(outputRoot, "Models"), { recursive: true });
+    // Lightmap sets equal to UV0 are valid source data. Deduplication merged those accessors, so one buffer view carried
+    // several semantics and the native host rejected the scene.
+    const uv0 = [0, 0, 1, 0, 0, 1];
+    const sets = {
+      TEXCOORD_0: uv0,
+      TEXCOORD_1: uv0,
+      TEXCOORD_2: [0.5, 0.5, 0.25, 0.75, 0.75, 0.25],
+      TEXCOORD_3: uv0,
+      TEXCOORD_7: [0.9375, 0.0625, 0.5, 0.875, 0.1875, 0.4375],
+    };
+    const model = new Document();
+    const buffer = model.createBuffer();
+    const accessor = (semantic: string, type: "VEC2" | "VEC3", values: number[]) =>
+      model.createAccessor(semantic).setType(type).setArray(new Float32Array(values)).setBuffer(buffer);
+    const primitive = model.createPrimitive()
+      .setAttribute("POSITION", accessor("POSITION", "VEC3", [0, 0, 0, 1, 0, 0, 0, 2, 0]))
+      .setAttribute("NORMAL", accessor("NORMAL", "VEC3", [0, 0, 1, 0, 0, 1, 0, 0, 1]));
+    for (const [semantic, values] of Object.entries(sets)) primitive.setAttribute(semantic, accessor(semantic, "VEC2", values));
+    model.createScene().addChild(model.createNode("SM_Desk").setMesh(model.createMesh("SM_Desk").addPrimitive(primitive)));
+    await new NodeIO().write(join(outputRoot, "Models", "SM_Desk.glb"), model);
+
+    const base = source();
+    const imported = await assembleSceneGlb({
+      source: { ...base, actors: [{ ...base.actors[0]!, meshName: "SM_Desk" }], instanceGroups: [], landscapes: [], lights: [] },
+      package: "Content/Maps/DemoMap.umap",
+      outputRoot,
+      models: [{ name: "SM_Desk", glb: "Models/SM_Desk.glb" }],
+      validate: validateGlb,
+    });
+
+    const bytes = await readFile(join(outputRoot, imported.glb));
+    const scene = await new NodeIO().read(join(outputRoot, imported.glb));
+    const scenePrimitive = scene.getRoot().listMeshes()[0]!.listPrimitives()[0]!;
+    expect(scenePrimitive.listSemantics().sort()).toEqual(["NORMAL", "POSITION", ...Object.keys(sets)].sort());
+    for (const [semantic, values] of Object.entries(sets)) {
+      expect(Array.from(scenePrimitive.getAttribute(semantic)!.getArray()!), semantic).toEqual(values);
+    }
+    expect(interleavedBufferViews(bytes)).toBe(0);
   });
 });

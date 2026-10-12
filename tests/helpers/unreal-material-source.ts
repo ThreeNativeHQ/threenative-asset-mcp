@@ -7,11 +7,13 @@ export interface SourceProperty {
   inner?: string;
   enum?: string;
 }
-export interface SourceExport { name: string; className: string; properties: SourceProperty[]; outer?: number }
+// `trailing` are 32-bit words written after the tags and the ObjectGuid flag, where a gated class field (a cached-data bool) would sit.
+export interface SourceExport { name: string; className: string; properties: SourceProperty[]; outer?: number; trailing?: number[] }
 export const prop = (name: string, type: string, value: unknown, meta: Partial<SourceProperty> = {}): SourceProperty => ({ name, type, value, ...meta });
 export const float = (name: string, value: number) => prop(name, "FloatProperty", value);
 export const bool = (name: string, value: boolean) => prop(name, "BoolProperty", value);
 export const input = (name: string, expression: number, channel?: number, outputIndex = 0) => prop(name, "StructProperty", { expression, channel, outputIndex }, { struct: "ExpressionInput" });
+export const scalarInput = (name: string, expression: number, outputIndex = 0, constant?: number) => prop(name, "StructProperty", { expression, outputIndex, constant }, { struct: "ScalarMaterialInput" });
 export const fields = (name: string, struct: string, value: SourceProperty[]) => prop(name, "StructProperty", value, { struct });
 export const parameter = (name: string, value: number | boolean, override = true): SourceProperty[] => [
   fields("ParameterInfo", "MaterialParameterInfo", [prop("Name", "NameProperty", name), prop("Association", "ByteProperty", "GlobalParameter", { enum: "EMaterialParameterAssociation" }), prop("Index", "IntProperty", -1)]),
@@ -19,7 +21,7 @@ export const parameter = (name: string, value: number | boolean, override = true
   ...(typeof value === "boolean" ? [bool("bOverride", override)] : []),
 ];
 
-export function materialPackage(exports: SourceExport[], external: string[] = [], options: { version?: number; core?: number; framework?: number; externalClasses?: Readonly<Record<string, string>> } = {}): Buffer {
+export function materialPackage(exports: SourceExport[], external: string[] = [], options: { version?: number; core?: number; framework?: number; customVersions?: readonly { guid: readonly number[]; version: number }[]; externalClasses?: Readonly<Record<string, string>> } = {}): Buffer {
   const names: string[] = [];
   const imports: { name: string; outer: number; className: string }[] = [];
   const i32 = (n: number) => { const b = Buffer.alloc(4); b.writeInt32LE(n); return b; };
@@ -46,9 +48,11 @@ export function materialPackage(exports: SourceExport[], external: string[] = []
       case "NameProperty": case "ByteProperty": return fname(p.value as string);
       case "ObjectProperty": return i32(typeof p.value === "string" ? externalRefs[external.indexOf(p.value)]! : p.value as number);
       case "StructProperty": {
-        if (p.struct === "ExpressionInput") {
-          const v = p.value as { expression: number; channel?: number; outputIndex: number };
-          return Buffer.concat([i32(v.expression), i32(v.outputIndex), fname("None"), i32(v.channel === undefined ? 0 : 1), ...[0, 1, 2, 3].map((c) => i32(c === v.channel ? 1 : 0))]);
+        if (p.struct === "ExpressionInput" || p.struct === "ScalarMaterialInput") {
+          const v = p.value as { expression: number; channel?: number; outputIndex: number; constant?: number };
+          // A ScalarMaterialInput appends UseConstant and Constant after the masks; an ExpressionInput has no such tail.
+          const constant = p.struct === "ScalarMaterialInput" ? [i32(v.constant === undefined ? 0 : 1), f32(v.constant ?? 0)] : [];
+          return Buffer.concat([i32(v.expression), i32(v.outputIndex), fname("None"), i32(v.channel === undefined ? 0 : 1), ...[0, 1, 2, 3].map((c) => i32(c === v.channel ? 1 : 0)), ...constant]);
         }
         if (["Vector", "Vector2D", "Vector4", "LinearColor"].includes(p.struct!)) return Buffer.concat((p.value as number[]).map(f32));
         return encodeProperties(p.value as SourceProperty[]);
@@ -69,13 +73,16 @@ export function materialPackage(exports: SourceExport[], external: string[] = []
     ...(p.type === "ArrayProperty" ? [fname(p.inner!)] : []), Buffer.from([0]), body,
   ]);
   const encodeProperties = (properties: SourceProperty[]) => Buffer.concat([...properties.map((p) => encodeTag(p, encodeValue(p))), fname("None")]);
-  const bodies = exports.map((e) => encodeProperties(e.properties));
+  // Every UE4 export ends its tags with a 32-bit ObjectGuid flag (CUE4Parse's UObject.Deserialize reads it for each non-default
+  // object). Without it the read runs one int past the body, which CUE4Parse logs as a failed read of the whole material.
+  const bodies = exports.map((e) => Buffer.concat([encodeProperties(e.properties), Buffer.alloc(4), ...(e.trailing ?? []).map(i32)]));
   const importTable = Buffer.concat(imports.map((r) => Buffer.concat([fname("/Script/Engine"), fname(r.className), i32(r.outer), fname(r.name)])));
   exports.forEach((e) => fname(e.name));
   const summary = (nameOffset: number, importOffset: number, exportOffset: number, headerSize: number) => Buffer.concat([
-    u32(0x9e2a83c1), i32(-7), i32(864), i32(options.version ?? 516), i32(0), i32(2),
+    u32(0x9e2a83c1), i32(-7), i32(864), i32(options.version ?? 516), i32(0), i32(2 + (options.customVersions?.length ?? 0)),
     ...[0x375ec13c, 0x06e448fb, 0xb50084f0, 0x262a717e].map(u32), i32(options.core ?? 2),
     ...[0xcffc743f, 0x43b04480, 0x939114df, 0x171d2073].map(u32), i32(options.framework ?? 33),
+    ...(options.customVersions ?? []).flatMap((c) => [...c.guid.map(u32), i32(c.version)]),
     i32(headerSize), string(""), u32(0), i32(names.length), i32(nameOffset), string(""), i32(0), i32(0),
     i32(exports.length), i32(exportOffset), i32(imports.length), i32(importOffset), i32(headerSize),
     i32(0), i32(0), i32(0), i32(0), Buffer.alloc(16), i32(0),

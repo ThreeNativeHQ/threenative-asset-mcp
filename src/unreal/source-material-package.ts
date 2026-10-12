@@ -127,7 +127,9 @@ export function decodeMaterialPackage(bytes: Buffer, path: string): SourcePackag
         if (INPUT_STRUCTS.has(struct)) {
           if (!nativeInputs) { unsupportedNativeInput = true; throw new UnsupportedValue("Native inputs require verified Core=2 and Framework=33 custom versions"); }
           const result: Record<string, unknown> = { Expression: reference(cursor.i32()), OutputIndex: cursor.i32(), InputName: fname(cursor) };
-          if ((result.OutputIndex as number) < 0) throw new Error("Invalid source expression output index");
+          // INDEX_NONE on the null expression is a newly disconnected input (UE 4.19 UMaterialFunction::GetInputsAndOutputs); nothing else negative is admitted.
+          const disconnected = result.OutputIndex === -1 && (result.Expression as SourceReference).index === 0;
+          if ((result.OutputIndex as number) < 0 && !disconnected) throw new Error("Invalid source expression output index");
           for (const key of ["Mask", "MaskR", "MaskG", "MaskB", "MaskA"]) result[key] = cursor.flag(4) ? 1 : 0;
           if (struct !== "ExpressionInput" && struct !== "MaterialAttributesInput") {
             result.UseConstant = cursor.flag(4);
