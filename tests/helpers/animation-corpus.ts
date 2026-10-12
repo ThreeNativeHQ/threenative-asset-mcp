@@ -228,9 +228,30 @@ export function registerAnimationCorpusGates(): void {
           }
           if (id === "modern") modernClips++;
         }
-        if (id !== "modern") assert(controlRig > 0, `${id}: missing precise ControlRig unsupported coverage`);
+        if (id !== "modern") assert.equal(controlRig, 0, `${id}: Sequencer FK clips must not be reported as ControlRig`);
       }
       assert.equal(modernClips, 2, "selected UE5.0 body proof needs two actual walk clips");
+    });
+
+    gate("sequencer-differential", async () => {
+      const referencePath = process.env.PRD596_SEQUENCER_REFERENCE_PSA?.trim();
+      if (!referencePath) throw new Error("AC-2 is blocked: provide an independently decoded PSA at PRD596_SEQUENCER_REFERENCE_PSA");
+      const { outputs } = await load();
+      const source = parsePsa(await readFile(resolve(referencePath)));
+      const out = outputs.gasp58;
+      let comparedKeys = 0;
+      let maximum = 0;
+      for (const sequence of source.sequences) {
+        const documents = out.documents.filter((doc) => doc.getRoot().listAnimations().some((clip) => clip.getName() === sequence.name));
+        assert.equal(documents.length, 1, `${sequence.name}: exactly one Sequencer GLB is required`);
+        const result = compareAnimationDifferential(documents[0]!, { bones: source.bones, sequences: [sequence] }, { toleranceDegrees: 0.5 });
+        assert.deepEqual(result.missing, [], `${sequence.name}: missing independent comparisons`);
+        assert.deepEqual(result.errors, [], `${sequence.name}: independent angular errors`);
+        assert(result.comparedKeys > 0 && result.maxErrorDegrees <= 0.5, `${sequence.name}: no independent keys or error exceeds 0.5 degrees`);
+        comparedKeys += result.comparedKeys;
+        maximum = Math.max(maximum, result.maxErrorDegrees);
+      }
+      console.info(`sequencer-differential: ${source.sequences.length} clip(s), ${comparedKeys} keys, max ${maximum.toFixed(6)} deg`);
     });
 
     gate("clip-differential", async () => {

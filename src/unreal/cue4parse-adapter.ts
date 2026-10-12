@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.4",
+  version: "b4e95441+threenative.584.5",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -701,6 +701,7 @@ using CUE4Parse.UE4.Assets.Exports.Component.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.Component.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Component.TextRender;
 using CUE4Parse.UE4.Objects.Engine;
+using CUE4Parse.UE4.Objects.Engine.Curves;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
@@ -710,6 +711,7 @@ using CUE4Parse.UE4.Objects.Core.Compression;
 using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
+using CUE4Parse.UE4.Objects.MovieScene;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Objects.Engine.Animation;
@@ -2512,10 +2514,10 @@ async Task<bool> ExportSkeletalMeshAsync(USkeletalMesh mesh)
     return true;
 }
 
-// PRD-583: UE5 clips, blend spaces, aim offsets, montages and composites ------------------------------------------
-// The pinned CUE4Parse reader exposes a clip's bone tracks only through RawAnimationData, the UE4
-// FUECompressedAnimData layout or ACL. A UE5.6+ clip keeps its tracks in a ControlRig MovieScene
-// model instead, so it is reported with its reason and never replaced by the bind pose.
+// PRD-583/596: UE5 clips, blend spaces, aim offsets, montages and composites -------------------------------
+// The pinned CUE4Parse reader exposes conventional bone tracks through RawAnimationData, compressed data or
+// the UAnimDataModel. A UE5 Sequencer model is decoded only when its section is an FKControlRig; other ControlRig
+// graphs remain Reported with their exact reason and are never replaced by the bind pose.
 // One animation artifact per package, nested so two packages that share a clip or asset basename
 // ("/Game/A/Walk" and "/Game/B/Walk") never overwrite each other. The directory is the package path
 // below "/Game/"; the file name is the object name, which the importer reads back into exact
@@ -2578,7 +2580,7 @@ static FStructFallback[] ArrayElements(AbstractPropertyHolder holder, string nam
     return [];
 }
 
-static FStructFallback? StructProperty(UObject holder, string name)
+static FStructFallback? StructProperty(AbstractPropertyHolder holder, string name)
 {
     // A struct tag is either a bare FStructFallback or, when the struct name resolved to a typed struct,
     // an FScriptStruct wrapping one; unwrap it so a caller that only wants the fields reads both.
@@ -2756,7 +2758,8 @@ List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence, UObject? 
     var tracks = SelectAuthoredCurveTracks(conventional,
         modelLegacy is null ? null : new FRawCurveTracks(modelLegacy),
         sequenceLegacy is null ? null : new FRawCurveTracks(sequenceLegacy),
-        sequence.RawCurveData, sequence.CompressedCurveData);
+        sequence.RawCurveData,
+        model is not null && IsSequencerDataModel(model) ? null : sequence.CompressedCurveData);
     if (tracks?.FloatCurves is { } curves) return CurveList(curves);
     return [];
 }
@@ -2851,6 +2854,15 @@ static UObject? ExactDataModel(UAnimSequence sequence, IPackage package)
     return candidate is not null && IsConventionalDataModel(candidate) ? candidate : null;
 }
 
+static bool IsSequencerDataModel(UObject export) => export.ExportType is "AnimationSequencerDataModel" or "UAnimationSequencerDataModel";
+
+static UObject? ExactSequencerDataModel(UAnimSequence sequence, IPackage package)
+{
+    var candidate = DataModelExport(package, sequence, out _);
+    if (candidate is not null && IsSequencerDataModel(candidate)) return candidate;
+    return package.GetExports().FirstOrDefault(export => IsSequencerDataModel(export) && IsOwnedBy(export, sequence));
+}
+
 // Vectors and quaternions of a tagged FRawAnimSequenceTrack. A UE5 LWC package tags them as the float
 // structs Vector3f/Quat4f (CUE4Parse TIntVector3/4<float>); an older package tags them as Vector/Quat.
 static FVector[] TaggedVectors(FStructFallback data, string field)
@@ -2894,6 +2906,554 @@ static bool ModelTrackData(FStructFallback track, out FRawAnimSequenceTrack raw,
     return false;
 }
 
+// UE 5.8's UAnimationSequencerDataModel calls FMovieSceneFloatChannel::Evaluate directly for each
+// FFrameNumber in IterateTransformControlCurve (AnimSequencerDataModel.cpp:1246). Keep the evaluator
+// here as one pure function so synthetic channels can exercise the same interpolation contract.
+static bool EvaluateSequencerChannel(SequencerChannelData channel, double inputTime, out float result, out string reason)
+{
+    result = channel.HasDefaultValue ? channel.DefaultValue : 0f;
+    reason = "";
+    var evaluationReason = "";
+    var times = channel.Times ?? [];
+    var keys = channel.Values ?? [];
+    if (times.Length != keys.Length)
+    {
+        reason = $"channel has {times.Length} times and {keys.Length} values";
+        return false;
+    }
+    if (times.Length == 0) return channel.HasDefaultValue;
+    if (times.Length == 1)
+    {
+        result = keys[0].Value;
+        return true;
+    }
+    if (channel.TickRateNumerator <= 0 || channel.TickRateDenominator <= 0)
+    {
+        reason = $"channel has an invalid TickResolution {channel.TickRateNumerator}/{channel.TickRateDenominator}";
+        return false;
+    }
+    for (var index = 1; index < times.Length; index++)
+    {
+        if (times[index] <= times[index - 1])
+        {
+            reason = $"channel key times are not strictly increasing at index {index}";
+            return false;
+        }
+    }
+
+    var time = inputTime;
+    var valueOffset = 0d;
+    var firstTime = times[0];
+    var lastTime = times[^1];
+    var firstValue = keys[0].Value;
+    var lastValue = keys[^1].Value;
+
+    bool RemapCycle(ERichCurveExtrapolation mode, bool pre)
+    {
+        var duration = (double) lastTime - firstTime;
+        if (duration <= 0)
+        {
+            evaluationReason = "channel extrapolation has no positive time range";
+            return false;
+        }
+        var cycles = pre ? Math.Floor((lastTime - time) / duration) : Math.Floor((time - firstTime) / duration);
+        var cycleCount = pre ? -(long) cycles : (long) cycles;
+        time += pre ? duration * cycles : -duration * cycles;
+        if (mode == ERichCurveExtrapolation.RCCE_CycleWithOffset)
+            valueOffset = (lastValue - firstValue) * cycleCount;
+        if (mode == ERichCurveExtrapolation.RCCE_Oscillate && Math.Abs(cycleCount) % 2 == 1)
+            time = firstTime + lastTime - time;
+        return true;
+    }
+
+    if (time < firstTime)
+    {
+        switch (channel.PreInfinityExtrap)
+        {
+            case ERichCurveExtrapolation.RCCE_Constant:
+                result = firstValue;
+                return true;
+            case ERichCurveExtrapolation.RCCE_None:
+                return false;
+            case ERichCurveExtrapolation.RCCE_Linear:
+                if (keys[0].InterpMode is ERichCurveInterpMode.RCIM_Constant or ERichCurveInterpMode.RCIM_None)
+                    result = firstValue;
+                else if (keys[0].InterpMode == ERichCurveInterpMode.RCIM_Cubic)
+                    result = (float) (firstValue + keys[0].ArriveTangent * (time - firstTime));
+                else if (keys[0].InterpMode == ERichCurveInterpMode.RCIM_Linear)
+                {
+                    var delta = times[1] - times[0];
+                    result = delta == 0 ? firstValue : (float) (firstValue + (keys[1].Value - firstValue) / delta * (time - firstTime));
+                }
+                else
+                {
+                    reason = $"unsupported interpolation mode {(int) keys[0].InterpMode} in pre-infinity extrapolation";
+                    return false;
+                }
+                return true;
+            case ERichCurveExtrapolation.RCCE_Cycle:
+            case ERichCurveExtrapolation.RCCE_CycleWithOffset:
+            case ERichCurveExtrapolation.RCCE_Oscillate:
+                if (!RemapCycle(channel.PreInfinityExtrap, true)) { reason = evaluationReason; return false; }
+                break;
+            default:
+                reason = $"unsupported pre-infinity extrapolation mode {(int) channel.PreInfinityExtrap}";
+                return false;
+        }
+    }
+    else if (time > lastTime)
+    {
+        switch (channel.PostInfinityExtrap)
+        {
+            case ERichCurveExtrapolation.RCCE_Constant:
+                result = lastValue;
+                return true;
+            case ERichCurveExtrapolation.RCCE_None:
+                return false;
+            case ERichCurveExtrapolation.RCCE_Linear:
+                if (keys[^1].InterpMode is ERichCurveInterpMode.RCIM_Constant or ERichCurveInterpMode.RCIM_None)
+                    result = lastValue;
+                else if (keys[^1].InterpMode == ERichCurveInterpMode.RCIM_Cubic)
+                    result = (float) (lastValue + keys[^1].LeaveTangent * (time - lastTime));
+                else if (keys[^1].InterpMode == ERichCurveInterpMode.RCIM_Linear)
+                {
+                    var delta = times[^1] - times[^2];
+                    result = delta == 0 ? lastValue : (float) (lastValue + (lastValue - keys[^2].Value) / delta * (time - lastTime));
+                }
+                else
+                {
+                    reason = $"unsupported interpolation mode {(int) keys[^1].InterpMode} in post-infinity extrapolation";
+                    return false;
+                }
+                return true;
+            case ERichCurveExtrapolation.RCCE_Cycle:
+            case ERichCurveExtrapolation.RCCE_CycleWithOffset:
+            case ERichCurveExtrapolation.RCCE_Oscillate:
+                if (!RemapCycle(channel.PostInfinityExtrap, false)) { reason = evaluationReason; return false; }
+                break;
+            default:
+                reason = $"unsupported post-infinity extrapolation mode {(int) channel.PostInfinityExtrap}";
+                return false;
+        }
+    }
+
+    double Bezier(double p0, double p1, double p2, double p3, double alpha)
+    {
+        var p01 = p0 + (p1 - p0) * alpha;
+        var p12 = p1 + (p2 - p1) * alpha;
+        var p23 = p2 + (p3 - p2) * alpha;
+        var p012 = p01 + (p12 - p01) * alpha;
+        var p123 = p12 + (p23 - p12) * alpha;
+        return p012 + (p123 - p012) * alpha;
+    }
+
+    int SolveCubic(double[] coefficients, double[] solutions)
+    {
+        double Cbrt(double value) => value > 0 ? Math.Pow(value, 1d / 3d) : value < 0 ? -Math.Pow(-value, 1d / 3d) : 0;
+        var denominator = coefficients[3] == 0 ? 1e-24 : coefficients[3];
+        var a = coefficients[2] / denominator;
+        var b = coefficients[1] / denominator;
+        var c = coefficients[0] / denominator;
+        var p = (-a * a / 3d + b) / 3d;
+        var q = (2d * a * a * a / 27d - a * b / 3d + c) / 2d;
+        var discriminant = q * q + p * p * p;
+        var count = 0;
+        if (Math.Abs(discriminant) <= 1e-12)
+        {
+            if (Math.Abs(q) <= 1e-12)
+            {
+                solutions[0] = 0;
+                count = 1;
+            }
+            else
+            {
+                var u = Cbrt(-q);
+                solutions[0] = 2 * u;
+                solutions[1] = -u;
+                count = 2;
+            }
+        }
+        else if (discriminant < 0)
+        {
+            var phi = Math.Acos(Math.Clamp(-q / Math.Sqrt(-p * p * p), -1d, 1d)) / 3d;
+            var t = 2d * Math.Sqrt(-p);
+            solutions[0] = t * Math.Cos(phi);
+            solutions[1] = -t * Math.Cos(phi + 2d * Math.PI / 3d);
+            solutions[2] = -t * Math.Cos(phi - 2d * Math.PI / 3d);
+            count = 3;
+        }
+        else
+        {
+            var sqrt = Math.Sqrt(discriminant);
+            solutions[0] = Cbrt(sqrt - q) - Cbrt(sqrt + q);
+            count = 1;
+        }
+        var sub = a / 3d;
+        for (var index = 0; index < count; index++) solutions[index] -= sub;
+        return count;
+    }
+
+    double Weighted(SequencerKey start, double startTime, SequencerKey end, double endTime, double evalTime, bool weightedStart, bool weightedEnd)
+    {
+        var interval = (double) channel.TickRateDenominator / channel.TickRateNumerator;
+        var toSeconds = 1d / interval;
+        var time1 = startTime * interval;
+        var time2 = endTime * interval;
+        var dxSeconds = time2 - time1;
+        var startAngle = Math.Atan(start.LeaveTangent * toSeconds);
+        var startCos = Math.Cos(startAngle);
+        var startSin = Math.Sin(startAngle);
+        var startWeight = weightedStart
+            ? start.LeaveTangentWeight
+            : Math.Sqrt(dxSeconds * dxSeconds + (start.LeaveTangent / interval * dxSeconds) * (start.LeaveTangent / interval * dxSeconds)) / 3d;
+        var startX = startCos * startWeight + time1;
+        var startY = startSin * startWeight + start.Value;
+        var endAngle = Math.Atan(end.ArriveTangent * toSeconds);
+        var endCos = Math.Cos(endAngle);
+        var endSin = Math.Sin(endAngle);
+        var endWeight = weightedEnd
+            ? end.ArriveTangentWeight
+            : Math.Sqrt(dxSeconds * dxSeconds + (end.ArriveTangent / interval * dxSeconds) * (end.ArriveTangent / interval * dxSeconds)) / 3d;
+        var endX = -endCos * endWeight + time2;
+        var endY = -endSin * endWeight + end.Value;
+        if (endX < startX)
+        {
+            var overlap = startX - endX;
+            var firstDistance = startX - time1;
+            var secondDistance = time2 - endX;
+            var total = firstDistance + secondDistance;
+            if (total > 0)
+            {
+                startX -= overlap * firstDistance / total;
+                startY = (startX - time1) * Math.Tan(startAngle) + start.Value;
+                endX += overlap * secondDistance / total;
+                endY = (time2 - endX) * -Math.Tan(endAngle) + end.Value;
+            }
+        }
+        var normalizedStartX = (startX - time1) / dxSeconds;
+        var normalizedEndX = (endX - time1) / dxSeconds;
+        var alpha = (float) ((evalTime - startTime) / (endTime - startTime));
+        var coefficients = new[] { 0d, 0d, 0d, 0d };
+        var roots = new[] { 0d, 0d, 0d };
+        // BezierToPower(0, startX, endX, 1), then solve x(alpha) = requested time.
+        coefficients[3] = 1d - 3d * normalizedEndX + 3d * normalizedStartX;
+        coefficients[2] = 3d * normalizedEndX - 6d * normalizedStartX;
+        coefficients[1] = 3d * normalizedStartX;
+        coefficients[0] = -alpha;
+        var count = SolveCubic(coefficients, roots);
+        var newAlpha = (double) alpha;
+        if (count == 1) newAlpha = roots[0];
+        else
+        {
+            newAlpha = double.NegativeInfinity;
+            for (var index = 0; index < count; index++)
+                if (roots[index] >= -1e-4 && roots[index] <= 1d + 1e-4 && (double.IsNegativeInfinity(newAlpha) || roots[index] > newAlpha))
+                    newAlpha = roots[index];
+            if (double.IsNegativeInfinity(newAlpha)) newAlpha = 0;
+        }
+        return Bezier(start.Value, startY, endY, end.Value, newAlpha);
+    }
+
+    bool EvaluateSegment(int first, int second, out float value)
+    {
+        var left = keys[first];
+        var right = keys[second];
+        var delta = times[second] - times[first];
+        if (delta <= 0)
+        {
+            evaluationReason = $"channel key times are not strictly increasing at index {second}";
+            value = 0;
+            return false;
+        }
+        var alpha = (time - times[first]) / delta;
+        switch (left.InterpMode)
+        {
+            case ERichCurveInterpMode.RCIM_Constant:
+            case ERichCurveInterpMode.RCIM_None:
+                value = left.Value;
+                return true;
+            case ERichCurveInterpMode.RCIM_Linear:
+                value = (float) (left.Value + (right.Value - left.Value) * alpha);
+                return true;
+            case ERichCurveInterpMode.RCIM_Cubic:
+                var weightedStart = left.TangentWeightMode is ERichCurveTangentWeightMode.RCTWM_WeightedBoth or ERichCurveTangentWeightMode.RCTWM_WeightedLeave;
+                var weightedEnd = right.TangentWeightMode is ERichCurveTangentWeightMode.RCTWM_WeightedBoth or ERichCurveTangentWeightMode.RCTWM_WeightedArrive;
+                value = (float) ((weightedStart || weightedEnd)
+                    ? Weighted(left, times[first], right, times[second], time, weightedStart, weightedEnd)
+                    : Bezier(left.Value, left.Value + left.LeaveTangent * delta / 3d, right.Value - right.ArriveTangent * delta / 3d, right.Value, alpha));
+                return true;
+            default:
+                evaluationReason = $"unsupported interpolation mode {(int) left.InterpMode}";
+                value = 0;
+                return false;
+        }
+    }
+
+    if (time <= firstTime)
+    {
+        result = (float) (firstValue + valueOffset);
+        return true;
+    }
+    for (var index = 0; index < times.Length - 1; index++)
+    {
+        if (time < times[index + 1])
+        {
+            if (!EvaluateSegment(index, index + 1, out result)) { reason = evaluationReason; return false; }
+            result = (float) (result + valueOffset);
+            return true;
+        }
+        if (time == times[index + 1])
+        {
+            result = (float) (keys[index + 1].Value + valueOffset);
+            return true;
+        }
+    }
+    result = (float) (lastValue + valueOffset);
+    return true;
+}
+
+static bool TrySequencerChannel(FMovieSceneChannel<float> channel, out SequencerChannelData data, out string reason)
+{
+    reason = "";
+    var times = channel.Times ?? [];
+    var values = channel.Values ?? [];
+    if (times.Length != values.Length)
+    {
+        data = new SequencerChannelData(times.Select(value => value.Value).ToArray(), [], channel.PreInfinityExtrap, channel.PostInfinityExtrap, 0, 0, channel.bHasDefaultValue, channel.DefaultValue);
+        reason = $"channel has {times.Length} times and {values.Length} values";
+        return false;
+    }
+    var numerator = channel.TickResolution.Numerator;
+    var denominator = channel.TickResolution.Denominator == 0 ? 1 : channel.TickResolution.Denominator;
+    data = new SequencerChannelData(
+        times.Select(value => value.Value).ToArray(),
+        values.Select(value => new SequencerKey(value.Value, value.Tangent.ArriveTangent, value.Tangent.LeaveTangent, value.Tangent.ArriveTangentWeight, value.Tangent.LeaveTangentWeight, value.InterpMode, value.TangentMode, value.Tangent.TangentWeightMode)).ToArray(),
+        channel.PreInfinityExtrap,
+        channel.PostInfinityExtrap,
+        numerator,
+        denominator,
+        channel.bHasDefaultValue,
+        channel.DefaultValue);
+    if (values.Length > 0 && numerator <= 0)
+    {
+        reason = $"channel has an invalid TickResolution {numerator}/{denominator}";
+        return false;
+    }
+    return true;
+}
+
+static bool SequencerFrameRate(AbstractPropertyHolder movieScene, out int numerator, out int denominator, out string reason)
+{
+    reason = "";
+    numerator = 0;
+    denominator = 1;
+    if (movieScene.TryGetValue<FFrameRate>(out var typed, "DisplayRate"))
+    {
+        numerator = typed.Numerator;
+        denominator = typed.Denominator == 0 ? 1 : typed.Denominator;
+    }
+    else if (StructProperty(movieScene, "DisplayRate") is { } fallback)
+    {
+        if (!StructNumber(fallback, "Numerator", out var rawNumerator))
+        {
+            reason = "the clip's MovieScene DisplayRate carries no Numerator";
+            return false;
+        }
+        numerator = (int) rawNumerator;
+        if (StructNumber(fallback, "Denominator", out var rawDenominator)) denominator = (int) rawDenominator;
+    }
+    else
+    {
+        reason = "the clip's MovieScene carries no DisplayRate";
+        return false;
+    }
+    if (numerator <= 0 || denominator <= 0)
+    {
+        reason = $"the clip's MovieScene DisplayRate is invalid ({numerator}/{denominator})";
+        return false;
+    }
+    return true;
+}
+
+// UE 5.8's UAnimationSequencerDataModel selects the first ControlRig track section whose object is an
+// FKControlRig. Its transform parameters are direct Euler bone controls; no ControlRig graph execution
+// or initial-pose substitution belongs in this path (AnimSequencerDataModel.cpp:927-947, :1246-1300).
+static bool PopulateFromSequencerDataModel(UAnimSequence sequence, UObject model, out string reason, out Dictionary<string, object?>? timing)
+{
+    reason = "";
+    timing = null;
+    var skeleton = sequence.Skeleton?.Load<USkeleton>();
+    if (skeleton is null)
+    {
+        reason = "the clip names no skeleton to map its Sequencer FK controls onto";
+        return false;
+    }
+    if (!model.TryGetValue<FPackageIndex>(out var movieSceneIndex, "MovieScene") || movieSceneIndex.IsNull || movieSceneIndex.Load<UObject>() is not AbstractPropertyHolder movieScene)
+    {
+        reason = "the clip's AnimationSequencerDataModel carries no MovieScene";
+        return false;
+    }
+    if (!SequencerFrameRate(movieScene, out var numerator, out var denominator, out reason)) return false;
+    if (!movieScene.TryGetValue<FMovieSceneFrameRange>(out var playbackRange, "PlaybackRange") || playbackRange.Value.UpperBound.Type == ERangeBoundTypes.Open)
+    {
+        reason = "the clip's MovieScene PlaybackRange has no finite upper bound";
+        return false;
+    }
+    var upper = (long) playbackRange.Value.UpperBound.Value.Value;
+    var numberOfFramesLong = playbackRange.Value.UpperBound.Type == ERangeBoundTypes.Exclusive ? upper - 1 : upper;
+    if (numberOfFramesLong > 1_000_000 || numberOfFramesLong < -1)
+    {
+        reason = $"the clip's MovieScene PlaybackRange has an unsupported length {numberOfFramesLong}";
+        return false;
+    }
+    var numberOfFrames = (int) Math.Max(numberOfFramesLong, 1);
+    var numberOfKeys = numberOfFrames + 1;
+
+    UObject? fkSection = null;
+    if (movieScene.TryGetValue<FPackageIndex[]>(out var trackReferences, "Tracks"))
+    {
+        foreach (var trackReference in trackReferences)
+        {
+            var trackObject = trackReference.IsNull ? null : trackReference.Load<UObject>();
+            if (trackObject?.ExportType != "MovieSceneControlRigParameterTrack" || trackObject is not AbstractPropertyHolder track) continue;
+            if (!track.TryGetValue<FPackageIndex[]>(out var sectionReferences, "Sections")) continue;
+            foreach (var sectionReference in sectionReferences)
+            {
+                var sectionObject = sectionReference.IsNull ? null : sectionReference.Load<UObject>();
+                if (sectionObject?.ExportType != "MovieSceneControlRigParameterSection" || sectionObject is not AbstractPropertyHolder sectionHolder) continue;
+                if (!sectionHolder.TryGetValue<FPackageIndex>(out var rigReference, "ControlRig") || rigReference.IsNull) continue;
+                if (rigReference.Load<UObject>()?.ExportType == "FKControlRig")
+                {
+                    fkSection = sectionObject;
+                    break;
+                }
+            }
+            if (fkSection is not null) break;
+        }
+    }
+    if (fkSection is not AbstractPropertyHolder section)
+    {
+        reason = "the clip's AnimationSequencerDataModel has no FKControlRig parameter section";
+        return false;
+    }
+    if (!section.TryGetValue<FStructFallback[]>(out var parameters, "TransformParameterNamesAndCurves") || parameters.Length == 0)
+    {
+        reason = "the clip's FKControlRig section carries no transform parameters";
+        return false;
+    }
+
+    var data = new List<FRawAnimSequenceTrack>();
+    var map = new List<FTrackToSkeletonMap>();
+    var seen = new bool[skeleton.BoneCount];
+    for (var parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
+    {
+        var parameter = parameters[parameterIndex];
+        if (!parameter.TryGetValue<FName>(out var parameterName, "ParameterName"))
+        {
+            reason = $"the FKControlRig parameter {parameterIndex} carries no ParameterName";
+            return false;
+        }
+        var parameterText = parameterName.Text ?? "";
+        var suffix = parameterText.IndexOf("_CONTROL", StringComparison.Ordinal);
+        var targetName = (suffix >= 0 ? parameterText[..suffix] : parameterText).ToLowerInvariant();
+        var boneMatches = skeleton.ReferenceSkeleton.FinalRefBoneInfo
+            .Select((bone, index) => (Name: bone.Name.Text ?? "", Index: index))
+            .Where(bone => string.Equals(bone.Name, targetName, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (boneMatches.Length != 1)
+        {
+            reason = $"the FKControlRig parameter {parameterText} targets {targetName}, which maps to {boneMatches.Length} skeleton bones";
+            return false;
+        }
+        var boneIndex = boneMatches[0].Index;
+        if (seen[boneIndex])
+        {
+            reason = $"the FKControlRig maps more than one parameter to skeleton bone {boneIndex}";
+            return false;
+        }
+        if (!parameter.TryGetAllValues<FMovieSceneChannel<float>>(out var translation, "Translation") ||
+            !parameter.TryGetAllValues<FMovieSceneChannel<float>>(out var rotation, "Rotation") ||
+            !parameter.TryGetAllValues<FMovieSceneChannel<float>>(out var scale, "Scale") ||
+            translation.Length != 3 || rotation.Length != 3 || scale.Length != 3)
+        {
+            reason = $"the FKControlRig parameter {parameterText} does not carry three translation, rotation and scale channels";
+            return false;
+        }
+        var translationData = new SequencerChannelData[3];
+        var rotationData = new SequencerChannelData[3];
+        var scaleData = new SequencerChannelData[3];
+        string channelReason;
+        for (var component = 0; component < 3; component++)
+        {
+            if (!TrySequencerChannel(translation[component], out translationData[component], out channelReason) ||
+                !TrySequencerChannel(rotation[component], out rotationData[component], out channelReason) ||
+                !TrySequencerChannel(scale[component], out scaleData[component], out channelReason))
+            {
+                reason = $"the FKControlRig parameter {parameterText} {channelReason}";
+                return false;
+            }
+        }
+        var hasData = translationData.Any(channel => channel.Values.Length > 0 || channel.HasDefaultValue) ||
+            rotationData.Any(channel => channel.Values.Length > 0 || channel.HasDefaultValue) ||
+            scaleData.Any(channel => channel.Values.Length > 0 || channel.HasDefaultValue);
+        if (!hasData) continue;
+
+        var positions = new FVector[numberOfKeys];
+        var rotations = new FQuat[numberOfKeys];
+        var scales = new FVector[numberOfKeys];
+        for (var frame = 0; frame < numberOfKeys; frame++)
+        {
+            var location = new[] { 0f, 0f, 0f };
+            var euler = new[] { 0f, 0f, 0f };
+            var scaleValue = new[] { 1f, 1f, 1f };
+            for (var component = 0; component < 3; component++)
+            {
+                if (!EvaluateSequencerChannel(translationData[component], frame, out var translationValue, out channelReason))
+                {
+                    if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} translation channel {component} {channelReason}"; return false; }
+                }
+                else location[component] = translationValue;
+                if (!EvaluateSequencerChannel(rotationData[component], frame, out var rotationValue, out channelReason))
+                {
+                    if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} rotation channel {component} {channelReason}"; return false; }
+                }
+                else euler[component] = rotationValue;
+                if (!EvaluateSequencerChannel(scaleData[component], frame, out var scaleComponent, out channelReason))
+                {
+                    if (channelReason.Length > 0) { reason = $"the FKControlRig parameter {parameterText} scale channel {component} {channelReason}"; return false; }
+                }
+                else scaleValue[component] = scaleComponent;
+            }
+            var quaternion = new FRotator(euler[1], euler[2], euler[0]).Quaternion();
+            quaternion.Normalize();
+            positions[frame] = new FVector(location[0], location[1], location[2]);
+            rotations[frame] = quaternion;
+            scales[frame] = new FVector(scaleValue[0], scaleValue[1], scaleValue[2]);
+        }
+        seen[boneIndex] = true;
+        data.Add(new FRawAnimSequenceTrack(positions, rotations, scales));
+        map.Add(new FTrackToSkeletonMap { BoneTreeIndex = boneIndex });
+    }
+    if (data.Count == 0)
+    {
+        reason = "the FKControlRig section carries no transform channel data";
+        return false;
+    }
+    sequence.RawAnimationData = data.ToArray();
+    sequence.TrackToSkeletonMapTable = map.ToArray();
+    sequence.NumFrames = numberOfKeys;
+    sequence.SequenceLength = (float) (numberOfKeys * (double) denominator / numerator);
+    timing = new Dictionary<string, object?>
+    {
+        ["frames"] = numberOfFrames,
+        ["keys"] = numberOfKeys,
+        ["rateNumerator"] = numerator,
+        ["rateDenominator"] = denominator,
+        ["duration"] = numberOfFrames * (double) denominator / numerator,
+    };
+    return true;
+}
+
 // Map a conventional UAnimDataModel's actual bone tracks into the fields the UE4 converter already reads,
 // with the model's own rational timing. Every track is validated: a unique, in-range BoneTreeIndex and a
 // non-empty raw track. A model that fails validation yields a precise reason and no clip, never a
@@ -2903,6 +3463,8 @@ bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string 
 {
     reason = "";
     timing = null;
+    if (ExactSequencerDataModel(sequence, package) is { } sequencerModel)
+        return PopulateFromSequencerDataModel(sequence, sequencerModel, out reason, out timing);
     var skeleton = sequence.Skeleton?.Load<USkeleton>();
     if (skeleton is null)
     {
@@ -3049,6 +3611,30 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
     };
     try
     {
+        var sequencerModel = ExactSequencerDataModel(sequence, package);
+        if (sequencerModel is not null)
+        {
+            document["notifies"] = new List<object>();
+            document["curves"] = new List<object>();
+            document["syncMarkers"] = new List<object>();
+            if (!PopulateFromDataModel(sequence, package, out var sequencerReason, out var sequencerTiming))
+            {
+                document["unsupportedReason"] = sequencerReason.Length > 0 ? sequencerReason : UnsupportedReason(package, sequence);
+                WriteAnimationJson(packagePath, name + ".clip", document);
+                return 0;
+            }
+            if (sequencerTiming is not null) document["timing"] = sequencerTiming;
+            if (sequence.IsValidAdditive() && sequence.RefPoseSeq?.Load<UAnimSequence>() is { } referenceSequence && referenceSequence.Owner is { } referencePackage && ExactSequencerDataModel(referenceSequence, referencePackage) is not null &&
+                !PopulateFromDataModel(referenceSequence, referencePackage, out var referenceReason, out _))
+                throw new InvalidDataException($"the additive reference clip could not be read from its Sequencer model: {referenceReason}");
+            using (var writer = new FArchiveWriter())
+            {
+                new ActorXAnim(sequence.ConvertAnims(), 0).Save(writer);
+                WriteAnimationBytes(packagePath, name, ".psa", writer.GetBuffer());
+            }
+            WriteAnimationJson(packagePath, name + ".clip", document);
+            return 1;
+        }
         var dataModel = DataModelExport(package, sequence, out var dataModelAmbiguity);
         document["notifies"] = NotifyRecords(sequence, sequence.Notifies, dataModel);
         document["curves"] = CurveRecords(sequence, dataModel, ExactDataModel(sequence, package));
@@ -3056,7 +3642,7 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
         if (dataModelAmbiguity.Length > 0) document["dataModelAmbiguity"] = dataModelAmbiguity;
         var hasRaw = sequence.RawAnimationData is { Length: > 0 };
         var modelReason = "";
-        if (!hasRaw && sequence.CompressedDataStructure is null)
+        if (!hasRaw && (sequence.CompressedDataStructure is null || sequencerModel is not null))
         {
             if (PopulateFromDataModel(sequence, package, out var populateReason, out var modelTiming))
             {
@@ -3065,7 +3651,7 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
             }
             else modelReason = populateReason;
         }
-        if (!hasRaw && sequence.CompressedDataStructure is null)
+        if (!hasRaw && (sequence.CompressedDataStructure is null || sequencerModel is not null))
         {
             // The metadata is still real, so its sidecar is written even though no clip is exported.
             document["unsupportedReason"] = modelReason.Length > 0 ? modelReason : UnsupportedReason(package, sequence);
@@ -3098,9 +3684,8 @@ string UnsupportedReason(IPackage package, UAnimSequence sequence)
 {
     if (ExactDataModel(sequence, package) is { } model)
         return $"the clip's {model.ExportType} bone tracks could not be read";
-    if (package.GetExports().Any(export => export.ExportType.Contains("ControlRig", StringComparison.OrdinalIgnoreCase) ||
-        export.ExportType.Contains("SequencerDataModel", StringComparison.OrdinalIgnoreCase)))
-        return "the clip's bone tracks are in a ControlRig/Sequencer MovieScene model the importer does not evaluate";
+    if (ExactSequencerDataModel(sequence, package) is { } sequencerModel)
+        return $"the clip's {sequencerModel.ExportType} has no FKControlRig parameter section the importer can evaluate";
     return $"the clip stores no raw or compressed bone data (NumFrames {sequence.NumFrames}) and references no UAnimDataModel";
 }
 
@@ -6201,6 +6786,24 @@ static class RawDerived
     public static readonly System.Runtime.CompilerServices.ConditionalWeakTable<byte[], object> Table = new();
 }
 sealed record GraphLegacyInput(FPackageIndex? Expression, int Output, int[]? Mask, object? Constant, bool UseConstant);
+sealed record SequencerKey(
+    float Value,
+    float ArriveTangent,
+    float LeaveTangent,
+    float ArriveTangentWeight,
+    float LeaveTangentWeight,
+    ERichCurveInterpMode InterpMode,
+    ERichCurveTangentMode TangentMode,
+    ERichCurveTangentWeightMode TangentWeightMode);
+sealed record SequencerChannelData(
+    int[] Times,
+    SequencerKey[] Values,
+    ERichCurveExtrapolation PreInfinityExtrap,
+    ERichCurveExtrapolation PostInfinityExtrap,
+    int TickRateNumerator,
+    int TickRateDenominator,
+    bool HasDefaultValue,
+    float DefaultValue);
 sealed record EditorMesh(
     float[] Positions,
     int[] InstanceVertices,
