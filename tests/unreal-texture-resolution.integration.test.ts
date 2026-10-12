@@ -47,6 +47,7 @@ async function writeRaw(path: string, data: Buffer, size: number): Promise<void>
 }
 
 async function decode(image: Uint8Array | null | undefined) {
+  expect(image, "the material binds this texture").toBeTruthy();
   const { data, info } = await sharp(image!).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   return { data, width: info.width, height: info.height, at: (x: number, y: number) => [...data.subarray((y * info.width + x) * 4, (y * info.width + x) * 4 + 3)] };
 }
@@ -54,9 +55,10 @@ async function decode(image: Uint8Array | null | undefined) {
 /**
  * The real consumer path: `importUnrealDirectory` over a pack whose mesh export names its textures and carries none, whose
  * material master reaches the modern converter (which writes the 16 px thumbnails), and whose Texture2D packages UE Viewer
- * exports at 64 px. `collidingNormal` adds an unrelated Texture2D package that shares the normal's basename.
+ * exports at 64 px. `collidingNormal` adds an unrelated Texture2D package that shares the normal's basename. `noMaterialTextures`
+ * makes the modern converter ship no image at all, as it does for a package whose source it cannot decode.
  */
-async function importCloth(options: { collidingNormal?: boolean } = {}) {
+async function importCloth(options: { collidingNormal?: boolean; noMaterialTextures?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "texture-resolution-")); directories.push(directory);
   const sourceDir = join(directory, "source"); const kit = join(sourceDir, "Content", "Kit");
   const meshExport = join(directory, "mesh-export"); const outputDir = join(directory, "output");
@@ -81,7 +83,7 @@ async function importCloth(options: { collidingNormal?: boolean } = {}) {
     classes: { Mesh: ["StaticMesh"], Cloth: ["MaterialInstanceConstant"], M_Cloth: ["Material"], T_Cloth_D: ["Texture2D"], T_Cloth_N: ["Texture2D"] },
   });
   const modern = join(directory, "modern-converter");
-  await writeFakeModernMaterialConverter(modern, { texturesFrom: join(directory, "thumbnails") });
+  await writeFakeModernMaterialConverter(modern, options.noMaterialTextures ? {} : { texturesFrom: join(directory, "thumbnails") });
   const report = await importUnrealDirectory({
     sourceDir, outputDir, concurrency: 1, graphBake: false, freeSpaceBytes: 30_000_000_000,
     environment: { ...process.env, THREENATIVE_UNREAL_CACHE_DIR: join(directory, "cache") },
@@ -115,4 +117,12 @@ it("keeps the indexed copy of a texture name that two Texture2D packages share",
   expect([normal.width, normal.height]).toEqual([THUMBNAIL, THUMBNAIL]);
   // The unique albedo still takes its full-resolution export.
   expect([albedo.width, albedo.height]).toEqual([FULL, FULL]);
+});
+
+it("embeds the full-resolution Texture2D export when the modern material export ships no image for the texture", async () => {
+  // The converter no longer ships an editor thumbnail as source art, so a UE4 package whose source it cannot decode has no material-route image.
+  const { normal, albedo, sources } = await importCloth({ noMaterialTextures: true });
+  expect([normal.width, normal.height, albedo.width, albedo.height]).toEqual([FULL, FULL, FULL, FULL]);
+  expect(normal.data.equals(sources.normal)).toBe(true);
+  expect(albedo.data.equals(sources.albedo)).toBe(true);
 });
