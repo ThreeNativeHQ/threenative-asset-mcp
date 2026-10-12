@@ -95,6 +95,7 @@ describeWithTools(["modern-converter"], "converter blend-space axis code (compil
     const functions = [
       "static Dictionary<string, object?> BlendAxis(FBlendParameter? typed, FStructFallback? raw)",
       "static double DumpNum(float value)",
+      "static FRawCurveTracks? SelectAuthoredCurveTracks(FRawCurveTracks? modelLegacy, FRawCurveTracks? sequenceLegacy, FRawCurveTracks? raw, FRawCurveTracks? compressed)",
       "static bool StructBool(FStructFallback? data, string field, out bool value)",
       "static FStructFallback[] ArrayElements(AbstractPropertyHolder holder, string name)",
       "static (string ClassName, string Kind) NotifyClassNames(string? objectClass, string? objectName, string? stateClass)",
@@ -102,11 +103,20 @@ describeWithTools(["modern-converter"], "converter blend-space axis code (compil
     await writeFile(
       join(project, "Program.cs"),
       `using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Objects.Engine.Curves;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.Engine.Animation;
 using CUE4Parse.UE4.Objects.UObject;
 
+if (args[0] == "curve-source")
+{
+    FRawCurveTracks Tracks(int count) => new(new[] { new FFloatCurve { FloatCurve = new FRichCurve { Keys = Enumerable.Range(0, count).Select(i => new FRichCurveKey(i / 60f, 1f)).ToArray() } } });
+    var raw = Tracks(2);
+    Console.WriteLine(SelectAuthoredCurveTracks(Tracks(602), null, raw, null)?.FloatCurves?[0].FloatCurve.Keys.Length);
+    Console.WriteLine(SelectAuthoredCurveTracks(null, null, raw, null)?.FloatCurves?[0].FloatCurve.Keys.Length);
+}
 if (args[0] == "axis")
 {
     // Three axes with unequal values, a middle one whose Max and GridNum the serializer omitted, and an
@@ -211,6 +221,10 @@ ${functions.join("\n")}
 
   const run = (...args: string[]): string =>
     execFileSync(sdk, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
+
+  it("preserves authored model curve keys ahead of reduced runtime curves and retains the UE4 raw fallback", () => {
+    expect(run("curve-source").split("\n")).toEqual(["602", "2"]);
+  });
 
   it("keeps each typed axis separate, restores an omitted Max and GridNum, and keeps a typed-only axis intact", () => {
     expect(run("axis")).toBe("Speed,-90,90,2,True,True|Yaw,0,100,4,False,False|Lean,-45,45,8,True,False");
