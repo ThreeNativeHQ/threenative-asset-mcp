@@ -88,6 +88,37 @@ describe("fab-slice finite per-class selection", () => {
     expect(selectSlicePackages(niagara, ["NiagaraSystem"], 2)).toHaveLength(2);
   });
 
+  it("counts only eligible representatives, not dependencies that merely mention the class", () => {
+    const withMentions: ScannedPackage[] = [
+      { rel: "Content/VFX/NS_A.uasset", primaryClass: "NiagaraSystem", classes: ["NiagaraSystem"], refs: ["/Game/VFX/D_A"] },
+      { rel: "Content/VFX/NS_B.uasset", primaryClass: "NiagaraSystem", classes: ["NiagaraSystem"], refs: ["/Game/VFX/D_B"] },
+      { rel: "Content/VFX/NS_C.uasset", primaryClass: "NiagaraSystem", classes: ["NiagaraSystem"], refs: [] },
+      { rel: "Content/VFX/D_A.uasset", primaryClass: "NiagaraEmitter", classes: ["NiagaraEmitter", "NiagaraSystem"], refs: [] },
+      { rel: "Content/VFX/D_B.uasset", primaryClass: "NiagaraEmitter", classes: ["NiagaraEmitter", "NiagaraSystem"], refs: [] },
+    ];
+    const selected = selectSlicePackages(withMentions, ["NiagaraSystem"], 3);
+    expect(selected).toEqual([
+      "Content/VFX/D_A.uasset",
+      "Content/VFX/D_B.uasset",
+      "Content/VFX/NS_A.uasset",
+      "Content/VFX/NS_B.uasset",
+      "Content/VFX/NS_C.uasset",
+    ]);
+  });
+
+  it("keeps name-table membership for a UE5 package with no parsed primary class", () => {
+    const ue5: ScannedPackage[] = [
+      { rel: "Content/VFX/NS_A.uasset", classes: ["NiagaraSystem"], refs: [] },
+      { rel: "Content/VFX/NS_B.uasset", classes: ["NiagaraEmitter", "NiagaraSystem"], refs: [] },
+      { rel: "Content/VFX/NS_C.uasset", classes: ["NiagaraSystem"], refs: ["/Game/VFX/NS_A"] },
+    ];
+    expect(selectSlicePackages(ue5, ["NiagaraSystem"], 3)).toEqual([
+      "Content/VFX/NS_A.uasset",
+      "Content/VFX/NS_B.uasset",
+      "Content/VFX/NS_C.uasset",
+    ]);
+  });
+
   it("counts a package matching two target classes as covering both (overlapping coverage)", () => {
     const overlap: ScannedPackage[] = [
       { rel: "Content/VFX/Both.uasset", classes: ["NiagaraSystem", "NiagaraEmitter"], refs: [] },

@@ -361,8 +361,6 @@ export function selectSlicePackages(
     }
     return found;
   };
-  const matches = (entry: ScannedPackage | undefined, className: string): boolean =>
-    entry !== undefined && (entry.primaryClass === className || entry.classes.includes(className));
   const poolFor = (className: string): ScannedPackage[] => {
     const exact = scanned.filter((entry) => entry.primaryClass === className);
     const pool = exact.length > 0 ? exact : scanned.filter((entry) => entry.classes.includes(className));
@@ -370,6 +368,11 @@ export function selectSlicePackages(
       sizeOf ? sizeOf(a.rel) - sizeOf(b.rel) : a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0,
     );
   };
+  // A class's eligible representatives are exactly its pool: the exact primary-class matches when any
+  // exist (UE4), otherwise the name-table members (UE5, or a sub-object class). A package that a closure
+  // merely pulls in and that only mentions the class by name must not count toward the representatives
+  // needed, or 3 importing-only packages could stand in for 3 assets.
+  const poolRels = (className: string): Set<string> => new Set(poolFor(className).map((entry) => entry.rel));
 
   if (!Number.isFinite(perClass)) {
     const seeds = new Set<string>();
@@ -387,7 +390,10 @@ export function selectSlicePackages(
   const include = new Set<string>();
   const byteTotal = (set: Set<string>): number => (sizeOf ? [...set].reduce((sum, rel) => sum + sizeOf(rel), 0) : set.size);
   const needFor = (className: string): number => Math.min(perClass, poolFor(className).length);
-  const covers = (className: string): number => [...include].filter((rel) => matches(byRel.get(rel), className)).length;
+  const covers = (className: string): number => {
+    const pool = poolRels(className);
+    return [...include].filter((rel) => pool.has(rel)).length;
+  };
   const maxRounds = targetClasses.reduce((sum, className) => sum + needFor(className), 0);
   for (let round = 0; round < maxRounds; round += 1) {
     const unmet = targetClasses.filter((className) => covers(className) < needFor(className));
@@ -400,7 +406,7 @@ export function selectSlicePackages(
         if (include.has(candidate.rel)) continue;
         const next = closure([...include, candidate.rel]);
         const added = byteTotal(next) - byteTotal(include);
-        const gain = unmet.filter((name) => matches(byRel.get(candidate.rel), name)).length;
+        const gain = unmet.filter((name) => poolRels(name).has(candidate.rel)).length;
         if (added < bestAdded || (added === bestAdded && gain > bestGain)) {
           bestAdded = added;
           bestSeed = candidate.rel;

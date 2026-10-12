@@ -143,12 +143,12 @@
         "NiagaraEmitter"
       ],
       "classCounts": {
-        "NiagaraSystem": 1,
-        "NiagaraEmitter": 1
+        "NiagaraSystem": 3,
+        "NiagaraEmitter": 3
       },
-      "packages": 4,
-      "bytes": 2923395,
-      "packageDigest": "sha256:9c1d806e59dc61e70ad8c23efbfa4e37e8c296051ef70dee229f052e1b02c8e8",
+      "packages": 6,
+      "bytes": 3604091,
+      "packageDigest": "sha256:cb678becf31af176c64f1ae97f10aca382e4d236ee027cb24fddaf6b4818fa55",
       "gaps": []
     }
   ]
