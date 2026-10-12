@@ -1,6 +1,6 @@
 # PRD-599 — UE5 landscape heightfields in levels
 
-**Status:** IN PROGRESS — all local AC complete; independent review and CI pending
+**Status:** IN PROGRESS — review dispatch repair complete; parent fresh gates, independent review and CI pending
 **Priority:** P2 — terrain export implemented; parent owns the comparison sheet and final repository gates.
 **Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `src/unreal/scenes.ts`), new module; risk override: none.
 **Owner:** PRD-599 repair lane; parent owns orchestration
@@ -31,9 +31,9 @@ only to PNG. Engine headers to confirm the UE5 fields (tracked, not checked out)
 ## Acceptance Criteria
 
 - [x] AC-1 [local]: A real UE5 level with a landscape imports with a terrain mesh whose height range and footprint match the landscape actor's bounds stored in the package, within 1%. proof: real-pack gate in `tests/fab-feature-corpus.test.ts` — Evidence: `.584.9.1` / importer 122, 2026-10-12: native and actual public importer GLB gates pass for all 51 components from the same eight-file stage; node-world POSITION bounds within 1%, zero terrain omissions, `reused: false`, pinned provenance.
-- [x] AC-2 [local]: A synthetic UE5 heightmap (known BGRA8 and `TSCF_UEDELTA` pixels) decodes to the expected heights. proof: red-to-green test beside `tests/unreal-converter-ue5-sources.test.ts` — Evidence: compiled BGRA8/UEDELTA known-height and public world-normal regression pass on `.584.9.1`; previous normal behavior fails for the expected direction.
+- [x] AC-2 [local]: A synthetic UE5 heightmap (known BGRA8 and `TSCF_UEDELTA` pixels) decodes to the expected heights. proof: red-to-green test beside `tests/unreal-converter-ue5-sources.test.ts` — Evidence: `.584.9.2` shares `TryDecodeLandscapeSourcePixels` between the actual texture reader and compiled synthetic harness. Raw BGRA8 and encoded UEDELTA both dispatch through it and assert the same known heights, normals, subsection atlas boundaries and mip-0 byte count; the public GLB nonuniform/mirrored normal regression remains. Disabling only its production UEDELTA branch compiles but fails the expected height assertion (-252.64844 vs -18.6953125), while raw passes; restored focused suites pass. Unsupported compression, PNG flag and truncated payload refusals are asserted.
 - [x] AC-3 [local]: Before/after terrain sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected actual before/after terrain and attached [PR52 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/52#issuecomment-6133268228). Same bounded eight-file stage, .584.8.1 blank terrain before and .584.9.1 public51-component GLB after. Production neutral renderer unchanged; existing fallback material, no layer-weight fidelity claim. Owner-only Drive permissions read back. Recipe and input/output SHA-256: raw/parent599-sheet.{mts,json}.
-- [x] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent normal-provisioner rebuild and all four gates pass on implementation7a04068: typecheck0.9s; default suite2,720 passed/17 skipped81.1s; leak gate clean89.6s; packed MCP15/15 in15.4s. Logs raw/parent599-final91-{typecheck,test,leaks,smoke}.log.
+- [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent normal-provisioner rebuild and all four gates pass on implementation7a04068: typecheck0.9s; default suite2,720 passed/17 skipped81.1s; leak gate clean89.6s; packed MCP15/15 in15.4s. Logs raw/parent599-final91-{typecheck,test,leaks,smoke}.log. These remain evidence for the prior implementation; parent must rerun all four and the real gate on `.584.9.2`.
 
 ## Decisions
 
@@ -55,7 +55,7 @@ only to PNG. Engine headers to confirm the UE5 fields (tracked, not checked out)
 - The UE5 export normalizes packed normals multiplied by absolute composed world scale before
   `scenes.ts` applies its node transform. This cancels glTF inverse scale while retaining mirrored
   signs. Invalid/zero scale explicitly omits the component with a reason. UE4 and heights are unchanged.
-- Converter `.584.9.1`; importer remains 122 for this unreleased lane. All executable version pins updated.
+- Review repair converter `.584.9.2`; importer remains 122 for this unreleased lane. All executable version pins updated. Compression-tag normalization, exact validation, dispatch and mip-0 slicing now belong to one production helper used by both the actual texture reader and compiled fixtures.
 - A bounded private eight-file source stage supplies 51 components. The gate checks both native
   arrays and every public GLB POSITION transformed by its node world matrix against independently
   stored `CachedLocalBox` and source parent chains, within 1%; zero terrain omissions and fresh
@@ -65,12 +65,12 @@ only to PNG. Engine headers to confirm the UE5 fields (tracked, not checked out)
   is not a cryptographic identity check. No other toolchain cache is mutated.
 - Honest red/green: replacing the normal helper with the previous unchanged-normal behavior fails
   the compiled-helper → public GLB world-direction assertion (nonuniform scale), without timeout;
-  the compensated implementation passes both positive and mirrored nonuniform scales. The earlier
-  BGRA8/UEDELTA test already covers known heights and subsection atlas boundaries. Layer weights remain out of scope.
+  the compensated implementation passes both positive and mirrored nonuniform scales. The revised
+  BGRA8/UEDELTA test reaches shared production dispatch and covers known heights and subsection atlas boundaries. Layer weights remain out of scope.
 
 ## Local verification
 
-All local acceptance criteria have parent evidence; independent review and GitHub CI are in progress. The first two real-gate
+Prior implementation `.584.9.1` has parent real-gate, sheet and repository evidence; `.584.9.2` repair has focused synthetic and typecheck evidence only. Fresh parent gates, real proof and independent review remain pending. The first two real-gate
 launches failed before conversion because the rebuilt apphost could not discover .NET. A private
 launcher now executes the converter DLL using the existing read-only SDK directly.
 
@@ -95,12 +95,14 @@ launcher now executes the converter DLL using the existing read-only SDK directl
 **Verification:** AC-1, AC-2.
 
 #### Phase 3: Evidence, ledger and gates
-**Status:** DONE
+**Status:** PENDING — parent refresh after `.584.9.2` review repair
 **Files:** `docs/unreal-format-support.md` row "Landscape, UE5", `README.md` import table.
 **Verification:** AC-3, AC-4.
 
 
-- Final parent real gate: 2 landscape gates passed (34 total including generic tests; 5.79 s), private index `/home/joao/.cache/threenative-asset-mcp/prd599-real-proof/index91.json`; source files SHA-256 checked before both imports.
+- Prior `.584.9.1` parent real gate: 2 landscape gates passed (34 total including generic tests; 5.79 s), private index `/home/joao/.cache/threenative-asset-mcp/prd599-real-proof/index91.json`; source files SHA-256 checked before both imports.
 - `npm run typecheck`: passed.
-- Focused synthetic suites: 99 passed across converter source decoding, instance parameters and public scene assembly (38.54 s).
-- Parent completed AC-3 and AC-4. No conversion or test process remains active.
+- Prior `.584.9.1` focused synthetic suites: 99 passed across converter source decoding, instance parameters and public scene assembly (38.54 s).
+- `.584.9.2` review repair: 142 focused tests passed across four suites (41.25 s); typecheck and diff checks passed. Normal provisioner rebuilt only the private PRD-599 cache; the existing launcher outside `modern/bin` reports `.584.9.2`. No build or test process remains active. An initial overlapping rebuild/test launch hit a missing-bin cache window; the final test run followed the completed rebuild.
+- Parent completed AC-3 and AC-4 on `.584.9.1`; final `.584.9.2` evidence is pending.
+- Review repair logs: `raw/599-review-repair-mutation-red.log`, `raw/599-review-repair-green.log`, `raw/599-review-repair-typecheck.log`, `raw/599-review-repair-native-build.log`. Private `index92.json` preserves the same source hashes and uses fresh output paths; the native/public real gate remains for the parent.

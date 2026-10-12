@@ -305,7 +305,7 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
   });
 
   it("reads trailer-backed landscape source payloads through the pinned CUE4Parse fixes", () => {
-    expect(CUE4PARSE_PROGRAM).toContain("b4e95441+threenative.584.9.1");
+    expect(CUE4PARSE_PROGRAM).toContain("b4e95441+threenative.584.9.2");
     expect(CUE4PARSE_PROGRAM).toContain("LandscapeComponents");
     expect(CUE4PARSE_PROGRAM).toContain("TryReadLandscapeSourcePixels");
     expect(CUE4PARSE_PROGRAM).toContain("DecodeLandscapeHeightfield");
@@ -353,6 +353,7 @@ describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled fr
     const functions = [
       "static (int BytesPerPixel, int SampleBytes) UeDeltaPixelLayout(",
       "static void UndoUeDelta(",
+      "static bool TryDecodeLandscapeSourcePixels(",
       "static (float[] Heights, float[] Normals) DecodeLandscapeHeightfield(",
       "static int LandscapeRoundToInt(",
       "static float[] LandscapeLocalNormals(",
@@ -396,10 +397,14 @@ else if (args[0] == "landscape")
     var numSubsections = int.Parse(args[5]);
     var biasX = float.Parse(args[6], CultureInfo.InvariantCulture);
     var biasY = float.Parse(args[7], CultureInfo.InvariantCulture);
-    UndoUeDelta(data, 0, size[0], size[1], 4, 1);
-    var decoded = DecodeLandscapeHeightfield(data, size[0], size[1], componentSizeQuads, subsectionSizeQuads, numSubsections, biasX, biasY);
-    if (args.Length > 8) decoded = (decoded.Heights, LandscapeLocalNormals(decoded.Normals, float.Parse(args[8], CultureInfo.InvariantCulture), float.Parse(args[9], CultureInfo.InvariantCulture), float.Parse(args[10], CultureInfo.InvariantCulture)));
-    Console.WriteLine(JsonSerializer.Serialize(new { componentSizeQuads, heights = decoded.Heights, normals = decoded.Normals }));
+    if (!TryDecodeLandscapeSourcePixels(data, size[0], size[1], args[8] == "PNG" ? "TSCF_None" : args[8], args[8] == "PNG", out var pixels, out var refusal))
+    {
+        Console.WriteLine(JsonSerializer.Serialize(new { refusal }));
+        return;
+    }
+    var decoded = DecodeLandscapeHeightfield(pixels, size[0], size[1], componentSizeQuads, subsectionSizeQuads, numSubsections, biasX, biasY);
+    if (args.Length > 9) decoded = (decoded.Heights, LandscapeLocalNormals(decoded.Normals, float.Parse(args[9], CultureInfo.InvariantCulture), float.Parse(args[10], CultureInfo.InvariantCulture), float.Parse(args[11], CultureInfo.InvariantCulture)));
+    Console.WriteLine(JsonSerializer.Serialize(new { componentSizeQuads, pixelBytes = pixels.Length, heights = decoded.Heights, normals = decoded.Normals }));
 }
 else if (args[0] == "sidecar")
 {
@@ -484,7 +489,7 @@ ${comparer}
     expect(decoded.equals(pixels)).toBe(true);
   });
 
-  it("decodes a BGRA8 UEDELTA landscape into the public height and normal arrays", async () => {
+  it.each(["TSCF_None", "ETextureSourceCompressionFormat::TSCF_UEDELTA"])("decodes a BGRA8 %s landscape through production dispatch into the public height and normal arrays", async (compression) => {
     const textureWidth = 8;
     const textureHeight = 8;
     const componentSizeQuads = 4;
@@ -503,8 +508,10 @@ ${comparer}
       return value;
     };
     for (let y = 0; y < textureHeight; y++) for (let x = 0; x < textureWidth; x++) encodedHeightAt(x, y);
-    const file = join(root, "landscape-bgra8-uedelta.bin");
-    await writeFile(file, encodeUeDelta(source, textureWidth, textureHeight, 4, 1));
+    const file = join(root, compression.endsWith("TSCF_UEDELTA") ? "landscape-bgra8-uedelta.bin" : "landscape-bgra8-raw.bin");
+    const payload = compression.endsWith("TSCF_UEDELTA") ? encodeUeDelta(source, textureWidth, textureHeight, 4, 1) : source;
+    // A trailing mip/slice must not be included in the heightfield decode.
+    await writeFile(file, Buffer.concat([payload, Buffer.alloc(64, 0xee)]));
     const decoded = JSON.parse(run(
       "landscape",
       file,
@@ -514,7 +521,8 @@ ${comparer}
       `${numSubsections}`,
       `${biasX}`,
       `${biasY}`,
-    )) as { componentSizeQuads: number; heights: number[]; normals: number[] };
+      compression,
+    )) as { componentSizeQuads: number; pixelBytes: number; heights: number[]; normals: number[] };
 
     const atlasCoordinate = (coordinate: number): number => {
       if (coordinate === 0) return 0;
@@ -537,6 +545,7 @@ ${comparer}
       }
     }
     expect(decoded.componentSizeQuads).toBe(componentSizeQuads);
+    expect(decoded.pixelBytes).toBe(textureWidth * textureHeight * 4);
     decoded.heights.forEach((value, index) => expect(value).toBeCloseTo(expectedHeights[index]!, 5));
     decoded.normals.forEach((value, index) => expect(value).toBeCloseTo(expectedNormals[index]!, 6));
     // x=2 and x=3 cross a two-quad subsection boundary. A dense rectangle reader samples the wrong atlas columns.
@@ -573,7 +582,7 @@ ${comparer}
     // Actual shipped C# helper -> public writer -> GLB normal matrix. Mirroring must keep its sign.
     for (const scaleX of [2, -2]) {
       const scale = { x: scaleX, y: 3, z: 5 };
-      const compensated = JSON.parse(run("landscape", file, `${textureWidth}x${textureHeight}`, `${componentSizeQuads}`, `${subsectionSizeQuads}`, `${numSubsections}`, `${biasX}`, `${biasY}`, `${scale.x}`, `${scale.y}`, `${scale.z}`)) as { normals: number[] };
+      const compensated = JSON.parse(run("landscape", file, `${textureWidth}x${textureHeight}`, `${componentSizeQuads}`, `${subsectionSizeQuads}`, `${numSubsections}`, `${biasX}`, `${biasY}`, compression, `${scale.x}`, `${scale.y}`, `${scale.z}`)) as { normals: number[] };
       const scaledSource = { ...scene, landscapes: [{ ...scene.landscapes![0]!, scale, normals: compensated.normals }] };
       const written = await assembleSceneGlb({ source: scaledSource, package: "Synthetic.umap", outputRoot: root, outputStem: `normals-${scaleX}`, models: [], validate: async () => ({ bytes: 0, sha256: "synthetic" }) });
       const document = await new NodeIO().read(join(root, written.glb));
@@ -586,8 +595,21 @@ ${comparer}
       const expected = [normalY, normalZ, -Math.sign(scaleX) * normalX];
       world.forEach((value, axis) => expect(value / length, `scale ${scaleX}, world normal axis ${axis}`).toBeCloseTo(expected[axis]!, 5));
     }
-    expect(() => run("landscape", file, `${textureWidth}x${textureHeight}`, `${componentSizeQuads}`, `${subsectionSizeQuads}`, `${numSubsections}`, `${biasX}`, `${biasY}`, "0", "3", "5")).toThrow();
+    expect(() => run("landscape", file, `${textureWidth}x${textureHeight}`, `${componentSizeQuads}`, `${subsectionSizeQuads}`, `${numSubsections}`, `${biasX}`, `${biasY}`, compression, "0", "3", "5")).toThrow();
 
+  });
+
+  it.each(["TSCF_PNG", "TSCF_JPEG", "invalidTSCF_UEDELTA"])("refuses unsupported landscape compression %s", async (compression) => {
+    const file = join(root, "landscape-unsupported.bin");
+    await writeFile(file, Buffer.alloc(16));
+    expect(JSON.parse(run("landscape", file, "2x2", "1", "1", "1", "0", "0", compression))).toEqual({ refusal: `heightmap source compression ${compression} is unsupported` });
+  });
+
+  it("refuses PNG-compressed and truncated landscape source art", async () => {
+    const file = join(root, "landscape-invalid-source.bin");
+    await writeFile(file, Buffer.alloc(15));
+    expect(JSON.parse(run("landscape", file, "2x2", "1", "1", "1", "0", "0", "PNG"))).toEqual({ refusal: "heightmap source is PNG-compressed rather than raw BGRA8" });
+    expect(JSON.parse(run("landscape", file, "2x2", "1", "1", "1", "0", "0", "TSCF_None"))).toEqual({ refusal: "editor source payload has 15 bytes, expected at least 16" });
   });
 
   it("decodes a mesh description in the established FName layout", async () => {

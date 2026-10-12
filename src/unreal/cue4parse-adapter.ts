@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.9.1",
+  version: "b4e95441+threenative.584.9.2",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -4896,18 +4896,6 @@ static bool TryReadLandscapeSourcePixels(UTexture2D texture, byte[]? packageByte
     format = format[(format.LastIndexOf(':') + 1)..];
     if (format != "TSF_BGRA8") { refusal = $"heightmap source format {format} is not TSF_BGRA8"; return false; }
     var compression = source.GetOrDefault<FName>("CompressionFormat").Text ?? "";
-    compression = compression[(compression.LastIndexOf(':') + 1)..];
-    var ueDelta = compression.EndsWith("TSCF_UEDELTA", StringComparison.Ordinal);
-    if (compression.Length > 0 && compression != "None" && compression != "TSCF_None" && !ueDelta)
-    {
-        refusal = $"heightmap source compression {compression} is unsupported";
-        return false;
-    }
-    if (source.GetOrDefault<bool>("bPNGCompressed", false))
-    {
-        refusal = "heightmap source is PNG-compressed rather than raw BGRA8";
-        return false;
-    }
     width = source.GetOrDefault<int>("SizeX");
     height = source.GetOrDefault<int>("SizeY");
     var slices = Math.Max(1, source.GetOrDefault<int>("NumSlices"));
@@ -4931,7 +4919,6 @@ static bool TryReadLandscapeSourcePixels(UTexture2D texture, byte[]? packageByte
         refusal = $"heightmap source size {total} bytes is unsupported";
         return false;
     }
-    var firstMip = checked((long) width * height * 4L);
     byte[]? raw = null;
     if (texture.EditorData is { } editor && editor.Payload.Header.TotalRawSize == (ulong) total)
     {
@@ -4959,6 +4946,33 @@ static bool TryReadLandscapeSourcePixels(UTexture2D texture, byte[]? packageByte
     if (raw is null)
     {
         refusal = refusal.Length > 0 ? refusal : $"no editor source payload of {total} bytes was found";
+        return false;
+    }
+    return TryDecodeLandscapeSourcePixels(raw, width, height, compression,
+        source.GetOrDefault<bool>("bPNGCompressed", false), out pixels, out refusal);
+}
+
+// Shared production dispatch: source art may contain more mips/slices, but terrain reads mip 0, slice 0.
+static bool TryDecodeLandscapeSourcePixels(byte[] raw, int width, int height, string compression, bool pngCompressed, out byte[] pixels, out string refusal)
+{
+    pixels = [];
+    refusal = "";
+    compression = compression[(compression.LastIndexOf(':') + 1)..];
+    var ueDelta = compression == "TSCF_UEDELTA";
+    if (compression.Length > 0 && compression != "None" && compression != "TSCF_None" && !ueDelta)
+    {
+        refusal = $"heightmap source compression {compression} is unsupported";
+        return false;
+    }
+    if (pngCompressed)
+    {
+        refusal = "heightmap source is PNG-compressed rather than raw BGRA8";
+        return false;
+    }
+    var firstMip = (long) width * height * 4L;
+    if (width <= 0 || height <= 0 || firstMip > int.MaxValue)
+    {
+        refusal = $"heightmap source dimensions are {width}x{height}";
         return false;
     }
     if (raw.LongLength < firstMip)
