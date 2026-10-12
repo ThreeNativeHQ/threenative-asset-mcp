@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.84-animation",
+  version: "b4e95441+threenative.85-animation",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2443,9 +2443,16 @@ static FStructFallback[] ArrayElements(AbstractPropertyHolder holder, string nam
 
 static FStructFallback? StructProperty(UObject holder, string name)
 {
+    // A struct tag is either a bare FStructFallback or, when the struct name resolved to a typed struct,
+    // an FScriptStruct wrapping one; unwrap it so a caller that only wants the fields reads both.
     FStructFallback? found = null;
     foreach (var property in holder.Properties)
-        if (property.Name.Text == name) found = property.Tag?.GetValue(typeof(FStructFallback)) as FStructFallback;
+    {
+        if (property.Name.Text != name) continue;
+        var value = property.Tag?.GenericValue;
+        if (value is FStructFallback fallback) found = fallback;
+        else if (value is FScriptStruct script && script.StructType is FStructFallback inner) found = inner;
+    }
     return found;
 }
 
@@ -2577,14 +2584,29 @@ static List<Dictionary<string, object?>> SyncMarkerRecords(UObject asset, UObjec
 }
 
 // Float curves from RawCurveData / CompressedCurveData (UE4-era), the LegacyCurveData a 5.6+ sequence
-// keeps, or the LegacyCurveData on a separate AnimationDataModel export.
-List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence, UObject? model)
+// keeps, the LegacyCurveData on a separate AnimationDataModel export, or the conventional
+// UAnimDataModel.CurveData.FloatCurves. CurveData is read only from the clip's exact conventional model
+// (never the first DataModel-named export), so a 5.6+ Sequencer model's curves are not misattributed.
+List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence, UObject? model, UObject? exactModel)
 {
     FRawCurveTracks? tracks = sequence.RawCurveData ?? sequence.CompressedCurveData;
     if (tracks is null && StructProperty(sequence, "LegacyCurveData") is { } legacy) tracks = new FRawCurveTracks(legacy);
     if (tracks is null && model is not null && StructProperty(model, "LegacyCurveData") is { } modelLegacy) tracks = new FRawCurveTracks(modelLegacy);
+    if (tracks?.FloatCurves is { } curves) return CurveList(curves);
+    if (exactModel is not null && StructProperty(exactModel, "CurveData") is { } curveData)
+    {
+        if (curveData.TryGetValue<FFloatCurve[]>(out var typedCurves, "FloatCurves") && typedCurves is not null) return CurveList(typedCurves);
+        if (curveData.TryGetValue<FStructFallback[]>(out var rawCurves, "FloatCurves") && rawCurves is not null)
+            return CurveList(rawCurves.Select(curve => new FFloatCurve(curve)).ToArray());
+    }
+    return [];
+}
+
+// One FFloatCurve's keys, with the interpolation mode and both tangents. The name is the curve's own
+// smart name from the model, so a consumer joins on the authored name rather than an index.
+static List<Dictionary<string, object?>> CurveList(IEnumerable<FFloatCurve?> curves)
+{
     var records = new List<Dictionary<string, object?>>();
-    if (tracks?.FloatCurves is not { } curves) return records;
     foreach (var curve in curves)
     {
         var keys = new List<Dictionary<string, object?>>();
@@ -2647,9 +2669,13 @@ static FVector[] TaggedVectors(FStructFallback data, string field)
 
 static FQuat[] TaggedQuats(FStructFallback data, string field)
 {
+    // Both the LWC "Quat4f" and the older "Quat" tagged structs are FScriptStruct-wrapped FQuat in the
+    // pinned reader (FScriptStruct maps both names to FQuat), so read FQuat[] first. Reading
+    // TIntVector4<float>[] instead returns a silently zero-filled array for a Quat and drops every
+    // rotation, which is why the Quat4f-first order was wrong.
+    if (data.TryGetValue<FQuat[]>(out var quats, field) && quats is not null) return quats;
     if (data.TryGetValue<TIntVector4<float>[]>(out var floats, field) && floats is not null)
         return floats.Select(value => new FQuat(value.X, value.Y, value.Z, value.W)).ToArray();
-    if (data.TryGetValue<FQuat[]>(out var quats, field) && quats is not null) return quats;
     return [];
 }
 
@@ -2679,9 +2705,10 @@ static bool ModelTrackData(FStructFallback track, out FRawAnimSequenceTrack raw,
 // non-empty raw track. A model that fails validation yields a precise reason and no clip, never a
 // fabricated bind-pose PSA. Returns false with an empty reason when there is no conventional model, so
 // the caller can name the actual unsupported evidence (a ControlRig/Sequencer model).
-bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string reason)
+bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string reason, out Dictionary<string, object?>? timing)
 {
     reason = "";
+    timing = null;
     var skeleton = sequence.Skeleton?.Load<USkeleton>();
     if (skeleton is null)
     {
@@ -2695,14 +2722,36 @@ bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string 
         reason = "the clip's data model carries no positive NumberOfFrames";
         return false;
     }
+    // UAnimDataModel.NumberOfFrames counts the intervals between keys; the model's own NumberOfKeys is
+    // one more and includes both endpoints. The ActorX sampler needs one frame per key, so the key count
+    // is NumberOfFrames + 1. Read the model's NumberOfKeys when the package carries it and require it.
+    var numberOfKeys = numberOfFrames + 1;
+    if (model.TryGetValue<int>(out var modelNumberOfKeys, "NumberOfKeys") && modelNumberOfKeys != numberOfKeys)
+    {
+        reason = $"the clip's data model has NumberOfFrames {numberOfFrames} but NumberOfKeys {modelNumberOfKeys}, not {numberOfKeys}";
+        return false;
+    }
+    // FrameRate is an FFrameRate tagged as a struct property; StructProperty unwraps the FScriptStruct
+    // wrapper the pinned reader puts around it before reading the rational fields.
     var frameRate = StructProperty(model, "FrameRate");
     var numerator = 0;
     var denominator = 0;
     if (frameRate is not null && StructNumber(frameRate, "Numerator", out var rateNumerator)) numerator = (int) rateNumerator;
     if (frameRate is not null && StructNumber(frameRate, "Denominator", out var rateDenominator)) denominator = (int) rateDenominator;
+    // FFrameRate's denominator default is 1, and a tagged struct omits a property equal to its default,
+    // so an omitted denominator is 1 rather than the invalid 0 the fallback leaves behind.
+    if (numerator > 0 && denominator <= 0) denominator = 1;
     if (numerator <= 0 || denominator <= 0)
     {
         reason = "the clip's data model carries no valid FrameRate";
+        return false;
+    }
+    var duration = numberOfFrames * (double) denominator / numerator;
+    // The model's own PlayLength must agree with NumberOfFrames at the rational rate to within a frame,
+    // or the timing is not the serialized UAnimDataModel contract.
+    if (model.TryGetValue<float>(out var playLength, "PlayLength") && playLength > 0f && Math.Abs(playLength - duration) > (double) denominator / numerator)
+    {
+        reason = $"the clip's data model PlayLength {playLength} disagrees with NumberOfFrames {numberOfFrames} at {numerator}/{denominator} fps ({duration}) by more than one frame";
         return false;
     }
     if (!model.TryGetValue<FStructFallback[]>(out var tracks, "BoneAnimationTracks") || tracks.Length == 0)
@@ -2742,15 +2791,36 @@ bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string 
             reason = $"the clip's data-model track {index} (bone {boneIndex}) carries no keys";
             return false;
         }
+        // Each real track array holds NumberOfKeys entries; a constant track holds one. Anything else is
+        // not the serialized UAnimDataModel contract and must be rejected, never resampled by a guess.
+        if (!ValidKeyCount(raw.RotKeys.Length, numberOfKeys) || !ValidKeyCount(raw.PosKeys.Length, numberOfKeys) || !ValidKeyCount(raw.ScaleKeys.Length, numberOfKeys))
+        {
+            reason = $"the clip's data-model track {index} (bone {boneIndex}) has {raw.RotKeys.Length}/{raw.PosKeys.Length}/{raw.ScaleKeys.Length} rot/pos/scale keys, not 1 or {numberOfKeys}";
+            return false;
+        }
         data.Add(raw);
         map.Add(new FTrackToSkeletonMap { BoneTreeIndex = boneIndex });
     }
     sequence.RawAnimationData = data.ToArray();
     sequence.TrackToSkeletonMapTable = map.ToArray();
-    sequence.NumFrames = numberOfFrames;
-    sequence.SequenceLength = (float) (numberOfFrames * (double) denominator / numerator);
+    // ActorX derives FramesPerSecond from NumFrames / SequenceLength, and samples key i at frame i.
+    // Set NumFrames to the key count and SequenceLength to NumFrames / fps so every key is sampled at
+    // its own frame, the endpoint key is included, and the rate is exactly the model's rational fps.
+    sequence.NumFrames = numberOfKeys;
+    sequence.SequenceLength = (float) (numberOfKeys * (double) denominator / numerator);
+    timing = new Dictionary<string, object?>
+    {
+        ["frames"] = numberOfFrames,
+        ["keys"] = numberOfKeys,
+        ["rateNumerator"] = numerator,
+        ["rateDenominator"] = denominator,
+        ["duration"] = duration,
+    };
     return true;
 }
+
+// A raw track array is either a single constant key or the model's full NumberOfKeys entries.
+static bool ValidKeyCount(int count, int keys) => count == 0 || count == 1 || count == keys;
 
 int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
 {
@@ -2769,13 +2839,17 @@ int ExportClip(UAnimSequence sequence, IPackage package, string packagePath)
     {
         var dataModel = DataModelExport(package, sequence);
         document["notifies"] = NotifyRecords(sequence, sequence.Notifies, dataModel);
-        document["curves"] = CurveRecords(sequence, dataModel);
+        document["curves"] = CurveRecords(sequence, dataModel, ExactDataModel(sequence, package));
         document["syncMarkers"] = SyncMarkerRecords(sequence, dataModel);
         var hasRaw = sequence.RawAnimationData is { Length: > 0 };
         var modelReason = "";
         if (!hasRaw && sequence.CompressedDataStructure is null)
         {
-            if (PopulateFromDataModel(sequence, package, out var populateReason)) hasRaw = true;
+            if (PopulateFromDataModel(sequence, package, out var populateReason, out var modelTiming))
+            {
+                hasRaw = true;
+                if (modelTiming is not null) document["timing"] = modelTiming;
+            }
             else modelReason = populateReason;
         }
         if (!hasRaw && sequence.CompressedDataStructure is null)
@@ -2878,11 +2952,17 @@ void ExportBlendSpace(UBlendSpaceBase space, string packagePath)
         {
             var sample = sampleData[index];
             var rawSample = index < rawSamples.Length ? rawSamples[index] : null;
+            // FBlendSample's own default (constructor and UPROPERTY) is RateScale 1. The pinned
+            // FBlendSample(FStructFallback) overwrites that with default(float) 0 when the tag omits the
+            // field, so restore 1 only for a field the raw tag actually omitted; an explicit 0 is kept.
+            var rateScale = DumpNum(sample.RateScale);
+            if (rawSample is not null && StructNumber(rawSample, "RateScale", out var rawRateScale)) rateScale = rawRateScale;
+            else if (rawSample is not null) rateScale = 1d;
             samples.Add(new Dictionary<string, object?>
             {
                 ["animation"] = AnimationReferenceName(sample.Animation),
                 ["sampleValue"] = new[] { DumpNum(sample.SampleValue.X), DumpNum(sample.SampleValue.Y), DumpNum(sample.SampleValue.Z) },
-                ["rateScale"] = DumpNum(sample.RateScale),
+                ["rateScale"] = rateScale,
                 ["mirror"] = StructBool(rawSample, "bMirror", out var mirror) && mirror,
             });
         }

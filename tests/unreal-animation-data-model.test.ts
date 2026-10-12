@@ -8,21 +8,41 @@ import { CUE4PARSE_PATCH, CUE4PARSE_PROGRAM, CUE4PARSE_SOURCE } from "../src/unr
 // silent rest-pose fallback for an unmapped raw track.
 describe("PRD-583 conventional UAnimDataModel reader", () => {
   it("ships in the converter revision that carries the data-model reader", () => {
-    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.84-animation");
+    expect(CUE4PARSE_SOURCE.version).toBe("b4e95441+threenative.85-animation");
   });
 
   it("reads the exact UAnimDataModel's own bone tracks into the existing bone-indexed route", () => {
-    expect(CUE4PARSE_PROGRAM).toContain("bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string reason)");
+    expect(CUE4PARSE_PROGRAM).toContain("bool PopulateFromDataModel(UAnimSequence sequence, IPackage package, out string reason, out Dictionary<string, object?>? timing)");
     expect(CUE4PARSE_PROGRAM).toContain('model.TryGetValue<FStructFallback[]>(out var tracks, "BoneAnimationTracks")');
     expect(CUE4PARSE_PROGRAM).toContain("sequence.RawAnimationData = data.ToArray();");
     expect(CUE4PARSE_PROGRAM).toContain("sequence.TrackToSkeletonMapTable = map.ToArray();");
-    // Rational timing from the model's own NumberOfFrames and FrameRate, not a frames-per-second guess.
-    expect(CUE4PARSE_PROGRAM).toContain("sequence.SequenceLength = (float) (numberOfFrames * (double) denominator / numerator);");
-    // The exact model is the clip's own property or the editor-created export whose Outer is the clip,
-    // never the first export whose type merely contains "DataModel".
+    // The model's NumberOfFrames counts intervals; the key count is one more and includes both endpoints.
+    expect(CUE4PARSE_PROGRAM).toContain("var numberOfKeys = numberOfFrames + 1;");
+    expect(CUE4PARSE_PROGRAM).toContain('model.TryGetValue<int>(out var modelNumberOfKeys, "NumberOfKeys")');
+    // One PSA frame per key, and a rate derived from NumFrames / SequenceLength, so the endpoint is
+    // sampled and the rate stays the model's rational frames per second.
+    expect(CUE4PARSE_PROGRAM).toContain("sequence.NumFrames = numberOfKeys;");
+    expect(CUE4PARSE_PROGRAM).toContain("sequence.SequenceLength = (float) (numberOfKeys * (double) denominator / numerator);");
+    // The FrameRate tag is an FFrameRate wrapped in FScriptStruct; StructProperty unwraps it, and the
+    // omitted denominator is taken as FFrameRate's default 1 rather than the invalid 0 the fallback leaves.
+    expect(CUE4PARSE_PROGRAM).toContain("else if (value is FScriptStruct script && script.StructType is FStructFallback inner) found = inner;");
+    expect(CUE4PARSE_PROGRAM).toContain("if (numerator > 0 && denominator <= 0) denominator = 1;");
+    expect(CUE4PARSE_PROGRAM).toContain('model.TryGetValue<float>(out var playLength, "PlayLength")');
+    expect(CUE4PARSE_PROGRAM).toContain("disagrees with NumberOfFrames");
+
     expect(CUE4PARSE_PROGRAM).toContain("static UObject? ExactDataModel(UAnimSequence sequence, IPackage package)");
     expect(CUE4PARSE_PROGRAM).toContain("string.Equals(export.Outer?.Name.Text, sequence.Name, StringComparison.Ordinal)");
     expect(CUE4PARSE_PROGRAM).toContain('static bool IsConventionalDataModel(UObject export) => export.ExportType is "AnimDataModel" or "UAnimDataModel";');
+  });
+
+  it("reads the model's CurveData.FloatCurves and rejects a track key count that is not 1 or NumberOfKeys", () => {
+    expect(CUE4PARSE_PROGRAM).toContain('StructProperty(exactModel, "CurveData")');
+    expect(CUE4PARSE_PROGRAM).toContain('curveData.TryGetValue<FFloatCurve[]>(out var typedCurves, "FloatCurves")');
+    expect(CUE4PARSE_PROGRAM).toContain("static List<Dictionary<string, object?>> CurveList(IEnumerable<FFloatCurve?> curves)");
+    expect(CUE4PARSE_PROGRAM).toContain('["arrive"] = DumpNum(key.ArriveTangent)');
+    expect(CUE4PARSE_PROGRAM).toContain('["leave"] = DumpNum(key.LeaveTangent)');
+    expect(CUE4PARSE_PROGRAM).toContain("static bool ValidKeyCount(int count, int keys) => count == 0 || count == 1 || count == keys;");
+    expect(CUE4PARSE_PROGRAM).toContain("not 1 or {numberOfKeys}");
   });
 
   it("decodes both the native and the tagged FRawAnimSequenceTrack layouts", () => {
@@ -30,6 +50,9 @@ describe("PRD-583 conventional UAnimDataModel reader", () => {
     expect(CUE4PARSE_PATCH).toContain("public FRawAnimSequenceTrack(FVector[] posKeys, FQuat[] rotKeys, FVector[] scaleKeys)");
     expect(CUE4PARSE_PROGRAM).toContain("static bool ModelTrackData(FStructFallback track, out FRawAnimSequenceTrack raw, out string reason)");
     expect(CUE4PARSE_PROGRAM).toContain('track.TryGetValue<FStructFallback>(out var tagged, "InternalTrackData")');
+    // Both Quat and Quat4f tagged structs are FQuat; reading TIntVector4<float>[] first drops every
+    // rotation (the real 5.0 probe returned zeros), so FQuat[] must be read first.
+    expect(CUE4PARSE_PROGRAM).toContain("if (data.TryGetValue<FQuat[]>(out var quats, field) && quats is not null) return quats;");
   });
 
   it("rejects a malformed or unmapped raw track map instead of leaving the rest pose", () => {
