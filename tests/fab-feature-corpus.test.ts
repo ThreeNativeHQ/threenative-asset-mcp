@@ -439,6 +439,239 @@ if (!corpusDir) {
   });
 }
 
+interface RealLandscapeProofFile {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+interface RealLandscapeProofIndex {
+  readonly sourceDir: string;
+  readonly publicOutputDir: string;
+  readonly nativeOutputDir: string;
+  readonly nativeSceneJson: string;
+  readonly schemaPath: string;
+  readonly mapPackage: string;
+  readonly engine: string;
+  readonly converterPath: string;
+  readonly converterVersion: string;
+  readonly sourceFiles: readonly RealLandscapeProofFile[];
+}
+
+interface RealLandscapeSchemaExport {
+  readonly id: string;
+  readonly class: string;
+  readonly fields: Record<string, unknown>;
+  readonly transformChain?: readonly { readonly fields: Record<string, unknown> }[];
+}
+
+interface RealLandscapeSchema {
+  readonly exports: readonly RealLandscapeSchemaExport[];
+}
+
+interface RealLandscapeSceneRecord {
+  readonly name: string;
+  readonly location: { readonly x: number; readonly y: number; readonly z: number };
+  readonly rotation: { readonly pitch: number; readonly yaw: number; readonly roll: number };
+  readonly scale: { readonly x: number; readonly y: number; readonly z: number };
+  readonly sizeQuads: number;
+  readonly heights: readonly number[];
+  readonly normals: readonly number[];
+}
+
+interface RealLandscapeScene {
+  readonly landscapes?: readonly RealLandscapeSceneRecord[];
+  readonly omittedActors?: readonly { readonly sourceClass: string; readonly reason: string }[];
+}
+
+interface RealLandscapePoint {
+  readonly X: number;
+  readonly Y: number;
+  readonly Z: number;
+}
+
+interface RealLandscapeBounds {
+  readonly min: [number, number, number];
+  readonly max: [number, number, number];
+}
+
+function landscapeNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function landscapeVector(fields: Record<string, unknown>, key: string, fallback: RealLandscapePoint): RealLandscapePoint {
+  const value = fields[key];
+  if (!value || typeof value !== "object") return fallback;
+  const object = value as Record<string, unknown>;
+  return {
+    X: landscapeNumber(object.X, fallback.X),
+    Y: landscapeNumber(object.Y, fallback.Y),
+    Z: landscapeNumber(object.Z, fallback.Z),
+  };
+}
+
+/**
+ * The schema records authored component/root fields independently of the emitted scene. Missing
+ * SceneComponent location/rotation/scale fields use the native zero/identity defaults; a non-zero
+ * rotation is refused here rather than approximated by an evidence test.
+ */
+function landscapeSourceWorldPoint(local: RealLandscapePoint, chain: readonly { readonly fields: Record<string, unknown> }[]): RealLandscapePoint {
+  let point = local;
+  for (const transform of chain) {
+    const fields = transform.fields;
+    const location = landscapeVector(fields, "RelativeLocation", { X: 0, Y: 0, Z: 0 });
+    const rotation = landscapeVector(fields, "RelativeRotation", { X: 0, Y: 0, Z: 0 });
+    const scale = landscapeVector(fields, "RelativeScale3D", { X: 1, Y: 1, Z: 1 });
+    if (Math.max(Math.abs(rotation.X), Math.abs(rotation.Y), Math.abs(rotation.Z)) > 1e-6) {
+      throw new Error(`landscape proof input has an unhandled non-zero rotation (${rotation.X},${rotation.Y},${rotation.Z})`);
+    }
+    point = {
+      X: point.X * scale.X + location.X,
+      Y: point.Y * scale.Y + location.Y,
+      Z: point.Z * scale.Z + location.Z,
+    };
+  }
+  return point;
+}
+
+function landscapeGltfPoint(point: RealLandscapePoint): [number, number, number] {
+  return [point.Y * 0.01, point.Z * 0.01, -point.X * 0.01];
+}
+
+function extendLandscapeBounds(bounds: { min: [number, number, number]; max: [number, number, number] }, point: readonly [number, number, number]): void {
+  for (let axis = 0; axis < 3; axis++) {
+    bounds.min[axis] = Math.min(bounds.min[axis]!, point[axis]!);
+    bounds.max[axis] = Math.max(bounds.max[axis]!, point[axis]!);
+  }
+}
+
+function emptyLandscapeBounds(): { min: [number, number, number]; max: [number, number, number] } {
+  return { min: [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY], max: [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY] };
+}
+
+function transformLandscapePoint(matrix: readonly number[], point: readonly [number, number, number]): [number, number, number] {
+  const w = matrix[3]! * point[0]! + matrix[7]! * point[1]! + matrix[11]! * point[2]! + matrix[15]!;
+  return [
+    (matrix[0]! * point[0]! + matrix[4]! * point[1]! + matrix[8]! * point[2]! + matrix[12]!) / w,
+    (matrix[1]! * point[0]! + matrix[5]! * point[1]! + matrix[9]! * point[2]! + matrix[13]!) / w,
+    (matrix[2]! * point[0]! + matrix[6]! * point[1]! + matrix[10]! * point[2]! + matrix[14]!) / w,
+  ];
+}
+
+function emittedLandscapeBounds(landscape: RealLandscapeSceneRecord): RealLandscapeBounds {
+  const matrix = unrealTransformToGltfMatrix(landscape.location, landscape.rotation, landscape.scale);
+  const side = landscape.sizeQuads + 1;
+  const bounds = emptyLandscapeBounds();
+  for (let y = 0; y < side; y++) {
+    for (let x = 0; x < side; x++) {
+      const index = y * side + x;
+      extendLandscapeBounds(bounds, transformLandscapePoint(matrix, [y * 0.01, landscape.heights[index]! * 0.01, -x * 0.01]));
+    }
+  }
+  return bounds;
+}
+
+function storedLandscapeBounds(component: RealLandscapeSchemaExport): RealLandscapeBounds {
+  const box = component.fields.CachedLocalBox;
+  if (!box || typeof box !== "object") throw new Error(`${component.id}: CachedLocalBox is missing`);
+  const bounds = box as Record<string, unknown>;
+  const minimum = landscapeVector(bounds, "Min", { X: 0, Y: 0, Z: 0 });
+  const maximum = landscapeVector(bounds, "Max", { X: 0, Y: 0, Z: 0 });
+  const chain = component.transformChain;
+  if (!chain || chain.length === 0) throw new Error(`${component.id}: transform chain is missing`);
+  const output = emptyLandscapeBounds();
+  for (const x of [minimum.X, maximum.X]) {
+    for (const y of [minimum.Y, maximum.Y]) {
+      for (const z of [minimum.Z, maximum.Z]) {
+        extendLandscapeBounds(output, landscapeGltfPoint(landscapeSourceWorldPoint({ X: x, Y: y, Z: z }, chain)));
+      }
+    }
+  }
+  return output;
+}
+
+function assertLandscapeBounds(actual: RealLandscapeBounds, expected: RealLandscapeBounds, label: string): void {
+  for (let axis = 0; axis < 3; axis++) {
+    const tolerance = Math.max((expected.max[axis]! - expected.min[axis]!) * 0.01, 0.0001);
+    expect(Math.abs(actual.min[axis]! - expected.min[axis]!), `${label} min axis ${axis}`).toBeLessThanOrEqual(tolerance);
+    expect(Math.abs(actual.max[axis]! - expected.max[axis]!), `${label} max axis ${axis}`).toBeLessThanOrEqual(tolerance);
+  }
+}
+
+const realLandscapeProofPath = process.env.PRD599_REAL_LANDSCAPE_PROOF_INDEX?.trim();
+if (!realLandscapeProofPath) {
+  describe("PRD-599 real landscape gate (skipped)", () => {
+    it.skip("PRD599_REAL_LANDSCAPE_PROOF_INDEX is not set; licensed real-pack evidence is local-only", () => {});
+  });
+} else {
+  describe("PRD-599 real landscape gate (local-only)", () => {
+    let proof: RealLandscapeProofIndex;
+    let scene: RealLandscapeScene;
+    let schema: RealLandscapeSchema;
+    let report: ImportReport;
+
+    beforeAll(async () => {
+      proof = await readJson<RealLandscapeProofIndex>(realLandscapeProofPath);
+      expect(proof.converterVersion).toBe(CUE4PARSE_SOURCE.version);
+      await assertProofFiles(proof.sourceDir, proof.sourceFiles);
+      const converterVersion = await runTool(proof.converterPath, ["--version"]);
+      expect(`${converterVersion.stdout}\n${converterVersion.stderr}`).toContain(proof.converterVersion);
+      await rm(proof.nativeOutputDir, { recursive: true, force: true });
+      await mkdir(proof.nativeOutputDir, { recursive: true });
+      await runTool(proof.converterPath, [proof.sourceDir, "--export-dir", proof.nativeOutputDir, "--engine", proof.engine.replace(/^UE_/, ""), "--filter", proof.mapPackage]);
+      scene = await readJson<RealLandscapeScene>(proof.nativeSceneJson);
+      schema = await readJson<RealLandscapeSchema>(proof.schemaPath);
+      await rm(proof.publicOutputDir, { recursive: true, force: true });
+      report = await importUnrealDirectory({
+        sourceDir: proof.sourceDir, outputDir: proof.publicOutputDir, sourceKind: "local-directory",
+        engine: proof.engine, formatHint: proof.engine, graphBake: false, concurrency: 1,
+        modernConverter: { name: "modern", path: proof.converterPath, version: proof.converterVersion },
+        environment: { ...process.env, THREENATIVE_MODERN_UNREAL_CONVERTER_PATH: proof.converterPath }, log: () => {} });
+      expect(report.reused).toBe(false);
+      expect(report.importer.version).toBe(IMPORTER_VERSION);
+      expect(report.toolchain.modernConverter).toBe(proof.converterVersion);
+    }, 900_000);
+
+    it("imports all 51 terrain meshes through the public GLB within stored world bounds", async () => {
+      expect(report.scenes).toHaveLength(1);
+      expect(report.scenes[0]!.landscapes).toBe(51);
+      expect(report.scenes[0]!.omittedActors.filter((entry) => entry.sourceClass === "LandscapeComponent")).toHaveLength(0);
+      const document = await new NodeIO().read(join(proof.publicOutputDir, report.scenes[0]!.glb));
+      const nodes = document.getRoot().listNodes().filter((node) => (node.getExtras().unreal as { sourceClass?: string } | undefined)?.sourceClass === "LandscapeComponent");
+      expect(nodes).toHaveLength(51);
+      for (const component of schema.exports.filter((entry) => entry.class === "LandscapeComponent")) {
+        const name = component.id.slice(component.id.lastIndexOf(":") + 1);
+        const matches = nodes.filter((node) => node.getName().endsWith(`/${name}`));
+        expect(matches).toHaveLength(1);
+        const node = matches[0]!;
+        const bounds = emptyLandscapeBounds();
+        const positions = node.getMesh()!.listPrimitives()[0]!.getAttribute("POSITION")!;
+        const matrix = node.getWorldMatrix();
+        for (let vertex = 0; vertex < positions.getCount(); vertex++) {
+          extendLandscapeBounds(bounds, transformLandscapePoint(matrix, positions.getElement(vertex, [0, 0, 0]) as [number, number, number]));
+        }
+        assertLandscapeBounds(bounds, storedLandscapeBounds(component), name);
+      }
+    });
+
+    it("emits every stored landscape component with heights, normals, footprint and height bounds within 1%", () => {
+      const components = schema.exports.filter((entry) => entry.class === "LandscapeComponent");
+      const landscapes = scene.landscapes ?? [];
+      expect(components).toHaveLength(51);
+      expect(landscapes).toHaveLength(components.length);
+      expect(scene.omittedActors?.filter((entry) => entry.sourceClass === "LandscapeComponent") ?? []).toHaveLength(0);
+      for (const component of components) {
+        const componentName = component.id.slice(component.id.lastIndexOf(":") + 1);
+        const landscape = landscapes.find((entry) => entry.name.endsWith(`/${componentName}`));
+        expect(landscape, `${componentName}: emitted landscape record`).toBeDefined();
+        expect(landscape!.heights).toHaveLength((landscape!.sizeQuads + 1) ** 2);
+        expect(landscape!.normals).toHaveLength(landscape!.heights.length * 3);
+        assertLandscapeBounds(emittedLandscapeBounds(landscape!), storedLandscapeBounds(component), componentName);
+      }
+    });
+  });
+}
+
 // PRD-582 gameplay gates over the real corpus. The five matrix slices are required: when
 // FAB_FEATURE_CORPUS_DIR is set, an absent one is a failure, never an empty success. Each slice is
 // imported once through the public `importUnrealDirectory` with the immutable `threenative.86-gameplay`

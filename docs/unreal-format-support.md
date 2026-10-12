@@ -4,7 +4,7 @@ Single place to track which Unreal 4 and Unreal 5 formats the importer supports,
 and which are missing. `README.md` ("Unreal import support") links here. Update this file in the same
 commit as any importer, converter or adapter change that moves a row.
 
-Last audited: 2026-10-12, `IMPORTER_VERSION` 121 (`src/unreal/importer.ts`). Evidence comes from the
+Last audited: 2026-10-12, `IMPORTER_VERSION` 122 (`src/unreal/importer.ts`). Evidence comes from the
 README import table, `src/unreal/`, `tests/`, and the engine headers in `~/projects/UnrealEngine-5.8.3`
 (tag `5.8.3-release`, `Engine/Source/Runtime/Engine/Classes`, file names only).
 
@@ -105,9 +105,9 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | ISM and HISM, painted foliage | UE4 | Implemented | `EXT_mesh_gpu_instancing` | `tests/unreal-foliage-import.integration.test.ts`. |
 | `FoliageType_InstancedStaticMesh` as a standalone package | any | Reported | none | |
 | `LandscapeComponent` heightfields | UE4 editor | Implemented | indexed terrain mesh | Compressed BGRA8 heightmaps only. |
-| Landscape, UE5 | UE5 | **Missing** | none | The importer lists `LandscapeComponent` as unsupported when standalone. The UE5 level export writes an empty `landscapes` list (PRD-599). |
+| Landscape, UE5 | UE5 | **Verified** | indexed terrain mesh | PRD-599 final `.584.9.4` / importer122 native/public real gates pass: all51 selected source components, world POSITION bounds within1%, zero terrain omissions. Compiled raw BGRA8/UEDELTA tests exercise shared production dispatch; branch-disable mutation fails known heights. Nonuniform/mirrored normal regression passes. Direct GLB audit:10,809 shared boundary vertices, zero height mismatch. Combined35-file terrain/actor sample passes51 terrain components and3 resolved mesh actors, zero actor omissions. Selected slices only, not full-map completeness; layer weights remain unsupported. Licensed inputs/provenance local-only (`tests/fab-feature-corpus.test.ts`, `tests/unreal-converter-ue5-sources.test.ts`, PRD-599). |
 | Landscape layer weights and `LandscapeLayerInfoObject` | any | **Missing** | none | |
-| World Partition external actors (`__ExternalActors__`) | UE5 | **Verified** | level scene GLB | Real-pack gate imports all three probe-confirmed supported actor components at stored transforms; compiled association preserves provider mount identity and excludes cross-mount, same-basename/different-prefix and `__ExternalObjects__` packages; fresh `.584.8.4` native/public real-pack proof passes with three meshes and three nodes; final repository gates pending parent, while unimported maps remain skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/fab-feature-corpus.test.ts`, `tests/unreal-external-actors.test.ts`, PRD-598). |
+| World Partition external actors (`__ExternalActors__`) | UE5 | **Verified** | level scene GLB | Real-pack gate imports all three probe-confirmed supported actor components at stored transforms; compiled association preserves provider mount identity and excludes cross-mount, same-basename/different-prefix and `__ExternalObjects__` packages; fresh `.584.8.4` native/public real-pack proof passes with three meshes and three nodes; final union `.584.9.4` native/public real-pack proof also passes all three gates, while unimported maps remain skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/fab-feature-corpus.test.ts`, `tests/unreal-external-actors.test.ts`, PRD-598). |
 | Level streaming, sublevels, HLOD proxies | any | Implemented | partial | `tests/unreal-hlod-proxy.test.ts`, `tests/unreal-level-gate.test.ts`. |
 | `DecalActor` and decal components | any | **Missing** | none | |
 | Volumes (post-process, audio, blocking) | any | **Missing** | none | |

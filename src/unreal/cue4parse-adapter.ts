@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.8.4",
+  version: "b4e95441+threenative.584.9.4",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -546,6 +546,26 @@ diff --git a/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs b/CUE4Pars
          }
      }
 
+diff --git a/CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs b/CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs
+--- a/CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs
++++ b/CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs
+@@ -55,5 +55,5 @@ public bool IsValid()
+     public bool IsValid()
+     {
+         ReadOnlySpan<byte> span = Hash;
+-        return span.IndexOfAnyExcept((byte) 0) < 0;
++        return span.IndexOfAnyExcept((byte) 0) >= 0;
+     }
+
+diff --git a/CUE4Parse/UE4/Assets/FPackageTrailer.cs b/CUE4Parse/UE4/Assets/FPackageTrailer.cs
+--- a/CUE4Parse/UE4/Assets/FPackageTrailer.cs
++++ b/CUE4Parse/UE4/Assets/FPackageTrailer.cs
+@@ -36,3 +36,3 @@
+         {
+-            if (entry.Identifier.Equals(id.Hash))
++            if (entry.Identifier.Equals(id))
+             {
+
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
@@ -696,6 +716,7 @@ using CUE4Parse.UE4.Assets.Exports.Engine;
 using CUE4Parse.UE4.Assets.Exports.Engine.Font;
 using CUE4Parse.UE4.Assets.Exports.Actor;
 using CUE4Parse.UE4.Assets.Exports.Component;
+using CUE4Parse.UE4.Assets.Exports.Component.Landscape;
 using CUE4Parse.UE4.Assets.Exports.Component.Lights;
 using CUE4Parse.UE4.Assets.Exports.Component.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.Component.StaticMesh;
@@ -889,6 +910,25 @@ IEnumerable<UObject> ActorsForLevel(string levelKey, ULevel level, List<object> 
     }
     foreach (var actorKey in provider.Files.Keys.Where(key => IsExternalActorForLevel(key, levelKey)))
         foreach (var actor in LoadExternalActorPackage(actorKey)) yield return actor;
+}
+
+byte[]? ReadPackageBytes(IPackage? owner)
+{
+    if (owner is null || string.IsNullOrWhiteSpace(owner.Name)) return null;
+    var ownerName = owner.Name.Replace('\\', '/');
+    var packageKeys = ownerName.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) || ownerName.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)
+        ? new[] { ownerName }
+        : new[] { ownerName, ownerName + ".uasset" };
+    foreach (var packageKey in packageKeys)
+        if (provider.Files.TryGetValue(packageKey, out var packageFile)) return packageFile.Read();
+    return null;
+}
+
+string? LandscapeMaterialName(FPackageIndex reference)
+{
+    if (reference.IsNull) return null;
+    try { return reference.Load<UMaterialInterface>()?.Name; }
+    catch { return null; }
 }
 // The provider mounts a loose directory under its top-level .uproject stem when one is present, else its
 // name. Compute that mount once from the same selection and reuse it for every gameplay selector below, so
@@ -3568,14 +3608,22 @@ foreach (var key in provider.Files.Keys.Where(key =>
         PropertyUtil.SearchPropertyInTemplate = true;
         var actors = new List<object>();
         var texts = new List<object>();
+        var landscapes = new List<object>();
         var lights = new List<object>();
         var omittedActors = new List<object>();
+        var landscapeProxies = new List<(ALandscapeProxy Proxy, string Name)>();
         var groupedSpriteInstances = new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
         var blueprintComponents = 0;
         var hasCamera = false;
         double cameraX = 0, cameraY = 0, cameraZ = 0, cameraPitch = 0, cameraYaw = 0, cameraRoll = 0;
         foreach (var actor in ActorsForLevel(key, level, omittedActors))
         {
+            var actorName = actor is AActor labeled && !string.IsNullOrWhiteSpace(labeled.ActorLabel) ? labeled.ActorLabel : actor.Name;
+            if (actor is ALandscapeProxy landscapeProxy)
+            {
+                landscapeProxies.Add((landscapeProxy, actorName));
+                continue;
+            }
             var componentReferences = new List<FPackageIndex?> {
                 actor.GetOrDefault<FPackageIndex?>("RootComponent"),
                 actor.GetOrDefault<FPackageIndex?>("RenderComponent"),
@@ -3620,7 +3668,6 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     parentComponent = parentComponent.GetOrDefault<FPackageIndex?>("AttachParent")?.Load<USceneComponent>();
                 }
                 var rotation = transform.Rotator();
-                var actorName = actor is AActor labeled && !string.IsNullOrWhiteSpace(labeled.ActorLabel) ? labeled.ActorLabel : actor.Name;
                 if (component is USkyLightComponent)
                 {
                     omittedActors.Add(new { actor = actorName, component = component.Name, sourceClass = component.ExportType, reason = "SkyLight environment capture is not reconstructable as a punctual Three.js light" });
@@ -3773,6 +3820,107 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 });
             }
         }
+        var landscapeMaterials = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (proxy, _) in landscapeProxies)
+        {
+            var materialName = LandscapeMaterialName(proxy.LandscapeMaterial);
+            if (materialName is not null) landscapeMaterials[proxy.LandscapeGuid.ToString()] = materialName;
+        }
+        void OmitLandscape(string actorName, string componentName, string reason)
+        {
+            omittedActors.Add(new {
+                actor = actorName,
+                component = componentName,
+                sourceClass = "LandscapeComponent",
+                reason = $"landscape heightfield was not exported: {reason}"
+            });
+        }
+        foreach (var (proxy, proxyName) in landscapeProxies)
+        {
+            foreach (var componentReference in proxy.LandscapeComponents ?? [])
+            {
+                ULandscapeComponent? component;
+                try { component = componentReference.IsNull ? null : componentReference.Load<ULandscapeComponent>(); }
+                catch (Exception error)
+                {
+                    OmitLandscape(proxyName, componentReference.Name, $"component could not be loaded: {error.Message}");
+                    continue;
+                }
+                if (component is null)
+                {
+                    OmitLandscape(proxyName, componentReference.Name, "landscape component reference is null or not a ULandscapeComponent");
+                    continue;
+                }
+                var componentName = component.Name;
+                var heightmap = component.GetHeightmap();
+                if (heightmap is null)
+                {
+                    OmitLandscape(proxyName, componentName, "HeightmapTexture is missing");
+                    continue;
+                }
+                int textureWidth = 0, textureHeight = 0;
+                byte[] sourcePixels = [];
+                var sourceRefusal = "";
+                try
+                {
+                    if (!TryReadLandscapeSourcePixels(heightmap, ReadPackageBytes(heightmap.Owner), out textureWidth, out textureHeight, out sourcePixels, out sourceRefusal))
+                    {
+                        OmitLandscape(proxyName, componentName, sourceRefusal);
+                        continue;
+                    }
+                }
+                catch (Exception error)
+                {
+                    OmitLandscape(proxyName, componentName, $"heightmap source could not be read: {error.Message}");
+                    continue;
+                }
+                (float[] Heights, float[] Normals) decoded;
+                try
+                {
+                    decoded = DecodeLandscapeHeightfield(
+                        sourcePixels,
+                        textureWidth,
+                        textureHeight,
+                        component.ComponentSizeQuads,
+                        component.SubsectionSizeQuads,
+                        component.NumSubsections,
+                        component.HeightmapScaleBias.Z,
+                        component.HeightmapScaleBias.W);
+                }
+                catch (Exception error)
+                {
+                    OmitLandscape(proxyName, componentName, $"heightmap layout could not be decoded: {error.Message}");
+                    continue;
+                }
+                var transform = component.GetRelativeTransform();
+                var parentComponent = component.GetOrDefault<FPackageIndex?>("AttachParent")?.Load<USceneComponent>();
+                for (var parentDepth = 0; parentComponent is not null && parentDepth < 64; parentDepth++)
+                {
+                    transform *= parentComponent.GetRelativeTransform();
+                    parentComponent = parentComponent.GetOrDefault<FPackageIndex?>("AttachParent")?.Load<USceneComponent>();
+                }
+                try { decoded = (decoded.Heights, LandscapeLocalNormals(decoded.Normals, transform.Scale3D.X, transform.Scale3D.Y, transform.Scale3D.Z)); }
+                catch (InvalidDataException error) { OmitLandscape(proxyName, componentName, error.Message); continue; }
+                var rotation = transform.Rotator();
+                var landscapeGuid = proxy.LandscapeGuid.ToString();
+                var materialName = component.OverrideMaterial is { IsNull: false } overrideMaterial
+                    ? LandscapeMaterialName(overrideMaterial)
+                    : null;
+                materialName ??= LandscapeMaterialName(proxy.LandscapeMaterial);
+                materialName ??= landscapeMaterials.GetValueOrDefault(landscapeGuid);
+                materialName ??= "Landscape_Default";
+                landscapes.Add(new {
+                    name = proxyName + "/" + componentName,
+                    materialName,
+                    location = new { x = transform.Translation.X, y = transform.Translation.Y, z = transform.Translation.Z },
+                    rotation = new { pitch = rotation.Pitch, yaw = rotation.Yaw, roll = rotation.Roll },
+                    scale = new { x = transform.Scale3D.X, y = transform.Scale3D.Y, z = transform.Scale3D.Z },
+                    sizeQuads = component.ComponentSizeQuads,
+                    heights = decoded.Heights,
+                    normals = decoded.Normals
+                });
+            }
+        }
         var descriptor = new {
             format = "threenative-unreal-scene-source",
             version = 1,
@@ -3788,7 +3936,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 parent = group.Key[..group.Key.IndexOf('/')],
                 sourceClass = "PaperGroupedSpriteComponent"
             }).ToArray(),
-            landscapes = Array.Empty<object>(),
+            landscapes,
             lights,
             blueprintComponents,
             camera = new {
@@ -4867,6 +5015,196 @@ static void UndoUeDelta(byte[] data, long offset, int width, int height, int byt
         var rows = RowsPerCut(tileWidth, height);
         for (long startY = 0; startY < height; startY += rows) Tile(startX, tileWidth, startY, Math.Min(rows, height - startY));
     }
+}
+
+// Landscape source art is BGRA8 even though its height and normal channels are packed into the
+// colour bytes: R is the high height byte, G the low byte, B is normal X, and A is normal Y.
+// The vertex-to-atlas mapping deliberately keeps the shared subsection edge in the same place as
+// Unreal's ComponentXYToSubsectionXY/VertexXYToTexelXY pair; treating the component as one dense
+// rectangle shifts every vertex after the first subsection boundary.
+static (float[] Heights, float[] Normals) DecodeLandscapeHeightfield(
+    byte[] pixels,
+    int textureWidth,
+    int textureHeight,
+    int componentSizeQuads,
+    int subsectionSizeQuads,
+    int numSubsections,
+    float heightmapBiasX,
+    float heightmapBiasY)
+{
+    if (textureWidth <= 0 || textureHeight <= 0 || (long) textureWidth * textureHeight * 4 != pixels.LongLength)
+        throw new InvalidDataException($"landscape heightmap is not BGRA8 {textureWidth}x{textureHeight}");
+    if (componentSizeQuads <= 0 || subsectionSizeQuads <= 0 || numSubsections <= 0 ||
+        (long) subsectionSizeQuads * numSubsections != componentSizeQuads)
+        throw new InvalidDataException($"landscape component layout is invalid: {componentSizeQuads} quads, {subsectionSizeQuads} per subsection, {numSubsections} subsections");
+
+    var subsectionSizeVerts = subsectionSizeQuads + 1;
+    var side = componentSizeQuads + 1;
+    var offsetX = LandscapeRoundToInt(heightmapBiasX * textureWidth);
+    var offsetY = LandscapeRoundToInt(heightmapBiasY * textureHeight);
+    var atlasWidth = checked(numSubsections * subsectionSizeVerts);
+    if (offsetX < 0 || offsetY < 0 || offsetX > textureWidth - atlasWidth || offsetY > textureHeight - atlasWidth)
+        throw new InvalidDataException($"landscape heightmap atlas {offsetX},{offsetY}+{atlasWidth} exceeds {textureWidth}x{textureHeight}");
+
+    var vertexCount = checked(side * side);
+    var heights = new float[vertexCount];
+    var normals = new float[checked(vertexCount * 3)];
+    for (var y = 0; y < side; y++)
+    {
+        var previousY = y - 1;
+        var subsectionY = y == 0 ? 0 : previousY / subsectionSizeQuads;
+        var localY = y == 0 ? 0 : previousY % subsectionSizeQuads + 1;
+        var textureY = offsetY + subsectionY * subsectionSizeVerts + localY;
+        for (var x = 0; x < side; x++)
+        {
+            var previousX = x - 1;
+            var subsectionX = x == 0 ? 0 : previousX / subsectionSizeQuads;
+            var localX = x == 0 ? 0 : previousX % subsectionSizeQuads + 1;
+            var textureX = offsetX + subsectionX * subsectionSizeVerts + localX;
+            var pixel = checked((textureY * textureWidth + textureX) * 4);
+            var vertex = y * side + x;
+            var encodedHeight = (pixels[pixel + 2] << 8) | pixels[pixel + 1];
+            heights[vertex] = (encodedHeight - 32768f) / 128f;
+            var normalX = 2f * pixels[pixel] / 255f - 1f;
+            var normalY = 2f * pixels[pixel + 3] / 255f - 1f;
+            var normal = vertex * 3;
+            normals[normal] = normalX;
+            normals[normal + 1] = normalY;
+            normals[normal + 2] = MathF.Sqrt(MathF.Max(1f - normalX * normalX - normalY * normalY, 0f));
+        }
+    }
+    return (heights, normals);
+}
+
+// UE uses LocalToWorldNoScaling for packed landscape normals. Cancel glTF's inverse
+// scale using magnitudes only: RemoveScaling retains mirrored basis signs.
+static float[] LandscapeLocalNormals(float[] packed, float scaleX, float scaleY, float scaleZ)
+{
+    if (!float.IsFinite(scaleX) || !float.IsFinite(scaleY) || !float.IsFinite(scaleZ) || scaleX == 0 || scaleY == 0 || scaleZ == 0)
+        throw new InvalidDataException("landscape normal transform has invalid or zero world scale");
+    var output = new float[packed.Length];
+    for (var i = 0; i < packed.Length; i += 3)
+    {
+        var x = (double) packed[i] * Math.Abs((double) scaleX);
+        var y = (double) packed[i + 1] * Math.Abs((double) scaleY);
+        var z = (double) packed[i + 2] * Math.Abs((double) scaleZ);
+        var length = Math.Sqrt(x*x + y*y + z*z);
+        if (!double.IsFinite(length) || length == 0) throw new InvalidDataException("landscape packed normal is invalid or zero");
+        output[i] = (float) (x / length);
+        output[i + 1] = (float) (y / length);
+        output[i + 2] = (float) (z / length);
+    }
+    return output;
+}
+
+static int LandscapeRoundToInt(float value)
+{
+    if (!float.IsFinite(value)) throw new InvalidDataException("landscape heightmap scale bias is not finite");
+    return checked((int) MathF.Floor(value + 0.5f));
+}
+
+// UE 5.3 stores these heightmaps as raw BGRA8 source art in FEditorBulkData. UE 5.6+ may wrap
+// the same bytes in TSCF_UEDELTA, so the source compression tag decides whether to apply the row
+// filter; an absent CompressionFormat is the engine's TSCF_None default, not a reason to guess PNG.
+static bool TryReadLandscapeSourcePixels(UTexture2D texture, byte[]? packageBytes, out int width, out int height, out byte[] pixels, out string refusal)
+{
+    width = 0;
+    height = 0;
+    pixels = [];
+    refusal = "";
+    var source = texture.GetOrDefault<FStructFallback?>("Source", null);
+    if (source is null) { refusal = "heightmap has no serialized Source struct"; return false; }
+    var format = source.GetOrDefault<FName>("Format").Text ?? "";
+    format = format[(format.LastIndexOf(':') + 1)..];
+    if (format != "TSF_BGRA8") { refusal = $"heightmap source format {format} is not TSF_BGRA8"; return false; }
+    var compression = source.GetOrDefault<FName>("CompressionFormat").Text ?? "";
+    width = source.GetOrDefault<int>("SizeX");
+    height = source.GetOrDefault<int>("SizeY");
+    var slices = Math.Max(1, source.GetOrDefault<int>("NumSlices"));
+    var mips = Math.Max(1, source.GetOrDefault<int>("NumMips"));
+    var layers = Math.Max(1, source.GetOrDefault<int>("NumLayers"));
+    var blocks = source.GetOrDefault<FStructFallback[]>("Blocks") ?? [];
+    if (layers > 1 || blocks.Length > 0)
+    {
+        refusal = $"heightmap source has {layers} layers and {blocks.Length} extra blocks";
+        return false;
+    }
+    if (width <= 0 || height <= 0)
+    {
+        refusal = $"heightmap source dimensions are {width}x{height}";
+        return false;
+    }
+    long total = 0;
+    for (var mip = 0; mip < mips; mip++) total += (long) Math.Max(1, width >> mip) * Math.Max(1, height >> mip) * slices * 4;
+    if (total <= 0 || total > int.MaxValue)
+    {
+        refusal = $"heightmap source size {total} bytes is unsupported";
+        return false;
+    }
+    byte[]? raw = null;
+    if (texture.EditorData is { } editor && editor.Payload.Header.TotalRawSize == (ulong) total)
+    {
+        try { raw = DecompressEditorPayload(editor.Payload); }
+        catch (Exception error) { refusal = $"FEditorBulkData payload could not be decompressed: {error.Message}"; }
+    }
+    if (raw is null && texture.SourceArt?.ReadDataOnce() is { } sourceArt && sourceArt.LongLength >= total)
+        raw = sourceArt;
+    if (raw is null && packageBytes is not null)
+    {
+        var candidates = ScanEditorPayloads(packageBytes).Where(entry => entry.RawSize == (ulong) total).ToArray();
+        if (candidates.Length > 1) { refusal = $"ambiguous editor source: {candidates.Length} payloads of {total} bytes"; return false; }
+        foreach (var (at, rawSize) in candidates)
+        {
+            try
+            {
+                using var archive = new FByteArchive("landscape-editor-payload", packageBytes);
+                archive.Position = at;
+                raw = DecompressEditorPayload(new FCompressedBuffer(archive));
+                break;
+            }
+            catch (Exception error) { refusal = $"editor payload at {at} could not be decompressed: {error.Message}"; }
+        }
+    }
+    if (raw is null)
+    {
+        refusal = refusal.Length > 0 ? refusal : $"no editor source payload of {total} bytes was found";
+        return false;
+    }
+    return TryDecodeLandscapeSourcePixels(raw, width, height, compression,
+        source.GetOrDefault<bool>("bPNGCompressed", false), out pixels, out refusal);
+}
+
+// Shared production dispatch: source art may contain more mips/slices, but terrain reads mip 0, slice 0.
+static bool TryDecodeLandscapeSourcePixels(byte[] raw, int width, int height, string compression, bool pngCompressed, out byte[] pixels, out string refusal)
+{
+    pixels = [];
+    refusal = "";
+    compression = compression[(compression.LastIndexOf(':') + 1)..];
+    var ueDelta = compression == "TSCF_UEDELTA";
+    if (compression.Length > 0 && compression != "None" && compression != "TSCF_None" && !ueDelta)
+    {
+        refusal = $"heightmap source compression {compression} is unsupported";
+        return false;
+    }
+    if (pngCompressed)
+    {
+        refusal = "heightmap source is PNG-compressed rather than raw BGRA8";
+        return false;
+    }
+    var firstMip = (long) width * height * 4L;
+    if (width <= 0 || height <= 0 || firstMip > int.MaxValue)
+    {
+        refusal = $"heightmap source dimensions are {width}x{height}";
+        return false;
+    }
+    if (raw.LongLength < firstMip)
+    {
+        refusal = $"editor source payload has {raw.LongLength} bytes, expected at least {firstMip}";
+        return false;
+    }
+    pixels = raw.AsSpan(0, checked((int) firstMip)).ToArray();
+    if (ueDelta) UndoUeDelta(pixels, 0, width, height, 4, 1);
+    return true;
 }
 
 // Raw source pixels (mip 0, slice 0) as an RGBA PNG in true colour. A 16-bit sRGB source is linear

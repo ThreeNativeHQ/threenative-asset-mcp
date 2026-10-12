@@ -69,4 +69,3 @@ export function meshDescription(slotNames: readonly string[], compactNames: bool
     element("PolygonGroups", slotNames.length, [{ name: "ImportedMaterialSlotName", kind: 6, names: slotNames }], compactNames),
   ]);
 }
-
