@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.8",
+  version: "b4e95441+threenative.584.8.1",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -857,9 +857,7 @@ provider.Initialize();
 provider.PostMount();
 static string SourceRelativePackagePath(string key)
 {
-    var normalized = key.Replace('\\', '/');
-    var rootedContent = normalized.IndexOf("/Content/", StringComparison.OrdinalIgnoreCase);
-    return rootedContent >= 0 ? normalized[(rootedContent + 1)..] : normalized;
+    return key.Replace('\\', '/');
 }
 static bool IsExternalActorForLevel(string actorKey, string levelKey)
 {
@@ -867,12 +865,11 @@ static bool IsExternalActorForLevel(string actorKey, string levelKey)
     var level = SourceRelativePackagePath(levelKey);
     const string marker = "__ExternalActors__/";
     var markerAt = actor.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-    if (markerAt < 0 || !actor.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) return false;
+    if (markerAt < 0 || (markerAt > 0 && actor[markerAt - 1] != '/') || !actor.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) return false;
     var actorPath = actor[(markerAt + marker.Length)..].Split('/', StringSplitOptions.RemoveEmptyEntries);
     if (actorPath.Length < 4) return false;
-    var mapPath = string.Join('/', actorPath.Take(actorPath.Length - 3));
+    var mapPath = actor[..markerAt] + string.Join('/', actorPath.Take(actorPath.Length - 3));
     var levelPath = level.EndsWith(".umap", StringComparison.OrdinalIgnoreCase) ? level[..^5] : level;
-    if (levelPath.StartsWith("Content/", StringComparison.OrdinalIgnoreCase)) levelPath = levelPath[8..];
     return string.Equals(mapPath, levelPath, StringComparison.OrdinalIgnoreCase);
 }
 IEnumerable<UObject> ActorsForLevel(string levelKey, ULevel level, List<object> omittedActors)

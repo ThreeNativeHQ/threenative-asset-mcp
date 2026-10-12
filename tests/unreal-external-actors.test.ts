@@ -1,7 +1,12 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
+import { modernSdkExecutable } from "../src/unreal/provision.js";
+import { childEnvironment, runBounded } from "../src/unreal/toolchain.js";
+import { compileProject } from "./helpers/material-overrides-harness.js";
+import { describeWithTools } from "./helpers/require-tool.js";
 import {
   importUnrealDirectory,
   isWorldPartitionExternalPackage,
@@ -14,6 +19,59 @@ import { writeFakeUmodel, writeMeshFixture, writePng } from "./helpers/unreal-fi
 const directories: string[] = [];
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+// ULevel's external actor directory preserves the mount and full map path before the three hash segments.
+const ownershipCases = [
+  ["Content/__ExternalActors__/Maps/City/0/23/actor.uasset", "Content/Maps/City.umap", true],
+  ["Project/Content/__ExternalActors__/Maps/City/0/23/actor.uasset", "Project/Content/Maps/City.umap", true],
+  ["Plugins/A/Content/__ExternalActors__/Maps/City/0/23/actor.uasset", "Plugins/A/Content/Maps/City.umap", true],
+  ["Plugins/A/Content/__ExternalActors__/Maps/City/0/23/actor.uasset", "Plugins/B/Content/Maps/City.umap", false],
+  ["Plugins/A/Content/__ExternalActors__/Maps/City/0/23/actor.uasset", "Content/Maps/City.umap", false],
+  ["Content/__ExternalActors__/Maps/City/0/23/actor.uasset", "Project/Content/Maps/City.umap", false],
+  ["plugins/a/content/__externalactors__/maps/city/0/23/actor.UASSET", "Plugins/A/Content/Maps/City.UMAP", true],
+  ["Project\\Content\\__ExternalActors__\\Maps\\City\\0\\23\\actor.uasset", "Project/Content/Maps/City.umap", true],
+  ["Content/__ExternalActors__/Other/Maps/City/0/23/actor.uasset", "Content/Maps/City.umap", false],
+  ["Content/__ExternalObjects__/Maps/City/0/23/object.uasset", "Content/Maps/City.umap", false],
+  ["Content/__ExternalActors__/Maps/Other/0/23/actor.uasset", "Content/Maps/City.umap", false],
+  ["Content/__ExternalActors__/Maps/City/0/actor.uasset", "Content/Maps/City.umap", false],
+] as const;
+
+describe("public external actor mount ownership", () => {
+  it.each(ownershipCases)("%s belongs to %s: %s", (actor, level, owns) => {
+    expect(shouldSkipWorldPartitionExternalPackage(actor, [level])).toBe(!owns);
+  });
+});
+
+describeWithTools(["modern-converter"], "compiled production external actor mount ownership", () => {
+  let directory = "";
+  let results: boolean[] = [];
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), "tn-external-actor-mount-"));
+    // Extract the shipped methods verbatim; no alternate ownership implementation in the harness.
+    const start = CUE4PARSE_PROGRAM.indexOf("static string SourceRelativePackagePath(");
+    const end = CUE4PARSE_PROGRAM.indexOf("IEnumerable<UObject> ActorsForLevel(", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const calls = ownershipCases.map(([actor, level]) => `IsExternalActorForLevel(${JSON.stringify(actor)}, ${JSON.stringify(level)})`);
+    const build = await compileProject(directory, "ActorMount", {
+      "Program.cs": `Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new bool[] { ${calls.join(",")} }));\n${CUE4PARSE_PROGRAM.slice(start, end)}`,
+    });
+    expect(build.code, build.output).toBe(0);
+    const run = await runBounded(await modernSdkExecutable(), [build.dll], {
+      timeoutMs: 30_000, environment: childEnvironment(process.env),
+    });
+    expect(run.code, run.stderr).toBe(0);
+    results = JSON.parse(run.stdout);
+  }, 120_000);
+  afterAll(async () => {
+    if (directory) await rm(directory, { recursive: true, force: true });
+  });
+  it.each(ownershipCases.map(([actor, level, owns], index) => ({ actor, level, owns, index })))(
+    "$actor belongs to $level: $owns", ({ owns, index }) => {
+      expect(results[index]).toBe(owns);
+    },
+  );
 });
 
 describe("World Partition external packages", () => {
