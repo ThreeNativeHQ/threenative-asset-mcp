@@ -1,7 +1,7 @@
 # PRD-598 — UE5 World Partition external actors in levels
 
-**Status:** IN PROGRESS — mount-identity repair complete; fresh native proof, final gates, second review and CI pending
-**Priority:** P2 — prior `.584.8` evidence remains historical; AC-1/AC-4 require parent reruns on `.584.8.1`.
+**Status:** IN PROGRESS — all local criteria complete; final independent review and CI pending
+**Priority:** P2 — real actor placement, mount isolation, sheets and repository gates pass on the repaired implementation.
 **Complexity:** 2 (LOW) — importer, adapter, format ledger, and focused real gates; risk override: licensed evidence remains local-only.
 **Owner:** lane-598; parent owns final sheet and delivery
 **Depends on:** None
@@ -29,14 +29,14 @@ compiled converter gate.
 
 ## Acceptance Criteria
 
-- [ ] AC-1 [local]: A real UE5 World Partition level imports with its external actors placed: the scene GLB holds one node per external actor that carries a supported component, at the transform the package stores. proof: opt-in real-pack gate in `tests/fab-feature-corpus.test.ts` — Historical `.584.8` evidence (fresh `.584.8.1` proof pending): private proof index `/home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index.json`; native scene JSON has 3 probe-confirmed actors, public output has 3/3 resolved actors, one mesh node per actor with decoded POSITION data, and GLB world matrices matching the native transforms.
+- [x] AC-1 [local]: A real UE5 World Partition level imports with its external actors placed: the scene GLB holds one node per external actor that carries a supported component, at the transform the package stores. proof: opt-in real-pack gate in `tests/fab-feature-corpus.test.ts` — Evidence: parent fresh native/public proof on implementation 5f9b22b, converter .584.8.1/importer121, passed3 real gates in21.29s. Index /home/joao/.cache/threenative-asset-mcp/prd598-real-proof/index81.json; fresh outputs reused:false have3 native actors and3 resolved decoded GLB nodes at the stored source transforms. Converter DLL SHA-25649c6033c5c8364f8aba659ccb30940862eb96addcdee9254c04381fb130c6f6e.
 - [x] AC-2 [local]: External actor packages of a map that is not imported stay skipped with `WORLD_PARTITION_EXTERNAL_REASON`. proof: `npx vitest run tests/unreal-external-actors.test.ts --maxWorkers=1` (extended) — Evidence: 27 focused tests pass, including source-extracted compiled production helpers and public TypeScript checks for two mount identities, root/project Content keys, case/separator variants, different maps and external objects. The prior real compiled association fixture also rejects same-basename/different-prefix and `__ExternalObjects__` packages.
-- [x] AC-3 [local]: Before/after level sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected the actual scene actor crops, attached in [PR51 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/51#issuecomment-6132573301). Before is the same bounded level through `.584.4` (0 actors), after is `.584.8` (3 actors); empty before tiles contain no placeholder geometry. Owner-only Drive PNG, local SHA/path metadata `raw/parent598-sheet.json`.
-- [ ] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Historical `.584.8` evidence (new final-head gates pending): parent final checks on implementation `aee9c49` (subsequent edits are prose only): typecheck0.8s, default suite2,694 passed/16 skipped74.4s, clean leak gate82.6s, packed MCP15/15 in12.7s. Logs are `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent598-final-{typecheck,test,leaks,smoke}.log`.
+- [x] AC-3 [local]: Before/after level sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected the actual scene actor crops, attached in [PR51 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/51#issuecomment-6132573301). Before is the same bounded level through `.584.4` (0 actors), after is `.584.8` (3 actors); empty before tiles contain no placeholder geometry. The inspected after-GLB is byte-identical to final .584.8.1 (SHA-256 e96609d898710b862b443a6dd76aacfb056957beafa6adf95c0ddaa99c113552); identity is recorded in raw/parent598-final81-sheet-identity.json. Owner-only Drive PNG, local SHA/path metadata `raw/parent598-sheet.json`.
+- [x] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: all four parent checks pass on implementation5f9b22b (subsequent edits are prose only): typecheck0.9s; default suite2,718 passed/16 skipped79.9s; clean leak gate83.4s; packed MCP15/15 in10.6s. Logs: /home/joao/.cache/agent-dumps/prd-596-599/raw/parent598-final81-{typecheck,test,leaks,smoke}.log.
 
 ## Remaining work
 
-- Parent must rebuild converter `.584.8.1`, rerun all four repository gates and the strict real three-actor proof, and verify sheet SHA/identity before final review 2 and CI. Prior `.584.8` proof is not final for this repair. There is no external input blocker.
+- Final independent review and CI remain in progress; there is no external input blocker.
 
 ## Integration Ledger
 
@@ -56,11 +56,11 @@ compiled converter gate.
 **Status:** DONE
 **Files:** `src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `tests/unreal-external-actors.test.ts`, `tests/fab-feature-corpus.test.ts`.
 **Implementation:** As in Solution 1–2. Bump converter tag and `IMPORTER_VERSION`.
-**Verification:** converter source pin `b4e95441+threenative.584.8.1`, importer `121`; 27 focused tests pass. Prior `.584.8` real gate is historical; parent must rebuild and rerun.
+**Verification:** converter source pin `b4e95441+threenative.584.8.1`, importer `121`; 27 focused tests pass. Final .584.8.1 real native/public gate passed3/3 in21.29s.
 
 #### Phase 3: Evidence and gates
-**Status:** IN PROGRESS — fresh mount-repair proof and gates pending
-**Verification:** historical `.584.8` AC-3 sheet and repository gates passed; the ledger retains that evidence. AC-1/AC-4 await fresh `.584.8.1` proof and gates; parent must verify sheet SHA/identity.
+**Status:** DONE
+**Verification:** final .584.8.1 real proof, all four repository gates and sheet-byte identity passed. Final review and CI are delivery checks in progress.
 
 ## Source-backed implementation facts
 
@@ -68,7 +68,7 @@ compiled converter gate.
 - `src/unreal/importer.ts:614-634` derives the owning `.umap` from the external-actor path; `:3462-3467` removes external packages from standalone classification; `:3892-3894` retains only unimported-map skips with `WORLD_PARTITION_EXTERNAL_REASON`.
 - `src/unreal/cue4parse-adapter.ts:858-876` normalizes separators while preserving provider mount identity and compares the full map path; `:878-895` enumerates `AActor` runtime exports and records named package-load omissions; `:3349-3362` feeds them into level reconstruction.
 - `tests/fab-feature-corpus.test.ts:797-840` runs both the direct native converter and public importer; `:842-895` compares all 3 probe records, native JSON transforms, decoded GLB nodes/geometry, and global matrices, with a compiled association fixture.
-- `tests/unreal-external-actors.test.ts:27-38,40-70` covers same-basename/different-prefix ownership and the public unimported-map skip reason.
+- `tests/unreal-external-actors.test.ts:24-74,85-128` covers same-basename/different-prefix ownership and the public unimported-map skip reason.
 
 ## Local real evidence
 
@@ -87,3 +87,5 @@ compiled converter gate.
 ## Review 1 mount-identity repair
 
 The shipped native matcher previously stripped every prefix before `Content/`, admitting an actor from one plugin into another plugin’s same-path map. Converter `b4e95441+threenative.584.8.1` now preserves the full provider prefix in both ownership comparisons and omission paths; importer stays `121` because only native association changed. The source-extracted compiled production helpers and public TypeScript helper share synthetic ownership cases for root Content, project Content, two plugin mounts, case/separator variants, other map prefixes and external objects. Focused verification: the old compiled matcher failed three cross-mount cases (24 passed), then all 27 passed after repair; `npm run typecheck` and `git diff --check` pass. Private logs: `raw/598-mount-{red,green,typecheck}.log`. final native build and AC-1/AC-4 proof remain the parent’s work.
+
+- Final parent proof: repaired mount matching retains all three actual actors, and the freshly imported scene matches the inspected sheet bytes. All local ACs are complete. The first independent review requested the mount fix;5f9b22b repairs it, with actual compiled old-code failures and27 passing ownership checks. Final independent review remains pending.
