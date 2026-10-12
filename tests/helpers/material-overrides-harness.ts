@@ -206,7 +206,9 @@ export interface ConverterRun {
   readonly files: readonly string[];
 }
 
-const MODERN_BIN = join(toolchainCacheDir(process.env), "modern", "bin");
+const MODERN_BIN = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim()
+  ? dirname(process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH.trim())
+  : join(toolchainCacheDir(process.env), "modern", "bin");
 
 /**
  * Compiles `program` (the converter's own C#) together with the harness against the installed CUE4Parse assemblies, then runs
@@ -307,7 +309,7 @@ export async function dumpGraphsOfPackages(
   return { code: run.code, stdout: run.stdout, stderr: run.stderr, files };
 }
 
-async function compileProject(
+export async function compileProject(
   root: string,
   assembly: string,
   sources: Readonly<Record<string, string>>,

@@ -145,6 +145,14 @@ Fab:
   flows.
 - `asset_import_unreal` — converts an already-downloaded Unreal directory to
   self-contained GLBs plus `import-report.json`; Unreal Engine is not required.
+  Cascade `ParticleSystem` and Niagara systems are exported as data-only
+  descriptors under `Effects/<system>-<hash>.<cascade|niagara>.json`, one per
+  canonical package and object path so two same-basename systems in different
+  folders stay distinct. No runtime plays them: each descriptor lists the
+  modules and inputs it does not carry, and a placed effect component points at
+  its descriptor through `import-report.json`. Effects with no exported
+  descriptor stay named in the report; the importer never reconstructs a
+  particle simulation.
 - `fab_import_asset` — downloads an owned listing through the user's existing
   FabCLI session, then runs the same Unreal importer. It never signs in, claims,
   or purchases an asset.

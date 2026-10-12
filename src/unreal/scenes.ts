@@ -71,6 +71,9 @@ export interface UnrealSceneOmission {
   readonly component: string;
   readonly sourceClass: string;
   readonly reason: string;
+  /** PRD-584: the portable effect descriptor this component was exported as, relative to the import
+   * output (`Effects/<system>-<hash>.cascade.json` or `.niagara.json`). Absent for non-effect omissions. */
+  readonly descriptor?: string;
 }
 
 export interface UnrealSceneLandscape {
@@ -289,11 +292,15 @@ export function parseUnrealSceneSource(json: string): UnrealSceneSource {
   const omittedActors = rawOmissions.map((raw, index): UnrealSceneOmission => {
     const omission = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
     if (!omission) throw new Error(`Scene omission ${index} is invalid.`);
+    const descriptor = typeof omission.descriptor === "string" && omission.descriptor.length > 0
+      ? text(omission.descriptor, `omittedActors[${index}].descriptor`)
+      : undefined;
     return {
       actor: text(omission.actor, `omittedActors[${index}].actor`),
       component: text(omission.component, `omittedActors[${index}].component`),
       sourceClass: text(omission.sourceClass, `omittedActors[${index}].sourceClass`),
       reason: text(omission.reason, `omittedActors[${index}].reason`),
+      ...(descriptor !== undefined ? { descriptor } : {}),
     };
   });
   const rawLandscapes = value.landscapes ?? [];
@@ -447,6 +454,12 @@ export interface AssembleSceneRequest {
   readonly outputStem?: string;
   readonly models: readonly SceneModel[];
   readonly bitmapFonts?: readonly { readonly name: string; readonly manifest: string }[];
+  /**
+   * PRD-584 AC-4: the effect descriptors actually written this import, keyed by output path and
+   * canonical source package. An omission's `descriptor` is kept only when exactly one written
+   * effect matches that full path, so a dangling or basename-colliding pointer is never reported.
+   */
+  readonly effectDescriptors?: readonly { readonly descriptor: string; readonly package: string }[];
   readonly validate: (
     path: string,
     options?: { readonly allowEmptyScene?: boolean },
@@ -593,7 +606,42 @@ function unshareAttributeAccessors(document: Document): void {
   }
 }
 
+/**
+ * PRD-584 AC-4: reconcile each effect `omittedActors` pointer with the effect descriptors actually
+ * written. The pointer is the identity-keyed `Effects/<system>-<hash>.<cascade|niagara>.json`; it is
+ * kept only when exactly one written descriptor matches that full path. A missing descriptor, or a
+ * path two different source packages collide on, leaves the omission with an explicit reason and no
+ * dangling pointer.
+ */
+function reconcileEffectOmissions(
+  omissions: readonly UnrealSceneOmission[],
+  effectDescriptors: readonly { readonly descriptor: string; readonly package: string }[] | undefined,
+): UnrealSceneOmission[] {
+  if (effectDescriptors === undefined) return [...omissions];
+  const packagesByDescriptor = new Map<string, Set<string>>();
+  for (const effect of effectDescriptors) {
+    const packages = packagesByDescriptor.get(effect.descriptor) ?? new Set<string>();
+    packages.add(effect.package);
+    packagesByDescriptor.set(effect.descriptor, packages);
+  }
+  return omissions.map((omission) => {
+    if (omission.descriptor === undefined) return omission;
+    const packages = packagesByDescriptor.get(omission.descriptor);
+    if (packages !== undefined && packages.size === 1) return omission;
+    const reason = packages === undefined
+      ? `particle effect descriptor ${omission.descriptor} was not exported; its simulation is not reconstructed`
+      : `particle effect descriptor ${omission.descriptor} is shared by ${packages.size} source packages, so it cannot be resolved; its simulation is not reconstructed`;
+    return {
+      actor: omission.actor,
+      component: omission.component,
+      sourceClass: omission.sourceClass,
+      reason,
+    };
+  });
+}
+
 /** Creates one ordinary GLB scene whose nodes instance the already-imported unique mesh resources. */
+
 export async function assembleSceneGlb(request: AssembleSceneRequest): Promise<ImportedScene> {
   const io = new NodeIO()
     .registerExtensions([KHRLightsPunctual, EXTMeshGPUInstancing, KHRMaterialsUnlit])
@@ -605,6 +653,7 @@ export async function assembleSceneGlb(request: AssembleSceneRequest): Promise<I
   const meshByName = new Map<string, Mesh>();
   const unresolved = new Set<string>();
   const generatedEnginePrimitives = new Set<string>();
+  const omittedActors = reconcileEffectOmissions(request.source.omittedActors ?? [], request.effectDescriptors);
   let resolvedActors = 0;
 
   const preserveUsedExtensions = (sourceDocument: Document): void => {
@@ -874,7 +923,7 @@ export async function assembleSceneGlb(request: AssembleSceneRequest): Promise<I
         matrix: unrealTransformToGltfMatrix(actor.location, actor.rotation, actor.scale),
       })),
       ...(sourceTexts.length > 0 ? { texts: sourceTexts } : {}),
-      ...((request.source.omittedActors?.length ?? 0) > 0 ? { omittedActors: request.source.omittedActors } : {}),
+      ...((omittedActors.length > 0) ? { omittedActors } : {}),
       instanceGroups: instanceGroups.map((group) => ({
         ...group,
         model: modelByName.get(group.meshName)?.glb ?? null,
@@ -920,6 +969,6 @@ export async function assembleSceneGlb(request: AssembleSceneRequest): Promise<I
     lights: request.source.lights.length,
     blueprintComponents: request.source.blueprintComponents,
     approximatedAreaLights,
-    omittedActors: request.source.omittedActors ?? [],
+    omittedActors,
   };
 }
