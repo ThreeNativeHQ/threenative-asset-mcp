@@ -43,7 +43,8 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | Cooked `StaticMesh` | UE5.5 | **Verified** | GLB | README names UE5.5 cooked static geometry. |
 | `StaticMesh` LOD1 and higher from editor source | UE5 | **Missing** | none | Only LOD0 is decoded. |
 | `StaticMesh` with Nanite data and no fallback mesh | UE5 | Reported | none | Reported honestly, no geometry. |
-| `StaticMesh` BuildScale3D | UE5 editor | **Missing** | none | `readBuildScale3D` reads legacy -7 headers only (`AGENTS.md`). |
+| `StaticMesh` BuildScale3D | UE5.0–5.3 | Implemented | scaled GLB | `readBuildScale3D` reads legacy -7 and -8 headers (`tests/unreal-palms-paragon.test.ts`, synthetic). No real pack named. |
+| `StaticMesh` BuildScale3D | UE5.4+ | **Missing** | none | The UE 5.4 property-tag layout and the UE 5.5 legacy -9 header are not read (PRD-597). |
 | `SkeletalMesh`, skinned | UE4.0–4.20 | **Verified** | skinned GLB | Animal Variety Pack (6 rigged animals, 146 clips) |
 | `SkeletalMesh`, cooked | UE4 | Implemented | skinned GLB | Joints, weights and inverse-bind matrices preserved. |
 | `SkeletalMesh`, editor source | UE5 | **Verified** | skinned GLB | README: "UE5 editor skeletal geometry". |
@@ -105,9 +106,9 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | ISM and HISM, painted foliage | UE4 | Implemented | `EXT_mesh_gpu_instancing` | `tests/unreal-foliage-import.integration.test.ts`. |
 | `FoliageType_InstancedStaticMesh` as a standalone package | any | Reported | none | |
 | `LandscapeComponent` heightfields | UE4 editor | Implemented | indexed terrain mesh | Compressed BGRA8 heightmaps only. |
-| Landscape, UE5 | UE5 | **Missing** | none | The importer lists `LandscapeComponent` as unsupported when standalone. Check UE5 levels before changing this row. |
+| Landscape, UE5 | UE5 | **Missing** | none | The importer lists `LandscapeComponent` as unsupported when standalone. The UE5 level export writes an empty `landscapes` list (PRD-599). |
 | Landscape layer weights and `LandscapeLayerInfoObject` | any | **Missing** | none | |
-| World Partition external actors (`__ExternalActors__`) | UE5 | Implemented | merged into the level | `tests/unreal-external-actors.test.ts`. No real pack named. |
+| World Partition external actors (`__ExternalActors__`) | UE5 | Reported | none | Skipped with `WORLD_PARTITION_EXTERNAL_REASON` (`tests/unreal-external-actors.test.ts`); the UE5 level export reads `PersistentLevel.Actors` only, so a World Partition level has no actors (PRD-598). |
 | Level streaming, sublevels, HLOD proxies | any | Implemented | partial | `tests/unreal-hlod-proxy.test.ts`, `tests/unreal-level-gate.test.ts`. |
 | `DecalActor` and decal components | any | **Missing** | none | |
 | Volumes (post-process, audio, blocking) | any | **Missing** | none | |
@@ -175,6 +176,12 @@ CUE4Parse decodes every class in PRD-582 and PRD-583 on UE4 and UE5. UE Viewer d
 
 | PRD | Covers |
 |---|---|
+| [PRD-596](PRDs/PRD-596-ue5-sequencer-animation-clips.md) | UE 5.4+ `AnimSequence` clips stored in the Sequencer/FK Control Rig data model (P1) |
+| [PRD-597](PRDs/PRD-597-ue5-static-mesh-lods-and-build-scale.md) | UE5 static mesh LOD1+ and UE 5.4+ `BuildScale3D` |
+| [PRD-598](PRDs/PRD-598-ue5-world-partition-external-actors.md) | World Partition external actors placed in their level |
+| [PRD-599](PRDs/PRD-599-ue5-landscape-heightfields.md) | UE5 landscape heightfields in levels (after PRD-598) |
+
+Visual parity of the existing formats stays with PRD-537 and PRD-538 (corpus sweep and baseline).
 
 ## Visual fidelity (separate claim)
 

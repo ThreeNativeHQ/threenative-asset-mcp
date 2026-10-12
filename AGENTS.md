@@ -128,8 +128,8 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   The reader accepts one distinct name, the only case seen, and refuses more with the reason in the mesh
   failure.
 - **`BuildScale3D` applies on every UE4 route.** Neither UE Viewer nor the uncooked MeshDescription converter
-  multiplies the source model by it; the importer does (`meshGeometryScale`). UE5 editor meshes are not yet
-  covered: `readBuildScale3D` reads legacy -7 headers only.
+  multiplies the source model by it; the importer does (`meshGeometryScale`). `readBuildScale3D` reads
+  legacy -7 and -8 headers (UE 5.0–5.3); the UE 5.4 tag layout and the 5.5 -9 header are not read yet (PRD-597).
 - Fab downloads land in `~/.cache/threenative-asset-mcp/fab-downloads/<listing>/<artifact>`. They
   are licensed, not redistributable: never commit pack contents. Delete what you downloaded when
   you are done; FabCLI fetched Soul Cave (1.2 GB) in 17 s, so re-downloading is cheap.
