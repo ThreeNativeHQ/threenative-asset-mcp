@@ -72,7 +72,7 @@ export interface UnrealSceneOmission {
   readonly sourceClass: string;
   readonly reason: string;
   /** PRD-584: the portable effect descriptor this component was exported as, relative to the import
-   * output (`Effects/<system>.cascade.json` or `.niagara.json`). Absent for non-effect omissions. */
+   * output (`Effects/<system>-<hash>.cascade.json` or `.niagara.json`). Absent for non-effect omissions. */
   readonly descriptor?: string;
 }
 
@@ -608,9 +608,10 @@ function unshareAttributeAccessors(document: Document): void {
 
 /**
  * PRD-584 AC-4: reconcile each effect `omittedActors` pointer with the effect descriptors actually
- * written. The pointer names `Effects/<system>.<cascade|niagara>.json`; it is kept only when exactly
- * one written descriptor matches that full path. A missing descriptor, or a path two different
- * source packages collide on, leaves the omission with an explicit reason and no dangling pointer.
+ * written. The pointer is the identity-keyed `Effects/<system>-<hash>.<cascade|niagara>.json`; it is
+ * kept only when exactly one written descriptor matches that full path. A missing descriptor, or a
+ * path two different source packages collide on, leaves the omission with an explicit reason and no
+ * dangling pointer.
  */
 function reconcileEffectOmissions(
   omissions: readonly UnrealSceneOmission[],

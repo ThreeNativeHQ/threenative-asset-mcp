@@ -6,7 +6,8 @@ import { compileProject } from "./material-overrides-harness.js";
 // PRD-584 proof helper. It compiles the converter's own Program.cs, which owns the production
 // EffectDump serializer, together with this harness. The harness builds synthetic typed values (a
 // self cycle, a UObject field, an FPackageIndex and a 32 element array) and calls the production
-// helper. Nothing here mirrors EffectDump: the compiled class is the one the converter ships.
+// serializer, and it calls the production descriptor-path helper for both sources and a null
+// reference. Nothing here mirrors production: the compiled methods are the ones the converter ships.
 export const EFFECTS_DUMP_HARNESS = String.raw`using System.Globalization;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Objects;
@@ -71,6 +72,27 @@ static class EffectsDumpHarness
         }
         catch (EffectDump.Refusal refusal) { result["deep"] = refusal.Message; }
         catch (Exception error) { result["deep"] = error.GetType().Name + ": " + error.Message; }
+
+        // PRD-584 AC-4: the compiled production descriptor-path helper. The display label must sanitize
+        // exactly as the Node writer (effectDescriptorFileName), and the canonical full object path must
+        // hash to the same suffix. Two packages with the same basename must differ; a case/mount variant
+        // of one package must be the same file; a name that only collides after sanitization must differ;
+        // a null canonical path or reference must yield no pointer. The object name and resolved path are
+        // read directly; the owner graph is never walked.
+        try
+        {
+            result["pointerCascade"] = EffectDump.EffectDescriptorPath("P fire", "/Game/A/P fire.P fire", false);
+            result["pointerNiagara"] = EffectDump.EffectDescriptorPath("P fire", "/Game/A/P fire.P fire", true);
+            result["pointerFolderA"] = EffectDump.EffectDescriptorPath("P_effect", "/Game/A/P_effect.P_effect", false);
+            result["pointerFolderB"] = EffectDump.EffectDescriptorPath("P_effect", "/Game/B/P_effect.P_effect", false);
+            result["pointerCaseVariant"] = EffectDump.EffectDescriptorPath("P_effect", "/Game/a/P_EFFECT.P_effect", false);
+            result["pointerUnderscore"] = EffectDump.EffectDescriptorPath("P_fire", "/Game/A/P_fire.P_fire", false);
+            result["pointerTraversal"] = EffectDump.EffectDescriptorPath("../../evil", "/Game/A/P_evil.../../evil", false);
+            result["pointerEmpty"] = EffectDump.EffectDescriptorPath("", "/Game/A/P_empty.", false);
+            result["pointerNull"] = EffectDump.EffectDescriptorPointer(null, "P", false);
+            result["pointerNullPath"] = EffectDump.EffectDescriptorPointer("", "P", true);
+        }
+        catch (Exception error) { result["pointerError"] = error.Message; }
 
         Console.WriteLine(JsonConvert.SerializeObject(result));
         return 0;

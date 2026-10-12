@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { runEffectsDumpHarness, type EffectsDumpHarnessRun } from "./helpers/effects-dump-harness.js";
 import { describeWithTools } from "./helpers/require-tool.js";
+import { effectDescriptorRelativePath } from "../src/unreal/effects-dump.js";
 
 /**
  * PROOF REQUIRED FIRST (PRD-584): the compiled production EffectDump serializer must survive a typed
@@ -54,5 +55,42 @@ describeWithTools(["modern-converter"], "effect dump serializer is bounded (PRD-
 
   it("raises an explicit refusal past the depth budget", () => {
     expect(String(result()["deep"])).toMatch(/deeper than/);
+  });
+
+  const identity = (pkg: string, system: string) => ({ package: pkg, system });
+
+  it("sanitizes the compiled descriptor pointer exactly as the Node writer", () => {
+    // The pointer and the written file must agree; a raw name with a space used to diverge.
+    expect(result()["pointerCascade"]).toBe(effectDescriptorRelativePath(identity("/Game/A/P fire", "P fire"), "cascade"));
+    expect(result()["pointerNiagara"]).toBe(effectDescriptorRelativePath(identity("/Game/A/P fire", "P fire"), "niagara"));
+    expect(String(result()["pointerCascade"])).toMatch(/^Effects\/P_fire-[0-9a-f]{16}\.cascade\.json$/);
+    expect(result()["pointerError"]).toBeUndefined();
+  });
+
+  it("keeps same-basename, case-variant and sanitization-collision identities distinct", () => {
+    // Same basename in two folders: two different files, so the level pointer cannot resolve the wrong one.
+    expect(result()["pointerFolderA"]).not.toBe(result()["pointerFolderB"]);
+    expect(result()["pointerFolderA"]).toBe(effectDescriptorRelativePath(identity("/Game/A/P_effect", "P_effect"), "cascade"));
+    expect(result()["pointerFolderB"]).toBe(effectDescriptorRelativePath(identity("/Game/B/P_effect", "P_effect"), "cascade"));
+    // A package case variant and a `/Content/` mount are the same identity, so the same file.
+    expect(result()["pointerCaseVariant"]).toBe(result()["pointerFolderA"]);
+    // `P fire` and `P_fire` sanitize to the same display label but are different canonical identities.
+    expect(String(result()["pointerUnderscore"])).toMatch(/^Effects\/P_fire-[0-9a-f]{16}\.cascade\.json$/);
+    expect(result()["pointerUnderscore"]).not.toBe(result()["pointerCascade"]);
+    expect(result()["pointerUnderscore"]).toBe(effectDescriptorRelativePath(identity("/Game/A/P_fire", "P_fire"), "cascade"));
+  });
+
+  it("keeps a traversal name under Effects/ and an empty name deterministic", () => {
+    const traversal = String(result()["pointerTraversal"]);
+    expect(traversal.startsWith("Effects/")).toBe(true);
+    expect(traversal.split("/")).not.toContain("..");
+    expect(result()["pointerTraversal"]).toBe(effectDescriptorRelativePath(identity("/Game/A/P_evil", "../../evil"), "cascade"));
+    expect(String(result()["pointerEmpty"])).toMatch(/^Effects\/Effect-[0-9a-f]{16}\.cascade\.json$/);
+    expect(result()["pointerEmpty"]).toBe(effectDescriptorRelativePath(identity("/Game/A/P_empty", ""), "cascade"));
+  });
+
+  it("returns no pointer for a null reference or an unresolvable path", () => {
+    expect(result()["pointerNull"]).toBeNull();
+    expect(result()["pointerNullPath"]).toBeNull();
   });
 });

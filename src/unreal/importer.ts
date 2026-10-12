@@ -61,6 +61,7 @@ import {
 import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphPbrFactors, type GraphTextureSource } from "./graph-baker.js";
 import { dumpMaterialGraphs } from "./graph-dump.js";
 import { effectsDumpSchema, writeUnrealEffects, type EffectsDump, type ImportedEffect } from "./effects-dump.js";
+import { gamePackageKey } from "./game-path.js";
 import { assertEngineContentDirectory, canonicalEngineReference, engineContentFromEnvironment, isEngineReference, type EngineContentConfig } from "./engine-content.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
@@ -1321,13 +1322,7 @@ export function sharedBasenames<T extends { readonly package: string }>(entries:
   return entries.filter((entry) => (counts.get(key(entry)) ?? 0) > 1);
 }
 
-/** `/Game/A/MI_X`, `Content/A/MI_X.uasset` and `Pack/Content/A/MI_X.uasset` all become `a/mi_x`. */
-export function gamePackageKey(path: string): string {
-  const segments = path.replace(/\\/g, "/").replace(/\.(uasset|umap)$/i, "").split("/").filter((segment) => segment.length > 0);
-  const content = segments.map((segment) => segment.toLowerCase()).lastIndexOf("content");
-  // After the last `Content` folder; a `/Game/...` (or other mount) path drops its mount name.
-  return segments.slice(content >= 0 ? content + 1 : 1).join("/").toLowerCase();
-}
+export { gamePackageKey };
 
 /** The modern converter's `<mesh>.materials.json` (slot material name -> package path), lower-cased; undefined without one. */
 async function readConverterMaterialPackages(path: string): Promise<ReadonlyMap<string, string> | undefined> {

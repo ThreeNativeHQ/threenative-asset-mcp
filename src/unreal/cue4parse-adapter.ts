@@ -1844,8 +1844,9 @@ static List<Dictionary<string, object?>> DumpScalarParameters(UObject instance)
 
 // PRD-584 AC-4: a level or Blueprint that places a particle/Niagara component points at the portable
 // descriptor the effect writer exported, so the omission is actionable instead of "not yet reconstructable".
-// The descriptor file name matches the Node writer (system + source suffix).
-string? EffectDescriptorPointer(USceneComponent component)
+// The path is built by EffectDump.EffectDescriptorPointer, the same production rule the writer uses, so the
+// pointer and the file agree.
+string? EffectDescriptorPointer(IPackage package, USceneComponent component)
 {
     var isNiagara = component.ExportType.Contains("Niagara", StringComparison.OrdinalIgnoreCase);
     var isCascade = component.ExportType.Contains("ParticleSystem", StringComparison.OrdinalIgnoreCase);
@@ -1853,7 +1854,9 @@ string? EffectDescriptorPointer(USceneComponent component)
     foreach (var name in new[] { "Asset", "SystemTemplate", "Template" })
     {
         if (component.TryGetValue<FPackageIndex>(out var reference, name) && reference is { IsNull: false })
-            return $"Effects/{reference.Name}.{(isNiagara ? "niagara" : "cascade")}.json";
+            // The typed reference's own canonical object path is read through the package's resolver,
+            // the same helper every material and texture pointer uses. The owner graph is never walked.
+            return EffectDump.EffectDescriptorPointer(DumpPath(package, reference), reference.Name, isNiagara);
     }
     return null;
 }
@@ -3497,7 +3500,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     {
                         if (isEffectComponent)
                         {
-                            var effectDescriptor = EffectDescriptorPointer(component);
+                            var effectDescriptor = EffectDescriptorPointer(package, component);
                             omittedActors.Add(effectDescriptor is not null
                                 ? new { actor = actorName, component = component.Name, sourceClass = component.ExportType, descriptor = effectDescriptor, reason = $"particle effect is exported as a portable descriptor ({effectDescriptor}); its simulation is not reconstructed" }
                                 : new { actor = actorName, component = component.Name, sourceClass = component.ExportType, descriptor = (string?)null, reason = "particle effect component has no serialized system reference, so no descriptor was exported" });
@@ -3640,7 +3643,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                             component.ExportType.Contains("ParticleSystem", StringComparison.OrdinalIgnoreCase);
                         if (isEffectComponent)
                         {
-                            var effectDescriptor = EffectDescriptorPointer(component);
+                            var effectDescriptor = EffectDescriptorPointer(package, component);
                             omittedActors.Add(effectDescriptor is not null
                                 ? new { actor = prefabName, component = componentName, sourceClass = component.ExportType, descriptor = effectDescriptor, reason = $"particle effect is exported as a portable descriptor ({effectDescriptor}); its simulation is not reconstructed" }
                                 : new { actor = prefabName, component = componentName, sourceClass = component.ExportType, descriptor = (string?)null, reason = "particle effect component has no serialized system reference, so no descriptor was exported" });
@@ -5883,6 +5886,49 @@ public static class EffectDump
     static string Number(float value) => value.ToString(CultureInfo.InvariantCulture);
     static string Number(uint value) => value.ToString(CultureInfo.InvariantCulture);
     static string Number(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+    // PRD-584 AC-4: the portable descriptor path, shared by the writer and the level pointer. The system
+    // name is sanitized to the readable display label exactly as the Node effectDescriptorFileName (a run
+    // of path or whitespace characters becomes one underscore, repeated dots collapse, leading/trailing
+    // dots drop, an empty name falls back to Effect). The canonical full object path is normalized like
+    // the Node gamePackageKey and hashed with SHA-256; its first 16 hex digits are the stable suffix. So
+    // two systems with the same basename in different folders, and two names that only collide after
+    // sanitization, both get distinct files. A name is never interpolated raw, so it cannot escape Effects.
+    public static string EffectDescriptorPath(string system, string canonicalObjectPath, bool niagara)
+    {
+        var safe = System.Text.RegularExpressions.Regex.Replace(system ?? "", "[^A-Za-z0-9._-]+", "_");
+        safe = System.Text.RegularExpressions.Regex.Replace(safe, "\\.{2,}", ".").Trim('.');
+        if (safe.Length == 0) safe = "Effect";
+        var hash = Sha256Hex(CanonicalEffectKey(canonicalObjectPath)).Substring(0, 16);
+        return $"Effects/{safe}-{hash}.{(niagara ? "niagara" : "cascade")}.json";
+    }
+
+    // The pointer a placed component carries for its exported descriptor, or null when it has no
+    // serialized system reference or its canonical object path does not resolve. The resolved path and the
+    // object name are read directly from the typed reference; the owner/provider graph is never walked.
+    public static string? EffectDescriptorPointer(string? canonicalObjectPath, string objectName, bool niagara) =>
+        string.IsNullOrEmpty(canonicalObjectPath) ? null : EffectDescriptorPath(objectName, canonicalObjectPath, niagara);
+
+    // The canonical identity, mirroring the Node gamePackageKey: a Content prefix drops up to and
+    // including its last occurrence, a mount name drops the first segment, and the whole key is lowercased.
+    static string CanonicalEffectKey(string path)
+    {
+        var normalized = System.Text.RegularExpressions.Regex.Replace((path ?? "").Replace('\\', '/'), "\\.(uasset|umap)$", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var content = -1;
+        for (var index = 0; index < segments.Length; index++)
+            if (segments[index].Equals("Content", StringComparison.OrdinalIgnoreCase)) content = index;
+        var start = content >= 0 ? content + 1 : 1;
+        var parts = new List<string>();
+        for (var index = start; index < segments.Length; index++) parts.Add(segments[index].ToLowerInvariant());
+        return string.Join("/", parts);
+    }
+
+    static string Sha256Hex(string value)
+    {
+        var bytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
 }
 
 // The instance's own overrides, written as .props.txt blocks. A row is written only when CUE4Parse read it whole: a tagged row must

@@ -655,6 +655,65 @@ describe("Cascade forces and type data (PRD-584 findings 1-2)", () => {
   });
 });
 
+describe("Cascade mapped modules carry a field or are named (PRD-584 audit)", () => {
+  function emitterWith(moduleClass: string, properties: DumpTag[]) {
+    return buildCascadeDescriptor(cascadeFixture({ modules: [{ class: moduleClass, properties }] }))!.emitters[0]!;
+  }
+  type Emitter = ReturnType<typeof emitterWith>;
+
+  // Every class in `CASCADE_MAPPED_MODULES` must carry a portable field. A class that stops being read
+  // (the repeated blindspot) fails here instead of silently exporting nothing.
+  const carries: readonly [string, DumpTag[], (emitter: Emitter) => unknown][] = [
+    ["ParticleModuleSpawn", [tableDistTag("Rate", [5])], (emitter) => emitter.spawn?.rate],
+    ["ParticleModuleLifetime", [tableDistTag("Lifetime", [3])], (emitter) => emitter.init?.lifetime],
+    ["ParticleModuleSize", [tableDistTag("StartSize", [2, 2, 2])], (emitter) => emitter.init?.size],
+    ["ParticleModuleSizeScale", [tableDistTag("SizeScale", [1, 1, 1])], (emitter) => emitter.overLife?.size],
+    ["ParticleModuleSizeMultiplyLife", [tableDistTag("LifeMultiplier", [1, 1, 1])], (emitter) => emitter.overLife?.size],
+    ["ParticleModuleVelocity", [tableDistTag("StartVelocity", [0, 0, 10])], (emitter) => emitter.init?.velocity],
+    ["ParticleModuleColor", [tableDistTag("StartColor", [1, 1, 1])], (emitter) => emitter.init?.color],
+    ["ParticleModuleColorOverLife", [tableDistTag("ColorOverLife", [1, 1, 1])], (emitter) => emitter.overLife?.color],
+    ["ParticleModuleRotation", [tableDistTag("StartRotation", [1])], (emitter) => emitter.init?.rotation],
+    ["ParticleModuleRotationRate", [tableDistTag("StartRotationRate", [1])], (emitter) => emitter.init?.rotationRate],
+    ["ParticleModuleAcceleration", [tableDistTag("Acceleration", [0, 0, -9.8])], (emitter) => emitter.forces?.acceleration],
+    ["ParticleModuleDrag", [tableDistTag("Drag", [0.5])], (emitter) => emitter.forces?.drag],
+  ];
+  for (const [moduleClass, properties, read] of carries) {
+    it(`carries a field for ${moduleClass}`, () => {
+      const emitter = emitterWith(moduleClass, properties);
+      expect(read(emitter)).toBeDefined();
+      expect(emitter.limitations).not.toContain(moduleClass);
+    });
+  }
+
+  // A module the descriptor cannot represent must be named, never left mapped with no data.
+  const names = ["ParticleModuleSpawnPerUnit", "ParticleModuleVelocityOverLifetime", "ParticleModuleColorScaleOverLife", "ParticleModuleAccelerationOverLifetime"];
+  for (const moduleClass of names) {
+    it(`names ${moduleClass} as a limitation`, () => {
+      const emitter = emitterWith(moduleClass, [tableDistTag("Unused", [1])]);
+      expect(emitter.limitations.some((entry) => entry.includes(moduleClass))).toBe(true);
+    });
+  }
+
+  it("reads StartSize only from ParticleModuleSize, so SizeScale is not mistaken for it", () => {
+    const emitter = emitterWith("ParticleModuleSizeScale", [tableDistTag("SizeScale", [4, 4, 4])]);
+    expect(emitter.init?.size).toBeUndefined();
+    expect(emitter.overLife?.size).toEqual({ kind: "curve", keys: [{ t: 0, v: [4, 4, 4], interp: "linear" }] });
+  });
+
+  it("normalizes Cascade rotation from turns to radians and rate to radians per second", () => {
+    // ParticleModules.cpp:1803 multiplies StartRotation by 2π; :1884 does the same for the rate.
+    // A single-entry baked table becomes a one-key curve, so read its value lane.
+    const firstValue = (channel: unknown): number => {
+      const typed = channel as { kind: "range"; min: number } | { kind: "curve"; keys: { v: number }[] };
+      return typed.kind === "range" ? typed.min : typed.keys[0]!.v;
+    };
+    const rotation = emitterWith("ParticleModuleRotation", [tableDistTag("StartRotation", [0.25])]).init?.rotation;
+    expect(firstValue(rotation)).toBeCloseTo(Math.PI / 2, 6);
+    const rate = emitterWith("ParticleModuleRotationRate", [tableDistTag("StartRotationRate", [1])]).init?.rotationRate;
+    expect(firstValue(rate)).toBeCloseTo(2 * Math.PI, 6);
+  });
+});
+
 describe("Cascade mapping (AC-1)", () => {
   it("maps the emitter count, material, spawn and lifetime, and names the unmapped module", () => {
     const descriptor = buildCascadeDescriptor(PACKAGE)!;
@@ -684,7 +743,7 @@ describe("Cascade mapping (AC-1)", () => {
 });
 
 describe("importer: Cascade descriptors (AC-1, AC-4)", () => {
-  it("writes Effects/<system>.cascade.json through the public import and clears the skip", async () => {
+  it("writes the identity-keyed cascade descriptor through the public import and clears the skip", async () => {
     const root = await mkdtemp(join(tmpdir(), "effect-import-"));
     onTestFinished(() => rm(root, { recursive: true, force: true }));
     const sourceDir = join(root, "source");
@@ -722,12 +781,13 @@ process.exit(0);
     expect(report.effects).toHaveLength(1);
     expect(report.counts.effects).toBe(1);
     expect(report.skipped.some((entry) => entry.package.includes("P_effect"))).toBe(false);
-    const descriptor = JSON.parse(await readFile(join(outputDir, "Effects", "P_effect.cascade.json"), "utf8"));
+    expect(report.effects[0]!.descriptor).toBe(effectDescriptorRelativePath({ package: "Content/Test/P_effect", system: "P_effect" }, "cascade"));
+    const descriptor = JSON.parse(await readFile(join(outputDir, ...report.effects[0]!.descriptor.split("/")), "utf8"));
     expect(descriptor.emitters).toHaveLength(1);
     expect(descriptor.emitters[0].material).toBe("M_effect");
   });
 
-  it("writes Effects/<system>.niagara.json through the public import and clears the skip", async () => {
+  it("writes the identity-keyed niagara descriptor through the public import and clears the skip", async () => {
     const root = await mkdtemp(join(tmpdir(), "niagara-import-"));
     onTestFinished(() => rm(root, { recursive: true, force: true }));
     const sourceDir = join(root, "source");
@@ -765,7 +825,8 @@ process.exit(0);
     expect(report.effects).toHaveLength(1);
     expect(report.counts.effects).toBe(1);
     expect(report.skipped.some((entry) => entry.package.includes("NS_test"))).toBe(false);
-    const descriptor = JSON.parse(await readFile(join(outputDir, "Effects", "NS_Test.niagara.json"), "utf8"));
+    expect(report.effects[0]!.descriptor).toBe(effectDescriptorRelativePath({ package: "Content/Test/NS_test", system: "NS_Test" }, "niagara"));
+    const descriptor = JSON.parse(await readFile(join(outputDir, ...report.effects[0]!.descriptor.split("/")), "utf8"));
     expect(descriptor.source).toBe("niagara");
     expect(descriptor.emitters[0].material).toBe("M_Smoke");
   });
@@ -790,6 +851,11 @@ describe("importer: level and Blueprint effect omissions (AC-4)", () => {
     return Buffer.concat([header, ...table]);
   }
 
+  // The compiled adapter's pointer for each source package, computed by the same production helper the
+  // writer uses, so the fake scene source agrees with the descriptor the writer actually wrote.
+  const P_EFFECT_POINTER = effectDescriptorRelativePath({ package: "/Game/Test/P_effect", system: "P_effect" }, "cascade");
+  const P_MISSING_POINTER = effectDescriptorRelativePath({ package: "/Game/Test/P_missing", system: "P_missing" }, "cascade");
+
   /** A synthetic level that places one effect component in the level plus one serialized Blueprint, and one whose source was not exportable. */
   const SCENE_SOURCE = {
     format: "threenative-unreal-scene-source",
@@ -801,9 +867,9 @@ describe("importer: level and Blueprint effect omissions (AC-4)", () => {
     blueprintComponents: 1,
     camera: { hasCamera: false, location: { x: 0, y: 0, z: 0 }, rotation: { pitch: 0, yaw: 0, roll: 0 } },
     omittedActors: [
-      { actor: "TestMap", component: "ParticleSystemComponent_0", sourceClass: "ParticleSystemComponent", descriptor: "Effects/P_effect.cascade.json", reason: "particle effect is exported as a portable descriptor (Effects/P_effect.cascade.json); its simulation is not reconstructed" },
-      { actor: "BP_Dust", component: "ParticleSystemComponent_0", sourceClass: "ParticleSystemComponent", descriptor: "Effects/P_effect.cascade.json", reason: "particle effect is exported as a portable descriptor (Effects/P_effect.cascade.json); its simulation is not reconstructed" },
-      { actor: "TestMap", component: "ParticleSystemComponent_1", sourceClass: "ParticleSystemComponent", descriptor: "Effects/P_missing.cascade.json", reason: "particle effect is exported as a portable descriptor (Effects/P_missing.cascade.json); its simulation is not reconstructed" },
+      { actor: "TestMap", component: "ParticleSystemComponent_0", sourceClass: "ParticleSystemComponent", descriptor: P_EFFECT_POINTER, reason: `particle effect is exported as a portable descriptor (${P_EFFECT_POINTER}); its simulation is not reconstructed` },
+      { actor: "BP_Dust", component: "ParticleSystemComponent_0", sourceClass: "ParticleSystemComponent", descriptor: P_EFFECT_POINTER, reason: `particle effect is exported as a portable descriptor (${P_EFFECT_POINTER}); its simulation is not reconstructed` },
+      { actor: "TestMap", component: "ParticleSystemComponent_1", sourceClass: "ParticleSystemComponent", descriptor: P_MISSING_POINTER, reason: `particle effect is exported as a portable descriptor (${P_MISSING_POINTER}); its simulation is not reconstructed` },
       { actor: "TestMap", component: "ParticleSystemComponent_2", sourceClass: "ParticleSystemComponent", reason: "particle effect component has no serialized system reference, so no descriptor was exported" },
     ],
   };
@@ -880,11 +946,11 @@ process.exit(0);
     const scene = report.scenes.find((entry) => entry.name === "TestMap");
     expect(scene).toBeDefined();
     const omissions = scene!.omittedActors;
-    const exported = omissions.filter((entry) => entry.descriptor === "Effects/P_effect.cascade.json");
+    const exported = omissions.filter((entry) => entry.descriptor === P_EFFECT_POINTER);
     // Both the level's component and the Blueprint's serialized component point at the written descriptor.
     expect(exported.map((entry) => entry.actor).sort()).toEqual(["BP_Dust", "TestMap"]);
     // The descriptor the writer produced is on disk.
-    const descriptor = JSON.parse(await readFile(join(outputDir, "Effects", "P_effect.cascade.json"), "utf8"));
+    const descriptor = JSON.parse(await readFile(join(outputDir, ...P_EFFECT_POINTER.split("/")), "utf8"));
     expect(descriptor.system).toBe("P_effect");
   });
 
@@ -894,7 +960,7 @@ process.exit(0);
     const missing = scene.omittedActors.filter((entry) => entry.component === "ParticleSystemComponent_1");
     expect(missing).toHaveLength(1);
     expect(missing[0]?.descriptor).toBeUndefined();
-    expect(missing[0]?.reason).toContain("P_missing.cascade.json");
+    expect(missing[0]?.reason).toContain(P_MISSING_POINTER);
     expect(missing[0]?.reason).toContain("was not exported");
     // An effect component with no source reference stays an explicit omission with no dangling pointer.
     const noSource = scene.omittedActors.find((entry) => entry.component === "ParticleSystemComponent_2")!;
@@ -1194,13 +1260,81 @@ describe("Niagara mapped modules are read or named (PRD-584 finding 3)", () => {
     expect(emitter.spawn?.bursts).toEqual([]);
     expect(emitter.limitations.some((entry) => entry.includes('SpawnBurstInstantaneous is present but "Spawn Count"'))).toBe(true);
   });
+
+  it("populates spawn.rate from a stored SpawnRate override, and names it when absent", () => {
+    const present = buildNiagaraDescriptor(niagaraPackage([[0, "Constants.SmokeTrail.SpawnRate.Spawn Rate"]], floatBytes(12)))!.emitters[0]!;
+    expect(present.spawn?.rate).toEqual({ kind: "range", min: 12, max: 12 });
+    expect(present.limitations.some((entry) => entry.includes("SpawnRate has no stored override"))).toBe(false);
+    const absent = buildNiagaraDescriptor(niagaraPackage([], []))!.emitters[0]!;
+    expect(absent.spawn?.rate).toBeNull();
+    expect(absent.limitations.some((entry) => entry.includes("SpawnRate has no stored override"))).toBe(true);
+  });
+
+  it("reads InitializeParticle Initial Velocity and names an unread stored input", () => {
+    const offsets: readonly (readonly [number, string])[] = [
+      [0, "Constants.SmokeTrail.InitializeParticle.Initial Velocity"],
+      [12, "Constants.SmokeTrail.InitializeParticle.Mass Max"],
+    ];
+    const bytes = [...floatBytes(1), ...floatBytes(2.5), ...floatBytes(3), ...floatBytes(2)];
+    const emitter = buildNiagaraDescriptor(niagaraPackage(offsets, bytes))!.emitters[0]!;
+    expect(emitter.init?.velocity).toEqual({ kind: "range", min: [1, 2.5, 3], max: [1, 2.5, 3] });
+    // A stored InitializeParticle input the descriptor does not carry is named, never dropped.
+    expect(emitter.limitations.some((entry) => entry.includes("InitializeParticle") && entry.includes("Mass Max"))).toBe(true);
+  });
+
+  it("normalizes a stored Niagara sprite angle from degrees to radians", () => {
+    // NiagaraSpriteVertexFactory.ush:813 divides Particles.SpriteRotation by 180 and multiplies by PI.
+    const offsets: readonly (readonly [number, string])[] = [
+      [0, "Constants.SmokeTrail.InitializeParticle.Sprite Rotation Angle Min"],
+      [4, "Constants.SmokeTrail.InitializeParticle.Sprite Rotation Angle Max"],
+    ];
+    const bytes = [...floatBytes(90), ...floatBytes(180)];
+    const emitter = buildNiagaraDescriptor(niagaraPackage(offsets, bytes))!.emitters[0]!;
+    const rotation = emitter.init?.rotation as { kind: "range"; min: number; max: number };
+    expect(rotation.min).toBeCloseTo(Math.PI / 2, 6);
+    expect(rotation.max).toBeCloseTo(Math.PI, 6);
+  });
+
+  // A stored input is consumed only when its portable field is assigned, so the half of a pair
+  // that never reached a field is still named rather than dropped silently (PRD-584 final audit).
+  it("names a stored Lifetime Min whose Lifetime Max is absent", () => {
+    const offsets: readonly (readonly [number, string])[] = [[0, "Constants.SmokeTrail.InitializeParticle.Lifetime Min"]];
+    const emitter = buildNiagaraDescriptor(niagaraPackage(offsets, floatBytes(1)))!.emitters[0]!;
+    expect(emitter.init?.lifetime).toBeUndefined();
+    expect(emitter.limitations.some((entry) => entry.includes("InitializeParticle") && entry.includes("Lifetime Min"))).toBe(true);
+  });
+
+  it("names a stored Sprite Rotation Angle Min whose Max is absent", () => {
+    const offsets: readonly (readonly [number, string])[] = [[0, "Constants.SmokeTrail.InitializeParticle.Sprite Rotation Angle Min"]];
+    const emitter = buildNiagaraDescriptor(niagaraPackage(offsets, floatBytes(90)))!.emitters[0]!;
+    expect(emitter.init?.rotation).toBeUndefined();
+    expect(emitter.limitations.some((entry) => entry.includes("InitializeParticle") && entry.includes("Sprite Rotation Angle Min"))).toBe(true);
+  });
+
+  it("names a stored Color Minimum whose Color Maximum is absent", () => {
+    const offsets: readonly (readonly [number, string])[] = [[0, "Constants.SmokeTrail.InitializeParticle.Color Minimum"]];
+    const bytes = [...floatBytes(1), ...floatBytes(0.5), ...floatBytes(0.25), ...floatBytes(1)];
+    const emitter = buildNiagaraDescriptor(niagaraPackage(offsets, bytes))!.emitters[0]!;
+    expect(emitter.init?.color).toBeUndefined();
+    expect(emitter.limitations.some((entry) => entry.includes("InitializeParticle") && entry.includes("Color Minimum"))).toBe(true);
+  });
+
+  it("names a stored Spawn Time whose Spawn Count is absent", () => {
+    const offsets: readonly (readonly [number, string])[] = [[0, "Constants.SmokeTrail.SpawnBurstInstantaneous.Spawn Time"]];
+    const emitter = buildNiagaraDescriptor(niagaraPackage(offsets, floatBytes(0.5)))!.emitters[0]!;
+    expect(emitter.spawn?.bursts).toEqual([]);
+    expect(emitter.limitations.some((entry) => entry.includes('SpawnBurstInstantaneous is present but "Spawn Count"'))).toBe(true);
+    expect(emitter.limitations.some((entry) => entry.includes("SpawnBurstInstantaneous") && entry.includes("Spawn Time"))).toBe(true);
+  });
 });
 
 describe("effect writer isolation and safe names (PRD-584 finding 5)", () => {
+  const identity = (pkg: string, system: string) => ({ package: pkg, system });
+
   it("exports the valid package and reports the invalid one without aborting", async () => {
     const root = await mkdtemp(join(tmpdir(), "effect-write-"));
     onTestFinished(() => rm(root, { recursive: true, force: true }));
-    expect(effectDescriptorRelativePath("P_effect", "cascade")).toBe("Effects/P_effect.cascade.json");
+    expect(effectDescriptorRelativePath(identity("/Game/Test/P_effect", "P_effect"), "cascade")).toMatch(/^Effects\/P_effect-[0-9a-f]{16}\.cascade\.json$/);
     const dump = {
       format: 1,
       game: "GAME_UE4_18",
@@ -1214,11 +1348,11 @@ describe("effect writer isolation and safe names (PRD-584 finding 5)", () => {
     expect(result.written[0]?.package).toBe("/Game/Test/P_effect");
     expect(result.failures).toHaveLength(1);
     expect(result.failures[0]?.package).toBe("/Game/Test/P_bad");
-    const descriptor = JSON.parse(await readFile(join(root, "Effects", "P_effect.cascade.json"), "utf8"));
+    const descriptor = JSON.parse(await readFile(join(root, ...result.written[0]!.descriptor.split("/")), "utf8"));
     expect(descriptor.system).toBe("P_effect");
   });
 
-  it("refuses a duplicate system name instead of overwriting, and keeps a malicious name under Effects/", async () => {
+  it("writes two same-basename systems in different folders to distinct descriptors", async () => {
     const root = await mkdtemp(join(tmpdir(), "effect-name-"));
     onTestFinished(() => rm(root, { recursive: true, force: true }));
     const evil = CASCADE_EXPORTS.map((entry) => (entry.class === "ParticleSystem" ? { ...entry, name: "../../evil" } : entry));
@@ -1232,16 +1366,69 @@ describe("effect writer isolation and safe names (PRD-584 finding 5)", () => {
       ],
     } as unknown as EffectsDump;
     const result = await writeUnrealEffects(dump, root);
+    const effects = result.written.filter((effect) => effect.system === "P_effect");
+    expect(effects.map((effect) => effect.package)).toEqual(["/Game/A/P_effect", "/Game/B/P_effect"]);
+    // Both systems keep their basename but get different identity-keyed files, and both are on disk.
+    expect(new Set(effects.map((effect) => effect.descriptor)).size).toBe(2);
+    for (const effect of effects) await readFile(join(root, ...effect.descriptor.split("/")), "utf8");
     const evilEffect = result.written.find((effect) => effect.package === "/Game/Evil/P_evil")!;
     expect(evilEffect.descriptor.startsWith("Effects/")).toBe(true);
     expect(evilEffect.descriptor.split("/")).not.toContain("..");
     await readFile(join(root, ...evilEffect.descriptor.split("/")), "utf8");
-    // The first `P_effect` wins; the second is refused, never written over the first.
-    expect(result.written.filter((effect) => effect.system === "P_effect")).toHaveLength(1);
-    expect(result.failures.some((failure) => failure.package === "/Game/B/P_effect" && failure.error.includes("already written"))).toBe(true);
   });
 
-  it("keeps a collided package skipped through the public import while the winner exports", async () => {
+  it("keeps two names that collide only after sanitization distinct", async () => {
+    const root = await mkdtemp(join(tmpdir(), "effect-sanitize-"));
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
+    const spaced = CASCADE_EXPORTS.map((entry) => (entry.class === "ParticleSystem" ? { ...entry, name: "P fire" } : entry));
+    const underscored = CASCADE_EXPORTS.map((entry) => (entry.class === "ParticleSystem" ? { ...entry, name: "P_fire" } : entry));
+    const dump = {
+      format: 1,
+      game: "GAME_UE4_18",
+      packages: [
+        { path: "/Game/A/P_fire", exports: spaced },
+        { path: "/Game/B/P_fire", exports: underscored },
+      ],
+    } as unknown as EffectsDump;
+    const result = await writeUnrealEffects(dump, root);
+    expect(result.written).toHaveLength(2);
+    expect(new Set(result.written.map((effect) => effect.descriptor)).size).toBe(2);
+    // Same sanitized display label, different canonical hash suffix.
+    expect(result.written.every((effect) => effect.descriptor.includes("Effects/P_fire-"))).toBe(true);
+    expect(result.written[0]!.descriptor).not.toBe(result.written[1]!.descriptor);
+  });
+
+  it("refuses only the same canonical identity, never two same-basename packages", async () => {
+    const root = await mkdtemp(join(tmpdir(), "effect-dupe-identity-"));
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
+    const dump = {
+      format: 1,
+      game: "GAME_UE4_18",
+      packages: [
+        { path: "/Game/A/P_effect", exports: CASCADE_EXPORTS },
+        { path: "/Game/A/P_effect", exports: CASCADE_EXPORTS },
+      ],
+    } as unknown as EffectsDump;
+    const result = await writeUnrealEffects(dump, root);
+    expect(result.written).toHaveLength(1);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]!.error).toContain("same canonical identity");
+  });
+
+  it("reports a package with no canonical identity instead of an ambiguous fallback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "effect-nopath-"));
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
+    const dump = {
+      format: 1,
+      game: "GAME_UE4_18",
+      packages: [{ exports: CASCADE_EXPORTS }],
+    } as unknown as EffectsDump;
+    const result = await writeUnrealEffects(dump, root);
+    expect(result.written).toHaveLength(0);
+    expect(result.failures[0]!.error).toContain("no canonical game path");
+  });
+
+  it("exports both same-basename packages through the public import and clears both from skipped", async () => {
     const root = await mkdtemp(join(tmpdir(), "effect-dupe-"));
     onTestFinished(() => rm(root, { recursive: true, force: true }));
     const sourceDir = join(root, "source");
@@ -1283,10 +1470,11 @@ process.exit(0);
       umodel: { name: "umodel", path: umodel, version: "fixture" },
       modernConverter: { name: "modern", path: converter, version: "fake-converter 1" },
     });
-    expect(report.effects).toHaveLength(1);
-    expect(report.counts.effects).toBe(1);
-    // The winner left the skip list by canonical package key; the collided package stays skipped with its reason.
+    expect(report.effects).toHaveLength(2);
+    expect(report.counts.effects).toBe(2);
+    expect(new Set(report.effects.map((effect) => effect.descriptor)).size).toBe(2);
+    // Both canonical package keys carry a descriptor, so neither stays skipped.
     expect(report.skipped.some((entry) => entry.package.includes("/A/P_effect"))).toBe(false);
-    expect(report.skipped.some((entry) => entry.package === "/Game/B/P_effect" && entry.reason.includes("already written"))).toBe(true);
+    expect(report.skipped.some((entry) => entry.package.includes("/B/P_effect"))).toBe(false);
   });
 });

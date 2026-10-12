@@ -4,7 +4,9 @@
  * Three.js has no particle runtime, so this module does not simulate anything. It bakes a
  * deterministic approximation: for a descriptor it places sprite-card quads from the stored
  * lifetime/size/velocity/color/alpha/rotation/acceleration/drag values at four documented
- * sample times, and writes one GLB per time. The production tile renderer (`renderTiles`) and
+ * sample times, and writes one GLB per time. An `overLife.size` channel multiplies the card's
+ * `init.size` at the particle's age, so its scale is visible across samples. The production tile
+ * renderer (`renderTiles`) and
  * `judgeRender` consume these GLBs later; this module only generates them, in pure Node.
  *
  * Approximation rules (never a claim about Unreal's simulation):
@@ -21,7 +23,8 @@
  * - A material with no caller-supplied texture is a labelled neutral card; no texture is faked.
  *
  * Units: the descriptor stores Unreal centimetres. This module converts positions and sizes to
- * metres (`UNREAL_CM_TO_M`) for the renderer.
+ * metres (`UNREAL_CM_TO_M`) for the renderer. Rotation is the descriptor's portable radians (the
+ * builders convert Cascade turns and Niagara degrees), so it feeds `sin(rotation/2)` directly.
  */
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -180,13 +183,30 @@ function unitFraction(index: number): number {
 interface PreviewParticle {
   readonly position: readonly [number, number, number];
   readonly sizeM: number;
+  /** Rotation in radians, the descriptor's portable unit. */
   readonly rotation: number;
   readonly color: readonly [number, number, number, number];
+  /** The source emitter's material path, carried with the particle so its texture never depends on a flat index. */
+  readonly material: string | null;
 }
 
 /** Whether the descriptor stores any spawn evidence (a rate or a burst); otherwise one exemplar is shown. */
 function hasSpawnEvidence(emitter: EffectEmitter): boolean {
   return emitter.spawn?.rate != null || (emitter.spawn?.bursts.length ?? 0) > 0;
+}
+
+/** True when any lane of a channel can hold a vector, i.e. a per-axis value the uniform card collapses. */
+function channelHasVectorLanes(channel: EffectChannel | undefined): boolean {
+  if (channel === undefined) return false;
+  const isVector = (value: EffectValue): boolean => typeof value !== "number";
+  switch (channel.kind) {
+    case "range":
+      return isVector(channel.min) || isVector(channel.max);
+    case "curve":
+      return channel.keys.some((key) => isVector(key.v));
+    case "uniform-curve":
+      return channel.minKeys.some((key) => isVector(key.v)) || channel.maxKeys.some((key) => isVector(key.v));
+  }
 }
 
 function emitParticles(emitter: EffectEmitter, time: number): PreviewParticle[] {
@@ -211,7 +231,8 @@ function emitParticles(emitter: EffectEmitter, time: number): PreviewParticle[] 
       const v = (velocity[axis] ?? 0) * ageSeconds * decay + 0.5 * (acceleration[axis] ?? 0) * ageSeconds * ageSeconds;
       displacement.push(v * UNREAL_CM_TO_M);
     }
-    const sizeCm = scalarAt(init.size, age, unitFraction(index + 11), DEFAULT_CARD_SIZE_M / UNREAL_CM_TO_M);
+    const sizeCm = scalarAt(init.size, age, unitFraction(index + 11), DEFAULT_CARD_SIZE_M / UNREAL_CM_TO_M)
+      * scalarAt(overLife.size, age, unitFraction(index + 31), 1);
     const sizeM = Math.max(0, sizeCm * UNREAL_CM_TO_M);
     const rotationRate = scalarAt(init.rotationRate, age, unitFraction(index + 13), 0);
     const rotation = scalarAt(init.rotation, age, unitFraction(index + 17), 0) + rotationRate * ageSeconds;
@@ -228,6 +249,7 @@ function emitParticles(emitter: EffectEmitter, time: number): PreviewParticle[] 
         Math.min(1, Math.max(0, (base[2] ?? 1) * (tint[2] ?? 1))),
         alpha,
       ],
+      material: emitter.material,
     });
   }
   return particles;
@@ -264,6 +286,15 @@ function anchorBounds(samples: readonly PreviewParticle[][]): { min: [number, nu
   return { min, max };
 }
 
+/** The particles every sample places, in source emitter order, so two generators share one framing. */
+function particleSamples(descriptor: EffectDescriptor, times: readonly number[]): PreviewParticle[][] {
+  const samples: PreviewParticle[][] = times.map(() => []);
+  for (const emitter of descriptor.emitters) {
+    times.forEach((time, sample) => samples[sample]!.push(...emitParticles(emitter, time)));
+  }
+  return samples;
+}
+
 function quadAccessors(document: Document, buffer: ReturnType<Document["createBuffer"]>) {
   return {
     position: document.createAccessor().setType("VEC3").setArray(new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0])).setBuffer(buffer),
@@ -293,8 +324,6 @@ function cubeAccessors(document: Document, buffer: ReturnType<Document["createBu
 async function buildSampleGlb(options: {
   path: string;
   particles: readonly PreviewParticle[];
-  /** The resolved texture key (`emitter.material`) per particle, in order; `null` is a neutral card. */
-  particleTexture: readonly (string | null)[];
   box: { min: [number, number, number]; max: [number, number, number] };
   textures: ReadonlyMap<string, { png: Uint8Array; name: string }>;
 }): Promise<void> {
@@ -340,8 +369,9 @@ async function buildSampleGlb(options: {
     .setMaterial(anchorMaterial);
   scene.addChild(document.createNode("anchor").setMesh(document.createMesh("anchor").addPrimitive(anchorPrimitive)));
 
-  options.particles.forEach((particle, index) => {
-    const textureKey = options.particleTexture[index] ?? null;
+  options.particles.forEach((particle) => {
+    // The material travels on the particle, so its texture never depends on a flat index shared across emitters.
+    const textureKey = particle.material;
     const resolved = textureKey !== null && options.textures.has(textureKey) ? textureKey : null;
     // The neutral card keeps the particle's alpha, so an unresolved material still fades; only its colour is neutral.
     const factor: readonly [number, number, number, number] = resolved === null
@@ -366,57 +396,66 @@ async function buildSampleGlb(options: {
 export async function writeEffectPreviewGlbs(options: EffectPreviewOptions): Promise<EffectPreviewResult> {
   const times = options.times ?? EFFECT_PREVIEW_SAMPLE_TIMES;
   await mkdir(options.outputDir, { recursive: true });
-  const limitations: string[] = ["descriptor preview: sprite cards approximate the stored values, not Unreal's simulation"];
+  const limitations: string[] = [
+    "descriptor preview: sprite cards approximate the stored values, not Unreal's simulation",
+    "rotation is applied about the card's Z axis only; a per-axis (Euler) mesh rotation is not reproduced",
+  ];
 
   const textures = new Map<string, { png: Uint8Array; name: string }>();
-  const samples: PreviewParticle[][] = times.map(() => []);
-  // A particle's material key, in source emitter order; the same order every sample shares.
-  const particleTexture: (string | null)[] = [];
+  const samples = particleSamples(options.descriptor, times);
   for (const emitter of options.descriptor.emitters) {
     const material = emitter.material;
-    let resolved: string | null = null;
     if (material !== null) {
       const mapped = options.materialTextures?.get(material);
       if (mapped === undefined) limitations.push(`material ${material} is unresolved; a neutral card is shown`);
-      else {
-        textures.set(material, { png: new Uint8Array(await readFile(mapped)), name: material });
-        resolved = material;
-      }
+      else textures.set(material, { png: new Uint8Array(await readFile(mapped)), name: material });
     }
     if (emitter.renderer !== "sprite") limitations.push(`renderer ${emitter.renderer} is shown as a labelled sprite proxy, not Unreal's simulation`);
-    const evidence = hasSpawnEvidence(emitter);
-    const count = evidence ? EFFECT_PREVIEW_PARTICLE_CAP : 1;
-    if (!evidence) {
+    if (channelHasVectorLanes(emitter.init?.size) || channelHasVectorLanes(emitter.overLife?.size)) {
+      limitations.push(`size for ${emitter.name} carries per-axis lanes; the preview draws a uniform square card using the first lane`);
+    }
+    if (!hasSpawnEvidence(emitter)) {
       limitations.push(`spawn rate is not stored for ${emitter.name}; one exemplar particle only (no invented spawn rate)`);
     } else {
       limitations.push(`fixed preview cap of ${EFFECT_PREVIEW_PARTICLE_CAP} particles for ${emitter.name}; a shortcut, not Unreal's count`);
     }
-    for (let index = 0; index < count; index++) particleTexture.push(resolved);
-    times.forEach((time, sample) => samples[sample]!.push(...emitParticles(emitter, time)));
   }
   const box = anchorBounds(samples);
 
   const written: EffectPreviewSample[] = [];
   for (let sample = 0; sample < times.length; sample++) {
     const path = join(options.outputDir, `${options.system}.t${sample}.glb`);
-    await buildSampleGlb({ path, particles: samples[sample]!, particleTexture, box, textures });
+    await buildSampleGlb({ path, particles: samples[sample]!, box, textures });
     written.push({ time: times[sample]!, path });
   }
   return { system: options.descriptor.system, samples: written, times: [...times], limitations: unique(limitations), identity: IDENTITY };
 }
 
 /**
- * Writes a truly blank GLB (an empty scene, no meshes) for an effect the base importer had no
- * exported descriptor for. This is a placeholder, not a generated effect: the base
- * `import-report.json` skipping the class is the proof. The label says so.
+ * Writes the blank "before" GLB of a before/after pair for an effect the base importer produced no
+ * GLB for. It carries the SAME invisible framing anchor as {@link writeEffectPreviewGlbs} computes for
+ * `options.descriptor`, so both sides of the pair share one camera and bounding box, and it adds no
+ * particle: every mesh is the fully transparent anchor, so the judge mask stays empty. This is a
+ * framing placeholder, not a generated effect: the descriptor's base `import-report.json` skipping the
+ * class is the proof. The label says so.
  */
-export async function writeBlankEffectPreviewGlb(options: { system: string; outputDir: string }): Promise<{ path: string; limitation: string }> {
+export async function writeBlankEffectPreviewGlb(options: {
+  system: string;
+  outputDir: string;
+  /** The descriptor the "after" preview uses; its particle bounds frame this blank identically. */
+  descriptor: EffectDescriptor;
+  times?: readonly number[];
+}): Promise<{ path: string; limitation: string; identity: EffectPreviewIdentity }> {
+  const times = options.times ?? EFFECT_PREVIEW_SAMPLE_TIMES;
   await mkdir(options.outputDir, { recursive: true });
-  const document = new Document();
-  document.createScene("preview");
+  const box = anchorBounds(particleSamples(options.descriptor, times));
   const path = join(options.outputDir, `${options.system}.blank.glb`);
-  await new NodeIO().write(path, document);
-  return { path, limitation: `no exported descriptor for ${options.system}: the base importer skipped this effect class (import-report.json is the proof)` };
+  await buildSampleGlb({ path, particles: [], box, textures: new Map() });
+  return {
+    path,
+    limitation: `no exported descriptor for ${options.system}: the base importer produced no effect GLB (import-report.json is the proof); this blank reuses the descriptor preview's framing anchor and adds no particles`,
+    identity: IDENTITY,
+  };
 }
 
 function unique(values: readonly string[]): string[] {

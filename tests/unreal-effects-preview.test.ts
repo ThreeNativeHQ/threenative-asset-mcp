@@ -139,6 +139,24 @@ describe("writeEffectPreviewGlbs", () => {
     expect(Math.min(...lastAlpha)).toBeLessThan(0.1);
   });
 
+  it("scales each card by overLife.size as the particle ages", async () => {
+    const out = await tempDir("effect-preview-");
+    const described = descriptor([
+      emitter({
+        spawn: { rate: { kind: "range", min: 1, max: 1 }, bursts: [] },
+        init: { lifetime: { kind: "range", min: 1, max: 1 }, size: { kind: "range", min: 20, max: 20 } },
+        overLife: { size: { kind: "curve", keys: [{ t: 0, v: 1, interp: "linear" }, { t: 1, v: 4, interp: "linear" }] } },
+      }),
+    ]);
+    const result = await writeEffectPreviewGlbs({ system: "P_oversize", descriptor: described, outputDir: out });
+    const scalesAt = async (path: string): Promise<number[]> => particleNodes(await readDoc(path)).map((node) => node.getScale()[0]!);
+    const first = await scalesAt(result.samples[0]!.path);
+    const last = await scalesAt(result.samples[3]!.path);
+    // Age 0 is scale 1 and age 1 is scale 4, so every later card is larger than any card at time 0.
+    expect(Math.max(...first)).toBeGreaterThan(0);
+    expect(Math.min(...last)).toBeGreaterThan(Math.max(...first));
+  });
+
   it("gives every sample the same invisible anchor so auto-framing is consistent", async () => {
     const out = await tempDir("effect-preview-");
     const described = descriptor([
@@ -220,15 +238,97 @@ describe("writeEffectPreviewGlbs", () => {
     const second = nodes[1]!.getScale()[0]!;
     expect(first).toBeLessThan(second);
   });
+
+  it("turns a stored radian rotation into the matching quaternion (Cascade quarter turn, Niagara 90 degrees)", async () => {
+    const out = await tempDir("effect-preview-");
+    // A Cascade quarter turn and a Niagara 90-degree angle both normalize to π/2 radians at the builder
+    // boundary, so the preview receives the same portable value and must produce the same quaternion.
+    const described = descriptor([emitter({ init: { rotation: { kind: "range", min: Math.PI / 2, max: Math.PI / 2 } } })]);
+    const result = await writeEffectPreviewGlbs({ system: "P_rot", descriptor: described, outputDir: out });
+    const node = particleNodes(await readDoc(result.samples[0]!.path))[0]!;
+    const quaternion = node.getRotation();
+    expect(quaternion[2]).toBeCloseTo(Math.sin(Math.PI / 4), 6);
+    expect(quaternion[3]).toBeCloseTo(Math.cos(Math.PI / 4), 6);
+  });
+
+  it("advances rotation by the per-second rate over the particle's life", async () => {
+    const out = await tempDir("effect-preview-");
+    const described = descriptor([
+      emitter({
+        spawn: { rate: { kind: "range", min: 1, max: 1 }, bursts: [] },
+        init: {
+          lifetime: { kind: "range", min: 1, max: 1 },
+          rotationRate: { kind: "range", min: Math.PI / 2, max: Math.PI / 2 },
+        },
+      }),
+    ]);
+    const result = await writeEffectPreviewGlbs({ system: "P_rate", descriptor: described, outputDir: out });
+    // At age 1 with a one-second life, the rate of π/2 rad/s has turned the card a quarter turn.
+    // Index 0 is the youngest; the last card is the oldest, at the sampled wall time.
+    const nodes = particleNodes(await readDoc(result.samples[3]!.path));
+    expect(nodes[nodes.length - 1]!.getRotation()[2]).toBeCloseTo(Math.sin(Math.PI / 4), 6);
+  });
+
+  it("links every particle to its own emitter's material when the emitter counts differ", async () => {
+    const out = await tempDir("effect-preview-");
+    const redPng = await smallPng([255, 0, 0, 255]);
+    const bluePng = await smallPng([0, 0, 255, 255]);
+    const redPath = join(out, "M_red.png");
+    const bluePath = join(out, "M_blue.png");
+    await sharp(redPng).toFile(redPath);
+    await sharp(bluePng).toFile(bluePath);
+    const stored = { red: await readFile(redPath), blue: await readFile(bluePath) };
+    const described = descriptor([
+      // The first emitter stores no rate: one exemplar red card. The second stores a rate: the full
+      // default cap of blue cards. The counts differ, so a flat index across both emitters would hand
+      // the second emitter's cards the first emitter's texture; only the per-particle material is right.
+      emitter({ name: "First", material: "/Game/Test/M_red" }),
+      emitter({ name: "Second", material: "/Game/Test/M_blue", spawn: { rate: { kind: "range", min: 1, max: 1 }, bursts: [] } }),
+    ]);
+    const result = await writeEffectPreviewGlbs({
+      system: "P_materials",
+      descriptor: described,
+      outputDir: out,
+      materialTextures: new Map([["/Game/Test/M_red", redPath], ["/Game/Test/M_blue", bluePath]]),
+    });
+    for (const sample of result.samples) {
+      const nodes = particleNodes(await readDoc(sample.path));
+      const images = nodes.map((node) => Array.from(node.getMesh()!.listPrimitives()[0]!.getMaterial()!.getBaseColorTexture()!.getImage()!));
+      // Assert the texture each card carries, not the node count: the exemplar is red, every card of
+      // the rated emitter is blue.
+      expect(images[0]).toEqual([...stored.red]);
+      expect(images.length).toBeGreaterThan(1);
+      for (const image of images.slice(1)) expect(image).toEqual([...stored.blue]);
+    }
+  });
+
+  it("names the uniform-square-card approximation when a size channel carries per-axis lanes", async () => {
+    const out = await tempDir("effect-preview-");
+    const described = descriptor([emitter({ init: { size: { kind: "range", min: [10, 20, 30], max: [10, 20, 30] } } })]);
+    const result = await writeEffectPreviewGlbs({ system: "P_sizevec", descriptor: described, outputDir: out });
+    expect(result.limitations.some((line) => line.includes("per-axis lanes") && line.includes("first lane"))).toBe(true);
+  });
 });
 
 describe("writeBlankEffectPreviewGlb", () => {
-  it("writes a truly blank GLB labelled as no exported descriptor", async () => {
+  it("reuses the descriptor preview's invisible anchor and adds no visible particle", async () => {
     const out = await tempDir("effect-blank-");
-    const { path, limitation } = await writeBlankEffectPreviewGlb({ system: "P_base", outputDir: out });
+    const described = descriptor([
+      emitter({
+        spawn: { rate: { kind: "range", min: 5, max: 5 }, bursts: [] },
+        init: { lifetime: { kind: "range", min: 1, max: 1 }, velocity: { kind: "range", min: [0, 0, 0], max: [50, 20, 0] } },
+      }),
+    ]);
+    const after = await writeEffectPreviewGlbs({ system: "P_base", descriptor: described, outputDir: out });
+    const { path, limitation } = await writeBlankEffectPreviewGlb({ system: "P_base", outputDir: out, descriptor: described });
     expect(limitation).toContain("no exported descriptor");
-    const document = await readDoc(path);
-    expect(document.getRoot().listMeshes()).toHaveLength(0);
-    expect(document.getRoot().listNodes()).toHaveLength(0);
+    const before = await readDoc(path);
+    // Same camera and frame before/after: the blank carries the identical invisible anchor.
+    expect(anchorPosition(before)).toEqual(anchorPosition(await readDoc(after.samples[0]!.path)));
+    expect(anchorPosition(before).length).toBeGreaterThan(0);
+    // No visible particle: no particle node and every material is the fully transparent anchor.
+    expect(particleNodes(before)).toHaveLength(0);
+    expect(before.getRoot().listMaterials()).toHaveLength(1);
+    for (const material of before.getRoot().listMaterials()) expect(material.getBaseColorFactor()[3]).toBe(0);
   });
 });

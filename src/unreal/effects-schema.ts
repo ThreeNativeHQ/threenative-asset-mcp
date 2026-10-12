@@ -4,7 +4,7 @@
  *
  * This module is the one committed definition of the descriptor (AC-5) and the one
  * reference for reading Unreal's baked distribution tables (AC-2). The production
- * converter writes `Effects/<system>.cascade.json` and `Effects/<system>.niagara.json`
+ * converter writes `Effects/<system>-<hash>.cascade.json` and `Effects/<system>-<hash>.niagara.json`
  * through the CUE4Parse adapter; the importer validates them with
  * {@link effectDescriptorSchema}.
  *
@@ -107,7 +107,13 @@ export const effectEmitterSchema = z.object({
       size: effectChannelSchema,
       velocity: effectChannelSchema,
       color: effectChannelSchema,
+      /**
+       * Particle/sprite rotation in **radians**. This is the one portable unit; the builders normalize
+       * the source units at the boundary. Cascade stores turns (`ParticleModules.cpp:1803`), Niagara
+       * stores degrees (`NiagaraSpriteVertexFactory.ush:813`), so both are converted here.
+       */
       rotation: effectChannelSchema,
+      /** Rotation speed in **radians per second** (`ParticleModules.cpp:1884` converts turns/sec by 2π). */
       rotationRate: effectChannelSchema,
     })
     .partial()
@@ -1047,26 +1053,28 @@ const CASCADE_RENDERERS: Readonly<Record<string, string>> = {
 /** Modules the descriptor maps a type-data renderer for; an unknown type data is never defaulted silently. */
 const CASCADE_TYPE_DATA_PREFIX = "ParticleModuleTypeData";
 
-/** Module classes the descriptor carries; every other class is listed as a limitation. */
+/**
+ * Module classes the descriptor carries data from; every other class is listed as a limitation.
+ * This set must match the properties `buildCascadeDescriptor` actually reads: a class here with no
+ * read would be silently dropped instead of named. `ParticleModuleSizeMultiplyLife` and
+ * `ParticleModuleSizeScale` are read into `overLife.size`; a class whose over-life application the
+ * schema cannot hold (e.g. `ParticleModuleAccelerationOverLifetime`) stays out and is named.
+ */
 const CASCADE_MAPPED_MODULES = new Set<string>([
   "ParticleModuleRequired",
   "ParticleModuleSpawn",
-  "ParticleModuleSpawnPerUnit",
   "ParticleModuleLifetime",
   "ParticleModuleSize",
   "ParticleModuleSizeMultiplyLife",
   "ParticleModuleSizeScale",
   "ParticleModuleVelocity",
-  "ParticleModuleVelocityOverLifetime",
   "ParticleModuleColor",
   "ParticleModuleColorOverLife",
-  "ParticleModuleColorScaleOverLife",
   "ParticleModuleRotation",
   "ParticleModuleRotationRate",
   "ParticleModuleMeshRotation",
   "ParticleModuleMeshRotationRate",
   "ParticleModuleAcceleration",
-  "ParticleModuleAccelerationOverLifetime",
   "ParticleModuleDrag",
   "ParticleModuleMeshMaterial",
   "ParticleModuleTypeDataMesh",
@@ -1110,6 +1118,39 @@ function moduleBuckets(lodLevel: DumpExport | undefined, byIndex: (index: number
 function moduleOf(modules: readonly DumpExport[], ...classes: string[]): DumpExport | undefined {
   return modules.find((module) => classes.includes(module.class));
 }
+
+/** Scales a value and every lane by `factor`, so a builder can normalize a source unit to the portable one. */
+function scaleEffectValue(value: EffectValue, factor: number): EffectValue {
+  return typeof value === "number" ? value * factor : [value[0] * factor, value[1] * factor, value[2] * factor];
+}
+
+/**
+ * Scales every value and tangent lane of a channel by `factor`. Rotation is the only channel with a
+ * source unit that differs from the portable one, so this is the one conversion point: Cascade turns
+ * and Niagara degrees both become radians here, and a tangent is scaled with its value.
+ */
+function scaleChannel(channel: EffectChannel, factor: number): EffectChannel {
+  const scaleKeys = (keys: readonly CurveKey[]): CurveKey[] =>
+    keys.map((key) => ({
+      ...key,
+      v: scaleEffectValue(key.v, factor),
+      ...(key.arriveTangent !== undefined ? { arriveTangent: scaleEffectValue(key.arriveTangent, factor) } : {}),
+      ...(key.leaveTangent !== undefined ? { leaveTangent: scaleEffectValue(key.leaveTangent, factor) } : {}),
+    }));
+  switch (channel.kind) {
+    case "range":
+      return { kind: "range", min: scaleEffectValue(channel.min, factor), max: scaleEffectValue(channel.max, factor) };
+    case "curve":
+      return { kind: "curve", keys: scaleKeys(channel.keys) };
+    case "uniform-curve":
+      return { kind: "uniform-curve", minKeys: scaleKeys(channel.minKeys), maxKeys: scaleKeys(channel.maxKeys) };
+  }
+}
+
+/** Cascade stores rotation in turns and rotation rate in turns per second (`ParticleModules.cpp:1803`, `:1884`). */
+const CASCADE_TURNS_TO_RADIANS = 2 * Math.PI;
+/** Niagara stores sprite rotation in degrees (`NiagaraSpriteVertexFactory.ush:813`). */
+const NIAGARA_DEGREES_TO_RADIANS = Math.PI / 180;
 
 /**
  * Maps the tagged export dump of a Cascade package to a portable descriptor. Returns null
@@ -1159,7 +1200,12 @@ export function buildCascadeDescriptor(dumpPackage: DumpPackage): EffectDescript
     }
 
     const lifetime = readChannel(moduleOf(modules, "ParticleModuleLifetime"), "Lifetime", byIndex);
-    const size = readChannel(moduleOf(modules, "ParticleModuleSize", "ParticleModuleSizeMultiplyLife", "ParticleModuleSizeScale"), "StartSize", byIndex);
+    // PRD-584 audit: `StartSize` lives only on `ParticleModuleSize`. `ParticleModuleSizeScale.SizeScale`
+    // and `ParticleModuleSizeMultiplyLife.LifeMultiplier` are over-life size scales, read into
+    // `overLife.size`; reading `StartSize` off them left `init.size` null and the class suppressed.
+    const size = readChannel(moduleOf(modules, "ParticleModuleSize"), "StartSize", byIndex);
+    const sizeScale = readChannel(moduleOf(modules, "ParticleModuleSizeScale"), "SizeScale", byIndex);
+    const lifeMultiplier = readChannel(moduleOf(modules, "ParticleModuleSizeMultiplyLife"), "LifeMultiplier", byIndex);
     const velocity = readChannel(moduleOf(modules, "ParticleModuleVelocity"), "StartVelocity", byIndex);
     const rotation = readChannel(moduleOf(modules, "ParticleModuleRotation", "ParticleModuleMeshRotation"), "StartRotation", byIndex);
     const rotationRate = readChannel(moduleOf(modules, "ParticleModuleRotationRate", "ParticleModuleMeshRotationRate"), "StartRotationRate", byIndex);
@@ -1170,7 +1216,7 @@ export function buildCascadeDescriptor(dumpPackage: DumpPackage): EffectDescript
     // are read here; otherwise they would leave `forces` empty and be suppressed from `limitations`.
     const acceleration = readChannel(moduleOf(modules, "ParticleModuleAcceleration"), "Acceleration", byIndex);
     const drag = readChannel(moduleOf(modules, "ParticleModuleDrag"), "Drag", byIndex);
-    for (const channel of [lifetime, size, velocity, rotation, rotationRate, color, colorOverLife, alphaOverLife, acceleration, drag]) {
+    for (const channel of [lifetime, size, sizeScale, lifeMultiplier, velocity, rotation, rotationRate, color, colorOverLife, alphaOverLife, acceleration, drag]) {
       if (channel.unresolved !== undefined) unresolvedChannels.push(channel.unresolved);
     }
 
@@ -1179,11 +1225,14 @@ export function buildCascadeDescriptor(dumpPackage: DumpPackage): EffectDescript
     if (size.channel !== null) init.size = size.channel;
     if (velocity.channel !== null) init.velocity = velocity.channel;
     if (color.channel !== null) init.color = color.channel;
-    if (rotation.channel !== null) init.rotation = rotation.channel;
-    if (rotationRate.channel !== null) init.rotationRate = rotationRate.channel;
+    if (rotation.channel !== null) init.rotation = scaleChannel(rotation.channel, CASCADE_TURNS_TO_RADIANS);
+    if (rotationRate.channel !== null) init.rotationRate = scaleChannel(rotationRate.channel, CASCADE_TURNS_TO_RADIANS);
     const overLife: NonNullable<EffectEmitter["overLife"]> = {};
     if (colorOverLife.channel !== null) overLife.color = colorOverLife.channel;
     if (alphaOverLife.channel !== null) overLife.alpha = alphaOverLife.channel;
+    // `SizeScale` wins when both over-life size modules are present; the other is named below.
+    const sizeOverLife = sizeScale.channel !== null ? sizeScale : lifeMultiplier;
+    if (sizeOverLife.channel !== null) overLife.size = sizeOverLife.channel;
 
     const forces: NonNullable<EffectEmitter["forces"]> = {};
     if (acceleration.channel !== null) forces.acceleration = acceleration.channel;
@@ -1199,8 +1248,19 @@ export function buildCascadeDescriptor(dumpPackage: DumpPackage): EffectDescript
     const delay = floatOrDefault(findTag(requiredProps, "EmitterDelay"), 0);
     const delayLow = scalar(findTag(requiredProps, "EmitterDelayLow"));
 
+    // A class that is deliberately carried as a bespoke limitation, not the bare default name. The
+    // generic loop below names every other unhandled class, so a module can never be mapped and
+    // silently dropped.
+    const namedByClass = new Map<string, string>();
+    if (sizeScale.channel !== null && lifeMultiplier.channel !== null) {
+      namedByClass.set("ParticleModuleSizeMultiplyLife", "ParticleModuleSizeMultiplyLife.LifeMultiplier and ParticleModuleSizeScale.SizeScale are both present; the descriptor carries SizeScale");
+    }
+    if (moduleOf(modules, "ParticleModuleAccelerationOverLifetime") !== undefined) {
+      namedByClass.set("ParticleModuleAccelerationOverLifetime", "ParticleModuleAccelerationOverLifetime.AccelerationOverLifetime applies over particle life and is not represented by the descriptor's acceleration field");
+    }
     for (const module of modules) {
-      if (!CASCADE_MAPPED_MODULES.has(module.class)) limitations.push(module.class);
+      if (CASCADE_MAPPED_MODULES.has(module.class)) continue;
+      limitations.push(namedByClass.get(module.class) ?? module.class);
     }
     for (const unresolved of unresolvedChannels) limitations.push(unresolved);
     if (boolOrDefault(findTag(requiredProps, "bEmitterDurationUseRange"), false) && durationLow !== undefined && durationLow !== duration) {
@@ -1211,9 +1271,6 @@ export function buildCascadeDescriptor(dumpPackage: DumpPackage): EffectDescript
     }
     if (typeData !== undefined && renderer === undefined) {
       limitations.push(`${typeData.class} is not a mapped renderer; the descriptor records the sprite default and does not reproduce it`);
-    }
-    if (moduleOf(modules, "ParticleModuleAccelerationOverLifetime") !== undefined) {
-      limitations.push("ParticleModuleAccelerationOverLifetime.AccelerationOverLifetime applies over particle life and is not represented by the descriptor's acceleration field");
     }
 
     const descriptor: EffectEmitter = {
@@ -1373,16 +1430,8 @@ const NIAGARA_MAPPED_MODULES = new Set<string>([
 ]);
 
 /**
- * Inputs of mapped Niagara modules the descriptor does not carry. A present module names each specific
- * input in `limitations`, so a module is never claimed as mapped while exporting nothing. `SpawnBurstInstantaneous`
- * and `SolveForcesAndVelocity` are decoded instead, so they are absent here.
+ * Niagara inputs stored as signed 32-bit integers, so they are not misread as floats (e.g. `Spawn Count`).
  */
-const NIAGARA_UNEXPORTED_INPUTS: Readonly<Record<string, readonly string[]>> = {
-  ColorFromCurve: ["Scale RGB", "Scale RGBA"],
-  ScaleSpriteSize: ["Scale Factor"],
-};
-
-/** Niagara inputs stored as signed 32-bit integers, so they are not misread as floats (e.g. `Spawn Count`). */
 const NIAGARA_INT_INPUTS = new Set<string>(["Spawn Count"]);
 
 export interface NiagaraRapidIterationEntry {
@@ -1408,6 +1457,7 @@ function niagaraTypeWidth(leaf: string): number | undefined {
     "Color Minimum": 16,
     "Color Maximum": 16,
     "Initial Sprite Size": 8,
+    "Initial Velocity": 12,
     "Mesh Orientation": 16,
     "Scale RGB": 12,
     "Scale RGBA": 16,
@@ -1581,7 +1631,18 @@ function mapNiagaraEmitter(handle: NiagaraHandle, byIndex: (index: number) => Du
 
   const prefix = `Constants.${uniqueName}.`;
   const modules = new Set<string>();
-  const lookup = (module: string, input: string): NiagaraRapidIterationEntry | undefined => entries.get(`${prefix}${module}.${input}`);
+  // PRD-584 audit: an input counts as consumed only once a portable field actually carries it.
+  // Marking at the lookup would hide a half-present pair (for example a stored `Lifetime Min`
+  // with no `Lifetime Max`), because the paired assignment never runs. The unused-input scan
+  // below then names what a stored value must not silently lose.
+  const consumed = new Set<string>();
+  const lookup = (module: string, input: string): NiagaraRapidIterationEntry | undefined =>
+    entries.get(`${prefix}${module}.${input}`);
+  const consume = (...used: readonly (NiagaraRapidIterationEntry | undefined)[]): void => {
+    for (const entry of used) {
+      if (entry !== undefined) consumed.add(entry.name);
+    }
+  };
   for (const entry of rapidIteration) {
     if (!entry.name.startsWith(prefix)) continue;
     const rest = entry.name.slice(prefix.length);
@@ -1594,21 +1655,36 @@ function mapNiagaraEmitter(handle: NiagaraHandle, byIndex: (index: number) => Du
   const lifetimeMax = lookup("InitializeParticle", "Lifetime Max");
   if (lifetimeMin !== undefined && lifetimeMax !== undefined) {
     init.lifetime = { kind: "range", min: readNiagaraChannel(lifetimeMin, 1), max: readNiagaraChannel(lifetimeMax, 1) };
+    consume(lifetimeMin, lifetimeMax);
   }
   const sizeMin = lookup("InitializeParticle", "Uniform Sprite Size Min");
   const sizeMax = lookup("InitializeParticle", "Uniform Sprite Size Max");
   if (sizeMin !== undefined && sizeMax !== undefined) {
     init.size = { kind: "range", min: readNiagaraChannel(sizeMin, 1), max: readNiagaraChannel(sizeMax, 1) };
+    consume(sizeMin, sizeMax);
   }
   const rotationMin = lookup("InitializeParticle", "Sprite Rotation Angle Min");
   const rotationMax = lookup("InitializeParticle", "Sprite Rotation Angle Max");
   if (rotationMin !== undefined && rotationMax !== undefined) {
-    init.rotation = { kind: "range", min: readNiagaraChannel(rotationMin, 1), max: readNiagaraChannel(rotationMax, 1) };
+    init.rotation = {
+      kind: "range",
+      min: scaleEffectValue(readNiagaraChannel(rotationMin, 1), NIAGARA_DEGREES_TO_RADIANS),
+      max: scaleEffectValue(readNiagaraChannel(rotationMax, 1), NIAGARA_DEGREES_TO_RADIANS),
+    };
+    consume(rotationMin, rotationMax);
   }
   const colorMin = lookup("InitializeParticle", "Color Minimum");
   const colorMax = lookup("InitializeParticle", "Color Maximum");
   if (colorMin !== undefined && colorMax !== undefined) {
     init.color = { kind: "range", min: readNiagaraChannel(colorMin, 3), max: readNiagaraChannel(colorMax, 3) };
+    consume(colorMin, colorMax);
+  }
+  // PRD-584 fix: a stored `InitializeParticle.Initial Velocity` is the particle start velocity.
+  const initialVelocity = lookup("InitializeParticle", "Initial Velocity");
+  if (initialVelocity !== undefined) {
+    const value = readNiagaraChannel(initialVelocity, 3);
+    init.velocity = { kind: "range", min: value, max: value };
+    consume(initialVelocity);
   }
 
   const forces: NonNullable<EffectEmitter["forces"]> = {};
@@ -1616,22 +1692,26 @@ function mapNiagaraEmitter(handle: NiagaraHandle, byIndex: (index: number) => Du
   if (gravity !== undefined) {
     const value = readNiagaraChannel(gravity, 3);
     forces.acceleration = { kind: "range", min: value, max: value };
+    consume(gravity);
   }
   const drag = lookup("Drag", "Drag") ?? lookup("DragForce", "Drag");
   if (drag !== undefined) {
     const value = readNiagaraChannel(drag, 1);
     forces.drag = { kind: "range", min: value, max: value };
+    consume(drag);
   }
   // PRD-584: `SolveForcesAndVelocity` limits are stored scalars, exported so the module is not mapped silently.
   const accelerationLimit = lookup("SolveForcesAndVelocity", "Acceleration Limit");
   if (accelerationLimit !== undefined) {
     const value = readNiagaraChannel(accelerationLimit, 1);
     forces.accelerationLimit = { kind: "range", min: value, max: value };
+    consume(accelerationLimit);
   }
   const speedLimit = lookup("SolveForcesAndVelocity", "Speed Limit");
   if (speedLimit !== undefined) {
     const value = readNiagaraChannel(speedLimit, 1);
     forces.speedLimit = { kind: "range", min: value, max: value };
+    consume(speedLimit);
   }
   // `SpawnBurstInstantaneous` stores its count and time as inputs; read them so bursts are not dropped.
   const burstCount = lookup("SpawnBurstInstantaneous", "Spawn Count");
@@ -1639,14 +1719,21 @@ function mapNiagaraEmitter(handle: NiagaraHandle, byIndex: (index: number) => Du
   const bursts: EffectBurst[] = [];
   if (burstCount !== undefined) {
     bursts.push({ time: burstTime !== undefined ? (burstTime.values[0] ?? 0) : 0, count: burstCount.values[0] ?? 0 });
+    consume(burstCount, burstTime);
   }
+  // PRD-584 fix: the stored `SpawnRate.Spawn Rate` override must reach `spawn.rate`; it was hardcoded null.
+  const spawnRate = lookup("SpawnRate", "Spawn Rate") ?? lookup("SpawnRate", "Rate");
+  const rate: EffectChannel | null = spawnRate === undefined
+    ? null
+    : { kind: "range", min: readNiagaraChannel(spawnRate, 1), max: readNiagaraChannel(spawnRate, 1) };
+  consume(spawnRate);
 
   const limitations: string[] = [];
   for (const module of modules) {
     if (!NIAGARA_MAPPED_MODULES.has(module)) limitations.push(`Niagara module "${module}" is not exported`);
   }
   // An absent stored override means the value is wired or default: state it, never write a zero.
-  if (lookup("SpawnRate", "Spawn Rate") === undefined && lookup("SpawnRate", "Rate") === undefined) {
+  if (spawnRate === undefined) {
     limitations.push("SpawnRate has no stored override; the spawn rate is wired or default and is unresolved (default unavailable)");
   }
   if (modules.has("SpawnBurstInstantaneous")) {
@@ -1656,9 +1743,16 @@ function mapNiagaraEmitter(handle: NiagaraHandle, byIndex: (index: number) => Du
   } else {
     limitations.push("SpawnBurstInstantaneous is not present; bursts are not exported (default unavailable)");
   }
-  for (const [module, inputs] of Object.entries(NIAGARA_UNEXPORTED_INPUTS)) {
-    if (!modules.has(module)) continue;
-    limitations.push(`Niagara module "${module}" is stored but its input${inputs.length === 1 ? "" : "s"} ${inputs.map((input) => `"${input}"`).join(", ")} ${inputs.length === 1 ? "is" : "are"} not exported`);
+  // Every stored input of a mapped module the mapper did not consume is named, so a stored value can
+  // never disappear silently. Unmapped modules are already named as whole modules above.
+  for (const entry of rapidIteration) {
+    if (!entry.name.startsWith(prefix)) continue;
+    const rest = entry.name.slice(prefix.length);
+    const dot = rest.indexOf(".");
+    if (dot <= 0) continue;
+    const module = rest.slice(0, dot);
+    if (!NIAGARA_MAPPED_MODULES.has(module) || consumed.has(entry.name)) continue;
+    limitations.push(`Niagara module "${module}" is stored but its input "${rest.slice(dot + 1)}" is not exported`);
   }
   const hasColorFromCurve = modules.has("ColorFromCurve");
   if (!hasColorFromCurve && modules.has("FloatFromCurve")) {
@@ -1676,7 +1770,7 @@ function mapNiagaraEmitter(handle: NiagaraHandle, byIndex: (index: number) => Du
     simTarget,
     ...(version !== undefined ? { version } : {}),
     ...(bounds !== undefined ? { bounds } : {}),
-    spawn: { rate: null, bursts },
+    spawn: { rate, bursts },
     ...(Object.keys(init).length > 0 ? { init } : {}),
     ...(Object.keys(forces).length > 0 ? { forces } : {}),
     ...(modules.size > 0 ? { modules: [...modules].sort() } : {}),
