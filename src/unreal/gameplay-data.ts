@@ -730,17 +730,15 @@ export function resolvedCueWaveLeaves(cue: RawCue): string[] {
 }
 
 /**
- * Rewrites every WavePlayer leaf's soft path to the exported audio file it resolves to, given an
- * index of full source package selector -> promoted path (plus a unique-basename fallback). The
- * full selector is tried first, so a same-named wave in another folder never binds the wrong file;
- * the bare name is only a fallback, and a name in `ambiguous` is reported rather than guessed at.
- * A leaf whose wave no exported file matches is left as the soft path and named in `missing`. The
- * original `wave` soft path is always kept beside `waveExport`.
+ * Resolves qualified wave paths only through the canonical source-package index. Missing exact
+ * paths stay missing. Unqualified legacy names use a separate, lowercase unique-name index;
+ * aliases never share the canonical namespace and cannot impersonate a root-level package.
+ * The original soft path is retained beside any resolved `waveExport`.
  */
 export function resolveCueWaves(
   cue: RawCue,
-  audio: ReadonlyMap<string, string>,
-  ambiguous: ReadonlySet<string> = new Set(),
+  audioByPackage: ReadonlyMap<string, string>,
+  uniqueLegacyNames: ReadonlyMap<string, string> = new Map(),
 ): { readonly cue: RawCue; readonly missing: readonly string[] } {
   const missing: string[] = [];
   const seen = new Set<string>();
@@ -750,11 +748,10 @@ export function resolveCueWaves(
     if (typeof wave === "string") {
       const name = cueWaveObjectName(wave);
       const selector = wavePackageSelector(wave);
-      let exported = selector === undefined ? undefined : audio.get(selector);
-      if (exported === undefined && name !== undefined) {
-        const lower = name.toLowerCase();
-        if (!ambiguous.has(lower)) exported = audio.get(name) ?? audio.get(lower);
-      }
+      const qualified = /[/\\]/.test(wave);
+      const exported = qualified
+        ? selector === undefined ? undefined : audioByPackage.get(selector)
+        : name === undefined ? undefined : uniqueLegacyNames.get(name.toLowerCase());
       if (name !== undefined && exported !== undefined) {
         params = { ...node.params, waveExport: exported };
       } else if (name !== undefined && !seen.has(name.toLowerCase())) {

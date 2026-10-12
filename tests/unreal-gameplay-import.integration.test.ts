@@ -516,6 +516,34 @@ describe("gameplay data through the public import path", () => {
     expect(report.skipped.some(entry => entry.package === "SC_Same.uasset")).toBe(false);
   });
 
+  it("keeps missing qualified waves unresolved while a unique lowercase legacy name resolves", async () => {
+    const exported = await mkdtemp(join(tmpdir(), "asset-mcp-wave-identity-"));
+    onTestFinished(() => rm(exported, { recursive: true, force: true }));
+    await writeWavFixture(join(exported, "SW_Tone.wav"));
+    const { report, outputDir } = await runImport(
+      { "B/SW_Tone": ["SoundWave"], SC_Tone: ["SoundCue"] },
+      () => ({ "": {
+        "Audio/SC_Tone/SC_Tone.cue.json": `text:${JSON.stringify({ name: "SC_Tone", root: {
+          type: "SoundNodeMixer", children: [
+            { type: "SoundNodeWavePlayer", params: { wave: "/Game/A/SW_Tone.SW_Tone" } },
+            { type: "SoundNodeWavePlayer", params: { wave: "/Game/SW_Tone.SW_Tone" } },
+            { type: "SoundNodeWavePlayer", params: { wave: "sw_tone" } },
+          ],
+        } })}`,
+      } }),
+      exported,
+      { rootPackages: true },
+    );
+    expect(report.audio).toHaveLength(1);
+    expect(report.audio[0]!.package).toBe("B/SW_Tone.uasset");
+    const cue = report.soundCues[0]!;
+    const graph = JSON.parse(await readFile(join(outputDir, cue.file), "utf8")) as { root: { children: { params: Record<string, unknown> }[] } };
+    expect(graph.root.children[0]!.params.waveExport).toBeUndefined();
+    expect(graph.root.children[1]!.params.waveExport).toBeUndefined();
+    expect(graph.root.children[2]!.params.waveExport).toBe(report.audio[0]!.file);
+    expect(cue.missingWaves).toEqual(["SW_Tone"]);
+  });
+
   it("resolves a cue wave to the SoundWave its full package selector names, not a same-named one", async () => {
     const exported = await mkdtemp(join(tmpdir(), "asset-mcp-wave-export-"));
     onTestFinished(() => rm(exported, { recursive: true, force: true }));

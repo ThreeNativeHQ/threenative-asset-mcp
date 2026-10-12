@@ -5586,11 +5586,10 @@ export async function importUnrealDirectory(
       // tie the cue back to its source. Fall back to the sidecar selector only when nothing classified.
       const cueSourcePackage = (selector: string): string =>
         classified.find((candidate) => candidate.selector.toLowerCase() === selector.toLowerCase())?.package ?? selector;
-      // A leaf resolves by its full source package selector first, so a same-named wave in another
-      // folder never binds the wrong file. A bare name is a fallback only when it is unique; a
-      // duplicate bare name is reported unresolved instead of guessed at.
+      // Qualified leaves resolve only by source package. Bare legacy names have their own
+      // unique-name index, so an alias cannot impersonate a missing folder or root-level wave.
       const audioExportIndex = new Map<string, string>();
-      const ambiguousWaveNames = new Set<string>();
+      const legacyWaveNames = new Map<string, string>();
       const waveNameCounts = new Map<string, number>();
       for (const file of audio) {
         const selector = wavePackageSelector(file.package);
@@ -5600,8 +5599,7 @@ export async function importUnrealDirectory(
       }
       for (const file of audio) {
         const lower = file.name.toLowerCase();
-        if ((waveNameCounts.get(lower) ?? 0) === 1) audioExportIndex.set(file.name, file.file);
-        else ambiguousWaveNames.add(lower);
+        if ((waveNameCounts.get(lower) ?? 0) === 1) legacyWaveNames.set(lower, file.file);
       }
       const cueNameCounts = new Map<string, number>();
       for (const sidecar of modernCueSidecars.values()) {
@@ -5611,7 +5609,7 @@ export async function importUnrealDirectory(
       for (const sidecar of modernCueSidecars.values()) {
         try {
           const cue = parseCueSidecar(await readFile(sidecar.path, "utf8"));
-          const { cue: resolved, missing } = resolveCueWaves(cue, audioExportIndex, ambiguousWaveNames);
+          const { cue: resolved, missing } = resolveCueWaves(cue, audioExportIndex, legacyWaveNames);
           // A globally unique cue name keeps the simple `Audio/<cue>.cue.json`; a duplicate keeps its
           // package selector, so two same-named cues in different folders both survive.
           const relative = (cueNameCounts.get(cue.name.toLowerCase()) ?? 0) > 1

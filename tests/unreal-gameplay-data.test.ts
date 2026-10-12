@@ -385,7 +385,7 @@ describe("gameplay data: SoundCue", () => {
         },
       }),
     );
-    const { cue: resolved, missing } = resolveCueWaves(cue, new Map([["SW_A", "audio/Content/SW_A.wav"]]));
+    const { cue: resolved, missing } = resolveCueWaves(cue, new Map([["audio/sw_a", "audio/Content/SW_A.wav"]]));
     expect(missing).toEqual(["SW_Missing"]);
     const children = resolved.root!.children!;
     expect(children[0]!.params).toMatchObject({ wave: "/Game/Audio/SW_A.SW_A", waveExport: "audio/Content/SW_A.wav" });
@@ -427,14 +427,14 @@ describe("gameplay data: SoundCue", () => {
     const cue = parseCueSidecar(
       JSON.stringify({
         name: "SC_Foot",
-        root: { type: "USoundNodeWavePlayer", params: { wave: "/Game/Audio/Unknown/SW_Hit.SW_Hit" } },
+        root: { type: "USoundNodeWavePlayer", params: { wave: "SW_Hit" } },
       }),
     );
     // Only a bare fallback is available, and it is ambiguous: report it, never bind either file.
     const { cue: resolved, missing } = resolveCueWaves(
       cue,
-      new Map([["sw_hit", "audio/Content/Audio/A/SW_Hit.wav"]]),
-      new Set(["sw_hit"]),
+      new Map([["audio/a/sw_hit", "audio/Content/Audio/A/SW_Hit.wav"], ["audio/b/sw_hit", "audio/Content/Audio/B/SW_Hit.wav"]]),
+      new Map(),
     );
     expect(missing).toEqual(["SW_Hit"]);
     expect(resolved.root!.params).not.toHaveProperty("waveExport");
