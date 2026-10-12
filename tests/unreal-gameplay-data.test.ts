@@ -265,6 +265,38 @@ describe("gameplay data: physics asset", () => {
     expect(drives.angular!.mode).toBe("TwistAndSwing");
   });
 
+  it("converts asymmetric linear targets and the angular orientation and velocity targets", () => {
+    const physics = convertPhysics(
+      {
+        asset: "PA",
+        bodies: [],
+        constraints: [
+          {
+            child: "a",
+            parent: "b",
+            childFrame: { location: [0, 0, 0], primaryAxis: [1, 0, 0], secondaryAxis: [0, 1, 0] },
+            parentFrame: { location: [0, 0, 0], primaryAxis: [1, 0, 0], secondaryAxis: [0, 1, 0] },
+            drives: {
+              linear: { positionTarget: [100, 200, 300], velocityTarget: [10, 20, 30] },
+              angular: { orientationTarget: [0, 90, 0], angularVelocityTarget: [7, 8, 9], mode: "SLERP" },
+            },
+          },
+        ],
+        collisionDisabledPairs: [],
+      },
+      0.01,
+    );
+    const drives = physics!.constraints[0]!.drives!;
+    // A length target becomes metres and glTF axes: [x, z, y] then times 0.01.
+    close(drives.linear!.positionTarget!, [1, 3, 2]);
+    close(drives.linear!.velocityTarget!, [0.1, 0.3, 0.2]);
+    // The orientation target is an FRotator, converted exactly like a bone rotation (90 degree yaw).
+    close(drives.angular!.orientationTarget!, [0, Math.SQRT1_2, 0, -Math.SQRT1_2]);
+    // The angular velocity target is a rate in revolutions per second: the basis swaps, the magnitude does not.
+    close(drives.angular!.angularVelocityTarget!, [7, 9, 8]);
+    expect(drives.angular!.mode).toBe("SLERP");
+  });
+
   it("reports missing body and constraint sub-exports instead of dropping them silently", () => {
     const physics = convertPhysics({ asset: "PA", bodies: [], constraints: [], collisionDisabledPairs: [], missingBodies: 2, missingConstraints: 1 }, 0.01);
     expect(physics!.missingBodies).toBe(2);

@@ -58,7 +58,38 @@ export interface RawConstraintDrive {
   readonly velocityDrive?: boolean;
 }
 
-/** The decoded `FLinearDriveConstraint` and `FAngularDriveConstraint` of one constraint. */
+/**
+ * A constraint's decoded drives in glTF space. The linear targets are lengths, so both become metres
+ * and glTF axes; the angular orientation target converts like a bone rotation, and the angular
+ * velocity target is in revolutions per second (a rate, not a length) so only its basis changes. The
+ * scalar `FConstraintDrive` parameters (stiffness, damping, maxForce) keep Unreal's own force or
+ * acceleration units and are not converted.
+ */
+export interface ConvertedConstraintDrives {
+  readonly linear?: {
+    /** Target position in metres, glTF axes. */
+    readonly positionTarget?: Vec3;
+    /** Target velocity in metres per second, glTF axes. */
+    readonly velocityTarget?: Vec3;
+    readonly x?: RawConstraintDrive;
+    readonly y?: RawConstraintDrive;
+    readonly z?: RawConstraintDrive;
+    readonly accelerationMode?: boolean;
+  };
+  readonly angular?: {
+    /** Target orientation relative to the body reference frame, as a glTF quaternion. */
+    readonly orientationTarget?: Quat;
+    /** Target angular velocity in revolutions per second, glTF axes. */
+    readonly angularVelocityTarget?: Vec3;
+    readonly swing?: RawConstraintDrive;
+    readonly twist?: RawConstraintDrive;
+    readonly slerp?: RawConstraintDrive;
+    readonly mode?: string;
+    readonly accelerationMode?: boolean;
+  };
+}
+
+/** The decoded `FLinearDriveConstraint` and `FAngularDriveConstraint` of one constraint, in Unreal's frame. */
 export interface RawConstraintDrives {
   readonly linear?: {
     readonly positionTarget?: Vec3;
@@ -188,7 +219,7 @@ export interface ConvertedConstraint {
   readonly twistDeg?: number;
   readonly linearLimit?: number;
   readonly motions?: RawConstraint["motions"];
-  readonly drives?: RawConstraintDrives;
+  readonly drives?: ConvertedConstraintDrives;
   readonly disableCollision?: boolean;
 }
 
@@ -438,15 +469,18 @@ export function convertConstraintFrame(frame: RawConstraint["childFrame"], scale
   };
 }
 
-/** Converts a drive's linear targets to glTF space and metres; the angular targets keep their own units. */
-function convertDrives(drives: RawConstraintDrives | undefined, scale: number | Vec3): RawConstraintDrives | undefined {
+/** Converts one constraint's drives from Unreal's frame to glTF space and metres. */
+function convertDrives(drives: RawConstraintDrives | undefined, scale: number | Vec3): ConvertedConstraintDrives | undefined {
   if (!drives) return undefined;
   const linear = drives.linear;
+  const angular = drives.angular;
   return {
     ...(linear === undefined
       ? {}
       : {
           linear: {
+            // Position and velocity are both lengths (metres and metres per second), so each is
+            // swapped into glTF axes and scaled by the geometry scale.
             ...(linear.positionTarget === undefined ? {} : { positionTarget: scaleVector(ueVectorToGltf(linear.positionTarget), scale) }),
             ...(linear.velocityTarget === undefined ? {} : { velocityTarget: scaleVector(ueVectorToGltf(linear.velocityTarget), scale) }),
             ...(linear.x === undefined ? {} : { x: linear.x }),
@@ -455,7 +489,22 @@ function convertDrives(drives: RawConstraintDrives | undefined, scale: number | 
             ...(linear.accelerationMode === undefined ? {} : { accelerationMode: linear.accelerationMode }),
           },
         }),
-    ...(drives.angular === undefined ? {} : { angular: drives.angular }),
+    ...(angular === undefined
+      ? {}
+      : {
+          angular: {
+            // The orientation target is an FRotator, so it converts exactly like a bone rotation;
+            // the angular velocity target is a rate in revolutions per second, so it is only swapped
+            // into glTF axes and is never scaled by the geometry scale.
+            ...(angular.orientationTarget === undefined ? {} : { orientationTarget: ueQuaternionToGltf(rotatorToUeQuaternion(angular.orientationTarget)) }),
+            ...(angular.angularVelocityTarget === undefined ? {} : { angularVelocityTarget: ueVectorToGltf(angular.angularVelocityTarget) }),
+            ...(angular.swing === undefined ? {} : { swing: angular.swing }),
+            ...(angular.twist === undefined ? {} : { twist: angular.twist }),
+            ...(angular.slerp === undefined ? {} : { slerp: angular.slerp }),
+            ...(angular.mode === undefined ? {} : { mode: angular.mode }),
+            ...(angular.accelerationMode === undefined ? {} : { accelerationMode: angular.accelerationMode }),
+          },
+        }),
   };
 }
 
