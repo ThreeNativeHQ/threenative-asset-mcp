@@ -1,4 +1,5 @@
 import { registerAnimationCorpusGates } from "./helpers/animation-corpus.js";
+import { registerEffectsCorpusTests } from "./helpers/effects-corpus.js";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -662,3 +663,4 @@ if (corpusDir) {
 }
 
 registerAnimationCorpusGates();
+registerEffectsCorpusTests(process.env.FAB_FEATURE_CORPUS_DIR);

@@ -5115,6 +5115,7 @@ export async function importUnrealDirectory(
       }
     }
     if (parsed !== undefined) {
+      await copyFile(dumpPath, join(promotion, "effects-dump.json"));
       const result = await writeUnrealEffects(parsed, promotion);
       const written = result.written;
       // Match on the canonical package key, never a raw basename: two packages that share a system name
