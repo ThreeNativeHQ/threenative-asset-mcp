@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.79",
+  version: "b4e95441+threenative.86-gameplay",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -291,6 +291,107 @@ diff --git a/CUE4Parse/UE4/Versions/VersionUtils.cs b/CUE4Parse/UE4/Versions/Ver
 +               versions.GetVersion(key) == -1;
 +    }
  }
+diff --git a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintBaseParams.cs b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintBaseParams.cs
+index b8630da..f226cc2 100644
+--- a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintBaseParams.cs
++++ b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintBaseParams.cs
+@@ -14,8 +14,8 @@ public class FConstraintBaseParams
+     
+     public FConstraintBaseParams(FStructFallback fallback)
+     {
+-        Stiffness = fallback.GetOrDefault<float>(nameof(Stiffness));
+-        Damping = fallback.GetOrDefault<float>(nameof(Damping));
++        Stiffness = fallback.GetOrDefault(nameof(Stiffness), 50f);
++        Damping = fallback.GetOrDefault(nameof(Damping), 1f);
+         Restitution = fallback.GetOrDefault<float>(nameof(Restitution));
+         ContactDistance = fallback.GetOrDefault<float>(nameof(ContactDistance));
+         bSoftConstraint = fallback.GetOrDefault<bool>(nameof(bSoftConstraint));
+@@ -33,10 +33,11 @@ public class FLinearConstraint : FConstraintBaseParams
+     
+     public FLinearConstraint(FStructFallback fallback) : base(fallback)
+     {
+-        Limit = fallback.GetOrDefault<float>(nameof(Limit));
+-        XMotion = fallback.GetOrDefault<ELinearConstraintMotion>(nameof(XMotion));
+-        YMotion = fallback.GetOrDefault<ELinearConstraintMotion>(nameof(YMotion));
+-        ZMotion = fallback.GetOrDefault<ELinearConstraintMotion>(nameof(ZMotion));
++        // FLinearConstraint's native default (ConstraintTypes.cpp): a zero limit on all axes Locked.
++        Limit = fallback.GetOrDefault(nameof(Limit), 0f);
++        XMotion = fallback.GetOrDefault(nameof(XMotion), ELinearConstraintMotion.LCM_Locked);
++        YMotion = fallback.GetOrDefault(nameof(YMotion), ELinearConstraintMotion.LCM_Locked);
++        ZMotion = fallback.GetOrDefault(nameof(ZMotion), ELinearConstraintMotion.LCM_Locked);
+     }
+ }
+ 
+@@ -59,10 +60,11 @@ public class FConeConstraint  : FConstraintBaseParams
+     
+     public FConeConstraint(FStructFallback fallback) : base(fallback)
+     {
+-        Swing1LimitDegrees = fallback.GetOrDefault<float>(nameof(Swing1LimitDegrees));
+-        Swing2LimitDegrees = fallback.GetOrDefault<float>(nameof(Swing2LimitDegrees));
+-        Swing1Motion = fallback.GetOrDefault<EAngularConstraintMotion>(nameof(Swing1Motion));
+-        Swing2Motion = fallback.GetOrDefault<EAngularConstraintMotion>(nameof(Swing2Motion));
++        // FConeConstraint's native default: 45 degrees on both swings, Free motion.
++        Swing1LimitDegrees = fallback.GetOrDefault(nameof(Swing1LimitDegrees), 45f);
++        Swing2LimitDegrees = fallback.GetOrDefault(nameof(Swing2LimitDegrees), 45f);
++        Swing1Motion = fallback.GetOrDefault(nameof(Swing1Motion), EAngularConstraintMotion.ACM_Free);
++        Swing2Motion = fallback.GetOrDefault(nameof(Swing2Motion), EAngularConstraintMotion.ACM_Free);
+     }
+ }
+ 
+@@ -75,8 +77,9 @@ public class FTwistConstraint  : FConstraintBaseParams
+     
+     public FTwistConstraint(FStructFallback fallback) : base(fallback)
+     {
+-        TwistLimitDegrees = fallback.GetOrDefault<float>(nameof(TwistLimitDegrees));
+-        TwistMotion = fallback.GetOrDefault<EAngularConstraintMotion>(nameof(TwistMotion));
++        // FTwistConstraint's native default: 45 degrees, Free motion.
++        TwistLimitDegrees = fallback.GetOrDefault(nameof(TwistLimitDegrees), 45f);
++        TwistMotion = fallback.GetOrDefault(nameof(TwistMotion), EAngularConstraintMotion.ACM_Free);
+     }
+ }
+ 
+diff --git a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintDrive.cs b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintDrive.cs
+index c9628ca..c54a734 100644
+--- a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintDrive.cs
++++ b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintDrive.cs
+@@ -15,8 +15,11 @@ public class FConstraintDrive
+     
+     public FConstraintDrive(FStructFallback fallback)
+     {
+-        Stiffness = fallback.GetOrDefault<float>(nameof(Stiffness));
+-        Damping = fallback.GetOrDefault<float>(nameof(Damping));
++        // Unreal's FConstraintDrive constructor (ConstraintDrives.cpp) defaults Stiffness to 50 and
++        // Damping to 1. A saved drive can carry only one tag (for example bEnablePositionDrive), so an
++        // omitted Stiffness/Damping must read the native default, not CUE4Parse's 0.
++        Stiffness = fallback.GetOrDefault(nameof(Stiffness), 50f);
++        Damping = fallback.GetOrDefault(nameof(Damping), 1f);
+         MaxForce = fallback.GetOrDefault<float>(nameof(MaxForce));
+         bEnablePositionDrive = fallback.GetOrDefault<bool>(nameof(bEnablePositionDrive));
+         bEnableVelocityDrive = fallback.GetOrDefault<bool>(nameof(bEnableVelocityDrive));
+diff --git a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintInstance.cs b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintInstance.cs
+--- a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintInstance.cs
++++ b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintInstance.cs
+@@ -32,12 +32,16 @@ public class FConstraintInstance
+         ConstraintBone2 = fallback.GetOrDefault<FName>(nameof(ConstraintBone2));
+ 
+         Pos1 = fallback.GetOrDefault<FVector>(nameof(Pos1));
+-        PriAxis1 = fallback.GetOrDefault<FVector>(nameof(PriAxis1));
+-        SecAxis1 = fallback.GetOrDefault<FVector>(nameof(SecAxis1));
++        // FConstraintInstance's native constructor (ConstraintInstance.cpp) sets each frame to the
++        // identity basis: primary axis unit X, secondary axis unit Y. Unreal omits a tag whose value
++        // equals that native default, so an absent axis tag must supply the unit vector rather than
++        // the zero vector. A tagged value is still read as saved, so explicit axes are preserved.
++        PriAxis1 = fallback.GetOrDefault(nameof(PriAxis1), new FVector(1f, 0f, 0f));
++        SecAxis1 = fallback.GetOrDefault(nameof(SecAxis1), new FVector(0f, 1f, 0f));
+ 
+         Pos2 = fallback.GetOrDefault<FVector>(nameof(Pos2));
+-        PriAxis2 = fallback.GetOrDefault<FVector>(nameof(PriAxis2));
+-        SecAxis2 = fallback.GetOrDefault<FVector>(nameof(SecAxis2));
++        PriAxis2 = fallback.GetOrDefault(nameof(PriAxis2), new FVector(1f, 0f, 0f));
++        SecAxis2 = fallback.GetOrDefault(nameof(SecAxis2), new FVector(0f, 1f, 0f));
+ 
+         AngularRotationOffset = fallback.GetOrDefault<FRotator>(nameof(AngularRotationOffset));
+         bScaleLinearLimits = fallback.GetOrDefault(nameof(bScaleLinearLimits), true);
 diff --git a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
 --- a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
 +++ b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
@@ -457,6 +558,9 @@ using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.Material.Parameters;
 using CUE4Parse.UE4.Assets.Exports.Sound;
+using CUE4Parse.UE4.Assets.Exports.Sound.Node;
+using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Objects.PhysicsEngine;
 using CUE4Parse.UE4.Assets.Exports.Engine;
 using CUE4Parse.UE4.Assets.Exports.Engine.Font;
 using CUE4Parse.UE4.Assets.Exports.Actor;
@@ -569,6 +673,7 @@ if (dumpAt < 0 && graphAt < 0)
     Directory.CreateDirectory(Path.Combine(output, "Sprites"));
     Directory.CreateDirectory(Path.Combine(output, "TileMaps"));
     Directory.CreateDirectory(Path.Combine(output, "Grooms"));
+    Directory.CreateDirectory(Path.Combine(output, "Gameplay"));
 }
 ObjectTypeRegistry.RegisterClass(typeof(USkeletalMeshEditorData));
 // CUE4Parse swallows an export it cannot deserialize and logs it, which leaves a mesh with no
@@ -606,6 +711,10 @@ if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
+// The provider mounts a loose directory under its top-level .uproject stem when one is present, else its
+// name. Compute that mount once from the same selection and reuse it for every gameplay selector below, so
+// a full project whose folder name differs from its .uproject stem still yields root-relative selectors.
+var looseMountPrefix = LooseMountPrefix(root);
 if (dataTextureKey is not null) dataTexturePackage = ResolveRgba16fPackage(provider, root, dataTextureSelector!);
 if (dumpAt >= 0)
 {
@@ -2927,6 +3036,58 @@ foreach (var key in provider.Files.Keys.Where(key =>
         if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
         exported++;
     }
+    // PRD-582: sockets, static-mesh simple collision and the PhysicsAsset reference for this package, plus every
+    // SoundCue graph. The importer reads Gameplay/*.json and Audio/*.cue.json and turns them into glTF nodes,
+    // extras and metre-scale sidecars.
+    var skeletalSockets = new List<object>();
+    var staticSockets = new List<object>();
+    object? collision = null;
+    string? physicsAssetRef = null;
+    foreach (var mesh in package.GetExports().OfType<USkeletalMesh>())
+    {
+        foreach (var socketIndex in mesh.Sockets)
+            if (socketIndex?.Load<USkeletalMeshSocket>() is { } socket) skeletalSockets.Add(GpSocket(socket, "mesh"));
+        if (mesh.Skeleton?.Load<USkeleton>() is { } skeleton)
+            foreach (var socketIndex in skeleton.Sockets)
+                if (socketIndex?.Load<USkeletalMeshSocket>() is { } socket) skeletalSockets.Add(GpSocket(socket, "skeleton"));
+        // Name the physics asset by its own package selector, not its bare asset name: two folders
+        // can hold a same-named asset and a bare name would attach the wrong one. Fall back to the bare
+        // name only when the resolved owner package is unavailable (the importer then reports ambiguity).
+        if (mesh.PhysicsAsset is { IsNull: false } physicsIndex)
+        {
+            var physicsObject = physicsIndex.Load<UPhysicsAsset>();
+            physicsAssetRef = physicsObject?.Owner?.Name is { Length: > 0 } owner ? GameplaySelector(owner) : physicsObject?.Name ?? physicsIndex.Name;
+        }
+    }
+    foreach (var mesh in package.GetExports().OfType<UStaticMesh>())
+    {
+        foreach (var socketIndex in mesh.Sockets ?? Array.Empty<FPackageIndex>())
+            if (socketIndex?.Load<UStaticMeshSocket>() is { } socket) staticSockets.Add(GpStaticSocket(socket));
+        if (mesh.BodySetup?.Load<UBodySetup>() is { } setup) collision = GpCollision(setup);
+    }
+    var physics = package.GetExports().OfType<UPhysicsAsset>().Select(GpPhysics).FirstOrDefault();
+    if (skeletalSockets.Count > 0 || staticSockets.Count > 0 || collision is not null || physicsAssetRef is not null || physics is not null)
+    {
+        var gameplay = new Dictionary<string, object?> { ["version"] = 1, ["package"] = GameplaySelector(key) };
+        if (skeletalSockets.Count > 0) gameplay["skeletalSockets"] = skeletalSockets;
+        if (staticSockets.Count > 0) gameplay["staticSockets"] = staticSockets;
+        if (collision is not null) gameplay["collision"] = collision;
+        if (physicsAssetRef is not null) gameplay["physicsAssetRef"] = physicsAssetRef;
+        if (physics is not null) gameplay["physics"] = physics;
+        var gameplayTarget = Path.Combine(output, "Gameplay", GameplaySelector(key) + ".json");
+        Directory.CreateDirectory(Path.GetDirectoryName(gameplayTarget)!);
+        await File.WriteAllTextAsync(gameplayTarget, JsonConvert.SerializeObject(gameplay, Formatting.Indented));
+        exported++;
+    }
+    foreach (var cue in package.GetExports().OfType<USoundCue>())
+    {
+        // Key the raw sidecar by the cue's full package selector so two same-named cues in different
+        // folders never overwrite one file. The importer reads this back and promotes collision-free.
+        var cueTarget = GpCueTarget(output, GameplaySelector(key), cue.Name);
+        Directory.CreateDirectory(Path.GetDirectoryName(cueTarget)!);
+        await File.WriteAllTextAsync(cueTarget, JsonConvert.SerializeObject(GpCue(cue), Formatting.Indented));
+        exported++;
+    }
 }
 foreach (var (failedMesh, failureDetail) in meshFailures)
     Console.Error.WriteLine($"threenative-mesh-failure\t{failedMesh}\t{failureDetail}");
@@ -4240,10 +4401,358 @@ static EGame ParseGame(string version) => version switch
     _ => throw new ArgumentException($"unsupported --engine version {version}")
 };
 
+// PRD-582 gameplay data. Every value is written in Unreal's own frame (centimetres, UE axes, FRotator
+// degrees); src/unreal/gameplay-data.ts converts it to metres and glTF space. Keeping the conversion in
+// TypeScript makes it unit-testable without compiling the converter.
+static object GpVec(FVector value) => new[] { value.X, value.Y, value.Z };
+static object GpRot(FRotator value) => new[] { value.Pitch, value.Yaw, value.Roll };
+static string GpText(FName name) => name.IsNone ? "" : name.Text;
+
+static object? GpShape(FKShapeElem shape)
+{
+    var result = new Dictionary<string, object?>();
+    switch (shape)
+    {
+        case FKSphereElem sphere:
+            result["type"] = "sphere"; result["center"] = GpVec(sphere.Center); result["radius"] = sphere.Radius; break;
+        case FKBoxElem box:
+            result["type"] = "box"; result["center"] = GpVec(box.Center); result["rotation"] = GpRot(box.Rotation);
+            result["x"] = box.X; result["y"] = box.Y; result["z"] = box.Z; break;
+        case FKSphylElem sphyl:
+            result["type"] = "capsule"; result["center"] = GpVec(sphyl.Center); result["rotation"] = GpRot(sphyl.Rotation);
+            result["radius"] = sphyl.Radius; result["length"] = sphyl.Length; break;
+        case FKTaperedCapsuleElem tapered:
+            // Keep both end radii: collapsing them to one radius loses the taper. The importer keeps
+            // radius0 and radius1, and only uses radius (the larger) for a coarse single-radius consumer.
+            result["type"] = "capsule"; result["center"] = GpVec(tapered.Center); result["rotation"] = GpRot(tapered.Rotation);
+            result["radius"] = Math.Max(tapered.Radius0, tapered.Radius1); result["radius0"] = tapered.Radius0; result["radius1"] = tapered.Radius1;
+            result["length"] = tapered.Length; break;
+        case FKConvexElem convex:
+            result["type"] = "convex"; result["center"] = GpVec(convex.Transform.Translation); result["rotation"] = GpRot(convex.Transform.Rotation.Rotator());
+            // The hull's own local scale is preserved, so the importer applies it instead of dropping it.
+            result["scale"] = GpVec(convex.Transform.Scale3D);
+            result["vertices"] = convex.VertexData.Select(vertex => GpVec(vertex)).ToArray();
+            result["indices"] = convex.IndexData; break;
+        default:
+            return null;
+    }
+    if (!shape.Name.IsNone) result["name"] = shape.Name.Text;
+    return result;
+}
+
+static List<object> GpAggShapes(FKAggregateGeom? aggregate)
+{
+    var shapes = new List<object>();
+    if (aggregate is null) return shapes;
+    foreach (var sphere in aggregate.SphereElems) if (GpShape(sphere) is { } shape) shapes.Add(shape);
+    foreach (var box in aggregate.BoxElems) if (GpShape(box) is { } shape) shapes.Add(shape);
+    foreach (var sphyl in aggregate.SphylElems) if (GpShape(sphyl) is { } shape) shapes.Add(shape);
+    foreach (var convex in aggregate.ConvexElems) if (GpShape(convex) is { } shape) shapes.Add(shape);
+    foreach (var tapered in aggregate.TaperedCapsuleElems) if (GpShape(tapered) is { } shape) shapes.Add(shape);
+    return shapes;
+}
+
+static object GpCollision(UBodySetup setup)
+{
+    var profile = setup.GetOrDefault<FName>("CollisionProfileName");
+    var result = new Dictionary<string, object?>
+    {
+        ["traceFlag"] = setup.GetOrDefault<ECollisionTraceFlag>("CollisionTraceFlag").ToString(),
+        ["shapes"] = GpAggShapes(setup.AggGeom),
+    };
+    if (!profile.IsNone && !string.IsNullOrEmpty(profile.Text)) result["profile"] = profile.Text;
+    return result;
+}
+
+static object GpFrame(FVector location, FVector primary, FVector secondary) => new Dictionary<string, object?>
+{
+    ["location"] = GpVec(location), ["primaryAxis"] = GpVec(primary), ["secondaryAxis"] = GpVec(secondary),
+};
+
+static object GpDamping(UBodySetup body)
+{
+    // FBodyInstance's constructor defaults LinearDamping to 0.01 (BodyInstance.cpp) and AngularDamping to 0.
+    // Unreal omits a tagged property whose value equals the native default, so an absent LinearDamping tag
+    // means 0.01, not the CUE4Parse fallback 0. A body whose whole DefaultInstance tag is absent still
+    // carries those native defaults, so read an empty fallback rather than reporting no damping at all.
+    var instance = body.TryGetValue<FStructFallback>(out var value, "DefaultInstance") && value is not null
+        ? value
+        : new FStructFallback();
+    return new Dictionary<string, object?>
+    {
+        ["linear"] = instance.GetOrDefault("LinearDamping", 0.01f),
+        ["angular"] = instance.GetOrDefault<float>("AngularDamping"),
+    };
+}
+
+// Unreal default-constructs the constraint's profile sub-structs: FLinearConstraint, FConeConstraint and
+// FTwistConstraint in ConstraintTypes.cpp, FConstraintDrive in ConstraintDrives.cpp, and
+// FConstraintProfileProperties in ConstraintInstance.cpp. Unreal omits a tagged property whose value
+// equals the native default, so CUE4Parse's struct fallback leaves the whole nested struct null. Rebuild
+// each native default here rather than dereference the null (crash) or drop the constraint.
+static FConstraintDrive GpDefaultDrive() => new FConstraintDrive(new FStructFallback());
+
+static FLinearConstraint GpDefaultLinear() => new FLinearConstraint(new FStructFallback());
+
+static FConeConstraint GpDefaultCone() => new FConeConstraint(new FStructFallback());
+
+static FTwistConstraint GpDefaultTwist() => new FTwistConstraint(new FStructFallback());
+
+static object GpDrive(FConstraintDrive? drive)
+{
+    var value = drive ?? GpDefaultDrive();
+    return new Dictionary<string, object?>
+    {
+        ["stiffness"] = value.Stiffness,
+        ["damping"] = value.Damping,
+        ["maxForce"] = value.MaxForce,
+        ["positionDrive"] = value.bEnablePositionDrive,
+        ["velocityDrive"] = value.bEnableVelocityDrive,
+    };
+}
+
+static object GpDrives(FConstraintProfileProperties? profile)
+{
+    var linear = profile?.LinearDrive;
+    var angular = profile?.AngularDrive;
+    return new Dictionary<string, object?>
+    {
+        ["linear"] = new Dictionary<string, object?>
+        {
+            ["positionTarget"] = GpVec(linear?.PositionTarget ?? default),
+            ["velocityTarget"] = GpVec(linear?.VelocityTarget ?? default),
+            ["x"] = GpDrive(linear?.XDrive), ["y"] = GpDrive(linear?.YDrive), ["z"] = GpDrive(linear?.ZDrive),
+        },
+        ["angular"] = new Dictionary<string, object?>
+        {
+            ["orientationTarget"] = GpRot(angular?.OrientationTarget ?? default),
+            ["angularVelocityTarget"] = GpVec(angular?.AngularVelocityTarget ?? default),
+            ["swing"] = GpDrive(angular?.SwingDrive), ["twist"] = GpDrive(angular?.TwistDrive), ["slerp"] = GpDrive(angular?.SlerpDrive),
+            ["mode"] = (angular?.AngularDriveMode ?? EAngularDriveMode.SLERP).ToString(),
+        },
+    };
+}
+
+// One constraint from its decoded DefaultInstance. The profile and each nested limit or drive can be null
+// (see GpDefault* above); every value falls back to its native Unreal default, so a real constraint is
+// never dropped and its count is preserved.
+static object GpConstraint(FConstraintInstance instance)
+{
+    var profile = instance.ProfileInstance;
+    var cone = profile?.ConeLimit ?? GpDefaultCone();
+    var twist = profile?.TwistLimit ?? GpDefaultTwist();
+    var limit = profile?.LinearLimit ?? GpDefaultLinear();
+    return new Dictionary<string, object?>
+    {
+        ["child"] = GpText(instance.ConstraintBone1),
+        ["parent"] = GpText(instance.ConstraintBone2),
+        ["childFrame"] = GpFrame(instance.Pos1, instance.PriAxis1, instance.SecAxis1),
+        ["parentFrame"] = GpFrame(instance.Pos2, instance.PriAxis2, instance.SecAxis2),
+        ["swing1Deg"] = cone.Swing1LimitDegrees,
+        ["swing2Deg"] = cone.Swing2LimitDegrees,
+        ["twistDeg"] = twist.TwistLimitDegrees,
+        ["linearLimit"] = limit.Limit,
+        ["motions"] = new Dictionary<string, object?>
+        {
+            ["linear"] = new[] { limit.XMotion.ToString(), limit.YMotion.ToString(), limit.ZMotion.ToString() },
+            ["swing1"] = cone.Swing1Motion.ToString(),
+            ["swing2"] = cone.Swing2Motion.ToString(),
+            ["twist"] = twist.TwistMotion.ToString(),
+        },
+        ["drives"] = GpDrives(profile),
+        ["disableCollision"] = profile?.bDisableCollision ?? false,
+    };
+}
+
+// UE4.4-saved physics assets name the body array "BodySetup"; the property was renamed to
+// "SkeletalBodySetups" in later engines. CUE4Parse reads only the new name, so the legacy array is read
+// here. Counts come from the package's own exports, so a legacy asset keeps all its bodies.
+static FPackageIndex[] GpBodySetups(UPhysicsAsset asset)
+{
+    if (asset.SkeletalBodySetups is { Length: > 0 }) return asset.SkeletalBodySetups;
+    return asset.GetOrDefault<FPackageIndex[]>("BodySetup", Array.Empty<FPackageIndex>());
+}
+
+// A legacy body exports as UBodySetup, not USkeletalBodySetup, so the bone name, physics type and trace
+// flag come from the tagged properties rather than the derived type's fields. AggGeom is typed on the base.
+static object GpBody(UBodySetup body)
+{
+    var entry = new Dictionary<string, object?>
+    {
+        ["bone"] = GpText(body.GetOrDefault<FName>("BoneName")),
+        ["physicsType"] = body.GetOrDefault<EPhysicsType>("PhysicsType").ToString(),
+        ["traceFlag"] = body.GetOrDefault<ECollisionTraceFlag>("CollisionTraceFlag").ToString(),
+        ["shapes"] = GpAggShapes(body.AggGeom),
+    };
+    entry["damping"] = GpDamping(body);
+    return entry;
+}
+
+static object GpPhysics(UPhysicsAsset asset)
+{
+    var bodies = new List<object>();
+    var missingBodies = 0;
+    foreach (var index in GpBodySetups(asset))
+    {
+        if (index?.Load<UBodySetup>() is not { } body) { missingBodies++; continue; }
+        bodies.Add(GpBody(body));
+    }
+    var constraints = new List<object>();
+    var missingConstraints = 0;
+    foreach (var index in asset.ConstraintSetup)
+    {
+        if (index?.Load<UPhysicsConstraintTemplate>() is not { } template) { missingConstraints++; continue; }
+        // A template whose DefaultInstance is absent is an unresolved sub-export: report it, never drop it.
+        if (template.DefaultInstance is not { } instance) { missingConstraints++; continue; }
+        constraints.Add(GpConstraint(instance));
+    }
+    var disabled = new List<object>();
+    foreach (var pair in asset.CollisionDisableTable ?? new Dictionary<FRigidBodyIndexPair, bool>())
+        if (pair.Value) disabled.Add(new[] { pair.Key.Indices[0], pair.Key.Indices[1] });
+    return new Dictionary<string, object?>
+    {
+        ["asset"] = asset.Name, ["bodies"] = bodies, ["constraints"] = constraints,
+        ["collisionDisabledPairs"] = disabled, ["missingBodies"] = missingBodies, ["missingConstraints"] = missingConstraints,
+    };
+}
+
+static object GpSocket(USkeletalMeshSocket socket, string source) => new Dictionary<string, object?>
+{
+    ["name"] = GpText(socket.SocketName), ["bone"] = GpText(socket.BoneName), ["source"] = source,
+    ["location"] = GpVec(socket.RelativeLocation), ["rotation"] = GpRot(socket.RelativeRotation), ["scale"] = GpVec(socket.RelativeScale),
+};
+
+static object GpStaticSocket(UStaticMeshSocket socket)
+{
+    var result = new Dictionary<string, object?>
+    {
+        ["name"] = GpText(socket.SocketName),
+        ["location"] = GpVec(socket.RelativeLocation), ["rotation"] = GpRot(socket.RelativeRotation), ["scale"] = GpVec(socket.RelativeScale),
+    };
+    if (!string.IsNullOrEmpty(socket.Tag)) result["tag"] = socket.Tag;
+    return result;
+}
+
+static object GpCueNode(UObject node, int depth)
+{
+    var result = new Dictionary<string, object?> { ["type"] = node.ExportType };
+    var parameters = new Dictionary<string, object?>();
+    switch (node)
+    {
+        // A UE5 editor SoundCue stores the wave as a soft path; the native SoundWave FPackageIndex CUE4Parse reads
+        // is bogus on those assets, so only SoundWaveAssetPtr is used here.
+        case USoundNodeWavePlayer player:
+            if (!string.IsNullOrEmpty(player.SoundWaveAssetPtr.AssetPathName.Text)) parameters["wave"] = player.SoundWaveAssetPtr.AssetPathName.Text;
+            break;
+        case USoundNodeSwitch soundSwitch:
+            parameters["intParameterName"] = GpText(soundSwitch.GetOrDefault<FName>("IntParameterName")); break;
+        case USoundNodeBranch branch:
+            parameters["boolParameterName"] = GpText(branch.GetOrDefault<FName>("BoolParameterName")); break;
+        case USoundNodeParamCrossFade crossFade:
+            parameters["paramName"] = GpText(crossFade.GetOrDefault<FName>("ParamName")); break;
+        case USoundNodeMixer mixer:
+            parameters["inputVolume"] = mixer.InputVolume; break;
+        case USoundNodeRandom random:
+            parameters["weights"] = random.Weights; break;
+    }
+    if (parameters.Count > 0) result["params"] = parameters;
+    if (node is USoundNode soundNode && depth < 256)
+    {
+        var children = new List<object>();
+        foreach (var child in soundNode.ChildNodes ?? Array.Empty<FPackageIndex>())
+            if (child?.Load<UObject>() is { } loaded) children.Add(GpCueNode(loaded, depth + 1));
+        if (children.Count > 0) result["children"] = children;
+    }
+    return result;
+}
+
+static object GpCue(USoundCue cue)
+{
+    var result = new Dictionary<string, object?>
+    {
+        ["name"] = cue.Name,
+        ["volume"] = cue.VolumeMultiplier,
+        ["pitch"] = cue.PitchMultiplier,
+        ["root"] = cue.FirstNode?.Load<UObject>() is { } first ? GpCueNode(first, 0) : null,
+    };
+    var attenuation = new Dictionary<string, object?>();
+    if (cue.TryGetValue<FPackageIndex>(out var settings, "AttenuationSettings") && settings is { IsNull: false } && !string.IsNullOrEmpty(settings.Name))
+        attenuation["asset"] = settings.Name;
+    if (cue.GetOrDefault<bool>("bOverrideAttenuation")) attenuation["overridden"] = true;
+    if (attenuation.Count > 0) result["attenuation"] = attenuation;
+    return result;
+}
+
+// The key prefix the pinned provider gives a loose directory (DefaultFileProvider.IterateFiles): the stem
+// of a top-level .uproject when one is present, the directory name otherwise. A full project's folder name
+// need not equal its .uproject stem (a Fab download folder does not), so the mount must follow the same
+// selection the provider made rather than the folder name. Root() refuses a .uproject for engine content,
+// so this is always the pack root's own mount. Factor it out so the compiled regression can call it.
+static string LooseMountPrefix(string root)
+{
+    var directory = new DirectoryInfo(Path.TrimEndingDirectorySeparator(root));
+    var uproject = directory.GetFiles("*.uproject", SearchOption.TopDirectoryOnly).FirstOrDefault();
+    return uproject is not null ? Path.GetFileNameWithoutExtension(uproject.Name) + "/" : directory.Name + "/";
+}
+
+// The provider key relative to a mount, without its package extension: the same selector the importer
+// uses (entry.selector), so Gameplay/<selector>.json maps back to the package it came from.
+static string GameplaySelectorUnder(string mountPrefix, string key)
+{
+    var normalized = key.Replace('\\', '/');
+    var relative = normalized.StartsWith(mountPrefix, StringComparison.Ordinal) ? normalized[mountPrefix.Length..] : normalized;
+    if (relative.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) return relative[..^".uasset".Length];
+    if (relative.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)) return relative[..^".umap".Length];
+    return relative;
+}
+
+// The selector of one key under the pack root's loose-provider mount, computed once at startup
+// (looseMountPrefix), so the gameplay sidecars and the physics asset reference both strip it.
+string GameplaySelector(string key) => GameplaySelectorUnder(looseMountPrefix, key);
+
+// The raw SoundCue sidecar path. The package selector is a path segment, so two same-named cues in
+// different folders never overwrite one file. Factor it out so the compiled regression can call it.
+static string GpCueTarget(string output, string selector, string name) =>
+    Path.Combine(output, "Audio", selector, name + ".cue.json");
+
 // The instance's own overrides, written as .props.txt blocks. A row is written only when CUE4Parse read it whole: a tagged row must
 // carry the tags it needs, and a binary row must come from a material whose read raised no logged failure. Presence is the tag
 // list: a missing tag is never read as 0, false or a default colour. The typed views of a tagged set are not used: GetParams
 // flattens the parent's values into the instance, and GetOrDefault cannot tell an absent field from a zero one.
+
+
+public sealed class PackageReadFailureSink(Dictionary<string, string> failures) : Serilog.Core.ILogEventSink
+{
+    public void Emit(Serilog.Events.LogEvent logEvent)
+    {
+        if (logEvent.Exception is null) return;
+        var match = System.Text.RegularExpressions.Regex.Match(logEvent.RenderMessage(), "^Could not read \"?(?<type>[^\"]+?)\"? named \"?(?<name>[^\"]+?)\"? correctly$");
+        if (!match.Success) return;
+        var root = logEvent.Exception;
+        while (root.InnerException is not null) root = root.InnerException;
+        var first = (root.Message.Split('\n')[0]).Trim();
+        failures.TryAdd(match.Groups["name"].Value, $"{match.Groups["type"].Value} {root.GetType().Name}: {first}");
+    }
+}
+
+public sealed class USkeletalMeshEditorData : UObject
+{
+    public override void Deserialize(FAssetArchive ar, long validPos)
+    {
+        base.Deserialize(ar, validPos);
+        var count = ar.Read<int>();
+        if (count < 0 || count > 128) throw new InvalidDataException($"Invalid editor LOD count {count}");
+        for (var index = 0; index < count; index++)
+        {
+            if (FEditorObjectVersion.Get(ar) >= FEditorObjectVersion.Type.SkeletalMeshBuildRefactor) ar.Position += 2;
+            _ = new FByteBulkData(ar);
+            ar.Position += 16;
+            _ = ar.ReadBoolean();
+        }
+    }
+}
+
+
 public static class MaterialOverrides
 {
     public sealed class Refusal(string message) : Exception(message);
@@ -4463,37 +4972,6 @@ public static class MaterialOverrides
     }
 
     static string Number(float value) => value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-}
-
-public sealed class PackageReadFailureSink(Dictionary<string, string> failures) : Serilog.Core.ILogEventSink
-{
-    public void Emit(Serilog.Events.LogEvent logEvent)
-    {
-        if (logEvent.Exception is null) return;
-        var match = System.Text.RegularExpressions.Regex.Match(logEvent.RenderMessage(), "^Could not read \"?(?<type>[^\"]+?)\"? named \"?(?<name>[^\"]+?)\"? correctly$");
-        if (!match.Success) return;
-        var root = logEvent.Exception;
-        while (root.InnerException is not null) root = root.InnerException;
-        var first = (root.Message.Split('\n')[0]).Trim();
-        failures.TryAdd(match.Groups["name"].Value, $"{match.Groups["type"].Value} {root.GetType().Name}: {first}");
-    }
-}
-
-public sealed class USkeletalMeshEditorData : UObject
-{
-    public override void Deserialize(FAssetArchive ar, long validPos)
-    {
-        base.Deserialize(ar, validPos);
-        var count = ar.Read<int>();
-        if (count < 0 || count > 128) throw new InvalidDataException($"Invalid editor LOD count {count}");
-        for (var index = 0; index < count; index++)
-        {
-            if (FEditorObjectVersion.Get(ar) >= FEditorObjectVersion.Type.SkeletalMeshBuildRefactor) ar.Position += 2;
-            _ = new FByteBulkData(ar);
-            ar.Position += 16;
-            _ = ar.ReadBoolean();
-        }
-    }
 }
 
 // PNGs that were re-encoded from a JPEG source payload, by reference, so NormalizeSourcePng can tell them apart.

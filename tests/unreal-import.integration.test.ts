@@ -1,6 +1,7 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -30,6 +31,7 @@ import {
   validateGlb,
 } from "../src/unreal/importer.js";
 import { ENGINE_CONTENT_DIR_ENV, ENGINE_CONTENT_VERSION_ENV } from "../src/unreal/engine-content.js";
+import { CUE4PARSE_SOURCE } from "../src/unreal/cue4parse-adapter.js";
 import { childEnvironment, resolveExecutable, ToolchainError } from "../src/unreal/toolchain.js";
 import { patchUncookedPackageVersionGates, UEVIEWER_SOURCE } from "../src/unreal/provision.js";
 import { runImportCli } from "../src/cli.js";
@@ -299,6 +301,22 @@ async function unrealWorkspace(options: {
     ...(options.emptyExports === undefined ? {} : { emptyExports: options.emptyExports }),
   });
 
+  // PRD-582: a mesh package with a `BodySetup` (the default fixture) is metadata-bearing, so the importer
+  // now also asks CUE4Parse for its gameplay sidecar. This stand-in answers `--version` and writes nothing,
+  // keeping the geometry and assertions of these UE Viewer tests unchanged.
+  const modern = join(root, "modern-converter");
+  await writeFile(
+    modern,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+if (process.argv.includes("--version")) { process.stdout.write("ThreeNativeConverter ${CUE4PARSE_SOURCE.version}\\n"); process.exit(0); }
+const out = process.argv[process.argv.indexOf("--export-dir") + 1];
+if (out) fs.mkdirSync(out, { recursive: true });
+process.exit(0);
+`,
+  );
+  await chmod(modern, 0o755);
+
   return {
     sourceDir: join(root, "pack"),
     outputDir: join(root, "game", "assets", "fab", "pack"),
@@ -306,6 +324,7 @@ async function unrealWorkspace(options: {
     environment: {
       ...process.env,
       THREENATIVE_UMODEL_PATH: umodel,
+      THREENATIVE_MODERN_UNREAL_CONVERTER_PATH: modern,
       THREENATIVE_UNREAL_CACHE_DIR: join(root, "cache"),
       THREENATIVE_TOOLCHAIN_AUTOINSTALL: "0",
     },
@@ -2262,7 +2281,17 @@ fs.writeFileSync(path.join(target, "SM_Rock.texture.json"), JSON.stringify({
 
   it("promotes an embedded Unreal Font as a collision-safe browser FontFace", async () => {
     const workspace = await unrealWorkspace({ classes: { SM_Rock: ["Font", "FontBulkData"] } });
-    const sourceFont = await readFile(join(process.cwd(), "node_modules/playwright-core/lib/vite/recorder/assets/codicon-DCmgc-ay.ttf"));
+    // The installed Playwright recorder ships a .ttf beside its bundled assets. Its hash changes between
+    // releases, so discover it by extension through Node's own resolution rather than a pinned filename,
+    // which also works when the test runs from a linked worktree with no local node_modules.
+    const require = createRequire(import.meta.url);
+    const assetsDir = join(dirname(require.resolve("playwright-core/package.json")), "lib/vite/recorder/assets");
+    const installedTtf = (await readdir(assetsDir).catch(() => [] as string[]))
+      .filter((name) => name.toLowerCase().endsWith(".ttf"))
+      .sort();
+    expect(installedTtf, `no installed .ttf under ${assetsDir}`).not.toHaveLength(0);
+    const sourceName = installedTtf.find((name) => name.toLowerCase().includes("codicon")) ?? installedTtf[0]!;
+    const sourceFont = await readFile(join(assetsDir, sourceName));
     await writeFile(join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset"), sourceFont);
 
     const report = await importUnrealDirectory({
@@ -3446,7 +3475,9 @@ describe("the CLI and the MCP tool are one code path", () => {
 
     const previous = process.env.THREENATIVE_UMODEL_PATH;
     const previousCache = process.env.THREENATIVE_UNREAL_CACHE_DIR;
+    const previousModern = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH;
     process.env.THREENATIVE_UMODEL_PATH = workspace.umodel;
+    process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH = workspace.environment.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH ?? "";
     process.env.THREENATIVE_UNREAL_CACHE_DIR = workspace.environment.THREENATIVE_UNREAL_CACHE_DIR ?? "";
     try {
       const result = await runImportCli([
@@ -3467,6 +3498,8 @@ describe("the CLI and the MCP tool are one code path", () => {
     } finally {
       if (previous === undefined) delete process.env.THREENATIVE_UMODEL_PATH;
       else process.env.THREENATIVE_UMODEL_PATH = previous;
+      if (previousModern === undefined) delete process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH;
+      else process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH = previousModern;
       if (previousCache === undefined) delete process.env.THREENATIVE_UNREAL_CACHE_DIR;
       else process.env.THREENATIVE_UNREAL_CACHE_DIR = previousCache;
     }
