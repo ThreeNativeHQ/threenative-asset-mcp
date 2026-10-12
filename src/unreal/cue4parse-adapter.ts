@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.88-animation",
+  version: "b4e95441+threenative.89-animation",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -532,6 +532,20 @@ diff --git a/CUE4Parse-Conversion/Legacy/AnimConverter.cs b/CUE4Parse-Conversion
 +                    CopyArray(out track.KeyScale, rawData[trackIndex].ScaleKeys);
                  }
              }
+diff --git a/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs b/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs
+--- a/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs
++++ b/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs
+@@ -23,6 +23,8 @@ namespace CUE4Parse.UE4.Assets.Exports.Animation
+         public FAnimCurveBase(FStructFallback data)
+         {
+-            CurveName = data.GetOrDefault<FName>(nameof(CurveName));
++            CurveName = data.TryGetValue<FName>(out var curveName, nameof(CurveName))
++                ? curveName
++                : data.GetOrDefault<CUE4Parse.UE4.Objects.Engine.Animation.FSmartName>("Name").DisplayName;
+             CurveTypeFlags = data.GetOrDefault<int>(nameof(CurveTypeFlags));
+         }
+     }
+
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">

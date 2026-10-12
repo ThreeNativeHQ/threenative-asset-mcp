@@ -110,6 +110,17 @@ using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.Engine.Animation;
 using CUE4Parse.UE4.Objects.UObject;
 
+if (args[0] == "curve-name")
+{
+    var legacyName = new FStructFallback(new List<FPropertyTag> { Tag("DisplayName", "NameProperty", new NameProperty(new FName("blendOrient1"))) });
+    var legacy = new FStructFallback(new List<FPropertyTag> { Tag("Name", "StructProperty", new StructProperty(new FScriptStruct(new FSmartName(legacyName)))) });
+    Console.WriteLine(new FFloatCurve(legacy).CurveName.Text);
+    legacy.Properties.Add(Tag("CurveName", "NameProperty", new NameProperty(new FName("modernName"))));
+    Console.WriteLine(new FFloatCurve(legacy).CurveName.Text);
+    legacy.Properties.RemoveAt(legacy.Properties.Count - 1);
+    legacy.Properties.Add(Tag("CurveName", "NameProperty", new NameProperty(new FName("None"))));
+    Console.WriteLine(new FFloatCurve(legacy).CurveName.Text);
+}
 if (args[0] == "curve-source")
 {
     FRawCurveTracks Tracks(int count) => new(new[] { new FFloatCurve { FloatCurve = new FRichCurve { Keys = Enumerable.Range(0, count).Select(i => new FRichCurveKey(i / 60f, 1f)).ToArray() } } });
@@ -222,6 +233,10 @@ ${functions.join("\n")}
 
   const run = (...args: string[]): string =>
     execFileSync(sdk, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
+
+  it("reads legacy SmartName curve identities while keeping an explicit modern CurveName", () => {
+    expect(run("curve-name").split("\n")).toEqual(["blendOrient1", "modernName", "None"]);
+  });
 
   it("preserves authored model curve keys ahead of reduced runtime curves and retains the UE4 raw fallback", () => {
     expect(run("curve-source").split("\n")).toEqual(["602", "602", "2"]);
