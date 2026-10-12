@@ -150,6 +150,22 @@ export const SLICES: readonly SlicePlan[] = [
     ),
     optional: true,
   },
+  // Optional PRD-599 slice: the same UE5.3 World Partition level, narrowed to its landscape
+  // proxies/components and their heightmap/material dependency closure. Keeping this separate
+  // from the PRD-598 actor slice prevents the real terrain gate from staging the whole pack.
+  {
+    id: "medieval-village-landscape-5.3",
+    listingId: "89efe5924d3d467c839449ab6ab52e7f",
+    artifactId: "MedievalGame_5.3",
+    engine: "UE_5.3",
+    route: "cue4parse",
+    targetClasses: ["Level", "Landscape", "LandscapeStreamingProxy", "LandscapeComponent"],
+    defaultFull: join(
+      homedir(),
+      ".cache/threenative-asset-mcp/fab-downloads/prd598/MedievalGame_5.3",
+    ),
+    optional: true,
+  },
 ];
 
 export function findSlice(id: string): SlicePlan {

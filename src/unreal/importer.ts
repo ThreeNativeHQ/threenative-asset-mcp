@@ -79,7 +79,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 121;
+export const IMPORTER_VERSION = 122;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -6605,7 +6605,7 @@ export async function importUnrealDirectory(
         }
         if (scene.landscapes > 0) {
           warnings.push(
-            `${scene.name} decoded ${scene.landscapeVertices} UE4 Landscape heightfield vertices across ${scene.landscapes} components; material ${scene.landscapes === 1 ? "identity is" : "identities are"} preserved with neutral PBR shading.`,
+            `${scene.name} decoded ${scene.landscapeVertices} Unreal Landscape heightfield vertices across ${scene.landscapes} components; material ${scene.landscapes === 1 ? "identity is" : "identities are"} preserved with neutral PBR shading.`,
           );
         }
         if (scene.approximatedAreaLights > 0) {

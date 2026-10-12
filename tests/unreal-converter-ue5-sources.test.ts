@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { NodeIO, type Accessor, type Primitive } from "@gltf-transform/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
+import { CUE4PARSE_PATCH, CUE4PARSE_PROGRAM } from "../src/unreal/cue4parse-adapter.js";
+import { parseUnrealSceneSource } from "../src/unreal/scenes.js";
 import { modernSdkExecutable, toolchainCacheDir } from "../src/unreal/provision.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
@@ -16,6 +17,8 @@ import { describeWithTools } from "./helpers/require-tool.js";
 //  - The UE 5.8 compact FName array in an FMeshDescription: the static mesh had no readable source model.
 //  - A UE4-saved MaterialInstanceConstant inside a UE5 artifact: CUE4Parse throws before filling the typed
 //    TextureParameterValues, so the instance exported no textures although its tagged properties hold them.
+//  - UE5 LandscapeComponent source art: serialized proxy components now become the same height/normal arrays
+//    consumed by the public scene contract, including the subsection edge mapping and component transform.
 // The decoders are pure functions in the embedded program. They are compiled on their own, against the .NET 10
 // SDK and SharpGLTF assemblies of the `modern-converter` test prerequisite, and run against synthetic data
 // encoded here from Unreal's documented tile rules. Without them the compiled suite skips locally and fails under CI=true.
@@ -300,6 +303,17 @@ describe("UE5 editor sources the converter decodes (program text)", () => {
     expect(CUE4PARSE_PROGRAM).toContain("ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles)");
     expect(CUE4PARSE_PROGRAM).toContain("ReadMeshDescriptionLayout(raw, compactNames: true, 0)");
   });
+
+  it("reads trailer-backed landscape source payloads through the pinned CUE4Parse fixes", () => {
+    expect(CUE4PARSE_PROGRAM).toContain("b4e95441+threenative.584.9");
+    expect(CUE4PARSE_PROGRAM).toContain("LandscapeComponents");
+    expect(CUE4PARSE_PROGRAM).toContain("TryReadLandscapeSourcePixels");
+    expect(CUE4PARSE_PROGRAM).toContain("DecodeLandscapeHeightfield");
+    expect(CUE4PARSE_PATCH).toContain("CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs");
+    expect(CUE4PARSE_PATCH).toContain("return span.IndexOfAnyExcept((byte) 0) >= 0;");
+    expect(CUE4PARSE_PATCH).toContain("CUE4Parse/UE4/Assets/FPackageTrailer.cs");
+    expect(CUE4PARSE_PATCH).toContain("entry.Identifier.Equals(id)");
+  });
 });
 
 // The glTF vertex-colour writer compiles against the SharpGLTF assemblies the provisioned converter ships.
@@ -339,6 +353,8 @@ describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled fr
     const functions = [
       "static (int BytesPerPixel, int SampleBytes) UeDeltaPixelLayout(",
       "static void UndoUeDelta(",
+      "static (float[] Heights, float[] Normals) DecodeLandscapeHeightfield(",
+      "static int LandscapeRoundToInt(",
       "static EditorMesh ReadMeshDescription(",
       "static EditorMesh ReadMeshDescriptionInEitherLayout(",
       "static void CheckActiveUvChannels(",
@@ -360,6 +376,8 @@ describeWithTools(["modern-converter"], "UE5 editor source decoders (compiled fr
       join(project, "Program.cs"),
       `using System.Runtime.InteropServices;
 using System.Text;
+using System.Globalization;
+using System.Text.Json;
 if (args[0] == "delta")
 {
     var data = File.ReadAllBytes(args[1]);
@@ -367,6 +385,19 @@ if (args[0] == "delta")
     var size = args[2].Split('x').Select(int.Parse).ToArray();
     UndoUeDelta(data, 0, size[0], size[1], bytesPerPixel, sampleBytes);
     File.WriteAllBytes(args[1] + ".out", data);
+}
+else if (args[0] == "landscape")
+{
+    var data = File.ReadAllBytes(args[1]);
+    var size = args[2].Split('x').Select(int.Parse).ToArray();
+    var componentSizeQuads = int.Parse(args[3]);
+    var subsectionSizeQuads = int.Parse(args[4]);
+    var numSubsections = int.Parse(args[5]);
+    var biasX = float.Parse(args[6], CultureInfo.InvariantCulture);
+    var biasY = float.Parse(args[7], CultureInfo.InvariantCulture);
+    UndoUeDelta(data, 0, size[0], size[1], 4, 1);
+    var decoded = DecodeLandscapeHeightfield(data, size[0], size[1], componentSizeQuads, subsectionSizeQuads, numSubsections, biasX, biasY);
+    Console.WriteLine(JsonSerializer.Serialize(new { componentSizeQuads, heights = decoded.Heights, normals = decoded.Normals }));
 }
 else if (args[0] == "sidecar")
 {
@@ -449,6 +480,94 @@ ${comparer}
     run("delta", file, `${width}x${height}`, format);
     const decoded = await readFile(`${file}.out`);
     expect(decoded.equals(pixels)).toBe(true);
+  });
+
+  it("decodes a BGRA8 UEDELTA landscape into the public height and normal arrays", async () => {
+    const textureWidth = 8;
+    const textureHeight = 8;
+    const componentSizeQuads = 4;
+    const subsectionSizeQuads = 2;
+    const numSubsections = 2;
+    const biasX = 1 / textureWidth;
+    const biasY = 2 / textureHeight;
+    const source = Buffer.alloc(textureWidth * textureHeight * 4);
+    const encodedHeightAt = (x: number, y: number): number => {
+      const value = 30_000 + y * 173 + x * 29;
+      const at = (y * textureWidth + x) * 4;
+      source[at] = 191; // normal X: 2*B/255 - 1
+      source[at + 3] = 64; // normal Y: 2*A/255 - 1
+      source[at + 1] = value & 0xff;
+      source[at + 2] = value >>> 8;
+      return value;
+    };
+    for (let y = 0; y < textureHeight; y++) for (let x = 0; x < textureWidth; x++) encodedHeightAt(x, y);
+    const file = join(root, "landscape-bgra8-uedelta.bin");
+    await writeFile(file, encodeUeDelta(source, textureWidth, textureHeight, 4, 1));
+    const decoded = JSON.parse(run(
+      "landscape",
+      file,
+      `${textureWidth}x${textureHeight}`,
+      `${componentSizeQuads}`,
+      `${subsectionSizeQuads}`,
+      `${numSubsections}`,
+      `${biasX}`,
+      `${biasY}`,
+    )) as { componentSizeQuads: number; heights: number[]; normals: number[] };
+
+    const atlasCoordinate = (coordinate: number): number => {
+      if (coordinate === 0) return 0;
+      const previous = coordinate - 1;
+      return Math.floor(previous / subsectionSizeQuads) * (subsectionSizeQuads + 1) + (previous % subsectionSizeQuads) + 1;
+    };
+    const atlasOffsetX = Math.round(biasX * textureWidth);
+    const atlasOffsetY = Math.round(biasY * textureHeight);
+    const expectedHeights: number[] = [];
+    const expectedNormals: number[] = [];
+    const normalX = 2 * 191 / 255 - 1;
+    const normalY = 2 * 64 / 255 - 1;
+    const normalZ = Math.sqrt(Math.max(1 - normalX * normalX - normalY * normalY, 0));
+    for (let y = 0; y <= componentSizeQuads; y++) {
+      for (let x = 0; x <= componentSizeQuads; x++) {
+        const textureX = atlasOffsetX + atlasCoordinate(x);
+        const textureY = atlasOffsetY + atlasCoordinate(y);
+        expectedHeights.push((encodedHeightAt(textureX, textureY) - 32768) / 128);
+        expectedNormals.push(normalX, normalY, normalZ);
+      }
+    }
+    expect(decoded.componentSizeQuads).toBe(componentSizeQuads);
+    decoded.heights.forEach((value, index) => expect(value).toBeCloseTo(expectedHeights[index]!, 5));
+    decoded.normals.forEach((value, index) => expect(value).toBeCloseTo(expectedNormals[index]!, 6));
+    // x=2 and x=3 cross a two-quad subsection boundary. A dense rectangle reader samples the wrong atlas columns.
+    expect(decoded.heights[2]).toBeCloseTo(expectedHeights[2]!, 5);
+    expect(decoded.heights[3]).toBeCloseTo(expectedHeights[3]!, 5);
+    expect(decoded.heights[2]).not.toBe(decoded.heights[3]);
+
+    const scene = parseUnrealSceneSource(JSON.stringify({
+      format: "threenative-unreal-scene-source",
+      version: 1,
+      mapName: "SyntheticLandscape",
+      sourceFile: "Synthetic.umap",
+      actors: [],
+      texts: [],
+      omittedActors: [],
+      instanceGroups: [],
+      landscapes: [{
+        name: "LandscapeProxy/LandscapeComponent",
+        materialName: "Landscape_Default",
+        location: { x: 0, y: 0, z: 0 },
+        rotation: { pitch: 0, yaw: 0, roll: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+        sizeQuads: componentSizeQuads,
+        heights: decoded.heights,
+        normals: decoded.normals,
+      }],
+      lights: [],
+      blueprintComponents: 0,
+      camera: { hasCamera: false, location: { x: 0, y: 0, z: 0 }, rotation: { pitch: 0, yaw: 0, roll: 0 } },
+    }));
+    expect(scene.landscapes).toHaveLength(1);
+    scene.landscapes![0]!.heights.forEach((value, index) => expect(value).toBeCloseTo(expectedHeights[index]!, 5));
+    expect(scene.landscapes![0]!.normals).toEqual(decoded.normals);
   });
 
   it("decodes a mesh description in the established FName layout", async () => {
