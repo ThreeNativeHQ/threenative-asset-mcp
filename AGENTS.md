@@ -104,7 +104,7 @@ Each of these broke on a clean Debian 13 amd64 host on 2026-10-07:
   reproduce it, so a section with no base colour asks the graph baker (`src/unreal/graph-baker.ts`,
   PRD-538): CUE4Parse dumps the graph, `material-graph.ts` evaluates a closed node set and bakes a
   base-colour PNG (`source: "graph"`). Anything it cannot evaluate (e.g. `ReflectionVectorWS` feeding a
-  cubemap lookup, `CameraVectorWS`, a `CollectionParameter`) stays on the neutral fallback and is named under the section's `graph`.
+  cubemap lookup, `CameraVectorWS`) stays on the neutral fallback and is named under the section's `graph`.
   Engine content functions are not in the pack, so a bake that relies on them is `heuristic`. View-dependent
   nodes stand in as recorded approximations: `Fresnel` as its mean over a sphere's visible surface,
   `DepthFade` as fully faded in, `TwoSidedSign` as +1 (front face), `Time` as 0 and `Panner` unpanned (one

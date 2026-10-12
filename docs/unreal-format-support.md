@@ -83,8 +83,8 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | `Material`, `MaterialInstanceConstant` | UE4 and UE5 | **Verified** | `UnrealMaterialLibrary.glb` | Sweep packs: Temperate, KUBIKOS, Kite, Soul Cave, Hornbeam, Paladin. Per-pack parity differs, see below. |
 | Material graph colour baking | UE4 and UE5 | Implemented | base-colour PNG (`source: "graph"`) | Closed node set. Fresnel, DepthFade, Time and similar nodes are approximations. |
 | `MaterialFunction`, `MaterialFunctionInstance` | any | Implemented | read through the graph | Engine content functions are not in the pack, so such a bake is `heuristic`. |
-| `MaterialParameterCollection` | any | **Missing** | none | `CollectionParameter` stays on the neutral fallback. |
-| Material nodes the baker cannot evaluate | any | **Missing** | neutral fallback | `ReflectionVectorWS` into a cubemap, `CameraVectorWS`, `Custom` HLSL pins, `SetMaterialAttributes` routing, `BoundingBoxBased`, `TenLayerBlend`. See `IMPORTER-REMAINING.md`. |
+| `MaterialParameterCollection` | any | Implemented | evaluated at the collection default in graph bakes | Evidence: `src/unreal/cue4parse-adapter.ts` (default read, ~line 1421), `src/unreal/material-graph.ts` (`CollectionParameter`, ~line 1128), `tests/unreal-material-graph.test.ts` `describe("CollectionParameter")`. Gameplay changes to the collection are not applied. No real pack named. |
+| Material nodes the baker cannot evaluate | any | **Missing** | neutral fallback | `ReflectionVectorWS` into a cubemap, `CameraVectorWS`, `Custom` HLSL pins. See `IMPORTER-REMAINING.md`. |
 | Layered, subsurface, hair and eye shading models | any | Reported | PBR approximation | Section `limitations` name what was dropped. |
 | `SubsurfaceProfile` | any | **Missing** | none | |
 | `TextureRenderTarget*`, `CanvasRenderTarget2D` | any | **Missing** | none | Runtime targets, usually nothing to export. |
@@ -160,16 +160,21 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | Pak and IoStore, encrypted | **Missing** | Needs user-supplied keys. Never reported as a complete conversion. |
 | Cooked UE5 with unversioned properties | Implemented | Needs one matching `.usmap` file beside the tree. |
 
+## Done (feature epic)
+
+| PRD | Covers |
+|---|---|
+| [PRD-581](PRDs/done/unreal-feature-coverage/001-fab-feature-test-corpus.md) | Small, non-redundant Fab test corpus (slices) for the PRDs below |
+| [PRD-582](PRDs/done/unreal-feature-coverage/002-sockets-collision-soundcue.md) | Sockets, StaticMesh collision, PhysicsAsset, SoundCue |
+| [PRD-583](PRDs/done/unreal-feature-coverage/003-animation-logic.md) | UE5 clips, BlendSpace, AimOffset, AnimMontage, AnimComposite, clip notifies and curves |
+| [PRD-584](PRDs/done/unreal-feature-coverage/004-vfx-descriptors.md) | Cascade and Niagara descriptors (P3) |
+
+CUE4Parse decodes every class in PRD-582 and PRD-583 on UE4 and UE5. UE Viewer decodes none of them.
+
 ## Planned work
 
 | PRD | Covers |
 |---|---|
-| [PRD-581](PRDs/unreal-feature-coverage/001-fab-feature-test-corpus.md) | Small, non-redundant Fab test corpus (slices) for the PRDs below |
-| [PRD-582](PRDs/unreal-feature-coverage/002-sockets-collision-soundcue.md) | Sockets, StaticMesh collision, PhysicsAsset, SoundCue |
-| [PRD-583](PRDs/unreal-feature-coverage/003-animation-logic.md) | UE5 clips, BlendSpace, AimOffset, AnimMontage, AnimComposite, clip notifies and curves |
-| [PRD-584](PRDs/unreal-feature-coverage/004-vfx-descriptors.md) | Cascade and Niagara descriptors (P3) |
-
-CUE4Parse decodes every class in PRD-582 and PRD-583 on UE4 and UE5. UE Viewer decodes none of them.
 
 ## Visual fidelity (separate claim)
 
@@ -185,7 +190,7 @@ A format row can be Verified while the picture is still wrong. Current state:
 
 These need a check against a real pack or the engine source before a row can move:
 
-1. Settled 2026-10-11: UE5 `AnimSequence` is Missing (see the row above and PRD-583).
+1. UE5 `AnimSequence` is Verified for UE5.0–5.5 and Reported for UE5.6+ (see the rows above). Check the UE5.6+ ControlRig or Sequencer model against a real pack.
 2. Whether UE5 landscapes inside levels convert. The importer marks standalone `LandscapeComponent` unsupported.
 3. Which plugin classes (Chaos, Control Rig, MetaSound, Sequencer) exist as Fab content. They are listed from
    general engine knowledge. The sparse checkout holds only part of `Engine/Source/Runtime/Engine`, so the

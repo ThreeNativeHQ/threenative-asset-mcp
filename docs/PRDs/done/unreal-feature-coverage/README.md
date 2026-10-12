@@ -1,5 +1,7 @@
 # Epic: Unreal feature coverage
 
+**Status:** DONE — all four PRDs (001–004) merged 2026-10-12 (PRs #43–#46).
+
 Imports the Unreal classes that `docs/unreal-format-support.md` lists as Missing or Reported. Each step
 updates that ledger.
 

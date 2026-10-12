@@ -1,6 +1,6 @@
 # PRD-584 — Export Cascade and Niagara effects as portable descriptors
 
-**Status:** IN PROGRESS
+**Status:** DONE — AC-1 to AC-7 proved on 2026-10-12 (importer 117, converter `b4e95441+threenative.584.4`). Merged 2026-10-12 (PR #46, merge commit `54bb3c5`).
 **Priority:** P3 — optional: AC-1 to AC-6 give no visible result until `threenative-engine` builds a particle runtime, and João flagged VFX as skippable on 2026-10-11.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new effects module (+2), crosses the .NET converter / Node importer boundary (+2); risk override: none
 **Owner:** João
@@ -82,7 +82,7 @@ A `Curve` is `{keys: [{t, v, arriveTangent, leaveTangent, interp}]}` and a `Rang
 - [x] AC-6 [local]: The ledger rows for Cascade and Niagara move from Reported to Implemented (descriptor) with evidence. Repository gates are green: `npm run typecheck`, `npm run test:leaks` with default workers, and `npx vitest run tests/mcp-smoke.test.ts`. proof: those commands and the ledger diff — Evidence: GREEN 2026-10-12 on the rebased head (importer 117, executed private converter `b4e95441+threenative.584.4`): ledger rows moved to Verified (descriptor) with the executed corpus run; corpus gates `cascade`, `cascade-distributions` and `niagara` pass on Soul: Cave 4.18 and VTOL 5.4; `npm run typecheck` clean, `npm run test:leaks` (147 files, 2693 tests, leak-gate clean) and `npx vitest run tests/mcp-smoke.test.ts` (15 tests) green.
 - [x] AC-7 [local]: Every PR attaches before/after sheets per the epic `README.md` evidence rule. Before: nothing, because the class is skipped. After: a preview sheet of each system at 4 times, drawn by a minimal sprite-only preview in the tile renderer from the descriptor, beside Unreal's editor thumbnail of the system where the package has one. proof: the PR comment with sheets — Evidence: GREEN 2026-10-12: four sheets (1 Cascade, 3 Niagara) inspected by eye, in the PR #46 comment (assets branch `feat/unreal-effects-data-assets`). Before is a blank anchor because the base writes no descriptor; the judge fails every after tile as a speck (0.01% to 0.2% coverage) because the sprite preview draws a few cards, and this is stated in the comment.
 
-## Blocked on
+## Follow-up (not a blocker)
 
 - A Three.js particle runtime that plays these descriptors — unblocked by a separate `threenative-engine` PRD (not filed). Until it exists, the AC-7 sprite preview is the only visual check, and it approximates the effect, not Unreal's simulation.
 
@@ -111,7 +111,7 @@ A `Curve` is `{keys: [{t, v, arriveTangent, leaveTangent, interp}]}` and a `Rang
 ## Execution Phases
 
 #### Phase 1: Cascade descriptors and distributions
-**Status:** IN PROGRESS — shared schema, corrected distribution decoder, Node Cascade builder (`buildCascadeDescriptor`), the adapter `--dump-effects` tagged writer, and the importer wiring (writes `Effects/<system>.cascade.json`, lists it under `effects`) have landed. The real bounded run on the Soul: Cave slice emits one descriptor with the emitter count, material, spawn, lifetime and ordered unmapped-module limitations, and the real-corpus AC-2 enumeration passes (14/17 within 1%; the 3 particle-parameters carry a source-backed no-owner default and an unbaked table). Remaining: the AC-6 leak/smoke gates.
+**Status:** DONE — shared schema, corrected distribution decoder, Node Cascade builder (`buildCascadeDescriptor`), the adapter `--dump-effects` tagged writer, and the importer wiring (writes `Effects/<system>.cascade.json`, lists it under `effects`) have landed. The real bounded run on the Soul: Cave slice emits one descriptor with the emitter count, material, spawn, lifetime and ordered unmapped-module limitations, and the real-corpus AC-2 enumeration passes (14/17 within 1%; the 3 particle-parameters carry a source-backed no-owner default and an unbaked table). AC-6 gates passed on 2026-10-12.
 **Files:** `src/unreal/cue4parse-adapter.ts` (Cascade writer, distribution reader), `src/unreal/effects-schema.ts` (new), `src/unreal/effects-dump.ts` (new), `src/unreal/importer.ts` (classification and skip list), `tests/unreal-effects.test.ts` (new).
 **Implementation:**
 1. Probe a Soul: Cave system with the CUE4Parse generic reader first, to confirm the tagged layout.
@@ -121,7 +121,7 @@ A `Curve` is `{keys: [{t, v, arriveTangent, leaveTangent, interp}]}` and a `Rang
 **Verification:** AC-1, AC-2, AC-5.
 
 #### Phase 2: Niagara descriptors, levels, ledger and gates
-**Status:** IN PROGRESS — the Node Niagara builder (`buildNiagaraDescriptor`), the `.niagara.json` writer, and the importer classification (Niagara packages now leave the skipped list, `IMPORTER_VERSION` 117) have landed. The rebuilt `.584` converter and the real bounded VTOL run write all 3 systems, and the level/Blueprint `omittedActors` pointer with importer reconciliation has landed (AC-4). Remaining: the AC-6 leak/smoke gates and the AC-7 sheets.
+**Status:** DONE — the Node Niagara builder (`buildNiagaraDescriptor`), the `.niagara.json` writer, and the importer classification (Niagara packages now leave the skipped list, `IMPORTER_VERSION` 117) have landed. The rebuilt `.584` converter and the real bounded VTOL run write all 3 systems, and the level/Blueprint `omittedActors` pointer with importer reconciliation has landed (AC-4). AC-6 gates and AC-7 sheets passed on 2026-10-12.
 **Files:** `src/unreal/effects-schema.ts` (Niagara mapping), `src/unreal/effects-dump.ts` (`.niagara.json`), `src/unreal/cue4parse-adapter.ts` (effect-package admission and `omittedActors` pointer), `src/unreal/importer.ts` (`EFFECT_CLASSES`, effect reconciliation, `IMPORTER_VERSION` 117), `src/unreal/scenes.ts` (`effectDescriptors` reconciliation), `tests/unreal-effects.test.ts`.
 **Implementation:** Read the emitter handles and versioned data, the renderer properties, and `RapidIterationParameters`. Map the known modules by script path.
 **Verification:** AC-3, AC-4, AC-6, AC-7 (sheets for every phase's PR).
