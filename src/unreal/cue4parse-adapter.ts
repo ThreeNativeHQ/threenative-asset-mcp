@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.81",
+  version: "b4e95441+threenative.83",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -291,6 +291,83 @@ diff --git a/CUE4Parse/UE4/Versions/VersionUtils.cs b/CUE4Parse/UE4/Versions/Ver
 +               versions.GetVersion(key) == -1;
 +    }
  }
+diff --git a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintBaseParams.cs b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintBaseParams.cs
+index b8630da..f226cc2 100644
+--- a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintBaseParams.cs
++++ b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintBaseParams.cs
+@@ -14,8 +14,8 @@ public class FConstraintBaseParams
+     
+     public FConstraintBaseParams(FStructFallback fallback)
+     {
+-        Stiffness = fallback.GetOrDefault<float>(nameof(Stiffness));
+-        Damping = fallback.GetOrDefault<float>(nameof(Damping));
++        Stiffness = fallback.GetOrDefault(nameof(Stiffness), 50f);
++        Damping = fallback.GetOrDefault(nameof(Damping), 1f);
+         Restitution = fallback.GetOrDefault<float>(nameof(Restitution));
+         ContactDistance = fallback.GetOrDefault<float>(nameof(ContactDistance));
+         bSoftConstraint = fallback.GetOrDefault<bool>(nameof(bSoftConstraint));
+@@ -33,10 +33,11 @@ public class FLinearConstraint : FConstraintBaseParams
+     
+     public FLinearConstraint(FStructFallback fallback) : base(fallback)
+     {
+-        Limit = fallback.GetOrDefault<float>(nameof(Limit));
+-        XMotion = fallback.GetOrDefault<ELinearConstraintMotion>(nameof(XMotion));
+-        YMotion = fallback.GetOrDefault<ELinearConstraintMotion>(nameof(YMotion));
+-        ZMotion = fallback.GetOrDefault<ELinearConstraintMotion>(nameof(ZMotion));
++        // FLinearConstraint's native default (ConstraintTypes.cpp): a zero limit on all axes Locked.
++        Limit = fallback.GetOrDefault(nameof(Limit), 0f);
++        XMotion = fallback.GetOrDefault(nameof(XMotion), ELinearConstraintMotion.LCM_Locked);
++        YMotion = fallback.GetOrDefault(nameof(YMotion), ELinearConstraintMotion.LCM_Locked);
++        ZMotion = fallback.GetOrDefault(nameof(ZMotion), ELinearConstraintMotion.LCM_Locked);
+     }
+ }
+ 
+@@ -59,10 +60,11 @@ public class FConeConstraint  : FConstraintBaseParams
+     
+     public FConeConstraint(FStructFallback fallback) : base(fallback)
+     {
+-        Swing1LimitDegrees = fallback.GetOrDefault<float>(nameof(Swing1LimitDegrees));
+-        Swing2LimitDegrees = fallback.GetOrDefault<float>(nameof(Swing2LimitDegrees));
+-        Swing1Motion = fallback.GetOrDefault<EAngularConstraintMotion>(nameof(Swing1Motion));
+-        Swing2Motion = fallback.GetOrDefault<EAngularConstraintMotion>(nameof(Swing2Motion));
++        // FConeConstraint's native default: 45 degrees on both swings, Free motion.
++        Swing1LimitDegrees = fallback.GetOrDefault(nameof(Swing1LimitDegrees), 45f);
++        Swing2LimitDegrees = fallback.GetOrDefault(nameof(Swing2LimitDegrees), 45f);
++        Swing1Motion = fallback.GetOrDefault(nameof(Swing1Motion), EAngularConstraintMotion.ACM_Free);
++        Swing2Motion = fallback.GetOrDefault(nameof(Swing2Motion), EAngularConstraintMotion.ACM_Free);
+     }
+ }
+ 
+@@ -75,8 +77,9 @@ public class FTwistConstraint  : FConstraintBaseParams
+     
+     public FTwistConstraint(FStructFallback fallback) : base(fallback)
+     {
+-        TwistLimitDegrees = fallback.GetOrDefault<float>(nameof(TwistLimitDegrees));
+-        TwistMotion = fallback.GetOrDefault<EAngularConstraintMotion>(nameof(TwistMotion));
++        // FTwistConstraint's native default: 45 degrees, Free motion.
++        TwistLimitDegrees = fallback.GetOrDefault(nameof(TwistLimitDegrees), 45f);
++        TwistMotion = fallback.GetOrDefault(nameof(TwistMotion), EAngularConstraintMotion.ACM_Free);
+     }
+ }
+ 
+diff --git a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintDrive.cs b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintDrive.cs
+index c9628ca..c54a734 100644
+--- a/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintDrive.cs
++++ b/CUE4Parse/UE4/Objects/PhysicsEngine/FConstraintDrive.cs
+@@ -15,8 +15,11 @@ public class FConstraintDrive
+     
+     public FConstraintDrive(FStructFallback fallback)
+     {
+-        Stiffness = fallback.GetOrDefault<float>(nameof(Stiffness));
+-        Damping = fallback.GetOrDefault<float>(nameof(Damping));
++        // Unreal's FConstraintDrive constructor (ConstraintDrives.cpp) defaults Stiffness to 50 and
++        // Damping to 1. A saved drive can carry only one tag (for example bEnablePositionDrive), so an
++        // omitted Stiffness/Damping must read the native default, not CUE4Parse's 0.
++        Stiffness = fallback.GetOrDefault(nameof(Stiffness), 50f);
++        Damping = fallback.GetOrDefault(nameof(Damping), 1f);
+         MaxForce = fallback.GetOrDefault<float>(nameof(MaxForce));
+         bEnablePositionDrive = fallback.GetOrDefault<bool>(nameof(bEnablePositionDrive));
+         bEnableVelocityDrive = fallback.GetOrDefault<bool>(nameof(bEnableVelocityDrive));
 diff --git a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
 --- a/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
 +++ b/CUE4Parse/UE4/Versions/FUE5MainStreamObjectVersion.cs
@@ -4353,91 +4430,139 @@ static object GpFrame(FVector location, FVector primary, FVector secondary) => n
     ["location"] = GpVec(location), ["primaryAxis"] = GpVec(primary), ["secondaryAxis"] = GpVec(secondary),
 };
 
-static object? GpDamping(USkeletalBodySetup body)
+static object? GpDamping(UBodySetup body)
 {
     if (!body.TryGetValue<FStructFallback>(out var instance, "DefaultInstance") || instance is null) return null;
+    // FBodyInstance's constructor defaults LinearDamping to 0.01 (BodyInstance.cpp) and AngularDamping to 0.
+    // Unreal omits a tagged property whose value equals the native default, so an absent LinearDamping tag
+    // means 0.01, not the CUE4Parse fallback 0.
     return new Dictionary<string, object?>
     {
-        ["linear"] = instance.GetOrDefault<float>("LinearDamping"),
+        ["linear"] = instance.GetOrDefault("LinearDamping", 0.01f),
         ["angular"] = instance.GetOrDefault<float>("AngularDamping"),
     };
 }
 
-static object GpDrive(FConstraintDrive drive) => new Dictionary<string, object?>
-{
-    ["stiffness"] = drive.Stiffness,
-    ["damping"] = drive.Damping,
-    ["maxForce"] = drive.MaxForce,
-    ["positionDrive"] = drive.bEnablePositionDrive,
-    ["velocityDrive"] = drive.bEnableVelocityDrive,
-};
+// Unreal default-constructs the constraint's profile sub-structs: FLinearConstraint, FConeConstraint and
+// FTwistConstraint in ConstraintTypes.cpp, FConstraintDrive in ConstraintDrives.cpp, and
+// FConstraintProfileProperties in ConstraintInstance.cpp. Unreal omits a tagged property whose value
+// equals the native default, so CUE4Parse's struct fallback leaves the whole nested struct null. Rebuild
+// each native default here rather than dereference the null (crash) or drop the constraint.
+static FConstraintDrive GpDefaultDrive() => new FConstraintDrive(new FStructFallback());
 
-static object GpDrives(FConstraintProfileProperties profile)
+static FLinearConstraint GpDefaultLinear() => new FLinearConstraint(new FStructFallback());
+
+static FConeConstraint GpDefaultCone() => new FConeConstraint(new FStructFallback());
+
+static FTwistConstraint GpDefaultTwist() => new FTwistConstraint(new FStructFallback());
+
+static object GpDrive(FConstraintDrive? drive)
 {
-    var linear = profile.LinearDrive;
-    var angular = profile.AngularDrive;
+    var value = drive ?? GpDefaultDrive();
+    return new Dictionary<string, object?>
+    {
+        ["stiffness"] = value.Stiffness,
+        ["damping"] = value.Damping,
+        ["maxForce"] = value.MaxForce,
+        ["positionDrive"] = value.bEnablePositionDrive,
+        ["velocityDrive"] = value.bEnableVelocityDrive,
+    };
+}
+
+static object GpDrives(FConstraintProfileProperties? profile)
+{
+    var linear = profile?.LinearDrive;
+    var angular = profile?.AngularDrive;
     return new Dictionary<string, object?>
     {
         ["linear"] = new Dictionary<string, object?>
         {
-            ["positionTarget"] = GpVec(linear.PositionTarget),
-            ["velocityTarget"] = GpVec(linear.VelocityTarget),
-            ["x"] = GpDrive(linear.XDrive), ["y"] = GpDrive(linear.YDrive), ["z"] = GpDrive(linear.ZDrive),
+            ["positionTarget"] = GpVec(linear?.PositionTarget ?? default),
+            ["velocityTarget"] = GpVec(linear?.VelocityTarget ?? default),
+            ["x"] = GpDrive(linear?.XDrive), ["y"] = GpDrive(linear?.YDrive), ["z"] = GpDrive(linear?.ZDrive),
         },
         ["angular"] = new Dictionary<string, object?>
         {
-            ["orientationTarget"] = GpRot(angular.OrientationTarget),
-            ["angularVelocityTarget"] = GpVec(angular.AngularVelocityTarget),
-            ["swing"] = GpDrive(angular.SwingDrive), ["twist"] = GpDrive(angular.TwistDrive), ["slerp"] = GpDrive(angular.SlerpDrive),
-            ["mode"] = angular.AngularDriveMode.ToString(),
+            ["orientationTarget"] = GpRot(angular?.OrientationTarget ?? default),
+            ["angularVelocityTarget"] = GpVec(angular?.AngularVelocityTarget ?? default),
+            ["swing"] = GpDrive(angular?.SwingDrive), ["twist"] = GpDrive(angular?.TwistDrive), ["slerp"] = GpDrive(angular?.SlerpDrive),
+            ["mode"] = (angular?.AngularDriveMode ?? EAngularDriveMode.SLERP).ToString(),
         },
     };
+}
+
+// One constraint from its decoded DefaultInstance. The profile and each nested limit or drive can be null
+// (see GpDefault* above); every value falls back to its native Unreal default, so a real constraint is
+// never dropped and its count is preserved.
+static object GpConstraint(FConstraintInstance instance)
+{
+    var profile = instance.ProfileInstance;
+    var cone = profile?.ConeLimit ?? GpDefaultCone();
+    var twist = profile?.TwistLimit ?? GpDefaultTwist();
+    var limit = profile?.LinearLimit ?? GpDefaultLinear();
+    return new Dictionary<string, object?>
+    {
+        ["child"] = GpText(instance.ConstraintBone1),
+        ["parent"] = GpText(instance.ConstraintBone2),
+        ["childFrame"] = GpFrame(instance.Pos1, instance.PriAxis1, instance.SecAxis1),
+        ["parentFrame"] = GpFrame(instance.Pos2, instance.PriAxis2, instance.SecAxis2),
+        ["swing1Deg"] = cone.Swing1LimitDegrees,
+        ["swing2Deg"] = cone.Swing2LimitDegrees,
+        ["twistDeg"] = twist.TwistLimitDegrees,
+        ["linearLimit"] = limit.Limit,
+        ["motions"] = new Dictionary<string, object?>
+        {
+            ["linear"] = new[] { limit.XMotion.ToString(), limit.YMotion.ToString(), limit.ZMotion.ToString() },
+            ["swing1"] = cone.Swing1Motion.ToString(),
+            ["swing2"] = cone.Swing2Motion.ToString(),
+            ["twist"] = twist.TwistMotion.ToString(),
+        },
+        ["drives"] = GpDrives(profile),
+        ["disableCollision"] = profile?.bDisableCollision ?? false,
+    };
+}
+
+// UE4.4-saved physics assets name the body array "BodySetup"; the property was renamed to
+// "SkeletalBodySetups" in later engines. CUE4Parse reads only the new name, so the legacy array is read
+// here. Counts come from the package's own exports, so a legacy asset keeps all its bodies.
+static FPackageIndex[] GpBodySetups(UPhysicsAsset asset)
+{
+    if (asset.SkeletalBodySetups is { Length: > 0 }) return asset.SkeletalBodySetups;
+    return asset.GetOrDefault<FPackageIndex[]>("BodySetup", Array.Empty<FPackageIndex>());
+}
+
+// A legacy body exports as UBodySetup, not USkeletalBodySetup, so the bone name, physics type and trace
+// flag come from the tagged properties rather than the derived type's fields. AggGeom is typed on the base.
+static object GpBody(UBodySetup body)
+{
+    var entry = new Dictionary<string, object?>
+    {
+        ["bone"] = GpText(body.GetOrDefault<FName>("BoneName")),
+        ["physicsType"] = body.GetOrDefault<EPhysicsType>("PhysicsType").ToString(),
+        ["traceFlag"] = body.GetOrDefault<ECollisionTraceFlag>("CollisionTraceFlag").ToString(),
+        ["shapes"] = GpAggShapes(body.AggGeom),
+    };
+    if (GpDamping(body) is { } damping) entry["damping"] = damping;
+    return entry;
 }
 
 static object GpPhysics(UPhysicsAsset asset)
 {
     var bodies = new List<object>();
     var missingBodies = 0;
-    foreach (var index in asset.SkeletalBodySetups)
+    foreach (var index in GpBodySetups(asset))
     {
-        if (index?.Load<USkeletalBodySetup>() is not { } body) { missingBodies++; continue; }
-        var entry = new Dictionary<string, object?>
-        {
-            ["bone"] = GpText(body.BoneName),
-            ["physicsType"] = body.PhysicsType.ToString(),
-            ["traceFlag"] = body.CollisionTraceFlag.ToString(),
-            ["shapes"] = GpAggShapes(body.AggGeom),
-        };
-        if (GpDamping(body) is { } damping) entry["damping"] = damping;
-        bodies.Add(entry);
+        if (index?.Load<UBodySetup>() is not { } body) { missingBodies++; continue; }
+        bodies.Add(GpBody(body));
     }
     var constraints = new List<object>();
     var missingConstraints = 0;
     foreach (var index in asset.ConstraintSetup)
     {
         if (index?.Load<UPhysicsConstraintTemplate>() is not { } template) { missingConstraints++; continue; }
-        var instance = template.DefaultInstance;
-        var profile = instance.ProfileInstance;
-        constraints.Add(new Dictionary<string, object?>
-        {
-            ["child"] = GpText(instance.ConstraintBone1),
-            ["parent"] = GpText(instance.ConstraintBone2),
-            ["childFrame"] = GpFrame(instance.Pos1, instance.PriAxis1, instance.SecAxis1),
-            ["parentFrame"] = GpFrame(instance.Pos2, instance.PriAxis2, instance.SecAxis2),
-            ["swing1Deg"] = profile.ConeLimit.Swing1LimitDegrees,
-            ["swing2Deg"] = profile.ConeLimit.Swing2LimitDegrees,
-            ["twistDeg"] = profile.TwistLimit.TwistLimitDegrees,
-            ["linearLimit"] = profile.LinearLimit.Limit,
-            ["motions"] = new Dictionary<string, object?>
-            {
-                ["linear"] = new[] { profile.LinearLimit.XMotion.ToString(), profile.LinearLimit.YMotion.ToString(), profile.LinearLimit.ZMotion.ToString() },
-                ["swing1"] = profile.ConeLimit.Swing1Motion.ToString(),
-                ["swing2"] = profile.ConeLimit.Swing2Motion.ToString(),
-                ["twist"] = profile.TwistLimit.TwistMotion.ToString(),
-            },
-            ["drives"] = GpDrives(profile),
-            ["disableCollision"] = profile.bDisableCollision,
-        });
+        // A template whose DefaultInstance is absent is an unresolved sub-export: report it, never drop it.
+        if (template.DefaultInstance is not { } instance) { missingConstraints++; continue; }
+        constraints.Add(GpConstraint(instance));
     }
     var disabled = new List<object>();
     foreach (var pair in asset.CollisionDisableTable ?? new Dictionary<FRigidBodyIndexPair, bool>())

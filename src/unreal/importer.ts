@@ -3193,6 +3193,10 @@ export async function importUnrealDirectory(
       // the package, its classes win: a material instance names Texture2D and carries
       // AssetImportData too, and reading that as a texture drops the material entirely.
       const listed = run.code === 0 && classes.length > 0;
+      // A UE5 package UE Viewer cannot list keeps its gameplay classes invisible, so a PhysicsAsset or
+      // SoundCue package reads as a listing failure and its decoded sidecar is dropped. The name table
+      // names them: recover every PRD-582 gameplay class so classification routes it to CUE4Parse.
+      if (!listed) for (const className of cooking?.gameplayClasses ?? []) if (!classes.includes(className)) classes.push(className);
       // A World named after its package is that package's own object, so it decides what the package is. The Texture2D
       // exports beside it are auxiliaries (see `auxiliaryTextures`), never this package's texture. The match is exact on the
       // package's own name, so a World with any other name does not claim the package.
@@ -5031,17 +5035,31 @@ export async function importUnrealDirectory(
     // bodies and constraints; the linked mesh, packaged above, references the asset by name. A package
     // whose sidecar is absent is reported, not dropped. This is also what lets a descriptor-only import
     // succeed: a pack of only a physics asset or a SoundCue still promotes output.
-    for (const entry of gameplayPackages) {
-      if (meshSelectors.has(entry.selector.toLowerCase())) continue;
-      const raw = await readGameplay(entry.selector);
+    //
+    // The converter scans every package, so it writes a physics sidecar for a PhysicsAsset a mesh pulled
+    // in as a dependency even when that package's own classification failed. Promote by what the
+    // converter actually wrote, not by classification: a decoded sidecar is the authoritative evidence.
+    const gameplaySelectors = new Map<string, { readonly selector: string; readonly package: string }>();
+    for (const entry of gameplayPackages) gameplaySelectors.set(entry.selector.toLowerCase(), {
+      selector: entry.selector,
+      package: entry.package,
+    });
+    for (const selector of modernGameplaySidecars.keys()) {
+      if (gameplaySelectors.has(selector)) continue;
+      const entry = classified.find((candidate) => candidate.selector.toLowerCase() === selector);
+      gameplaySelectors.set(selector, { selector: entry?.selector ?? selector, package: entry?.package ?? selector });
+    }
+    for (const [key, { selector, package: packagePath }] of gameplaySelectors) {
+      if (meshSelectors.has(key)) continue;
+      const raw = await readGameplay(key);
       if (!raw) {
         // A SoundCue-only package has no `Gameplay/` sidecar; its graph was already promoted from
         // `modernCueSidecars`. Report it skipped only when no cue claimed it, so a descriptor-only
         // import never lists a package it actually converted.
-        const cueName = basename(entry.package, extname(entry.package)).toLowerCase();
+        const cueName = basename(packagePath, extname(packagePath)).toLowerCase();
         if (modernCueSidecars.has(cueName)) continue;
         skipped.push({
-          package: entry.package,
+          package: packagePath,
           reason: "Gameplay package produced no Gameplay sidecar; it holds no socket, collision, physics asset or SoundCue this build decoded.",
         });
         continue;
@@ -5051,14 +5069,14 @@ export async function importUnrealDirectory(
         // The adapter writes centimetres; the sidecar is metre-scale like the mesh it links to.
         const converted = convertPhysics(raw.physics, 0.01);
         if (!converted) continue;
-        const relativePhysics = `Physics/${entry.selector}.json`;
+        const relativePhysics = `Physics/${selector}.json`;
         const output = assertContained(promotion, relativePhysics);
         await mkdir(dirname(output), { recursive: true });
         const body = `${JSON.stringify(converted, null, 2)}\n`;
         await writeFile(output, body);
         physicsAssets.push({
           name: converted.asset,
-          package: entry.package,
+          package: packagePath,
           file: relativePhysics,
           bytes: Buffer.byteLength(body),
           sha256: createHash("sha256").update(body).digest("hex"),
@@ -5066,10 +5084,15 @@ export async function importUnrealDirectory(
           constraints: converted.constraints.length,
           missingBones: [],
         });
+        // One authoritative package outcome: a package whose sidecar is now promoted stops being
+        // reported as an unlistable package, so a decoded asset is never both a success and a failure.
+        for (let index = failed.length - 1; index >= 0; index--) {
+          if (failed[index]!.package.toLowerCase() === packagePath.toLowerCase() && failed[index]!.reason.startsWith("UE Viewer could not list")) failed.splice(index, 1);
+        }
         if (converted.missingBodies) warnings.push(`${converted.asset}: ${converted.missingBodies} body sub-export${converted.missingBodies === 1 ? "" : "s"} could not be loaded and were omitted.`);
         if (converted.missingConstraints) warnings.push(`${converted.asset}: ${converted.missingConstraints} constraint sub-export${converted.missingConstraints === 1 ? "" : "s"} could not be loaded and were omitted.`);
       } catch (error) {
-        failed.push({ package: entry.package, reason: `Physics asset packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
+        failed.push({ package: packagePath, reason: `Physics asset packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
       }
     }
 

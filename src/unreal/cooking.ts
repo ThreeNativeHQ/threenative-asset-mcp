@@ -70,6 +70,12 @@ export interface PackageCooking {
   /** An editor-only class with nothing to import, named when UE Viewer cannot list the package. */
   readonly nonImportableClassHint: string | undefined;
   /**
+   * The PRD-582 gameplay classes this package names in its name table, which UE Viewer cannot list
+   * for a UE5 package. A PhysicsAsset, SoundCue, SkeletalBodySetup or socket class otherwise reads as
+   * a listing failure even though CUE4Parse decodes it. Whole name-table entries only.
+   */
+  readonly gameplayClasses: readonly string[];
+  /**
    * The package holds an `HLODProxy`: the editor's generated hierarchical-LOD stand-ins for a level (merged, reduced
    * copies of the level's own meshes with a flattened material), built output rather than an authored asset.
    */
@@ -79,6 +85,23 @@ export interface PackageCooking {
 /** Editor-only asset classes a UE5 pack ships beside its meshes. UE Viewer cannot list them, so
  * without this they read as failed packages rather than as content with nothing to import. */
 const NON_IMPORTABLE_CLASSES = ["FoliageType_InstancedStaticMesh", "MaterialFunction", "MaterialParameterCollection"];
+
+/**
+ * Every gameplay class PRD-582 routes to CUE4Parse. UE Viewer cannot list a UE5 package, so without
+ * this a PhysicsAsset or SoundCue package is reported as `UE Viewer could not list the package`,
+ * its decoded sidecar is silently dropped. The list mirrors `GAMEPLAY_CLASSES` plus
+ * `GAMEPLAY_METADATA_CLASSES` (importer.ts): a mesh whose only signal is a BodySetup/SkeletalBodySetup
+ * must still reach the converter for its metadata. Matched as whole name-table entries.
+ */
+export const GAMEPLAY_CLASS_HINTS = Object.freeze([
+  "SkeletalMeshSocket",
+  "StaticMeshSocket",
+  "PhysicsAsset",
+  "SoundCue",
+  "BodySetup",
+  "SkeletalBodySetup",
+  "SkeletalMesh",
+]);
 
 /** What a file that is not a readable package reports: no signal, never a negative one. */
 const UNKNOWN: PackageCooking = Object.freeze({
@@ -101,6 +124,7 @@ const UNKNOWN: PackageCooking = Object.freeze({
   groomHint: false,
   blueprintPrefabHint: false,
   nonImportableClassHint: undefined,
+  gameplayClasses: [],
   hlodProxyHint: false,
 });
 
@@ -407,6 +431,7 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
   // A whole name-table entry: the length prefix's high byte and the NUL terminator bracket it,
   // so "MaterialFunction" does not match inside "MaterialFunctionInstance".
   const nonImportableClassHint = NON_IMPORTABLE_CLASSES.find((className) => head.includes(`\0${className}\0`, 0, "latin1"));
+  const gameplayClasses = GAMEPLAY_CLASS_HINTS.filter((className) => head.includes(`\0${className}\0`, 0, "latin1"));
   const blueprintPrefabHint = file.toLowerCase().endsWith(".uasset") &&
     head.includes("BlueprintGeneratedClass", 0, "latin1") && head.includes("SimpleConstructionScript", 0, "latin1");
   return {
@@ -441,6 +466,7 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     groomHint,
     blueprintPrefabHint,
     nonImportableClassHint,
+    gameplayClasses,
     hlodProxyHint: head.includes("\0HLODProxy\0", 0, "latin1"),
   };
 }

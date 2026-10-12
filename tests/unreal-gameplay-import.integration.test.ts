@@ -33,6 +33,25 @@ function ue4Package(names: readonly string[]): Buffer {
   return Buffer.concat([header, ...table]);
 }
 
+/** A UE5 package head (legacy -8) whose name table carries the classes a class sniff looks for.
+ * UE Viewer cannot list a UE5 package, so only this head names the class. */
+function ue5Package(names: readonly string[]): Buffer {
+  const header = Buffer.alloc(24);
+  header.writeUInt32LE(PACKAGE_MAGIC, 0);
+  header.writeInt32LE(-8, 4);
+  header.writeInt32LE(864, 8);
+  header.writeInt32LE(522, 12);
+  header.writeInt32LE(1012, 16);
+  header.writeInt32LE(names.length, 20);
+  const table = names.map((name) => {
+    const bytes = Buffer.from(`${name}\0`, "latin1");
+    const length = Buffer.alloc(4);
+    length.writeInt32LE(bytes.length, 0);
+    return Buffer.concat([length, bytes]);
+  });
+  return Buffer.concat([header, ...table]);
+}
+
 /** A skinned GLB whose mesh node is named after the package and whose only joint is `hand_r`. */
 async function skinnedGlb(path: string): Promise<void> {
   const document = new Document();
@@ -86,18 +105,25 @@ async function runImport(
   packages: Record<string, readonly string[]>,
   outputs: (root: string) => Record<string, Record<string, string>>,
   umodelExportFrom?: string,
+  extras?: { readonly ue5?: readonly string[]; readonly listExitCode?: number },
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "asset-mcp-gameplay-import-"));
   onTestFinished(() => rm(root, { recursive: true, force: true }));
   const sourceDir = join(root, "source");
+  const ue5 = new Set(extras?.ue5 ?? []);
   const classes: Record<string, string[]> = {};
   for (const [relative, names] of Object.entries(packages)) {
     await mkdir(dirname(join(sourceDir, "Content", relative)), { recursive: true });
-    await writeFile(join(sourceDir, "Content", `${relative}.uasset`), ue4Package(names));
-    classes[relative.split("/").pop()!] = [...names];
+    await writeFile(join(sourceDir, "Content", `${relative}.uasset`), ue5.has(relative) ? ue5Package(names) : ue4Package(names));
+    // UE Viewer cannot list a UE5 package: report no rows for it, so only the name-table sniff can name it.
+    classes[relative.split("/").pop()!] = ue5.has(relative) ? [] : [...names];
   }
   const umodel = join(root, "umodel");
-  await writeFakeUmodel(umodel, { classes, ...(umodelExportFrom === undefined ? {} : { exportFrom: umodelExportFrom }) });
+  await writeFakeUmodel(umodel, {
+    classes,
+    ...(extras?.listExitCode === undefined ? {} : { listExitCode: extras.listExitCode }),
+    ...(umodelExportFrom === undefined ? {} : { exportFrom: umodelExportFrom }),
+  });
   const converter = join(root, "converter");
   await fakeConverter(converter, outputs(root));
   const outputDir = join(root, "output");
@@ -303,5 +329,35 @@ describe("gameplay data through the public import path", () => {
     expect(report.warnings.some((warning) => warning.includes("SW_Footstep"))).toBe(true);
     // A SoundCue-only package has no Gameplay sidecar; it must not be listed as skipped.
     expect(report.skipped.some((entry) => entry.package.includes("SC_Footstep"))).toBe(false);
+  });
+
+  it("promotes a UE5 PhysicsAsset sidecar when UE Viewer cannot list the package", async () => {
+    const { report, outputDir } = await runImport(
+      // A UE5 PhysicsAsset package: UE Viewer cannot list it (exit 1), and its class is only in the
+      // name table. Without the shared class sniff it reads as a failed package and its decoded sidecar
+      // is dropped; the public import must promote Physics/<package>.json and not report a listing failure.
+      { "Chars/PA_Hero": ["PhysicsAsset", "SkeletalBodySetup"] },
+      () => ({
+        "": {
+          "Gameplay/Content/Chars/PA_Hero.json": `text:${JSON.stringify({
+            version: 1,
+            package: "Content/Chars/PA_Hero",
+            physics: {
+              asset: "PA_Hero",
+              bodies: [{ bone: "hand_r", shapes: [{ type: "sphere", center: [100, 0, 0], radius: 10 }] }],
+              constraints: [],
+              collisionDisabledPairs: [],
+            },
+          })}`,
+        },
+      }),
+      undefined,
+      { ue5: ["Chars/PA_Hero"], listExitCode: 1 },
+    );
+    expect(report.counts.physicsAssets).toBe(1);
+    const promoted = JSON.parse(await readFile(join(outputDir, "Physics/Content/Chars/PA_Hero.json"), "utf8")) as { bodies: { bone: string; shapes: { radius: number }[] }[] };
+    expect(promoted.bodies[0]!.bone).toBe("hand_r");
+    expect(promoted.bodies[0]!.shapes[0]!.radius).toBeCloseTo(0.1, 6);
+    expect(report.failed.some((entry) => entry.package.includes("PA_Hero"))).toBe(false);
   });
 });
