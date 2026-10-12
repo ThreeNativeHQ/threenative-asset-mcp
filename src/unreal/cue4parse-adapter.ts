@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.78",
+  version: "b4e95441+threenative.79",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -3257,8 +3257,47 @@ static byte[]? ExtractCompressedPayloadPng(byte[] bytes, List<string>? failures 
 
 // Editor source art in the order every exporter should try it: a TSCF_UEDELTA payload (raw pixels,
 // row-delta filtered, UE 5.6+), then an inline PNG, then a PNG or JPEG inside a compressed payload.
+// The inline scan skips the package's own registered thumbnails, which are previews, not source art.
 static byte[]? ExtractSourcePng(byte[] bytes, UTexture? texture, List<string>? failures = null)
-    => ExtractUeDeltaSourcePng(bytes, texture, failures) ?? ExtractLargestPng(bytes) ?? ExtractCompressedPayloadPng(bytes, failures);
+    => ExtractUeDeltaSourcePng(bytes, texture, failures) ?? ExtractLargestPng(bytes, RegisteredThumbnails(bytes, texture), failures) ?? ExtractCompressedPayloadPng(bytes, failures);
+
+// The editor saves a 256 px display-gamma preview of every asset in its package (FObjectThumbnail: int32 width, int32 height,
+// int32 byte count, then the image) and lists where each one sits in the summary's thumbnail table, which CUE4Parse reads the same
+// way. That table is the proof that an image is a preview. An image's size, its name or the bytes in front of it prove nothing,
+// because a genuine source can look the same. A package without a table registers nothing, and a damaged table registers the
+// entries read before the damage. A texture CUE4Parse did not load (a sprite or a material route whose class it rejects) has no
+// parsed summary, so the summary is read from the package bytes instead; if that fails too, nothing is registered.
+static List<(long Start, long End)> RegisteredThumbnails(byte[] bytes, UTexture? texture)
+{
+    var previews = new List<(long Start, long End)>();
+    var offsets = new List<int>();
+    try
+    {
+        using var archive = new FByteArchive("thumbnail-table", bytes);
+        var tableAt = texture?.Owner is Package owner ? owner.Summary.ThumbnailTableOffset : new FPackageFileSummary(archive).ThumbnailTableOffset;
+        if (tableAt <= 0 || tableAt > bytes.Length - 4L) return previews;
+        archive.Position = tableAt;
+        var count = archive.Read<int>();
+        // An entry is two strings and an offset, at least 12 bytes, so the bytes left bound the loop and no fixed cap is needed.
+        for (var index = 0; index < count && archive.Position + 12 <= bytes.Length; index++)
+        {
+            archive.ReadFString();
+            archive.ReadFString();
+            offsets.Add(archive.Read<int>());
+        }
+    }
+    catch (Exception)
+    {
+        // The offsets read before the damage stay registered; nothing else is assumed to be a preview.
+    }
+    foreach (var offset in offsets)
+    {
+        if (offset < 0 || offset + 12L > bytes.Length) continue;
+        var size = BitConverter.ToInt32(bytes, offset + 8);
+        if (size > 0 && offset + 12L + size <= bytes.Length) previews.Add((offset + 12L, offset + 12L + size));
+    }
+    return previews;
+}
 
 // TSCF_UEDELTA (UE 5.6+ editor default for 8- and 16-bit sources): the payload is the raw source
 // pixels with each tile's rows replaced by their difference from the row above. Decoding it needs
@@ -4089,7 +4128,7 @@ static byte[]? ExtractLargestJpegAsPng(byte[] bytes)
     return best;
 }
 
-static byte[]? ExtractLargestPng(byte[] bytes)
+static byte[]? ExtractLargestPng(byte[] bytes, IReadOnlyList<(long Start, long End)>? previews = null, List<string>? failures = null)
 {
     ReadOnlySpan<byte> signature = [137, 80, 78, 71, 13, 10, 26, 10];
     byte[]? best = null;
@@ -4097,6 +4136,12 @@ static byte[]? ExtractLargestPng(byte[] bytes)
     for (var start = 0; start <= bytes.Length - signature.Length; start++)
     {
         if (!bytes.AsSpan(start, signature.Length).SequenceEqual(signature)) continue;
+        // Only an image the package's thumbnail table registers is skipped (see RegisteredThumbnails).
+        if (previews is not null && previews.Any(preview => start >= preview.Start && start < preview.End))
+        {
+            failures?.Add($"ignored the PNG at {start}: the package's thumbnail table registers it, so it is a preview, not source art");
+            continue;
+        }
         var cursor = start + signature.Length;
         uint width = 0, height = 0;
         while (cursor <= bytes.Length - 12)

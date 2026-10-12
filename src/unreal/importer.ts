@@ -62,7 +62,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 112;
+export const IMPORTER_VERSION = 113;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -999,7 +999,8 @@ async function refreshPngIndex(assets: ExportedAssets): Promise<ExportedAssets> 
   return { ...assets, png, ambiguousPng };
 }
 
-// Some material exports carry editor previews. Prefer a larger export from the unique source package,
+// Some material exports carry editor previews, and the converter ships no image at all for a package whose source it cannot decode.
+// Prefer a larger export from the unique source package, and take it when the material exports have none,
 // preserving existing choices when a name is ambiguous.
 async function preferStandaloneResolution(assets: ExportedAssets, standalone: ReadonlyMap<string, string>): Promise<ExportedAssets> {
   const sharp = (await import("sharp")).default;
@@ -1011,8 +1012,8 @@ async function preferStandaloneResolution(assets: ExportedAssets, standalone: Re
   let png: Map<string, string> | undefined;
   for (const [name, exported] of standalone) {
     const indexed = assets.png.get(name);
-    if (indexed === undefined || indexed === exported || assets.ambiguousPng?.has(name)) continue;
-    if ((await pixels(exported)) > (await pixels(indexed))) (png ??= new Map(assets.png)).set(name, exported);
+    if (indexed === exported || assets.ambiguousPng?.has(name)) continue;
+    if (indexed === undefined || (await pixels(exported)) > (await pixels(indexed))) (png ??= new Map(assets.png)).set(name, exported);
   }
   return png === undefined ? assets : { ...assets, png };
 }

@@ -272,9 +272,9 @@ function meshDescription(slotNames: readonly string[], compactNames: boolean, co
 
 describe("UE5 editor sources the converter decodes (program text)", () => {
   it("tries a TSCF_UEDELTA source before scanning for an image signature, at every texture site", () => {
-    expect(CUE4PARSE_PROGRAM).toContain("ExtractUeDeltaSourcePng(bytes, texture, failures) ?? ExtractLargestPng(bytes) ?? ExtractCompressedPayloadPng(bytes, failures)");
+    expect(CUE4PARSE_PROGRAM).toContain("ExtractUeDeltaSourcePng(bytes, texture, failures) ?? ExtractLargestPng(bytes, RegisteredThumbnails(bytes, texture), failures) ?? ExtractCompressedPayloadPng(bytes, failures)");
     // No texture site bypasses it any more: the only PNG-then-payload chain left is inside ExtractSourcePng.
-    expect(CUE4PARSE_PROGRAM.match(/ExtractLargestPng\([^)]*\) \?\? ExtractCompressedPayloadPng\(/g)).toHaveLength(1);
+    expect(CUE4PARSE_PROGRAM.match(/ExtractLargestPng\(bytes, RegisteredThumbnails\(bytes, texture\), failures\) \?\? ExtractCompressedPayloadPng\(/g)).toHaveLength(1);
     // Raw pixels are written in true colour, so the BGRA8-PNG channel swap must skip them.
     expect(CUE4PARSE_PROGRAM).toContain("if (RawDerived.Table.TryGetValue(png, out _)) return png;");
   });
