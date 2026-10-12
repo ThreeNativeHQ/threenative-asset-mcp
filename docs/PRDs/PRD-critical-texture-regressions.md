@@ -1,12 +1,12 @@
 # PRD-critical-texture-regressions — Finish texture regression protection
 
-**Status:** IN PROGRESS — native79/importer113 implementation and real-asset proof pass; full checks and new PR CI pending.
+**Status:** IN PROGRESS — implementation, real-asset proof and local repository checks pass; final-head PR41 CI pending.
 **Priority:** P0 — prevent the known chair/crate texture-resolution regression from recurring.
 **Complexity:** 3 (LOW) — 1–5 implementation files and the TypeScript/generated .NET boundary; no new subsystem.
 **Owner:** João / next coding session
 **Depends on:** Existing importer112 checkpoint; does not require PRD-537/538 corpus completion.
 **Time box:** 2–3 hours of execution from session restart.
-**PR:** New PR against `main` required (user instruction at resume); PR40 is merged and remains historical evidence only.
+**PR:** https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/41 (against `main`; PR40 is merged historical evidence).
 
 ## Goal and scope
 
@@ -37,21 +37,21 @@ Affected boundaries: native material/standalone extraction and its sprite/font/s
 - [x] Genuine small/unregistered source images and normal/albedo pixels survive unchanged. proof: `npx vitest run tests/unreal-native-texture-source.test.ts tests/unreal-texture-resolution.integration.test.ts`; controls include matching-prefix images outside the thumbnail table plus inside decoded payloads.
 
 #### Phase 2: Prove the user's chair and crate on the final head
-**Status:** IN PROGRESS — candidate proof passes; new PR attachment pending
+**Status:** COMPLETE — source-equivalent final production inputs; comparison attached to PR41
 
-- [ ] Final-head real chair04a/crate01a GLBs embed authentic full-resolution albedo/normal textures. proof: rerun the existing local canary against `crate112-proof-SYtqCKvK/src`, compare embedded dimensions/raw pixels to source exports and retain unchanged geometry assertions in its GLB proof.
-- [ ] The new PR shows both assets before/after with identical camera/environment settings and visibly restored texture detail. proof: actual final-head rendered comparisons in the new PR; reuse the published PR40 sheet only if its production/render inputs are unchanged.
+- [x] Final-head real chair04a/crate01a GLBs embed authentic full-resolution albedo/normal textures. proof: rerun the existing local canary against `crate112-proof-SYtqCKvK/src`, compare embedded dimensions/raw pixels to source exports and retain unchanged geometry assertions in its GLB proof.
+- [x] The new PR shows both assets before/after with identical camera/environment settings and visibly restored texture detail. proof: actual final-head rendered comparisons in the new PR; reuse the published PR40 sheet only if its production/render inputs are unchanged.
 
 #### Phase 3: Integrate and verify
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — local checks pass; final-head CI pending
 
-- [ ] The integrated final head passes repository checks. proof: `npm run typecheck`, `npm test` (builds first, default workers), `npm run test:leaks`, and `npx vitest run tests/mcp-smoke.test.ts`; avoid repeating equivalent runs when the existing command already proves the requirement.
+- [x] The integrated final head passes repository checks. proof: `npm run typecheck`, `npm test` (builds first, default workers), `npm run test:leaks`, and `npx vitest run tests/mcp-smoke.test.ts`; avoid repeating equivalent runs when the existing command already proves the requirement.
 - [ ] Required CI checks pass on the exact pushed new PR head. proof: new PR checks with matching head SHA. Record results/limits in the existing PR/PRD, without standalone verification reports.
 
 ## Acceptance criteria
 
-- [ ] The user can inspect final-head texture restoration for both named assets. proof: Phase 2 GLB/source assertions and the chair/crate screenshot attached to the new PR.
-- [ ] Producer and real importer regression tests cover the preview-selection defect without rejecting legitimate small source textures. proof: Phase 1 red/green results, backed by final-head checks from Phase 3.
+- [x] The user can inspect final-head texture restoration for both named assets. proof: Phase 2 GLB/source assertions and the chair/crate screenshot attached to the new PR.
+- [x] Producer and real importer regression tests cover the preview-selection defect without rejecting legitimate small source textures. proof: Phase 1 red/green results, backed by final-head checks from Phase 3.
 
 ## Resume the existing lane first
 
@@ -82,3 +82,7 @@ Final source review: native79/importer113 passes 15 compiled-converter source te
 Real candidate proof: `/home/joao/.cache/threenative-asset-mcp/native79-iqopBvdy/canary/out2`. Both assets embed 4096×4096 albedo/normal pixels equal to standalone exports, with unchanged geometry. The complete chair GLB SHA256 is `ac8502c97a686e62742b09e643daec6855ce2d0d902ef6fd729d1c35f08cb834`; crate is `ed59194e4d04bd1d98c731abb8ccd2f462fe6d873a1156cf33bbdfa6ec2f5212`. Both exactly match importer112 render inputs, so the published sheet can be reused with its original label explained.
 
 Delivery uses the existing repair lane `.worktrees/importer-native-texture-source`, branch `fix/native-texture-source`. PR40 merged at `3f4c114`; its tree equals the lane's starting `8798545` tree. Rebase only this change onto current `origin/main` for a separate PR. No merge or release authorized. Laptop offload status failed SSH host-key verification; repository checks will run locally. Preserve both current worktrees and licensed proof data while delivery is pending.
+
+Local final code verification at `d6134a9ae9343b583d2c612e4c0337dd0f26a959`: `npm run typecheck` exit0; `npm test` exit0 (build first, default workers: 2,425 passed, five licensed-input skips); `npm run test:leaks` exit0 (same 2,425 passed, five skips; `leak-gate: clean`); `npx vitest run tests/mcp-smoke.test.ts` exit0 (15 passed). Logs: `/tmp/critical-texture-{typecheck,test,leaks,smoke}.log`. Used owned native79 toolchain with auto-install disabled; protected native78 inputs retained. Source/tests unchanged by the subsequent PRD-only evidence commit.
+
+New PR41 contains the published comparison and full-GLB hash justification for reusing it. The repair checkout is retained (14 MB measured, without dereferencing links) because PR41 is open and unmerged. The original nodes checkout contains the requested PRD and other existing work; no checkout or licensed evidence was deleted. No merge, publish, baseline ratchet, broad corpus sweep or engine-pin change performed. Final-head CI remains the sole open gate.
