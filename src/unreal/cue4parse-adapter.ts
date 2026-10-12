@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.87-animation",
+  version: "b4e95441+threenative.88-animation",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2639,22 +2639,24 @@ List<Dictionary<string, object?>> CurveRecords(UAnimSequence sequence, UObject? 
     // RawCurveData can have reduced keys (602 authored keys versus 2 runtime keys in the real proof).
     var modelLegacy = model is null ? null : StructProperty(model, "LegacyCurveData");
     var sequenceLegacy = StructProperty(sequence, "LegacyCurveData");
-    var tracks = SelectAuthoredCurveTracks(
+    FRawCurveTracks? conventional = null;
+    if (exactModel is not null && StructProperty(exactModel, "CurveData") is { } curveData)
+    {
+        if (curveData.TryGetValue<FFloatCurve[]>(out var typedCurves, "FloatCurves") && typedCurves is not null)
+            conventional = new FRawCurveTracks(typedCurves);
+        else if (curveData.TryGetValue<FStructFallback[]>(out var rawCurves, "FloatCurves") && rawCurves is not null)
+            conventional = new FRawCurveTracks(rawCurves.Select(curve => new FFloatCurve(curve)).ToArray());
+    }
+    var tracks = SelectAuthoredCurveTracks(conventional,
         modelLegacy is null ? null : new FRawCurveTracks(modelLegacy),
         sequenceLegacy is null ? null : new FRawCurveTracks(sequenceLegacy),
         sequence.RawCurveData, sequence.CompressedCurveData);
     if (tracks?.FloatCurves is { } curves) return CurveList(curves);
-    if (exactModel is not null && StructProperty(exactModel, "CurveData") is { } curveData)
-    {
-        if (curveData.TryGetValue<FFloatCurve[]>(out var typedCurves, "FloatCurves") && typedCurves is not null) return CurveList(typedCurves);
-        if (curveData.TryGetValue<FStructFallback[]>(out var rawCurves, "FloatCurves") && rawCurves is not null)
-            return CurveList(rawCurves.Select(curve => new FFloatCurve(curve)).ToArray());
-    }
     return [];
 }
 
-static FRawCurveTracks? SelectAuthoredCurveTracks(FRawCurveTracks? modelLegacy, FRawCurveTracks? sequenceLegacy, FRawCurveTracks? raw, FRawCurveTracks? compressed) =>
-    modelLegacy ?? sequenceLegacy ?? raw ?? compressed;
+static FRawCurveTracks? SelectAuthoredCurveTracks(FRawCurveTracks? conventional, FRawCurveTracks? modelLegacy, FRawCurveTracks? sequenceLegacy, FRawCurveTracks? raw, FRawCurveTracks? compressed) =>
+    conventional ?? modelLegacy ?? sequenceLegacy ?? raw ?? compressed;
 
 // One FFloatCurve's keys, with the interpolation mode and both tangents. The name is the curve's own
 // smart name from the model, so a consumer joins on the authored name rather than an index.

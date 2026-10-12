@@ -95,7 +95,7 @@ describeWithTools(["modern-converter"], "converter blend-space axis code (compil
     const functions = [
       "static Dictionary<string, object?> BlendAxis(FBlendParameter? typed, FStructFallback? raw)",
       "static double DumpNum(float value)",
-      "static FRawCurveTracks? SelectAuthoredCurveTracks(FRawCurveTracks? modelLegacy, FRawCurveTracks? sequenceLegacy, FRawCurveTracks? raw, FRawCurveTracks? compressed)",
+      "static FRawCurveTracks? SelectAuthoredCurveTracks(FRawCurveTracks? conventional, FRawCurveTracks? modelLegacy, FRawCurveTracks? sequenceLegacy, FRawCurveTracks? raw, FRawCurveTracks? compressed)",
       "static bool StructBool(FStructFallback? data, string field, out bool value)",
       "static FStructFallback[] ArrayElements(AbstractPropertyHolder holder, string name)",
       "static (string ClassName, string Kind) NotifyClassNames(string? objectClass, string? objectName, string? stateClass)",
@@ -114,8 +114,9 @@ if (args[0] == "curve-source")
 {
     FRawCurveTracks Tracks(int count) => new(new[] { new FFloatCurve { FloatCurve = new FRichCurve { Keys = Enumerable.Range(0, count).Select(i => new FRichCurveKey(i / 60f, 1f)).ToArray() } } });
     var raw = Tracks(2);
-    Console.WriteLine(SelectAuthoredCurveTracks(Tracks(602), null, raw, null)?.FloatCurves?[0].FloatCurve.Keys.Length);
-    Console.WriteLine(SelectAuthoredCurveTracks(null, null, raw, null)?.FloatCurves?[0].FloatCurve.Keys.Length);
+    Console.WriteLine(SelectAuthoredCurveTracks(Tracks(602), null, null, raw, null)?.FloatCurves?[0].FloatCurve.Keys.Length);
+    Console.WriteLine(SelectAuthoredCurveTracks(null, Tracks(602), null, raw, null)?.FloatCurves?[0].FloatCurve.Keys.Length);
+    Console.WriteLine(SelectAuthoredCurveTracks(null, null, null, raw, null)?.FloatCurves?[0].FloatCurve.Keys.Length);
 }
 if (args[0] == "axis")
 {
@@ -223,7 +224,7 @@ ${functions.join("\n")}
     execFileSync(sdk, [harness, ...args], { env: environment(), encoding: "utf8", timeout: 60_000 }).trim();
 
   it("preserves authored model curve keys ahead of reduced runtime curves and retains the UE4 raw fallback", () => {
-    expect(run("curve-source").split("\n")).toEqual(["602", "2"]);
+    expect(run("curve-source").split("\n")).toEqual(["602", "602", "2"]);
   });
 
   it("keeps each typed axis separate, restores an omitted Max and GridNum, and keeps a typed-only axis intact", () => {

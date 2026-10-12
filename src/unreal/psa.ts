@@ -333,7 +333,7 @@ export function attachPsaAnimations(
       // A clip that names a canonical skeleton must not fall back to bone-name matching against a mesh
       // whose skeleton package is unknown: that is exactly how a modern clip cross-attaches to an
       // arbitrary same-bone rig. Only the caller's single-candidate (legacy) case permits the fallback.
-      if (targetSkeleton === undefined && sequenceSkeleton !== undefined && resolved.allowUnknownSkeleton === false) {
+      if (targetSkeleton === undefined && sequenceSkeleton !== undefined && resolved.allowUnknownSkeleton !== true) {
         unresolved.push({
           name: sequence.name,
           ...(sequence.package === undefined ? {} : { package: sequence.package }),

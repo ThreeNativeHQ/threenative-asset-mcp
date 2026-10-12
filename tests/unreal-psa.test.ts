@@ -220,7 +220,7 @@ describe("ActorX PSA conversion", () => {
     const document = rig();
     const first = withProvenance(parsePsa(fixture()), "/Game/A/Walk", "/Game/A/SK_Hero.SK_Hero");
     const second = withProvenance(parsePsa(fixture()), "/Game/B/Walk", "/Game/B/SK_Hero.SK_Hero");
-    const result = attachPsaAnimations(document, [first, second]);
+    const result = attachPsaAnimations(document, [first, second], { allowUnknownSkeleton: true });
     expect(result.attached).toEqual(["Wave", "B_Walk_Wave"]);
     expect(result.clips.map((clip) => [clip.name, clip.source, clip.package])).toEqual([
       ["Wave", "Wave", "/Game/A/Walk"],
@@ -239,7 +239,7 @@ describe("ActorX PSA conversion", () => {
     const document = rig();
     const first = withProvenance(parsePsa(fixture()), "/Game/A/Walk", "/Game/A/SK_Hero.SK_Hero");
     const second = withProvenance(parsePsa(fixture()), "/Game/B/Walk", "/Game/B/SK_Hero.SK_Hero");
-    const result = attachPsaAnimations(document, [first, second, second]);
+    const result = attachPsaAnimations(document, [first, second, second], { allowUnknownSkeleton: true });
     expect(result.attached).toEqual(["Wave", "B_Walk_Wave"]);
     expect(document.getRoot().listAnimations().map((animation) => animation.getName())).toEqual(["Wave", "B_Walk_Wave"]);
     expect(result.existing).toEqual(["B_Walk_Wave"]);
@@ -252,7 +252,7 @@ describe("ActorX PSA conversion", () => {
     // as the imported package's clip. The PSA's own clip attaches under a disambiguated name.
     document.createAnimation("Wave");
     const own = withProvenance(parsePsa(fixture()), "/Game/B/Walk", "/Game/B/SK_Hero.SK_Hero");
-    const result = attachPsaAnimations(document, [own]);
+    const result = attachPsaAnimations(document, [own], { skeleton: "/Game/B/SK_Hero" });
     expect(result.attached).toEqual(["B_Walk_Wave"]);
     expect(result.existing).toEqual([]);
     expect(document.getRoot().listAnimations().map((animation) => animation.getName())).toEqual(["Wave", "B_Walk_Wave"]);
@@ -272,7 +272,7 @@ describe("ActorX PSA conversion", () => {
     const document = rig();
     document.createAnimation("Wave");
     const source = { ...withProvenance(parsePsa(fixture()), "/Game/A/Walk", "/Game/A/SK_Hero"), embeddedGlbSource: true };
-    const result = attachPsaAnimations(document, [source, { ...source, embeddedGlbSource: false }]);
+    const result = attachPsaAnimations(document, [source, { ...source, embeddedGlbSource: false }], { skeleton: "/Game/A/SK_Hero" });
     expect(result.attached).toEqual([]);
     expect(result.existing).toEqual(["Wave", "Wave"]);
     expect(result.clips.map((clip) => clip.package)).toEqual(["/Game/A/Walk", "/Game/A/Walk"]);
@@ -283,7 +283,7 @@ describe("ActorX PSA conversion", () => {
     const own = withProvenance(parsePsa(fixture()), "/Game/B/Walk", "/Game/B/SK_Hero.SK_Hero");
     // Two same-bone rigs could both accept it, so the import-level caller must not permit the fallback.
     const refused = rig();
-    const result = attachPsaAnimations(refused, [own], { allowUnknownSkeleton: false });
+    const result = attachPsaAnimations(refused, [own]);
     expect(result.attached).toEqual([]);
     expect(result.unresolved.map((entry) => entry.name)).toEqual(["Wave"]);
     expect(refused.getRoot().listAnimations()).toHaveLength(0);
