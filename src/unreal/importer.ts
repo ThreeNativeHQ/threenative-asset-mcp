@@ -60,6 +60,7 @@ import {
 } from "./paper-tilemaps.js";
 import { createGraphBaker, textureIsSrgb, texturePackageKey, type GraphBakeRequest, type GraphBaker, type GraphPbrFactors, type GraphTextureSource } from "./graph-baker.js";
 import { dumpMaterialGraphs } from "./graph-dump.js";
+import { effectsDumpSchema, writeUnrealEffects, type EffectsDump, type ImportedEffect } from "./effects-dump.js";
 import { assertEngineContentDirectory, canonicalEngineReference, engineContentFromEnvironment, isEngineReference, type EngineContentConfig } from "./engine-content.js";
 import { readPackageBuildScale3D } from "./mesh-build-scale.js";
 import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
@@ -77,7 +78,7 @@ import { runUmodelExport } from "./umodel-export.js";
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 116;
+export const IMPORTER_VERSION = 117;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -493,6 +494,8 @@ export interface ImportReport {
     readonly physicsAssets: number;
     readonly animationLogic: number;
     readonly animationClips: number;
+    /** Cascade and Niagara effect descriptors written under `Effects/` (PRD-584). */
+    readonly effects: number;
     readonly skipped: number;
     readonly failed: number;
   };
@@ -514,6 +517,8 @@ export interface ImportReport {
   readonly physicsAssets: readonly ImportedPhysicsAsset[];
   readonly animationLogic: readonly ImportedAnimationLogic[];
   readonly animationClips: readonly ImportedAnimationClip[];
+  /** Cascade and Niagara effect descriptors (PRD-584). */
+  readonly effects: readonly ImportedEffect[];
   readonly skipped: readonly { readonly package: string; readonly reason: string }[];
   readonly failed: readonly { readonly package: string; readonly reason: string }[];
   readonly materialCoverage: {
@@ -616,6 +621,9 @@ const UNSUPPORTED_CLASSES = new Map<string, string>([
   ["World", "level"],
   ["MapBuildDataRegistry", "baked level lighting"],
 ]);
+
+/** Effect classes that leave the skipped list once a portable descriptor is written (PRD-584). */
+const EFFECT_CLASSES = new Set<string>(["ParticleSystem", "NiagaraSystem", "NiagaraEmitter"]);
 
 const DATA_ASSET_CLASSES = new Set([
   "DataTable",
@@ -3881,6 +3889,7 @@ export async function importUnrealDirectory(
       (entry.paperClass !== undefined && !entry.error) ||
       (entry.hasGroom && !entry.error) ||
       (entry.hasGameplay && !entry.error) ||
+      (entry.classes.some((className) => EFFECT_CLASSES.has(className)) && !entry.error) ||
       prefabFiles.has(entry.file) ||
       mapFiles.has(entry.file)
     ) continue;
@@ -3903,6 +3912,10 @@ export async function importUnrealDirectory(
     });
   }
 
+  // Cascade and Niagara packages are exported to descriptors once staging exists; only a
+  // successful export removes them from the skipped list, so a failed one still reports its reason.
+  const effectPackages = classified.filter((entry) => !entry.error && entry.classes.some((className) => EFFECT_CLASSES.has(className)));
+
   if (
     assetMeshPackages.length === 0 &&
     mapPackages.length === 0 &&
@@ -3921,6 +3934,7 @@ export async function importUnrealDirectory(
     // Blend spaces, aim offsets, montages and composites are content on their own and are decoded by the
     // CUE4Parse animation route even when no mesh is present, so they must not trip the empty guard.
     && modernAnimationPackages.length === 0
+    && effectPackages.length === 0
   ) {
     const animationCount = legacyAnimationPackages.length;
     const animationOnly = animationCount > 0
@@ -5078,6 +5092,63 @@ export async function importUnrealDirectory(
   const flipbooks: ImportedFlipbook[] = [];
   const scenes: ImportedScene[] = [];
   const strands: ImportedGroom[] = [];
+  const effects: ImportedEffect[] = [];
+  // Cascade and Niagara descriptors (PRD-584): the tagged dump is mapped to portable JSON under Effects/.
+  // A package only leaves the skipped list when its descriptor is written and validated.
+  if (effectPackages.length > 0) {
+    const converter = request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const dumpPath = join(staging, "effects-dump.json");
+    const attempts = [...new Set<string | undefined>([formatProfile, undefined, ...MODERN_ENGINE_FALLBACKS])];
+    let dumped: { readonly stdout: string; readonly stderr: string; readonly code: number } | undefined;
+    for (const engine of attempts) {
+      const args = [sourceDir, "--dump-effects", dumpPath];
+      if (engine) args.push("--engine", engine);
+      const run = await runBounded(converter.path, args, { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 });
+      if (run.code === 0) {
+        dumped = run;
+        break;
+      }
+      dumped = run;
+      if (!isEngineProfileMismatch(`${run.stdout}\n${run.stderr}`)) break;
+    }
+    let parsed: EffectsDump | undefined;
+    if (dumped?.code === 0) {
+      try {
+        parsed = effectsDumpSchema.parse(JSON.parse(await readFile(dumpPath, "utf8")));
+      } catch (error) {
+        warnings.push(`The effect dump was not usable: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (parsed !== undefined) {
+      const result = await writeUnrealEffects(parsed, promotion);
+      const written = result.written;
+      // Match on the canonical package key, never a raw basename: two packages that share a system name
+      // stay distinguishable, so a package whose descriptor collided is not cleared from the skip list.
+      const writtenKeys = new Set(written.map((effect) => gamePackageKey(effect.package)));
+      effects.push(...written);
+      for (let index = skipped.length - 1; index >= 0; index--) {
+        if (writtenKeys.has(gamePackageKey(skipped[index]!.package))) skipped.splice(index, 1);
+      }
+      // A descriptor that could not be written leaves its package skipped with the reason; the others still export.
+      for (const failure of result.failures) {
+        skipped.push({
+          package: failure.package,
+          reason: `effect descriptor was not written${failure.system.length > 0 ? ` (${failure.system})` : ""}: ${failure.error}`,
+        });
+      }
+      warnings.push(
+        `Exported ${written.length} effect descriptor${written.length === 1 ? "" : "s"} to Effects/ (PRD-584); each names the modules it does not carry.`,
+      );
+      // A package the compiled adapter could not load must not disappear: it stays skipped and names the error.
+      for (const failure of parsed.errors ?? []) {
+        warnings.push(`Effect package ${failure.path} could not be dumped: ${failure.error}`);
+      }
+    } else {
+      for (const entry of effectPackages) {
+        skipped.push({ package: entry.package, reason: "unsupported Unreal-only content: effect package (descriptor export failed)" });
+      }
+    }
+  }
   const modernSceneModelsByFile = new Map<string, ImportedModel[]>();
   const modernSceneModelPackages = new Set<string>();
   const imageCache = new TransformedImageCache();
@@ -6488,6 +6559,7 @@ export async function importUnrealDirectory(
             ...sprites.map((sprite) => ({ name: sprite.name, glb: sprite.glb })),
           ],
           bitmapFonts: bitmapFonts.map((font) => ({ name: font.name, manifest: font.manifest })),
+          effectDescriptors: effects.map((effect) => ({ descriptor: effect.descriptor, package: effect.package })),
           validate: validateGlb,
         });
         scenes.push(scene);
@@ -6557,13 +6629,14 @@ export async function importUnrealDirectory(
       // An animation logic package (blend space, montage) or a clip sidecar is a promoted output, so a
       // logic-only import is not empty.
       animationLogic.length === 0 &&
-      animationSidecars.length === 0
+      animationSidecars.length === 0 &&
+      effects.length === 0
     ) {
       const reasons = failed.slice(0, 5).map((entry) => `${entry.package}: ${entry.reason}`);
       const more = failed.length > reasons.length ? ` (+${failed.length - reasons.length} more)` : "";
       throw new ImportError(
         "UNREAL_EXPORT_EMPTY",
-        "No package produced a valid model, texture, RGBA16F data texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, or scene; nothing was promoted." +
+        "No package produced a valid model, texture, RGBA16F data texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, strand, scene, or effect descriptor; nothing was promoted." +
           (reasons.length > 0 ? ` Failures — ${reasons.join("; ")}${more}.` : ""),
       );
     }
@@ -6676,6 +6749,7 @@ export async function importUnrealDirectory(
         physicsAssets: physicsAssets.length,
         animationLogic: animationLogic.length,
         animationClips: animationSidecars.length,
+        effects: effects.length,
         skipped: skipped.length,
         failed: failed.length,
       },
@@ -6697,6 +6771,7 @@ export async function importUnrealDirectory(
       physicsAssets,
       animationLogic,
       animationClips: animationSidecars,
+      effects,
       skipped,
       failed,
       materialCoverage: coverage,

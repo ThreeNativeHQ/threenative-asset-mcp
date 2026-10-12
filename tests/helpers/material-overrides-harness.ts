@@ -307,7 +307,7 @@ export async function dumpGraphsOfPackages(
   return { code: run.code, stdout: run.stdout, stderr: run.stderr, files };
 }
 
-async function compileProject(
+export async function compileProject(
   root: string,
   assembly: string,
   sources: Readonly<Record<string, string>>,

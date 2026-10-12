@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.89-animation",
+  version: "b4e95441+threenative.584.4",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -677,6 +677,7 @@ public static class EngineContent
 export const CUE4PARSE_PROGRAM = String.raw`using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Globalization;
 using CUE4Parse.FileProvider;
 using CUE4Parse.MappingsProvider.Usmap;
 using CUE4Parse.Compression;
@@ -702,6 +703,7 @@ using CUE4Parse.UE4.Assets.Exports.Component.TextRender;
 using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Assets.Objects;
+using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Assets.Readers;
 using CUE4Parse.UE4.Readers;
 using CUE4Parse.UE4.Objects.Core.Compression;
@@ -723,10 +725,11 @@ using Newtonsoft.Json;
 
 if (args.Contains("--version")) { Console.WriteLine("threenative-cue4parse ${CUE4PARSE_SOURCE.version}"); return; }
 var dumpAt = Array.IndexOf(args, "--dump-properties");
+var effectsAt = Array.IndexOf(args, "--dump-effects");
 var graphAt = Array.IndexOf(args, "--dump-graphs");
-if (args.Length < 3 || (dumpAt < 0 && graphAt < 0 && !args.Contains("--export-dir"))) throw new ArgumentException("usage: converter SOURCE --export-dir OUTPUT [--filter NAME] [--lods 0,1] | converter SOURCE --dump-properties OUT.json [--engine X] [--filter NAME] | converter SOURCE --dump-graphs OUT_DIR [--engine X] [--filter NAME]");
+if (args.Length < 3 || (dumpAt < 0 && effectsAt < 0 && graphAt < 0 && !args.Contains("--export-dir"))) throw new ArgumentException("usage: converter SOURCE --export-dir OUTPUT [--filter NAME] [--lods 0,1] | converter SOURCE --dump-properties OUT.json [--engine X] [--filter NAME] | converter SOURCE --dump-effects OUT.json [--engine X] [--filter NAME] | converter SOURCE --dump-graphs OUT_DIR [--engine X] [--filter NAME]");
 var root = Path.GetFullPath(args[0]);
-var output = dumpAt >= 0 || graphAt >= 0 ? Path.GetFullPath(".") : Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
+var output = dumpAt >= 0 || effectsAt >= 0 || graphAt >= 0 ? Path.GetFullPath(".") : Path.GetFullPath(args[Array.IndexOf(args, "--export-dir") + 1]);
 var filterAt = Array.IndexOf(args, "--filter");
 var filter = filterAt >= 0 ? args[filterAt + 1] : null;
 // Exact mode: one Engine package, named by its canonical /Engine/ reference under the root (EngineContent.TryExactReference). Only
@@ -758,7 +761,7 @@ Rgba16fPackage? dataTexturePackage = null;
 if (dataTextureAt >= 0)
 {
     if (exactAt >= 0 || filterAt >= 0) throw new ArgumentException("--data-texture cannot be combined with --filter or --exact-reference");
-    if (dumpAt >= 0 || graphAt >= 0) throw new ArgumentException("--data-texture cannot be combined with --dump-properties or --dump-graphs");
+    if (dumpAt >= 0 || effectsAt >= 0 || graphAt >= 0) throw new ArgumentException("--data-texture cannot be combined with --dump-properties, --dump-effects or --dump-graphs");
     if (dataTextureAt + 1 >= args.Length) throw new ArgumentException("--data-texture needs a package key");
     dataTextureSelector = args[dataTextureAt + 1];
     if (dataTextureSelector.Length == 0 || dataTextureSelector.Contains('\\') || dataTextureSelector.StartsWith('/') ||
@@ -869,6 +872,24 @@ if (dumpAt >= 0)
     var dumpDocument = new Dictionary<string, object?> { ["format"] = 1, ["game"] = game.ToString(), ["packages"] = dumpedPackages };
     File.WriteAllText(dumpPath, JsonConvert.SerializeObject(dumpDocument, Formatting.Indented), new UTF8Encoding(false));
     Console.WriteLine($"dumped {dumpedPackages.Count} packages to {dumpPath}");
+    return;
+}
+if (effectsAt >= 0)
+{
+    var effectsPath = Path.GetFullPath(args[effectsAt + 1]);
+    Directory.CreateDirectory(Path.GetDirectoryName(effectsPath)!);
+    var effectPackages = new List<Dictionary<string, object?>>();
+    var effectErrors = new List<Dictionary<string, object?>>();
+    foreach (var key in provider.Files.Keys
+        .Where(key => key.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) && MatchesFilter(key))
+        .OrderBy(key => key, StringComparer.OrdinalIgnoreCase))
+    {
+        var dumped = DumpEffectPackage(key, effectErrors);
+        if (dumped is not null) effectPackages.Add(dumped);
+    }
+    var effectsDocument = new Dictionary<string, object?> { ["format"] = 1, ["game"] = game.ToString(), ["packages"] = effectPackages, ["errors"] = effectErrors };
+    File.WriteAllText(effectsPath, JsonConvert.SerializeObject(effectsDocument, Formatting.Indented), new UTF8Encoding(false));
+    Console.WriteLine($"dumped {effectPackages.Count} effect packages to {effectsPath}{(effectErrors.Count > 0 ? $" with {effectErrors.Count} load error(s)" : "")}");
     return;
 }
 
@@ -1814,6 +1835,74 @@ static List<Dictionary<string, object?>> DumpScalarParameters(UObject instance)
         parameters.Add(new Dictionary<string, object?> { ["name"] = name ?? "", ["value"] = DumpNum(parameter.GetOrDefault<float>("ParameterValue")) });
     }
     return parameters;
+}
+
+// PRD-584: the tagged effect transport delegates to EffectDump (near MaterialOverrides). EffectDump
+// writes every known typed leaf explicitly and never follows a UObject, IPackage or ResolvedObject,
+// so the owner and provider graph cannot be walked. It bounds depth and node counts and raises an
+// explicit Refusal on overflow instead of truncating, so no array or emitter is silently dropped.
+
+// PRD-584 AC-4: a level or Blueprint that places a particle/Niagara component points at the portable
+// descriptor the effect writer exported, so the omission is actionable instead of "not yet reconstructable".
+// The descriptor file name matches the Node writer (system + source suffix).
+string? EffectDescriptorPointer(USceneComponent component)
+{
+    var isNiagara = component.ExportType.Contains("Niagara", StringComparison.OrdinalIgnoreCase);
+    var isCascade = component.ExportType.Contains("ParticleSystem", StringComparison.OrdinalIgnoreCase);
+    if (!isNiagara && !isCascade) return null;
+    foreach (var name in new[] { "Asset", "SystemTemplate", "Template" })
+    {
+        if (component.TryGetValue<FPackageIndex>(out var reference, name) && reference is { IsNull: false })
+            return $"Effects/{reference.Name}.{(isNiagara ? "niagara" : "cascade")}.json";
+    }
+    return null;
+}
+
+// The generic tagged transport for effect packages: CUE4Parse has no typed classes for most
+// Cascade modules, and Niagara is read through the same tagged properties (EmitterHandles ->
+// VersionedInstance -> VersionData -> renderer and script RapidIterationParameters). Every export
+// is emitted as tagged properties for the Node builder.
+Dictionary<string, object?>? DumpEffectPackage(string key, List<Dictionary<string, object?>> errors)
+{
+    IPackage package;
+    try { package = provider.LoadPackage(key); }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine($"effect dump skipped {key}: {error.Message}");
+        errors.Add(new Dictionary<string, object?> { ["path"] = key, ["error"] = error.Message });
+        return null;
+    }
+    // A class pre-filter reads each export's class name from the export map, so a package that holds
+    // no effect never loads one of its export objects. Before this the loop instantiated every export
+    // of every package, which walked the whole project into memory.
+    var isEffectPackage = false;
+    for (var index = 0; index < package.ExportMapLength && !isEffectPackage; index++)
+    {
+        try
+        {
+            var className = package.ResolvePackageIndex(new FPackageIndex(package, index + 1))?.Class?.Name.Text;
+            if (className is "ParticleSystem" or "NiagaraSystem" or "NiagaraEmitter") isEffectPackage = true;
+        }
+        // An export map this reader cannot resolve means the class is unknown, not absent, so the
+        // package is examined rather than dropped. Its per export errors are still reported.
+        catch { isEffectPackage = true; }
+    }
+    if (!isEffectPackage) return null;
+    var exportsJson = new List<Dictionary<string, object?>>();
+    for (var index = 0; index < package.ExportsLazy.Length; index++)
+    {
+        var item = new Dictionary<string, object?> { ["index"] = index };
+        try
+        {
+            var export = package.ExportsLazy[index].Value;
+            item["class"] = export.ExportType;
+            item["name"] = export.Name;
+            if (export is AbstractPropertyHolder holder) item["properties"] = holder.Properties.Select(property => EffectDump.Tag(property)).ToList();
+        }
+        catch (Exception error) { item["error"] = error.Message; }
+        exportsJson.Add(item);
+    }
+    return new Dictionary<string, object?> { ["path"] = DumpGamePath(package.Name), ["exports"] = exportsJson };
 }
 
 Dictionary<string, object?> DumpPackage(string key)
@@ -3399,12 +3488,23 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     meshName = tileMap.Name;
                 if (meshName.Length == 0)
                 {
+                    var isEffectComponent = component.ExportType.Contains("Niagara", StringComparison.OrdinalIgnoreCase) ||
+                        component.ExportType.Contains("ParticleSystem", StringComparison.OrdinalIgnoreCase);
                     if (component.ExportType.Contains("MeshComponent", StringComparison.OrdinalIgnoreCase) ||
-                        component.ExportType.Contains("Niagara", StringComparison.OrdinalIgnoreCase) ||
-                        component.ExportType.Contains("ParticleSystem", StringComparison.OrdinalIgnoreCase) ||
+                        isEffectComponent ||
                         component.ExportType.Contains("Decal", StringComparison.OrdinalIgnoreCase) ||
                         component.ExportType.Contains("Groom", StringComparison.OrdinalIgnoreCase))
-                        omittedActors.Add(new { actor = actorName, component = component.Name, sourceClass = component.ExportType, reason = "render component class is not yet reconstructable" });
+                    {
+                        if (isEffectComponent)
+                        {
+                            var effectDescriptor = EffectDescriptorPointer(component);
+                            omittedActors.Add(effectDescriptor is not null
+                                ? new { actor = actorName, component = component.Name, sourceClass = component.ExportType, descriptor = effectDescriptor, reason = $"particle effect is exported as a portable descriptor ({effectDescriptor}); its simulation is not reconstructed" }
+                                : new { actor = actorName, component = component.Name, sourceClass = component.ExportType, descriptor = (string?)null, reason = "particle effect component has no serialized system reference, so no descriptor was exported" });
+                        }
+                        else
+                            omittedActors.Add(new { actor = actorName, component = component.Name, sourceClass = component.ExportType, reason = "render component class is not yet reconstructable" });
+                    }
                     continue;
                 }
                 actors.Add(new {
@@ -3536,7 +3636,17 @@ foreach (var key in provider.Files.Keys.Where(key =>
                              component.ExportType.Contains("Groom", StringComparison.OrdinalIgnoreCase) ||
                              component.ExportType.Contains("TextRender", StringComparison.OrdinalIgnoreCase))
                     {
-                        omittedActors.Add(new { actor = prefabName, component = componentName, sourceClass = component.ExportType, reason = "serialized Blueprint render component is not yet reconstructable" });
+                        var isEffectComponent = component.ExportType.Contains("Niagara", StringComparison.OrdinalIgnoreCase) ||
+                            component.ExportType.Contains("ParticleSystem", StringComparison.OrdinalIgnoreCase);
+                        if (isEffectComponent)
+                        {
+                            var effectDescriptor = EffectDescriptorPointer(component);
+                            omittedActors.Add(effectDescriptor is not null
+                                ? new { actor = prefabName, component = componentName, sourceClass = component.ExportType, descriptor = effectDescriptor, reason = $"particle effect is exported as a portable descriptor ({effectDescriptor}); its simulation is not reconstructed" }
+                                : new { actor = prefabName, component = componentName, sourceClass = component.ExportType, descriptor = (string?)null, reason = "particle effect component has no serialized system reference, so no descriptor was exported" });
+                        }
+                        else
+                            omittedActors.Add(new { actor = prefabName, component = componentName, sourceClass = component.ExportType, reason = "serialized Blueprint render component is not yet reconstructable" });
                     }
                 }
             }
@@ -5625,6 +5735,155 @@ string GameplaySelector(string key) => GameplaySelectorUnder(looseMountPrefix, k
 // different folders never overwrite one file. Factor it out so the compiled regression can call it.
 static string GpCueTarget(string output, string selector, string name) =>
     Path.Combine(output, "Audio", selector, name + ".cue.json");
+
+// PRD-584: the serializer for the effect tagged transport. CUE4Parse has no typed classes for most
+// Cascade modules, and Niagara is read through the same tags (EmitterHandles -> VersionedInstance ->
+// VersionData -> renderer and script RapidIterationParameters). A known leaf (name, package reference,
+// GUID, vector, colour, box, rotator, quaternion, point) is written explicitly. A tagged holder is
+// written tag by tag. Any other object is read field by field with a reference cycle guard and hard
+// depth and node budgets, and a budget overflow raises Refusal. A UObject, IPackage, ResolvedObject,
+// FPropertyTag or tag value is never followed: walking that owner and provider graph reached tens of
+// gigabytes. Every array element is written, so no emitter, module or curve key is dropped silently.
+public static class EffectDump
+{
+    public sealed class Refusal(string message) : Exception(message);
+
+    public const int MaxDepth = 48;
+    public const int MaxNodes = 250_000;
+    public const int MaxItems = 250_000;
+
+    sealed class Budget
+    {
+        public int Nodes;
+        public readonly HashSet<object> Seen = new(ReferenceEqualityComparer.Instance);
+    }
+
+    public static object? Reflect(object? value) => Reflect(value, 0, new Budget());
+
+    public static object? Value(FPropertyTagType? tagValue) => Value(tagValue, 0, new Budget());
+
+    public static Dictionary<string, object?> Tag(FPropertyTag tag) => Tag(tag, 0, new Budget());
+
+    static void Spend(Budget budget, int depth)
+    {
+        if (depth > MaxDepth) throw new Refusal($"effect value is deeper than {MaxDepth}");
+        if (++budget.Nodes > MaxNodes) throw new Refusal($"effect value has more than {MaxNodes} nodes");
+    }
+
+    static object? Reflect(object? value, int depth, Budget budget)
+    {
+        if (value is null) return null;
+        Spend(budget, depth);
+        switch (value)
+        {
+            case string text: return text;
+            case FName name: return name.Text;
+            case bool flag: return flag ? "true" : "false";
+            case FPropertyTagType: return "<typed-value>";
+            case FPropertyTag: return "<property-tag>";
+            case FPackageIndex reference: return PackageReference(reference);
+            case ResolvedObject: return new Dictionary<string, object?> { ["kind"] = "unsupported", ["type"] = "ResolvedObject" };
+            case IPackage: return new Dictionary<string, object?> { ["kind"] = "unsupported", ["type"] = "IPackage" };
+            case UObject: return new Dictionary<string, object?> { ["kind"] = "unsupported", ["type"] = value.GetType().FullName };
+            case FGuid guid: return new Dictionary<string, object?> { ["A"] = Number(guid.A), ["B"] = Number(guid.B), ["C"] = Number(guid.C), ["D"] = Number(guid.D) };
+            case FVector vector: return new Dictionary<string, object?> { ["X"] = Number(vector.X), ["Y"] = Number(vector.Y), ["Z"] = Number(vector.Z) };
+            case FVector2D vector2: return new Dictionary<string, object?> { ["X"] = Number(vector2.X), ["Y"] = Number(vector2.Y) };
+            case FVector4 vector4: return new Dictionary<string, object?> { ["X"] = Number(vector4.X), ["Y"] = Number(vector4.Y), ["Z"] = Number(vector4.Z), ["W"] = Number(vector4.W) };
+            case FLinearColor color: return new Dictionary<string, object?> { ["R"] = Number(color.R), ["G"] = Number(color.G), ["B"] = Number(color.B), ["A"] = Number(color.A) };
+            case FQuat quat: return new Dictionary<string, object?> { ["X"] = Number(quat.X), ["Y"] = Number(quat.Y), ["Z"] = Number(quat.Z), ["W"] = Number(quat.W) };
+            case FRotator rotator: return new Dictionary<string, object?> { ["Pitch"] = Number(rotator.Pitch), ["Yaw"] = Number(rotator.Yaw), ["Roll"] = Number(rotator.Roll) };
+            case FIntPoint point: return new Dictionary<string, object?> { ["X"] = Number(point.X), ["Y"] = Number(point.Y) };
+            case FBox box: return new Dictionary<string, object?> { ["Min"] = Reflect(box.Min, depth + 1, budget), ["Max"] = Reflect(box.Max, depth + 1, budget), ["IsValid"] = box.IsValid != 0 ? "1" : "0" };
+        }
+        var type = value.GetType();
+        if (type.IsEnum) return value.ToString();
+        if (type.IsPrimitive || value is decimal) return Convert.ToString(value, CultureInfo.InvariantCulture);
+        if (value is byte[] bytes) return bytes.Select(item => (object?) item.ToString(CultureInfo.InvariantCulture)).ToList();
+        if (value is AbstractPropertyHolder holder) return Struct(holder, depth, budget);
+        if (value is System.Collections.IEnumerable enumerable) return Items(enumerable, depth, budget);
+        if (!type.IsValueType && !budget.Seen.Add(value))
+            return new Dictionary<string, object?> { ["kind"] = "cycle", ["type"] = type.FullName };
+        try
+        {
+            var fields = new Dictionary<string, object?>();
+            foreach (var field in type.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+                fields[field.Name] = Reflect(field.GetValue(value), depth + 1, budget);
+            foreach (var property in type.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+                if (property.GetIndexParameters().Length == 0 && property.CanRead) fields[property.Name] = Reflect(property.GetValue(value), depth + 1, budget);
+            return fields.Count > 0 ? fields : (object?) value.ToString();
+        }
+        finally { if (!type.IsValueType) budget.Seen.Remove(value); }
+    }
+
+    static object? Value(FPropertyTagType? tagValue, int depth, Budget budget)
+    {
+        if (tagValue is null) return null;
+        Spend(budget, depth);
+        switch (tagValue)
+        {
+            case StructProperty structProperty:
+                return new Dictionary<string, object?>
+                {
+                    ["kind"] = "struct",
+                    ["structType"] = structProperty.Value?.StructType?.ToString(),
+                    ["fields"] = structProperty.Value?.StructType is AbstractPropertyHolder holder
+                        ? holder.Properties.Select(property => Tag(property, depth + 1, budget)).ToList()
+                        : Reflect(structProperty.Value?.StructType, depth + 1, budget),
+                };
+            case ArrayProperty arrayProperty:
+                return new Dictionary<string, object?>
+                {
+                    ["kind"] = "array",
+                    ["inner"] = arrayProperty.Value?.InnerType,
+                    ["count"] = arrayProperty.Value?.Properties?.Count,
+                    ["elements"] = arrayProperty.Value?.Properties?.Select(element => Value(element, depth + 1, budget)).ToList(),
+                };
+            case MapProperty mapProperty:
+                return new Dictionary<string, object?> { ["kind"] = "map", ["value"] = mapProperty.Value?.ToString() };
+            case SetProperty setProperty:
+                return new Dictionary<string, object?> { ["kind"] = "set", ["value"] = setProperty.Value?.ToString() };
+            case FPropertyTagType<FPackageIndex> referenceProperty:
+                return new Dictionary<string, object?> { ["kind"] = "object", ["value"] = referenceProperty.Value is null ? null : PackageReference(referenceProperty.Value) };
+            default:
+                return new Dictionary<string, object?> { ["kind"] = tagValue.GetType().Name, ["value"] = tagValue.GenericValue?.ToString() };
+        }
+    }
+
+    static Dictionary<string, object?> Tag(FPropertyTag tag, int depth, Budget budget) => new()
+    {
+        ["name"] = tag.Name.Text,
+        ["type"] = tag.PropertyType.Text,
+        ["arrayIndex"] = tag.ArrayIndex,
+        ["arraySize"] = tag.ArraySize,
+        ["value"] = Value(tag.Tag, depth, budget),
+    };
+
+    static Dictionary<string, object?> Struct(AbstractPropertyHolder holder, int depth, Budget budget) =>
+        new() { ["kind"] = "struct", ["fields"] = holder.Properties.Select(property => Tag(property, depth + 1, budget)).ToList() };
+
+    static object? Items(System.Collections.IEnumerable enumerable, int depth, Budget budget)
+    {
+        var list = new List<object?>();
+        foreach (var item in enumerable)
+        {
+            if (list.Count >= MaxItems) throw new Refusal($"effect array has more than {MaxItems} items");
+            list.Add(Reflect(item, depth + 1, budget));
+        }
+        return list;
+    }
+
+    static Dictionary<string, object?> PackageReference(FPackageIndex reference)
+    {
+        if (reference.IsNull) return new Dictionary<string, object?> { ["Name"] = "None", ["Index"] = 0, ["IsNull"] = true };
+        string name;
+        try { name = reference.Name; } catch (Exception error) { name = $"<unresolved:{error.GetType().Name}>"; }
+        return new Dictionary<string, object?> { ["Name"] = name, ["Index"] = reference.Index, ["IsNull"] = reference.IsNull };
+    }
+
+    static string Number(float value) => value.ToString(CultureInfo.InvariantCulture);
+    static string Number(uint value) => value.ToString(CultureInfo.InvariantCulture);
+    static string Number(int value) => value.ToString(CultureInfo.InvariantCulture);
+}
 
 // The instance's own overrides, written as .props.txt blocks. A row is written only when CUE4Parse read it whole: a tagged row must
 // carry the tags it needs, and a binary row must come from a material whose read raised no logged failure. Presence is the tag

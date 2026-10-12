@@ -107,6 +107,10 @@ export const GAMEPLAY_CLASS_HINTS = Object.freeze([
   "SkeletalMesh",
 ]);
 
+/** Effect classes a UE5 pack ships that UE Viewer cannot list (PRD-584). Without the hint a Niagara
+ * package reads as a failed listing rather than as an effect whose descriptor must be exported. */
+const EFFECT_CLASS_HINTS = ["NiagaraSystem", "NiagaraEmitter", "ParticleSystem"];
+
 /** What a file that is not a readable package reports: no signal, never a negative one. */
 const UNKNOWN: PackageCooking = Object.freeze({
   state: "unknown",
@@ -443,7 +447,8 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
       .some((className) => head.includes(`\0${className}\0`, 0, "latin1"));
   // A whole name-table entry: the length prefix's high byte and the NUL terminator bracket it,
   // so "MaterialFunction" does not match inside "MaterialFunctionInstance".
-  const nonImportableClassHint = NON_IMPORTABLE_CLASSES.find((className) => head.includes(`\0${className}\0`, 0, "latin1"));
+  const nonImportableClassHint = [...EFFECT_CLASS_HINTS, ...NON_IMPORTABLE_CLASSES]
+    .find((className) => head.includes(`\0${className}\0`, 0, "latin1"));
   const gameplayClasses = GAMEPLAY_CLASS_HINTS.filter((className) => head.includes(`\0${className}\0`, 0, "latin1"));
   const blueprintPrefabHint = file.toLowerCase().endsWith(".uasset") &&
     head.includes("BlueprintGeneratedClass", 0, "latin1") && head.includes("SimpleConstructionScript", 0, "latin1");
