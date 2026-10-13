@@ -369,13 +369,14 @@ sealed class SkeletonExport(IPackage package) : ResolvedObject(package, 0) {
         },
         encoding: "utf8",
         maxBuffer: 8 * 1024 * 1024,
+        timeout: 90_000,
       });
     } catch (error) {
       const failure = error as { stdout?: string | Buffer; stderr?: string | Buffer };
       throw new Error(`${failure.stdout ?? ""}${failure.stderr ?? ""}`);
     }
     runner = join(project, "bin", "Release", "net10.0", "SequencerChannels.dll");
-  });
+  }, 120_000);
 
   afterAll(async () => {
     if (root) await rm(root, { recursive: true, force: true });
