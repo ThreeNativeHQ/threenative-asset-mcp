@@ -452,9 +452,13 @@ describe("Blendkit discovery", () => {
 });
 
 describe("Blendkit import", () => {
-  it("downloads one consented item through the Client, converts it with export_glb and records provenance", async () => {
+  it.each(["download", "downloads"])("downloads through /api/v1/%s/ and records converted provenance", async (route) => {
     const fake = await new FakeClient().start();
     happyPath(fake);
+    fake.searchResults = [item({ files: [
+      { fileType: "blend", downloadUrl: `https://www.blendkit.com/api/v1/${route}/${ID}/` },
+      { fileType: "resolution_2K", downloadUrl: `https://www.blendkit.com/api/v1/${route}/${BASE}/` },
+    ] })];
     const out = await tempDir();
     const progress: number[] = [];
     const result = await importBlendkitAsset(
@@ -497,6 +501,10 @@ describe("Blendkit import", () => {
       (file) => file.fileType,
     );
     expect(files).toEqual(["blend", "resolution_2K"]);
+    expect((download.asset_data as { files: { downloadUrl: string }[] }).files.map(file => file.downloadUrl)).toEqual([
+      `https://www.blendkit.com/api/v1/${route}/${ID}/`,
+      `https://www.blendkit.com/api/v1/${route}/${BASE}/`,
+    ]);
     const run = fake.requests.find((request) => request.path === "/tools/run")!.body;
     expect(run).toMatchObject({
       script_id: "export_glb",
@@ -569,6 +577,20 @@ describe("Blendkit import", () => {
     expect(result.license.name).toBe("CC0 1.0");
     expect(result.redistribution.redistributionAllowed).toBe(false);
     expect(result.redistribution.restriction).toMatch(/CC0 label does not grant/u);
+  });
+
+  it.each([
+    "https://www.blendkit.com/api/v1/downloads.evil/1/",
+    "https://evil.example/api/v1/downloads/1/",
+  ])("refuses %s before forwarding the key to a download", async (downloadUrl) => {
+    const fake = await new FakeClient().start();
+    happyPath(fake);
+    fake.searchResults = [item({ files: [{ fileType: "blend", downloadUrl }] })];
+    const error = await rejection(importBlendkitAsset(
+      provider(fake), importInput(await tempDir()), AbortSignal.timeout(5000), toolOptions,
+    ));
+    expect(error.code).toBe("BLENDKIT_UNSUPPORTED");
+    expect(fake.paths()).not.toContain("/assets/download");
   });
 
   it("never forwards download links outside the provider API, so the key cannot leave", async () => {
@@ -869,6 +891,23 @@ async function waitFor(condition: () => unknown): Promise<void> {
 const DOWNLOAD = { id: ID, name: "Oak Chair", assetType: "model", files: [] };
 
 describe("Blendkit bridge boundaries", () => {
+  it("sends a stable UUID4 scene identity per client on every download", async () => {
+    const fake = await new FakeClient().start();
+    fake.onDownload = (_body, task) =>
+      void Object.assign(task, { status: "finished", result: { file_paths: ["/staging/a.blend"] } });
+    const first = new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5 });
+    const second = new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5 });
+    for (const client of [first, first, second])
+      await client.download(DOWNLOAD, "/staging", "ORIGINAL", "", AbortSignal.timeout(5000));
+    const scenes = fake.requests
+      .filter((request) => request.path === "/assets/download")
+      .map((request) => (request.body.PREFS as { scene_id: string }).scene_id);
+    for (const scene of scenes)
+      expect(scene).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+    expect(scenes[0]).toBe(scenes[1]);
+    expect(scenes[2]).not.toBe(scenes[0]);
+  });
+
   it("redacts the configured API key from task text and task type, in plain text", async () => {
     const fake = await new FakeClient().start();
     fake.onDownload = (_body, task) =>

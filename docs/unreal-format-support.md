@@ -4,7 +4,7 @@ Single place to track which Unreal 4 and Unreal 5 formats the importer supports,
 and which are missing. `README.md` ("Unreal import support") links here. Update this file in the same
 commit as any importer, converter or adapter change that moves a row.
 
-Last audited: 2026-10-12, `IMPORTER_VERSION` 122 (`src/unreal/importer.ts`). Evidence comes from the
+Last audited: 2026-10-12, `IMPORTER_VERSION` 123 (`src/unreal/importer.ts`). Evidence comes from the
 README import table, `src/unreal/`, `tests/`, and the engine headers in `~/projects/UnrealEngine-5.8.3`
 (tag `5.8.3-release`, `Engine/Source/Runtime/Engine/Classes`, file names only).
 
@@ -48,8 +48,9 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | `SkeletalMesh`, cooked | UE4 | Implemented | skinned GLB | Joints, weights and inverse-bind matrices preserved. |
 | `SkeletalMesh`, editor source | UE5 | **Verified** | skinned GLB | README: "UE5 editor skeletal geometry". |
 | `AnimSequence` | UE4 | **Verified** | GLB clips | 146 clips in Animal Variety Pack. The CUE4Parse route now reads the editor raw track map (`TrackToSkeletonMapTable`), so raw/compressed UE4 clips convert to ActorX PSA: the Animation Starter Pack 4.4 CUE4Parse export matches the UE Viewer clips within 0.265° per bone per frame (13 clips, 68 bones). |
-| `AnimSequence` | UE5.0–5.5 | **Verified** | GLB clips | The conventional `UAnimDataModel.BoneAnimationTracks` editor model converts: the executed native probe (converter `85-animation`) decoded a real UE 5.0.3 MetaHuman Sample `MM_Walk_Fwd` to a 354-bone, 83-frame PSA at 30 fps with the endpoint sampled; the final-head public import (importer 116, converter `89-animation`, 2026-10-12) then exported the two selected MetaHuman Sample 5.0.3 clips, each with moving bound rotations and a duration within one frame of the model's own timing (`tests/helpers/animation-corpus.ts`, gate `ue5-clips`). Timing comes from the model's own `NumberOfFrames`/`NumberOfKeys` (keys = frames + 1) and rational `FrameRate`. A real 5.4 Fab pack (Game Animation Sample 5.4, 606 clips) still stores its tracks in a `UAnimationSequencerDataModel` — a `UMovieScene` with an `FKControlRig` parameter track — not in `BoneAnimationTracks`, and is Reported with that model. A cooked 5.0–5.5 clip that carries `RawAnimationData`/`FUECompressedAnimData`/ACL still converts. |
-| `AnimSequence` | UE5.6+ (incl. 5.8) | Reported | none | A clip with no raw or compressed bone data is reported from the package's own evidence (a `ControlRig`/Sequencer model, or `NumFrames`), never with a blanket engine-version claim and never as a bind-pose clip. |
+| `AnimSequence` | UE5.0–5.5 conventional data model | **Verified** | GLB clips | The conventional `UAnimDataModel.BoneAnimationTracks` editor model converts: the executed native probe (converter `85-animation`) decoded a real UE 5.0.3 MetaHuman Sample to a 354-bone, 83-frame PSA at 30 fps with the endpoint sampled; the final-head public import (importer 116, converter `89-animation`, 2026-10-12) exported the selected clips with moving bound rotations and model-derived timing (`tests/helpers/animation-corpus.ts`, gate `ue5-clips`). A cooked clip that carries `RawAnimationData`/`FUECompressedAnimData`/ACL still converts. |
+| `AnimSequence` | UE5.4+ FK Sequencer data model (incl.5.8) | **Verified** (selected FK clips, current `.584.10.2`) | GLB clips | Samples actual FK channels using serialized MovieScene ticks, frame-rate defaults and fractional whole-transform blending; preserves authored sidecar metadata. Current release 0.12.0 / importer124 / converter `.584.10.2` fresh public/native proof retains 325 selected UE5.4 clips and 7 UE5.8 clips with bound geometry and valid timing. Independent actual UE5.8.3 full-pose comparison passes 7 selected clips /8 GLB-document comparisons /72,233 keys: zero missing keys or errors above 0.5°, actual current maximum 0.000264°. Serialized raw-bone scope compares91/93 mannequin bones (only 2 independently declared virtuals excluded) and 875/875 face bones. Static poses remain intact; non-FK graphs stay Reported. Current independent replay and all four local repository gates pass (PRD-596); no whole-pack or generated-virtual-bone support claim. |
+| `AnimSequence` | UE5.6+ without an evaluable FK Sequencer section | Reported | none | A clip with no raw or compressed bone data is reported from the package's own evidence (a non-FK `ControlRig`/Sequencer model, or `NumFrames`), never with a blanket engine-version claim and never as a bind-pose clip. |
 | ActorX `.psa` clips | UE4 | Implemented | attached by bone name | Needs at least 80% of tracks to match. |
 | ActorX per-frame bone scale | any | Reported | none | |
 | `Skeleton` (standalone) | any | **Missing** | none | Read only as part of a mesh. |
@@ -175,10 +176,10 @@ CUE4Parse decodes every class in PRD-582 and PRD-583 on UE4 and UE5. UE Viewer d
 
 | PRD | Covers |
 |---|---|
-| [PRD-596](PRDs/PRD-596-ue5-sequencer-animation-clips.md) | UE 5.4+ `AnimSequence` clips stored in the Sequencer/FK Control Rig data model (P1) |
+| [PRD-596](PRDs/done/PRD-596-ue5-sequencer-animation-clips.md) | UE 5.4+ `AnimSequence` clips stored in the Sequencer/FK Control Rig data model (P1) |
 | [PRD-597](PRDs/done/PRD-597-ue5-static-mesh-lods-and-build-scale.md) | UE5 static mesh LOD1+ and UE 5.4+ `BuildScale3D` |
 | [PRD-598](PRDs/done/PRD-598-ue5-world-partition-external-actors.md) | World Partition external actors placed in their level |
-| [PRD-599](PRDs/PRD-599-ue5-landscape-heightfields.md) | UE5 landscape heightfields in levels (after PRD-598) |
+| [PRD-599](PRDs/done/PRD-599-ue5-landscape-heightfields.md) | UE5 landscape heightfields in levels (after PRD-598) |
 
 Visual parity of the existing formats stays with PRD-537 and PRD-538 (corpus sweep and baseline).
 
@@ -196,7 +197,7 @@ A format row can be Verified while the picture is still wrong. Current state:
 
 These need a check against a real pack or the engine source before a row can move:
 
-1. UE5 `AnimSequence` is Verified for UE5.0–5.5 and Reported for UE5.6+ (see the rows above). Check the UE5.6+ ControlRig or Sequencer model against a real pack.
+1. UE5 FK Sequencer clips have selected real UE5.4/5.8 coverage and a current `.584.10.2` / importer124 independent UE5.8.3 raw-bone differential. The current independent comparison and local repository gates pass (PRD-596); non-FK Control Rig graphs and untested per-version coverage remain open.
 2. Whether UE5 landscapes inside levels convert. The importer marks standalone `LandscapeComponent` unsupported.
 3. Which plugin classes (Chaos, Control Rig, MetaSound, Sequencer) exist as Fab content. They are listed from
    general engine knowledge. The sparse checkout holds only part of `Engine/Source/Runtime/Engine`, so the

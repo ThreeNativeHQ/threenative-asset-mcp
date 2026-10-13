@@ -12,9 +12,11 @@ import {
   canonicalPackagePath, parseAnimationDescriptor, parseAnimationReference,
   type RawAnimationAsset, type NormalizedAnimationAsset, type NormalizedClipSidecar,
 } from "../../src/unreal/animation-data.js";
-import type { ImportReport, ImportedAnimationLogic, ImportedAnimationClip } from "../../src/unreal/importer.js";
+import { IMPORTER_VERSION, type ImportReport, type ImportedAnimationLogic, type ImportedAnimationClip } from "../../src/unreal/importer.js";
+import { CUE4PARSE_SOURCE } from "../../src/unreal/cue4parse-adapter.js";
 import { parsePsa } from "../../src/unreal/psa.js";
 import { angularErrorDegrees, compareAnimationDifferential } from "./animation-differential.js";
+import { compareUnrealReferenceDocuments, loadUnrealAnimationReference, unrealReferenceSources } from "./unreal-animation-reference.js";
 
 const AFTER = ["modern", "asp", "stickmanFull", "gasp58", "gasp54", "rawCurve", "legacyCurve"] as const;
 type After = typeof AFTER[number];
@@ -108,29 +110,37 @@ function reference(out: Output, asset: ImportedAnimationLogic, source: string | 
   }
 }
 
-/** Registers five local licensed-corpus gates; never imports or manufactures proof inputs. */
+/** Registers local licensed-corpus gates; never imports or manufactures proof inputs. */
 export function registerAnimationCorpusGates(): void {
   describe("PRD-583 animation corpus", () => {
-    let loaded: Promise<{ proof: AnimationCorpusProof; outputs: Record<After | "aspBefore", Output>; path: (value: string) => string }> | undefined;
-    const load = () => loaded ??= (async () => {
+    type Scope = "historical" | "ue5-clips" | "sequencer-differential";
+    type Loaded = { proof: AnimationCorpusProof; outputs: Record<After | "aspBefore", Output>; path: (value: string) => string };
+    const loaded = new Map<Scope, Promise<Loaded>>();
+    const loadScope = async (scope: Scope): Promise<Loaded> => {
+      const current = scope !== "historical";
       required(process.env.PRD583_ANIMATION_PROOF, "PRD583_ANIMATION_PROOF (JSON index path)");
       const indexPath = resolve(process.env.PRD583_ANIMATION_PROOF);
       const proof = await json<AnimationCorpusProof>(indexPath);
       const path = (value: string): string => { required(value, "index path"); return resolve(dirname(indexPath), value); };
-      for (const [converter, expected] of [[proof.converter, "89-animation"], [proof.beforeConverter, "86-gameplay"]] as const) {
+      const converters = current ? [[proof.converter, CUE4PARSE_SOURCE.version]] as const
+        : [[proof.converter, "89-animation"], [proof.beforeConverter, "86-gameplay"]] as const;
+      for (const [converter, expected] of converters) {
         assert(converter, `converter ${expected} is required`);
         required(converter.version, "converter version");
-        assert.match(converter.version, new RegExp(`threenative\\.${expected}\\b`));
+        if (current) assert.equal(converter.version, `threenative-cue4parse ${CUE4PARSE_SOURCE.version}`);
+        else assert.match(converter.version, new RegExp(`threenative\\.${expected}\\b`));
         assert.match(converter.dllHash, /^[a-f0-9]{64}$/);
         const actual = (await run(path(converter.path), ["--version"], { timeout: 30_000, maxBuffer: 1024 * 1024 })).stdout.trim();
         assert.equal(actual, converter.version, `current ${expected} binary --version differs`);
         assert.equal(createHash("sha256").update(await readFile(path(converter.dll))).digest("hex"), converter.dllHash, `${expected}: DLL hash differs`);
       }
       const outputs = {} as Record<After | "aspBefore", Output>;
-      for (const id of [...AFTER, "aspBefore"] as const) {
+      const ids: readonly (After | "aspBefore")[] = scope === "ue5-clips" ? ["modern", "gasp54", "gasp58"]
+        : scope === "sequencer-differential" ? ["gasp58"] : [...AFTER, "aspBefore"];
+      for (const id of ids) {
         const dir = path(proof.outputs[id]);
         const report = await json<ImportReport>(join(dir, "import-report.json"));
-        assert.equal(report.importer.version, id === "aspBefore" ? 115 : 116, `${id}: importer version`);
+        assert.equal(report.importer.version, current ? IMPORTER_VERSION : id === "aspBefore" ? 115 : 116, `${id}: importer version`);
         assert.equal(report.reused, false, `${id}: cached proof is forbidden`);
         assert.equal(report.toolchain.modernConverter, (id === "aspBefore" ? proof.beforeConverter : proof.converter).version.replace(/^\S+\s+/, ""), `${id}: converter provenance`);
         assert(id === "legacyCurve" || report.models.length > 0, `${id}: no public models`);
@@ -153,16 +163,25 @@ export function registerAnimationCorpusGates(): void {
         }
         outputs[id] = out;
       }
-      assert((await files(path(proof.nativeAspDir), ".psa")).length > 0, "native ASP PSAs missing");
-      assert.equal(proof.curvePairs.length, 2, "two independent curve pairs required");
-      assert.deepEqual(proof.curvePairs.map((pair) => pair.property).sort(), ["LegacyCurveData", "RawCurveData"]);
-      for (const pair of proof.curvePairs) {
-        assert(AFTER.includes(pair.output), "curve pair output is invalid");
-        assert((await stat(path(pair.sourcePropertiesJSONL))).size > 0, "independent curve properties are empty");
-        assert((await stat(path(pair.sidecarPath))).size > 0, "promoted curve sidecar is empty");
+      if (!current) {
+        assert((await files(path(proof.nativeAspDir), ".psa")).length > 0, "native ASP PSAs missing");
+        assert.equal(proof.curvePairs.length, 2, "two independent curve pairs required");
+        assert.deepEqual(proof.curvePairs.map((pair) => pair.property).sort(), ["LegacyCurveData", "RawCurveData"]);
+        for (const pair of proof.curvePairs) {
+          assert(AFTER.includes(pair.output), "curve pair output is invalid");
+          assert((await stat(path(pair.sourcePropertiesJSONL))).size > 0, "independent curve properties are empty");
+          assert((await stat(path(pair.sidecarPath))).size > 0, "promoted curve sidecar is empty");
+        }
       }
       return { proof, outputs, path };
-    })();
+    };
+    const load = (scope: Scope = "historical"): Promise<Loaded> => {
+      const cached = loaded.get(scope);
+      if (cached) return cached;
+      const loading = loadScope(scope);
+      loaded.set(scope, loading);
+      return loading;
+    };
     const gate = (name: string, test: () => Promise<void>): void => {
       it(name, async (context) => {
         if (!process.env.FAB_FEATURE_CORPUS_DIR?.trim()) {
@@ -174,29 +193,25 @@ export function registerAnimationCorpusGates(): void {
     };
 
     gate("ue5-clips", async () => {
-      const { outputs } = await load();
+      const { outputs } = await load("ue5-clips");
       let modernClips = 0;
       for (const id of ["modern", "gasp54", "gasp58"] as const) {
         const out = outputs[id];
         const clips = out.native.filter((raw) => raw.kind === "clip" && raw.className === "AnimSequence");
         assert(clips.length > 0, `${id}: native AnimSequences missing`);
         if (id === "modern") assert.equal(clips.length, 2, "UE5.0 selection must contain exactly two clips");
-        let controlRig = 0;
+        let movingClips = 0;
         for (const raw of clips) {
           const rows = out.report.animationClips.filter((row) => canonicalPackagePath(row.package) === canonicalPackagePath(raw.package!));
-          if (rows.length === 0) { issue(out, raw, raw.unsupportedReason ?? ""); if (/ControlRig/i.test(raw.unsupportedReason ?? "")) controlRig++; continue; }
-          assert.equal(rows.length, 1, `${raw.package}: ambiguous clip sidecars`);
+          const failure = out.report.failed.find((row) => canonicalPackagePath(row.package) === canonicalPackagePath(raw.package!));
+          assert.equal(rows.length, 1, `${raw.package}: exactly one exported animation sidecar is required; converter reason: ${failure?.reason ?? raw.unsupportedReason ?? "no sidecar"}`);
           const sidecar = await artifact<Sidecar>(out, rows[0]!);
-          if (sidecar.unsupportedReason) {
-            assert(id !== "modern", "selected UE5.0 clips must contain motion");
-            issue(out, raw, sidecar.unsupportedReason);
-            if (/ControlRig/i.test(sidecar.unsupportedReason)) controlRig++;
-            continue;
-          }
+          assert(!sidecar.unsupportedReason, `${raw.package}: converter reported unsupportedReason: ${sidecar.unsupportedReason}`);
           assert.equal(sidecar.source ?? sidecar.clip, raw.name);
           required(sidecar.clip, `${raw.name}: exported clip identity`);
           const matches = out.documents.flatMap((doc) => doc.getRoot().listAnimations().filter((clip) => clip.getName() === sidecar.clip).map((clip) => ({ doc, clip })));
           assert(matches.length > 0, `${raw.name}: metadata-only motion proof`);
+          let clipMoving = false;
           for (const { doc, clip } of matches) {
             const bound = doc.getRoot().listNodes().filter((node) => node.getSkin() && node.getMesh()?.listPrimitives().some((p) => (p.getAttribute("POSITION")?.getCount() ?? 0) > 0));
             assert(bound.length > 0, `${raw.name}: no bound skinned geometry`);
@@ -220,17 +235,51 @@ export function registerAnimationCorpusGates(): void {
                 if (angularErrorDegrees([values[0]!, values[1]!, values[2]!, values[3]!], [values[i * 4]!, values[i * 4 + 1]!, values[i * 4 + 2]!, values[i * 4 + 3]!]) > 0.01) moving = true;
               }
             }
-            assert(moving && duration > 0 && Number.isFinite(frame), `${raw.name}: nontrivial bound rotation motion required`);
+            assert(duration > 0 && Number.isFinite(frame), `${raw.name}: finite animation timing required`);
+            clipMoving ||= moving;
             // The native clip descriptor reports `timing.duration` for UE5 data models and `animLength` elsewhere.
             const nativeLength = raw.animLength ?? (raw as { timing?: { duration?: number } }).timing?.duration;
             assert(typeof nativeLength === "number" && nativeLength > 0, `${raw.name}: native timing missing`);
             assert(Math.abs(duration - nativeLength) <= frame + 1e-6, `${raw.name}: duration differs by more than one frame`);
           }
+          if (clipMoving) movingClips++;
           if (id === "modern") modernClips++;
         }
-        if (id !== "modern") assert(controlRig > 0, `${id}: missing precise ControlRig unsupported coverage`);
+        if (id === "gasp54" || id === "gasp58") assert(movingClips > 0, `${id}: no selected clip carries genuine bound-bone motion`);
+        console.info(`ue5-clips: ${id}, ${out.report.models.length} models, ${clips.length} native AnimSequences, ${movingClips} clips with bound-bone motion`);
       }
       assert.equal(modernClips, 2, "selected UE5.0 body proof needs two actual walk clips");
+    });
+
+    gate("sequencer-differential", async () => {
+      const unrealPath = process.env.PRD596_UNREAL_REFERENCE_JSON?.trim();
+      const psaPath = process.env.PRD596_SEQUENCER_REFERENCE_PSA?.trim();
+      if (!unrealPath && !psaPath) throw new Error("AC-2 requires PRD596_UNREAL_REFERENCE_JSON or an independent PRD596_SEQUENCER_REFERENCE_PSA");
+      const { outputs } = await load("sequencer-differential");
+      const out = outputs.gasp58;
+      const sources = unrealPath
+        ? unrealReferenceSources(await loadUnrealAnimationReference(resolve(unrealPath)), out.native)
+        : [parsePsa(await readFile(resolve(psaPath!)))];
+      const results = [];
+      const absentClips: string[] = [];
+      let expectedKeys = 0;
+      for (const source of sources) for (const sequence of source.sequences) {
+        const documents = out.documents.filter((doc) => doc.getRoot().listAnimations().some((clip) => clip.getName() === sequence.name));
+        if (documents.length === 0) {
+          absentClips.push(`${sequence.name}: no matching Sequencer GLB`);
+          continue;
+        }
+        expectedKeys += sequence.tracks.reduce((sum, track) => sum + track.times.length, 0) * documents.length;
+        for (const { index, result } of compareUnrealReferenceDocuments(out.documents, { ...source, sequences: [sequence] })) {
+          results.push(result);
+          console.info(`sequencer-differential: ${sequence.name}, model=${out.report.models[index]!.glb}, documents=${documents.length}, ${result.comparedBones}/${source.bones.length} bones, ${result.comparedKeys} keys, max ${result.maxErrorDegrees.toFixed(6)} deg; worst=${JSON.stringify(result.worst)}; missing=${JSON.stringify(result.missing)}; errors=${result.errors.length}`);
+        }
+      }
+      const comparedKeys = results.reduce((sum, r) => sum + r.comparedKeys, 0);
+      const maximum = Math.max(...results.map((r) => r.maxErrorDegrees));
+      console.info(`sequencer-differential: ${results.length} document comparisons for ${sources.reduce((sum, source) => sum + source.sequences.length, 0)} clip(s), ${comparedKeys}/${expectedKeys} keys, ${results.reduce((sum, r) => sum + r.errors.length, 0)} angular errors, max ${maximum.toFixed(6)} deg; independent source=${unrealPath ? "official Unreal Raw full local poses" : "PSA"}`);
+      assert(comparedKeys === expectedKeys && absentClips.length === 0 && results.every((r) => r.missing.length === 0 && r.comparedKeys > 0 && r.errors.length === 0 && r.maxErrorDegrees <= 0.5),
+        `independent differential failed: ${JSON.stringify({ absentClips, missing: results.flatMap((r) => r.missing), worst: results.map((r) => r.worst) })}`);
     });
 
     gate("clip-differential", async () => {

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 
 /**
@@ -146,6 +147,8 @@ export class BlendkitClient {
   private readonly cancelConfirmMs: number;
   readonly appId: number;
   private readonly addonVersion: string;
+  /** Stable scene identity for this client session, forwarded by the Client as scene_uuid. */
+  private readonly sceneId = randomUUID();
   /** Terminal tasks /report handed over before their waiter asked; each is delivered once. */
   private readonly done = new Map<string, BlendkitTask>();
   private readonly latest = new Map<string, TaskProgress>();
@@ -407,7 +410,7 @@ export class BlendkitClient {
         asset_data: { ...assetData, available_resolutions: [] },
         PREFS: {
           api_key: apiKey,
-          scene_id: "",
+          scene_id: this.sceneId,
           app_id: this.appId,
           unpack_files: false,
           create_asset_library: false,
