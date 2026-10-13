@@ -351,7 +351,7 @@ export class BlendkitProvider implements AssetAdapter {
       const url = new URL(file.downloadUrl);
       if (
         !this.downloadOrigins.has(url.origin) ||
-        !url.pathname.startsWith("/api/v1/download/") ||
+        !/^\/api\/v1\/downloads?\//u.test(url.pathname) ||
         url.username ||
         url.password ||
         (file.fileUploadSize ?? 0) > maxBytes
