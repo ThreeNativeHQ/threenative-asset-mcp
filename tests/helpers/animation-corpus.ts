@@ -16,6 +16,7 @@ import { IMPORTER_VERSION, type ImportReport, type ImportedAnimationLogic, type 
 import { CUE4PARSE_SOURCE } from "../../src/unreal/cue4parse-adapter.js";
 import { parsePsa } from "../../src/unreal/psa.js";
 import { angularErrorDegrees, compareAnimationDifferential } from "./animation-differential.js";
+import { loadUnrealAnimationReference, unrealReferenceSources } from "./unreal-animation-reference.js";
 
 const AFTER = ["modern", "asp", "stickmanFull", "gasp58", "gasp54", "rawCurve", "legacyCurve"] as const;
 type After = typeof AFTER[number];
@@ -251,24 +252,34 @@ export function registerAnimationCorpusGates(): void {
     });
 
     gate("sequencer-differential", async () => {
-      const referencePath = process.env.PRD596_SEQUENCER_REFERENCE_PSA?.trim();
-      if (!referencePath) throw new Error("AC-2 is blocked: provide an independently decoded PSA at PRD596_SEQUENCER_REFERENCE_PSA");
+      const unrealPath = process.env.PRD596_UNREAL_REFERENCE_JSON?.trim();
+      const psaPath = process.env.PRD596_SEQUENCER_REFERENCE_PSA?.trim();
+      if (!unrealPath && !psaPath) throw new Error("AC-2 requires PRD596_UNREAL_REFERENCE_JSON or an independent PRD596_SEQUENCER_REFERENCE_PSA");
       const { outputs } = await load("sequencer-differential");
-      const source = parsePsa(await readFile(resolve(referencePath)));
       const out = outputs.gasp58;
-      let comparedKeys = 0;
-      let maximum = 0;
-      for (const sequence of source.sequences) {
+      const sources = unrealPath
+        ? unrealReferenceSources(await loadUnrealAnimationReference(resolve(unrealPath)), out.native)
+        : [parsePsa(await readFile(resolve(psaPath!)))];
+      const results = [];
+      const absentClips: string[] = [];
+      let expectedKeys = 0;
+      for (const source of sources) for (const sequence of source.sequences) {
         const documents = out.documents.filter((doc) => doc.getRoot().listAnimations().some((clip) => clip.getName() === sequence.name));
-        assert.equal(documents.length, 1, `${sequence.name}: exactly one Sequencer GLB is required`);
+        expectedKeys += sequence.tracks.reduce((sum, track) => sum + track.times.length, 0);
+        if (documents.length !== 1) {
+          absentClips.push(`${sequence.name}: expected exactly one Sequencer GLB, found ${documents.length}`);
+          console.info(`sequencer-differential: ${absentClips.at(-1)}`);
+          continue;
+        }
         const result = compareAnimationDifferential(documents[0]!, { bones: source.bones, sequences: [sequence] }, { toleranceDegrees: 0.5 });
-        assert.deepEqual(result.missing, [], `${sequence.name}: missing independent comparisons`);
-        assert.deepEqual(result.errors, [], `${sequence.name}: independent angular errors`);
-        assert(result.comparedKeys > 0 && result.maxErrorDegrees <= 0.5, `${sequence.name}: no independent keys or error exceeds 0.5 degrees`);
-        comparedKeys += result.comparedKeys;
-        maximum = Math.max(maximum, result.maxErrorDegrees);
+        results.push(result);
+        console.info(`sequencer-differential: ${sequence.name}, ${result.comparedBones}/${source.bones.length} bones, ${result.comparedKeys} keys, max ${result.maxErrorDegrees.toFixed(6)} deg; worst=${JSON.stringify(result.worst)}; missing=${JSON.stringify(result.missing)}; errors=${result.errors.length}`);
       }
-      console.info(`sequencer-differential: ${source.sequences.length} clip(s), ${comparedKeys} keys, max ${maximum.toFixed(6)} deg`);
+      const comparedKeys = results.reduce((sum, r) => sum + r.comparedKeys, 0);
+      const maximum = Math.max(...results.map((r) => r.maxErrorDegrees));
+      console.info(`sequencer-differential: ${results.length}/${sources.reduce((sum, source) => sum + source.sequences.length, 0)} clip(s), ${comparedKeys}/${expectedKeys} keys, ${results.reduce((sum, r) => sum + r.errors.length, 0)} angular errors, max ${maximum.toFixed(6)} deg; independent source=${unrealPath ? "official Unreal Raw local poses" : "PSA"}`);
+      assert(absentClips.length === 0 && results.every((r) => r.missing.length === 0 && r.comparedKeys > 0 && r.errors.length === 0 && r.maxErrorDegrees <= 0.5),
+        `independent differential failed: ${JSON.stringify({ absentClips, missing: results.flatMap((r) => r.missing), worst: results.map((r) => r.worst) })}`);
     });
 
     gate("clip-differential", async () => {

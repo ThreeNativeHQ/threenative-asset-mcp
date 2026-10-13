@@ -203,3 +203,22 @@ runtime closure, then fetch only the modules needed for a headless independent p
 The full39.8GB archive is not required in advance. An independently exported matching PSA
 remains an alternative. AC2 is still unchecked; PR49 merge, package publish and the engine
 pin/merge remain pending that comparison.
+
+
+### Local Unreal reference recovered (2026-10-13 UTC)
+
+The owner supplied the official Linux5.8.3 archive. A selective6.2GiB runtime now starts
+headlessly and exports raw local poses through Unreal AnimPoseExtensions. Seven selected
+clips,101 frame samples and39,109 bone-frame poses are recorded privately with archive,
+executable, source package and skeleton digests. The download401 is historical; fresh
+browser access is no longer needed.
+
+A test-only JSON reference validator and real differential gate now verify those identities,
+frame rates, complete sample arrays and the fixed Unreal-to-glTF coordinate reflection.
+Focused guards and typecheck pass. The first real comparison is red: the raw reference
+exports additive deltas while standalone glTF clips use full poses; generated virtual bones
+also need explicit source-backed comparison scope. One clip appears in two GLBs, rather
+than being absent. The non-additive ragdoll's91 compared serialized bones match within
+0.000056degrees, but this is not sufficient to mark AC2 complete. Preserve the original
+oracle unchanged and obtain a separate official full-pose evaluation before deciding whether
+an importer repair is necessary. AC2 remains unchecked pending that actual comparison.
