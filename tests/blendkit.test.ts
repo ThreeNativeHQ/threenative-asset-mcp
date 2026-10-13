@@ -121,6 +121,9 @@ class FakeClient {
   reportStatus = 200;
   cancelStatus = 200;
   cancelIgnored = false;
+  /** Accept the request (the task exists), then drop the connection or answer without a task id. */
+  dropStart = new Set<string>();
+  malformedStart = new Set<string>();
 
   async start(): Promise<this> {
     this.server = createServer(async (req, res) => {
@@ -147,7 +150,9 @@ class FakeClient {
           data: body,
         };
         this.tasks.set(created.task_id, created);
-        json({ task_id: created.task_id });
+        if (this.dropStart.has(path)) req.socket.destroy();
+        else if (this.malformedStart.has(path)) json({ accepted: true });
+        else json({ task_id: created.task_id });
         return created;
       };
       if (path === "/addons/list") return void res.end(this.statusBody);
@@ -1153,5 +1158,64 @@ describe("Blendkit bridge boundaries", () => {
     ).resolves.toEqual(["/staging/held.blend"]);
     stop.abort(new Error("stop"));
     await first.catch(() => undefined);
+  });
+
+  it("removes URLs before redacting a short key, so ':' cannot expose a signed-link token", async () => {
+    const signed = "failed https://cdn.example/f.blend?X-Amz-Signature=TOKEN123 next";
+    expect(safeTaskText(signed, [":"])).toBe("failed <url> next");
+    expect(safeTaskText("key : here, link http://h/p?t=SECRET9", [":", "k"])).toBe(
+      "<redacted>ey <redacted> here, lin<redacted> <url>",
+    );
+    const fake = await new FakeClient().start();
+    fake.onDownload = (_body, task) =>
+      void Object.assign(task, { status: "error", message: signed });
+    const error = await rejection(
+      importBlendkitAsset(
+        provider(fake, { apiKey: ":" }),
+        importInput(await tempDir()),
+        AbortSignal.timeout(5000),
+        toolOptions,
+      ),
+    );
+    expect(error.message).not.toMatch(/TOKEN123|cdn\.example/u);
+    expect(error.message).toContain("<url>");
+  });
+
+  it("keeps staging when an accepted start request drops or answers without a task id", async () => {
+    const cases: [string, "dropStart" | "malformedStart"][] = [
+      ["/assets/download", "dropStart"],
+      ["/assets/download", "malformedStart"],
+      ["/tools/run", "dropStart"],
+      ["/tools/run", "malformedStart"],
+    ];
+    for (const [path, mode] of cases) {
+      const fake = await new FakeClient().start();
+      happyPath(fake);
+      fake[mode].add(path);
+      const out = await tempDir();
+      const error = await rejection(
+        importBlendkitAsset(
+          provider(fake),
+          importInput(out),
+          AbortSignal.timeout(10_000),
+          toolOptions,
+        ),
+      );
+      expect(error.code, `${path} ${mode}`).toBe("BLENDKIT_STAGING_RETAINED");
+      expect(error.message, `${path} ${mode}`).toContain("was kept");
+      const entries = await readdir(out);
+      expect(entries, `${path} ${mode}`).toHaveLength(1);
+      expect(entries[0]).toMatch(/^\.blendkit-staging-/u);
+    }
+  });
+
+  it("does not treat an abort before a recipe start request is sent as a possibly running writer", async () => {
+    const fake = await new FakeClient().start();
+    const client = new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5 });
+    const aborted = AbortSignal.abort(new Error("already aborted"));
+    await expect(
+      client.runTool("export_glb", "/a.blend", "/a.glb", {}, "/opt/blender", aborted),
+    ).rejects.toThrow("already aborted");
+    expect(fake.requests).toEqual([]);
   });
 });

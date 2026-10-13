@@ -66,7 +66,8 @@ exists (see [Provider permission](#provider-permission)).
 - The Client owns search, download, export and task execution. The MCP only
   bridges its HTTP API and adds the policy checks in this document.
 - The configured API key, of any length, is also removed from task text and task
-  types that the Client echoes, in plain text as well as in URLs.
+  types that the Client echoes, in plain text as well as in URLs. URLs are removed
+  first, so a very short key cannot expose a signed-link token.
 - A caller that has aborted never accepts a parked completion, and nothing is
   published after an abort. Results that someone still waits for are never
   evicted from the poll buffer, and nothing is evicted while a start request is
@@ -83,8 +84,12 @@ exists (see [Provider permission](#provider-permission)).
   staging directory, and the error (`BLENDKIT_STAGING_RETAINED`, or
   `BLENDKIT_CANCELLED` after an abort) names it, so a running Go download or
   Blender export never loses its target. Delete the directory once it has
-  ended. A start request that fails before a task id exists is treated as "not
-  started"; a timeout there is ambiguous and not handled separately.
+  ended. A start request for a download or recipe that fails after the Client may
+  have accepted it (dropped connection, timeout, malformed answer with no task id)
+  also keeps the staging directory, because there is no task id to cancel or watch.
+  Only a start request that was never sent (the caller had already aborted) is
+  treated as "not started". A Client that is simply not running therefore also
+  leaves an empty staging directory behind; delete it.
 - Staging cleanup after a committed import is reported in `warnings`. It never
   turns a finished import into a failure.
 

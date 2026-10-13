@@ -74,19 +74,20 @@ export function loopbackOrigin(raw: string): string {
  */
 export function safeTaskText(value: unknown, secrets: Iterable<string> = []): string {
   if (typeof value !== "string") return "";
-  // One pass, longest first, so a short secret cannot split a longer one or the placeholder.
+  // URLs go first: a short secret such as ":" would otherwise split "https://" and leave a
+  // signed link's token behind. Then one pass over the secrets, longest first.
+  const withoutUrls = value.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/giu, "<url>");
   const known = [...secrets].filter(Boolean).sort((a, b) => b.length - a.length);
   const text = known.length
-    ? value.replace(
+    ? withoutUrls.replace(
         new RegExp(
           known.map((secret) => secret.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")).join("|"),
           "gu",
         ),
         "<redacted>",
       )
-    : value;
+    : withoutUrls;
   return text
-    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/giu, "<url>")
     .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
     .trim()
     .slice(0, 300);
@@ -252,6 +253,17 @@ export class BlendkitClient {
     return { clientVersion, tools };
   }
 
+  /**
+   * A start request for work that writes files (download, recipe) can fail after the Client
+   * accepted it: the connection may drop or the answer may be malformed, and then there is no task
+   * id to cancel or watch. That is not proof that nothing runs, so it never counts as "not started".
+   */
+  private startWriter(path: string, body: unknown, signal: AbortSignal): Promise<string> {
+    return this.startTask(path, body, signal).catch((error: unknown) => {
+      throw new UnconfirmedStopError(error);
+    });
+  }
+
   private async startTask(path: string, body: unknown, signal: AbortSignal): Promise<string> {
     this.pendingStarts += 1;
     try {
@@ -386,7 +398,7 @@ export class BlendkitClient {
     signal.throwIfAborted();
     if (apiKey) this.secrets.add(apiKey);
     // The start request runs to completion so an abort always knows which task to cancel.
-    const taskId = await this.startTask(
+    const taskId = await this.startWriter(
       "/assets/download",
       {
         ...this.identity(),
@@ -445,7 +457,8 @@ export class BlendkitClient {
     blenderExePath: string,
     signal: AbortSignal,
   ): Promise<string> {
-    const taskId = await this.startTask(
+    signal.throwIfAborted();
+    const taskId = await this.startWriter(
       "/tools/run",
       {
         ...this.identity(),
