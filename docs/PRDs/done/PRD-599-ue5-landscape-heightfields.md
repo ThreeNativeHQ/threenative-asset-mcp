@@ -1,0 +1,130 @@
+# PRD-599 — UE5 landscape heightfields in levels
+
+**Status:** DONE — final integrated local acceptance complete; final review and current-head CI remain delivery checks
+**Priority:** P2 — terrain export implemented; parent owns the comparison sheet and final repository gates.
+**Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, `src/unreal/scenes.ts`), new module; risk override: none.
+**Owner:** PRD-599 repair lane; parent owns orchestration
+**Depends on:** PRD-598 (most UE5 levels keep their `LandscapeStreamingProxy` actors as World Partition external actors).
+
+## Context
+
+UE4 4.21–4.27 levels already convert landscapes: the uncooked Python decoder walks each `LandscapeComponent`, reads
+its `HeightmapTexture` (mip 0, `TSF_BGRA8`), and decodes height as `((R<<8)|G) − 32768) / 128` with the normal in
+B/A (`src/unreal/provision.ts:1017,1228-1298`). `src/unreal/scenes.ts:306-341,802-851` builds the indexed terrain grid
+(cap 4M vertices, `sourceClass: "LandscapeComponent"`). Tests are synthetic only (`tests/unreal-scenes.test.ts:94,258,336`).
+
+The UE5 level route has no landscape code: `landscapes = Array.Empty<object>()` at `src/unreal/cue4parse-adapter.ts:3538`
+(level) and :3721 (Blueprint prefab); `ALandscape.LandscapeComponents` is never followed. UE5 editor texture sources
+already decode, including `TSCF_UEDELTA` `TSF_BGRA8` and `TSF_G16` (`ExtractUeDeltaSourcePng`, :4487; formats :4543), but
+only to PNG. Engine headers to confirm the UE5 fields (tracked, not checked out):
+`Engine/Source/Runtime/Landscape/Classes/{Landscape,LandscapeComponent,LandscapeProxy,LandscapeStreamingProxy}.h`,
+`Engine/Source/Runtime/Landscape/Public/LandscapeDataAccess.h`.
+
+## Solution
+
+1. In the UE5 level export, follow each landscape proxy's components and emit the same landscape record the UE4 path
+   gives `scenes.ts` (component size, subsections, `HeightmapScaleBias`, transform, material, heights). Read the
+   heightmap from the editor texture source with the existing source decoders, as raw pixels, not PNG.
+2. Confirm the height encoding against `LandscapeDataAccess.h` before reuse; record it under Decisions.
+3. `scenes.ts` builds the grid unchanged. Layer weights stay out of scope (ledger row stays Missing).
+
+## Acceptance Criteria
+
+- [x] AC-1 [local]: A real UE5 level with a landscape imports with a terrain mesh whose height range and footprint match the landscape actor's bounds stored in the package, within 1%. proof: real-pack gate in `tests/fab-feature-corpus.test.ts` — Evidence: `.584.9.1` / importer 122, 2026-10-12: native and actual public importer GLB gates pass for all 51 components from the same eight-file stage; node-world POSITION bounds within 1%, zero terrain omissions, `reused: false`, pinned provenance.
+- [x] AC-2 [local]: A synthetic UE5 heightmap (known BGRA8 and `TSCF_UEDELTA` pixels) decodes to the expected heights. proof: red-to-green test beside `tests/unreal-converter-ue5-sources.test.ts` — Evidence: `.584.9.2` shares `TryDecodeLandscapeSourcePixels` between the actual texture reader and compiled synthetic harness. Raw BGRA8 and encoded UEDELTA both dispatch through it and assert the same known heights, normals, subsection atlas boundaries and mip-0 byte count; the public GLB nonuniform/mirrored normal regression remains. Disabling only its production UEDELTA branch compiles but fails the expected height assertion (-252.64844 vs -18.6953125), while raw passes; restored focused suites pass. Unsupported compression, PNG flag and truncated payload refusals are asserted.
+- [x] AC-3 [local]: Before/after terrain sheet attached to the PR and inspected by eye. proof: PR comment link — Evidence: parent inspected actual before/after terrain and attached [PR52 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/52#issuecomment-6133268228). Selected eight-package terrain-only proof, not full-map completeness; material layers unsupported and final combined map sample parent-owned pending. Same bounded eight-file stage, .584.8.1 blank terrain before and .584.9.1 public51-component GLB after. Production neutral renderer unchanged; existing fallback material, no layer-weight fidelity claim. Direct native PNG attachment is on the same PR52 comment. Recipe and input/output SHA-256: raw/parent599-sheet.{mts,json}.
+- [x] AC-4 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent normal-provisioner rebuild and all four gates pass on implementation7a04068: typecheck0.9s; default suite2,720 passed/17 skipped81.1s; leak gate clean89.6s; packed MCP15/15 in15.4s. Logs raw/parent599-final91-{typecheck,test,leaks,smoke}.log. These remain evidence for the prior implementation; parent must rerun all four and the real gate on final union `.584.9.4`.
+
+## Decisions
+
+- Height encoding: official LandscapeDataAccess.h:13,31–72; subsection duplicated-edge mapping
+  :177–208,314–329; LandscapeDataAccess.cpp:15–17 rounds atlas bias and :140–148 transforms local
+  vertices. Component fields are LandscapeComponent.h:437–501. LandscapeProxy.h:477–481 shares
+  the landscape GUID across proxies; :527 SectionOffset is not added again because component
+  relative location already accounts for it (Landscape.cpp:1387–1398).
+- SceneComponent.cpp:120–132 supplies native identity scale and :727–753 defines parent composition.
+  Source instances in this bounded proof have template-null components, no absolute flags and zero
+  rotations; stored root/component transforms plus native defaults determine their bounds.
+
+- Official engine reference: `5.8.3-release`, commit `396c9f059903aed5fec78ecd3d437a40c6415368`.
+  `Engine/Source/Runtime/Landscape/Public/LandscapeDataAccess.h` confirms height decoding and,
+  at lines 357–365, documents packed normals as already scaled but not rotated.
+  `Engine/Shaders/Private/LandscapeVertexFactory.ush:515,559` transforms those normals with
+  `LocalToWorldNoScaling`; `Engine/Source/Runtime/Landscape/Private/LandscapeRender.cpp:2298–2300`
+  constructs it using `RemoveScaling()`, retaining mirrored basis signs.
+- The UE5 export normalizes packed normals multiplied by absolute composed world scale before
+  `scenes.ts` applies its node transform. This cancels glTF inverse scale while retaining mirrored
+  signs. Invalid/zero scale explicitly omits the component with a reason. UE4 and heights are unchanged.
+- Review repair converter `.584.9.2`; importer remains 122 for this unreleased lane. All executable version pins updated. Compression-tag normalization, exact validation, dispatch and mip-0 slicing now belong to one production helper used by both the actual texture reader and compiled fixtures.
+- A bounded private eight-file source stage supplies 51 components. The gate checks both native
+  arrays and every public GLB POSITION transformed by its node world matrix against independently
+  stored `CachedLocalBox` and source parent chains, within 1%; zero terrain omissions and fresh
+  importer/converter provenance are required. Licensed inputs, GLBs and index remain local-only.
+- Payload fallback audit found first-match selection by size. Multiple same-size scan candidates now
+  refuse explicitly rather than choose one. A unique size-only candidate remains a fallback; this
+  is not a cryptographic identity check. No other toolchain cache is mutated.
+- Honest red/green: replacing the normal helper with the previous unchanged-normal behavior fails
+  the compiled-helper → public GLB world-direction assertion (nonuniform scale), without timeout;
+  the compensated implementation passes both positive and mirrored nonuniform scales. The revised
+  BGRA8/UEDELTA test reaches shared production dispatch and covers known heights and subsection atlas boundaries. Layer weights remain out of scope.
+
+## Local verification
+
+Prior implementation `.584.9.1` has parent real-gate, sheet and repository evidence; `.584.9.2` repair has focused synthetic and typecheck evidence only. Fresh parent gates, real proof and independent review remain pending. The first two real-gate
+launches failed before conversion because the rebuilt apphost could not discover .NET. A private
+launcher now executes the converter DLL using the existing read-only SDK directly.
+
+## Integration Ledger
+
+| Capability | Reachable consumer/trigger | Replaces / disposition | Evidence |
+|---|---|---|---|
+| UE5 landscape | `asset_import_unreal` → UE5 level route → CUE4Parse level export `landscapes` (`cue4parse-adapter.ts:3538`) → `scenes.ts` grid | Empty list replaced | AC-1 |
+
+## Execution Phases
+
+#### Phase 1: Pack and height encoding
+**Status:** DONE
+**Files:** `scripts/fab-slice.ts` (slice), notes under Decisions.
+**Implementation:** Find a UE5 landscape pack; expand the sparse checkout with the Landscape paths; record the UE5 fields and encoding.
+**Verification:** slice builds.
+
+#### Phase 2: Converter landscape records
+**Status:** DONE
+**Files:** `src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, tests.
+**Implementation:** As in Solution 1. Bump converter tag and `IMPORTER_VERSION`.
+**Verification:** AC-1, AC-2.
+
+#### Phase 3: Evidence, ledger and gates
+**Status:** DONE — fresh final union local acceptance passed
+**Files:** `docs/unreal-format-support.md` row "Landscape, UE5", `README.md` import table.
+**Verification:** AC-3, AC-4.
+
+
+- Prior `.584.9.1` parent real gate: 2 landscape gates passed (34 total including generic tests; 5.79 s), private index `/home/joao/.cache/threenative-asset-mcp/prd599-real-proof/index91.json`; source files SHA-256 checked before both imports.
+- `npm run typecheck`: passed.
+- Prior `.584.9.1` focused synthetic suites: 99 passed across converter source decoding, instance parameters and public scene assembly (38.54 s).
+- `.584.9.2` review repair: 142 focused tests passed across four suites (41.25 s); typecheck and diff checks passed. Normal provisioner rebuilt only the private PRD-599 cache; the existing launcher outside `modern/bin` reports `.584.9.2`. No build or test process remains active. An initial overlapping rebuild/test launch hit a missing-bin cache window; the final test run followed the completed rebuild.
+- Parent completed AC-3 and AC-4 on `.584.9.1`; final `.584.9.2` evidence is pending.
+- Review repair logs: `raw/599-review-repair-mutation-red.log`, `raw/599-review-repair-green.log`, `raw/599-review-repair-typecheck.log`, `raw/599-review-repair-native-build.log`. Private `index92.json` preserves the same source hashes and uses fresh output paths; the native/public real gate remains for the parent.
+
+## Final union integration
+
+Ordinary merge of exact released PRD-598 head `1931a3e72780917f77b4a4f69c18d9a12d2b11d6` retains full PRD-597 source-model LOD/cooked BuildScale fixes, PRD-598 provider mount and mesh guards, and PRD-599 shared `TryDecodeLandscapeSourcePixels` dispatch and `LandscapeLocalNormals` absolute world-scale compensation. The shared actual parser now handles the legacy TOC/odd UObject preamble and complete static-mesh bulk header. Converter is `.584.9.4`; unreleased importer remains 122. Private `index94.json` preserves the same eight source packages and hashes with fresh `parent-native-58494` / `parent-public-58494` output paths and the retained outside-bin launcher. No native rebuild or cache mutation was performed in this integration lane. Fresh normal provisioning, real proof, all four repository gates, final review 2/2 and CI remain parent-owned and pending; no final approval is claimed.
+
+The existing sheet proves only the selected eight-package terrain slice, not full-map completeness. Material layers remain unsupported. The final combined map sample is parent-owned and pending.
+
+Prior `.584.9.3` union verification: private normal-provisioner rebuild passed and the retained outside-bin launcher reports `b4e95441+threenative.584.9.3`; typecheck and diff checks passed. Corrected default-worker `CI=true` focused run passed 353 tests across 11 files, with one existing opt-in suite skipped (44.06 s): the 337 union guards plus public scene coverage, retaining the dispatch and nonuniform/mirrored-normal guards. An initial run passed 290 but failed 59 compiled harness tests because its executable override pointed outside `modern/bin`, so harness assembly lookup used the launcher directory; rerunning with the private bin executable resolved this without code changes. The real-proof index still uses the retained launcher. No final-tag real terrain, all-four-gates, CI or final-review approval is claimed. Build and test command sessions have exited.
+
+Final `.584.9.4` mechanical integration: `npm run typecheck` and `git diff --cached --check` pass. No native build, cache mutation, runtime tests or review was run; those remain parent-owned.
+
+## Final integrated parent verification
+
+Final source68a7790 plus doc-only PRD-598 merge; converter `.584.9.4` / importer122. Typecheck1.2s, default2,738 passed /17 skipped115.9s, leak gate112.0s clean, packed MCP15/15 in13.9s. Fresh native/public gates pass37 tests including3 WP and2 landscape gates in48.92s; private index94.json and wp-index94.json. All51 landscape components match stored world bounds within1%, zero terrain omissions, and all3 selected mesh actors retain decoded geometry and stored transforms. Modern Hornbeam requested LOD0/1/2 guard passes unchanged115,674 /41,543 /15,076 triangles. Source files SHA checked and imports fresh. Logs raw/parent599-final94-{typecheck,test,leaks,smoke,real,hornbeam}.log.
+
+The final94 terrain GLB is byte-identical to the inspected native PR52 image input (SHA-2565cd60fad494d2bb494b09bc7268bb0c6d3033abccfd2eee15c43b0c9fac07c0d). A direct GLB edge audit found10,809 shared boundary vertices across163 touching component pairs and zero height mismatch. This is geometry evidence for the selected eight-package terrain slice; it does not prove full-village coverage. Terrain layers remain unsupported and the green material is the existing fallback. The PR52 native attachment comment now states these limits. The additional combined35-file sample passed:51 terrain components,822,579 terrain vertices,3 resolved mesh actors, zero actor omissions; sceneGLB SHA-2568ebc5967299b97c4031a852697584b560095a21e203aa20deedf3f8292c66b65. This is also a selected slice, with no full-map completeness claim. Local recipe/log raw/599-combined-import.{mts,log}. No renderer changes or per-asset tuning.
+
+Both final local acceptance and original ACs are complete; final independent review round2/2 and current-head CI remain merge prerequisites. Prior proof sections above are historical; this section supersedes pending final94 gate statements. No deployment/publication.
+
+## Final independent review disposition
+
+Round2/2 found one documentation defect: the format ledger still claimed final94 proof was pending despite fresh green native/public evidence. The ledger now records actual final94 terrain and World Partition results and the combined sample, with selected-slice/material limitations explicit. Parent checked the corrected rows against completed proof logs and image/scene digests. No code defect was reported in round2; its recorded verdict remains REQUEST_CHANGES, repaired here without a third review or invented approval. All executable source/tests/config are unchanged from the parent-tested head. Current-head CI remains mandatory before merge.

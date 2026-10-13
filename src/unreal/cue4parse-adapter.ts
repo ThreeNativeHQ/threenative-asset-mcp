@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.6.4",
+  version: "b4e95441+threenative.584.10.1",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -546,6 +546,26 @@ diff --git a/CUE4Parse/UE4/Assets/Exports/Animation/AnimCurveTypes.cs b/CUE4Pars
          }
      }
 
+diff --git a/CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs b/CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs
+--- a/CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs
++++ b/CUE4Parse/UE4/Objects/Core/Misc/FSHAHash.cs
+@@ -55,5 +55,5 @@ public bool IsValid()
+     public bool IsValid()
+     {
+         ReadOnlySpan<byte> span = Hash;
+-        return span.IndexOfAnyExcept((byte) 0) < 0;
++        return span.IndexOfAnyExcept((byte) 0) >= 0;
+     }
+
+diff --git a/CUE4Parse/UE4/Assets/FPackageTrailer.cs b/CUE4Parse/UE4/Assets/FPackageTrailer.cs
+--- a/CUE4Parse/UE4/Assets/FPackageTrailer.cs
++++ b/CUE4Parse/UE4/Assets/FPackageTrailer.cs
+@@ -36,3 +36,3 @@
+         {
+-            if (entry.Identifier.Equals(id.Hash))
++            if (entry.Identifier.Equals(id))
+             {
+
 `;
 
 export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
@@ -696,6 +716,7 @@ using CUE4Parse.UE4.Assets.Exports.Engine;
 using CUE4Parse.UE4.Assets.Exports.Engine.Font;
 using CUE4Parse.UE4.Assets.Exports.Actor;
 using CUE4Parse.UE4.Assets.Exports.Component;
+using CUE4Parse.UE4.Assets.Exports.Component.Landscape;
 using CUE4Parse.UE4.Assets.Exports.Component.Lights;
 using CUE4Parse.UE4.Assets.Exports.Component.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.Component.StaticMesh;
@@ -771,7 +792,7 @@ if (dataTextureAt >= 0)
         throw new ArgumentException($"--data-texture is not a relative package key: {dataTextureSelector}");
     dataTextureKey = dataTextureSelector + ".uasset";
 }
-// Source-model LODs of a skeletal mesh to export, as indices into its source model array.
+// Source-model LODs of a static or skeletal mesh to export, as indices into its source model array.
 var lodsAt = Array.IndexOf(args, "--lods");
 var requestedLods = lodsAt >= 0
     ? args[lodsAt + 1].Split(',', StringSplitOptions.RemoveEmptyEntries)
@@ -857,6 +878,60 @@ if (mappings.Length > 1) throw new InvalidDataException($"Found {mappings.Length
 if (mappings.Length == 1) provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappings[0]);
 provider.Initialize();
 provider.PostMount();
+static string SourceRelativePackagePath(string key)
+{
+    return key.Replace('\\', '/');
+}
+static bool IsExternalActorForLevel(string actorKey, string levelKey)
+{
+    var actor = SourceRelativePackagePath(actorKey);
+    var level = SourceRelativePackagePath(levelKey);
+    const string marker = "__ExternalActors__/";
+    var markerAt = actor.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+    if (markerAt < 0 || (markerAt > 0 && actor[markerAt - 1] != '/') || !actor.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) return false;
+    var actorPath = actor[(markerAt + marker.Length)..].Split('/', StringSplitOptions.RemoveEmptyEntries);
+    if (actorPath.Length < 4) return false;
+    var mapPath = actor[..markerAt] + string.Join('/', actorPath.Take(actorPath.Length - 3));
+    var levelPath = level.EndsWith(".umap", StringComparison.OrdinalIgnoreCase) ? level[..^5] : level;
+    return string.Equals(mapPath, levelPath, StringComparison.OrdinalIgnoreCase);
+}
+IEnumerable<UObject> ActorsForLevel(string levelKey, ULevel level, List<object> omittedActors)
+{
+    foreach (var actorIndex in level.Actors ?? [])
+        if (actorIndex?.Load<UObject>() is { } actor) yield return actor;
+    IEnumerable<AActor> LoadExternalActorPackage(string actorKey)
+    {
+        try { return provider.LoadPackage(actorKey).GetExports().OfType<AActor>().ToArray(); }
+        catch (Exception error)
+        {
+            var reason = $"external actor package could not be loaded: {error.Message}";
+            omittedActors.Add(new { actor = SourceRelativePackagePath(actorKey), component = "package", sourceClass = "ExternalActorPackage", reason });
+            Console.Error.WriteLine($"external actor package skipped {actorKey}: {error.Message}");
+            return [];
+        }
+    }
+    foreach (var actorKey in provider.Files.Keys.Where(key => IsExternalActorForLevel(key, levelKey)))
+        foreach (var actor in LoadExternalActorPackage(actorKey)) yield return actor;
+}
+
+byte[]? ReadPackageBytes(IPackage? owner)
+{
+    if (owner is null || string.IsNullOrWhiteSpace(owner.Name)) return null;
+    var ownerName = owner.Name.Replace('\\', '/');
+    var packageKeys = ownerName.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) || ownerName.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)
+        ? new[] { ownerName }
+        : new[] { ownerName, ownerName + ".uasset" };
+    foreach (var packageKey in packageKeys)
+        if (provider.Files.TryGetValue(packageKey, out var packageFile)) return packageFile.Read();
+    return null;
+}
+
+string? LandscapeMaterialName(FPackageIndex reference)
+{
+    if (reference.IsNull) return null;
+    try { return reference.Load<UMaterialInterface>()?.Name; }
+    catch { return null; }
+}
 // The provider mounts a loose directory under its top-level .uproject stem when one is present, else its
 // name. Compute that mount once from the same selection and reuse it for every gameplay selector below, so
 // a full project whose folder name differs from its .uproject stem still yields root-relative selectors.
@@ -2169,6 +2244,19 @@ async Task WriteMeshMaterialPackagesAsync(string meshName, IEnumerable<FPackageI
     await File.WriteAllTextAsync(Path.Combine(output, "Meshes", meshName + ".materials.json"), JsonConvert.SerializeObject(known2));
 }
 
+async Task WriteMeshMetadataAsync(string meshName, StaticMeshMetadata metadata)
+{
+    await File.WriteAllTextAsync(
+        Path.Combine(output, "Meshes", meshName + ".metadata.json"),
+        JsonConvert.SerializeObject(new
+        {
+            format = "threenative-static-mesh-metadata",
+            version = 1,
+            buildScale3D = metadata.BuildScale3D,
+            lods = metadata.Lods.Select(lod => new { lod = lod.Lod, status = lod.Status, reason = lod.Reason }).ToArray(),
+        }));
+}
+
 // A refused material is recorded by its identity and fails the conversion at completion. The reason is flattened and bounded like
 // a mesh failure, so a long CUE4Parse message cannot grow the report.
 void RecordMaterialFailure(string identity, string reason)
@@ -2321,11 +2409,10 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
     var staticMaterials = mesh.StaticMaterials.Length > 0
         ? mesh.StaticMaterials
         : mesh.GetOrDefault("StaticMaterials", Array.Empty<FStaticMaterial>());
+    StaticMeshMetadata? metadata;
     if (mesh.RenderData?.LODs is not { Length: > 0 })
     {
-        // Uncooked editor mesh: no render data, only the source model. Decode LOD0's
-        // FMeshDescription from the package trailer instead.
-        if (!ExportEditorStaticMesh(mesh, staticMaterials, target))
+        if (!ExportEditorStaticMesh(mesh, staticMaterials, out metadata))
         {
             exportedMeshes.Remove(identity);
             meshFailures[mesh.Name] = assetLookupDiagnostics.GetValueOrDefault(mesh.Name, "the uncooked static mesh could not be decoded");
@@ -2334,28 +2421,178 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
     }
     else
     {
+        // EMeshQuality.Highest is the export default and drops every lower source-model LOD.
+        var quality = requestedLods.Any(lod => lod > 0) ? EMeshQuality.All : EMeshQuality.Highest;
         var session = new ExportSession { MaxDegreeOfParallelism = 1 };
         session.Add(mesh);
-        var results = await session.RunAsync(output, new ExportOptions(meshFormat: EMeshFormat.Gltf2, exportMaterials: false));
-        var emitted = results.SelectMany(result => result.DiskFilePaths ?? [])
-            .FirstOrDefault(path => path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase));
-        if (emitted is null || !File.Exists(emitted))
+        var results = await session.RunAsync(output, new ExportOptions(meshFormat: EMeshFormat.Gltf2, exportMaterials: false, meshQuality: quality));
+        var wanted = requestedLods.ToHashSet();
+        var glbByLod = new Dictionary<int, string>();
+        foreach (var path in results.SelectMany(result => result.DiskFilePaths ?? []).Where(path => path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)))
+        {
+            var stem = Path.GetFileNameWithoutExtension(path);
+            var marker = stem.LastIndexOf("_LOD", StringComparison.Ordinal);
+            var lod = marker < 0 || !int.TryParse(stem[(marker + 4)..], out var parsed) ? 0 : parsed;
+            if (wanted.Contains(lod)) glbByLod[lod] = path;
+        }
+        if (glbByLod.Count == 0)
         {
             exportedMeshes.Remove(identity);
             RecordMeshFailure(mesh.Name, "static mesh", results);
             return false;
         }
-        if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
+        foreach (var (lod, path) in glbByLod)
+        {
+            var lodTarget = Path.Combine(output, "Meshes", lod == 0 ? mesh.Name + ".glb" : mesh.Name + "_LOD" + lod + ".glb");
+            if (!Path.GetFullPath(path).Equals(Path.GetFullPath(lodTarget), StringComparison.OrdinalIgnoreCase)) File.Move(path, lodTarget, true);
+        }
+        // Cooked render vertices already include BuildScale3D (StaticMeshBuilder.cpp:1694-1703).
+        metadata = new StaticMeshMetadata(null, glbByLod.Keys.OrderBy(lod => lod).Select(lod => new StaticMeshLodMetadata(lod, "payload", null)).ToArray());
     }
     meshFailures.Remove(mesh.Name);
+    await WriteMeshMetadataAsync(mesh.Name, metadata!);
     await WriteMeshMaterialPackagesAsync(mesh.Name, staticMaterials.Select(slot => slot.MaterialInterface));
     foreach (var slot in staticMaterials.Where(slot => !string.IsNullOrWhiteSpace(slot.MaterialInterface?.Name)))
         await ExportMaterialAsync(slot.MaterialInterface!.Name, IndexPackagePath(slot.MaterialInterface));
     return true;
 }
 
-bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials, string target)
+static float[]? ReadStaticMeshBuildScale(UStaticMesh mesh)
 {
+    var source = (mesh.GetOrDefault<FStructFallback[]>("SourceModels") ?? Array.Empty<FStructFallback>()).FirstOrDefault();
+    var settings = source?.GetOrDefault<FScriptStruct>("BuildSettings")?.StructType;
+    var scale = settings is FStructFallback buildSettings
+        ? buildSettings.GetOrDefault<FScriptStruct>("BuildScale3D")?.StructType
+        : settings;
+    FVector value;
+    if (scale is FVector vector)
+    {
+        value = vector;
+    }
+    else if (scale is FStructFallback fallback)
+    {
+        value = new FVector(fallback.GetOrDefault<float>("X"), fallback.GetOrDefault<float>("Y"), fallback.GetOrDefault<float>("Z"));
+    }
+    else
+    {
+        return null;
+    }
+    return float.IsFinite(value.X) && float.IsFinite(value.Y) && float.IsFinite(value.Z) && value.X > 0 && value.Y > 0 && value.Z > 0
+        ? new[] { value.X, value.Y, value.Z }
+        : null;
+}
+
+static (uint Flags, byte[] ContentHash, long PayloadSize, long? PayloadOffset)? ReadStaticMeshBulkHeader(byte[] bytes, int exportAt, long validPos, AbstractUePackage package, VersionContainer versions)
+{
+    try
+    {
+        using var archive = new FAssetArchive(new FByteArchive("static-mesh-bulk-object", bytes, versions), package);
+        if (exportAt < 0 || validPos > bytes.Length || exportAt >= validPos) return null;
+        archive.Position = exportAt;
+        new UObject().Deserialize(archive, validPos);
+        // FEditorBulkData serializes flags, GUID, FSHAHash (20 bytes), size, then an optional inline offset.
+        if (archive.Position > validPos - 48) return null;
+        var flags = archive.Read<uint>();
+        archive.Read<FGuid>();
+        var contentHash = archive.ReadBytes(20);
+        var payloadSize = archive.Read<long>();
+        long? payloadOffset = null;
+        if ((flags & (1u | 512u | 1024u)) == 0)
+        {
+            if (archive.Position > validPos - 8) return null;
+            payloadOffset = archive.Read<long>();
+        }
+        return (flags, contentHash, payloadSize, payloadOffset);
+    }
+    catch { return null; }
+}
+
+static EditorMesh? ReadUniqueLegacyLod0(byte[] bytes, int cachedTriangles, out string refusal)
+{
+    refusal = "legacy LOD0 requires a positive cached triangle count";
+    if (cachedTriangles <= 0) return null;
+    var candidates = new List<EditorMesh>();
+    foreach (var (at, _) in ScanEditorPayloads(bytes))
+    {
+        try
+        {
+            using var archive = new FByteArchive("legacy-lod0", bytes);
+            archive.Position = at;
+            candidates.Add(ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)), cachedTriangles));
+        }
+        catch { }
+    }
+    refusal = candidates.Count > 1 ? "ambiguous legacy LOD0: multiple readable MeshDescription payloads without bulk identity"
+        : "legacy LOD0 payload does not match the cached triangle count";
+    return candidates.Count == 1 && candidates[0].LiveTriangles.Count(live => live) == cachedTriangles ? candidates[0] : null;
+}
+
+static byte[]? ReadStaticMeshSourcePayload(FPackageIndex? reference)
+{
+    if (reference is null || reference.IsNull || reference.ResolvedObject is not { } resolved || resolved.Package is not Package package || resolved.ExportIndex < 0 || resolved.ExportIndex >= package.ExportMap.Length)
+        return null;
+    var provider = package.Provider;
+    if (provider is null || !provider.Files.TryGetValue(package.Name + ".uasset", out var file) || file.Size > 2_000_000_000L)
+        return null;
+    var bytes = file.Read();
+    var export = package.ExportMap[resolved.ExportIndex];
+    if (export.SerialOffset < 0 || export.SerialOffset >= bytes.Length) return null;
+    var exportAt = checked((int)export.SerialOffset);
+    var decodedHeader = ReadStaticMeshBulkHeader(bytes, exportAt, export.SerialOffset + export.SerialSize, package, provider.Versions);
+    if (decodedHeader is not { } header) return null;
+    var flags = header.Flags;
+    var payloadSize = header.PayloadSize;
+    if (payloadSize <= 0 || payloadSize > 1_073_741_824L) return null;
+    var contentHash = header.ContentHash.AsSpan();
+    long payloadAt = -1;
+    // UE5.1 editor packages mark this record as a legacy-file reference even though the compressed
+    // payload is indexed by the package trailer. Prefer that exact hash lookup whenever a trailer
+    // exists; only fall back to the inline offset for older non-virtualized records.
+    var trailerAt = package.Summary.PayloadTocOffset;
+    if (trailerAt > 0 && trailerAt <= bytes.Length - 28 &&
+        BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(checked((int)trailerAt), 8)) == 0xd1c43b2e80a5f697UL)
+    {
+        var trailer = checked((int)trailerAt);
+        var version = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(trailer + 8, 4));
+        var headerLength = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(trailer + 12, 4));
+        var count = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(trailer + 24, 4));
+        if (headerLength < 28 || count < 0 || count > 10_000 || trailerAt + headerLength > bytes.Length) return null;
+        var cursor = trailer + 28;
+        var entrySize = version >= 2 ? 49 : version == 1 ? 45 : 44;
+        var trailerHash = contentHash.Slice(contentHash.Length - 20, 20);
+        for (var index = 0; index < count; index++)
+        {
+            if (cursor > bytes.Length - entrySize) return null;
+            if (bytes.AsSpan(cursor, 20).SequenceEqual(trailerHash))
+            {
+                var offset = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(cursor + 20, 8));
+                var access = version >= 2 ? bytes[cursor + 48] : version == 1 ? bytes[cursor + 44] : (byte)0;
+                if (offset >= 0 && access == 0) payloadAt = trailerAt + headerLength + offset;
+                break;
+            }
+            cursor += entrySize;
+        }
+    }
+    if (payloadAt < 0 && (flags & 1u) == 0 && header.PayloadOffset is { } inlineOffset)
+        payloadAt = inlineOffset;
+    if (payloadAt < 0 || payloadAt > bytes.Length - 64) return null;
+    try
+    {
+        using var archive = new FByteArchive("static-mesh-editor-payload", bytes);
+        archive.Position = payloadAt;
+        var compressed = new FCompressedBuffer(archive);
+        if (compressed.Header.TotalRawSize != (ulong)payloadSize) return null;
+        return DecompressEditorPayload(compressed);
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials, out StaticMeshMetadata metadata)
+{
+    metadata = new StaticMeshMetadata(ReadStaticMeshBuildScale(mesh), Array.Empty<StaticMeshLodMetadata>());
     // Same-named meshes in different folders: prefer the key whose last two path segments match
     // the owning package's.
     var packageTail = string.Join('/', (mesh.Owner?.Name ?? mesh.Name).Split('/').TakeLast(2));
@@ -2374,24 +2611,80 @@ bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials,
     // a payload with a stale tail through (see ReadMeshDescription).
     var cachedTriangles = (int)((mesh.GetOrDefault<FStructFallback[]>("SourceModels") ?? Array.Empty<FStructFallback>())
         .FirstOrDefault()?.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount") ?? 0);
-    var editorMesh = ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles);
-    if (editorMesh is null)
+    var sourceModels = mesh.GetOrDefault<FStructFallback[]>("SourceModels") ?? Array.Empty<FStructFallback>();
+    if (sourceModels.Length == 0)
     {
-        assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model" + (refusal is null ? "" : $" ({refusal})");
-        return false;
+        var editorMesh = ReadLargestMeshDescription(file.Read(), out var refusal, cachedTriangles);
+        if (editorMesh is null)
+        {
+            assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model" + (refusal is null ? "" : $" ({refusal})");
+            return false;
+        }
+        var materialNames = editorMesh.GroupSlots.Select((slot, index) =>
+        {
+            var match = staticMaterials.FirstOrDefault(material =>
+                string.Equals(material.ImportedMaterialSlotName?.Text, slot, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(material.MaterialSlotName.Text, slot, StringComparison.OrdinalIgnoreCase))
+                ?? (index < staticMaterials.Length ? staticMaterials[index] : null);
+            return match?.MaterialInterface?.Name ?? match?.ImportedMaterialSlotName?.Text ?? slot;
+        }).ToArray();
+        WriteEditorMeshGlb(editorMesh, materialNames, mesh.Name, Path.Combine(output, "Meshes", mesh.Name + ".glb"));
+        metadata = new StaticMeshMetadata(metadata.BuildScale3D, new[] { new StaticMeshLodMetadata(0, "payload", null) });
+        return File.Exists(Path.Combine(output, "Meshes", mesh.Name + ".glb"));
     }
-    // Same material naming as the cooked glTF writer (MeshMaterialDto.SlotName): the material
-    // interface's name, else the imported slot name.
-    var materialNames = editorMesh.GroupSlots.Select((slot, index) =>
+
+    var wanted = requestedLods.ToHashSet();
+    var lodMetadata = new List<StaticMeshLodMetadata>();
+    var exported = 0;
+    foreach (var (lod, sourceModel) in sourceModels.Select((sourceModel, lod) => (lod, sourceModel)))
     {
-        var match = staticMaterials.FirstOrDefault(material =>
-            string.Equals(material.ImportedMaterialSlotName?.Text, slot, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(material.MaterialSlotName.Text, slot, StringComparison.OrdinalIgnoreCase))
-            ?? (index < staticMaterials.Length ? staticMaterials[index] : null);
-        return match?.MaterialInterface?.Name ?? match?.ImportedMaterialSlotName?.Text ?? slot;
-    }).ToArray();
-    WriteEditorMeshGlb(editorMesh, materialNames, mesh.Name, target);
-    return File.Exists(target);
+        var payload = ReadStaticMeshSourcePayload(sourceModel.GetOrDefault<FPackageIndex>("StaticMeshDescriptionBulkData"));
+        EditorMesh? legacyMesh = null;
+        string? legacyRefusal = null;
+        if (payload is null && lod == 0 && sourceModel.GetOrDefault<FPackageIndex>("StaticMeshDescriptionBulkData") is not { IsNull: false })
+            legacyMesh = ReadUniqueLegacyLod0(file.Read(), (int)sourceModel.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount"), out legacyRefusal);
+        if (payload is null && legacyMesh is null)
+        {
+            if (lod == 0)
+            {
+                var reference = sourceModel.GetOrDefault<FPackageIndex>("StaticMeshDescriptionBulkData");
+                var reason = reference is { IsNull: false }
+                    ? "LOD0 bulk reference has no readable payload"
+                    : legacyRefusal ?? "LOD0 has no readable source payload";
+                lodMetadata.Add(new StaticMeshLodMetadata(lod, "unreadable", reason));
+                assetLookupDiagnostics[mesh.Name] = reason;
+            }
+            else lodMetadata.Add(new StaticMeshLodMetadata(lod, "generated", "generated by Unreal at build time; not decoded"));
+            continue;
+        }
+        EditorMesh editorMesh;
+        try
+        {
+            var cached = (int)sourceModel.GetOrDefault<uint>("CacheMeshDescriptionTrianglesCount");
+            editorMesh = legacyMesh ?? ReadMeshDescription(payload!, cached);
+        }
+        catch (Exception error)
+        {
+            lodMetadata.Add(new StaticMeshLodMetadata(lod, "unreadable", error.Message));
+            if (lod == 0 && wanted.Contains(0)) assetLookupDiagnostics[mesh.Name] = $"LOD0 MeshDescription could not be decoded ({error.Message})";
+            continue;
+        }
+        lodMetadata.Add(new StaticMeshLodMetadata(lod, "payload", null));
+        if (!wanted.Contains(lod)) continue;
+        var materialNames = editorMesh.GroupSlots.Select((slot, index) =>
+        {
+            var match = staticMaterials.FirstOrDefault(material =>
+                string.Equals(material.ImportedMaterialSlotName?.Text, slot, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(material.MaterialSlotName.Text, slot, StringComparison.OrdinalIgnoreCase))
+                ?? (index < staticMaterials.Length ? staticMaterials[index] : null);
+            return match?.MaterialInterface?.Name ?? match?.ImportedMaterialSlotName?.Text ?? slot;
+        }).ToArray();
+        var lodTarget = Path.Combine(output, "Meshes", lod == 0 ? mesh.Name + ".glb" : mesh.Name + "_LOD" + lod + ".glb");
+        WriteEditorMeshGlb(editorMesh, materialNames, mesh.Name + (lod == 0 ? "" : "_LOD" + lod), lodTarget);
+        if (File.Exists(lodTarget)) exported++;
+    }
+    metadata = new StaticMeshMetadata(metadata.BuildScale3D, lodMetadata.ToArray());
+    return exported > 0;
 }
 
 T? LoadAssetByName<T>(string name) where T : UObject
@@ -3978,20 +4271,26 @@ foreach (var key in provider.Files.Keys.Where(key =>
     foreach (var world in package.GetExports().OfType<UWorld>())
     {
         var level = world.PersistentLevel.Load<ULevel>();
-        if (level?.Actors is null) continue;
+        if (level is null) continue;
         PropertyUtil.SearchPropertyInTemplate = true;
         var actors = new List<object>();
         var texts = new List<object>();
+        var landscapes = new List<object>();
         var lights = new List<object>();
         var omittedActors = new List<object>();
+        var landscapeProxies = new List<(ALandscapeProxy Proxy, string Name)>();
         var groupedSpriteInstances = new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
         var blueprintComponents = 0;
         var hasCamera = false;
         double cameraX = 0, cameraY = 0, cameraZ = 0, cameraPitch = 0, cameraYaw = 0, cameraRoll = 0;
-        foreach (var actorIndex in level.Actors)
+        foreach (var actor in ActorsForLevel(key, level, omittedActors))
         {
-            var actor = actorIndex?.Load<UObject>();
-            if (actor is null) continue;
+            var actorName = actor is AActor labeled && !string.IsNullOrWhiteSpace(labeled.ActorLabel) ? labeled.ActorLabel : actor.Name;
+            if (actor is ALandscapeProxy landscapeProxy)
+            {
+                landscapeProxies.Add((landscapeProxy, actorName));
+                continue;
+            }
             var componentReferences = new List<FPackageIndex?> {
                 actor.GetOrDefault<FPackageIndex?>("RootComponent"),
                 actor.GetOrDefault<FPackageIndex?>("RenderComponent"),
@@ -4036,7 +4335,6 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     parentComponent = parentComponent.GetOrDefault<FPackageIndex?>("AttachParent")?.Load<USceneComponent>();
                 }
                 var rotation = transform.Rotator();
-                var actorName = actor is AActor labeled && !string.IsNullOrWhiteSpace(labeled.ActorLabel) ? labeled.ActorLabel : actor.Name;
                 if (component is USkyLightComponent)
                 {
                     omittedActors.Add(new { actor = actorName, component = component.Name, sourceClass = component.ExportType, reason = "SkyLight environment capture is not reconstructable as a punctual Three.js light" });
@@ -4136,7 +4434,9 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 if (!staticMesh.IsNull)
                 {
                     meshName = staticMesh.Name;
-                    if ((staticMesh.Load<UStaticMesh>() ?? LoadAssetByName<UStaticMesh>(staticMesh.Name)) is { } loadedStaticMesh) await ExportStaticMeshAsync(loadedStaticMesh);
+                    if ((staticMesh.Load<UStaticMesh>() ?? LoadAssetByName<UStaticMesh>(staticMesh.Name)) is not { } loadedStaticMesh || !await ExportStaticMeshAsync(loadedStaticMesh))
+                        omittedActors.Add(new { actor = actorName, component = component.Name, sourceClass = component.ExportType,
+                            reason = "static mesh " + staticMesh.Name + " could not be decoded: " + meshFailures.GetValueOrDefault(staticMesh.Name, assetLookupDiagnostics.GetValueOrDefault(staticMesh.Name, "mesh package could not be loaded")) });
                 }
                 else if (!skeletalMesh.IsNull)
                 {
@@ -4187,6 +4487,107 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 });
             }
         }
+        var landscapeMaterials = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (proxy, _) in landscapeProxies)
+        {
+            var materialName = LandscapeMaterialName(proxy.LandscapeMaterial);
+            if (materialName is not null) landscapeMaterials[proxy.LandscapeGuid.ToString()] = materialName;
+        }
+        void OmitLandscape(string actorName, string componentName, string reason)
+        {
+            omittedActors.Add(new {
+                actor = actorName,
+                component = componentName,
+                sourceClass = "LandscapeComponent",
+                reason = $"landscape heightfield was not exported: {reason}"
+            });
+        }
+        foreach (var (proxy, proxyName) in landscapeProxies)
+        {
+            foreach (var componentReference in proxy.LandscapeComponents ?? [])
+            {
+                ULandscapeComponent? component;
+                try { component = componentReference.IsNull ? null : componentReference.Load<ULandscapeComponent>(); }
+                catch (Exception error)
+                {
+                    OmitLandscape(proxyName, componentReference.Name, $"component could not be loaded: {error.Message}");
+                    continue;
+                }
+                if (component is null)
+                {
+                    OmitLandscape(proxyName, componentReference.Name, "landscape component reference is null or not a ULandscapeComponent");
+                    continue;
+                }
+                var componentName = component.Name;
+                var heightmap = component.GetHeightmap();
+                if (heightmap is null)
+                {
+                    OmitLandscape(proxyName, componentName, "HeightmapTexture is missing");
+                    continue;
+                }
+                int textureWidth = 0, textureHeight = 0;
+                byte[] sourcePixels = [];
+                var sourceRefusal = "";
+                try
+                {
+                    if (!TryReadLandscapeSourcePixels(heightmap, ReadPackageBytes(heightmap.Owner), out textureWidth, out textureHeight, out sourcePixels, out sourceRefusal))
+                    {
+                        OmitLandscape(proxyName, componentName, sourceRefusal);
+                        continue;
+                    }
+                }
+                catch (Exception error)
+                {
+                    OmitLandscape(proxyName, componentName, $"heightmap source could not be read: {error.Message}");
+                    continue;
+                }
+                (float[] Heights, float[] Normals) decoded;
+                try
+                {
+                    decoded = DecodeLandscapeHeightfield(
+                        sourcePixels,
+                        textureWidth,
+                        textureHeight,
+                        component.ComponentSizeQuads,
+                        component.SubsectionSizeQuads,
+                        component.NumSubsections,
+                        component.HeightmapScaleBias.Z,
+                        component.HeightmapScaleBias.W);
+                }
+                catch (Exception error)
+                {
+                    OmitLandscape(proxyName, componentName, $"heightmap layout could not be decoded: {error.Message}");
+                    continue;
+                }
+                var transform = component.GetRelativeTransform();
+                var parentComponent = component.GetOrDefault<FPackageIndex?>("AttachParent")?.Load<USceneComponent>();
+                for (var parentDepth = 0; parentComponent is not null && parentDepth < 64; parentDepth++)
+                {
+                    transform *= parentComponent.GetRelativeTransform();
+                    parentComponent = parentComponent.GetOrDefault<FPackageIndex?>("AttachParent")?.Load<USceneComponent>();
+                }
+                try { decoded = (decoded.Heights, LandscapeLocalNormals(decoded.Normals, transform.Scale3D.X, transform.Scale3D.Y, transform.Scale3D.Z)); }
+                catch (InvalidDataException error) { OmitLandscape(proxyName, componentName, error.Message); continue; }
+                var rotation = transform.Rotator();
+                var landscapeGuid = proxy.LandscapeGuid.ToString();
+                var materialName = component.OverrideMaterial is { IsNull: false } overrideMaterial
+                    ? LandscapeMaterialName(overrideMaterial)
+                    : null;
+                materialName ??= LandscapeMaterialName(proxy.LandscapeMaterial);
+                materialName ??= landscapeMaterials.GetValueOrDefault(landscapeGuid);
+                materialName ??= "Landscape_Default";
+                landscapes.Add(new {
+                    name = proxyName + "/" + componentName,
+                    materialName,
+                    location = new { x = transform.Translation.X, y = transform.Translation.Y, z = transform.Translation.Z },
+                    rotation = new { pitch = rotation.Pitch, yaw = rotation.Yaw, roll = rotation.Roll },
+                    scale = new { x = transform.Scale3D.X, y = transform.Scale3D.Y, z = transform.Scale3D.Z },
+                    sizeQuads = component.ComponentSizeQuads,
+                    heights = decoded.Heights,
+                    normals = decoded.Normals
+                });
+            }
+        }
         var descriptor = new {
             format = "threenative-unreal-scene-source",
             version = 1,
@@ -4202,7 +4603,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 parent = group.Key[..group.Key.IndexOf('/')],
                 sourceClass = "PaperGroupedSpriteComponent"
             }).ToArray(),
-            landscapes = Array.Empty<object>(),
+            landscapes,
             lights,
             blueprintComponents,
             camera = new {
@@ -4275,7 +4676,9 @@ foreach (var key in provider.Files.Keys.Where(key =>
                     if (!staticMesh.IsNull)
                     {
                         meshName = staticMesh.Name;
-                        if ((staticMesh.Load<UStaticMesh>() ?? LoadAssetByName<UStaticMesh>(staticMesh.Name)) is { } loadedStaticMesh) await ExportStaticMeshAsync(loadedStaticMesh);
+                        if ((staticMesh.Load<UStaticMesh>() ?? LoadAssetByName<UStaticMesh>(staticMesh.Name)) is not { } loadedStaticMesh || !await ExportStaticMeshAsync(loadedStaticMesh))
+                        omittedActors.Add(new { actor = prefabName, component = component.Name, sourceClass = component.ExportType,
+                            reason = "static mesh " + staticMesh.Name + " could not be decoded: " + meshFailures.GetValueOrDefault(staticMesh.Name, assetLookupDiagnostics.GetValueOrDefault(staticMesh.Name, "mesh package could not be loaded")) });
                     }
                     else if (!skeletalMesh.IsNull)
                     {
@@ -5281,6 +5684,196 @@ static void UndoUeDelta(byte[] data, long offset, int width, int height, int byt
     }
 }
 
+// Landscape source art is BGRA8 even though its height and normal channels are packed into the
+// colour bytes: R is the high height byte, G the low byte, B is normal X, and A is normal Y.
+// The vertex-to-atlas mapping deliberately keeps the shared subsection edge in the same place as
+// Unreal's ComponentXYToSubsectionXY/VertexXYToTexelXY pair; treating the component as one dense
+// rectangle shifts every vertex after the first subsection boundary.
+static (float[] Heights, float[] Normals) DecodeLandscapeHeightfield(
+    byte[] pixels,
+    int textureWidth,
+    int textureHeight,
+    int componentSizeQuads,
+    int subsectionSizeQuads,
+    int numSubsections,
+    float heightmapBiasX,
+    float heightmapBiasY)
+{
+    if (textureWidth <= 0 || textureHeight <= 0 || (long) textureWidth * textureHeight * 4 != pixels.LongLength)
+        throw new InvalidDataException($"landscape heightmap is not BGRA8 {textureWidth}x{textureHeight}");
+    if (componentSizeQuads <= 0 || subsectionSizeQuads <= 0 || numSubsections <= 0 ||
+        (long) subsectionSizeQuads * numSubsections != componentSizeQuads)
+        throw new InvalidDataException($"landscape component layout is invalid: {componentSizeQuads} quads, {subsectionSizeQuads} per subsection, {numSubsections} subsections");
+
+    var subsectionSizeVerts = subsectionSizeQuads + 1;
+    var side = componentSizeQuads + 1;
+    var offsetX = LandscapeRoundToInt(heightmapBiasX * textureWidth);
+    var offsetY = LandscapeRoundToInt(heightmapBiasY * textureHeight);
+    var atlasWidth = checked(numSubsections * subsectionSizeVerts);
+    if (offsetX < 0 || offsetY < 0 || offsetX > textureWidth - atlasWidth || offsetY > textureHeight - atlasWidth)
+        throw new InvalidDataException($"landscape heightmap atlas {offsetX},{offsetY}+{atlasWidth} exceeds {textureWidth}x{textureHeight}");
+
+    var vertexCount = checked(side * side);
+    var heights = new float[vertexCount];
+    var normals = new float[checked(vertexCount * 3)];
+    for (var y = 0; y < side; y++)
+    {
+        var previousY = y - 1;
+        var subsectionY = y == 0 ? 0 : previousY / subsectionSizeQuads;
+        var localY = y == 0 ? 0 : previousY % subsectionSizeQuads + 1;
+        var textureY = offsetY + subsectionY * subsectionSizeVerts + localY;
+        for (var x = 0; x < side; x++)
+        {
+            var previousX = x - 1;
+            var subsectionX = x == 0 ? 0 : previousX / subsectionSizeQuads;
+            var localX = x == 0 ? 0 : previousX % subsectionSizeQuads + 1;
+            var textureX = offsetX + subsectionX * subsectionSizeVerts + localX;
+            var pixel = checked((textureY * textureWidth + textureX) * 4);
+            var vertex = y * side + x;
+            var encodedHeight = (pixels[pixel + 2] << 8) | pixels[pixel + 1];
+            heights[vertex] = (encodedHeight - 32768f) / 128f;
+            var normalX = 2f * pixels[pixel] / 255f - 1f;
+            var normalY = 2f * pixels[pixel + 3] / 255f - 1f;
+            var normal = vertex * 3;
+            normals[normal] = normalX;
+            normals[normal + 1] = normalY;
+            normals[normal + 2] = MathF.Sqrt(MathF.Max(1f - normalX * normalX - normalY * normalY, 0f));
+        }
+    }
+    return (heights, normals);
+}
+
+// UE uses LocalToWorldNoScaling for packed landscape normals. Cancel glTF's inverse
+// scale using magnitudes only: RemoveScaling retains mirrored basis signs.
+static float[] LandscapeLocalNormals(float[] packed, float scaleX, float scaleY, float scaleZ)
+{
+    if (!float.IsFinite(scaleX) || !float.IsFinite(scaleY) || !float.IsFinite(scaleZ) || scaleX == 0 || scaleY == 0 || scaleZ == 0)
+        throw new InvalidDataException("landscape normal transform has invalid or zero world scale");
+    var output = new float[packed.Length];
+    for (var i = 0; i < packed.Length; i += 3)
+    {
+        var x = (double) packed[i] * Math.Abs((double) scaleX);
+        var y = (double) packed[i + 1] * Math.Abs((double) scaleY);
+        var z = (double) packed[i + 2] * Math.Abs((double) scaleZ);
+        var length = Math.Sqrt(x*x + y*y + z*z);
+        if (!double.IsFinite(length) || length == 0) throw new InvalidDataException("landscape packed normal is invalid or zero");
+        output[i] = (float) (x / length);
+        output[i + 1] = (float) (y / length);
+        output[i + 2] = (float) (z / length);
+    }
+    return output;
+}
+
+static int LandscapeRoundToInt(float value)
+{
+    if (!float.IsFinite(value)) throw new InvalidDataException("landscape heightmap scale bias is not finite");
+    return checked((int) MathF.Floor(value + 0.5f));
+}
+
+// UE 5.3 stores these heightmaps as raw BGRA8 source art in FEditorBulkData. UE 5.6+ may wrap
+// the same bytes in TSCF_UEDELTA, so the source compression tag decides whether to apply the row
+// filter; an absent CompressionFormat is the engine's TSCF_None default, not a reason to guess PNG.
+static bool TryReadLandscapeSourcePixels(UTexture2D texture, byte[]? packageBytes, out int width, out int height, out byte[] pixels, out string refusal)
+{
+    width = 0;
+    height = 0;
+    pixels = [];
+    refusal = "";
+    var source = texture.GetOrDefault<FStructFallback?>("Source", null);
+    if (source is null) { refusal = "heightmap has no serialized Source struct"; return false; }
+    var format = source.GetOrDefault<FName>("Format").Text ?? "";
+    format = format[(format.LastIndexOf(':') + 1)..];
+    if (format != "TSF_BGRA8") { refusal = $"heightmap source format {format} is not TSF_BGRA8"; return false; }
+    var compression = source.GetOrDefault<FName>("CompressionFormat").Text ?? "";
+    width = source.GetOrDefault<int>("SizeX");
+    height = source.GetOrDefault<int>("SizeY");
+    var slices = Math.Max(1, source.GetOrDefault<int>("NumSlices"));
+    var mips = Math.Max(1, source.GetOrDefault<int>("NumMips"));
+    var layers = Math.Max(1, source.GetOrDefault<int>("NumLayers"));
+    var blocks = source.GetOrDefault<FStructFallback[]>("Blocks") ?? [];
+    if (layers > 1 || blocks.Length > 0)
+    {
+        refusal = $"heightmap source has {layers} layers and {blocks.Length} extra blocks";
+        return false;
+    }
+    if (width <= 0 || height <= 0)
+    {
+        refusal = $"heightmap source dimensions are {width}x{height}";
+        return false;
+    }
+    long total = 0;
+    for (var mip = 0; mip < mips; mip++) total += (long) Math.Max(1, width >> mip) * Math.Max(1, height >> mip) * slices * 4;
+    if (total <= 0 || total > int.MaxValue)
+    {
+        refusal = $"heightmap source size {total} bytes is unsupported";
+        return false;
+    }
+    byte[]? raw = null;
+    if (texture.EditorData is { } editor && editor.Payload.Header.TotalRawSize == (ulong) total)
+    {
+        try { raw = DecompressEditorPayload(editor.Payload); }
+        catch (Exception error) { refusal = $"FEditorBulkData payload could not be decompressed: {error.Message}"; }
+    }
+    if (raw is null && texture.SourceArt?.ReadDataOnce() is { } sourceArt && sourceArt.LongLength >= total)
+        raw = sourceArt;
+    if (raw is null && packageBytes is not null)
+    {
+        var candidates = ScanEditorPayloads(packageBytes).Where(entry => entry.RawSize == (ulong) total).ToArray();
+        if (candidates.Length > 1) { refusal = $"ambiguous editor source: {candidates.Length} payloads of {total} bytes"; return false; }
+        foreach (var (at, rawSize) in candidates)
+        {
+            try
+            {
+                using var archive = new FByteArchive("landscape-editor-payload", packageBytes);
+                archive.Position = at;
+                raw = DecompressEditorPayload(new FCompressedBuffer(archive));
+                break;
+            }
+            catch (Exception error) { refusal = $"editor payload at {at} could not be decompressed: {error.Message}"; }
+        }
+    }
+    if (raw is null)
+    {
+        refusal = refusal.Length > 0 ? refusal : $"no editor source payload of {total} bytes was found";
+        return false;
+    }
+    return TryDecodeLandscapeSourcePixels(raw, width, height, compression,
+        source.GetOrDefault<bool>("bPNGCompressed", false), out pixels, out refusal);
+}
+
+// Shared production dispatch: source art may contain more mips/slices, but terrain reads mip 0, slice 0.
+static bool TryDecodeLandscapeSourcePixels(byte[] raw, int width, int height, string compression, bool pngCompressed, out byte[] pixels, out string refusal)
+{
+    pixels = [];
+    refusal = "";
+    compression = compression[(compression.LastIndexOf(':') + 1)..];
+    var ueDelta = compression == "TSCF_UEDELTA";
+    if (compression.Length > 0 && compression != "None" && compression != "TSCF_None" && !ueDelta)
+    {
+        refusal = $"heightmap source compression {compression} is unsupported";
+        return false;
+    }
+    if (pngCompressed)
+    {
+        refusal = "heightmap source is PNG-compressed rather than raw BGRA8";
+        return false;
+    }
+    var firstMip = (long) width * height * 4L;
+    if (width <= 0 || height <= 0 || firstMip > int.MaxValue)
+    {
+        refusal = $"heightmap source dimensions are {width}x{height}";
+        return false;
+    }
+    if (raw.LongLength < firstMip)
+    {
+        refusal = $"editor source payload has {raw.LongLength} bytes, expected at least {firstMip}";
+        return false;
+    }
+    pixels = raw.AsSpan(0, checked((int) firstMip)).ToArray();
+    if (ueDelta) UndoUeDelta(pixels, 0, width, height, 4, 1);
+    return true;
+}
+
 // Raw source pixels (mip 0, slice 0) as an RGBA PNG in true colour. A 16-bit sRGB source is linear
 // light, so it is encoded to sRGB like the 16-bit PNG source path does.
 static byte[] EncodeSourcePixels(byte[] pixels, int width, int height, string format, bool srgb)
@@ -5345,20 +5938,18 @@ static byte[] EncodeSourcePixels(byte[] pixels, int width, int height, string fo
     }
 }
 
-// The LOD0 source model of an uncooked UE5 StaticMesh. Its package trailer holds one
-// FMeshDescription payload per source-model LOD, so the largest raw payload that parses is LOD0.
-// Every other payload in a StaticMesh package is also a mesh description, so ranking by the
-// header's raw size decompresses only what is kept.
+// With no SourceModels metadata, accept only one readable description; size is not LOD identity.
 static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal, int cachedTriangles = 0)
 {
     refusal = null;
+    var readings = new List<EditorMesh>();
     foreach (var (at, _) in ScanEditorPayloads(bytes))
     {
         try
         {
             using var archive = new FByteArchive("editor-payload", bytes);
             archive.Position = at;
-            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)), cachedTriangles);
+            readings.Add(ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)), cachedTriangles));
         }
         catch (NotSupportedException error)
         {
@@ -5370,7 +5961,8 @@ static EditorMesh? ReadLargestMeshDescription(byte[] bytes, out string? refusal,
             // Not a mesh description; try the next largest payload.
         }
     }
-    return null;
+    if (readings.Count > 1) refusal = "ambiguous legacy LOD0: multiple readable MeshDescription payloads without bulk identity";
+    return readings.Count == 1 ? readings[0] : null;
 }
 
 // Every plausible FCompressedBuffer in a package, largest raw size first. The 0xb7 0x75 0x63 0x62
@@ -6896,6 +7488,8 @@ sealed record EditorMesh(
     int[] TriangleGroups,
     bool[] LiveTriangles,
     string[] GroupSlots);
+sealed record StaticMeshLodMetadata(int Lod, string Status, string? Reason);
+sealed record StaticMeshMetadata(float[]? BuildScale3D, StaticMeshLodMetadata[] Lods);
 sealed record Rgba16fSourceArt(string Format, int SizeX, int SizeY, int NumSlices, int NumMips, bool PngCompressed, string? Compression, bool Srgb, long ElementCount, byte[]? Bytes);
 sealed record Rgba16fDataTexture(int Width, int Height, byte[] Bytes);
 sealed record Rgba16fPackage(string Key, string PackageKey, Dictionary<string, string> Sidecars);
