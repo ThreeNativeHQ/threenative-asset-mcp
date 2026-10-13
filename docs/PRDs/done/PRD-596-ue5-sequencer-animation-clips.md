@@ -172,9 +172,10 @@ The mixed saved-version bulk fix reads each package's saved version for its UObj
 rather than using the older fallback profile. It restores three control meshes; the compiled
 saved-header regression failed before the fix and all seven static-mesh converter tests pass
 on `.584.10.2` (`raw/596-bulk-version-{red,final-green}.log`). Current terrain gates pass
-2 tests in 25.43s (`raw/current599-102-terrain-gate.log`); the separate combined-scene replay
-of 51 terrain components plus 3 mesh actors with zero omissions remains pending observation.
-Parent owns AC-6 completion, final diff review, PR49 merge, publication and the engine dependency update.
+2 tests in 25.43s (`raw/current599-102-terrain-gate.log`). The separate combined-scene replay
+retains 51 terrain components plus 3 resolved mesh actors with zero omissions; 10,809 shared
+boundary vertices across 163 neighbor pairs have zero height gap (`raw/current599-102-combined-proof.json`,
+`raw/current599-102-seams.json`). Parent owns final diff review, PR49 merge, publication and the engine dependency update.
 No third formal review or independent review approval is claimed.
 
 ## Execution Phases
