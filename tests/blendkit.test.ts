@@ -13,6 +13,7 @@ import {
   BlendkitError,
   loopbackOrigin,
   safeTaskText,
+  UnconfirmedStopError,
 } from "../src/blendkit/client.js";
 import {
   BlendkitProvider,
@@ -117,6 +118,9 @@ class FakeClient {
   replyDelayMs = new Map<string, number>();
   onSearchTask: (task: FakeTask) => void = () => {};
   badReport = false;
+  reportStatus = 200;
+  cancelStatus = 200;
+  cancelIgnored = false;
 
   async start(): Promise<this> {
     this.server = createServer(async (req, res) => {
@@ -162,11 +166,13 @@ class FakeClient {
         return void (await this.onDownload(body, task("asset_download")));
       if (path === "/tools/run") return void (await this.onRun(body, task("run_blender_script")));
       if (path === "/assets/cancel_download") {
+        if (this.cancelStatus !== 200) return void res.writeHead(this.cancelStatus).end();
         const cancelled = this.tasks.get(String(body.task_id));
-        if (cancelled) cancelled.status = "cancelled";
+        if (cancelled && !this.cancelIgnored) cancelled.status = "cancelled";
         return void res.end();
       }
       if (path === "/report") {
+        if (this.reportStatus !== 200) return void res.writeHead(this.reportStatus).end();
         if (this.badReport) return json({ not: "a list" });
         const all = [...this.tasks.values()];
         for (const t of all) if (t.status !== "created") this.tasks.delete(t.task_id);
@@ -215,7 +221,12 @@ function provider(
   overrides: Partial<ConstructorParameters<typeof BlendkitProvider>[0]> = {},
 ) {
   return new BlendkitProvider({
-    client: new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5, addonVersion: "0.11.0" }),
+    client: new BlendkitClient({
+      baseUrl: fake.origin,
+      pollIntervalMs: 5,
+      cancelConfirmMs: 300,
+      addonVersion: "0.11.0",
+    }),
     clientUrl: fake.origin,
     blenderPath: "/opt/blender/blender",
     permissionEvidence: "test: documented permission stand-in",
@@ -732,7 +743,7 @@ describe("Blendkit import", () => {
       expect(provenance.output.sha256).toBe(createHash("sha256").update(glb).digest("hex"));
     });
 
-    it("rolls back its provenance file when the GLB name appears during publishing", async () => {
+    it("keeps its published provenance and reports partial output when the GLB name appears", async () => {
       const fake = await new FakeClient().start();
       happyPath(fake);
       const out = await tempDir();
@@ -742,9 +753,30 @@ describe("Blendkit import", () => {
           hooks: { beforePublish: () => writeFile(join(out, `blendkit-${ID}.glb`), "external") },
         }),
       );
-      expect(error.code).toBe("BLENDKIT_OUTPUT_EXISTS");
-      expect(await readdir(out)).toEqual([`blendkit-${ID}.glb`]);
+      // Nothing is deleted from the shared directory: no inode-conditional unlink exists on POSIX.
+      expect(error.code).toBe("BLENDKIT_PARTIAL_OUTPUT");
+      expect(error.message).toContain(`blendkit-${ID}.provenance.json`);
+      expect((await readdir(out)).sort()).toEqual([
+        `blendkit-${ID}.glb`,
+        `blendkit-${ID}.provenance.json`,
+      ]);
       expect(await readFile(join(out, `blendkit-${ID}.glb`), "utf8")).toBe("external");
+    });
+
+    it("reports partial output, not success, when the caller aborts between the two links", async () => {
+      const fake = await new FakeClient().start();
+      happyPath(fake);
+      const out = await tempDir();
+      const controller = new AbortController();
+      const error = await rejection(
+        importBlendkitAsset(provider(fake), importInput(out), controller.signal, {
+          ...toolOptions,
+          hooks: { afterLink: async () => controller.abort(new Error("cancelled mid-publish")) },
+        }),
+      );
+      expect(error.code).toBe("BLENDKIT_PARTIAL_OUTPUT");
+      expect(error.message).toContain("cancelled");
+      expect(await readdir(out)).toEqual([`blendkit-${ID}.provenance.json`]);
     });
 
     it("leaves a provenance file that appears during publishing untouched and creates nothing", async () => {
@@ -910,12 +942,17 @@ describe("Blendkit bridge boundaries", () => {
 
   it("asks the official Client to cancel a download that failed for any reason but its own end", async () => {
     const fake = await new FakeClient().start();
-    const client = new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5 });
+    const client = new BlendkitClient({
+      baseUrl: fake.origin,
+      pollIntervalMs: 5,
+      cancelConfirmMs: 200,
+    });
     fake.onDownload = () => {};
     fake.badReport = true;
+    // Cancel was asked for, but with /report broken nothing confirms the writer stopped.
     await expect(
       client.download(DOWNLOAD, "/staging", "ORIGINAL", "", AbortSignal.timeout(5000)),
-    ).rejects.toMatchObject({ code: "BLENDKIT_INVALID_RESPONSE" });
+    ).rejects.toBeInstanceOf(UnconfirmedStopError);
     const cancel = fake.requests.find((request) => request.path === "/assets/cancel_download");
     expect(typeof cancel?.body.task_id).toBe("string");
 
@@ -990,5 +1027,131 @@ describe("Blendkit bridge boundaries", () => {
       }),
     ).rejects.toThrow("late abort");
     expect(await readdir(out)).toEqual([]);
+  });
+
+  it("redacts every accepted API key, including 1-3 character ones, in text and task type", async () => {
+    for (const key of ["7", "k9", "abc"]) {
+      const fake = await new FakeClient().start();
+      fake.onDownload = (_body, task) =>
+        void Object.assign(task, {
+          status: "error",
+          task_type: `dl-${key}`,
+          message: `rejected ${key} and again ${key}`,
+        });
+      const error = await rejection(
+        importBlendkitAsset(
+          provider(fake, { apiKey: key }),
+          importInput(await tempDir()),
+          AbortSignal.timeout(5000),
+          toolOptions,
+        ),
+      );
+      expect(error.message, key).not.toContain(key);
+      expect(error.message, key).toContain("<redacted>");
+    }
+    expect(safeTaskText("a.b a.b ab", ["a.b", "ab"])).toBe("<redacted> <redacted> <redacted>");
+  });
+
+  it("keeps staging when /report fails with HTTP 500: an error response is not an observed task end", async () => {
+    const fake = await new FakeClient().start();
+    happyPath(fake);
+    fake.onRun = () => {};
+    const out = await tempDir();
+    const work = importBlendkitAsset(
+      provider(fake),
+      importInput(out),
+      AbortSignal.timeout(10_000),
+      toolOptions,
+    );
+    await waitFor(() => fake.paths().includes("/tools/run"));
+    fake.reportStatus = 500;
+    const error = await rejection(work);
+    expect(error.code).toBe("BLENDKIT_STAGING_RETAINED");
+    expect(error.message).toContain("was kept");
+    const entries = await readdir(out);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatch(/^\.blendkit-staging-/u);
+  });
+
+  it("still asks for the download cancel on HTTP 500 and keeps staging when it cannot be confirmed", async () => {
+    const fake = await new FakeClient().start();
+    fake.onDownload = (body, task) => {
+      void mkdir(join((body.download_dirs as string[])[0]!, "partial"), { recursive: true });
+      void task;
+    };
+    const out = await tempDir();
+    const work = importBlendkitAsset(
+      provider(fake),
+      importInput(out),
+      AbortSignal.timeout(10_000),
+      toolOptions,
+    );
+    await waitFor(() => fake.paths().includes("/assets/download"));
+    fake.reportStatus = 500;
+    const error = await rejection(work);
+    expect(error.code).toBe("BLENDKIT_STAGING_RETAINED");
+    expect(fake.paths()).toContain("/assets/cancel_download");
+    expect((await readdir(out)).length).toBe(1);
+  });
+
+  it("keeps staging when the official cancel fails or is ignored", async () => {
+    for (const mode of ["fails", "ignored"] as const) {
+      const fake = await new FakeClient().start();
+      fake.onDownload = () => {};
+      if (mode === "fails") fake.cancelStatus = 500;
+      else fake.cancelIgnored = true;
+      const out = await tempDir();
+      const controller = new AbortController();
+      const work = importBlendkitAsset(
+        provider(fake),
+        importInput(out),
+        controller.signal,
+        toolOptions,
+      );
+      await waitFor(() => fake.paths().includes("/assets/download"));
+      controller.abort(new Error("caller cancelled"));
+      const error = await rejection(work);
+      expect(error.code, mode).toBe("BLENDKIT_CANCELLED");
+      expect(error.message, mode).toContain("was kept");
+      expect(await readdir(out), mode).toHaveLength(1);
+    }
+  });
+
+  it("does not lose a completion that /report delivers while its start response is still held", async () => {
+    const fake = await new FakeClient().start();
+    const client = new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5 });
+    let started = 0;
+    fake.onDownload = (_body, task) => {
+      // The first download never finishes and keeps the shared poller running. The second one
+      // finishes at once, and 300 other tasks finish after it, while its reply is held.
+      if (++started === 2) {
+        Object.assign(task, {
+          status: "finished",
+          result: { file_paths: ["/staging/held.blend"] },
+        });
+        for (let index = 0; index < 300; index += 1) {
+          const id = randomUUID();
+          fake.tasks.set(id, {
+            task_id: id,
+            task_type: "other",
+            status: "finished",
+            progress: 100,
+            message: "",
+            result: null,
+            data: {},
+          });
+        }
+      }
+    };
+    const stop = new AbortController();
+    const first = client.download(DOWNLOAD, "/staging", "ORIGINAL", "", stop.signal);
+    first.catch(() => undefined);
+    await waitFor(() => fake.paths().includes("/assets/download"));
+    fake.replyDelayMs.set("/assets/download", 300);
+    await expect(
+      client.download(DOWNLOAD, "/staging", "ORIGINAL", "", AbortSignal.timeout(10_000)),
+    ).resolves.toEqual(["/staging/held.blend"]);
+    stop.abort(new Error("stop"));
+    await first.catch(() => undefined);
   });
 });

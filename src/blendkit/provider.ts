@@ -7,7 +7,6 @@ import {
   readFile,
   realpath,
   rm,
-  unlink,
   writeFile,
 } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve, sep } from "node:path";
@@ -28,7 +27,7 @@ import {
   BlendkitClient,
   BlendkitError,
   DEFAULT_CLIENT_URL,
-  taskEnded,
+  UnconfirmedStopError,
   type TaskProgress,
 } from "./client.js";
 
@@ -468,36 +467,51 @@ async function inside(root: string, path: string): Promise<string> {
 
 /**
  * Publishes staged files to their final names without ever replacing something that exists.
- * link(2) fails with EEXIST if the name is taken (a file, or even a dangling symlink), and it is
+ * link(2) fails with EEXIST if the name is taken (a file, or even a dangling symlink) and is
  * atomic across processes, unlike check-then-rename, which POSIX rename(2) would turn into an
- * overwrite. The last file is the one consumers look for. If a later link fails, the links this
- * call made are removed, but only while the name still points at the file this call linked.
+ * overwrite. The provenance file goes first and the GLB, the file consumers look for, last.
+ *
+ * Nothing is ever deleted from the output directory. POSIX has no unlink that is conditional on
+ * the file being the one we created, so a rollback in a shared namespace could erase someone
+ * else's file. If a later step fails or the caller aborts, the files already published stay, and
+ * the error names them as partial output. The abort is checked before every link, so a caller
+ * that aborts before the GLB is linked never sees success.
  */
-async function publishWithoutOverwrite(files: [from: string, to: string][]): Promise<void> {
-  const made: [path: string, ino: number][] = [];
-  try {
-    for (const [from, to] of files) {
-      try {
-        await link(from, to);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        throw code === "EEXIST"
-          ? new BlendkitError(
-              "BLENDKIT_OUTPUT_EXISTS",
-              `${to} already exists; this tool never overwrites an import.`,
-            )
-          : new BlendkitError(
-              "BLENDKIT_PUBLISH_FAILED",
-              `Could not publish ${basename(to)} (${code ?? "unknown error"}); the output directory must support hard links.`,
-            );
-      }
-      made.push([to, (await lstat(to)).ino]);
+async function publishWithoutOverwrite(
+  files: [from: string, to: string][],
+  signal: AbortSignal,
+  afterLink?: (path: string) => Promise<void>,
+): Promise<void> {
+  const published: string[] = [];
+  const partial = (why: string) =>
+    new BlendkitError(
+      "BLENDKIT_PARTIAL_OUTPUT",
+      `Partial output: ${published.join(", ")} was published and kept, but the import did not complete ` +
+        `(${why}). Inspect it and delete it by hand, or re-run after removing the name that blocked the import.`,
+    );
+  for (const [from, to] of files) {
+    if (signal.aborted) {
+      if (published.length) throw partial("cancelled before the final file");
+      throw signal.reason;
     }
-  } catch (error) {
-    for (const [path, ino] of made.reverse())
-      if ((await lstat(path).catch(() => undefined))?.ino === ino)
-        await unlink(path).catch(() => undefined);
-    throw error;
+    try {
+      await link(from, to);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (published.length)
+        throw partial(`${basename(to)} could not be published: ${code ?? "error"}`);
+      throw code === "EEXIST"
+        ? new BlendkitError(
+            "BLENDKIT_OUTPUT_EXISTS",
+            `${to} already exists; this tool never overwrites an import.`,
+          )
+        : new BlendkitError(
+            "BLENDKIT_PUBLISH_FAILED",
+            `Could not publish ${basename(to)} (${code ?? "unknown error"}); the output directory must support hard links.`,
+          );
+    }
+    published.push(to);
+    await afterLink?.(to);
   }
 }
 
@@ -515,6 +529,7 @@ export async function importBlendkitAsset(
     /** Test seam: runs once everything is staged, immediately before the files are published. */
     hooks?: {
       beforePublish?: () => Promise<void>;
+      afterLink?: (path: string) => Promise<void>;
       removeStaging?: (path: string) => Promise<void>;
     };
   },
@@ -559,9 +574,8 @@ export async function importBlendkitAsset(
   const staging = await realpath(await mkdtemp(join(outputDir, ".blendkit-staging-")));
   const removeStaging =
     options.hooks?.removeStaging ?? ((path: string) => rm(path, { recursive: true, force: true }));
-  // The Client cannot cancel a running recipe: until it reports the task over, Blender may still
-  // be writing into the staging directory, so a failure in that window keeps it.
-  let recipeMayRun = false;
+  // Staging is deleted only when nothing can still be writing into it. An UnconfirmedStopError
+  // (a download not confirmed cancelled, or a recipe the Client cannot cancel) keeps it.
   let outcome;
   try {
     const client = provider.options.client;
@@ -584,7 +598,6 @@ export async function importBlendkitAsset(
         "The downloaded file exceeds the byte budget.",
       );
     const converted = join(staging, `${randomUUID()}.glb`);
-    recipeMayRun = true;
     try {
       await client.runTool(
         CONVERSION_RECIPE,
@@ -594,10 +607,8 @@ export async function importBlendkitAsset(
         provider.options.blenderPath,
         AbortSignal.any([signal, AbortSignal.timeout(600_000)]),
       );
-      recipeMayRun = false;
     } catch (error) {
-      if (taskEnded(error)) recipeMayRun = false;
-      if (signal.aborted || recipeMayRun) throw error;
+      if (signal.aborted || error instanceof UnconfirmedStopError) throw error;
       throw new BlendkitError(
         "BLENDKIT_CONVERSION_FAILED",
         `The Client's ${CONVERSION_RECIPE} recipe failed: ${error instanceof Error ? error.message : "unknown error"}`.slice(
@@ -650,20 +661,21 @@ export async function importBlendkitAsset(
     await writeFile(stagedProvenance, JSON.stringify(provenance, null, 2) + "\n");
     await options.hooks?.beforePublish?.();
     signal.throwIfAborted();
-    await publishWithoutOverwrite([
-      [stagedProvenance, provenancePath],
-      [converted, glbPath],
-    ]);
+    await publishWithoutOverwrite(
+      [
+        [stagedProvenance, provenancePath],
+        [converted, glbPath],
+      ],
+      signal,
+      options.hooks?.afterLink,
+    );
     outcome = { glbPath, provenancePath, ...provenance };
   } catch (error) {
-    if (recipeMayRun)
+    if (error instanceof UnconfirmedStopError)
       throw new BlendkitError(
-        signal.aborted ? "BLENDKIT_CANCELLED" : "BLENDKIT_CONVERSION_FAILED",
-        `${error instanceof Error ? error.message : "The conversion did not finish"}. The Client cannot stop ` +
-          `a running Blender export, so ${staging} was kept in case it is still writing. Delete it once Blender has exited.`.slice(
-            0,
-            900,
-          ),
+        signal.aborted ? "BLENDKIT_CANCELLED" : "BLENDKIT_STAGING_RETAINED",
+        `${error.message}. The official Client did not confirm that its task stopped, so ${staging} was ` +
+          "kept in case a download or Blender export is still writing. Delete it once that has ended.",
       );
     await removeStaging(staging).catch(() => undefined);
     throw error;

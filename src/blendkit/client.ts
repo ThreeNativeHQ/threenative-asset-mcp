@@ -26,7 +26,10 @@ export type BlendkitErrorCode =
   | "BLENDKIT_UNSUPPORTED"
   | "BLENDKIT_CONVERSION_FAILED"
   | "BLENDKIT_OUTPUT_EXISTS"
-  | "BLENDKIT_PUBLISH_FAILED";
+  | "BLENDKIT_PUBLISH_FAILED"
+  | "BLENDKIT_PARTIAL_OUTPUT"
+  | "BLENDKIT_CLIENT_ERROR"
+  | "BLENDKIT_STAGING_RETAINED";
 
 export class BlendkitError extends Error {
   constructor(
@@ -71,10 +74,17 @@ export function loopbackOrigin(raw: string): string {
  */
 export function safeTaskText(value: unknown, secrets: Iterable<string> = []): string {
   if (typeof value !== "string") return "";
-  let text = value;
-  // ponytail: a credential shorter than 4 characters is not redacted, to avoid mangling text.
-  for (const secret of secrets)
-    if (secret.length >= 4) text = text.split(secret).join("<redacted>");
+  // One pass, longest first, so a short secret cannot split a longer one or the placeholder.
+  const known = [...secrets].filter(Boolean).sort((a, b) => b.length - a.length);
+  const text = known.length
+    ? value.replace(
+        new RegExp(
+          known.map((secret) => secret.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")).join("|"),
+          "gu",
+        ),
+        "<redacted>",
+      )
+    : value;
   return text
     .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/giu, "<url>")
     .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
@@ -82,12 +92,24 @@ export function safeTaskText(value: unknown, secrets: Iterable<string> = []): st
     .slice(0, 300);
 }
 
-/** True when the Client reported the task itself as failed or cancelled, so nothing still runs. */
+/**
+ * True only for an OBSERVED terminal task state (the Client's /report said the task failed or was
+ * cancelled). A transport error such as HTTP 500 or an unreachable Client proves nothing about
+ * whether a Go download or a Blender export is still writing.
+ */
 export function taskEnded(error: unknown): boolean {
   return (
     error instanceof BlendkitError &&
     (error.code === "BLENDKIT_TASK_FAILED" || error.code === "BLENDKIT_CANCELLED")
   );
+}
+
+/** A task failed or was aborted and the Client did not confirm that it stopped writing. */
+export class UnconfirmedStopError extends Error {
+  constructor(readonly reason: unknown) {
+    super(reason instanceof Error ? reason.message : "The Client task was interrupted.");
+    this.name = "UnconfirmedStopError";
+  }
 }
 
 export type BlendkitTask = {
@@ -108,6 +130,8 @@ export type BlendkitClientOptions = {
   requestTimeoutMs?: number;
   maxResponseBytes?: number;
   pollIntervalMs?: number;
+  /** How long to wait for the Client to report a cancelled download as over. */
+  cancelConfirmMs?: number;
   appId?: number;
   addonVersion?: string;
 };
@@ -118,6 +142,7 @@ export class BlendkitClient {
   private readonly requestTimeoutMs: number;
   private readonly maxResponseBytes: number;
   private readonly pollIntervalMs: number;
+  private readonly cancelConfirmMs: number;
   readonly appId: number;
   private readonly addonVersion: string;
   /** Terminal tasks /report handed over before their waiter asked; each is delivered once. */
@@ -125,6 +150,8 @@ export class BlendkitClient {
   private readonly latest = new Map<string, TaskProgress>();
   /** Tasks someone is waiting for: their parked results are never evicted. */
   private readonly active = new Set<string>();
+  /** Start requests in flight: their task id is unknown, so nothing may be evicted meanwhile. */
+  private pendingStarts = 0;
   /** API keys seen in requests, redacted from any task text the Client echoes back. */
   private readonly secrets = new Set<string>();
   private polling: Promise<void> | undefined;
@@ -135,6 +162,7 @@ export class BlendkitClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.maxResponseBytes = options.maxResponseBytes ?? 8 * 1024 * 1024;
     this.pollIntervalMs = options.pollIntervalMs ?? 500;
+    this.cancelConfirmMs = options.cancelConfirmMs ?? 5000;
     this.appId = options.appId ?? process.pid;
     this.addonVersion = options.addonVersion ?? "0.0.0";
   }
@@ -192,7 +220,7 @@ export class BlendkitClient {
     }
     if (!response.ok)
       throw new BlendkitError(
-        response.status === 404 ? "BLENDKIT_UNSUPPORTED" : "BLENDKIT_TASK_FAILED",
+        response.status === 404 ? "BLENDKIT_UNSUPPORTED" : "BLENDKIT_CLIENT_ERROR",
         `Blendkit-Client ${path} answered HTTP ${response.status}.`,
       );
     if (!expectJson) return undefined;
@@ -225,12 +253,20 @@ export class BlendkitClient {
   }
 
   private async startTask(path: string, body: unknown, signal: AbortSignal): Promise<string> {
-    const started = (await this.request(path, body, signal)) as { task_id?: unknown };
-    const taskId = started?.task_id;
-    if (typeof taskId !== "string" || !/^[a-f0-9-]{36}$/u.test(taskId))
-      throw new BlendkitError("BLENDKIT_INVALID_RESPONSE", "Blendkit-Client returned no task id.");
-    this.active.add(taskId);
-    return taskId;
+    this.pendingStarts += 1;
+    try {
+      const started = (await this.request(path, body, signal)) as { task_id?: unknown };
+      const taskId = started?.task_id;
+      if (typeof taskId !== "string" || !/^[a-f0-9-]{36}$/u.test(taskId))
+        throw new BlendkitError(
+          "BLENDKIT_INVALID_RESPONSE",
+          "Blendkit-Client returned no task id.",
+        );
+      this.active.add(taskId);
+      return taskId;
+    } finally {
+      this.pendingStarts -= 1;
+    }
   }
 
   /**
@@ -271,7 +307,7 @@ export class BlendkitClient {
           if (TERMINAL.has(task.status)) this.done.set(task.taskId, task);
         }
         // ponytail: parked results of abandoned waiters are dropped oldest-first past 256.
-        for (const map of [this.done, this.latest])
+        for (const map of this.pendingStarts ? [] : [this.done, this.latest])
           for (const id of map.keys()) {
             if (map.size <= 256) break;
             if (!this.active.has(id)) map.delete(id);
@@ -294,6 +330,7 @@ export class BlendkitClient {
         signal.throwIfAborted();
         const finished = this.done.get(taskId);
         if (finished) {
+          this.done.delete(taskId);
           if (finished.status === "finished") return finished;
           throw new BlendkitError(
             finished.status === "cancelled" ? "BLENDKIT_CANCELLED" : "BLENDKIT_TASK_FAILED",
@@ -310,8 +347,9 @@ export class BlendkitClient {
           );
       }
     } finally {
+      // A parked completion stays (bounded by eviction): an aborted caller still needs to learn,
+      // through cancelDownload, whether the task really ended.
       this.active.delete(taskId);
-      this.done.delete(taskId);
       this.latest.delete(taskId);
     }
   }
@@ -336,7 +374,7 @@ export class BlendkitClient {
     return (await this.waitTask(taskId, signal)).result;
   }
 
-  /** Downloads one asset into downloadDir; any failure but a reported task end cancels the Client task. */
+  /** Downloads one asset into downloadDir; a failure that is not an observed task end cancels the Client task. */
   async download(
     assetData: { id: string; name: string; assetType: string; files: unknown[] },
     downloadDir: string,
@@ -366,25 +404,35 @@ export class BlendkitClient {
       },
       AbortSignal.timeout(this.requestTimeoutMs),
     );
+    let task: BlendkitTask;
     try {
-      const task = await this.waitTask(taskId, signal, onProgress);
-      const paths = (task.result as { file_paths?: unknown })?.file_paths;
-      if (!Array.isArray(paths) || !paths.every((path) => typeof path === "string"))
-        throw new BlendkitError(
-          "BLENDKIT_INVALID_RESPONSE",
-          "Download task returned no file paths.",
-        );
-      return paths;
+      task = await this.waitTask(taskId, signal, onProgress);
     } catch (error) {
-      // Anything but the Client reporting the task itself over: ask the official Client to stop it.
-      if (!taskEnded(error))
-        await this.request(
-          "/assets/cancel_download",
-          { task_id: taskId, app_id: this.appId },
-          AbortSignal.timeout(this.requestTimeoutMs),
-          false,
-        ).catch(() => undefined);
-      throw error;
+      if (taskEnded(error)) throw error;
+      // Anything else (abort, timeout, /report failing): ask the official Client to stop the
+      // download, then only trust that it did once /report says the task is over.
+      throw (await this.cancelDownload(taskId)) ? error : new UnconfirmedStopError(error);
+    }
+    const paths = (task.result as { file_paths?: unknown })?.file_paths;
+    if (!Array.isArray(paths) || !paths.every((path) => typeof path === "string"))
+      throw new BlendkitError("BLENDKIT_INVALID_RESPONSE", "Download task returned no file paths.");
+    return paths;
+  }
+
+  /** True only when the cancelled task was observed in a terminal state within the deadline. */
+  private async cancelDownload(taskId: string): Promise<boolean> {
+    try {
+      await this.request(
+        "/assets/cancel_download",
+        { task_id: taskId, app_id: this.appId },
+        AbortSignal.timeout(this.requestTimeoutMs),
+        false,
+      );
+      this.active.add(taskId);
+      await this.waitTask(taskId, AbortSignal.timeout(this.cancelConfirmMs));
+      return true;
+    } catch (error) {
+      return taskEnded(error);
     }
   }
 
@@ -410,7 +458,10 @@ export class BlendkitClient {
       },
       signal,
     );
-    const task = await this.waitTask(taskId, signal);
+    // The Client cannot cancel a recipe: anything but an observed end leaves Blender possibly writing.
+    const task = await this.waitTask(taskId, signal).catch((error: unknown) => {
+      throw taskEnded(error) ? error : new UnconfirmedStopError(error);
+    });
     const path = (task.result as { file_path?: unknown })?.file_path;
     if (path !== outputPath)
       throw new BlendkitError(

@@ -65,17 +65,26 @@ exists (see [Provider permission](#provider-permission)).
   file. The MCP never signs in.
 - The Client owns search, download, export and task execution. The MCP only
   bridges its HTTP API and adds the policy checks in this document.
-- The configured API key is also removed from task text and task types that the
-  Client echoes, in plain text as well as in URLs.
+- The configured API key, of any length, is also removed from task text and task
+  types that the Client echoes, in plain text as well as in URLs.
 - A caller that has aborted never accepts a parked completion, and nothing is
   published after an abort. Results that someone still waits for are never
-  evicted from the poll buffer. A download that fails for any reason except the
-  Client reporting the task itself over is cancelled through the official
-  Client, and the MCP waits for that request.
+  evicted from the poll buffer, and nothing is evicted while a start request is
+  still waiting for its task id.
+- An HTTP error from the Client (for example a 500 from `/report`) is a
+  transport problem. It never counts as proof that a task ended. Only a task
+  that `/report` shows as finished, failed or cancelled is over.
+- A download that fails for any reason except an observed task end is cancelled
+  through the official Client. The MCP then waits (5 s by default) for `/report`
+  to show the task as over. If the cancel fails, is ignored, or `/report`
+  cannot confirm it, the staging directory is kept.
 - The Client cannot cancel a running recipe. The MCP stops waiting after
-  10 minutes. If a failure or abort happens while the recipe may still run, the
-  staging directory is kept and the error names it, so a running Blender export
-  never loses its target. Delete the directory once Blender has exited.
+  10 minutes. Any failure or abort of a recipe without an observed end keeps the
+  staging directory, and the error (`BLENDKIT_STAGING_RETAINED`, or
+  `BLENDKIT_CANCELLED` after an abort) names it, so a running Go download or
+  Blender export never loses its target. Delete the directory once it has
+  ended. A start request that fails before a task id exists is treated as "not
+  started"; a timeout there is ambiguous and not handled separately.
 - Staging cleanup after a committed import is reported in `warnings`. It never
   turns a finished import into a failure.
 
@@ -106,10 +115,17 @@ separate explicit permission from Blendkit exist and are recorded.
 
 Publishing the GLB and the provenance file never overwrites an existing name.
 The MCP links each staged file to its final name (`link(2)`, which fails if the
-name exists, also for a dangling symlink). This holds across concurrent calls
-and processes. If the second file cannot be published, the first is removed,
-and only while it is still the file that this call created. The output
-directory must support hard links.
+name exists, also for a dangling symlink), provenance first and the GLB last.
+This holds across concurrent calls and processes. The output directory must
+support hard links.
+
+The MCP **never deletes anything from the output directory**. POSIX has no
+unlink that is conditional on the file being the one this call created, so a
+rollback could erase another process's file. If the GLB cannot be published
+after the provenance file was, or the caller aborts between the two links, the
+provenance file stays and the error (`BLENDKIT_PARTIAL_OUTPUT`) names it as
+partial output to inspect and delete by hand. The abort is checked before every
+link, so a call that is aborted before the GLB is linked never reports success.
 
 ## Provider permission
 
