@@ -63,8 +63,21 @@ exists (see [Provider permission](#provider-permission)).
 - The API key comes only from `BLENDKIT_API_KEY`. It goes only into loopback
   request bodies, never into a command line, log, MCP response or provenance
   file. The MCP never signs in.
+- The Client owns search, download, export and task execution. The MCP only
+  bridges its HTTP API and adds the policy checks in this document.
+- The configured API key is also removed from task text and task types that the
+  Client echoes, in plain text as well as in URLs.
+- A caller that has aborted never accepts a parked completion, and nothing is
+  published after an abort. Results that someone still waits for are never
+  evicted from the poll buffer. A download that fails for any reason except the
+  Client reporting the task itself over is cancelled through the official
+  Client, and the MCP waits for that request.
 - The Client cannot cancel a running recipe. The MCP stops waiting after
-  10 minutes.
+  10 minutes. If a failure or abort happens while the recipe may still run, the
+  staging directory is kept and the error names it, so a running Blender export
+  never loses its target. Delete the directory once Blender has exited.
+- Staging cleanup after a committed import is reported in `warnings`. It never
+  turns a finished import into a failure.
 
 ## Rights gate
 
@@ -74,18 +87,29 @@ Each acquisition applies these rules per item. Unknown values fail closed.
 | --- | --- | --- |
 | Paid (Full Plan) | refused | refused |
 | License unknown or missing | refused | refused |
-| Royalty Free | allowed with consent; provenance says redistribution is denied | refused |
-| CC0 | allowed with consent | allowed with consent |
+| Royalty Free | allowed with consent | refused |
+| CC0 | allowed with consent | refused |
 
 `acceptLicense: true` and `projectUseConsent: true` are both required.
+`purpose: "redistribution"` is refused before the MCP contacts the Client or
+the provider. Every provenance file records `redistributionAllowed: false`.
 
-Royalty Free terms (Terms art. 5) allow use only inside a project. They forbid
-stand-alone redistribution. They also say that software "may not … embed any
-open-format 3D model". A GLB in a web game is an open-format model. **Never
-commit, publish or ship Royalty Free Blendkit models in game builds, engine
-demos or starter kits**, even after conversion. Use them only privately, for
-example for blockout or reference, until Blendkit confirms otherwise. Only CC0
-items are safe to ship.
+**A CC0 label does not grant shipping rights.** The CC0 paragraph of Terms
+art. 5 applies the Royalty Free project rules "accordingly". Those rules allow
+use only inside a project. They forbid stand-alone redistribution. They also
+say that software "may not … embed any open-format 3D model". A GLB in a web
+game is an open-format model. Treat every converted Blendkit model as private:
+**never commit, publish or ship it in game builds, engine demos or starter
+kits**, even after conversion. Use it for blockout or reference only. A later
+release can allow redistribution only when independent per-asset rights or
+separate explicit permission from Blendkit exist and are recorded.
+
+Publishing the GLB and the provenance file never overwrites an existing name.
+The MCP links each staged file to its final name (`link(2)`, which fails if the
+name exists, also for a dangling symlink). This holds across concurrent calls
+and processes. If the second file cannot be published, the first is removed,
+and only while it is still the file that this call created. The output
+directory must support hard links.
 
 ## Provider permission
 

@@ -54,9 +54,10 @@ export const BlendkitImportOutputSchema = z.object({
     .object({ name: z.string(), url: z.string().optional(), evidence: z.string() })
     .passthrough(),
   purpose: z.enum(["project-use", "redistribution"]),
-  redistribution: z.object({ redistributionAllowed: z.boolean(), restriction: z.string() }),
+  redistribution: z.object({ redistributionAllowed: z.literal(false), restriction: z.string() }),
   output: z.object({ file: z.string(), bytes: z.number().int(), sha256: z.string() }),
   inspection: InspectionSchema,
+  warnings: z.array(z.string().max(1000)).max(8),
 });
 
 function failure(error: unknown) {

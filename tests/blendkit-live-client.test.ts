@@ -215,7 +215,7 @@ describe.skipIf(!BIN || !BLENDER)(
         {
           assetId: `blendkit:${FAST}`,
           outputDir: out,
-          purpose: "redistribution",
+          purpose: "project-use",
           acceptLicense: true,
           projectUseConsent: true,
           resolution: "ORIGINAL",
@@ -243,7 +243,7 @@ describe.skipIf(!BIN || !BLENDER)(
       expect(JSON.parse(await readFile(result.provenancePath, "utf8"))).toMatchObject({
         conversion: { recipe: "export_glb" },
         license: { name: "CC0 1.0" },
-        redistribution: { redistributionAllowed: true },
+        redistribution: { redistributionAllowed: false },
       });
       expect(seen).toContain("/files/cube.blend");
     }, 180_000);

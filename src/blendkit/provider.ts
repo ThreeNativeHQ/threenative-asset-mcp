@@ -1,5 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { basename, isAbsolute, join, resolve, sep } from "node:path";
 
 import { NodeIO } from "@gltf-transform/core";
@@ -14,7 +24,13 @@ import {
   type AssetAdapter,
   type AssetDetail,
 } from "../discovery/types.js";
-import { BlendkitClient, BlendkitError, DEFAULT_CLIENT_URL, type TaskProgress } from "./client.js";
+import {
+  BlendkitClient,
+  BlendkitError,
+  DEFAULT_CLIENT_URL,
+  taskEnded,
+  type TaskProgress,
+} from "./client.js";
 
 export const PROVIDER = "blendkit";
 export const PRODUCTION_SERVER = "https://www.blendkit.com";
@@ -119,7 +135,9 @@ export function licenseOf(raw: string | undefined): Asset["license"] {
     return {
       name: "CC0 1.0",
       url: "https://creativecommons.org/publicdomain/zero/1.0/",
-      evidence: `Blendkit item license field "cc_zero"; terms ${TERMS_URL} (effective 2026-06-12).`,
+      evidence:
+        `Blendkit item license field "cc_zero"; terms ${TERMS_URL} (effective 2026-06-12) apply the project-only, ` +
+        "no-open-format-embedding rules to CC0 items too. The label alone grants no shipping rights.",
       commercialUse: "yes",
       attributionRequired: "no",
     };
@@ -142,41 +160,51 @@ export function licenseOf(raw: string | undefined): Asset["license"] {
 }
 
 export type Purpose = "project-use" | "redistribution";
-export type RightsDecision = { redistributionAllowed: boolean; restriction: string };
+export type RightsDecision = { redistributionAllowed: false; restriction: string };
 
 /**
- * Per-asset rights gate. Acquisition always needs the caller's explicit project-use consent; a
- * free download is never redistribution rights. Only CC0 items may leave the project as files.
+ * Raw redistribution is refused for every Blendkit item in this release. A CC0 label is not
+ * enough: the Terms' CC0 clause applies the project-only rules "accordingly", and no independent
+ * per-asset rights or separate permission is recorded here.
+ */
+export function redistributionDenied(): BlendkitError {
+  return new BlendkitError(
+    "BLENDKIT_LICENSE_DENIED",
+    "Raw redistribution of Blendkit assets (files, game builds, demos, starter kits) is refused for every " +
+      "item, CC0 included: the Blendkit Terms apply their project-only, no-open-format-embedding rules to CC0 " +
+      "items too, and no independent rights or separate permission is recorded. Use purpose project-use.",
+  );
+}
+
+/**
+ * Per-asset rights gate. Acquisition always needs the caller's explicit project-use consent, and
+ * a download is never redistribution rights, whatever the item's license label says.
  */
 export function rightsDecision(
   license: string | undefined,
   purpose: Purpose,
   projectUseConsent: boolean,
 ): RightsDecision {
+  if (purpose === "redistribution") throw redistributionDenied();
   if (license !== "cc_zero" && license !== "royalty_free")
     throw new BlendkitError(
       "BLENDKIT_LICENSE_DENIED",
       "The item's license is unknown, so it cannot be acquired; check it on the provider page.",
-    );
-  if (purpose === "redistribution" && license !== "cc_zero")
-    throw new BlendkitError(
-      "BLENDKIT_LICENSE_DENIED",
-      "Blendkit Royalty Free items may not be redistributed as files, starter kits or demos, and a game may " +
-        "not embed them as open-format (GLB) models. Only CC0 items can be acquired for redistribution.",
     );
   if (!projectUseConsent)
     throw new BlendkitError(
       "BLENDKIT_CONSENT_REQUIRED",
       "Set projectUseConsent: true to confirm this one item is acquired for your own project under its license.",
     );
-  return license === "cc_zero"
-    ? { redistributionAllowed: true, restriction: "CC0: no restriction beyond the Blendkit Terms." }
-    : {
-        redistributionAllowed: false,
-        restriction:
-          "Royalty Free: private use only. The Terms forbid embedding open-format models such as GLB in software, " +
-          "so do not ship this file in a game build, commit or publish it, or use it in demos or starter kits.",
-      };
+  return {
+    redistributionAllowed: false,
+    restriction:
+      (license === "cc_zero"
+        ? "CC0 label does not grant shipping rights: the Blendkit Terms apply the project-only rules to CC0 items. "
+        : "Royalty Free: private use only. ") +
+      "The Terms forbid embedding open-format models such as GLB in software, so do not ship this file in a " +
+      "game build, commit or publish it, or use it in demos or starter kits without independently verified rights.",
+  };
 }
 
 export type BlendkitProviderOptions = BlendkitConfig & {
@@ -352,12 +380,12 @@ export const BlendkitImportInputSchema = z.strictObject({
     .min(1)
     .max(4096)
     .describe(
-      "Private directory for the GLB and its provenance file. Keep Royalty Free output out of version control and game builds.",
+      "Private directory for the GLB and its provenance file. Keep the output out of version control and game builds.",
     ),
   purpose: z
     .enum(["project-use", "redistribution"])
     .describe(
-      "project-use: your own project, files kept private. redistribution: files may be published; CC0 items only.",
+      "project-use: your own project, files kept private. redistribution is always refused in this release, for CC0 items too.",
     ),
   acceptLicense: z
     .literal(true)
@@ -439,6 +467,41 @@ async function inside(root: string, path: string): Promise<string> {
 }
 
 /**
+ * Publishes staged files to their final names without ever replacing something that exists.
+ * link(2) fails with EEXIST if the name is taken (a file, or even a dangling symlink), and it is
+ * atomic across processes, unlike check-then-rename, which POSIX rename(2) would turn into an
+ * overwrite. The last file is the one consumers look for. If a later link fails, the links this
+ * call made are removed, but only while the name still points at the file this call linked.
+ */
+async function publishWithoutOverwrite(files: [from: string, to: string][]): Promise<void> {
+  const made: [path: string, ino: number][] = [];
+  try {
+    for (const [from, to] of files) {
+      try {
+        await link(from, to);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        throw code === "EEXIST"
+          ? new BlendkitError(
+              "BLENDKIT_OUTPUT_EXISTS",
+              `${to} already exists; this tool never overwrites an import.`,
+            )
+          : new BlendkitError(
+              "BLENDKIT_PUBLISH_FAILED",
+              `Could not publish ${basename(to)} (${code ?? "unknown error"}); the output directory must support hard links.`,
+            );
+      }
+      made.push([to, (await lstat(to)).ino]);
+    }
+  } catch (error) {
+    for (const [path, ino] of made.reverse())
+      if ((await lstat(path).catch(() => undefined))?.ino === ino)
+        await unlink(path).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
  * Acquire one free, explicitly consented Blendkit item through the user's Client, convert it with
  * the Client's bundled export_glb recipe, inspect the GLB and write its provenance.
  */
@@ -446,9 +509,18 @@ export async function importBlendkitAsset(
   provider: BlendkitProvider,
   rawInput: BlendkitImportInput,
   signal: AbortSignal,
-  options: { toolVersion: string; onProgress?: (progress: TaskProgress) => void },
+  options: {
+    toolVersion: string;
+    onProgress?: (progress: TaskProgress) => void;
+    /** Test seam: runs once everything is staged, immediately before the files are published. */
+    hooks?: {
+      beforePublish?: () => Promise<void>;
+      removeStaging?: (path: string) => Promise<void>;
+    };
+  },
 ) {
   const input = BlendkitImportInputSchema.parse(rawInput);
+  if (input.purpose === "redistribution") throw redistributionDenied();
   const nativeId = input.assetId.slice(PROVIDER.length + 1);
   const outputDir = resolve(input.outputDir);
   const item = await provider.lookup(nativeId, signal);
@@ -476,7 +548,7 @@ export async function importBlendkitAsset(
   const stem = `blendkit-${nativeId}`;
   const glbPath = join(outputDir, `${stem}.glb`);
   const provenancePath = join(outputDir, `${stem}.provenance.json`);
-  // ponytail: check-then-rename; two concurrent imports of one item can race, add a lock if that matters.
+  // Early, cheap refusal before any download; publishing below is what actually guarantees it.
   for (const path of [glbPath, provenancePath])
     if (await lstat(path).catch(() => undefined))
       throw new BlendkitError(
@@ -485,6 +557,12 @@ export async function importBlendkitAsset(
       );
   await mkdir(outputDir, { recursive: true });
   const staging = await realpath(await mkdtemp(join(outputDir, ".blendkit-staging-")));
+  const removeStaging =
+    options.hooks?.removeStaging ?? ((path: string) => rm(path, { recursive: true, force: true }));
+  // The Client cannot cancel a running recipe: until it reports the task over, Blender may still
+  // be writing into the staging directory, so a failure in that window keeps it.
+  let recipeMayRun = false;
+  let outcome;
   try {
     const client = provider.options.client;
     const downloaded = await client.download(
@@ -506,6 +584,7 @@ export async function importBlendkitAsset(
         "The downloaded file exceeds the byte budget.",
       );
     const converted = join(staging, `${randomUUID()}.glb`);
+    recipeMayRun = true;
     try {
       await client.runTool(
         CONVERSION_RECIPE,
@@ -515,8 +594,10 @@ export async function importBlendkitAsset(
         provider.options.blenderPath,
         AbortSignal.any([signal, AbortSignal.timeout(600_000)]),
       );
+      recipeMayRun = false;
     } catch (error) {
-      if (signal.aborted) throw error;
+      if (taskEnded(error)) recipeMayRun = false;
+      if (signal.aborted || recipeMayRun) throw error;
       throw new BlendkitError(
         "BLENDKIT_CONVERSION_FAILED",
         `The Client's ${CONVERSION_RECIPE} recipe failed: ${error instanceof Error ? error.message : "unknown error"}`.slice(
@@ -565,11 +646,34 @@ export async function importBlendkitAsset(
       },
       inspection,
     };
-    await writeFile(join(staging, "provenance.json"), JSON.stringify(provenance, null, 2) + "\n");
-    await rename(join(staging, "provenance.json"), provenancePath);
-    await rename(converted, glbPath);
-    return { glbPath, provenancePath, ...provenance };
-  } finally {
-    await rm(staging, { recursive: true, force: true });
+    const stagedProvenance = join(staging, "provenance.json");
+    await writeFile(stagedProvenance, JSON.stringify(provenance, null, 2) + "\n");
+    await options.hooks?.beforePublish?.();
+    signal.throwIfAborted();
+    await publishWithoutOverwrite([
+      [stagedProvenance, provenancePath],
+      [converted, glbPath],
+    ]);
+    outcome = { glbPath, provenancePath, ...provenance };
+  } catch (error) {
+    if (recipeMayRun)
+      throw new BlendkitError(
+        signal.aborted ? "BLENDKIT_CANCELLED" : "BLENDKIT_CONVERSION_FAILED",
+        `${error instanceof Error ? error.message : "The conversion did not finish"}. The Client cannot stop ` +
+          `a running Blender export, so ${staging} was kept in case it is still writing. Delete it once Blender has exited.`.slice(
+            0,
+            900,
+          ),
+      );
+    await removeStaging(staging).catch(() => undefined);
+    throw error;
   }
+  // The import is committed: a cleanup problem is a warning, never an acquisition failure.
+  const warnings: string[] = [];
+  await removeStaging(staging).catch((error: NodeJS.ErrnoException) =>
+    warnings.push(
+      `The import is complete, but the staging directory ${staging} could not be removed (${error.code ?? "unknown error"}). Delete it by hand.`,
+    ),
+  );
+  return { ...outcome, warnings };
 }

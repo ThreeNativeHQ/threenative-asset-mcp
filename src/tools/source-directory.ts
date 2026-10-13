@@ -150,15 +150,15 @@ export const ASSET_SOURCES: readonly AssetSource[] = [
     categories: ["3d-model", "texture", "hdri"],
     bestFor: "Blender-native models and materials through the user's own official Blendkit-Client",
     browseUrls: ["https://www.blendkit.com/asset-gallery"],
-    licenseSummary: "Per item: Blendkit Royalty Free (project use only, no raw redistribution) or CC0",
-    licenseTags: ["per-asset", "cc0"],
+    licenseSummary: "Per item: Blendkit Royalty Free or CC0 label; Blendkit Terms keep both project-use only, with no raw redistribution or open-format embedding",
+    licenseTags: ["per-asset"],
     attribution: "Not required",
     access: "mcp-api",
     downloadSupport: "authenticated-url",
     detailTool: "blendkit_status",
     downloadTool: "blendkit_import_asset",
     caution:
-      "Live search and download need documented provider permission (BLENDKIT_PROVIDER_PERMISSION) and the user's running Blendkit-Client. Free items only; Royalty Free models must never ship as raw GLBs, demos or starter kits.",
+      "Live search and download need documented provider permission (BLENDKIT_PROVIDER_PERMISSION) and the user's running Blendkit-Client. Free items only. Treat every Blendkit model, CC0-labelled ones included, as private project use: never ship, commit or publish it as a raw GLB, in a game build, demo or starter kit without independently verified rights.",
   }),
   source({
     id: "sketchfab",

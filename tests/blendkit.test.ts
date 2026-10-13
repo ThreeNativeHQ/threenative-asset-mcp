@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -113,6 +113,10 @@ class FakeClient {
   onDownload: (body: Record<string, unknown>, task: FakeTask) => Promise<void> | void = () => {};
   onRun: (body: Record<string, unknown>, task: FakeTask) => Promise<void> | void = () => {};
   statusBody = JSON.stringify({ clientVersion: "1.13.6", softwares: null });
+  /** Test controls: hold a reply, act on a freshly created search task, break /report. */
+  replyDelayMs = new Map<string, number>();
+  onSearchTask: (task: FakeTask) => void = () => {};
+  badReport = false;
 
   async start(): Promise<this> {
     this.server = createServer(async (req, res) => {
@@ -120,8 +124,13 @@ class FakeClient {
       const path = req.url ?? "/";
       this.requests.push({ path, body });
       const json = (value: unknown) => {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(value));
+        const send = () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(value));
+        };
+        const wait = this.replyDelayMs.get(path) ?? 0;
+        if (wait) setTimeout(send, wait);
+        else send();
       };
       const task = (type: string): FakeTask => {
         const created: FakeTask = {
@@ -146,6 +155,7 @@ class FakeClient {
           status: "finished",
           result: { count: 1, results: this.searchResults },
         });
+        this.onSearchTask(created);
         return;
       }
       if (path === "/assets/download")
@@ -157,6 +167,7 @@ class FakeClient {
         return void res.end();
       }
       if (path === "/report") {
+        if (this.badReport) return json({ not: "a list" });
         const all = [...this.tasks.values()];
         for (const t of all) if (t.status !== "created") this.tasks.delete(t.task_id);
         return json(all);
@@ -341,13 +352,21 @@ describe("Blendkit permission and rights gates", () => {
   it("decides rights per item and fails closed", () => {
     expect(() => rightsDecision(undefined, "project-use", true)).toThrow(/unknown/u);
     expect(() => rightsDecision("editorial", "project-use", true)).toThrow(BlendkitError);
-    expect(() => rightsDecision("royalty_free", "redistribution", true)).toThrow(/Royalty Free/u);
+    // Raw redistribution is refused for every license, CC0 included: Blendkit's Terms apply the
+    // project-only rules to CC0 items too, and no independent permission exists.
+    for (const license of ["royalty_free", "cc_zero", undefined, "editorial"])
+      for (const consent of [true, false])
+        expect(() => rightsDecision(license, "redistribution", consent), `${license}`).toThrow(
+          expect.objectContaining({ code: "BLENDKIT_LICENSE_DENIED" }),
+        );
     expect(() => rightsDecision("royalty_free", "project-use", false)).toThrow(
       /projectUseConsent/u,
     );
-    expect(() => rightsDecision("cc_zero", "redistribution", false)).toThrow(/projectUseConsent/u);
+    expect(() => rightsDecision("cc_zero", "project-use", false)).toThrow(/projectUseConsent/u);
     expect(rightsDecision("royalty_free", "project-use", true).redistributionAllowed).toBe(false);
-    expect(rightsDecision("cc_zero", "redistribution", true).redistributionAllowed).toBe(true);
+    const cc0 = rightsDecision("cc_zero", "project-use", true);
+    expect(cc0.redistributionAllowed).toBe(false);
+    expect(cc0.restriction).toMatch(/CC0 label does not grant/u);
   });
 });
 
@@ -431,6 +450,7 @@ describe("Blendkit import", () => {
         onProgress: (update) => progress.push(update.progress),
       },
     );
+    expect(result.warnings).toEqual([]);
     expect(result.glbPath).toBe(join(out, `blendkit-${ID}.glb`));
     expect(result.inspection).toMatchObject({ meshes: 1, triangles: 1, textures: 1, warnings: [] });
     expect(result.inspection.materials[0]).toMatchObject({ baseColorTexture: true });
@@ -478,6 +498,7 @@ describe("Blendkit import", () => {
       [{ isFree: false }, {}, "BLENDKIT_PAID_DENIED"],
       [{ license: undefined }, {}, "BLENDKIT_LICENSE_DENIED"],
       [{}, { purpose: "redistribution" }, "BLENDKIT_LICENSE_DENIED"],
+      [{ license: "cc_zero" }, { purpose: "redistribution" }, "BLENDKIT_LICENSE_DENIED"],
       [{}, { projectUseConsent: false }, "BLENDKIT_CONSENT_REQUIRED"],
       [
         { canDownload: false, canDownloadError: { type: "anonymous_user" } },
@@ -501,18 +522,37 @@ describe("Blendkit import", () => {
     expect(fake.paths()).not.toContain("/assets/download");
   });
 
-  it("accepts a CC0 item for redistribution", async () => {
+  it("refuses raw redistribution of a CC0 item before contacting the provider", async () => {
+    const fake = await new FakeClient().start();
+    happyPath(fake);
+    fake.searchResults = [item({ license: "cc_zero" })];
+    const out = await tempDir();
+    const error = await rejection(
+      importBlendkitAsset(
+        provider(fake),
+        importInput(out, { purpose: "redistribution" }),
+        AbortSignal.timeout(5000),
+        toolOptions,
+      ),
+    );
+    expect(error.code).toBe("BLENDKIT_LICENSE_DENIED");
+    expect(fake.requests).toEqual([]);
+    expect(await readdir(out)).toEqual([]);
+  });
+
+  it("imports a CC0 item for private project use without granting shipping rights", async () => {
     const fake = await new FakeClient().start();
     happyPath(fake);
     fake.searchResults = [item({ license: "cc_zero" })];
     const result = await importBlendkitAsset(
       provider(fake),
-      importInput(await tempDir(), { purpose: "redistribution" }),
+      importInput(await tempDir()),
       AbortSignal.timeout(10_000),
       toolOptions,
     );
-    expect(result.redistribution.redistributionAllowed).toBe(true);
     expect(result.license.name).toBe("CC0 1.0");
+    expect(result.redistribution.redistributionAllowed).toBe(false);
+    expect(result.redistribution.restriction).toMatch(/CC0 label does not grant/u);
   });
 
   it("never forwards download links outside the provider API, so the key cannot leave", async () => {
@@ -651,6 +691,98 @@ describe("Blendkit import", () => {
     expect(await readdir(out)).toEqual([]);
   });
 
+  describe("publishing", () => {
+    /** Holds each caller until `count` have arrived, then releases them together. */
+    function barrier(count: number) {
+      let arrived = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      return async () => {
+        if (++arrived === count) release();
+        await gate;
+      };
+    }
+
+    it("lets exactly one of two simultaneous imports of one item publish", async () => {
+      const fake = await new FakeClient().start();
+      happyPath(fake);
+      const out = await tempDir();
+      const hold = barrier(2);
+      // One provider, as in the server: a second client would share the app id and swallow tasks.
+      const shared = provider(fake);
+      const settled = await Promise.allSettled(
+        [1, 2].map(() =>
+          importBlendkitAsset(shared, importInput(out), AbortSignal.timeout(20_000), {
+            ...toolOptions,
+            hooks: { beforePublish: hold },
+          }),
+        ),
+      );
+      expect(settled.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+      const lost = settled.find((result) => result.status === "rejected") as PromiseRejectedResult;
+      expect(lost.reason).toMatchObject({ code: "BLENDKIT_OUTPUT_EXISTS" });
+      expect((await readdir(out)).sort()).toEqual([
+        `blendkit-${ID}.glb`,
+        `blendkit-${ID}.provenance.json`,
+      ]);
+      const provenance = JSON.parse(
+        await readFile(join(out, `blendkit-${ID}.provenance.json`), "utf8"),
+      );
+      const glb = await readFile(join(out, `blendkit-${ID}.glb`));
+      expect(provenance.output.sha256).toBe(createHash("sha256").update(glb).digest("hex"));
+    });
+
+    it("rolls back its provenance file when the GLB name appears during publishing", async () => {
+      const fake = await new FakeClient().start();
+      happyPath(fake);
+      const out = await tempDir();
+      const error = await rejection(
+        importBlendkitAsset(provider(fake), importInput(out), AbortSignal.timeout(10_000), {
+          ...toolOptions,
+          hooks: { beforePublish: () => writeFile(join(out, `blendkit-${ID}.glb`), "external") },
+        }),
+      );
+      expect(error.code).toBe("BLENDKIT_OUTPUT_EXISTS");
+      expect(await readdir(out)).toEqual([`blendkit-${ID}.glb`]);
+      expect(await readFile(join(out, `blendkit-${ID}.glb`), "utf8")).toBe("external");
+    });
+
+    it("leaves a provenance file that appears during publishing untouched and creates nothing", async () => {
+      const fake = await new FakeClient().start();
+      happyPath(fake);
+      const out = await tempDir();
+      const error = await rejection(
+        importBlendkitAsset(provider(fake), importInput(out), AbortSignal.timeout(10_000), {
+          ...toolOptions,
+          hooks: {
+            beforePublish: () => writeFile(join(out, `blendkit-${ID}.provenance.json`), "external"),
+          },
+        }),
+      );
+      expect(error.code).toBe("BLENDKIT_OUTPUT_EXISTS");
+      expect(await readdir(out)).toEqual([`blendkit-${ID}.provenance.json`]);
+      expect(await readFile(join(out, `blendkit-${ID}.provenance.json`), "utf8")).toBe("external");
+    });
+
+    it("does not follow a dangling symlink at a destination name", async () => {
+      const fake = await new FakeClient().start();
+      happyPath(fake);
+      const out = await tempDir();
+      const victim = join(await tempDir(), "victim.glb");
+      await symlink(victim, join(out, `blendkit-${ID}.glb`));
+      const error = await rejection(
+        importBlendkitAsset(
+          provider(fake),
+          importInput(out),
+          AbortSignal.timeout(10_000),
+          toolOptions,
+        ),
+      );
+      expect(error.code).toBe("BLENDKIT_OUTPUT_EXISTS");
+      await expect(readFile(victim)).rejects.toThrow();
+    });
+  });
+
   it("never overwrites an existing import", async () => {
     const fake = await new FakeClient().start();
     happyPath(fake);
@@ -689,5 +821,174 @@ describe("Blendkit import", () => {
     const paid = await handler(importInput(out));
     expect(JSON.parse(paid.content[0]!.text)).toMatchObject({ code: "BLENDKIT_PAID_DENIED" });
     expect(JSON.stringify(paid)).not.toContain(SECRET);
+  });
+});
+
+async function waitFor(condition: () => unknown): Promise<void> {
+  for (let attempt = 0; attempt < 500 && !condition(); attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(condition()).toBeTruthy();
+}
+const DOWNLOAD = { id: ID, name: "Oak Chair", assetType: "model", files: [] };
+
+describe("Blendkit bridge boundaries", () => {
+  it("redacts the configured API key from task text and task type, in plain text", async () => {
+    const fake = await new FakeClient().start();
+    fake.onDownload = (_body, task) =>
+      void Object.assign(task, {
+        status: "error",
+        task_type: `dl-${SECRET}`,
+        message: `rejected key ${SECRET} for this user`,
+      });
+    const error = await rejection(
+      importBlendkitAsset(
+        provider(fake),
+        importInput(await tempDir()),
+        AbortSignal.timeout(5000),
+        toolOptions,
+      ),
+    );
+    expect(error.code).toBe("BLENDKIT_TASK_FAILED");
+    expect(error.message).not.toContain(SECRET);
+    expect(error.message).toContain("<redacted>");
+  });
+
+  it("does not accept a completion that was parked for an aborted caller", async () => {
+    const fake = await new FakeClient().start();
+    const client = new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5 });
+    const aborted = new AbortController();
+    let started = 0;
+    fake.onDownload = (_body, task) => {
+      // The first download never finishes and keeps the shared poller running. The second one
+      // finishes and aborts its caller while its reply is still held, so the poller parks it.
+      if (++started === 2) {
+        Object.assign(task, { status: "finished", result: { file_paths: ["/staging/x.blend"] } });
+        aborted.abort(new Error("caller aborted"));
+      }
+    };
+    fake.replyDelayMs.set("/assets/download", 0);
+    const stop = new AbortController();
+    const first = client.download(DOWNLOAD, "/staging", "ORIGINAL", "", stop.signal);
+    first.catch(() => undefined);
+    await waitFor(() => fake.paths().includes("/assets/download"));
+    fake.replyDelayMs.set("/assets/download", 150);
+    await expect(
+      client.download(DOWNLOAD, "/staging", "ORIGINAL", "", aborted.signal),
+    ).rejects.toThrow("caller aborted");
+    stop.abort(new Error("stop"));
+    await first.catch(() => undefined);
+  });
+
+  it("keeps the result of a task someone is waiting for when many others finish at once", async () => {
+    const fake = await new FakeClient().start();
+    const client = new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5 });
+    let held: FakeTask | undefined;
+    fake.onDownload = (_body, task) => void (held = task);
+    const download = client.download(
+      DOWNLOAD,
+      "/staging",
+      "ORIGINAL",
+      "",
+      AbortSignal.timeout(10_000),
+    );
+    await waitFor(() => held);
+    for (let index = 0; index < 300; index += 1) {
+      const id = randomUUID();
+      fake.tasks.set(id, {
+        task_id: id,
+        task_type: "other",
+        status: "finished",
+        progress: 100,
+        message: "",
+        result: null,
+        data: {},
+      });
+    }
+    Object.assign(held!, { status: "finished", result: { file_paths: ["/staging/a.blend"] } });
+    await expect(download).resolves.toEqual(["/staging/a.blend"]);
+  });
+
+  it("asks the official Client to cancel a download that failed for any reason but its own end", async () => {
+    const fake = await new FakeClient().start();
+    const client = new BlendkitClient({ baseUrl: fake.origin, pollIntervalMs: 5 });
+    fake.onDownload = () => {};
+    fake.badReport = true;
+    await expect(
+      client.download(DOWNLOAD, "/staging", "ORIGINAL", "", AbortSignal.timeout(5000)),
+    ).rejects.toMatchObject({ code: "BLENDKIT_INVALID_RESPONSE" });
+    const cancel = fake.requests.find((request) => request.path === "/assets/cancel_download");
+    expect(typeof cancel?.body.task_id).toBe("string");
+
+    // A task the Client itself reports as failed is already over: nothing to cancel.
+    const other = await new FakeClient().start();
+    other.onDownload = (_body, task) => void Object.assign(task, { status: "error" });
+    await expect(
+      new BlendkitClient({ baseUrl: other.origin, pollIntervalMs: 5 }).download(
+        DOWNLOAD,
+        "/staging",
+        "ORIGINAL",
+        "",
+        AbortSignal.timeout(5000),
+      ),
+    ).rejects.toMatchObject({ code: "BLENDKIT_TASK_FAILED" });
+    expect(other.paths()).not.toContain("/assets/cancel_download");
+  });
+
+  it("keeps the staging directory while a recipe the Client cannot cancel may still write", async () => {
+    const fake = await new FakeClient().start();
+    happyPath(fake);
+    fake.onRun = () => {};
+    const out = await tempDir();
+    const controller = new AbortController();
+    const work = importBlendkitAsset(
+      provider(fake),
+      importInput(out),
+      controller.signal,
+      toolOptions,
+    );
+    await waitFor(() => fake.paths().includes("/tools/run"));
+    controller.abort(new Error("caller cancelled"));
+    const error = await rejection(work);
+    expect(error.code).toBe("BLENDKIT_CANCELLED");
+    expect(error.message).toContain("caller cancelled");
+    expect(error.message).toContain("was kept");
+    const entries = await readdir(out);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatch(/^\.blendkit-staging-/u);
+  });
+
+  it("reports a staging cleanup problem after commit as a warning, not a failure", async () => {
+    const fake = await new FakeClient().start();
+    happyPath(fake);
+    const out = await tempDir();
+    const result = await importBlendkitAsset(
+      provider(fake),
+      importInput(out),
+      AbortSignal.timeout(10_000),
+      {
+        ...toolOptions,
+        hooks: {
+          removeStaging: () => Promise.reject(Object.assign(new Error("busy"), { code: "EBUSY" })),
+        },
+      },
+    );
+    expect(result.warnings).toEqual([expect.stringMatching(/staging directory .*EBUSY/u)]);
+    const entries = await readdir(out);
+    expect(entries).toContain(`blendkit-${ID}.glb`);
+    expect(entries).toContain(`blendkit-${ID}.provenance.json`);
+  });
+
+  it("publishes nothing when the caller aborts just before publishing", async () => {
+    const fake = await new FakeClient().start();
+    happyPath(fake);
+    const out = await tempDir();
+    const controller = new AbortController();
+    await expect(
+      importBlendkitAsset(provider(fake), importInput(out), controller.signal, {
+        ...toolOptions,
+        hooks: { beforePublish: async () => controller.abort(new Error("late abort")) },
+      }),
+    ).rejects.toThrow("late abort");
+    expect(await readdir(out)).toEqual([]);
   });
 });

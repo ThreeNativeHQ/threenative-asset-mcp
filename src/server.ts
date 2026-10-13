@@ -613,7 +613,7 @@ export function createAssetServer(
     {
       title: "Import one free Blendkit model as GLB",
       description:
-        "Acquire one free Blendkit model (an asset_search id, blendkit:<uuid>) through the user's own Blendkit-Client, convert it with the Client's bundled export_glb recipe under headless Blender, inspect the GLB, and write a provenance file. Requires the item's license acknowledgement and explicit project-use consent. Royalty Free items are private use only: the Blendkit Terms forbid open-format models such as GLB in software, so never commit, publish or ship them in game builds, demos or starter kits; purpose \"redistribution\" accepts CC0 items only. Never purchases, signs in or bulk-downloads. Off until documented provider permission is configured (see blendkit_status).",
+        "Acquire one free Blendkit model (an asset_search id, blendkit:<uuid>) through the user's own Blendkit-Client, convert it with the Client's bundled export_glb recipe under headless Blender, inspect the GLB, and write a provenance file. Requires the item's license acknowledgement and explicit project-use consent. Output is for private use only: the Blendkit Terms forbid open-format models such as GLB in software and apply that to CC0 items too, so never commit, publish or ship it in game builds, demos or starter kits. Raw redistribution (purpose redistribution) is always refused, CC0 included. Existing outputs are never overwritten. Never purchases, signs in or bulk-downloads. Off until documented provider permission is configured (see blendkit_status).",
       inputSchema: BlendkitImportInputSchema,
       outputSchema: BlendkitImportOutputSchema,
       annotations: {

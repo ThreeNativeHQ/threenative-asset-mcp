@@ -25,7 +25,8 @@ export type BlendkitErrorCode =
   | "BLENDKIT_CONSENT_REQUIRED"
   | "BLENDKIT_UNSUPPORTED"
   | "BLENDKIT_CONVERSION_FAILED"
-  | "BLENDKIT_OUTPUT_EXISTS";
+  | "BLENDKIT_OUTPUT_EXISTS"
+  | "BLENDKIT_PUBLISH_FAILED";
 
 export class BlendkitError extends Error {
   constructor(
@@ -64,15 +65,29 @@ export function loopbackOrigin(raw: string): string {
   return url.origin;
 }
 
-/** Task text comes from the Client and the provider: bounded, single-line, URLs (signed or not) removed. */
-export function safeTaskText(value: unknown): string {
-  return typeof value === "string"
-    ? value
-        .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/giu, "<url>")
-        .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
-        .trim()
-        .slice(0, 300)
-    : "";
+/**
+ * Task text comes from the Client and the provider: bounded, single-line, with any configured
+ * credential (plain text, not only inside a URL) and every URL, signed or not, removed.
+ */
+export function safeTaskText(value: unknown, secrets: Iterable<string> = []): string {
+  if (typeof value !== "string") return "";
+  let text = value;
+  // ponytail: a credential shorter than 4 characters is not redacted, to avoid mangling text.
+  for (const secret of secrets)
+    if (secret.length >= 4) text = text.split(secret).join("<redacted>");
+  return text
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/giu, "<url>")
+    .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
+    .trim()
+    .slice(0, 300);
+}
+
+/** True when the Client reported the task itself as failed or cancelled, so nothing still runs. */
+export function taskEnded(error: unknown): boolean {
+  return (
+    error instanceof BlendkitError &&
+    (error.code === "BLENDKIT_TASK_FAILED" || error.code === "BLENDKIT_CANCELLED")
+  );
 }
 
 export type BlendkitTask = {
@@ -108,6 +123,10 @@ export class BlendkitClient {
   /** Terminal tasks /report handed over before their waiter asked; each is delivered once. */
   private readonly done = new Map<string, BlendkitTask>();
   private readonly latest = new Map<string, TaskProgress>();
+  /** Tasks someone is waiting for: their parked results are never evicted. */
+  private readonly active = new Set<string>();
+  /** API keys seen in requests, redacted from any task text the Client echoes back. */
+  private readonly secrets = new Set<string>();
   private polling: Promise<void> | undefined;
 
   constructor(options: BlendkitClientOptions = {}) {
@@ -210,6 +229,7 @@ export class BlendkitClient {
     const taskId = started?.task_id;
     if (typeof taskId !== "string" || !/^[a-f0-9-]{36}$/u.test(taskId))
       throw new BlendkitError("BLENDKIT_INVALID_RESPONSE", "Blendkit-Client returned no task id.");
+    this.active.add(taskId);
     return taskId;
   }
 
@@ -241,10 +261,10 @@ export class BlendkitClient {
           if (typeof item?.task_id !== "string" || typeof item.status !== "string") continue;
           const task: BlendkitTask = {
             taskId: item.task_id,
-            taskType: String(item.task_type ?? ""),
+            taskType: safeTaskText(item.task_type, this.secrets).slice(0, 64),
             status: item.status,
             progress: Math.max(0, Math.min(100, Number(item.progress) || 0)),
-            message: safeTaskText(item.message),
+            message: safeTaskText(item.message, this.secrets),
             result: item.result,
           };
           this.latest.set(task.taskId, { progress: task.progress, message: task.message });
@@ -252,7 +272,10 @@ export class BlendkitClient {
         }
         // ponytail: parked results of abandoned waiters are dropped oldest-first past 256.
         for (const map of [this.done, this.latest])
-          while (map.size > 256) map.delete(map.keys().next().value!);
+          for (const id of map.keys()) {
+            if (map.size <= 256) break;
+            if (!this.active.has(id)) map.delete(id);
+          }
       } finally {
         this.polling = undefined;
       }
@@ -265,31 +288,37 @@ export class BlendkitClient {
     signal: AbortSignal,
     onProgress?: (progress: TaskProgress) => void,
   ): Promise<BlendkitTask> {
-    for (;;) {
-      const finished = this.done.get(taskId);
-      if (finished) {
-        this.done.delete(taskId);
-        this.latest.delete(taskId);
-        if (finished.status === "finished") return finished;
-        throw new BlendkitError(
-          finished.status === "cancelled" ? "BLENDKIT_CANCELLED" : "BLENDKIT_TASK_FAILED",
-          `Blendkit-Client ${finished.taskType || "task"} ${finished.status}: ${finished.message || "no reason given"}`,
-        );
+    try {
+      for (;;) {
+        // Before the parked result: a caller that has aborted never accepts a completion.
+        signal.throwIfAborted();
+        const finished = this.done.get(taskId);
+        if (finished) {
+          if (finished.status === "finished") return finished;
+          throw new BlendkitError(
+            finished.status === "cancelled" ? "BLENDKIT_CANCELLED" : "BLENDKIT_TASK_FAILED",
+            `Blendkit-Client ${finished.taskType || "task"} ${finished.status}: ${finished.message || "no reason given"}`,
+          );
+        }
+        await this.poll();
+        const latest = this.latest.get(taskId);
+        if (latest && onProgress) onProgress(latest);
+        // timers/promises rejects with a generic AbortError; surface the caller's own reason.
+        if (!this.done.has(taskId))
+          await delay(this.pollIntervalMs, undefined, { signal }).catch(() =>
+            signal.throwIfAborted(),
+          );
       }
-      signal.throwIfAborted();
-      await this.poll();
-      const latest = this.latest.get(taskId);
-      if (latest && onProgress) onProgress(latest);
-      // timers/promises rejects with a generic AbortError; surface the caller's own reason.
-      if (!this.done.has(taskId))
-        await delay(this.pollIntervalMs, undefined, { signal }).catch(() =>
-          signal.throwIfAborted(),
-        );
+    } finally {
+      this.active.delete(taskId);
+      this.done.delete(taskId);
+      this.latest.delete(taskId);
     }
   }
 
   /** Starts a provider search whose URL the caller built and validated; returns the raw result. */
   async search(urlquery: string, pageSize: number, apiKey: string, signal: AbortSignal) {
+    if (apiKey) this.secrets.add(apiKey);
     const taskId = await this.startTask(
       "/assets/search",
       {
@@ -307,7 +336,7 @@ export class BlendkitClient {
     return (await this.waitTask(taskId, signal)).result;
   }
 
-  /** Downloads one asset into downloadDir; aborting cancels the Client task. */
+  /** Downloads one asset into downloadDir; any failure but a reported task end cancels the Client task. */
   async download(
     assetData: { id: string; name: string; assetType: string; files: unknown[] },
     downloadDir: string,
@@ -317,6 +346,7 @@ export class BlendkitClient {
     onProgress?: (progress: TaskProgress) => void,
   ): Promise<string[]> {
     signal.throwIfAborted();
+    if (apiKey) this.secrets.add(apiKey);
     // The start request runs to completion so an abort always knows which task to cancel.
     const taskId = await this.startTask(
       "/assets/download",
@@ -346,7 +376,8 @@ export class BlendkitClient {
         );
       return paths;
     } catch (error) {
-      if (signal.aborted)
+      // Anything but the Client reporting the task itself over: ask the official Client to stop it.
+      if (!taskEnded(error))
         await this.request(
           "/assets/cancel_download",
           { task_id: taskId, app_id: this.appId },

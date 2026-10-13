@@ -168,12 +168,12 @@ Blendkit (through the user's own official Blendkit-Client; see
   Blender, inspects the GLB (meshes, triangles, PBR texture slots, size) and
   writes a provenance file. It needs the item's license acknowledgement and
   explicit project-use consent, and it refuses paid items and unknown licenses.
-  Royalty Free items are private use only: the Blendkit Terms forbid
-  open-format models such as GLB in software, so they never go into game
-  builds, demos or starter kits. `purpose: "redistribution"` accepts CC0 items
-  only. Live search and import stay off until
-  `BLENDKIT_PROVIDER_PERMISSION` is set. With it, `asset_search` also searches
-  Blendkit.
+  The output is private use only: the Blendkit Terms forbid open-format models
+  such as GLB in software and apply that to CC0-labelled items too. It never
+  goes into game builds, demos or starter kits, and `purpose: "redistribution"`
+  is always refused. Existing outputs are never overwritten. Live search and
+  import stay off until `BLENDKIT_PROVIDER_PERMISSION` is set. With it,
+  `asset_search` also searches Blendkit.
 
 Poly Haven:
 
