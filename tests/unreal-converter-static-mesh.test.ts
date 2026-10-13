@@ -184,7 +184,7 @@ ${CUE4PARSE_PROGRAM.match(/sealed record StaticMeshMetadata[^\n]+/)![0]}
 sealed class SyntheticPackage : AbstractUePackage
 {
     public SyntheticPackage(string[] names) : base("Synthetic", null) { NameMap = names.Select(name => new FNameEntrySerialized(name)).ToArray(); }
-    public override FPackageFileSummary Summary { get; } = new();
+    public override FPackageFileSummary Summary { get; } = new() { bUnversioned = true };
     public override FNameEntrySerialized[] NameMap { get; }
     public override int ImportMapLength => 0;
     public override int ExportMapLength => 0;
@@ -239,7 +239,7 @@ using CUE4Parse.UE4.Objects.Core.Misc;`)
     if (success) await WriteMeshMetadataAsync(mesh.Name, metadata);
     Console.WriteLine(JsonSerializer.Serialize(new { success, metadata, reason = assetLookupDiagnostics.GetValueOrDefault(mesh.Name) }));
 }
-else if (args[0] == "header")
+else if (args[0] == "header" || args[0] == "saved-header")
 {
     var results = new List<object>();
     foreach (var guidPresent in new[] { false, true })
@@ -247,6 +247,7 @@ else if (args[0] == "header")
         using var stream = new MemoryStream();
         using (var writer = new BinaryWriter(stream, Encoding.UTF8, true))
         {
+            if (args[0] == "saved-header") writer.Write((byte)0); // UE5.4+ serialization control extension
             writer.Write(1); writer.Write(0); // None FName
             writer.Write(guidPresent ? 1 : 0);
             if (guidPresent) writer.Write(Enumerable.Range(1, 16).Select(i => (byte)i).ToArray());
@@ -257,8 +258,10 @@ else if (args[0] == "header")
             writer.Write(987654321L);
         }
         var bytes = stream.ToArray();
-        var header = ReadStaticMeshBulkHeader(bytes, 0, bytes.Length, new SyntheticPackage(new[] { "Unused", "None" }), new VersionContainer(EGame.GAME_UE5_3));
-        var truncated = ReadStaticMeshBulkHeader(bytes, 0, bytes.Length - 1, new SyntheticPackage(new[] { "Unused", "None" }), new VersionContainer(EGame.GAME_UE5_3));
+        var package = new SyntheticPackage(new[] { "Unused", "None" });
+        if (args[0] == "saved-header") { package.Summary.bUnversioned = false; package.Summary.FileVersionUE = EGame.GAME_UE5_8.GetVersion(); }
+        var header = ReadStaticMeshBulkHeader(bytes, 0, bytes.Length, package, new VersionContainer(EGame.GAME_UE5_0));
+        var truncated = ReadStaticMeshBulkHeader(bytes, 0, bytes.Length - 1, package, new VersionContainer(EGame.GAME_UE5_0));
         results.Add(new { flags = header?.Flags, hash = header is { } h ? Convert.ToHexString(h.ContentHash) : null, size = header?.PayloadSize, offset = header?.PayloadOffset, truncated = truncated is null });
     }
     Console.WriteLine(JsonSerializer.Serialize(results));
@@ -316,6 +319,16 @@ describeWithTools(["modern-converter"], "native UE5 static mesh source and cooke
   it("reads the complete bulk header after variable UObject preambles within export bounds", async () => {
     expect(editorBuild.code, editorBuild.output).toBe(0);
     const result = await runBounded(sdk, [editorBuild.dll, "header"], { timeoutMs: 30_000, environment: childEnvironment(process.env) });
+    expect(result.code, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([false, true].map(() => ({
+      flags: 64, hash: Buffer.from(Array.from({ length: 20 }, (_, i) => i + 33)).toString("hex").toUpperCase(),
+      size: 123456789, offset: 987654321, truncated: true,
+    })));
+  });
+
+  it("uses the saved package version for bulk UObject headers under an older fallback profile", async () => {
+    expect(editorBuild.code, editorBuild.output).toBe(0);
+    const result = await runBounded(sdk, [editorBuild.dll, "saved-header"], { timeoutMs: 30_000, environment: childEnvironment(process.env) });
     expect(result.code, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual([false, true].map(() => ({
       flags: 64, hash: Buffer.from(Array.from({ length: 20 }, (_, i) => i + 33)).toString("hex").toUpperCase(),

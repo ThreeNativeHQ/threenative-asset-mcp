@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.584.10.1",
+  version: "b4e95441+threenative.584.10.2",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -2486,6 +2486,10 @@ static (uint Flags, byte[] ContentHash, long PayloadSize, long? PayloadOffset)? 
 {
     try
     {
+        // A fallback profile may be older than this package's UObject serialization layout.
+        versions = (VersionContainer)versions.Clone();
+        if (!package.Summary.bUnversioned) versions.Ver = package.Summary.FileVersionUE;
+        if (package.Summary.CustomVersionContainer is { Versions.Length: > 0 } customVersions) versions.CustomVersions = customVersions;
         using var archive = new FAssetArchive(new FByteArchive("static-mesh-bulk-object", bytes, versions), package);
         if (exportAt < 0 || validPos > bytes.Length || exportAt >= validPos) return null;
         archive.Position = exportAt;

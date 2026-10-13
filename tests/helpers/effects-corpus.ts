@@ -574,13 +574,13 @@ async function importSlice(sliceDir: string, label: string, cleanups: (() => Pro
     );
   }
   const converterPath = process.env.THREENATIVE_MODERN_UNREAL_CONVERTER_PATH?.trim();
-  if (!converterPath) throw new Error("PRD-584 corpus requires THREENATIVE_MODERN_UNREAL_CONVERTER_PATH pointing to the fresh private 584.10.1 executable");
+  if (!converterPath) throw new Error("PRD-584 corpus requires THREENATIVE_MODERN_UNREAL_CONVERTER_PATH pointing to the fresh private 584.10.2 executable");
   const environment = { ...childEnvironment(process.env), DOTNET_GCHeapHardLimit: "0x40000000" };
   const versionRun = await runBounded(converterPath, ["--version"], { timeoutMs: 30_000, environment });
   expect(versionRun.code, versionRun.stderr).toBe(0);
   // The executable prints "threenative-cue4parse <version>"; only that exact anchored prefix is removed.
   const version = versionRun.stdout.trim().replace(/^threenative-cue4parse /, "");
-  expect(version, "executed private converter identity").toBe("b4e95441+threenative.584.10.1");
+  expect(version, "executed private converter identity").toBe("b4e95441+threenative.584.10.2");
   expect(version).toBe(CUE4PARSE_SOURCE.version);
   const root = await mkdtemp(join(tmpdir(), `effects-corpus-${label}-`));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
