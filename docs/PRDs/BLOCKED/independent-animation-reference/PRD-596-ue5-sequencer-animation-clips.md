@@ -119,9 +119,9 @@ blendspace descriptor is reported outside this clip proof; the whole pack is not
 Recipes and raw logs remain local: `current596-64-recipe.mts`,
 `parent596-final64-corpus.log`. Licensed inputs, outputs and renders stay outside the repository.
 
-Final comparison sheets are private owner-only Drive files, rendered from the final GLB bytes and inspected:
-[moving comparison](https://drive.google.com/file/d/1BlNF0o3vODTzMvlK7QBA4h9-q1YdIX-l/view?usp=drivesdk) and
-[additive integrity](https://drive.google.com/file/d/1WW5DF-dAPNcghHvPSy84TP0hbH-1gJuQ/view?usp=drivesdk).
+Final moving and additive comparison sheets are attached directly to
+[PR49](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/49#issuecomment-6132085569),
+rendered from the final GLB bytes and inspected.
 Before means pre-review `.584.5`, after was rendered on `.584.6.3` and its GLB bytes match final `.584.6.4`; neither row substitutes a bind pose for the requested
 clip. Both use the same neutral renderer and rest-pose camera. A moving foot reaches the camera boundary;
 this presentation limit does not change the numeric motion gate. PR attachment is recorded under AC-5.
@@ -182,3 +182,24 @@ User explicitly requested resolving the blocker before publishing and reinstalli
 4. Once AC2 passes, integrate current main without discarding merged mesh/WorldPartition/landscape fixes, bump converter/importer provenance, run current-head verification, merge PR49, then publish the completed package and update the engine dependency in a separate PR to develop. User authorized skipping CI only for that dependency-only engine PR.
 
 Operational diagnostics remain in the existing local run dump; no independent accuracy result is claimed yet.
+
+
+### Confirmed reference-access boundary (2026-10-13 UTC)
+
+The existing FabCLI secure session restores successfully and its OAuth exchange returns200.
+The intended Epic client had two local protocol defects: an obsolete CSRF endpoint and selection
+of the first of two same-name XSRF cookies. A private diagnostic helper now uses the current
+CSRF endpoint and final cookie value; web exchange200, redirect200 and set-sid204 succeed.
+Unreal cosmos/auth returns200 with bearerTokenValid=false, upgradedBearerToken=false and
+clearedOffline=true. Following Epic Asset Manager's actual next step, the protected, read-only
+EULA check returns401 Unauthorized. No terms were accepted and no credentials were exported.
+The exact server-side reason for the Unreal session rejection is unknown; this does not prove
+that the working FabCLI session has expired.
+
+Smallest owner input to resume: obtain a fresh official Linux_Unreal_Engine_5.8.3.zip download
+link from the signed-in Unreal Linux download page. The link is temporary access data; keep it
+private and never paste it into a PR. With access, first inspect ZIP metadata and the required
+runtime closure, then fetch only the modules needed for a headless independent pose export.
+The full39.8GB archive is not required in advance. An independently exported matching PSA
+remains an alternative. AC2 is still unchecked; PR49 merge, package publish and the engine
+pin/merge remain pending that comparison.
