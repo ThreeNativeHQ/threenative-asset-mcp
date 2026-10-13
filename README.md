@@ -1,5 +1,46 @@
 # threenative-asset-mcp
 
+[![npm version](https://img.shields.io/npm/v/threenative-asset-mcp)](https://www.npmjs.com/package/threenative-asset-mcp)
+[![Node.js requirement](https://img.shields.io/node/v/threenative-asset-mcp)](package.json)
+[![CI](https://img.shields.io/github/actions/workflow/status/ThreeNativeHQ/threenative-asset-mcp/ci.yml?branch=main&label=CI)](https://github.com/ThreeNativeHQ/threenative-asset-mcp/actions/workflows/ci.yml)
+
+Find game assets, review their licenses, and download supported files through
+one [Model Context Protocol](https://modelcontextprotocol.io/) server.
+AI clients can search multiple providers, extract individual bundle files,
+import supported Unreal assets, and inspect game audio.
+
+| Capability | Tools and scope |
+| --- | --- |
+| Discover assets | `asset_search` and `asset_search_sources` return provider metadata, license information, and available next actions. |
+| Download supported files | `asset_get` and `asset_download` use reviewed acquisition plans; provider tools support guarded downloads and selective ZIP/animation extraction. |
+| Convert Unreal assets | `asset_import_unreal` converts supported local packages; `fab_import_asset` uses your existing FabCLI session for owned packs. See [format support](docs/unreal-format-support.md) for verified scope and gaps. |
+| Work with game audio | Search curated packs, inspect local files, or generate sound effects with your own ElevenLabs key. Artistic quality remains unverified. |
+
+**Status: experimental.** Provider availability and asset licenses vary.
+Unreal support covers specific formats and verified cases, including selected FK clips; it does not certify whole packs.
+Blendkit is optional and requires documented provider permission. Live Blendkit downloads remain **UNVERIFIED**.
+
+## Quick start
+
+1. Install **Node.js 20.19.0 or newer**.
+2. Configure your [MCP host](#mcp-host-configuration) to launch:
+
+   ```bash
+   npx -y threenative-asset-mcp
+   ```
+
+3. Restart the host, then ask it to find an asset and inspect its license before downloading.
+
+For Fab browser verification, install Chromium once with
+`npx -p playwright@1.62.0 playwright install chromium`.
+Additional import and audio prerequisites are listed under [Requirements](#requirements).
+
+**Reference:** [Tools](#mcp-tools) · [Unreal imports](#unreal-import-support) ·
+[Configuration](#configuration) · [Troubleshooting](#troubleshooting) ·
+[Contributing and help](#contributing-and-help)
+
+## Provider scope and licensing
+
 A [Model Context Protocol](https://modelcontextprotocol.io/) server for finding
 3D assets across [Fab](https://www.fab.com/),
 [Poly Haven](https://polyhaven.com/), [ambientCG](https://ambientcg.com/),
@@ -174,6 +215,8 @@ Blendkit (through the user's own official Blendkit-Client; see
   is always refused. Existing outputs are never overwritten. Live search and
   import stay off until `BLENDKIT_PROVIDER_PERMISSION` is set. With it,
   `asset_search` also searches Blendkit.
+  Live provider downloads remain **UNVERIFIED**; local Client verification
+  does not establish a successful live download.
 
 Poly Haven:
 
@@ -951,3 +994,20 @@ search, detail, categories, and file discovery for ambientCG, Smithsonian 3D,
 and Sketchfab. If `SKETCHFAB_API_TOKEN` is configured it also verifies the
 authenticated download endpoint; otherwise it verifies the explicit
 authentication-required response.
+
+## Contributing and help
+
+For setup problems, start with [Troubleshooting](#troubleshooting) and
+`npm run doctor` from a local checkout.
+Report bugs or propose changes through [GitHub issues](https://github.com/ThreeNativeHQ/threenative-asset-mcp/issues).
+Include the package version, Node version, operating system, affected tool,
+and sanitized reproduction steps. Never include credentials, signed download URLs, or licensed asset files.
+Before submitting a pull request, read [AGENTS.md](AGENTS.md) and run the
+[verification commands](#verification) relevant to your change.
+
+## License
+
+The package declares **UNLICENSED** in [package.json](package.json).
+No open-source license is granted for this project.
+Downloaded assets and external tools retain their own licenses and terms;
+public availability does not grant redistribution rights.
