@@ -1,18 +1,18 @@
 # Unreal format support ledger
 
 Single place to track which Unreal 4 and Unreal 5 formats the importer supports, which are verified,
-and which are missing. `README.md` ("Unreal import support") links here. Update this file in the same
+and which are missing. `docs/unreal-import.md` links here. Update this file in the same
 commit as any importer, converter or adapter change that moves a row.
 
 Last audited: 2026-10-12, `IMPORTER_VERSION` 123 (`src/unreal/importer.ts`). Evidence comes from the
-README import table, `src/unreal/`, `tests/`, and the engine headers in `~/projects/UnrealEngine-5.8.3`
+import table in `docs/unreal-import.md`, `src/unreal/`, `tests/`, and the engine headers in `~/projects/UnrealEngine-5.8.3`
 (tag `5.8.3-release`, `Engine/Source/Runtime/Engine/Classes`, file names only).
 
 ## Status vocabulary
 
 | Status | Meaning |
 |---|---|
-| **Verified** | Imported from a real, named pack. The README or a sweep names the pack. |
+| **Verified** | Imported from a real, named pack. `docs/unreal-import.md` or a sweep names the pack. |
 | **Implemented** | Code and tests exist (synthetic or hand-authored fixtures). No real pack is named. |
 | **Reported** | The importer detects the class, lists it in the report and converts nothing. |
 | **Missing** | Not detected. The package is skipped, or it fails with "nothing to convert". |
@@ -40,13 +40,13 @@ An artifact's format is its oldest listed engine version (see `AGENTS.md`).
 | Uncooked `StaticMesh` below object version 517 | UE4.0–4.20 | **Verified** | GLB | Modular Building Set (129), STF Landscape Pro 2.0 (61), Power Plant (65), UE4.19 fern pack (38) |
 | Uncooked `StaticMesh` (`FMeshDescription`) | UE4.21–4.27 | **Verified** | GLB, cm to m | Office Pack Vol.1 (47 of 47) |
 | Uncooked `StaticMesh` editor source | UE5.1 | **Verified** | GLB per requested payload-backed LOD | Megascans European Hornbeam: LOD0/1/2 emitted as 115,674/41,543/15,076 triangles; generated-at-build-time LODs are reported, not faked. |
-| Cooked `StaticMesh` | UE5.5 | **Verified** | GLB | README names UE5.5 cooked static geometry. |
+| Cooked `StaticMesh` | UE5.5 | **Verified** | GLB | `docs/unreal-import.md` names UE5.5 cooked static geometry. |
 | `StaticMesh` LOD1 and higher from editor source | UE5 | **Verified** | `Models/<name>_LOD<n>.glb` | `lods: [0, 1, 2]` on the local European Hornbeam UE5.1 artifact emits each payload-backed source model; the importer names every promoted LOD. The native synthetic cooked fixture also proves `EMeshQuality.All` writes a distinct lower-triangle LOD1 payload. |
 | `StaticMesh` with Nanite data and no fallback mesh | UE5 | Reported | none | Reported honestly, no geometry. |
 | `StaticMesh` BuildScale3D | UE5 | Implemented | scaled GLB | CUE4Parse emits `SourceModels[0].BuildSettings.BuildScale3D` metadata for editor source geometry; cooked render buffers already include the scale and emit null; the native pinned fixture reads tagged values for UE5.4 tag 1012 and UE5.5 legacy -9, while importer wiring proves consumption. The byte scanner remains for UE4/UE Viewer routes. |
 | `SkeletalMesh`, skinned | UE4.0–4.20 | **Verified** | skinned GLB | Animal Variety Pack (6 rigged animals, 146 clips) |
 | `SkeletalMesh`, cooked | UE4 | Implemented | skinned GLB | Joints, weights and inverse-bind matrices preserved. |
-| `SkeletalMesh`, editor source | UE5 | **Verified** | skinned GLB | README: "UE5 editor skeletal geometry". |
+| `SkeletalMesh`, editor source | UE5 | **Verified** | skinned GLB | `docs/unreal-import.md`: "UE5 editor skeletal geometry". |
 | `AnimSequence` | UE4 | **Verified** | GLB clips | 146 clips in Animal Variety Pack. The CUE4Parse route now reads the editor raw track map (`TrackToSkeletonMapTable`), so raw/compressed UE4 clips convert to ActorX PSA: the Animation Starter Pack 4.4 CUE4Parse export matches the UE Viewer clips within 0.265° per bone per frame (13 clips, 68 bones). |
 | `AnimSequence` | UE5.0–5.5 conventional data model | **Verified** | GLB clips | The conventional `UAnimDataModel.BoneAnimationTracks` editor model converts: the executed native probe (converter `85-animation`) decoded a real UE 5.0.3 MetaHuman Sample to a 354-bone, 83-frame PSA at 30 fps with the endpoint sampled; the final-head public import (importer 116, converter `89-animation`, 2026-10-12) exported the selected clips with moving bound rotations and model-derived timing (`tests/helpers/animation-corpus.ts`, gate `ue5-clips`). A cooked clip that carries `RawAnimationData`/`FUECompressedAnimData`/ACL still converts. |
 | `AnimSequence` | UE5.4+ FK Sequencer data model (incl.5.8) | **Verified** (selected FK clips, current `.584.10.2`) | GLB clips | Samples actual FK channels using serialized MovieScene ticks, frame-rate defaults and fractional whole-transform blending; preserves authored sidecar metadata. Current release 0.12.0 / importer124 / converter `.584.10.2` fresh public/native proof retains 325 selected UE5.4 clips and 7 UE5.8 clips with bound geometry and valid timing. Independent actual UE5.8.3 full-pose comparison passes 7 selected clips /8 GLB-document comparisons /72,233 keys: zero missing keys or errors above 0.5°, actual current maximum 0.000264°. Serialized raw-bone scope compares91/93 mannequin bones (only 2 independently declared virtuals excluded) and 875/875 face bones. Static poses remain intact; non-FK graphs stay Reported. Current independent replay and all four local repository gates pass (PRD-596); no whole-pack or generated-virtual-bone support claim. |
