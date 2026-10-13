@@ -157,6 +157,24 @@ Fab:
   FabCLI session, then runs the same Unreal importer. It never signs in, claims,
   or purchases an asset.
 
+Blendkit (through the user's own official Blendkit-Client; see
+[docs/blendkit-integration.md](docs/blendkit-integration.md)):
+
+- `blendkit_status` — local-only health: whether the Client runs on loopback,
+  its version and `export_glb` recipe, whether live access is enabled, and the
+  setup steps still missing. It never contacts Blendkit.
+- `blendkit_import_asset` — acquires one free Blendkit model through the Client,
+  converts it with the Client's bundled `export_glb` recipe under headless
+  Blender, inspects the GLB (meshes, triangles, PBR texture slots, size) and
+  writes a provenance file. It needs the item's license acknowledgement and
+  explicit project-use consent, and it refuses paid items and unknown licenses.
+  Royalty Free items are private use only: the Blendkit Terms forbid
+  open-format models such as GLB in software, so they never go into game
+  builds, demos or starter kits. `purpose: "redistribution"` accepts CC0 items
+  only. Live search and import stay off until
+  `BLENDKIT_PROVIDER_PERMISSION` is set. With it, `asset_search` also searches
+  Blendkit.
+
 Poly Haven:
 
 - `polyhaven_search_assets` — searches HDRIs, textures, and models by text,
@@ -729,6 +747,10 @@ new `--out`, or add `--no-sheets`. Profiles and binaries derive from licensed pa
 | `ASSET_PROVIDER_TIMEOUT_MS`     | `8000`                                             | Provider deadline; range 1–30000 milliseconds. |
 | `ASSET_SEARCH_TIMEOUT_MS`       | `10000`                                            | Aggregate search/metadata deadline including queue time; range 1–60000. |
 | `ASSET_PLAN_TTL_MS`             | `300000`                                           | Acquisition-plan TTL; range 1–900000; at most 100 bounded plans. |
+| `BLENDKIT_CLIENT_URL`           | `http://127.0.0.1:62485`                           | Loopback address of the user's official Blendkit-Client; other hosts fail. |
+| `BLENDKIT_PROVIDER_PERMISSION`  | unset                                              | Citation of documented Blendkit permission for this use. Unset keeps live Blendkit search and import off. |
+| `BLENDKIT_API_KEY`              | unset                                              | **Your own** key from the official Blendkit sign-in; sent only to the loopback Client, never logged or returned. |
+| `BLENDKIT_BLENDER_PATH`         | Client-stored Blender                              | Absolute path to the Blender that runs the `export_glb` recipe. |
 | `THREENATIVE_TOOLCHAIN_AUTOINSTALL` | `1`                                            | Set to `0` to disable first-use external-tool installs.  |
 | `THREENATIVE_TOOLCHAIN_DIR`     | OS cache under `threenative-asset-mcp/toolchain`   | UE Viewer, FabCLI, and uncooked-converter cache.          |
 | `THREENATIVE_UMODEL_PATH`       | auto-detected/provisioned                           | Absolute path to a UE Viewer executable override.        |

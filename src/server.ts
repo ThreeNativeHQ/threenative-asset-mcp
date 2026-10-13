@@ -5,6 +5,16 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { AssetFederation } from "./discovery/federation.js";
 import { createAssetAdapters } from "./discovery/adapters.js";
 import { KenneyClient } from "./kenney/client.js";
+import { BlendkitClient } from "./blendkit/client.js";
+import { blendkitConfig, BlendkitProvider } from "./blendkit/provider.js";
+import {
+  BlendkitImportInputSchema,
+  BlendkitImportOutputSchema,
+  BlendkitStatusInputSchema,
+  BlendkitStatusOutputSchema,
+  createBlendkitImportHandler,
+  createBlendkitStatusHandler,
+} from "./tools/blendkit.js";
 import {
   AssetSearchInputSchema,
   AssetSearchOutputSchema,
@@ -211,6 +221,7 @@ export interface AssetServerClients {
   bundle: BundleAssetClient;
   federation?: AssetFederation;
   kenney?: KenneyClient;
+  blendkit?: BlendkitProvider;
   /** Constructed on demand; overridden only by tests that supply a stub inspector or fetch. */
   audioInspector?: AudioInspector;
   audioGenerator?: AudioGenerator;
@@ -253,6 +264,14 @@ export function createAssetServer(
     version: packageVersion(),
   });
 
+  const blendkitSettings = blendkitConfig();
+  const blendkit =
+    clients.blendkit ??
+    new BlendkitProvider({
+      ...blendkitSettings,
+      client: new BlendkitClient({ baseUrl: blendkitSettings.clientUrl, addonVersion: packageVersion() }),
+      addonVersion: packageVersion(),
+    });
   const federation =
     clients.federation ??
     new AssetFederation(
@@ -261,7 +280,10 @@ export function createAssetServer(
         ambientcg,
         smithsonian,
         ...(kenneySetting === "1" ? { kenney: clients.kenney ?? new KenneyClient() } : {}),
-      }),
+      }).concat(
+        // Live Blendkit search joins the federation only with documented provider permission.
+        blendkit.options.permissionEvidence ? [blendkit] : [],
+      ),
       directDownloader,
       { toolVersion: packageVersion() },
     );
@@ -566,6 +588,42 @@ export function createAssetServer(
       },
     },
     createFabImportAssetHandler(),
+  );
+
+  server.registerTool(
+    "blendkit_status",
+    {
+      title: "Check the local Blendkit-Client",
+      description:
+        "Report whether the user's official Blendkit-Client is running on loopback, its version and GLB recipe, whether live Blendkit access is enabled, and the exact setup steps that are missing. Local only: it never contacts Blendkit.",
+      inputSchema: BlendkitStatusInputSchema,
+      outputSchema: BlendkitStatusOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createBlendkitStatusHandler(blendkit),
+  );
+
+  server.registerTool(
+    "blendkit_import_asset",
+    {
+      title: "Import one free Blendkit model as GLB",
+      description:
+        "Acquire one free Blendkit model (an asset_search id, blendkit:<uuid>) through the user's own Blendkit-Client, convert it with the Client's bundled export_glb recipe under headless Blender, inspect the GLB, and write a provenance file. Requires the item's license acknowledgement and explicit project-use consent. Royalty Free items are private use only: the Blendkit Terms forbid open-format models such as GLB in software, so never commit, publish or ship them in game builds, demos or starter kits; purpose \"redistribution\" accepts CC0 items only. Never purchases, signs in or bulk-downloads. Off until documented provider permission is configured (see blendkit_status).",
+      inputSchema: BlendkitImportInputSchema,
+      outputSchema: BlendkitImportOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    createBlendkitImportHandler(blendkit, packageVersion()),
   );
 
   server.registerTool(

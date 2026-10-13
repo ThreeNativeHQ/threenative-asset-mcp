@@ -462,6 +462,8 @@ describe("built stdio package", () => {
       "fab_list_owned",
       "asset_import_unreal",
       "fab_import_asset",
+      "blendkit_status",
+      "blendkit_import_asset",
       "polyhaven_search_assets",
       "polyhaven_get_asset",
       "polyhaven_list_categories",
