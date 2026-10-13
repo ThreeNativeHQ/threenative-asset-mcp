@@ -1,22 +1,32 @@
+import { cloneDocument } from "@gltf-transform/functions";
 import { Document } from "@gltf-transform/core";
 import { describe, expect, it } from "vitest";
 import type { RawAnimationAsset } from "../src/unreal/animation-data.js";
 import { compareAnimationDifferential } from "./helpers/animation-differential.js";
-import { parseUnrealAnimationReference, unrealLocalRotation, unrealReferenceSources } from "./helpers/unreal-animation-reference.js";
+import { compareUnrealReferenceDocuments, parseUnrealAnimationReference, parseUnrealVirtualBones, unrealLocalRotation, unrealReferenceSources } from "./helpers/unreal-animation-reference.js";
 
 const digest = "a".repeat(64);
 function fixture() {
   return {
     schema: "prd596-real-unreal-local-poses-v1", engineVersion: "5.8.3-58210709+++UE5+Release-5.8",
-    evaluation: "AnimPoseExtensions.get_anim_pose_at_time; Raw; should_retarget=false; retrieve_additive_as_full_pose=false",
+    evaluation: "AnimPoseExtensions.get_anim_pose_at_time; Raw; should_retarget=false; retrieve_additive_as_full_pose=true",
     quaternionOrder: "xyzw", space: "Unreal local bone", nonidentityMotion: true,
     assets: [{ package: "/Game/Walk", source: "/private/Walk.uasset", sha256: digest, animation: true }, { package: "/Game/Skeleton", source: "/private/Skeleton.uasset", sha256: digest, animation: false }],
     clips: [{ name: "Walk", asset: "/Game/Walk", sourceSHA256: digest, skeleton: "/Game/Skeleton.Skeleton", skeletonSourceSHA256: digest,
       frameRate: { numerator: 1, denominator: 1 }, numFrames: 1, playLength: 1,
-      bones: [{ name: "root", parent: null, pathToRoot: ["root"] }],
+      bones: [{ name: "root", parent: null as string | null, pathToRoot: ["root"] }],
       samples: [0, 1].map((frame) => ({ frame, time: frame, poses: [{ rotation: frame ? [0.6, 0, 0, 0.8] : [0, 0, 0, 1], translation: [0, 0, 0], scale: [1, 1, 1] }] })),
     }],
   };
+}
+function referenceFixture() {
+  const reference = parseUnrealAnimationReference(fixture());
+  reference.virtualBones = parseUnrealVirtualBones(virtualFixture(), reference);
+  return reference;
+}
+function virtualFixture() {
+  return { schema: "prd596-real-unreal-virtual-bones-v1", engineVersion: fixture().engineVersion,
+    skeletons: [{ asset: "/Game/Skeleton.Skeleton", sourceSkeletonSHA256: digest, exportPath: "/private/skeleton.t3d", exportSHA256: digest, declaredCount: 0, virtualBones: [] as { source: string; target: string; name: string }[] }] };
 }
 const native = [{ kind: "clip", className: "AnimSequence", name: "Walk", package: "/Game/Walk", skeleton: "/Game/Skeleton", timing: { frames: 1, keys: 2, rateNumerator: 1, rateDenominator: 1, duration: 1 } }] as unknown as RawAnimationAsset[];
 
@@ -50,26 +60,72 @@ describe("official Unreal local pose reference guard", () => {
     expect(() => parseUnrealAnimationReference(rate)).toThrow("duration/frame-rate mismatch");
     const source = fixture(); source.clips[0]!.sourceSHA256 = "b".repeat(64);
     expect(() => parseUnrealAnimationReference(source)).toThrow("source identity mismatch");
-    const ref = parseUnrealAnimationReference(fixture());
+    const ref = referenceFixture();
     expect(() => unrealReferenceSources(ref, [])).toThrow("clip coverage");
     expect(() => unrealReferenceSources(ref, [{ ...native[0]!, skeleton: "/Game/Other" }])).toThrow("native skeleton mismatch");
     expect(() => unrealReferenceSources(ref, [{ ...native[0]!, name: "Other" }])).toThrow("native name mismatch");
   });
   it("checks every key through the existing sampler and detects a 0.6 degree defect", () => {
-    const reference = parseUnrealAnimationReference(fixture());
+    const reference = referenceFixture();
     const source = unrealReferenceSources(reference, native)[0]!;
     const doc = new Document(); const node = doc.createNode("root"); const buffer = doc.createBuffer();
     const times = doc.createAccessor().setType("SCALAR").setArray(new Float32Array([0, 1])).setBuffer(buffer);
     const values = doc.createAccessor().setType("VEC4").setArray(new Float32Array(source.sequences[0]!.tracks[0]!.rotations)).setBuffer(buffer);
     const sampler = doc.createAnimationSampler().setInput(times).setOutput(values).setInterpolation("LINEAR");
     doc.createAnimation("Walk").addSampler(sampler).addChannel(doc.createAnimationChannel().setTargetNode(node).setTargetPath("rotation").setSampler(sampler));
+    expect(compareUnrealReferenceDocuments([doc, cloneDocument(doc)], source)).toHaveLength(2);
     expect(compareAnimationDifferential(doc, source)).toMatchObject({ comparedKeys: 2, errors: [], missing: [] });
+    const good = cloneDocument(doc);
     const half = 0.6 * Math.PI / 360;
     values.setArray(new Float32Array([Math.sin(half), 0, 0, Math.cos(half), -0.6, 0, 0, 0.8]));
+    const duplicates = compareUnrealReferenceDocuments([good, doc], source);
+    expect(duplicates[0]!.result.errors).toEqual([]);
+    expect(duplicates[1]!.result.errors.length).toBeGreaterThan(0);
     expect(compareAnimationDifferential(doc, source).errors[0]).toMatchObject({ bone: "root", key: 0 });
     node.setName("missing");
     // A removed channel on a moving reference bone must be reported, never omitted.
     doc.getRoot().listAnimations()[0]!.listChannels()[0]!.dispose();
     expect(compareAnimationDifferential(doc, source).missing[0]?.reason).toContain("moving bone");
   });
+  it("requires full consumer poses and an exact complete virtual declaration receipt", () => {
+    const delta = fixture(); delta.evaluation = delta.evaluation.replace("=true", "=false");
+    expect(() => parseUnrealAnimationReference(delta)).toThrow();
+    expect(() => unrealReferenceSources(parseUnrealAnimationReference(fixture()), native)).toThrow("receipt required");
+    const ref = referenceFixture();
+    const unknown = virtualFixture(); unknown.schema = "unknown";
+    expect(() => parseUnrealVirtualBones(unknown, ref)).toThrow();
+    const mismatch = virtualFixture(); mismatch.skeletons[0]!.sourceSkeletonSHA256 = "b".repeat(64);
+    expect(() => parseUnrealVirtualBones(mismatch, ref)).toThrow("source hash mismatch");
+    const absent = virtualFixture(); absent.skeletons = [];
+    expect(() => parseUnrealVirtualBones(absent, ref)).toThrow();
+    const declared = virtualFixture(); declared.skeletons[0]!.virtualBones = [{ source: "root", target: "root", name: "missing" }]; declared.skeletons[0]!.declaredCount = 1;
+    expect(() => parseUnrealVirtualBones(declared, ref)).toThrow("source/target/name missing");
+    declared.skeletons[0]!.virtualBones.push(declared.skeletons[0]!.virtualBones[0]!); declared.skeletons[0]!.declaredCount = 2;
+    expect(() => parseUnrealVirtualBones(declared, ref)).toThrow("duplicate virtual bone declaration");
+  });
+  it("excludes only declared generated bones and keeps ordinary and arbitrary VB bones mandatory", () => {
+    const value = fixture();
+    value.clips[0]!.bones.push({ name: "VB arbitrary", parent: "root", pathToRoot: ["VB arbitrary", "root"] });
+    value.clips[0]!.samples.forEach((sample) => sample.poses.push({ rotation: [0, 0, 0, 1], translation: [0, 0, 0], scale: [1, 1, 1] }));
+    const ref = parseUnrealAnimationReference(value);
+    ref.virtualBones = parseUnrealVirtualBones(virtualFixture(), ref);
+    const doc = new Document(); doc.createAnimation("Walk"); doc.createNode("root");
+    expect(compareUnrealReferenceDocuments([doc], unrealReferenceSources(ref, native)[0]!)[0]!.result.missing.some((m) => m.bone === "VB arbitrary")).toBe(true);
+    const declaration = virtualFixture(); declaration.skeletons[0]!.declaredCount = 1;
+    declaration.skeletons[0]!.virtualBones = [{ source: "root", target: "root", name: "VB arbitrary" }];
+    ref.virtualBones = parseUnrealVirtualBones(declaration, ref);
+    const source = unrealReferenceSources(ref, native)[0]!;
+    expect(source.bones.map((b) => b.name)).toEqual(["root"]);
+    doc.getRoot().listNodes()[0]!.dispose();
+    expect(compareUnrealReferenceDocuments([doc], source)[0]!.result.missing.some((m) => m.bone === "root")).toBe(true);
+    expect(() => compareUnrealReferenceDocuments([], source)).toThrow("no matching public GLB");
+  });
+  it("rejects different skeleton hierarchies before comparing unrelated poses", () => {
+    const ref = referenceFixture();
+    const base = unrealReferenceSources(ref, native)[0]!;
+    const source = { ...base, bones: [...base.bones, { name: "child", parentIndex: 0, translation: [0, 0, 0] as const, rotation: [0, 0, 0, 1] as const }] };
+    const doc = new Document(); doc.createAnimation("Walk"); doc.createNode("root"); doc.createNode("child");
+    expect(() => compareUnrealReferenceDocuments([doc], source)).toThrow("different skeleton hierarchy");
+  });
+
 });

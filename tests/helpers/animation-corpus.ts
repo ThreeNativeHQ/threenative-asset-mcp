@@ -16,7 +16,7 @@ import { IMPORTER_VERSION, type ImportReport, type ImportedAnimationLogic, type 
 import { CUE4PARSE_SOURCE } from "../../src/unreal/cue4parse-adapter.js";
 import { parsePsa } from "../../src/unreal/psa.js";
 import { angularErrorDegrees, compareAnimationDifferential } from "./animation-differential.js";
-import { loadUnrealAnimationReference, unrealReferenceSources } from "./unreal-animation-reference.js";
+import { compareUnrealReferenceDocuments, loadUnrealAnimationReference, unrealReferenceSources } from "./unreal-animation-reference.js";
 
 const AFTER = ["modern", "asp", "stickmanFull", "gasp58", "gasp54", "rawCurve", "legacyCurve"] as const;
 type After = typeof AFTER[number];
@@ -265,20 +265,20 @@ export function registerAnimationCorpusGates(): void {
       let expectedKeys = 0;
       for (const source of sources) for (const sequence of source.sequences) {
         const documents = out.documents.filter((doc) => doc.getRoot().listAnimations().some((clip) => clip.getName() === sequence.name));
-        expectedKeys += sequence.tracks.reduce((sum, track) => sum + track.times.length, 0);
-        if (documents.length !== 1) {
-          absentClips.push(`${sequence.name}: expected exactly one Sequencer GLB, found ${documents.length}`);
-          console.info(`sequencer-differential: ${absentClips.at(-1)}`);
+        if (documents.length === 0) {
+          absentClips.push(`${sequence.name}: no matching Sequencer GLB`);
           continue;
         }
-        const result = compareAnimationDifferential(documents[0]!, { bones: source.bones, sequences: [sequence] }, { toleranceDegrees: 0.5 });
-        results.push(result);
-        console.info(`sequencer-differential: ${sequence.name}, ${result.comparedBones}/${source.bones.length} bones, ${result.comparedKeys} keys, max ${result.maxErrorDegrees.toFixed(6)} deg; worst=${JSON.stringify(result.worst)}; missing=${JSON.stringify(result.missing)}; errors=${result.errors.length}`);
+        expectedKeys += sequence.tracks.reduce((sum, track) => sum + track.times.length, 0) * documents.length;
+        for (const { index, result } of compareUnrealReferenceDocuments(out.documents, { ...source, sequences: [sequence] })) {
+          results.push(result);
+          console.info(`sequencer-differential: ${sequence.name}, model=${out.report.models[index]!.glb}, documents=${documents.length}, ${result.comparedBones}/${source.bones.length} bones, ${result.comparedKeys} keys, max ${result.maxErrorDegrees.toFixed(6)} deg; worst=${JSON.stringify(result.worst)}; missing=${JSON.stringify(result.missing)}; errors=${result.errors.length}`);
+        }
       }
       const comparedKeys = results.reduce((sum, r) => sum + r.comparedKeys, 0);
       const maximum = Math.max(...results.map((r) => r.maxErrorDegrees));
-      console.info(`sequencer-differential: ${results.length}/${sources.reduce((sum, source) => sum + source.sequences.length, 0)} clip(s), ${comparedKeys}/${expectedKeys} keys, ${results.reduce((sum, r) => sum + r.errors.length, 0)} angular errors, max ${maximum.toFixed(6)} deg; independent source=${unrealPath ? "official Unreal Raw local poses" : "PSA"}`);
-      assert(absentClips.length === 0 && results.every((r) => r.missing.length === 0 && r.comparedKeys > 0 && r.errors.length === 0 && r.maxErrorDegrees <= 0.5),
+      console.info(`sequencer-differential: ${results.length} document comparisons for ${sources.reduce((sum, source) => sum + source.sequences.length, 0)} clip(s), ${comparedKeys}/${expectedKeys} keys, ${results.reduce((sum, r) => sum + r.errors.length, 0)} angular errors, max ${maximum.toFixed(6)} deg; independent source=${unrealPath ? "official Unreal Raw full local poses" : "PSA"}`);
+      assert(comparedKeys === expectedKeys && absentClips.length === 0 && results.every((r) => r.missing.length === 0 && r.comparedKeys > 0 && r.errors.length === 0 && r.maxErrorDegrees <= 0.5),
         `independent differential failed: ${JSON.stringify({ absentClips, missing: results.flatMap((r) => r.missing), worst: results.map((r) => r.worst) })}`);
     });
 
