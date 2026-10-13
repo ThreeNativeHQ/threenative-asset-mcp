@@ -1,7 +1,7 @@
 # PRD-596 — UE 5.4+ animation clips from the Sequencer data model
 
-**Status:** BLOCKED — independent AC-2 owner reference only; all internal criteria pass
-**Priority:** P1 — UE5.4+ FK Sequencer clips now import with bound motion; independent AC-2 pose comparison remains open.
+**Status:** BLOCKED — independent reference recovered; current-tag AC-2 replay pending, final repository gates pending
+**Priority:** P1 — UE5.4+ FK Sequencer clips import with bound motion; frozen-build independent comparison passes, current-build verification remains open.
 **Complexity:** 3 (LOW) — 1–5 files (`src/unreal/cue4parse-adapter.ts`, `src/unreal/importer.ts`, a new evaluator), new module; risk override: none.
 **Owner:** PRD-596 lane; parent owns final gates and sheet inspection
 **Depends on:** None
@@ -51,11 +51,11 @@ Risk: euler order and tangent semantics give a plausible but wrong pose. The dif
 ## Acceptance Criteria
 
 - [x] AC-1 [local]: Importing the `game-anim-5.8` slice through `asset_import_unreal` exports its seed clips as GLB animations with moving bones, and the report lists no ControlRig reason for them. proof: `PRD583_ANIMATION_PROOF=/absolute/path/current-prd583-proof.json npx vitest run tests/fab-feature-corpus.test.ts -t ue5-clips` — Evidence: parent strict `ue5-clips` replay passed on implementation `80df0c3`, converter `.584.6.4`, importer119 (3.43s). All seven selected UE5.8 native AnimSequences have public sidecars without unsupported reasons, GLB animations bound to actual skinned geometry, finite timing within one frame, and genuine bound-bone motion across the selection. Consumed local index: `/home/joao/.cache/agent-dumps/prd-596-599/raw/current596-proof.json`; raw gate: `parent596-final64-corpus.log`.
-- [ ] AC-2 [local]: A Sequencer-model clip matches an independent decode of the same clip within 0.5° per bone per frame. proof: differential gate beside `clip-differential` (`tests/helpers/animation-corpus.ts:252`) — Evidence: blocked on independent owner reference; authenticated library survey found no transition pair. See the owner-action section below. Remains unchecked.
+- [ ] AC-2 [local]: A Sequencer-model clip matches an independent decode of the same clip within 0.5° per serialized raw bone per frame; only independently declared generated virtual bones are excluded. proof: `sequencer-differential` — Frozen importer119 / converter `.584.6.4` passes against actual UE5.8.3: seven selected clips, eight GLB-document comparisons, 72,233 keys, zero missing keys or angular errors above the gate, worst 0.000264°. The face clip is present in two GLBs. Current importer123 / converter `.584.10.1` proof and replay are pending; do not infer a current-build pass from frozen evidence.
 - [x] AC-3 [local]: Each channel interpolation mode (constant, linear, cubic auto, cubic user, cubic break, weighted) evaluates to the engine's formula on synthetic keys, and an unsupported mode reports its reason. proof: `THREENATIVE_TOOLCHAIN_DIR=/tmp/prd596-toolchain npx vitest run tests/unreal-sequencer-channels.test.ts` — Evidence: metadata repair focused gate passes all six compiled shipped-helper tests on `.584.6.4`, including actual `ExportClip` reported Sequencer sidecar with native tagged notify/curve/sync-marker values; the metadata construction is shared before success/failure selection. Old code failed with empty `notifies` (five existing tests passed); logs: `raw/596-metadata-{red,green}.log`. Combined Sequencer/native metadata gates:13 passed (2.99s); typecheck and `git diff --check` passed. Prior evidence: all five compiled shipped-helper tests pass on `.584.6.3`: constant/linear/cubic/weighted/extrapolated formulas, scene-rate sampling, fractional whole-transform quaternion blend, omitted-denominator defaults with explicit invalid-rate rejection, and additive base-pose protection/restoration on success and failure. Red/green and deliberate Euler-blend mutation logs remain local under `raw/rates596-*` and `raw/parent596-rate-default-*`.
 - [x] AC-4 [local]: The `game-anim-5.4` slice imports its seed clip the same way. proof: same gate as AC-1 over `gasp54` — Evidence: the same strict gate passed all325 selected native UE5.4 AnimSequences against325 public sidecars and8 model GLBs, requiring bound geometry, valid timing and genuine motion across the selection. The fresh public replay selected every prior clip and model while excluding unrelated standalone audio promotion; no animation was removed to make the gate pass.
 - [x] AC-5 [local]: Before/after sheet of one 5.8 clip on the mannequin (several frames) is attached to the PR and inspected by eye. proof: PR comment link — Evidence: moving and additive-integrity sheets whose after-GLB SHA-256 matches final `.584.6.4` rendered with the production neutral renderer, inspected by the parent and attached in [PR49 comment](https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/49#issuecomment-6132085569). Before is pre-review `.584.5`, after GLB is byte-identical to final `.584.6.4`, at0.000/0.040/0.050s. The same rest-pose camera is retained; a moving foot can reach its boundary. Inspected PNGs are native GitHub attachments on that PR comment; licensed source packages remain local-only.
-- [x] AC-6 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Evidence: parent ran all four on implementation `80df0c3`, `.584.6.4` / importer119: typecheck0.9s, default suite2,699 passed/16 skipped92.3s, clean leak gate97.3s, packed MCP15/15 in10.6s. Logs: `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent596-final64-{typecheck,test,leaks,smoke}.log`.
+- [ ] AC-6 [local]: Repository gates pass on the final head. proof: `npm run typecheck`, `npm test`, `npm run test:leaks`, `npx vitest run tests/mcp-smoke.test.ts` — Current importer123 / converter `.584.10.1` full-suite gates are PENDING; parent owns recording their actual results. Historical evidence: parent ran all four on implementation `80df0c3`, `.584.6.4` / importer119: typecheck0.9s, default suite2,699 passed/16 skipped92.3s, clean leak gate97.3s, packed MCP15/15 in10.6s. Logs: `/home/joao/.cache/agent-dumps/prd-596-599/raw/parent596-final64-{typecheck,test,leaks,smoke}.log`.
 
 ## Integration Ledger
 
@@ -94,7 +94,7 @@ Paths below are relative to that checkout; exact ranges were inspected for this 
 - Same file `:1608–1642,1645–1691,1708–1721`: integer extraction prefers keys; fractional endpoint evaluation prefers defaults and blends floor/ceil whole transforms, otherwise evaluating channels through `EvaluateWithCache`. Translation and scale use XYZ; rotation channels are Roll, Pitch, Yaw and become `Rotator.Quaternion()`.
 - `Engine/Plugins/Animation/ControlRig/Source/ControlRig/Private/Sequencer/MovieSceneControlRigParameterSection.cpp:1714–1731`: transform defaults use translation XYZ, rotation Roll/Pitch/Yaw, scale XYZ. These facts do not substitute for independent AC-2 pose proof.
 
-## Local evidence and parent handoff
+## Historical local evidence and parent handoff (importer119 / converter `.584.6.4`)
 
 The consumed local proof index is `/home/joao/.cache/agent-dumps/prd-596-599/raw/current596-proof.json`.
 Fresh public imports and separate actual native CLI exports are under
@@ -126,99 +126,67 @@ Before means pre-review `.584.5`, after was rendered on `.584.6.3` and its GLB b
 clip. Both use the same neutral renderer and rest-pose camera. A moving foot reaches the camera boundary;
 this presentation limit does not change the numeric motion gate. PR attachment is recorded under AC-5.
 
-## Owner action remaining for AC-2
+## Independent reference and current-build handoff
 
-The authenticated owner-library survey succeeded; DBus is not the blocker. Matching older paths
-in City Sample (383) and MetaHumans (19) were byte-identical across 5.1/5.2, so no independent
-conventional-model/Sequencer-model pair was established. `/home/joao/UE58/Engine/Binaries/Linux/UnrealEditor`
-exists but lacks core shared libraries (Core, CoreUObject, Engine and others), and the partial installation
-cannot export the reference. No full engine setup/build is implied. Discovery is recorded in
-`~/.cache/agent-dumps/prd-596-599/STATE.md` and the primary AFK log
-`/home/joao/projects/threenative/threenative-asset-mcp/.afk/2026-10-12-prd-596-599.md`.
+The owner downloaded the official Linux UE5.8.3 ZIP locally, resolving the historical 401.
+No authentication bypass or fresh login is required. A selective 6.2GiB runtime exports actual
+Unreal poses independently of the importer. The original raw additive-delta oracle
+(`retrieve_additive_as_full_pose=false`) remains unchanged. The supplementary full-pose oracle
+uses `AnimPoseExtensions.get_anim_pose_at_time`, RAW evaluation, no retargeting, and
+`retrieve_additive_as_full_pose=true`. Official `AnimPose.cpp:698–729` applies the additive delta
+to the engine base pose and normalizes rotations; this matches the standalone full-pose GLB
+consumer context. This is an independent engine evaluation, not importer-generated reference data.
 
-Owner supplies an independently decoded PSA/editor export of a UE5.4+ FK Sequencer clip with the
-same skeleton and frame rate, or a ≤5.1 conventional-model artifact containing that same clip.
-Resume with a current proof-index JSON:
+Scope: seven selected Game Animation Sample 5.8 clips, 101 frame samples and 39,109 original
+bone-frame poses. For six mannequin clips, 91/93 bones are serialized raw bones; the only two
+excluded bones are declared virtuals established by actual Unreal T3D exports. All 875/875
+face bones are compared, with zero exclusions. `ReferenceSkeleton.h:106–116,244–254` and
+`ReferenceSkeleton.cpp:492–517` distinguish raw bones from appended virtual bones.
+No prefix-based exclusion, virtual-bone output support, whole-pack parity or all-version claim is made.
+The frozen `.584.6.4` / importer119 gate passes eight document comparisons and 72,233 keys,
+with zero missing keys or errors above 0.5°, worst 0.000264°; the face clip occurs in two GLBs.
 
-```sh
-PRD583_ANIMATION_PROOF=/absolute/path/current-prd583-proof.json \
-PRD596_SEQUENCER_REFERENCE_PSA=/absolute/path/reference.psa \
-FAB_FEATURE_CORPUS_DIR=/home/joao/.cache/threenative-asset-mcp/fab-slices \
-THREENATIVE_TOOLCHAIN_DIR=/tmp/prd596-toolchain \
-npx vitest run tests/fab-feature-corpus.test.ts -t sequencer-differential
-```
+Private provenance lives under `/home/joao/.cache/threenative-asset-mcp/prd596-independent-reference/`:
+`provenance-full.json` and `virtual-bones-provenance.json` record archive, executable,
+source package, skeleton and official source identities. SHA-256 digests:
 
-Expected result: every compared bone key is within 0.5°; the gate reports maximum error.
-Use the indexed `.584.6.4` private toolchain and current proof index for the owner-reference differential; the strict corpus now passes on that build.
-AC-2 remains unchecked until this independent comparison passes.
+- Official ZIP: `81985a9542e15761fa3cc0d4483a26ebe5fd0b448120faddaa2fe05d94142934`.
+- UnrealEditor-Cmd: `7e54a59c2740d66003656e7a8f33d11e7348bb97d33483e98f05fedd0784284a`.
+- Original raw poses: `651209382e839d2aac4d09e8155c36ecef05f4d761ddc7682df08a61ac847a78`.
+- Supplementary full poses: `0ad36d7d83708676cf9262231dcfe4989456d1854f542694882a785d6a57c436`.
+- Declared-virtual receipt: `f7d12c8d21562add0a2d3be8274ec9dad372a20a7576b6c904babf285d2565fc`.
+
+Current checkout: release 0.12.0, importer123, converter `.584.10.1`; PRDs 597–599 are integrated.
+Fresh evidence is being generated at
+`/home/joao/.cache/agent-dumps/prd-596-599/raw/current596-101-proof.json` and
+`raw/596-current101-replay.log`. AC-2 stays unchecked and this PRD stays in BLOCKED until
+an actual current-tag passing differential is observed. Parent owns the final full-suite numbers,
+PR49 merge, package publication and engine dependency update. Historical gate and screenshot
+results remain identified with their original build; they do not establish current-head verification.
 
 ## Execution Phases
 
 #### Phase 1: Layout and channel evaluator
-**Status:** DONE — local implementation, proof and gates complete; independent AC-2 is tracked below
+**Status:** DONE — implementation complete; historical proof above, current verification pending
 **Files:** new evaluator inside `src/unreal/cue4parse-adapter.ts` (the C# program is embedded there); `tests/unreal-sequencer-channels.test.ts`.
 **Implementation:** Expand the sparse checkout with the paths in Context. Record the layout facts under Decisions. Implement channel evaluation and the Euler-to-quaternion step. Find the AC-2 reference pair (owner's library via `fab_list_owned`).
 **Verification:** AC-3.
 
 #### Phase 2: Converter and importer route
-**Status:** DONE — local implementation, proof and gates complete; independent AC-2 is tracked below
+**Status:** DONE — implementation complete; historical proof above, current verification pending
 **Files:** `src/unreal/cue4parse-adapter.ts` (`ExportClip`, `UnsupportedReason`), `src/unreal/importer.ts` (version), `tests/helpers/animation-corpus.ts` (invert the ControlRig assertion, add the differential gate).
 **Implementation:** Route a Sequencer-model clip through the evaluator into `RawAnimationData`. Keep the sidecar. Bump versions.
-**Verification:** AC-1 and AC-4 passed; AC-2 remains owner-blocked.
+**Verification:** AC-1 and AC-4 passed; AC-2 current-tag replay is pending.
 
 #### Phase 3: Evidence and ledger
-**Status:** DONE — local implementation, proof and gates complete; independent AC-2 is tracked below
+**Status:** DONE — implementation complete; historical proof above, current verification pending
 **Files:** `docs/unreal-format-support.md`, `README.md` import table.
-**Implementation:** Sheets, ledger row, and README are updated with importer/converter provenance and local proof paths; formal corpus replay, PR attachment, and final gates passed.
-**Verification:** AC-5, AC-6.
+**Implementation:** Sheets, ledger row, and README are updated with importer/converter provenance and local proof paths; historical corpus replay, PR attachment, and `.584.6.4` gates passed; current-head gates remain pending.
+**Verification:** AC-5 historical attachment recorded; AC-6 current-head gates pending.
 
-## AC-2 reference recovery follow-up
+## Closure decision
 
-User explicitly requested resolving the blocker before publishing and reinstalling the engine dependency. Complexity2 (LOW) for bounded reference acquisition/verification; no importer behavior change planned unless the independent differential exposes a defect.
-
-1. Recover an independent reference for the exact selected clip, skeleton and frame rate. A normal editor save contains no fallback compressed stream: read-only probes of all334 selected sequences found zero RawAnimationData and bSerializeCompressedData=false, consistent with official AnimSequence serialization.
-2. Attempt a reduced, matching UE5.8.3 runtime from the original official Linux archive, using metadata/range selection before any large download. The existing partial install lacks117 engine modules; this does not establish that a full install is necessary. The previous signed archive URL has expired. Browser attempts reached an account/challenge boundary and are stopped; investigate only the intended authenticated download API using existing authorized Epic access. Never bypass a challenge or invent independent evidence.
-3. Run the existing independent differential on actual Unreal-exported poses, requiring at most0.5degrees perbone perframe and verified clip/skeleton/rate identity. Keep AC2 unchecked until it passes. Record provenance locally; never commit licensed runtime/modules/assets or credentials.
-4. Once AC2 passes, integrate current main without discarding merged mesh/WorldPartition/landscape fixes, bump converter/importer provenance, run current-head verification, merge PR49, then publish the completed package and update the engine dependency in a separate PR to develop. User authorized skipping CI only for that dependency-only engine PR.
-
-Operational diagnostics remain in the existing local run dump; no independent accuracy result is claimed yet.
-
-
-### Confirmed reference-access boundary (2026-10-13 UTC)
-
-The existing FabCLI secure session restores successfully and its OAuth exchange returns200.
-The intended Epic client had two local protocol defects: an obsolete CSRF endpoint and selection
-of the first of two same-name XSRF cookies. A private diagnostic helper now uses the current
-CSRF endpoint and final cookie value; web exchange200, redirect200 and set-sid204 succeed.
-Unreal cosmos/auth returns200 with bearerTokenValid=false, upgradedBearerToken=false and
-clearedOffline=true. Following Epic Asset Manager's actual next step, the protected, read-only
-EULA check returns401 Unauthorized. No terms were accepted and no credentials were exported.
-The exact server-side reason for the Unreal session rejection is unknown; this does not prove
-that the working FabCLI session has expired.
-
-Smallest owner input to resume: obtain a fresh official Linux_Unreal_Engine_5.8.3.zip download
-link from the signed-in Unreal Linux download page. The link is temporary access data; keep it
-private and never paste it into a PR. With access, first inspect ZIP metadata and the required
-runtime closure, then fetch only the modules needed for a headless independent pose export.
-The full39.8GB archive is not required in advance. An independently exported matching PSA
-remains an alternative. AC2 is still unchecked; PR49 merge, package publish and the engine
-pin/merge remain pending that comparison.
-
-
-### Local Unreal reference recovered (2026-10-13 UTC)
-
-The owner supplied the official Linux5.8.3 archive. A selective6.2GiB runtime now starts
-headlessly and exports raw local poses through Unreal AnimPoseExtensions. Seven selected
-clips,101 frame samples and39,109 bone-frame poses are recorded privately with archive,
-executable, source package and skeleton digests. The download401 is historical; fresh
-browser access is no longer needed.
-
-A test-only JSON reference validator and real differential gate now verify those identities,
-frame rates, complete sample arrays and the fixed Unreal-to-glTF coordinate reflection.
-Focused guards and typecheck pass. The first real comparison is red: the raw reference
-exports additive deltas while standalone glTF clips use full poses; generated virtual bones
-also need explicit source-backed comparison scope. One clip appears in two GLBs, rather
-than being absent. The non-additive ragdoll's91 compared serialized bones match within
-0.000056degrees, but this is not sufficient to mark AC2 complete. Preserve the original
-oracle unchanged and obtain a separate official full-pose evaluation before deciding whether
-an importer repair is necessary. AC2 remains unchecked pending that actual comparison.
+Prepared, not complete: the independent-reference owner blocker is resolved and frozen-build
+AC-2 passes. Observe the fresh `.584.10.1` / importer123 differential before checking AC-2
+and moving this original PRD to `docs/PRDs/done/`. Keep AC-6 pending until the parent records
+the actual final gates. No source, test or package edits are part of this documentation closure.
