@@ -68,7 +68,7 @@ prefab's world bounds, and the import's `sizeMeters` must match them.
 - [ ] AC-6 [local]: The PR comment embeds the `U1`–`U3` sheets per the epic's PR evidence rule (reference | before |
   after, with scores). Before and after are the same importer, so the judge must report no change on the shared
   pieces, and the new value is the reference column and the size check. proof: PR screenshot comment — Evidence: pending.
-  NOT MET: no PR comment was posted (sheets stay under `~/.cache/threenative-asset-mcp/unity-parity-*`). Also open: the sheet writes
+  PARTLY MET: the PR comment was posted, https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/63#issuecomment-6198151490, with the U1-U3 sheets and scores. Still open: the sheet writes
   reference | after only. The before score is measured with `--level models` (model GLBs, which carry no `.mat` binding: `U1` 28.9, `U3` 28.8), not as a column.
 
 ## Blocked on

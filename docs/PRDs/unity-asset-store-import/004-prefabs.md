@@ -1,6 +1,6 @@
 # PRD-618 — Unity prefabs to GLB scenes
 
-**Status:** IN PROGRESS (AC-1..AC-5 done; AC-6 partly met and AC-7 not met, 2026-10-15)
+**Status:** IN PROGRESS (AC-1..AC-5 done; AC-6 partly met, AC-7 met 2026-10-15)
 **Priority:** P2 — Asset Store packs are used through their prefabs, and AC-1..AC-6 do not exist yet.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new prefab resolver (+2), complex reference state (+2); risk override: none
 **Owner:** João
@@ -45,9 +45,9 @@ references in the report.
 - [ ] AC-6 [local]: On `U1`–`U3`, every prefab gives one GLB (`U3`: 1006 in, 1006 out; the listing says 458, the file holds 505 Built-in and 501 URP prefab documents) or a reported reason. Each
   prefab's size matches its `R1` bounds within 1 % where `R1` exists, and the sweep passes
   `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: PARTLY MET, NOT TICKED. `npm run parity:unity -- --ids U1,U2 --max 40` and `--ids U3 --max 60` (importer 7, 2026-10-15). Met: every prefab gives a GLB or a reason (`U1` 31/31, `U2` 17/17, `U3` 1006/1006, 0 failed); 14 `U3` prefabs hold no mesh (cameras, particle systems) and still give a node-only GLB; 8 mesh references of two `U3` prefabs stay unresolved with a reason (a Maya mesh that Unity splits into numbered `..._MeshPart` parts). Not met: the `R1` size clause cannot run (no `R1` exists), and the `check` pass is weak evidence because the baseline was written from the same sweep it checks, so it can only show that numbers did not fall since. Defects found on the real packs and fixed, each with a red-to-green test in `tests/unity-prefab.test.ts`: the 64-bit mesh ids of real Unity 2022 prefabs are in no table (matched by GameObject name, UNVERIFIED warning), the Blender-FBX node (scale 100, turn -90 about X) was applied twice (a car 397 m long), a Maya node away from its pivot put parts 12 m apart, and the Unity 5 `Prefab` container document was reported as 502 unresolved instances.
-- [ ] AC-7 [local]: The PR comment embeds sheets per the epic's PR evidence rule. Before is the model-level import
+- [x] AC-7 [local]: The PR comment embeds sheets per the epic's PR evidence rule. Before is the model-level import
   from PRD-616, and after is the prefab import, on a slice that covers multi-part prefabs (`U1`), per-slot
-  material overrides (`U2`) and modular pieces (`U3`). Each piece is checked by eye. proof: PR screenshot comment — Evidence: pending. NOT MET: sheets exist locally for the slices of `U1` (31 prefabs, all multi-node) and `U3` (36 prefabs; 334 of its prefabs have more than one mesh node), none was posted. `U2` has no reference picture, so its sheet shows our renders only (van, cars, motorcycle, seat and engine look right by eye).
+  material overrides (`U2`) and modular pieces (`U3`). Each piece is checked by eye. proof: PR screenshot comment — Evidence: https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/63#issuecomment-6198151490 (U1 before and after, U2 after, U3 before and after, each checked by eye; U2 has no reference picture, so its sheet shows our renders only: van, cars, motorcycle, seat and engine look right by eye; 2026-10-15).
 
 ## Integration Ledger
 
