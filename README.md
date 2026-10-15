@@ -6,11 +6,12 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) server that lets AI clients find, inspect and
 download game-ready 3D assets, textures, HDRIs, animations and audio. It gives each provider structured
-search, metadata and guarded downloads, and it converts owned Unreal/Fab packs to GLB.
+search, metadata and guarded downloads, and it converts owned Unreal/Fab packs and Unity Asset Store packages to GLB.
 
 > **Status: experimental.** Fab's `/i/*` JSON routes are undocumented and can change or restrict automated
 > access. Sketchfab licenses vary per model. Review each provider's terms and each asset's license.
-> Unreal support covers specific formats and verified cases; it does not certify whole packs.
+> Unreal and Unity support cover specific formats and verified cases; they do not certify whole packs.
+> Unity imports are verified on three real packs; real Unity Editor reference renders are not yet available.
 > Blendkit is optional and needs documented provider permission. Live Blendkit downloads remain **UNVERIFIED**.
 
 ## Contents
@@ -23,6 +24,7 @@ search, metadata and guarded downloads, and it converts owned Unreal/Fab packs t
 | Import an Unreal / Fab pack as GLB | [docs/unreal-import.md](docs/unreal-import.md) |
 | Import a Unity Asset Store package as GLB | [docs/unity-import.md](docs/unity-import.md) |
 | Check which Unreal formats work | [docs/unreal-format-support.md](docs/unreal-format-support.md) |
+| Check which Unity formats work | [docs/unity-format-support.md](docs/unity-format-support.md) |
 | Load imported assets in Three.js | [docs/unreal-threejs-usage.md](docs/unreal-threejs-usage.md) |
 | Read what each importer version changed | [docs/unreal-importer-history.md](docs/unreal-importer-history.md) |
 | Set environment variables | [docs/configuration.md](docs/configuration.md) |
@@ -56,6 +58,8 @@ making license or price claims. More in [docs/providers.md](docs/providers.md).
 - FFmpeg and FFprobe on `PATH` for the audio tools
 - Unreal imports on Linux also need build packages for older packs. Run `npm run doctor` for the list.
   See [docs/unreal-import.md](docs/unreal-import.md).
+- Unity imports need Blender 4.5 LTS to read FBX models. The MCP downloads a pinned copy into its toolchain cache on first use.
+  See [docs/unity-import.md](docs/unity-import.md).
 
 No Epic or Fab login is needed for search and free downloads. The MCP never signs in for you.
 
@@ -144,6 +148,16 @@ their own directories, and never purchase, sign in or overwrite. Full list: [doc
 self-contained GLBs plus an `import-report.json`. Unreal Engine is not required. The importer reports what it
 could not convert instead of claiming a full conversion. Setup, login and output types:
 [docs/unreal-import.md](docs/unreal-import.md). Per-class status: [docs/unreal-format-support.md](docs/unreal-format-support.md).
+
+## Unity Asset Store import
+
+`asset_import_unity` turns a `.unitypackage`, a UPM tarball or a Unity project folder you already have into
+self-contained GLBs (one per model, plus one per prefab with its materials bound) and an `import-report.json`.
+`unity_list_packages` lists the packages your Unity Editor cached. `fab_import_asset` hands a Unity-format Fab
+artifact to the same importer when FabCLI exposes it. The MCP never signs in to Unity, never calls Unity
+services and never decrypts a download. Unity is not required. The importer reports what it could not convert,
+such as custom shaders, which keep their saved colour and base texture. Setup and output:
+[docs/unity-import.md](docs/unity-import.md). Per-class status: [docs/unity-format-support.md](docs/unity-format-support.md).
 
 ## Privacy
 
