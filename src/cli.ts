@@ -113,6 +113,16 @@ export async function runImportCli(
   if (flags.json) {
     return { exitCode: 0, stdout: `${JSON.stringify(summary, null, 2)}\n`, stderr: "" };
   }
+  if ("importerVersion" in summary) {
+    // A Unity-only Fab listing took the Unity route.
+    const unity = [
+      `Imported ${summary.counts.models} Unity models and ${summary.counts.textures} textures into ${relative(process.cwd(), resolve(summary.outputDir)) || "."}`,
+      `Materials: ${summary.materials} (${summary.counts.fallbackMaterials} fallback)`,
+      `Skipped ${summary.counts.skipped}, failed ${summary.counts.failed}. Report: ${summary.reportPath}`,
+      ...summary.warnings.map((warning) => `warning: ${warning}`),
+    ];
+    return { exitCode: 0, stdout: `${unity.join("\n")}\n`, stderr: "" };
+  }
   const lines = [
     `Imported ${summary.counts.exported} meshes, ${summary.counts.cubemaps} cubemaps, ${summary.counts.textureStacks} texture stacks, ${summary.counts.dataTextures} RGBA16F data textures, ${summary.counts.fonts} web fonts, ${summary.counts.bitmapFonts} bitmap fonts, ${summary.counts.sprites} sprites, ${summary.counts.flipbooks} flipbooks, ${summary.counts.dataAssets} data assets, and ${summary.counts.scenes} scenes into ${relative(process.cwd(), resolve(summary.outputDir)) || "."}`,
     `Materials: ${summary.materials} (${summary.materialCoverage.textured}/${summary.materialCoverage.sections} sections textured, ${summary.materialCoverage.exact} exact, ${summary.materialCoverage.heuristic} heuristic, ${summary.materialCoverage.unsupported} unsupported)`,

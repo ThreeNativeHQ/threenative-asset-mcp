@@ -5,14 +5,19 @@ import { join, resolve } from "node:path";
 import { z } from "zod";
 
 import { FabClient } from "../fab/client.js";
-import { FabCli, FabCliError, preferredPlatform } from "../fab/fabcli.js";
+import { FabCli, FabCliError, type FabFormats, type FabUnityFormat, preferredPlatform } from "../fab/fabcli.js";
 import { decoderRoute, oldestEngine } from "../fab/routes.js";
 import { classifyLicenses, type LicenseDecision } from "../fab/license.js";
 import { normalizeListing } from "../fab/normalize.js";
 import { ImportError, type ImportReport, importUnrealDirectory } from "../unreal/importer.js";
 import type { ResolveMaterialRequest } from "../unreal/materials.js";
 import { ToolchainError } from "../unreal/toolchain.js";
+import { UnityImportError } from "../unity/errors.js";
+import { importUnityPackage } from "../unity/importer.js";
+import { UnityPackageError } from "../unity/package.js";
 import { parseListingId } from "./get-asset.js";
+import { importFabUnity, unityArtifactId } from "./import-fab-unity.js";
+import { AssetImportUnityOutputSchema } from "./import-unity.js";
 
 const SizeMetersSchema = z.object({
   x: z.number().nonnegative(),
@@ -291,12 +296,20 @@ export const FabImportAssetInputSchema = z.object({
     .regex(/^[A-Za-z0-9_]{1,32}$/)
     .optional()
     .describe("Platform build to download when the artifact publishes several, for example Windows."),
+  format: z
+    .enum(["unreal", "unity"])
+    .optional()
+    .describe(
+      "Which artifact to import. Omit to take the Unreal artifact, or the Unity one when the listing publishes only Unity. \"unity\" imports the listing's .unitypackage through the Unity importer (the result then has the asset_import_unity shape; `packages` names the models to convert). The Unity route can only run when FabCLI reports the Unity artifact's catalog coordinates; otherwise it stops with FABCLI_UNITY_DOWNLOAD_UNAVAILABLE and explains the manual route.",
+    ),
   acceptFabEula: z.literal(true).describe(
     "Required acknowledgement that the user accepts the Fab EULA for the listing they already own.",
   ),
 });
 
 export const ImportUnrealOutputSchema = SummarySchema;
+/** `fab_import_asset` returns the Unreal summary, or the Unity one when it took the Unity route. */
+export const FabImportOutputSchema = z.union([SummarySchema, AssetImportUnityOutputSchema]);
 
 export function summarize(report: ImportReport, outputDir: string): ImportSummary {
   return SummarySchema.parse({
@@ -452,6 +465,10 @@ function errorResult(error: unknown) {
   const safe =
     error instanceof ImportError || error instanceof ToolchainError || error instanceof FabCliError
       ? { code: error.code, message: error.message, retryable: error.retryable }
+      : error instanceof UnityImportError
+        ? { code: error.code, message: error.message, retryable: error.retryable }
+        : error instanceof UnityPackageError
+          ? { code: error.code, message: error.message, retryable: false }
       : error instanceof z.ZodError
         ? {
             code: "UNREAL_IMPORT_INVALID_INPUT",
@@ -473,6 +490,8 @@ export interface ImportUnrealDependencies {
   readonly environment?: NodeJS.ProcessEnv;
   readonly log?: (message: string) => void;
   readonly importDirectory?: typeof importUnrealDirectory;
+  /** Injected in tests; the Unity route of `fab_import_asset`. */
+  readonly importUnity?: typeof importUnityPackage;
   readonly fabCli?: FabCli;
   /** Injected in tests; production reads the listing's published licences from Fab. */
   readonly readLicenses?: (listingId: string) => Promise<readonly string[]>;
@@ -593,6 +612,27 @@ export function fabDownloadRoot(environment: NodeJS.ProcessEnv = process.env): s
 }
 
 /**
+ * True when `fab_import_asset` takes the Unity route: the caller asked for `unity`, or the listing
+ * publishes Unity and no Unreal artifact. A listing with both stays on the Unreal route unless asked.
+ */
+function chooseUnity(
+  format: "unreal" | "unity" | undefined,
+  formats: FabFormats,
+  listingId: string,
+): boolean {
+  if (format === "unity") {
+    if (formats.unity === undefined) {
+      throw new FabCliError(
+        "FABCLI_NO_UNITY_FORMAT",
+        `Listing ${listingId} publishes no Unity artifact.`,
+      );
+    }
+    return true;
+  }
+  return format === undefined && formats.unreal.length === 0 && formats.unity !== undefined;
+}
+
+/**
  * The composed Fab flow: verify the session the user already established, resolve which Unreal
  * artifact the engine selector names, download it into an MCP-owned staging directory outside the
  * game, and hand that directory to the same importer a local pack takes. No step here logs in,
@@ -619,7 +659,29 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
       const tool = await fabCli.tool();
       await fabCli.requireAuthenticatedSession();
 
-      const versions = await fabCli.unrealVersions(listingId);
+      const formats = await fabCli.formats(listingId);
+      if (chooseUnity(input.format, formats, listingId)) {
+        const output = await importFabUnity({
+          fabCli,
+          listingId,
+          unity: formats.unity!,
+          requestedArtifactId: input.artifactId,
+          platform: input.platform,
+          outputDir: input.outputDir,
+          assets: input.packages,
+          maxTextureSize: input.maxTextureSize,
+          downloadRoot: fabDownloadRoot(environment),
+          license,
+          runImport: dependencies.importUnity ?? importUnityPackage,
+          environment,
+          log,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(output) }],
+          structuredContent: output,
+        };
+      }
+      const versions = FabCli.requireUnreal(listingId, formats);
       const { version: selected, reason: choiceReason } = FabCli.selectVersion(
         versions,
         input.engine,
@@ -733,6 +795,7 @@ const OwnedListingSchema = z.object({
   categories: z.array(z.string().max(120)).max(20),
   distributionMethod: z.string().max(60),
   hasUnrealArtifact: z.boolean(),
+  hasUnityArtifact: z.boolean(),
   engineVersions: z.array(z.string().max(20)).max(60),
   artifacts: z
     .array(
@@ -740,13 +803,21 @@ const OwnedListingSchema = z.object({
         artifactId: z.string().max(200),
         engineVersions: z.array(z.string().max(20)).max(60),
         oldestEngine: z.string().max(20).optional(),
-        route: z.enum(["umodel", "mesh-description", "cue4parse"]).optional(),
+        route: z.enum(["umodel", "mesh-description", "cue4parse", "unity"]).optional(),
         targetPlatforms: z.array(z.string().max(60)).max(40),
+        unity: z
+          .object({
+            extensions: z.array(z.string().max(20)).max(10),
+            renderPipelines: z.array(z.string().max(60)).max(20),
+            unityAssetStoreUrl: z.string().max(1_000).optional(),
+            isInUnityAssetStore: z.boolean().optional(),
+          })
+          .optional(),
       }),
     )
-    .max(60)
+    .max(61)
     .describe(
-      "Each Unreal artifact separately. An artifact's format is its oldest listed engine, which picks the decoder route.",
+      "Each artifact separately. An Unreal artifact's format is its oldest listed engine, which picks the decoder route. A Unity-format artifact has route `unity` and a `unity` block; its artifactId is `unity` because FabCLI lists no id for it.",
     ),
 });
 
@@ -762,14 +833,17 @@ export const FabListOwnedInputSchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "Keep only what fab_import_asset can actually take: a listing UID plus a published Unreal artifact. Drops the engine installs and code plugins a library also contains.",
+      "Keep only what fab_import_asset can take through the Unreal route: a listing UID plus a published Unreal artifact. Drops the engine installs and code plugins a library also contains, and hides Unity-format artifacts (it also skips the per-listing `fabcli formats` lookups that find them).",
     ),
 });
 
 export const FabListOwnedOutputSchema = z.object({
   listings: z.array(OwnedListingSchema).max(500),
   total: z.number().int().nonnegative(),
+  warnings: z.array(z.string().max(500)).max(50).optional(),
 });
+
+const UNITY_PROBE_CONCURRENCY = 4;
 
 /**
  * What the signed-in Fab account already owns.
@@ -790,43 +864,93 @@ export function createFabListOwnedHandler(dependencies: ImportUnrealDependencies
       await fabCli.requireAuthenticatedSession();
       const owned = await fabCli.ownedListings();
       const needle = input.query?.toLowerCase();
-      const matched = owned
-        .filter((entry) => {
-          // A library also holds engine installs and code plugins. They carry no listing UID, or
-          // no Unreal artifact, and the importer can do nothing with either — offering them as
-          // candidates would send an agent down a dead end.
-          if (input.unrealOnly && (entry.listingId === undefined || entry.unrealArtifacts.length === 0)) {
-            return false;
+      const kept = owned.filter((entry) => {
+        // A library also holds engine installs and code plugins. They carry no listing UID, or
+        // no Unreal artifact, and the importer can do nothing with either — offering them as
+        // candidates would send an agent down a dead end.
+        if (input.unrealOnly && (entry.listingId === undefined || entry.unrealArtifacts.length === 0)) {
+          return false;
+        }
+        if (needle === undefined) return true;
+        return (
+          entry.title.toLowerCase().includes(needle) ||
+          entry.categories.some((category) => category.toLowerCase().includes(needle))
+        );
+      });
+      // `fabcli library` lists Unreal artifacts only; a Unity-format artifact shows up in `fabcli
+      // formats <listing>` and nowhere else, so each shown listing costs one lookup. A lookup that
+      // fails hides that listing's Unity artifact and says so; it never fails the listing.
+      const shown = kept.slice(0, 500);
+      const unityOf = new Map<number, FabUnityFormat>();
+      const warnings: string[] = [];
+      if (!input.unrealOnly) {
+        let next = 0;
+        const worker = async () => {
+          for (let index = next++; index < shown.length; index = next++) {
+            const listingId = shown[index]?.listingId;
+            if (listingId === undefined) continue;
+            try {
+              const { unity } = await fabCli.formats(listingId);
+              if (unity) unityOf.set(index, unity);
+            } catch (error) {
+              warnings.push(
+                `Could not read the formats of listing ${listingId} (${error instanceof Error ? error.message.slice(0, 200) : "lookup failed"}); a Unity artifact would not show.`,
+              );
+            }
           }
-          if (needle === undefined) return true;
-          return (
-            entry.title.toLowerCase().includes(needle) ||
-            entry.categories.some((category) => category.toLowerCase().includes(needle))
-          );
-        })
-        .map((entry) => ({
+        };
+        await Promise.all(Array.from({ length: UNITY_PROBE_CONCURRENCY }, worker));
+      }
+      const matched = shown.map((entry, index) => {
+        const unity = unityOf.get(index);
+        return {
           ...(entry.listingId === undefined ? {} : { listingId: entry.listingId }),
           title: entry.title,
           url: entry.url,
           categories: entry.categories,
           distributionMethod: entry.distributionMethod,
           hasUnrealArtifact: entry.unrealArtifacts.length > 0,
+          hasUnityArtifact: unity !== undefined,
           engineVersions: [
             ...new Set(entry.unrealArtifacts.flatMap((artifact) => artifact.engineVersions)),
           ],
-          artifacts: entry.unrealArtifacts.map((artifact) => {
-            const oldest = oldestEngine(artifact.engineVersions);
-            return {
-              artifactId: artifact.artifactId,
-              engineVersions: artifact.engineVersions,
-              ...(oldest === undefined ? {} : { oldestEngine: oldest, route: decoderRoute(oldest) }),
-              targetPlatforms: artifact.targetPlatforms,
-            };
-          }),
-        }));
+          artifacts: [
+            ...entry.unrealArtifacts.map((artifact) => {
+              const oldest = oldestEngine(artifact.engineVersions);
+              return {
+                artifactId: artifact.artifactId,
+                engineVersions: artifact.engineVersions,
+                ...(oldest === undefined ? {} : { oldestEngine: oldest, route: decoderRoute(oldest) }),
+                targetPlatforms: artifact.targetPlatforms,
+              };
+            }),
+            ...(unity === undefined
+              ? []
+              : [
+                  {
+                    artifactId: unityArtifactId(unity),
+                    engineVersions: [],
+                    route: "unity" as const,
+                    targetPlatforms: [],
+                    unity: {
+                      extensions: [...unity.extensions],
+                      renderPipelines: [...unity.renderPipelines],
+                      ...(unity.unityAssetStoreUrl === undefined
+                        ? {}
+                        : { unityAssetStoreUrl: unity.unityAssetStoreUrl }),
+                      ...(unity.isInUnityAssetStore === undefined
+                        ? {}
+                        : { isInUnityAssetStore: unity.isInUnityAssetStore }),
+                    },
+                  },
+                ]),
+          ],
+        };
+      });
       const output = FabListOwnedOutputSchema.parse({
-        listings: matched.slice(0, 500),
-        total: matched.length,
+        listings: matched,
+        total: kept.length,
+        ...(warnings.length === 0 ? {} : { warnings: warnings.slice(0, 50) }),
       });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(output) }],

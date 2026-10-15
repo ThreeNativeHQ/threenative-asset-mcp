@@ -463,6 +463,7 @@ describe("Fab import safety", () => {
       acceptFabEula: true,
     });
     if ("isError" in result) throw new Error(JSON.stringify(errorOf(result)));
+    if ("importerVersion" in result.structuredContent) throw new Error("took the Unity route");
     expect(result.structuredContent.counts.exported).toBe(1);
     expect(result.structuredContent.license).toMatchObject({
       verdict: "allowed",
