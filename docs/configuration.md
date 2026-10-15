@@ -39,6 +39,7 @@ Environment variables read by the server.
 | `BLENDKIT_PROVIDER_PERMISSION`  | unset                                              | Citation of documented Blendkit permission for this use. Unset keeps live Blendkit search and import off. |
 | `BLENDKIT_API_KEY`              | unset                                              | **Your own** key from the official Blendkit sign-in; sent only to the loopback Client, never logged or returned. |
 | `BLENDKIT_BLENDER_PATH`         | Client-stored Blender                              | Absolute path to the Blender that runs the `export_glb` recipe. |
+| `ASSETSTORE_CACHE_PATH`         | OS default (Linux `~/.local/share/unity3d/Asset Store-5.x`) | Where `unity_list_packages` looks for the Unity Editor's cached `.unitypackage` files. Local reads only. |
 | `THREENATIVE_TOOLCHAIN_AUTOINSTALL` | `1`                                            | Set to `0` to disable first-use external-tool installs.  |
 | `THREENATIVE_TOOLCHAIN_DIR`     | OS cache under `threenative-asset-mcp/toolchain`   | UE Viewer, FabCLI, and uncooked-converter cache.          |
 | `THREENATIVE_UMODEL_PATH`       | auto-detected/provisioned                           | Absolute path to a UE Viewer executable override.        |

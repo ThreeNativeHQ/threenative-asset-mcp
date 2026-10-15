@@ -37,6 +37,17 @@ Fab:
   FabCLI session, then runs the same Unreal importer. It never signs in, claims,
   or purchases an asset.
 
+Unity (the user's own Unity Editor cache; see
+[docs/unity-format-support.md](unity-format-support.md)):
+
+- `unity_list_packages` — lists the `.unitypackage` files the Unity Editor cached
+  under `ASSETSTORE_CACHE_PATH`, or the OS default
+  (`~/.local/share/unity3d/Asset Store-5.x` on Linux), with publisher, category,
+  name, size and modification time. It reads local files only and never contacts
+  or signs in to Unity. An empty or missing cache returns an empty list. The
+  intake that opens a package (`.unitypackage`, UPM tarball or project folder)
+  lives in `src/unity/package.ts`; `asset_import_unity` (PRD-616) is its consumer.
+
 Blendkit (through the user's own official Blendkit-Client; see
 [docs/blendkit-integration.md](blendkit-integration.md)):
 

@@ -167,6 +167,11 @@ import {
   createBundleListEntriesHandler,
 } from "./tools/bundle.js";
 import {
+  UnityListPackagesInputSchema,
+  UnityListPackagesOutputSchema,
+  createUnityListPackagesHandler,
+} from "./tools/unity-packages.js";
+import {
   AssetImportUnrealInputSchema,
   createAssetImportUnrealHandler,
   createFabImportAssetHandler,
@@ -588,6 +593,24 @@ export function createAssetServer(
       },
     },
     createFabImportAssetHandler(),
+  );
+
+  server.registerTool(
+    "unity_list_packages",
+    {
+      title: "List cached Unity Asset Store packages",
+      description:
+        "List the .unitypackage files the user's own Unity Editor has cached (ASSETSTORE_CACHE_PATH, else the OS default such as ~/.local/share/unity3d/Asset Store-5.x), with publisher, category, name, size and modification time. Reads local files only: it never contacts or signs in to Unity, and an empty or missing cache returns an empty list.",
+      inputSchema: UnityListPackagesInputSchema,
+      outputSchema: UnityListPackagesOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createUnityListPackagesHandler(),
   );
 
   server.registerTool(
