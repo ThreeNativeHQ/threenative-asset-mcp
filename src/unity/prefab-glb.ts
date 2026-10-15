@@ -122,7 +122,7 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
   const warnings: string[] = [];
   const sources = new Map<string, Source | null>();
   const materials = new Map<string, Material | null>();
-  const variants = new Map<string, Mesh>();
+  const variants = new Map<string, { mesh: Mesh; bound: number }>();
   let meshNodes = 0;
   let boundSlots = 0;
   const boundMaterials = new Set<string>();
@@ -227,7 +227,8 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
       warnings.push(`${item.path}: the MeshRenderer has ${item.slots.length} material slot(s) and the model mesh ${primitives.length} part(s)`);
     }
     const key = `${reference.model.guid}|${base.getName()}|${primitives.length}|${item.slots.map((slot) => slot?.guid ?? "-").join(",")}`;
-    let mesh = item.slots.some((slot) => slot !== undefined) ? variants.get(key) : base;
+    const shared = item.slots.some((slot) => slot !== undefined) ? variants.get(key) : { mesh: base, bound: 0 };
+    let { mesh, bound } = shared ?? { mesh: undefined, bound: 0 };
     if (!mesh) {
       mesh = document.createMesh(base.getName());
       for (const [index, primitive] of primitives.entries()) {
@@ -236,13 +237,14 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
         const override = slot ? await materialFor(slot, item.path) : undefined;
         if (override) {
           copy.setMaterial(override);
-          boundSlots += 1;
+          bound += 1;
           boundMaterials.add(slot!.path);
         }
         mesh.addPrimitive(copy);
       }
-      variants.set(key, mesh);
+      variants.set(key, { mesh, bound });
     }
+    boundSlots += bound;
     meshNodes += 1;
     // The frame is the mesh's place in Unity's space (see `fbxMeshFrame`); other model kinds keep their node chain, turned half about Y.
     const fbxFrame = host.meshFrame(reference.model);

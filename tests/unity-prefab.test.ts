@@ -638,6 +638,31 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(stranger.unresolved).toEqual([expect.objectContaining({ kind: "mesh", reason: expect.stringMatching(/no mesh id matches/) })]);
   }, 180_000);
 
+  it("meshes: every mesh node counts its bound slots, also when two nodes share one material variant", async () => {
+    const red = asset("Assets/Mats/red.mat", 2100000, 2);
+    const { report } = await importProject([
+      ...folders("Assets", "Assets/A", "Assets/Mats", "Assets/Prefabs"),
+      { path: "Assets/A/parts.fbx", data: parts, importer: importerWith(nameTable({ 4300000: "Body", 4300002: "Wheel" })) },
+      { path: "Assets/Mats/red.mat", content: std("red", [1, 0, 0]) },
+      {
+        path: "Assets/Prefabs/wheels.prefab",
+        content: prefabFile(
+          gameObject(10, "Root", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "WheelA", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/A/parts.fbx", 4300002)),
+          meshRenderer(23, 20, [red]),
+          gameObject(30, "WheelB", { components: [31, 32, 33] }),
+          transform(31, 30, { father: 11, position: [1, 0, 0] }),
+          meshFilter(32, 30, asset("Assets/A/parts.fbx", 4300002)),
+          meshRenderer(33, 30, [red]),
+        ),
+      },
+    ]);
+    expect(prefabOf(report, "Assets/Prefabs/wheels.prefab").boundSlots).toBe(2);
+  }, 180_000);
+
   it("meshes: an ancestor's name does not pick a child's mesh (a `Body` root must not give its `Door` child the Body mesh)", async () => {
     const { report } = await importProject([
       ...folders("Assets", "Assets/C", "Assets/Prefabs"),
