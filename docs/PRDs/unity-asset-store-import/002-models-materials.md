@@ -60,7 +60,7 @@ returns `SummarySchema`.
 - [x] AC-6 [local]: The FBX's embedded material slots bind to the `.mat` files named by `externalObjects`, and
   otherwise by name search, with the binding source recorded. proof: `npx vitest run tests/unity-models.test.ts -t slots` — Evidence: `npx vitest run tests/unity-models.test.ts -t slots` — 2 passed. 2026-10-14.
 - [x] AC-7 [local]: TGA, PSD and TIF textures decode, normal maps load as linear, `maxTextureSize` is applied, and
-  `convertToNormalMap` is reported as unsupported. proof: `npx vitest run tests/unity-textures.test.ts` — Evidence: `npx vitest run tests/unity-textures.test.ts` — 13 passed. `sharp` 0.35.4 cannot read TGA or PSD (checked), so TGA has its own decoder and PSD uses `ag-psd` 31.0.3. 2026-10-14.
+  `convertToNormalMap` was reported as unsupported (PRD-620 FR-T1 now converts it). proof: `npx vitest run tests/unity-textures.test.ts` — Evidence: `npx vitest run tests/unity-textures.test.ts` — 13 passed. `sharp` 0.35.4 cannot read TGA or PSD (checked), so TGA has its own decoder and PSD uses `ag-psd` 31.0.3. 2026-10-14.
 - [x] AC-8 [local]: Through the packed MCP, `asset_import_unity` refuses a call without `acceptUnityAssetStoreEula`
   and imports the synthetic package with one. proof: `npx vitest run tests/mcp-smoke.test.ts` — Evidence: `npx vitest run tests/mcp-smoke.test.ts` — 17 passed, including the refusal without `acceptUnityAssetStoreEula` and the import with it. 2026-10-14.
 - [ ] AC-9 [local]: Real-pack evidence per the epic's PR evidence rule. The slice is `U1` (Standard) plus the same

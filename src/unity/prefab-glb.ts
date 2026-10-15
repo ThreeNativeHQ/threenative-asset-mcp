@@ -183,17 +183,17 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
     const byMeshName = candidates.flatMap((candidate) => [{ ...candidate }, { ...candidate, name: candidate.mesh.getName() }]);
     const found =
       (reference.name !== undefined ? byMeshName.find((candidate) => candidate.name === reference.name) : undefined) ??
-      (reference.name === undefined ? byMeshName.find((candidate) => derivedMeshFileId(candidate.name) === reference.ref.fileID) : undefined);
+      (reference.name === undefined ? byMeshName.find((candidate) => [0, 1, 2, 3].some((counter) => derivedMeshFileId(candidate.name, counter) === reference.ref.fileID)) : undefined);
     if (found) return found;
     if (reference.name === undefined) {
-      // Real packs (Unity 2022, empty `internalIDToNameTable`) use 64-bit ids that the derived-id route does not reproduce.
+      // A 64-bit id that no table lists and no mesh name derives to (a mesh renamed by the exporter or by the model's own import settings).
       // The prefab then names its mesh by the GameObject itself, or, when the prefab has no other mesh to mix up, by its root
       // (U2: `SM_x` > `Model` holds the mesh called `SM_x`). An ancestor's name must not pick a child's mesh (a `Car` body for a `Door`).
       const segments = node.split("/");
       for (const segment of new Set([segments[segments.length - 1]!, ...(meshBearing === 1 ? [segments[0]!] : [])])) {
         const named = candidates.filter((candidate) => candidate.name === segment || candidate.mesh.getName() === segment);
         if (named.length === 1) {
-          warnings.push(`${node}: mesh ${reference.ref.fileID} is not in any table of ${reference.model.path}; matched the mesh named "${segment}" by the GameObject name (UNVERIFIED)`);
+          warnings.push(`${node}: mesh ${reference.ref.fileID} is not in any table of ${reference.model.path} and matches no derived id; matched the mesh named "${segment}" by the GameObject name (UNVERIFIED)`);
           return named[0];
         }
       }

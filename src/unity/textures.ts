@@ -36,6 +36,10 @@ export interface TextureSettings {
   /** `textureType: 1`, or a texture bound to a normal-map slot. */
   readonly normalMap: boolean;
   readonly convertToNormalMap: boolean;
+  /** `heightScale` ("Bumpiness"); only used with `convertToNormalMap`. */
+  readonly heightScale: number;
+  /** `normalMapFilter`: 0 smooth, 1 sharp. */
+  readonly normalMapFilter: number;
   readonly flipGreenChannel: boolean;
   /** Unity's own per-platform cap, recorded in the report only. */
   readonly unityMaxTextureSize?: number;
@@ -256,6 +260,44 @@ export function flipGreen(image: DecodedImage): DecodedImage {
   return { ...image, data };
 }
 
+/**
+ * Unity's `convertToNormalMap`: the height is the mean of R, G and B, scaled by `(width + height) * (10^bumpiness - 1) / 100`.
+ * The slope is taken with wrap-around, from `4 * (next - previous)` (smooth) or a 3x3 Sobel kernel (sharp), and the normal is
+ * `normalize(-dx, -dy, 1)` stored as `value * 0.5 + 0.5`. Image rows run top to bottom here and bottom to top in Unity, so
+ * Unity's `y + 1` is the row above. Measured on Unity 6000.0.64f1 (PRD-620); the corpus holds no texture that uses it.
+ */
+export function heightToNormal(image: DecodedImage, bumpiness: number, sharp: boolean): DecodedImage {
+  const { width, height } = image;
+  const gain = ((width + height) * (10 ** bumpiness - 1)) / 100 / 255 / 3;
+  const heights = new Float32Array(width * height);
+  for (let at = 0; at < heights.length; at += 1) heights[at] = (image.data[at * 4]! + image.data[at * 4 + 1]! + image.data[at * 4 + 2]!) * gain;
+  const wrap = (value: number, size: number): number => (value + size) % size;
+  const at = (x: number, y: number): number => heights[wrap(y, height) * width + wrap(x, width)]!;
+  const data = Buffer.alloc(width * height * 4, 255);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      // Unity's "next row" (y + 1) is the row above in this top-down image.
+      const up = y - 1;
+      const down = y + 1;
+      let dx: number;
+      let dy: number;
+      if (sharp) {
+        dx = 2 * at(x + 1, y) - 2 * at(x - 1, y) + at(x + 1, up) + at(x + 1, down) - at(x - 1, up) - at(x - 1, down);
+        dy = 2 * at(x, up) - 2 * at(x, down) + at(x - 1, up) + at(x + 1, up) - at(x - 1, down) - at(x + 1, down);
+      } else {
+        dx = 4 * (at(x + 1, y) - at(x - 1, y));
+        dy = 4 * (at(x, up) - at(x, down));
+      }
+      const length = Math.sqrt(dx * dx + dy * dy + 1);
+      const out = (y * width + x) * 4;
+      data[out] = clamp8(((-dx / length + 1) / 2) * 255);
+      data[out + 1] = clamp8(((-dy / length + 1) / 2) * 255);
+      data[out + 2] = clamp8(((1 / length + 1) / 2) * 255);
+    }
+  }
+  return { width, height, data };
+}
+
 // ---------------------------------------------------------------- recipes
 
 export interface ChannelRead {
@@ -309,7 +351,10 @@ export async function renderRecipe(recipe: ImageRecipe, context: RecipeContext):
   if (recipe.kind === "copy") {
     let image = await context.load(recipe.texture);
     const settings = context.settings(recipe.texture);
-    if (recipe.role === "normal") return settings.flipGreenChannel ? flipGreen(image) : image;
+    if (recipe.role === "normal") {
+      if (settings.convertToNormalMap) image = heightToNormal(image, settings.heightScale, settings.normalMapFilter === 1);
+      return settings.flipGreenChannel ? flipGreen(image) : image;
+    }
     if (recipe.role === "color" && !settings.srgb) image = encodeLinearAsSrgb(image);
     return image;
   }

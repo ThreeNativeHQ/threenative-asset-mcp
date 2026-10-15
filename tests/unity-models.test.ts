@@ -294,7 +294,7 @@ describeWithTools(["blender"], "unity models through Blender", () => {
     );
     expect(report.skipped).toEqual([{ asset: "Assets/Models/old.max", reason: expect.stringMatching(/needs the authoring application/) }]);
     expect(report.licenseFiles).toMatchObject([{ path: "Assets/LICENSE.txt", bytes: 33, excerpt: "Pack licence: personal use only." }]);
-    expect(report.textures.map((texture) => texture.png)).toHaveLength(2);
+    expect(report.textures.map((texture) => texture.png)).toHaveLength(3);
     for (const texture of report.textures) {
       expect(Math.max(texture.width, texture.height)).toBeLessThanOrEqual(4);
       expect((await stat(join(outputDir, texture.png))).size).toBe(texture.bytes);
@@ -305,12 +305,12 @@ describeWithTools(["blender"], "unity models through Blender", () => {
       shader: { ref: expect.stringContaining("/-1"), path: "Assets/Shaders/water.shadergraph" },
       fallbackReason: expect.stringContaining("water.shadergraph"),
     });
-    expect(byPath.get("Assets/Materials/height.mat")?.unsupported[0]).toMatch(/convertToNormalMap/);
+    expect(byPath.get("Assets/Materials/height.mat")?.unsupported).toEqual([]);
     expect(byPath.get("Assets/Materials/wood.mat")).toMatchObject({ status: "mapped", pipeline: "standard", textures: ["Assets/Textures/wood.png", "Assets/Textures/wood_n.png"] });
     expect(report.counts.fallbackMaterials).toBe(1);
 
     const document = await read(join(outputDir, report.models[0]!.glb));
-    expect(document.getRoot().listTextures().length).toBe(2); // wood colour and normal; Blender's own were dropped
+    expect(document.getRoot().listTextures().length).toBe(3); // wood colour and normal, and the converted height map; Blender's own were dropped
     const wood = document.getRoot().listMaterials().find((material) => material.getName() === "wood")!;
     expect(wood.getBaseColorTexture()).not.toBeNull();
     expect(wood.getNormalTexture()).not.toBeNull();

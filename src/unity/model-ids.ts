@@ -3,10 +3,10 @@
  * maps the id to the object's name through `internalIDToNameTable` (Unity 2019.1+) or `fileIDToRecycleName`
  * (older). When neither lists it, Unity derives the id from the type and name.
  *
- * The lookup order and the derived-id route follow V-Sekai/unidot_importer (MIT, Copyright (c) V-Sekai
- * contributors) `object_adapter.gd` and `asset_database.gd`, re-written here from memory of the format.
- * No Unidot code is copied. UNVERIFIED: the table routes are documented Unity formats and tested on
- * synthetic metas, but the derived-id string layout below is recalled, not checked against a real pack.
+ * The table routes are documented Unity formats (tested on synthetic metas). The derived route was measured:
+ * for a model whose importer has `fileIdsGeneration: 2` Unity names each sub-object by a signed 64-bit hash of
+ * its class name and a stable name (PRD-620; reproduced on all 17 mesh ids of the real pack U2). The rule is
+ * implemented here from that measurement; no Unity or Unidot code is copied.
  */
 import { parseMeta } from "./yaml.js";
 
@@ -60,58 +60,81 @@ export function firstModelId(metaYaml: string, classId: number): string | undefi
   return ids.reduce((low, id) => (id < low ? id : low)).toString();
 }
 
-// ---------------------------------------------------------------- MD4 (RFC 1320)
+// ---------------------------------------------------------------- derived ids
 
-/** MD4 is not in Node's default OpenSSL 3 provider, and the derived id needs it. */
-export function md4(input: Uint8Array): Uint8Array {
+const MASK = (1n << 64n) - 1n;
+const PRIME1 = 0x9e3779b185ebca87n;
+const PRIME2 = 0xc2b2ae3d27d4eb4fn;
+const PRIME3 = 0x165667b19e3779f9n;
+const PRIME4 = 0x85ebca77c2b2ae63n;
+const PRIME5 = 0x27d4eb2f165667c5n;
+const rotl = (value: bigint, bits: bigint): bigint => ((value << bits) | (value >> (64n - bits))) & MASK;
+const round = (acc: bigint, input: bigint): bigint => (rotl((acc + input * PRIME2) & MASK, 31n) * PRIME1) & MASK;
+const merge = (acc: bigint, value: bigint): bigint => (((acc ^ round(0n, value)) * PRIME1) + PRIME4) & MASK;
+
+/** XXH64 (seed 0 unless given), the hash Unity's importers use for sub-object ids. Returns the unsigned 64-bit value. */
+export function xxh64(input: Uint8Array, seed = 0n): bigint {
+  const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
   const length = input.length;
-  const padded = new Uint8Array((((length + 8) >> 6) + 1) << 6);
-  padded.set(input);
-  padded[length] = 0x80;
-  const view = new DataView(padded.buffer);
-  view.setUint32(padded.length - 8, (length << 3) >>> 0, true);
-  view.setUint32(padded.length - 4, Math.floor(length / 0x20000000), true);
-  let a = 0x67452301;
-  let b = 0xefcdab89 | 0;
-  let c = 0x98badcfe | 0;
-  let d = 0x10325476;
-  const rotl = (x: number, n: number): number => (x << n) | (x >>> (32 - n));
-  const f = (x: number, y: number, z: number): number => (x & y) | (~x & z);
-  const g = (x: number, y: number, z: number): number => (x & y) | (x & z) | (y & z);
-  const h = (x: number, y: number, z: number): number => x ^ y ^ z;
-  for (let offset = 0; offset < padded.length; offset += 64) {
-    const x = Array.from({ length: 16 }, (_, index) => view.getUint32(offset + index * 4, true) | 0);
-    const [sa, sb, sc, sd] = [a, b, c, d];
-    const round1 = [3, 7, 11, 19];
-    for (let i = 0; i < 16; i += 1) {
-      const t = (a + f(b, c, d) + x[i]!) | 0;
-      a = d; d = c; c = b; b = rotl(t, round1[i % 4]!);
+  let offset = 0;
+  let hash: bigint;
+  if (length >= 32) {
+    let v1 = (seed + PRIME1 + PRIME2) & MASK;
+    let v2 = (seed + PRIME2) & MASK;
+    let v3 = seed;
+    let v4 = (seed - PRIME1) & MASK;
+    for (; offset <= length - 32; offset += 32) {
+      v1 = round(v1, view.getBigUint64(offset, true));
+      v2 = round(v2, view.getBigUint64(offset + 8, true));
+      v3 = round(v3, view.getBigUint64(offset + 16, true));
+      v4 = round(v4, view.getBigUint64(offset + 24, true));
     }
-    const round2 = [3, 5, 9, 13];
-    for (let i = 0; i < 16; i += 1) {
-      const k = (i % 4) * 4 + Math.floor(i / 4);
-      const t = (a + g(b, c, d) + x[k]! + 0x5a827999) | 0;
-      a = d; d = c; c = b; b = rotl(t, round2[i % 4]!);
-    }
-    const round3 = [3, 9, 11, 15];
-    const order = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
-    for (let i = 0; i < 16; i += 1) {
-      const t = (a + h(b, c, d) + x[order[i]!]! + 0x6ed9eba1) | 0;
-      a = d; d = c; c = b; b = rotl(t, round3[i % 4]!);
-    }
-    a = (a + sa) | 0; b = (b + sb) | 0; c = (c + sc) | 0; d = (d + sd) | 0;
+    hash = (rotl(v1, 1n) + rotl(v2, 7n) + rotl(v3, 12n) + rotl(v4, 18n)) & MASK;
+    for (const lane of [v1, v2, v3, v4]) hash = merge(hash, lane);
+  } else {
+    hash = (seed + PRIME5) & MASK;
   }
-  const out = new Uint8Array(16);
-  const outView = new DataView(out.buffer);
-  [a, b, c, d].forEach((word, index) => outView.setInt32(index * 4, word, true));
-  return out;
+  hash = (hash + BigInt(length)) & MASK;
+  for (; offset + 8 <= length; offset += 8) hash = ((rotl(hash ^ round(0n, view.getBigUint64(offset, true)), 27n) * PRIME1) + PRIME4) & MASK;
+  if (offset + 4 <= length) {
+    hash = ((rotl(hash ^ ((BigInt(view.getUint32(offset, true)) * PRIME1) & MASK), 23n) * PRIME2) + PRIME3) & MASK;
+    offset += 4;
+  }
+  for (; offset < length; offset += 1) hash = (rotl(hash ^ ((BigInt(input[offset]!) * PRIME5) & MASK), 11n) * PRIME1) & MASK;
+  hash = ((hash ^ (hash >> 33n)) * PRIME2) & MASK;
+  hash = ((hash ^ (hash >> 29n)) * PRIME3) & MASK;
+  return hash ^ (hash >> 32n);
 }
 
 /**
- * The id Unity derives for a generated Mesh sub-object with no table entry: the first 8 bytes of the MD4 of
- * `Type:Mesh->{name}->0`, read as a little-endian signed 64-bit integer. UNVERIFIED against a real pack.
+ * The id Unity gives a generated sub-object of a model when no table lists it: the signed 64-bit XXH64 (seed 0) of
+ * `Type:<class>-><name><n>`, where `n` is 0 and counts up while an earlier object of the model already has the id.
+ * Measured on the real pack U2 (Unity 6, `fileIdsGeneration: 2`): meshes use the sanitized mesh name; the root
+ * GameObject uses `//RootNode/root` and its Transform `//RootNode/root/Transform` (a child GameObject would add
+ * `/<name>`, a component `/<class>` to its parent's path; only the root is verified).
+ * Control characters and invalid UTF-8 in a name become `_` before hashing (not reproduced here: names are text).
  */
-export function derivedMeshFileId(name: string): string {
-  const digest = md4(new TextEncoder().encode(`Type:Mesh->${name}->0`));
-  return new DataView(digest.buffer).getBigInt64(0, true).toString();
+export function derivedFileId(className: string, name: string, counter = 0): string {
+  return BigInt.asIntN(64, xxh64(new TextEncoder().encode(`Type:${className}->${name}${counter}`))).toString();
+}
+
+/** The id of a generated Mesh sub-object named `name` (the `counter`th of that name in the model). */
+export function derivedMeshFileId(name: string, counter = 0): string {
+  return derivedFileId("Mesh", name, counter);
+}
+
+/** `ModelImporter.meshes.fileIdsGeneration`: 2 means the sub-object ids are hash-derived (Unity 2021.2+ default). */
+export function usesDerivedIds(metaYaml: string): boolean {
+  const importer = parseMeta(metaYaml).ModelImporter;
+  const meshes = isRecord(importer) ? importer.meshes : undefined;
+  return isRecord(meshes) && Number(meshes.fileIdsGeneration) === 2;
+}
+
+/** Ids of a model's root GameObject and Transform: the tables, else the derived ids, else the legacy fixed ones. */
+export function modelRootIds(metaYaml: string): { gameObject: string; transform: string } {
+  const derived = usesDerivedIds(metaYaml);
+  return {
+    gameObject: firstModelId(metaYaml, 1) ?? (derived ? derivedFileId("GameObject", "//RootNode/root") : "100000"),
+    transform: firstModelId(metaYaml, 4) ?? (derived ? derivedFileId("Transform", "//RootNode/root/Transform") : "400000"),
+  };
 }

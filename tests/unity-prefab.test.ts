@@ -8,7 +8,7 @@ import { getBounds } from "@gltf-transform/functions";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { UNITY_IMPORTER_VERSION, importUnityPackage } from "../src/unity/importer.js";
-import { derivedMeshFileId, md4 } from "../src/unity/model-ids.js";
+import { derivedFileId, derivedMeshFileId, modelRootIds, xxh64 } from "../src/unity/model-ids.js";
 import { fbxMeshFrame, placeMeshFrame } from "../src/unity/prefab-glb.js";
 import { toGltfTransform } from "../src/unity/prefab.js";
 import { type FixtureFile, scratchDirectory, writeProjectFolder } from "./helpers/unity-fixtures.js";
@@ -395,15 +395,30 @@ describe("report", () => {
 });
 
 describe("meshes", () => {
-  it("meshes: MD4 matches the RFC 1320 vectors and the derived id is stable", () => {
-    const hex = (text: string) => Buffer.from(md4(new TextEncoder().encode(text))).toString("hex");
-    expect(hex("")).toBe("31d6cfe0d16ae931b73c59d7e0c089c0");
-    expect(hex("abc")).toBe("a448017aaf21d8525fc10ae87aa6729d");
-    expect(hex("message digest")).toBe("d9130a8164549fe818874806e1c7014b");
-    expect(hex("12345678901234567890123456789012345678901234567890123456789012345678901234567890")).toBe("e33b4ddc9c38f2199c3e7b164fcc0536");
-    expect(derivedMeshFileId("Wheel")).toBe(derivedMeshFileId("Wheel"));
+  it("meshes: the derived ids follow the measured rule (XXH64 of `Type:<class>-><name><n>`, signed), with XXH64's reference vectors", () => {
+    const hex = (text: string) => xxh64(new TextEncoder().encode(text)).toString(16);
+    expect(hex("")).toBe("ef46db3751d8e999");
+    expect(hex("abc")).toBe("44bc2cf5ad770999");
+    // 40 bytes take the tail path; 32 bytes and more also take the four-lane block path (expected values from an independent implementation).
+    expect(hex("0123456789012345678901234567890123456789")).toBe("ca6fc80cbde1a931");
+    expect(derivedMeshFileId("Wheel")).toBe("-2309305249758762421");
+    expect(derivedMeshFileId("Wheel", 1)).toBe("2822003925202616455");
+    expect(derivedFileId("GameObject", "//RootNode/root")).toBe("919132149155446097");
+    expect(derivedFileId("Transform", "//RootNode/root/Transform")).toBe("-8679921383154817045");
     expect(derivedMeshFileId("Wheel")).not.toBe(derivedMeshFileId("Body"));
     expect(derivedMeshFileId("Wheel")).toMatch(/^-?\d+$/);
+  });
+});
+
+describe("model root ids", () => {
+  const meta = (extra: string): string => `ModelImporter:\n  serializedVersion: 22200\n${extra}`;
+  it("model root ids: a table wins, fileIdsGeneration 2 derives them, anything else keeps the legacy fixed ids", () => {
+    const derived = { gameObject: derivedFileId("GameObject", "//RootNode/root"), transform: derivedFileId("Transform", "//RootNode/root/Transform") };
+    expect(modelRootIds(meta("  meshes:\n    fileIdsGeneration: 2\n  internalIDToNameTable: []\n"))).toEqual(derived);
+    expect(modelRootIds(meta("  meshes:\n    fileIdsGeneration: 1\n"))).toEqual({ gameObject: "100000", transform: "400000" });
+    expect(modelRootIds(meta("  internalIDToNameTable: []\n"))).toEqual({ gameObject: "100000", transform: "400000" });
+    const listed = "  meshes:\n    fileIdsGeneration: 2\n  internalIDToNameTable:\n  - first:\n      1: 7\n    second: a\n  - first:\n      4: 8\n    second: a\n";
+    expect(modelRootIds(meta(listed))).toEqual({ gameObject: "7", transform: "8" });
   });
 });
 
@@ -638,6 +653,29 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(stranger.unresolved).toEqual([expect.objectContaining({ kind: "mesh", reason: expect.stringMatching(/no mesh id matches/) })]);
   }, 180_000);
 
+  it("meshes: a hash-derived mesh id (fileIdsGeneration 2, no table) is matched by the mesh's name with no warning", async () => {
+    const { report, outputDir } = await importProject([
+      ...folders("Assets", "Assets/C", "Assets/Prefabs"),
+      { path: "Assets/C/parts.fbx", data: parts, importer: importerWith("  internalIDToNameTable: []\n") },
+      {
+        path: "Assets/Prefabs/Any.prefab",
+        content: prefabFile(
+          gameObject(10, "Any", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "NotTheName", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/C/parts.fbx", derivedMeshFileId("Wheel"))),
+          meshRenderer(23, 20, []),
+        ),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Prefabs/Any.prefab");
+    expect(prefab.meshNodes).toBe(1);
+    expect(prefab.unresolved).toEqual([]);
+    expect(prefab.warnings.join(" ")).not.toMatch(/UNVERIFIED/);
+    expect(size(await read(join(outputDir, prefab.glb)), "NotTheName")[0]).toBeCloseTo(0.2, 4);
+  }, 180_000);
+
   it("meshes: every mesh node counts its bound slots, also when two nodes share one material variant", async () => {
     const red = asset("Assets/Mats/red.mat", 2100000, 2);
     const { report } = await importProject([
@@ -823,6 +861,30 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(meshNode(document, "Wheel").getMesh()).not.toBeNull();
     expect(prefab.meshNodes).toBe(2);
     expect(prefab.unresolved).toEqual([expect.objectContaining({ kind: "modification", reason: expect.stringMatching(/only the root of a model can be edited/) })]);
+  }, 120_000);
+
+  it("nested: a prefab instance of a model whose root ids are hash-derived (no table) still applies its root edits", async () => {
+    const goId = derivedFileId("GameObject", "//RootNode/root");
+    const transformId = derivedFileId("Transform", "//RootNode/root/Transform");
+    const { report, outputDir } = await importProject([
+      ...folders("Assets"),
+      { path: "Assets/parts.fbx", data: parts, importer: importerWith("  internalIDToNameTable: []\n").replace("useFileScale: 0", "useFileScale: 0\n    fileIdsGeneration: 2") },
+      {
+        path: "Assets/Variant.prefab",
+        content: prefabFile(
+          prefabInstance(1000, {
+            source: "Assets/parts.fbx",
+            modifications: [
+              { target: transformId, path: "m_LocalPosition.x", value: 4 },
+              { target: goId, path: "m_Name", value: "PartsRoot" },
+            ],
+          }),
+        ),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Variant.prefab");
+    expect(prefab.unresolved).toEqual([]);
+    near(nodeNamed(await read(join(outputDir, prefab.glb)), "PartsRoot").getTranslation(), [4, 0, 0]);
   }, 120_000);
 
   it("report: a LODGroup keeps LOD0 and lists the other levels", async () => {

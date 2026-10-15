@@ -228,13 +228,13 @@ describe("pipelines: URP and HDRP materials", () => {
     }
   });
 
-  it("does not turn a height map marked convertToNormalMap into a normal map, and says so", () => {
+  it("binds a height map marked convertToNormalMap as the normal texture (the image is converted when it is written)", () => {
     const material = resolve(
       { name: "height", shader: SHADERS.standard, textures: { _BumpMap: NORMAL } },
       { [NORMAL]: { convertToNormalMap: true } },
     );
-    expect(material.normal).toBeUndefined();
-    expect(material.unsupported[0]).toMatch(/convertToNormalMap/);
+    expect(material.normal).toBeDefined();
+    expect(material.unsupported).toEqual([]);
   });
 });
 
