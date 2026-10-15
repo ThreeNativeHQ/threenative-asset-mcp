@@ -6,8 +6,9 @@ or PR as any change that adds, verifies, removes or regresses support for a kind
 decoder route. Epic: `docs/PRDs/unity-asset-store-import/README.md`.
 
 Last audited: 2026-10-14. Package intake (PRD-615) and the model, texture and material conversion (PRD-616,
-`asset_import_unity`, `UNITY_IMPORTER_VERSION` 1) exist and are tested with synthetic packages. The corpus
-packs (`U1`-`U3`) are not on this machine, so no row is Verified.
+`asset_import_unity`, `UNITY_IMPORTER_VERSION` 1) exist and are tested with synthetic packages. Fidelity
+measurement (PRD-617: the R1/R2 reference sheet, the material visual locks and the corpus sweep) exists and is
+tested with synthetic data only. The corpus packs (`U1`-`U3`) are not on this machine, so no row is Verified.
 
 ## Status vocabulary
 
@@ -62,3 +63,14 @@ mapping, so a kind not listed lands in Other.
 | `{fileID, guid, type}` to a packaged asset | Implemented | `resolveRef` in `src/unity/yaml.ts`; `tests/unity-yaml.test.ts`. |
 | Built-in GUIDs `0000000000000000f000000000000000` (extra resources, including the Standard shader, fileID 46) and `0000000000000000e000000000000000` (default resources) | Implemented | Marked `builtin`, never looked up. Same test file. |
 | Local reference (no guid) and sub-object of another YAML asset | Implemented | Same test file. |
+
+## Fidelity measurement (PRD-617)
+
+| Capability | Status | Evidence or gap |
+|---|---|---|
+| Reference sheet against `R2` (`<guid>/preview.png`) | Implemented | `tests/unity-fidelity.test.ts`: a synthetic package's import scores at least 85 against its preview, and a wrong base colour drops below 70. Gap: no real package preview has been measured. |
+| `R2` channel order and gamma | **Unverified** | A `preview.png` is a PNG, so `sharp` decodes it as stored. The sheet still re-scores every piece with red and blue exchanged and swaps the package only on near-perfect, consistent evidence (`decideChannelOrder`, tested on a synthetic swapped package). The PNG's gamma, sRGB and ICC chunks are recorded, not applied. Settle both on the first real preview. |
+| Reference sheet against `R1` (Editor render) | Implemented | `tests/unity-fidelity.test.ts` (`reference`): a synthetic R1 folder replaces R2, the column is labelled R1, and a piece whose `sizeMeters` is more than 1 % off its bounds is flagged. |
+| `R1` render script `scripts/unity/ReferenceRender.cs` | **Unverified** | Written, never compiled or run: no Unity Editor or licence on this machine. Its `bounds.json` layout is the one the tests write. HDRP light intensity is a guess. |
+| Material visual locks (smoothness inversion, HDRP mask split, cut-out, gamma tint) | Implemented | `tests/unity-visual-regression.test.ts` with goldens `tests/fixtures/visual-golden/unity-*.png`. Ten mutations of `src/unity/materials.ts` turn it red (PRD-617, AC-3). Synthetic materials only. |
+| Corpus sweep `npm run parity:unity` | Implemented | `tests/unity-parity.test.ts` runs it on a synthetic corpus and through `scripts/fidelity-baseline.ts`. With no corpus it prints a note and exits 0. No real pack has been swept, so `docs/parity/fidelity-baseline.json` has no `U1`-`U3` entry. |
