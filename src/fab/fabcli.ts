@@ -28,6 +28,8 @@ export type FabCliErrorCode =
   | "FABCLI_LICENSE_NOT_PERMITTED"
   | "FABCLI_LICENSE_UNVERIFIED"
   | "FABCLI_NO_UNREAL_FORMAT"
+  | "FABCLI_NO_UNITY_FORMAT"
+  | "FABCLI_UNITY_DOWNLOAD_UNAVAILABLE"
   | "FABCLI_DOWNLOAD_FAILED";
 
 export class FabCliError extends Error {
@@ -114,11 +116,17 @@ const FormatSchema = z.object({
   // `.default([])` fires on `undefined` and not on `null`, and fabcli returns `versions: null`
   // on a Unity entry. One unrelated null poisoned the whole parse, so every listing published
   // for both Unreal and Unity failed with FABCLI_INCOMPATIBLE — a message blaming the CLI
-  // version — and the well-formed `unreal-engine` entry beside it was never reached.
+  // version — and the well-formed `unreal-engine` entry beside it was never reached. Entries are
+  // parsed per format code in `formats()`, so a Unity entry's shape can never fail an Unreal one.
   versions: z
-    .array(VersionSchema)
+    .array(z.unknown())
     .nullish()
     .transform((versions) => versions ?? []),
+  // Unity entry fields (probe 2026-10-14). All optional: the shape is only ever read, never trusted.
+  extensions: z.array(z.string()).nullish(),
+  renderPipelines: z.array(z.unknown()).nullish(),
+  unityAssetStoreUrl: z.string().nullish(),
+  isInUnityAssetStore: z.boolean().nullish(),
 });
 
 export interface FabAuthStatus {
@@ -161,6 +169,24 @@ export interface FabUnrealVersion {
   readonly artifactId: string;
   readonly engineVersions: readonly string[];
   readonly targetPlatforms: readonly string[];
+}
+
+/**
+ * The `unity` entry of `fabcli formats`. FabCLI reports `versions: null` for it, so it carries no
+ * Epic catalog coordinates: `artifactId` is set only if a payload ever lists one.
+ */
+export interface FabUnityFormat {
+  readonly artifactId: string | undefined;
+  readonly extensions: readonly string[];
+  readonly renderPipelines: readonly string[];
+  readonly unityAssetStoreUrl: string | undefined;
+  readonly isInUnityAssetStore: boolean | undefined;
+}
+
+export interface FabFormats {
+  /** Empty when the listing publishes no Unreal artifact. */
+  readonly unreal: readonly FabUnrealVersion[];
+  readonly unity: FabUnityFormat | undefined;
 }
 
 export interface FabDownloadRequest {
@@ -401,8 +427,8 @@ export class FabCli {
     }));
   }
 
-  /** The Unreal artifact versions this account can download for a listing. */
-  async unrealVersions(listingId: string): Promise<readonly FabUnrealVersion[]> {
+  /** Every format a listing publishes that this server can route: Unreal artifacts and the Unity entry. */
+  async formats(listingId: string): Promise<FabFormats> {
     const parsed = z
       .array(FormatSchema.loose())
       .safeParse(await this.#json(["formats", assertListingId(listingId)], 180_000));
@@ -412,20 +438,51 @@ export class FabCli {
         "fabcli formats did not match the expected 0.1.x shape.",
       );
     }
-    const unreal = parsed.data.find(
-      (format) => format.assetFormatType.code === "unreal-engine",
-    );
-    if (!unreal || unreal.versions.length === 0) {
+    const unrealEntry = parsed.data.find((format) => format.assetFormatType.code === "unreal-engine");
+    const unreal = z.array(VersionSchema).safeParse(unrealEntry?.versions ?? []);
+    if (!unreal.success) {
+      throw new FabCliError(
+        "FABCLI_INCOMPATIBLE",
+        "fabcli formats did not match the expected 0.1.x shape.",
+      );
+    }
+    const unityEntry = parsed.data.find((format) => format.assetFormatType.code === "unity");
+    const unity: FabUnityFormat | undefined = unityEntry && {
+      artifactId: unityEntry.versions
+        .map((version) => z.object({ artifactId: z.string() }).safeParse(version))
+        .find((version) => version.success)?.data.artifactId,
+      extensions: unityEntry.extensions ?? [],
+      renderPipelines: (unityEntry.renderPipelines ?? []).flatMap((pipeline) => {
+        if (typeof pipeline === "string") return [pipeline];
+        const named = z.object({ name: z.string() }).safeParse(pipeline);
+        return named.success ? [named.data.name] : [];
+      }),
+      unityAssetStoreUrl: unityEntry.unityAssetStoreUrl ?? undefined,
+      isInUnityAssetStore: unityEntry.isInUnityAssetStore ?? undefined,
+    };
+    return {
+      unreal: unreal.data.map((version) => ({
+        artifactId: version.artifactId,
+        engineVersions: version.engineVersions,
+        targetPlatforms: version.targetPlatforms,
+      })),
+      unity,
+    };
+  }
+
+  /** The Unreal artifact versions this account can download for a listing. */
+  async unrealVersions(listingId: string): Promise<readonly FabUnrealVersion[]> {
+    return FabCli.requireUnreal(listingId, await this.formats(listingId));
+  }
+
+  static requireUnreal(listingId: string, formats: FabFormats): readonly FabUnrealVersion[] {
+    if (formats.unreal.length === 0) {
       throw new FabCliError(
         "FABCLI_NO_UNREAL_FORMAT",
         `Listing ${listingId} publishes no Unreal Engine artifact, so there is nothing for the Unreal importer to convert.`,
       );
     }
-    return unreal.versions.map((version) => ({
-      artifactId: version.artifactId,
-      engineVersions: version.engineVersions,
-      targetPlatforms: version.targetPlatforms,
-    }));
+    return formats.unreal;
   }
 
   /**
