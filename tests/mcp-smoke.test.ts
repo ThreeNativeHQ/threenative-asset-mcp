@@ -17,6 +17,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TtlLruCache } from "../src/fab/cache.js";
 import { DirectFabTransport } from "../src/fab/direct-transport.js";
 import { createStderrLogger } from "../src/fab/errors.js";
+import { prerequisiteById } from "../scripts/prerequisites.js";
+import { writeProjectFolder } from "./helpers/unity-fixtures.js";
+import { SHADERS, materialYaml, modelImporter, writeCubeFbx } from "./helpers/unity-models.js";
 
 const packageVersion = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -279,8 +282,9 @@ async function callTool(
   id: number,
   name: string,
   arguments_: Record<string, unknown> = {},
+  timeoutMs?: number,
 ): Promise<Record<string, unknown>> {
-  const response = jsonResponse(child, id);
+  const response = jsonResponse(child, id, timeoutMs);
   send(child, {
     jsonrpc: "2.0",
     id,
@@ -463,6 +467,7 @@ describe("built stdio package", () => {
       "asset_import_unreal",
       "fab_import_asset",
       "unity_list_packages",
+      "asset_import_unity",
       "blendkit_status",
       "blendkit_import_asset",
       "polyhaven_search_assets",
@@ -534,6 +539,65 @@ describe("built stdio package", () => {
     ]);
     await stopServer(populated.child);
   });
+
+  // Under CI=true a missing Blender must fail, never skip: the workflow provisions it first.
+  it.skipIf(!prerequisiteById("blender").check(process.env).ok && process.env.CI !== "true")(
+    "should refuse asset_import_unity without the Unity EULA acknowledgement and import a synthetic package with it",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "asset-mcp-unity-import-"));
+      temporaryDirectories.push(root);
+      const fbx = join(root, "crate.fbx");
+      await writeCubeFbx(fbx, ["Wood"]);
+      const project = join(root, "project");
+      await writeProjectFolder(project, [
+        { path: "Assets" },
+        { path: "Assets/Models" },
+        {
+          path: "Assets/Models/crate.fbx",
+          data: readFileSync(fbx),
+          importer: modelImporter({ globalScale: 2, externalObjects: { Wood: "Assets/Models/wood.mat" } }),
+        },
+        {
+          path: "Assets/Models/wood.mat",
+          content: materialYaml({ name: "wood", shader: SHADERS.standard, colors: { _Color: [1, 0, 0, 1] } }),
+        },
+      ]);
+      const outputDir = join(root, "out");
+      const { child } = await startInitializedServer();
+
+      const refused = (await callTool(child, 2, "asset_import_unity", { source: project, outputDir })) as {
+        result: { isError?: boolean; content: Array<{ text: string }> };
+      };
+      expect(refused.result.isError).toBe(true);
+      expect(refused.result.content[0]?.text).toMatch(/acceptUnityAssetStoreEula/);
+      expect(existsSync(outputDir)).toBe(false);
+
+      const imported = (await callTool(
+        child,
+        3,
+        "asset_import_unity",
+        { source: project, outputDir, acceptUnityAssetStoreEula: true },
+        120_000,
+      )) as {
+        result: {
+          isError?: boolean;
+          structuredContent: {
+            counts: { models: number; boundSlots: number; failed: number };
+            models: Array<{ glb: string; sizeMeters: { x: number }; slots: Array<{ binding: string }> }>;
+          };
+        };
+      };
+      expect(imported.result.isError).toBeFalsy();
+      const summary = imported.result.structuredContent;
+      expect(summary.counts).toMatchObject({ models: 1, boundSlots: 1, failed: 0 });
+      expect(summary.models[0]?.slots).toMatchObject([{ binding: "externalObjects" }]);
+      expect(summary.models[0]?.sizeMeters.x).toBeCloseTo(2, 2);
+      expect(existsSync(join(outputDir, summary.models[0]!.glb))).toBe(true);
+      expect(existsSync(join(outputDir, "import-report.json"))).toBe(true);
+      await stopServer(child);
+    },
+    180_000,
+  );
 
   it("should inspect a rig and its local library over stdio", async () => {
     const { child } = await startInitializedServer();

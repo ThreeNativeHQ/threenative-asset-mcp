@@ -64,6 +64,12 @@ jobs:
         run: |
           npx tsx -e 'import { ensureModernConverter } from "./src/unreal/provision.ts"; ensureModernConverter(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'
 
+      # The Unity model suites run Blender under CI=true; the pinned release is checksummed on download.
+      - name: Provision Blender for the Unity import
+        timeout-minutes: 15
+        run: |
+          npx tsx -e 'import { ensureBlender } from "./src/unity/blender.ts"; ensureBlender(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'
+
       - name: Typecheck
         id: typecheck
         run: npm run typecheck
@@ -167,6 +173,12 @@ jobs:
         timeout-minutes: 15
         run: |
           npx tsx -e 'import { ensureModernConverter } from "./src/unreal/provision.ts"; ensureModernConverter(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'
+
+      # The Unity model suites run Blender under CI=true; the pinned release is checksummed on download.
+      - name: Provision Blender for the Unity import
+        timeout-minutes: 15
+        run: |
+          npx tsx -e 'import { ensureBlender } from "./src/unity/blender.ts"; ensureBlender(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'
 
       - name: Build the distributable
         run: npm run build

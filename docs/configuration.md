@@ -41,7 +41,8 @@ Environment variables read by the server.
 | `BLENDKIT_BLENDER_PATH`         | Client-stored Blender                              | Absolute path to the Blender that runs the `export_glb` recipe. |
 | `ASSETSTORE_CACHE_PATH`         | OS default (Linux `~/.local/share/unity3d/Asset Store-5.x`) | Where `unity_list_packages` looks for the Unity Editor's cached `.unitypackage` files. Local reads only. |
 | `THREENATIVE_TOOLCHAIN_AUTOINSTALL` | `1`                                            | Set to `0` to disable first-use external-tool installs.  |
-| `THREENATIVE_TOOLCHAIN_DIR`     | OS cache under `threenative-asset-mcp/toolchain`   | UE Viewer, FabCLI, and uncooked-converter cache.          |
+| `THREENATIVE_TOOLCHAIN_DIR`     | OS cache under `threenative-asset-mcp/toolchain`   | UE Viewer, FabCLI, uncooked-converter and Blender cache.          |
+| `THREENATIVE_BLENDER`           | `blender` on `PATH`, else a pinned download         | Absolute path to a Blender 3.6+ executable for `asset_import_unity`. |
 | `THREENATIVE_UMODEL_PATH`       | auto-detected/provisioned                           | Absolute path to a UE Viewer executable override.        |
 | `THREENATIVE_UNCOOKED_CONVERTER_PATH` | auto-detected/provisioned                     | Absolute path to `unreal-assets-to-glb`.                  |
 | `THREENATIVE_FABCLI_PATH`       | auto-detected/provisioned                           | Absolute path to FabCLI; login remains user-controlled.  |

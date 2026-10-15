@@ -10,7 +10,8 @@ import {
   ensureUncookedConverter,
   type ProvisionLog,
 } from "../src/unreal/provision.js";
-import { type ExternalTool, childEnvironment } from "../src/unreal/toolchain.js";
+import { ensureBlender } from "../src/unity/blender.js";
+import { childEnvironment } from "../src/unreal/toolchain.js";
 
 // Each override would skip provisioning and resolve from the host, which proves nothing about a
 // fresh cache. PATH lookup is also kept out of the answer: a path outside the cache fails below.
@@ -19,11 +20,17 @@ const OVERRIDES = [
   "THREENATIVE_FABCLI_PATH",
   "THREENATIVE_UNCOOKED_CONVERTER_PATH",
   "THREENATIVE_MODERN_UNREAL_CONVERTER_PATH",
+  "THREENATIVE_BLENDER",
 ];
+
+interface ProvisionedTool {
+  readonly path: string;
+  readonly version: string;
+}
 
 interface Step {
   readonly name: string;
-  readonly ensure: (environment: NodeJS.ProcessEnv, log: ProvisionLog) => Promise<ExternalTool>;
+  readonly ensure: (environment: NodeJS.ProcessEnv, log: ProvisionLog) => Promise<ProvisionedTool>;
   // Tools whose ensure probe does not already prove identity get an explicit --version check.
   readonly versionCheck?: { readonly expect: RegExp };
 }
@@ -33,6 +40,7 @@ const STEPS: readonly Step[] = [
   { name: "umodel", ensure: ensureUmodel },
   { name: "uncooked", ensure: ensureUncookedConverter },
   { name: "modern", ensure: ensureModernConverter, versionCheck: { expect: /threenative-cue4parse/ } },
+  { name: "blender", ensure: ensureBlender, versionCheck: { expect: /^Blender /m } },
 ];
 
 function fail(code: number, message: string): never {
@@ -66,7 +74,7 @@ async function provision(
 ): Promise<{ ok: boolean; line: string; detail?: string }> {
   const log: ProvisionLog = (message) => console.log(`[${step.name}] ${message}`);
   const started = performance.now();
-  let tool: ExternalTool | undefined;
+  let tool: ProvisionedTool | undefined;
   try {
     tool = await step.ensure(environment, log);
     if (!isInside(tool.path, root)) {

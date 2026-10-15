@@ -21,6 +21,7 @@ search, metadata and guarded downloads, and it converts owned Unreal/Fab packs t
 | See every tool and how to chain them | [docs/tools.md](docs/tools.md) |
 | Generate or inspect game audio | [docs/audio.md](docs/audio.md) |
 | Import an Unreal / Fab pack as GLB | [docs/unreal-import.md](docs/unreal-import.md) |
+| Import a Unity Asset Store package as GLB | [docs/unity-import.md](docs/unity-import.md) |
 | Check which Unreal formats work | [docs/unreal-format-support.md](docs/unreal-format-support.md) |
 | Load imported assets in Three.js | [docs/unreal-threejs-usage.md](docs/unreal-threejs-usage.md) |
 | Read what each importer version changed | [docs/unreal-importer-history.md](docs/unreal-importer-history.md) |
@@ -129,7 +130,7 @@ changing its configuration.
 | Audio | `audio_search_assets`, `audio_download_asset`, `audio_inspect_asset`, `audio_generate_sound` |
 | itch.io bundles | `itch_list_downloads`, `asset_list_bundle_entries`, `asset_download_bundle_animation` |
 | Unreal | `asset_import_unreal` |
-| Unity | `unity_list_packages` |
+| Unity | `unity_list_packages`, `asset_import_unity` |
 
 Recommended flow: `asset_search_sources` → the returned search tool → the returned files tool → the returned
 download tool with `acceptLicense: true`. All discovery tools are read-only. Download tools write only inside

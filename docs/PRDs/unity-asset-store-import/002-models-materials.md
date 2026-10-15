@@ -1,7 +1,7 @@
 # PRD-616 — Unity models, textures and materials to GLB
 
-**Status:** NOT STARTED
-**Priority:** P2 — `asset_import_unity` is the epic's user-facing import, and none of AC-1..AC-8 exists yet.
+**Status:** IN PROGRESS — AC-1..AC-8 pass on synthetic packages; AC-9 (real-pack evidence) is open.
+**Priority:** P2 — `asset_import_unity` is the epic's user-facing import.
 **Complexity:** 4 (MEDIUM) — 6–10 implementation files (2), new importer module (+2); risk override: none
 **Owner:** João
 **Depends on:** PRD-615
@@ -44,54 +44,54 @@ returns `SummarySchema`.
 
 ## Acceptance Criteria
 
-- [ ] AC-1 [local]: A synthetic package with a 1 m FBX cube (made by Blender in the test) and `globalScale: 2`
+- [x] AC-1 [local]: A synthetic package with a 1 m FBX cube (made by Blender in the test) and `globalScale: 2`
   imports as a GLB whose `sizeMeters` is 2 ± 0.01 on every axis. proof: `npx vitest run tests/unity-models.test.ts`
-  — Evidence: pending.
-- [ ] AC-2 [local]: With no Blender on `PATH` and an empty toolchain cache, the import provisions the pinned Blender,
+  — Evidence: `npx vitest run tests/unity-models.test.ts` — 12 passed, 1 skipped (the on-demand real download). `globalScale` 2 gives 2.00 m on x, y and z; a `.unitypackage` source and a centimetre FBX with `useFileScale` on and off also pass. 2026-10-14.
+- [x] AC-2 [local]: With no Blender on `PATH` and an empty toolchain cache, the import provisions the pinned Blender,
   verifies its checksum and succeeds. `THREENATIVE_TOOLCHAIN_AUTOINSTALL=0` gives an error that names the fix.
-  proof: `npx vitest run tests/unity-models.test.ts -t provision` — Evidence: pending.
-- [ ] AC-3 [local]: Standard metallic and specular materials (synthetic `.mat` files covering each row above,
+  proof: `npx vitest run tests/unity-models.test.ts -t provision` — Evidence: `npx vitest run tests/unity-models.test.ts -t provision` — 5 passed, 1 skipped. A local archive served over HTTP covers download, SHA-256 check, extraction, install and reuse; a wrong digest installs nothing; `THREENATIVE_TOOLCHAIN_AUTOINSTALL=0` names `THREENATIVE_BLENDER` and `THREENATIVE_TOOLCHAIN_AUTOINSTALL`. With `THREENATIVE_REAL_BLENDER_PROVISION=1` the same command also provisions the real pinned Blender 4.5.14 (378 MB, SHA-256 `9ba871ff...06da3`) from an empty cache: 6 passed in 13.5 s. 2026-10-14.
+- [x] AC-3 [local]: Standard metallic and specular materials (synthetic `.mat` files covering each row above,
   including smoothness from albedo alpha and cutout) resolve to the expected glTF factors and textures.
-  proof: `npx vitest run tests/unity-materials.test.ts -t standard` — Evidence: pending.
-- [ ] AC-4 [local]: URP Lit/SimpleLit and an HDRP Lit mask map resolve correctly, and the HDRP mask is split into a
-  metallic-roughness texture plus occlusion. proof: `npx vitest run tests/unity-materials.test.ts -t pipelines` — Evidence: pending.
-- [ ] AC-5 [local]: A material on a Shader Graph or unknown shader falls back to its saved colour and texture,
-  and the report records `fallback` with the shader ref. proof: `npx vitest run tests/unity-materials.test.ts -t fallback` — Evidence: pending.
-- [ ] AC-6 [local]: The FBX's embedded material slots bind to the `.mat` files named by `externalObjects`, and
-  otherwise by name search, with the binding source recorded. proof: `npx vitest run tests/unity-models.test.ts -t slots` — Evidence: pending.
-- [ ] AC-7 [local]: TGA, PSD and TIF textures decode, normal maps load as linear, `maxTextureSize` is applied, and
-  `convertToNormalMap` is reported as unsupported. proof: `npx vitest run tests/unity-textures.test.ts` — Evidence: pending.
-- [ ] AC-8 [local]: Through the packed MCP, `asset_import_unity` refuses a call without `acceptUnityAssetStoreEula`
-  and imports the synthetic package with one. proof: `npx vitest run tests/mcp-smoke.test.ts` — Evidence: pending.
+  proof: `npx vitest run tests/unity-materials.test.ts -t standard` — Evidence: `npx vitest run tests/unity-materials.test.ts -t standard` — 8 passed. 2026-10-14.
+- [x] AC-4 [local]: URP Lit/SimpleLit and an HDRP Lit mask map resolve correctly, and the HDRP mask is split into a
+  metallic-roughness texture plus occlusion. proof: `npx vitest run tests/unity-materials.test.ts -t pipelines` — Evidence: `npx vitest run tests/unity-materials.test.ts -t pipelines` — 7 passed. 2026-10-14.
+- [x] AC-5 [local]: A material on a Shader Graph or unknown shader falls back to its saved colour and texture,
+  and the report records `fallback` with the shader ref. proof: `npx vitest run tests/unity-materials.test.ts -t fallback` — Evidence: `npx vitest run tests/unity-materials.test.ts -t fallback` — 2 passed, plus the end-to-end fallback in `tests/unity-models.test.ts`. 2026-10-14.
+- [x] AC-6 [local]: The FBX's embedded material slots bind to the `.mat` files named by `externalObjects`, and
+  otherwise by name search, with the binding source recorded. proof: `npx vitest run tests/unity-models.test.ts -t slots` — Evidence: `npx vitest run tests/unity-models.test.ts -t slots` — 2 passed. 2026-10-14.
+- [x] AC-7 [local]: TGA, PSD and TIF textures decode, normal maps load as linear, `maxTextureSize` is applied, and
+  `convertToNormalMap` is reported as unsupported. proof: `npx vitest run tests/unity-textures.test.ts` — Evidence: `npx vitest run tests/unity-textures.test.ts` — 13 passed. `sharp` 0.35.4 cannot read TGA or PSD (checked), so TGA has its own decoder and PSD uses `ag-psd` 31.0.3. 2026-10-14.
+- [x] AC-8 [local]: Through the packed MCP, `asset_import_unity` refuses a call without `acceptUnityAssetStoreEula`
+  and imports the synthetic package with one. proof: `npx vitest run tests/mcp-smoke.test.ts` — Evidence: `npx vitest run tests/mcp-smoke.test.ts` — 17 passed, including the refusal without `acceptUnityAssetStoreEula` and the import with it. 2026-10-14.
 - [ ] AC-9 [local]: Real-pack evidence per the epic's PR evidence rule. The slice is `U1` (Standard) plus the same
   `U2` pieces in each of its three pipelines. The sheet shows reference (`R2` previews, `R1` if available) | "no
   importer" | after, with judge scores. No Standard, URP Lit or HDRP Lit piece fails (score under 50), and each
   suspect piece names its cause. The same `U2` piece scores within 10 points across the three pipelines. Every
-  sheet is checked by eye and posted to the PR. proof: PR screenshot comment — Evidence: pending.
+  sheet is checked by eye and posted to the PR. proof: PR screenshot comment — Evidence: pending. **Blocked on João:** the corpus packs `U1`-`U3` are not on this machine (the Fab download route was unavailable), so no real pack was imported, no `R2` sheet was built and no judge score exists. Put the three `.unitypackage` files in `~/.cache/threenative-asset-mcp/unity-corpus/<id>/`, then build the sheet with `renderTiles` and `judgeRender`.
 
 ## Integration Ledger
 
 | Capability | Reachable consumer/trigger | Replaces / disposition | Evidence |
 |---|---|---|---|
-| Unity import | MCP `asset_import_unity` → `src/server.ts` → `src/unity/importer.ts` | New | AC-8 |
-| Blender toolchain | `ensureBlender` in the provisioning helpers; `npm run doctor` | New; Blendkit keeps its own client-stored Blender | AC-2 |
+| Unity import | MCP `asset_import_unity` → `src/server.ts` → `src/tools/import-unity.ts` → `src/unity/importer.ts` | New | AC-8 |
+| Blender toolchain | `ensureBlender` (`src/unity/blender.ts`); `npm run doctor`; `npm run provision:toolchain` | New; Blendkit keeps its own client-stored Blender | AC-2 |
 
 ## Execution Phases
 
 #### Phase 1: Models through Blender
-**Status:** NOT STARTED
+**Status:** DONE
 **Files:** `src/unity/blender.ts` (new), `src/unity/importer.ts` (new), provisioning entry, `tests/unity-models.test.ts`
 **Implementation:** Resolve or provision Blender. Convert one model per call, apply the scale, and bind the slots.
 **Verification:** AC-1, AC-2, AC-6. Tests that need Blender use `describeWithTools`.
 
 #### Phase 2: Materials and textures
-**Status:** NOT STARTED
+**Status:** DONE
 **Files:** `src/unity/materials.ts` (new), `src/unity/textures.ts` (new), `tests/unity-materials.test.ts`, `tests/unity-textures.test.ts`
 **Implementation:** The mapping table above. Check sharp's PSD and TGA input first, and add `ag-psd` only if sharp fails.
 **Verification:** AC-3, AC-4, AC-5, AC-7.
 
 #### Phase 3: Tool and report
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — the tool, report and docs are done; the AC-9 sheet waits for the corpus.
 **Files:** `src/tools/import-unity.ts` (new), `src/server.ts`, `docs/unity-import.md` (new), `docs/tools.md`, `docs/unity-format-support.md`
 **Implementation:** Wire the tool, write the report, bump the ledger rows to Implemented. Until PRD-617 lands,
 build the AC-9 sheet with `renderTiles` and `judgeRender` directly, with `R2` previews in the reference column.

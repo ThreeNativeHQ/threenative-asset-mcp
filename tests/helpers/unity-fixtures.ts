@@ -12,6 +12,10 @@ export interface FixtureFile {
   readonly path: string;
   /** Absent for a folder asset. */
   readonly content?: string;
+  /** Binary content, used instead of `content` (images, FBX). */
+  readonly data?: Buffer;
+  /** The importer block of the `.meta` (for example `ModelImporter:\n  meshes:\n    globalScale: 2`). */
+  readonly importer?: string;
   readonly preview?: boolean;
   /** Path the guid derives from, when it differs from `path` (a UPM tarball stores relative paths). */
   readonly guidPath?: string;
@@ -21,9 +25,12 @@ export function guidFor(path: string): string {
   return createHash("sha1").update(path).digest("hex").slice(0, 32);
 }
 
-export function metaFor(path: string, folder: boolean): string {
-  return `fileFormatVersion: 2\nguid: ${guidFor(path)}\n${folder ? "folderAsset: yes\n" : "NativeFormatImporter:\n  externalObjects: {}\n"}`;
+export function metaFor(path: string, folder: boolean, importer?: string): string {
+  const body = folder ? "folderAsset: yes\n" : importer ? `${importer}\n` : "NativeFormatImporter:\n  externalObjects: {}\n";
+  return `fileFormatVersion: 2\nguid: ${guidFor(path)}\n${body}`;
 }
+
+const isFolder = (file: FixtureFile): boolean => file.content === undefined && file.data === undefined;
 
 export async function scratchDirectory(prefix = "unity-test-", parent = tmpdir()): Promise<string> {
   const directory = await mkdtemp(join(parent, prefix));
@@ -54,7 +61,7 @@ function tar(args: string[], cwd: string): void {
   execFileSync("tar", args, { cwd, stdio: "ignore" });
 }
 
-async function put(file: string, content: string): Promise<void> {
+async function put(file: string, content: string | Buffer): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   await writeFile(file, content);
 }
@@ -62,9 +69,9 @@ async function put(file: string, content: string): Promise<void> {
 /** A project folder: each file beside a `.meta`. */
 export async function writeProjectFolder(root: string, files: readonly FixtureFile[]): Promise<void> {
   for (const file of files) {
-    if (file.content === undefined) await mkdir(join(root, file.path), { recursive: true });
-    else await put(join(root, file.path), file.content);
-    await put(join(root, `${file.path}.meta`), metaFor(file.guidPath ?? file.path, file.content === undefined));
+    if (isFolder(file)) await mkdir(join(root, file.path), { recursive: true });
+    else await put(join(root, file.path), file.data ?? file.content!);
+    await put(join(root, `${file.path}.meta`), metaFor(file.guidPath ?? file.path, isFolder(file), file.importer));
   }
 }
 
@@ -78,9 +85,9 @@ export async function writePackageTree(
   for (const file of files) {
     const guid = guidFor(file.path);
     folders.push(guid);
-    if (file.content !== undefined) await put(join(staging, guid, "asset"), file.content);
+    if (!isFolder(file)) await put(join(staging, guid, "asset"), file.data ?? file.content!);
     if (file.preview) await put(join(staging, guid, "preview.png"), "fake preview");
-    await put(join(staging, guid, "asset.meta"), metaFor(file.path, file.content === undefined));
+    await put(join(staging, guid, "asset.meta"), metaFor(file.path, isFolder(file), file.importer));
     await put(join(staging, guid, "pathname"), `${pathnameOf(file)}\n00`);
   }
   return folders;

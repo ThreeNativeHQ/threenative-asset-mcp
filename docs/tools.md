@@ -46,7 +46,15 @@ Unity (the user's own Unity Editor cache; see
   name, size and modification time. It reads local files only and never contacts
   or signs in to Unity. An empty or missing cache returns an empty list. The
   intake that opens a package (`.unitypackage`, UPM tarball or project folder)
-  lives in `src/unity/package.ts`; `asset_import_unity` (PRD-616) is its consumer.
+  lives in `src/unity/package.ts`; `asset_import_unity` is its consumer.
+- `asset_import_unity` — converts the FBX, OBJ and `.blend` models, textures and
+  materials of a Unity package the user owns into self-contained GLBs plus
+  `import-report.json`. It needs `acceptUnityAssetStoreEula: true`, applies each
+  model's import scale, binds material slots (`externalObjects`, then by name) and
+  maps Standard, URP Lit/SimpleLit/ComplexLit and HDRP Lit to glTF PBR. Other
+  shaders fall back to their saved colour and texture and are reported. It runs
+  headless Blender (`THREENATIVE_BLENDER`, `PATH`, or a pinned download) and never
+  contacts Unity. Details: [unity-import.md](unity-import.md).
 
 Blendkit (through the user's own official Blendkit-Client; see
 [docs/blendkit-integration.md](blendkit-integration.md)):
