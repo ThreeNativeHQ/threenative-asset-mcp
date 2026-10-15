@@ -39,6 +39,40 @@ function pictureNote(identity: PictureIdentity): string {
   return "unreal-style approximation lit by the local reference environment and Grid (camera and renderer differ)";
 }
 
+if (arg("--unity-package") !== undefined || arg("--unity-reference") !== undefined) {
+  const { importUnityPackage } = await import("../src/unity/importer.js");
+  const { runUnityFidelity, summaryLine, unityTable } = await import("../src/unity/fidelity.js");
+  const packagePath = arg("--unity-package");
+  const referenceDir = arg("--unity-reference");
+  const unityOut = arg("--out");
+  if (!unityOut || (!packagePath && !referenceDir)) {
+    console.error("usage: fidelity-sheet.ts --unity-package <file> [--unity-reference <R1 dir>] [--import <import dir>] --out <dir> [--max N]");
+    process.exit(2);
+  }
+  let importDir = arg("--import");
+  if (!importDir) {
+    if (!packagePath) {
+      console.error("--unity-reference alone needs --import <import dir> (or --unity-package to import one)");
+      process.exit(2);
+    }
+    importDir = join(resolve(unityOut), "import");
+    const imported = await importUnityPackage({ source: resolve(packagePath), outputDir: importDir });
+    console.log(`Imported ${imported.counts.models} model(s), ${imported.counts.fallbackMaterials} fallback material(s) into ${importDir}`);
+  }
+  const unity = await runUnityFidelity({
+    importDir,
+    out: unityOut,
+    ...(packagePath ? { packagePath: resolve(packagePath) } : {}),
+    ...(referenceDir ? { referenceDir: resolve(referenceDir) } : {}),
+    ...(arg("--max") ? { max: Number(arg("--max")) } : {}),
+  });
+  console.log(`Reference: ${unity.referenceNote}`);
+  if (unity.channelOrder) console.log(`R2 channel order: ${unity.channelOrder.order} (${unity.channelOrder.evidence}); unverified on real previews`);
+  console.table(unityTable(unity));
+  console.log(`${summaryLine(unity)} sheet=${unity.sheet}`);
+  process.exit(0);
+}
+
 const source = arg("--source");
 const importDir = arg("--import");
 const out = arg("--out");

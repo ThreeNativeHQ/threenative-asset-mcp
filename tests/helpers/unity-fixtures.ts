@@ -17,6 +17,8 @@ export interface FixtureFile {
   /** The importer block of the `.meta` (for example `ModelImporter:\n  meshes:\n    globalScale: 2`). */
   readonly importer?: string;
   readonly preview?: boolean;
+  /** A real `preview.png` (PNG bytes), instead of the placeholder text `preview` writes. */
+  readonly previewData?: Buffer;
   /** Path the guid derives from, when it differs from `path` (a UPM tarball stores relative paths). */
   readonly guidPath?: string;
 }
@@ -86,7 +88,8 @@ export async function writePackageTree(
     const guid = guidFor(file.path);
     folders.push(guid);
     if (!isFolder(file)) await put(join(staging, guid, "asset"), file.data ?? file.content!);
-    if (file.preview) await put(join(staging, guid, "preview.png"), "fake preview");
+    if (file.previewData) await put(join(staging, guid, "preview.png"), file.previewData);
+    else if (file.preview) await put(join(staging, guid, "preview.png"), "fake preview");
     await put(join(staging, guid, "asset.meta"), metaFor(file.path, isFolder(file), file.importer));
     await put(join(staging, guid, "pathname"), `${pathnameOf(file)}\n00`);
   }
