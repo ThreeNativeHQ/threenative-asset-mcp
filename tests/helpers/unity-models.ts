@@ -63,6 +63,8 @@ export const DEFAULT_TEXTURE: TextureSettings = {
   srgb: true,
   normalMap: false,
   convertToNormalMap: false,
+  heightScale: 0.25,
+  normalMapFilter: 0,
   flipGreenChannel: false,
 };
 

@@ -88,8 +88,8 @@ Each material in the FBX binds to a `.mat` in this order. The report records the
 
 Colours are converted from sRGB to linear. The base map's tiling and offset become `KHR_texture_transform` on
 every slot. Textures that the mapping does not carry (detail maps, parallax) are listed under `ignored`. A
-texture marked `convertToNormalMap` is a height map that Unity turns into normals. The importer does not
-convert it. It leaves the slot empty and lists the feature under `unsupported`.
+texture marked `convertToNormalMap` is a height map that Unity turns into normals. The importer converts it
+with Unity's rule (`heightScale` as bumpiness, `normalMapFilter` smooth or sharp) when it writes the normal texture.
 
 ## Textures
 

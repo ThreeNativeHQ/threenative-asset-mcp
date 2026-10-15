@@ -5,7 +5,7 @@ are missing. It uses the same rules as `docs/unreal-format-support.md`. Update t
 or PR as any change that adds, verifies, removes or regresses support for a kind, a package shape or a
 decoder route. Epic: `docs/PRDs/unity-asset-store-import/README.md`.
 
-Last audited: 2026-10-15 (real-pack verification: `UNITY_IMPORTER_VERSION` 7 on the corpus). Package intake (PRD-615), the model,
+Last audited: 2026-10-15 (real-pack verification on the corpus; static study of Unity 6000.0.64f1, PRD-620, `UNITY_IMPORTER_VERSION` 8). Package intake (PRD-615), the model,
 texture and material conversion (PRD-616, `asset_import_unity`) and the prefab conversion (PRD-618) were run on the
 three real packs: `U1` Apocalypse Playground (Built-in), `U2` the free Built-in "Rusty Cars" file and `U3` KUBIKOS Cube World
 (Built-in, URP and custom shaders). Rows below say Verified only where one of those packs shows the behaviour.
@@ -42,9 +42,10 @@ non-finite (`.nan`, `.inf`) material floats and colour channels take their defau
   GameObject translation and an ordinary node translation are both non-zero: that case (T placing the object, vertices about the origin)
   is covered by a synthetic test only, which keeps T out of the mesh so the part is not placed twice. The Y and Z signs are checked on the
   `U3` numbers (translation on all three axes) in `tests/unity-prefab.test.ts` (`pivot`), not on a Blender-made file.
-- **Mesh references of real prefabs.** The 64-bit `m_Mesh` ids of a Unity 2022 pack (`U2`) are in no table and the derived-id
-  formula does not reproduce them (MD4, MD5, SHA-1, SHA-256 of `Type:Mesh->name->0` tried with several byte orders). The importer then
-  matches the mesh by the GameObject's own name (or, when the prefab has one mesh node only, its root's name), with an UNVERIFIED warning; an ancestor's name never picks a child's mesh. `U1` and `U3` resolve through the name tables.
+- **Mesh references of real prefabs: derived and verified (2026-10-15, `U2`, PRD-620 FR-M1).** A Unity 6 model without a name table
+  (`fileIdsGeneration: 2`) names each mesh by the signed 64-bit XXH64 (seed 0) of `Type:Mesh->` + the mesh name + a collision
+  counter that starts at 0. The earlier MD4 guess was wrong. `derivedMeshFileId` in `src/unity/model-ids.ts` implements the rule, and all 17
+  `U2` prefabs resolve through it with no warning. The GameObject-name match stays as a labelled last resort for a mesh that the exporter renamed.
 - **Preview pictures are lit by Unity's own rig.** On `U1` ours is brighter (median lightness ratio 2.62) and more saturated
   (1.46) than the preview, with equal silhouettes (1.04). The judge compensates the measured copy of an `R2` reference with
   two fixed gains (`UNITY_RIG_*` in `src/unity/fidelity.ts`) and the sheet still shows Unity's picture. On `U3` (out of sample, 60 pieces) the lightness
@@ -84,7 +85,7 @@ mapping, so a kind not listed lands in Other.
 | Texture (PSD) | `.psd` | Implemented | same | `tests/unity-textures.test.ts` through `ag-psd` 31.0.3 (`sharp` cannot read PSD). Needs a flattened composite. Gap: composite transparency is unverified (an opaque PSD round-trips). |
 | Texture (BMP, DDS, EXR, HDR) | `.bmp` `.dds` `.exr` `.hdr` | **Missing** | none | The slot stays empty and the material carries a warning. |
 | Texture (importer settings) | `sRGBTexture`, `textureType`, `flipGreenChannel`, `maxTextureSize` | Implemented | n/a | Normal maps and masks stay linear; a colour texture with `sRGBTexture: 0` is re-encoded; the tool's `maxTextureSize` caps the longest edge (`tests/unity-textures.test.ts`). Unity's own per-platform size is only recorded. |
-| Texture (`convertToNormalMap`) | `bumpmap.convertToNormalMap` | **Missing** | none | A height map Unity turns into normals. Reported under `unsupported`; the slot stays empty (`tests/unity-materials.test.ts`, `tests/unity-models.test.ts`). |
+| Texture (`convertToNormalMap`) | `bumpmap.convertToNormalMap`, `heightScale`, `normalMapFilter` | Implemented | `textures/<name>.png` (a normal map) | `heightToNormal` in `src/unity/textures.ts`, from the PRD-620 static study (FR-T1): mean of RGB as height, gain `(w + h) * (10^bumpiness - 1) / 100`, wrap-around smooth or Sobel slope. Tests: `tests/unity-textures.test.ts`, `tests/unity-materials.test.ts`, `tests/unity-models.test.ts`. Not Verified: no corpus texture sets the flag, and the row order and the gamma of the input are inferred (importer 8, 2026-10-15). |
 | Material (Standard (metallic)) | **Partly verified** | glTF PBR | `tests/unity-materials.test.ts` (`standard`) and the real `fileID` 46 in `0000000000000000f000000000000000` on 31 `U1`, 21 `U2` and 13 `U3` materials (importer 7, 2026-10-15): the shader identity and the texture, smoothness and colour mapping show right on the sheets. PRD-002 AC-9 "no Standard piece fails" is NOT met: 11 of 31 `U1` pieces score under 50 (mean 60.7). The causes are named on the sheet and none is a wrong import: Unity's preview rig (compensated by two fitted gains), a fully metallic bottle (metallic 253/255, black in a neutral picture with no environment) and a grey object on a grey background. Cut-out (`_Cutoff` 1 on three `U2` materials) renders thin, as Unity's clip does. |
 | Material (Standard (Specular setup)) | **Verified** | glTF PBR + `KHR_materials_specular` | `tests/unity-materials.test.ts` (`standard`) and `fileID` 45 with `_SpecGlossMap`, `_SpecColor` and `_SPECGLOSSMAP` on the 5 `U3` crystal materials (2026-10-15, importer 7). Energy conservation is left to glTF's dielectric model. |
 | Material (URP Lit, SimpleLit, ComplexLit) | Implemented | glTF PBR | `tests/unity-materials.test.ts` (`pipelines`) with the URP shader GUIDs. The URP Lit guid `933532a4fcc9baf4fa0491de14d08ed7` is identified and mapped on 13 `U3` materials (importer 7, 2026-10-15), but no URP piece is scored: every `U3` URP preview is Unity's missing-shader pink, so there is no reference. Not Verified for that reason. SimpleLit is approximated as a non-metal; clear coat is unsupported. |
@@ -110,7 +111,8 @@ mapping, so a kind not listed lands in Other.
 | Local reference (no guid) and sub-object of another YAML asset | Implemented | Same test file. |
 | `MeshFilter.m_Mesh` to an FBX mesh by `internalIDToNameTable` (2019.1+) | **Verified** | `tests/unity-prefab.test.ts` (`meshes`) and the `U1` prefabs (2026-10-15, importer 7). |
 | `MeshFilter.m_Mesh` by `fileIDToRecycleName` (older) | **Verified** | Same test, and the `U3` models (`serializedVersion: 19`), 2026-10-15. |
-| `MeshFilter.m_Mesh` by the derived id (no table) | **Refuted on a real pack** | `src/unity/model-ids.ts` (MD4 of `Type:Mesh->{name}->0`) does not reproduce the 64-bit ids of the `U2` prefabs (no table there either; several hashes and byte orders tried). The importer falls back to the GameObject's name, with an UNVERIFIED warning (`tests/unity-prefab.test.ts`), then to the model's only mesh. |
+| `MeshFilter.m_Mesh` by the derived id (no table) | **Verified** | `derivedMeshFileId` in `src/unity/model-ids.ts`: XXH64 of `Type:Mesh->{name}{n}`, signed. All 17 `U2` prefab mesh ids match their mesh names, 2026-10-15, importer 8 (`parity:unity -- --ids U2`: no warning, 17 of 17 mesh nodes). Tests: `tests/unity-prefab.test.ts` (`meshes`, XXH64 vectors and a synthetic derived id). The GameObject-name match and the model's only mesh remain as labelled fallbacks. |
+| Root GameObject and Transform of a model used as a prefab source (`fileIdsGeneration: 2`, no table) | **Verified** (root only) | `modelRootIds` in `src/unity/model-ids.ts`: ids from `Type:GameObject->//RootNode/root` and `Type:Transform->//RootNode/root/Transform`, as the `U2` scene's prefab instance targets them (2026-10-15). Child and component ids are inferred, not implemented. Test: `tests/unity-prefab.test.ts` (`model root ids`, `nested`). |
 
 ## Fidelity measurement (PRD-617)
 

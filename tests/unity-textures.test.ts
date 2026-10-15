@@ -13,6 +13,7 @@ import {
   decodeTga,
   encodePng,
   limitTextureSize,
+  heightToNormal,
   renderRecipe,
 } from "../src/unity/textures.js";
 import { scratchDirectory } from "./helpers/unity-fixtures.js";
@@ -187,10 +188,59 @@ describe("colour spaces and sizes", () => {
       srgb: false,
       normalMap: true,
       convertToNormalMap: true,
+      heightScale: 0.25,
+      normalMapFilter: 0,
       flipGreenChannel: false,
       unityMaxTextureSize: 2048,
     });
     expect(readTextureSettings(`fileFormatVersion: 2\nguid: ${"a".repeat(32)}\nTextureImporter:\n  serializedVersion: 4\n`)).toMatchObject({ srgb: true, normalMap: false });
+  });
+
+  it("convertToNormalMap: a flat height map gives the flat normal, and bumpiness 0 flattens any map (PRD-620 FR-T1)", () => {
+    const flat = heightToNormal({ width: 4, height: 4, data: Buffer.alloc(64, 90) }, 0.25, false);
+    expect([...flat.data.subarray(0, 4)]).toEqual([128, 128, 255, 255]);
+    const ramp = Buffer.alloc(64, 255);
+    for (let at = 0; at < 16; at += 1) ramp.fill((at % 4) * 80, at * 4, at * 4 + 3);
+    expect([...heightToNormal({ width: 4, height: 4, data: ramp }, 0, true).data.subarray(20, 24)]).toEqual([128, 128, 255, 255]);
+  });
+
+  it("convertToNormalMap: a slope tilts the normal away from the rise, smooth and sharp agree on direction, and the grid wraps (PRD-620 FR-T1)", () => {
+    const size = 8;
+    const right = Buffer.alloc(size * size * 4, 255);
+    const upward = Buffer.alloc(size * size * 4, 255);
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        right.fill(x * 20, (y * size + x) * 4, (y * size + x) * 4 + 3);
+        // Brighter toward the top row of the image, which is the +V direction in Unity.
+        upward.fill((size - 1 - y) * 20, (y * size + x) * 4, (y * size + x) * 4 + 3);
+      }
+    }
+    for (const sharp of [false, true]) {
+      const east = heightToNormal({ width: size, height: size, data: right }, 0.25, sharp);
+      const at = (3 * size + 3) * 4;
+      expect(east.data[at]).toBeLessThan(128);
+      expect(Math.abs(east.data[at + 1]! - 128)).toBeLessThanOrEqual(1);
+      const north = heightToNormal({ width: size, height: size, data: upward }, 0.25, sharp);
+      expect(Math.abs(north.data[at]! - 128)).toBeLessThanOrEqual(1);
+      expect(north.data[at + 1]).toBeLessThan(128);
+      // Wrap: the last column steps down to the first, so the seam tilts the other way.
+      expect(east.data[(3 * size + size - 1) * 4]).toBeGreaterThan(128);
+    }
+    expect(heightToNormal({ width: size, height: size, data: right }, 3, false).data[(3 * size + 3) * 4 + 2]).toBeLessThan(255);
+    // The slope grows with 10^bumpiness and with (width + height): a stronger scale tilts further.
+    const weak = heightToNormal({ width: size, height: size, data: right }, 0.1, false).data[(3 * size + 3) * 4]!;
+    const strong = heightToNormal({ width: size, height: size, data: right }, 0.5, false).data[(3 * size + 3) * 4]!;
+    expect(strong).toBeLessThan(weak);
+  });
+
+  it("convertToNormalMap: the recipe converts a normal-role texture whose settings ask for it, then applies flipGreenChannel", async () => {
+    const ramp: DecodedImage = { width: 4, height: 4, data: Buffer.alloc(64, 255) };
+    for (let at = 0; at < 16; at += 1) ramp.data.fill((at % 4) * 60, at * 4, at * 4 + 3);
+    const settings = { ...DEFAULT_TEXTURE, normalMap: true, convertToNormalMap: true };
+    const plain = await renderRecipe({ kind: "copy", texture: "h", role: "normal" }, context(ramp, settings));
+    expect(plain.data).toEqual(heightToNormal(ramp, 0.25, false).data);
+    const flipped = await renderRecipe({ kind: "copy", texture: "h", role: "normal" }, context(ramp, { ...settings, flipGreenChannel: true }));
+    expect(flipped.data[5]).toBe(255 - plain.data[5]!);
   });
 
   it("applies maxTextureSize to the longest edge, keeps the aspect ratio and never scales up", async () => {

@@ -65,6 +65,8 @@ export function readTextureSettings(metaYaml: string): TextureSettings {
     srgb: num(setting(importer, "sRGBTexture"), 1) !== 0,
     normalMap: num(setting(importer, "textureType"), 0) === 1,
     convertToNormalMap: num(setting(importer, "convertToNormalMap"), 0) === 1,
+    heightScale: num(setting(importer, "heightScale"), 0.25),
+    normalMapFilter: num(setting(importer, "normalMapFilter"), 0),
     flipGreenChannel: num(setting(importer, "flipGreenChannel"), 0) === 1,
     ...(unityMax > 0 ? { unityMaxTextureSize: unityMax } : {}),
   };

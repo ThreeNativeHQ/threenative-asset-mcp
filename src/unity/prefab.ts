@@ -16,7 +16,7 @@ import { readFile } from "node:fs/promises";
 import { basename, extname } from "node:path/posix";
 
 import { unityKind } from "./inventory.js";
-import { firstModelId, meshNameFromMeta, type ModelIdSource } from "./model-ids.js";
+import { meshNameFromMeta, modelRootIds, type ModelIdSource } from "./model-ids.js";
 import type { UnityAssetDatabase, UnityAssetEntry } from "./package.js";
 import { asUnityRef, parseUnityDocuments, resolveRef, type UnityDocument, type UnityRef } from "./yaml.js";
 
@@ -373,8 +373,7 @@ export class PrefabResolver {
   /** A model used as a prefab source: one root GameObject and Transform whose edits are applied. */
   private modelScope(model: UnityAssetEntry): Scope {
     const scope = new Scope(model.path);
-    const goId = firstModelId(model.metaYaml, 1) ?? "100000";
-    const transformId = firstModelId(model.metaYaml, 4) ?? "400000";
+    const { gameObject: goId, transform: transformId } = modelRootIds(model.metaYaml);
     const name = basename(model.path, extname(model.path));
     scope.objects.set(goId, this.newObject(scope, CLASS_GAME_OBJECT, "GameObject", { m_Name: name, m_IsActive: 1 }, { model }));
     scope.objects.set(

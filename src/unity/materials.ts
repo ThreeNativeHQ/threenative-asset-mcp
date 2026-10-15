@@ -381,10 +381,7 @@ function resolveMapped(material: UnityMaterial, identity: ShaderIdentity, pipeli
   const normalName = hdrp ? "_NormalMap" : "_BumpMap";
   const bump = r.texture(normalName);
   if (bump) {
-    if (bump.settings.convertToNormalMap) {
-      r.unsupported.push(`convertToNormalMap on ${bump.path} (a height map Unity turns into normals)`);
-      r.used.delete(normalName);
-    } else if (hdrp && r.float("_NormalMapSpace", 0) === 1) {
+    if (hdrp && r.float("_NormalMapSpace", 0) === 1) {
       r.unsupported.push("object-space normal map");
       r.used.delete(normalName);
     } else {
