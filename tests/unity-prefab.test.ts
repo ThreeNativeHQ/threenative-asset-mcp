@@ -48,6 +48,12 @@ function nodeNamed(document: Document, name: string) {
   return found[0]!;
 }
 
+/** The node that holds a named GameObject's mesh: the node itself, or its `:mesh` child that carries Unity's mesh frame. */
+function meshNode(document: Document, name: string) {
+  const node = nodeNamed(document, name);
+  return node.getMesh() ? node : (node.listChildren().find((child) => child.getMesh()) ?? node);
+}
+
 const near = (actual: readonly number[], expected: readonly number[], digits = 5): void => {
   expect(actual).toHaveLength(expected.length);
   expected.forEach((value, index) => expect(actual[index]).toBeCloseTo(value, digits));
@@ -375,7 +381,8 @@ let fbxDirectory = "";
 let parts: Buffer;
 let single: Buffer;
 
-const importerWith = (table: string): string => `ModelImporter:\n  serializedVersion: 22200\n${table}  materials:\n    materialImportMode: 2\n    materialSearch: 1\n  meshes:\n    globalScale: 1\n    useFileScale: 1`;
+// These prefabs have identity transforms, so the FBX unit conversion is off to keep their sizes in metres (the real-pack shape is its own test).
+const importerWith = (table: string): string => `ModelImporter:\n  serializedVersion: 22200\n${table}  materials:\n    materialImportMode: 2\n    materialSearch: 1\n  meshes:\n    globalScale: 1\n    useFileScale: 0`;
 const nameTable = (entries: Record<string, string>): string =>
   `  internalIDToNameTable:\n${Object.entries(entries).map(([id, name]) => `  - first:\n      43: ${id}\n    second: ${name}\n`).join("")}`;
 const recycleTable = (entries: Record<string, string>): string =>
@@ -400,9 +407,9 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
   });
 
   const baseColor = (document: Document, node: string): number[][] =>
-    nodeNamed(document, node).getMesh()!.listPrimitives().map((primitive) => primitive.getMaterial()!.getBaseColorFactor().slice(0, 3));
+    meshNode(document, node).getMesh()!.listPrimitives().map((primitive) => primitive.getMaterial()!.getBaseColorFactor().slice(0, 3));
   const materialNames = (document: Document, node: string): string[] =>
-    nodeNamed(document, node).getMesh()!.listPrimitives().map((primitive) => primitive.getMaterial()!.getName());
+    meshNode(document, node).getMesh()!.listPrimitives().map((primitive) => primitive.getMaterial()!.getName());
   const size = (document: Document, node: string): number[] => {
     const { min, max } = getBounds(nodeNamed(document, node));
     return max.map((value, index) => value - min[index]!);
@@ -482,6 +489,48 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(report.models.map((model) => model.source)).toEqual(["Assets/A/parts.fbx", "Assets/B/parts.fbx", "Assets/C/parts.fbx", "Assets/D/single.fbx"]);
     expect(report.counts).toMatchObject({ models: 4, prefabs: 1, failed: 0 });
     expect(report.materialAssets.map((material) => material.path)).toEqual(["Assets/Mats/green.mat", "Assets/Mats/red.mat"]);
+  }, 180_000);
+
+  it("meshes: a Blender-exported FBX (node scale 100, turned -90 about X) under a prefab that repeats that node lands where Unity puts it, not 100 times too large or turned", async () => {
+    await writePartsFbx(join(fbxDirectory, "offset.fbx"), [{ name: "Foot", size: [0.4, 0.2, 0.1], materials: ["Paint"], offset: [1, 0.5, 0.25] }]);
+    const offset = await readFile(join(fbxDirectory, "offset.fbx"));
+    const half = Math.SQRT1_2;
+    const { report, outputDir } = await importProject([
+      ...folders("Assets", "Assets/Prefabs"),
+      { path: "Assets/offset.fbx", data: offset, importer: importerWith("  internalIDToNameTable: []\n").replace("useFileScale: 0", "useFileScale: 1") },
+      {
+        path: "Assets/Prefabs/Foot.prefab",
+        content: prefabFile(
+          gameObject(10, "Foot", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "Model", { components: [21, 22, 23] }),
+          // The node Unity gives a Blender FBX object: scale 100 and a quarter turn about X.
+          transform(21, 20, { father: 11, rotation: [-half, 0, 0, half], scale: [100, 100, 100] }),
+          meshFilter(22, 20, asset("Assets/offset.fbx", 4300000)),
+          meshRenderer(23, 20, []),
+        ),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Prefabs/Foot.prefab");
+    expect(prefab.unresolved).toEqual([]);
+    expect(prefab.sizeMeters.x).toBeCloseTo(0.4, 3);
+    // Unity: the mesh holds the raw vertices times 0.01 (centimetre file), mirrored in X; the node scales them back and turns Z up into Y up.
+    const unity = multiply(unityMatrix([0, 0, 0], [-half, 0, 0, half], [100, 100, 100]), unityMatrix([0, 0, 0], [0, 0, 0, 1], [-0.01, 0.01, 0.01]));
+    const corners: number[][] = [];
+    for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+      const raw = [1 + sx * 0.2, 0.5 + sy * 0.1, 0.25 + sz * 0.05];
+      const world = [0, 1, 2].map((row) => unity[row]! * raw[0]! + unity[4 + row]! * raw[1]! + unity[8 + row]! * raw[2]!);
+      corners.push([world[0]!, world[1]!, -world[2]!]); // Unity to glTF
+    }
+    const expected = [0, 1, 2].map((axis) => [Math.min(...corners.map((c) => c[axis]!)), Math.max(...corners.map((c) => c[axis]!))]);
+    const document = await read(join(outputDir, prefab.glb));
+    const { min, max } = getBounds(document.getRoot().listScenes()[0]!);
+    for (const axis of [0, 1, 2]) {
+      expect(min[axis], `min ${axis}`).toBeCloseTo(expected[axis]![0]!, 4);
+      expect(max[axis], `max ${axis}`).toBeCloseTo(expected[axis]![1]!, 4);
+    }
+    // Sanity on the expectation itself: the Blender part's Z (up) is the prefab's height, 0.25 m with the part 0.1 m thick.
+    expect(expected[1]).toEqual([expect.closeTo(0.2, 4), expect.closeTo(0.3, 4)]);
   }, 180_000);
 
   it("meshes: a 64-bit id that no table lists and the derivation does not reproduce is matched by the GameObject name, with a warning (real Unity 2022 packs)", async () => {
@@ -607,14 +656,14 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     ]);
     const car = await read(join(outputDir, prefabOf(report, "Assets/Prefabs/Car.prefab").glb));
     expect(materialNames(car, "Wheel")).toEqual(["rubber"]);
-    expect(nodeNamed(car, "Antenna").getMesh()).not.toBeNull();
+    expect(meshNode(car, "Antenna").getMesh()).not.toBeNull();
 
     for (const name of ["Garage", "GarageVariant"]) {
       const prefab = prefabOf(report, `Assets/Prefabs/${name}.prefab`);
       expect(prefab.unresolved).toEqual([]);
       expect(prefab.meshNodes).toBe(2); // Antenna was removed
       const document = await read(join(outputDir, prefab.glb));
-      expect(document.getRoot().listNodes().map((node) => node.getName()).sort()).toEqual(["Body", "Car", "Garage", "Wheel"]);
+      expect(document.getRoot().listNodes().map((node) => node.getName()).filter((name) => !name.endsWith(":mesh")).sort()).toEqual(["Body", "Car", "Garage", "Wheel"]);
       expect(materialNames(document, "Wheel")).toEqual(["chrome"]);
       expect(baseColor(document, "Wheel")).toEqual([[1, 1, 1]]);
       expect(materialNames(document, "Body")).toEqual(["paint", "glass"]);
@@ -649,7 +698,7 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     const document = await read(join(outputDir, prefab.glb));
     near(nodeNamed(document, "PartsRoot").getTranslation(), [4, 0, 0]);
     expect(nodeNamed(document, "Body").getParentNode()?.getName()).toBe("PartsRoot");
-    expect(nodeNamed(document, "Wheel").getMesh()).not.toBeNull();
+    expect(meshNode(document, "Wheel").getMesh()).not.toBeNull();
     expect(prefab.meshNodes).toBe(2);
     expect(prefab.unresolved).toEqual([expect.objectContaining({ kind: "modification", reason: expect.stringMatching(/only the root of a model can be edited/) })]);
   }, 120_000);
@@ -686,9 +735,9 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     ]);
     const prefab = prefabOf(report, "Assets/lod.prefab");
     const document = await read(join(outputDir, prefab.glb));
-    expect(nodeNamed(document, "LOD0").getMesh()).not.toBeNull();
-    expect(nodeNamed(document, "LOD1").getMesh()).toBeNull();
-    expect(nodeNamed(document, "LOD2").getMesh()).toBeNull();
+    expect(meshNode(document, "LOD0").getMesh()).not.toBeNull();
+    expect(meshNode(document, "LOD1").getMesh()).toBeNull();
+    expect(meshNode(document, "LOD2").getMesh()).toBeNull();
     expect(prefab.meshNodes).toBe(1);
     expect(prefab.lodLevels).toEqual([
       { group: "Tree", level: 1, transitionHeight: 0.2, nodes: ["Tree/LOD1"] },

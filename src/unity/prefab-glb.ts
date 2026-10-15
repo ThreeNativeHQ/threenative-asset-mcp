@@ -4,7 +4,7 @@
  * the model's binding for that slot. Each node's local transform is converted once from Unity's space
  * ({@link toGltfTransform}); the geometry is already glTF space, so it is not touched.
  */
-import { Document, Logger, type Material, type Mesh, type Node, PropertyType, type Scene } from "@gltf-transform/core";
+import { Document, Logger, type Material, type Mesh, type Node, PropertyType, type Scene, type mat4 } from "@gltf-transform/core";
 import { copyToDocument, createDefaultPropertyResolver, prune, unpartition } from "@gltf-transform/functions";
 
 import { TextureCache, applyResolvedMaterial, type ImageSource } from "./gltf-materials.js";
@@ -18,6 +18,8 @@ export interface PrefabGlbHost {
   modelDocument(entry: UnityAssetEntry): Promise<Document | undefined>;
   material(entry: UnityAssetEntry): Promise<ResolvedMaterial | undefined>;
   readonly imageSource: ImageSource;
+  /** `fbxMeshFrame` of a converted FBX; absent for other model kinds, which keep their own node chain. */
+  meshFrame(entry: UnityAssetEntry): readonly number[] | undefined;
 }
 
 export interface PrefabGlb {
@@ -38,6 +40,37 @@ interface Source {
 
 const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 const isIdentity = (matrix: readonly number[]): boolean => matrix.every((value, index) => Math.abs(value - IDENTITY[index]!) < 1e-6);
+
+/**
+ * Unity mirrors X when it imports a model, and a prefab's node chain is converted with a Z flip, so a mesh that
+ * Unity places in a prefab needs both: that is a half turn about Y of the model's own conversion. Column-major.
+ * MEASURED on a real pack (U1, 2026-10-15): with the prefab chain left alone, every asymmetric piece matched
+ * Unity's own preview only after a further 100 degrees of yaw, which is exactly this half turn plus Unity's
+ * preview camera (120 degrees about Y in glTF space) against ours (40 degrees).
+ */
+export const HALF_TURN_Y = [-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1];
+
+export function multiplyMatrices(a: readonly number[], b: readonly number[]): number[] {
+  const out = new Array<number>(16).fill(0);
+  for (let column = 0; column < 4; column += 1) {
+    for (let row = 0; row < 4; row += 1) {
+      for (let k = 0; k < 4; k += 1) out[column * 4 + row]! += a[k * 4 + row]! * b[column * 4 + k]!;
+    }
+  }
+  return out;
+}
+
+/**
+ * Maps a Blender-made model GLB's vertices to where Unity's mesh sub-asset puts them, in glTF space, for an FBX.
+ * Blender's importer leaves the FBX's raw vertices in the mesh and the file's own node transforms (and the unit and
+ * axis conversion) on the object; its glTF export then rotates the vertices to Y-up, (x, y, z) -> (x, z, -y).
+ * Unity's mesh holds the raw vertices times the unit scale, mirrored in X, with the node transforms left to the
+ * prefab's own GameObject. So the model's own node chain must not be applied, and the vertices are taken back to
+ * raw, scaled, mirrored in X and flipped in Z: (x, y, z) -> s * (-x, -z, -y).
+ */
+export function fbxMeshFrame(scale: number): number[] {
+  return [-scale, 0, 0, 0, 0, 0, -scale, 0, 0, -scale, 0, 0, 0, 0, 0, 1];
+}
 
 export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGlbHost): Promise<PrefabGlb> {
   const document = new Document().setLogger(new Logger(Logger.Verbosity.SILENT));
@@ -167,10 +200,10 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
       variants.set(key, mesh);
     }
     meshNodes += 1;
-    // The model's own node transform (rare for the Blender route) is kept so the part sits as in the model GLB.
-    const world = picked.owner?.getWorldMatrix();
-    if (world && !isIdentity(world)) {
-      node.addChild(document.createNode(`${item.name}:mesh`).setMatrix(world).setMesh(mesh));
+    // The frame is the mesh's place in Unity's space (see `fbxMeshFrame`); other model kinds keep their node chain, turned half about Y.
+    const frame = host.meshFrame(reference.model) ?? multiplyMatrices(HALF_TURN_Y, picked.owner?.getWorldMatrix() ?? IDENTITY);
+    if (!isIdentity(frame)) {
+      node.addChild(document.createNode(`${item.name}:mesh`).setMatrix(frame as mat4).setMesh(mesh));
     } else node.setMesh(mesh);
   };
 
@@ -181,18 +214,21 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
       unresolved.push({ kind: "prefab", node: item.path, reference: model.path, reason: "the model was not converted" });
       return;
     }
-    const copy = (from: Node, into: Node | Scene): void => {
-      const node = document.createNode(from.getName()).setTranslation(from.getTranslation()).setRotation(from.getRotation()).setScale(from.getScale());
+    const copy = (from: Node, into: Node | Scene, top: boolean): void => {
+      const node = document.createNode(from.getName());
+      // The model's scene is Blender's, in right-handed space; Unity mirrors it in X, which the Z-flipped chain turns into a half turn about Y.
+      if (top) node.setMatrix(multiplyMatrices(HALF_TURN_Y, from.getMatrix()) as mat4);
+      else node.setTranslation(from.getTranslation()).setRotation(from.getRotation()).setScale(from.getScale());
       const mesh = from.getMesh();
       if (mesh) {
         node.setMesh(copyMesh(source, mesh));
         meshNodes += 1;
       }
       into.addChild(node);
-      for (const child of from.listChildren()) copy(child, node);
+      for (const child of from.listChildren()) copy(child, node, false);
     };
     const root = source.document.getRoot();
-    for (const child of (root.getDefaultScene() ?? root.listScenes()[0])?.listChildren() ?? []) copy(child, parent);
+    for (const child of (root.getDefaultScene() ?? root.listScenes()[0])?.listChildren() ?? []) copy(child, parent, true);
   };
 
   const build = async (item: PrefabNode, parent: Node | Scene): Promise<void> => {

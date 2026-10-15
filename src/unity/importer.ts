@@ -34,11 +34,11 @@ import {
   renderRecipe,
 } from "./textures.js";
 import { type ComponentNote, type LodNote, PrefabResolver, type PrefabNode, type ResolvedPrefab, type Unresolved } from "./prefab.js";
-import { writePrefabDocument } from "./prefab-glb.js";
+import { fbxMeshFrame, writePrefabDocument } from "./prefab-glb.js";
 import { parseUnityDocuments, resolveRef } from "./yaml.js";
 
 /** Bump when a change alters the GLBs or the report for the same package. */
-export const UNITY_IMPORTER_VERSION = 3;
+export const UNITY_IMPORTER_VERSION = 4;
 
 const SUPPORTED_MODELS = new Set([".fbx", ".obj", ".blend"]);
 const NEEDS_DCC = new Set([".max", ".ma", ".mb"]);
@@ -260,6 +260,7 @@ class Importer {
   private readonly modelNames = new Set<string>();
   private readonly prefabNames = new Set<string>();
   private readonly modelFiles = new Map<string, string>();
+  private readonly modelFrames = new Map<string, readonly number[]>();
   private readonly modelDocuments = new Map<string, Promise<Document>>();
 
   constructor(
@@ -401,8 +402,16 @@ class Importer {
   }
 
   /** Remembers where a converted model's final GLB is, so prefabs can take its meshes. */
-  recordModel(entry: UnityAssetEntry, glb: string): void {
+  recordModel(entry: UnityAssetEntry, glb: string, scale: ReportModel["scale"]): void {
     this.modelFiles.set(entry.guid, glb);
+    if (extname(entry.path).toLowerCase() === ".fbx") {
+      // The scale Blender applied (see BLENDER_CONVERT_SCRIPT): the file's unit in centimetres with `useFileScale`, else `globalScale` alone.
+      this.modelFrames.set(entry.guid, fbxMeshFrame(scale.useFileScale ? (scale.globalScale * (scale.fileUnitScale ?? 1)) / 100 : scale.globalScale));
+    }
+  }
+
+  meshFrame(entry: UnityAssetEntry): readonly number[] | undefined {
+    return this.modelFrames.get(entry.guid);
   }
 
   /** The converted model's GLB (a prefab host method), read once per run. */
@@ -626,11 +635,12 @@ export async function importUnityPackage(options: UnityImportOptions): Promise<U
         const converted = await runBlender(blender!, entry, work, index, settings, environment);
         const name = importer.modelFileName(entry);
         const finalGlb = join(options.outputDir, "models", `${name}.glb`);
-        models.push(await importer.finishModel(entry, converted.glb, finalGlb, {
+        const model = await importer.finishModel(entry, converted.glb, finalGlb, {
           ...(converted.fileUnitScale !== undefined ? { fileUnitScale: converted.fileUnitScale } : {}),
           warnings: converted.warnings,
-        }));
-        importer.recordModel(entry, finalGlb);
+        });
+        models.push(model);
+        importer.recordModel(entry, finalGlb, model.scale);
         await rm(converted.glb, { force: true });
       } catch (error) {
         if (error instanceof UnityImportError && error.code === "UNITY_OUTPUT_EXISTS") throw error;
