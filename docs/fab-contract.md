@@ -163,6 +163,44 @@ npm run probe:fab
 Set `FAB_PROBE_HEADED=1` to open the same temporary anonymous profile visibly.
 The profile is deleted after the probe.
 
+## Unity-format artifacts through FabCLI (probe 2026-10-14)
+
+A Fab listing can publish a `unity` format beside its Unreal one. Measured with a signed-in
+FabCLI on one owned listing:
+
+- `fabcli formats <uid>` returns a `unity` entry next to the `unreal-engine` one:
+  `extensions: ["unitypackage"]`, `versions: null`, `renderPipelines`, `unityAssetStoreUrl` and
+  `isInUnityAssetStore`. `versions: null` means no `artifactId`.
+- `fabcli library` and `fabcli listing` expose Unreal `projectVersions` only. They carry no Epic
+  catalog coordinates (artifact id, namespace, asset id) for the Unity artifact.
+- `fabcli download <uid>` resolves its coordinates from the library, so for such a listing it
+  fetches the Unreal pack, not the Unity one.
+- The anonymous `/i/listings/<uid>/asset-formats/unity` call returns a Cloudflare challenge to a
+  plain fetch, and `download-info` for an owned paid file needs a signed-in Fab web session.
+  `fabcli ownership` answers `auth_required` (`claim needs a Fab session`), and `fabcli auth
+  status` shows `fab.session_present: false`.
+
+What the server does with that:
+
+- `fab_list_owned` runs `fabcli formats <uid>` once per listing it shows (four at a time) and
+  reports a Unity entry as an artifact with `route: "unity"`, `artifactId` `unity` (or the id
+  FabCLI lists, if one ever appears) and a `unity` block. `unrealOnly: true` hides them and skips
+  the lookups. A failed lookup adds a `warnings` entry and does not drop the listing.
+- `fab_import_asset` takes the Unity route for `format: "unity"`, or when the listing publishes
+  Unity and no Unreal artifact. A listing with both stays on the Unreal route. The Fab licence gate
+  runs first, as for Unreal. No Unity Asset Store terms apply: the licence is the listing's.
+- The route downloads only with explicit `--artifact-id --namespace --asset-id`, never with the
+  listing-only form. When FabCLI lists no Unity artifact id, or the library has no asset id and
+  namespace, nothing is downloaded and the call fails with `FABCLI_UNITY_DOWNLOAD_UNAVAILABLE`,
+  which names the manual route: download the `.unitypackage` from fab.com in a browser and run
+  `asset_import_unity` on it. The server guesses no endpoint, reuses no browser session and never
+  signs in.
+- A downloaded artifact lands in `fab-downloads/<listing>/<artifact>`. It must hold exactly one
+  `.unitypackage`, which goes to the Unity importer (PRD-616). The result has the
+  `asset_import_unity` shape.
+
+Status: the download itself is unproven against a real Unity artifact. See PRD-619.
+
 ## Fixture policy
 
 `tests/fixtures/fab-contracts.ts` contains synthetic, sanitized shapes used for
