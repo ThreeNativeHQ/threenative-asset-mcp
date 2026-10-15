@@ -130,6 +130,17 @@ describe("hierarchy", () => {
     expect(prefab.inactive).toEqual(["Root/Off"]);
     expect((await read(join(outputDir, prefab.glb))).getRoot().listNodes().map((node) => node.getName())).toEqual(["Root"]);
   }, 60_000);
+
+  it("hierarchy: a Unity 5 / 2017 prefab keeps a `Prefab` container document that is the prefab itself, not an instance of another one (real U3 pack)", async () => {
+    const container = "--- !u!1001 &100100000\nPrefab:\n  m_Modification:\n    m_TransformParent: {fileID: 0}\n    m_Modifications: []\n    m_RemovedComponents: []\n  m_ParentPrefab: {fileID: 0}\n  m_RootGameObject: {fileID: 10}\n  m_IsPrefabParent: 1\n";
+    const { report } = await importProject([
+      ...folders("Assets"),
+      { path: "Assets/old.prefab", content: prefabFile(container, gameObject(10, "Root", { components: [11] }), transform(11, 10)) },
+    ]);
+    const prefab = prefabOf(report, "Assets/old.prefab");
+    expect(prefab.unresolved).toEqual([]);
+    expect(prefab.nodes).toBe(1);
+  }, 60_000);
 });
 
 describe("cycle", () => {
