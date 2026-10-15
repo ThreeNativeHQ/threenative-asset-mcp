@@ -638,6 +638,33 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(stranger.unresolved).toEqual([expect.objectContaining({ kind: "mesh", reason: expect.stringMatching(/no mesh id matches/) })]);
   }, 180_000);
 
+  it("meshes: an ancestor's name does not pick a child's mesh (a `Body` root must not give its `Door` child the Body mesh)", async () => {
+    const { report } = await importProject([
+      ...folders("Assets", "Assets/C", "Assets/Prefabs"),
+      { path: "Assets/C/parts.fbx", data: parts, importer: importerWith("  internalIDToNameTable: []\n") },
+      {
+        path: "Assets/Prefabs/Body.prefab",
+        content: prefabFile(
+          gameObject(10, "Body", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "Door", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/C/parts.fbx", "-6579300303780749490")),
+          meshRenderer(23, 20, []),
+          gameObject(30, "Wheel", { components: [31, 32, 33] }),
+          transform(31, 30, { father: 11 }),
+          meshFilter(32, 30, asset("Assets/C/parts.fbx", "-5429810754378104994")),
+          meshRenderer(33, 30, []),
+        ),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Prefabs/Body.prefab");
+    expect(prefab.meshNodes).toBe(1);
+    expect(prefab.unresolved).toEqual([expect.objectContaining({ kind: "mesh", node: "Body/Door" })]);
+    expect(prefab.warnings.join(" ")).toMatch(/matched the mesh named "Wheel"/);
+    expect(prefab.warnings.join(" ")).not.toMatch(/named "Body"/);
+  }, 180_000);
+
   it("meshes: models only a prefab uses are converted when assets names just the prefab, and a model that cannot be converted is reported", async () => {
     const { report } = await importProject(
       [

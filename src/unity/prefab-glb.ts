@@ -126,6 +126,8 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
   let meshNodes = 0;
   let boundSlots = 0;
   const boundMaterials = new Set<string>();
+  const countMeshes = (items: readonly PrefabNode[]): number => items.reduce((sum, item) => sum + (item.mesh ? 1 : 0) + countMeshes(item.children), 0);
+  const meshBearing = countMeshes(prefab.roots);
 
   const sourceFor = async (model: UnityAssetEntry): Promise<Source | null> => {
     const known = sources.get(model.guid);
@@ -185,8 +187,10 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
     if (found) return found;
     if (reference.name === undefined) {
       // Real packs (Unity 2022, empty `internalIDToNameTable`) use 64-bit ids that the derived-id route does not reproduce.
-      // The prefab then usually names its mesh: a GameObject on the path, leaf first, is called like exactly one mesh.
-      for (const segment of node.split("/").reverse()) {
+      // The prefab then names its mesh by the GameObject itself, or, when the prefab has no other mesh to mix up, by its root
+      // (U2: `SM_x` > `Model` holds the mesh called `SM_x`). An ancestor's name must not pick a child's mesh (a `Car` body for a `Door`).
+      const segments = node.split("/");
+      for (const segment of new Set([segments[segments.length - 1]!, ...(meshBearing === 1 ? [segments[0]!] : [])])) {
         const named = candidates.filter((candidate) => candidate.name === segment || candidate.mesh.getName() === segment);
         if (named.length === 1) {
           warnings.push(`${node}: mesh ${reference.ref.fileID} is not in any table of ${reference.model.path}; matched the mesh named "${segment}" by the GameObject name (UNVERIFIED)`);
