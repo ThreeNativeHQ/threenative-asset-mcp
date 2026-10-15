@@ -66,7 +66,9 @@ export function multiplyMatrices(a: readonly number[], b: readonly number[]): nu
  * axis conversion) on the object; its glTF export then rotates the vertices to Y-up, (x, y, z) -> (x, z, -y).
  * Unity's mesh holds the raw vertices times the unit scale, mirrored in X, with the node transforms left to the
  * prefab's own GameObject. So the model's own node chain must not be applied, and the vertices are taken back to
- * raw, scaled, mirrored in X and flipped in Z: (x, y, z) -> s * (-x, -z, -y).
+ * raw, scaled, mirrored in X and flipped in Z: (x, y, z) -> s * (-x, -z, -y). The one part of the node chain Unity keeps is its translation
+ * (the mesh's offset from its pivot); the writer adds it, see `writePrefabDocument`. MEASURED on U3: crystals that Unity previews as one cluster
+ * are 12 m apart without it.
  */
 export function fbxMeshFrame(scale: number): number[] {
   return [-scale, 0, 0, 0, 0, 0, -scale, 0, 0, -scale, 0, 0, 0, 0, 0, 1];
@@ -201,7 +203,18 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
     }
     meshNodes += 1;
     // The frame is the mesh's place in Unity's space (see `fbxMeshFrame`); other model kinds keep their node chain, turned half about Y.
-    const frame = host.meshFrame(reference.model) ?? multiplyMatrices(HALF_TURN_Y, picked.owner?.getWorldMatrix() ?? IDENTITY);
+    const fbxFrame = host.meshFrame(reference.model);
+    const frame = fbxFrame ? [...fbxFrame] : multiplyMatrices(HALF_TURN_Y, picked.owner?.getWorldMatrix() ?? IDENTITY);
+    if (fbxFrame && picked.owner) {
+      // A file node that sits away from its pivot (Maya: node translation T, vertices about -T) keeps its place in Unity's mesh.
+      // T is in the node's raw units, so it takes the model's unit scale like the vertices do, then the half turn about Y.
+      const world = picked.owner.getWorldMatrix();
+      const chainScale = Math.hypot(world[0]!, world[1]!, world[2]!) || 1;
+      const k = -frame[0]! / chainScale;
+      frame[12] = -world[12]! * k;
+      frame[13] = world[13]! * k;
+      frame[14] = -world[14]! * k;
+    }
     if (!isIdentity(frame)) {
       node.addChild(document.createNode(`${item.name}:mesh`).setMatrix(frame as mat4).setMesh(mesh));
     } else node.setMesh(mesh);
