@@ -271,6 +271,8 @@ export interface UnityFidelityOptions {
   readonly tile?: number;
   /** `models` scores the model-level GLBs (the "before" of PRD-618's evidence); the default scores prefabs when the import has any. */
   readonly level?: "prefabs" | "models";
+  /** Project paths of the pieces to score and draw (the corpus slice); the rest of the import is left out of the sheet. */
+  readonly slice?: readonly string[];
 }
 
 export async function readImportReport(importDir: string): Promise<UnityImportReport> {
@@ -312,7 +314,9 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   const importDir = resolve(options.importDir);
   const out = resolve(options.out);
   const report = await readImportReport(importDir);
-  const scored = scoredPieces(report, options.level);
+  const chosen = options.slice && options.slice.length > 0 ? new Set(options.slice) : undefined;
+  const levelPieces = scoredPieces(report, options.level);
+  const scored = chosen ? levelPieces.filter((piece) => chosen.has(piece.source)) : levelPieces;
   const absolute = (key: string): string => join(importDir, key);
   await mkdir(out, { recursive: true });
 
@@ -354,11 +358,12 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
       glbPaths: scored.map((model) => absolute(model.glb)),
       outPath: join(out, "sheet.jpg"),
       title: `Unity fidelity (${references.kind})`,
-      subtitle: `${referenceNote}; ${scored.length} ${scored === report.prefabs ? "prefab" : "model"}(s), importer v${report.importerVersion}`,
+      subtitle: `${referenceNote}; ${scored.length} ${levelPieces === report.prefabs ? "prefab" : "model"}(s), importer v${report.importerVersion}`,
       selection: "spread",
       maxMeshes: options.max ?? 36,
       ...(options.tile !== undefined ? { tile: options.tile } : {}),
-      thumbnails: new Map([...references.images].map(([glb, image]) => [absolute(glb), swapped?.get(glb) ?? image.png])),
+      // With no reference at all (generic icons only) the sheet still shows our renders, so they can be looked at.
+      ...(references.images.size > 0 ? { thumbnails: new Map([...references.images].map(([glb, image]) => [absolute(glb), swapped?.get(glb) ?? image.png])) } : {}),
       expectColoured: new Set(texturedModels(report).map(absolute)),
       dumpTilesDir: tilesDir,
       referenceLabel: label,
@@ -394,9 +399,9 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   await writeFile(join(out, "fidelity.json"), `${JSON.stringify(pieces, null, 1)}\n`);
   await writeFile(
     join(out, "reference.json"),
-    `${JSON.stringify({ level: scored === report.prefabs ? "prefabs" : "models", reference: references.kind, note: referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, summary }, null, 1)}\n`,
+    `${JSON.stringify({ level: levelPieces === report.prefabs ? "prefabs" : "models", reference: references.kind, note: referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, summary }, null, 1)}\n`,
   );
-  return { level: scored === report.prefabs ? "prefabs" : "models", reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, genericPreviews: references.generic?.length ?? 0, pieces, summary };
+  return { level: levelPieces === report.prefabs ? "prefabs" : "models", reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, genericPreviews: references.generic?.length ?? 0, pieces, summary };
 }
 
 /** The per-piece table the PR evidence rule asks for (verdict, score, hue, saturation, fill, size). */

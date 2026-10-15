@@ -3,7 +3,8 @@
  * `runUnityFidelity`, and writes what `scripts/fidelity-baseline.ts check` reads (`<out>/sheets/<id>.json`).
  *
  * Corpus layout (local only, see the epic README): `<corpus>/<id>/*.unitypackage`, an optional `<id>/reference/` (R1) and
- * an optional `<id>/slice.json` (`{ "assets": [...] }`, the model paths the PR renders). A missing corpus is not a failure.
+ * an optional `<id>/slice.json` (`{ "assets": [...] }`, the project paths of the pieces the sheet renders). The whole pack is always
+ * imported, so the structural counts cover every prefab; the slice only picks the sheet's pieces. A missing corpus is not a failure.
  * Everything written under `<out>` derives from a licensed pack: local-only, never commit it.
  */
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -120,7 +121,6 @@ export async function runUnityParity(options: ParityOptions): Promise<PackOutcom
     const report = await importUnityPackage({
       source: packagePath,
       outputDir: importDir,
-      ...(slice.assets && slice.assets.length > 0 ? { assets: slice.assets } : {}),
       ...(options.environment ? { environment: options.environment } : {}),
       ...(options.blender ? { blender: options.blender } : {}),
     });
@@ -132,6 +132,7 @@ export async function runUnityParity(options: ParityOptions): Promise<PackOutcom
       ...((await exists(referenceDir)) ? { referenceDir } : {}),
       ...(options.max !== undefined ? { max: options.max } : {}),
       ...(options.level ? { level: options.level } : {}),
+      ...(slice.assets && slice.assets.length > 0 ? { slice: slice.assets } : {}),
     });
 
     // The ratchet reads `{ judge }`; the rest is for people. Numbers and verdicts, no pixels.
