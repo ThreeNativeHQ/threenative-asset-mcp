@@ -101,6 +101,11 @@ export interface ContactSheetOptions {
    * ORIGINAL | AFTER IMPORT pair, and the gallery image shrinks to a header reference.
    */
   thumbnails?: ReadonlyMap<string, Buffer>;
+  /**
+   * With `thumbnails`: the picture to measure against in place of the one drawn, same keys. For a reference that was
+   * lit by another rig than ours (Unity's preview), compensated by fixed constants, while the sheet still shows the original.
+   */
+  measuredThumbnails?: ReadonlyMap<string, Buffer>;
   /** GLB keys (same form as `thumbnails`) whose report says they have coloured or textured sections. */
   expectColoured?: ReadonlySet<string>;
   /**
@@ -188,6 +193,8 @@ interface Candidate {
   failed: boolean;
   /** The Unreal thumbnail for this piece, when thumbnails were given. */
   thumbnail?: Buffer | undefined;
+  /** What the render is measured against when that is not the picture drawn (`ContactSheetOptions.measuredThumbnails`). */
+  measured?: Buffer | undefined;
   expectColoured?: boolean;
 }
 
@@ -824,12 +831,13 @@ export async function renderContactSheet(
     options.glbPaths.map(async (path) => {
       const name = basename(path, extname(path));
       const thumbnail = lookup(options.thumbnails, path);
+      const measured = lookup(options.measuredThumbnails, path);
       const expectColoured = [...(options.expectColoured ?? [])].some((key) => path.split("\\").join("/").endsWith(`/${key}`) || path === key);
       try {
         const score = await glbBoundsScore(path);
-        return { path, name, score, failed: score < 0, thumbnail, expectColoured };
+        return { path, name, score, failed: score < 0, thumbnail, measured, expectColoured };
       } catch {
-        return { path, name, score: -1, failed: true, thumbnail, expectColoured };
+        return { path, name, score: -1, failed: true, thumbnail, measured, expectColoured };
       }
     }),
   );
@@ -916,7 +924,7 @@ export async function renderContactSheet(
     let fidelity: FidelityMetrics | undefined;
     if (candidate.thumbnail !== undefined) {
       try {
-        const reference = await decodeRgba(candidate.thumbnail);
+        const reference = await decodeRgba(candidate.measured ?? candidate.thumbnail);
         const comparison = colourSimilarity(reference, pixels, referenceObjectMask(reference));
         const shapePixels = decodedShape === undefined ? undefined : cutTile(decodedShape, tile, index % columns, Math.floor(index / columns));
         const measured = measureFidelity(reference, pixels, shapePixels);

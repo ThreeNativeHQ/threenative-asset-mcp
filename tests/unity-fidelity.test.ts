@@ -1,6 +1,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 
 import { swapRedBlue } from "../src/unreal/package-thumbnail.js";
@@ -8,6 +9,9 @@ import {
   type R1Bounds,
   type UnityFidelityResult,
   checkSize,
+  UNITY_RIG_LIGHTNESS_GAIN,
+  UNITY_RIG_SATURATION_GAIN,
+  compensatePreviewRig,
   decideChannelOrder,
   inspectPng,
   runUnityFidelity,
@@ -101,12 +105,25 @@ describe("fidelity sheet against R2 previews", () => {
     { name: "lamp", factor: ORANGE },
   ];
 
+  it("R2 compensates Unity's dimmer, greyer preview rig by default, and not when asked", async () => {
+    // Previews as Unity's rig would draw these pieces: the render, with saturation and lightness taken down by the fixed gains.
+    const dimmed = new Map<string, Buffer>();
+    for (const [name, png] of await previews(pieces)) {
+      dimmed.set(name, await compensatePreviewRig(png, { saturation: 1 / UNITY_RIG_SATURATION_GAIN, lightness: 1 / UNITY_RIG_LIGHTNESS_GAIN }));
+    }
+    const { packagePath, importDir, root } = await setup(pieces, dimmed);
+    const compensated = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160 });
+    const raw = await runUnityFidelity({ importDir, packagePath, out: join(root, "out-raw"), tile: 160, compensate: false });
+    expect(compensated.summary.meanScore ?? 0).toBeGreaterThanOrEqual(80);
+    expect(compensated.summary.meanScore ?? 0).toBeGreaterThan((raw.summary.meanScore ?? 0) + 10);
+  }, 120_000);
+
   it("scores an import against the package preview, and a wrong base colour drops below 70", async () => {
     const correct = await previews(pieces);
     // The lamp imports blue where the Editor preview shows orange.
     const imported = pieces.map((piece) => (piece.name === "lamp" ? { ...piece, factor: BLUE } : piece));
     const { packagePath, importDir, root } = await setup(imported, correct);
-    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160 });
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false });
 
     expect(result.reference).toBe("R2");
     expect(scoreOf(result, "crate")).toBeGreaterThanOrEqual(85);
@@ -134,7 +151,7 @@ describe("fidelity sheet against R2 previews", () => {
     const stored = new Map<string, Buffer>();
     for (const [name, png] of correct) stored.set(name, await swapRedBlue(png));
     const { packagePath, importDir, root } = await setup(warm, stored);
-    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160 });
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false });
 
     expect(result.channelOrder?.order).toBe("bgr");
     expect(result.referenceNote).toMatch(/swapped/);
@@ -145,7 +162,7 @@ describe("fidelity sheet against R2 previews", () => {
     const correct = await previews(pieces);
     const imported = pieces.map((piece) => (piece.name === "crate" ? { ...piece, factor: LIME } : piece));
     const { packagePath, importDir, root } = await setup(imported, correct);
-    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160 });
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false });
     expect(result.channelOrder?.order).toBe("rgb");
     expect(scoreOf(result, "crate")).toBeLessThan(70);
   }, 120_000);
@@ -202,7 +219,7 @@ describe("fidelity sheet scores prefabs against prefab previews", () => {
   it("a wrong prefab colour is caught: the grey model-level pair cannot hide it", async () => {
     const imported = pieces.map((piece) => (piece.name === "lamp" ? { ...piece, prefabFactor: BLUE } : piece));
     const { root, packagePath, importDir } = await prefabSetup(imported);
-    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160 });
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false });
 
     expect(result.pieces.map((piece) => piece.glb).sort()).toEqual(["prefabs/barrel.glb", "prefabs/crate.glb", "prefabs/lamp.glb"].map((glb) => expect.stringMatching(glb)));
     expect(scoreOf(result, "crate")).toBeGreaterThanOrEqual(85);
@@ -228,7 +245,7 @@ describe("fidelity sheet scores prefabs against prefab previews", () => {
     ]);
     const importDir = join(root, "import");
     await writeSyntheticImport(importDir, four);
-    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160 });
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false });
 
     expect(result.genericPreviews).toBe(3);
     expect(result.unmatched.map((glb) => glb.replace(/^.*\//, "")).sort()).toEqual(["a.glb", "b.glb", "c.glb"]);
@@ -239,7 +256,7 @@ describe("fidelity sheet scores prefabs against prefab previews", () => {
 
   it("level: models still scores the model-level GLBs (the before column)", async () => {
     const { root, packagePath, importDir } = await prefabSetup(pieces);
-    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, level: "models" });
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false, level: "models" });
     expect(result.pieces.every((piece) => piece.glb.includes("/models/"))).toBe(true);
     expect(result.pieces).toHaveLength(3);
   }, 120_000);
@@ -272,7 +289,9 @@ describe("fidelity sheet reference", () => {
 
   it("reference: a synthetic R1 folder is used instead of R2, and the column is labelled R1", async () => {
     // The package previews are deliberately wrong (every piece blue): only R1 can give a high score.
-    const wrong = await previews(pieces.map((piece) => ({ ...piece, factor: LIME })));
+    // Different wrong colours: one picture shared by three assets would read as Unity's generic icon, not a reference.
+    const wrongColours = { crate: LIME, barrel: BLUE, lamp: [0.6, 0.1, 0.6] as const };
+    const wrong = await previews(pieces.map((piece) => ({ ...piece, factor: wrongColours[piece.name as keyof typeof wrongColours] })));
     const { packagePath, importDir, root } = await setup(pieces, wrong);
     const r1 = join(root, "reference");
     await writeR1(r1, (piece) => piece.size ?? 1);
@@ -288,7 +307,7 @@ describe("fidelity sheet reference", () => {
     expect(written.reference).toBe("R1");
 
     // Without the R1 folder the wrong R2 previews pull the same import down.
-    const viaR2 = await runUnityFidelity({ importDir, packagePath, out: join(root, "out-r2"), tile: 160 });
+    const viaR2 = await runUnityFidelity({ importDir, packagePath, out: join(root, "out-r2"), tile: 160, compensate: false });
     expect(viaR2.reference).toBe("R2");
     expect(scoreOf(viaR2, "crate")).toBeLessThan(70);
     // A named but missing R1 folder falls back to R2 and says so.
@@ -355,11 +374,28 @@ describeWithTools(["blender", "chromium"], "fidelity of a real importer run", ()
       ]);
       const importDir = join(dir, "import");
       await importUnityPackage({ source: packagePath, outputDir: importDir });
-      return runUnityFidelity({ importDir, packagePath, out: join(dir, "out"), tile: 160 });
+      return runUnityFidelity({ importDir, packagePath, out: join(dir, "out"), tile: 160, compensate: false });
     };
     const good = await build(picked);
     const bad = await build([0.3, 0.9, 0.3]);
     expect(scoreOf(good, "crate")).toBeGreaterThanOrEqual(75);
     expect(scoreOf(bad, "crate")).toBeLessThan(70);
   }, 240_000);
+});
+
+describe("Unity preview rig compensation", () => {
+  const pixel = async (rgb: readonly [number, number, number]): Promise<Buffer> =>
+    sharp(Buffer.from([...rgb, 255]), { raw: { width: 1, height: 1, channels: 4 } }).png().toBuffer();
+  const read = async (png: Buffer): Promise<number[]> => [...(await sharp(png).ensureAlpha().raw().toBuffer())];
+
+  it("brightens and saturates by the fixed gains, keeps the hue, clamps, and leaves black and the alpha alone", async () => {
+    // A dim, grey-ish brown (hue 30 degrees, saturation 0.25, value 0.4) becomes saturation 0.5, value 0.68 at the same hue.
+    const [r, g, b, a] = await read(await compensatePreviewRig(await pixel([102, 90, 76]), { saturation: 2, lightness: 1.7 }));
+    expect(a).toBe(255);
+    expect((g! - b!) / (r! - b!)).toBeCloseTo((90 - 76) / (102 - 76), 1);
+    expect(r).toBe(173);
+    expect(1 - b! / r!).toBeCloseTo(0.5, 1);
+    expect(await read(await compensatePreviewRig(await pixel([0, 0, 0])))).toEqual([0, 0, 0, 255]);
+    expect(await read(await compensatePreviewRig(await pixel([200, 40, 40]), { saturation: 2, lightness: 2 }))).toEqual([255, 0, 0, 255]);
+  });
 });

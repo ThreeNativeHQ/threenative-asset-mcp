@@ -22,6 +22,8 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 
+import sharp from "sharp";
+
 import { renderContactSheet, type TileJudgement } from "../unreal/contact-sheet.js";
 import { decodeRgba } from "../unreal/image-diff.js";
 import { swapRedBlue } from "../unreal/package-thumbnail.js";
@@ -210,6 +212,47 @@ export async function readR2(packagePath: string, models: readonly ReportModelLi
   }
 }
 
+/**
+ * Unity lights a package preview with its own rig (a dim sky and a reflection probe), so against our neutral picture the
+ * same piece reads darker and greyer, whatever its import. MEASURED on U1 (31 prefabs, importer v4, 2026-10-15) before any
+ * compensation: median saturation ratio (ours over Unity's) 1.46, median lightness ratio 2.62, silhouette mass ratio 1.04.
+ * A texture's own preview equals its pixels (RGB order, sRGB), so this is lighting, not decoding. The two gains below
+ * bring both U1 medians to 0.98 and 0.96 (the lightness gain is in sRGB values, the metric reads linear light, and
+ * saturation and lightness interact, so neither equals its median). Fixed once: never tuned per asset or per pack, and
+ * checked out of sample on U2 and U3. Only the measured copy of the reference is compensated; the sheet shows Unity's picture as it is.
+ */
+export const UNITY_RIG_SATURATION_GAIN = 2.0;
+export const UNITY_RIG_LIGHTNESS_GAIN = 1.7;
+
+/** The reference with Unity's preview rig compensated: saturation and value scaled by the two fixed gains, hue untouched. */
+export async function compensatePreviewRig(png: Buffer, gains = { saturation: UNITY_RIG_SATURATION_GAIN, lightness: UNITY_RIG_LIGHTNESS_GAIN }): Promise<Buffer> {
+  const { data, info } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  for (let at = 0; at < data.length; at += 4) {
+    const r = data[at]! / 255;
+    const g = data[at + 1]! / 255;
+    const b = data[at + 2]! / 255;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const delta = max - min;
+    let hue = 0;
+    if (delta > 0) {
+      if (max === r) hue = ((g - b) / delta + 6) % 6;
+      else if (max === g) hue = (b - r) / delta + 2;
+      else hue = (r - g) / delta + 4;
+    }
+    const saturation = Math.min(1, (max === 0 ? 0 : delta / max) * gains.saturation);
+    const value = Math.min(1, max * gains.lightness);
+    const chroma = value * saturation;
+    const x = chroma * (1 - Math.abs((hue % 2) - 1));
+    const [rr, gg, bb] = hue < 1 ? [chroma, x, 0] : hue < 2 ? [x, chroma, 0] : hue < 3 ? [0, chroma, x] : hue < 4 ? [0, x, chroma] : hue < 5 ? [x, 0, chroma] : [chroma, 0, x];
+    const offset = value - chroma;
+    data[at] = Math.round((rr + offset) * 255);
+    data[at + 1] = Math.round((gg + offset) * 255);
+    data[at + 2] = Math.round((bb + offset) * 255);
+  }
+  return sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
+}
+
 export interface ChannelDecision {
   readonly order: "rgb" | "bgr";
   readonly evidence: string;
@@ -273,6 +316,8 @@ export interface UnityFidelityOptions {
   readonly level?: "prefabs" | "models";
   /** Project paths of the pieces to score and draw (the corpus slice); the rest of the import is left out of the sheet. */
   readonly slice?: readonly string[];
+  /** R2 only: `false` measures against Unity's preview as it is (the default compensates its rig, see `UNITY_RIG_SATURATION_GAIN`). */
+  readonly compensate?: boolean;
 }
 
 export async function readImportReport(importDir: string): Promise<UnityImportReport> {
@@ -353,6 +398,15 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   });
 
   const tilesDir = join(out, "tiles");
+  // R2 only: R1 is rendered by our own rig and needs no compensation.
+  const compensated = new Map<string, Buffer>();
+  const swappedCompensated = new Map<string, Buffer>();
+  if (references.kind === "R2" && options.compensate !== false) {
+    for (const [glb, image] of references.images) {
+      compensated.set(glb, await compensatePreviewRig(image.png));
+      swappedCompensated.set(glb, await compensatePreviewRig(await swapRedBlue(image.png)));
+    }
+  }
   const draw = (swapped: ReadonlyMap<string, Buffer> | undefined) =>
     renderContactSheet({
       glbPaths: scored.map((model) => absolute(model.glb)),
@@ -364,6 +418,7 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
       ...(options.tile !== undefined ? { tile: options.tile } : {}),
       // With no reference at all (generic icons only) the sheet still shows our renders, so they can be looked at.
       ...(references.images.size > 0 ? { thumbnails: new Map([...references.images].map(([glb, image]) => [absolute(glb), swapped?.get(glb) ?? image.png])) } : {}),
+      ...(compensated.size > 0 ? { measuredThumbnails: new Map([...compensated].map(([glb, png]) => [absolute(glb), swapped ? (swappedCompensated.get(glb) ?? png) : png])) } : {}),
       expectColoured: new Set(texturedModels(report).map(absolute)),
       dumpTilesDir: tilesDir,
       referenceLabel: label,
