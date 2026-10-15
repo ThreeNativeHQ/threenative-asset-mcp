@@ -132,6 +132,14 @@ export interface ContactSheetOptions {
    * so the neutral sheet and judge stay byte-identical.
    */
   sourceGrid?: ThumbnailSourceGrid;
+  /**
+   * Names the reference column when it is not an Unreal editor thumbnail (Unity: `R1 Editor render`, `R2 package preview`).
+   * The tile caption then prints the fidelity score with its hue, saturation and fill parts instead of the colour
+   * similarity. Unset keeps every Unreal sheet unchanged.
+   */
+  referenceLabel?: string;
+  /** With `referenceLabel`: an extra caption line per tile, keyed like `thumbnails` (for example a size mismatch). */
+  tileNotes?: ReadonlyMap<string, string>;
 }
 
 export interface TileJudgement {
@@ -993,11 +1001,15 @@ export async function renderContactSheet(
   // Names what the floor actually sampled. Without a supplied Grid the caption keeps its procedural wording.
   const floorNote = appliedGrid === undefined ? "procedural Grid approximation" : "actual source Grid pixels (filtering approximated)";
   const afterImportLine =
-    pictureLighting === "unreal-like"
+    options.referenceLabel !== undefined
+      ? `Each tile: ORIGINAL = ${options.referenceLabel} | AFTER IMPORT = our GLB, neutral light.`
+      : pictureLighting === "unreal-like"
       ? `AFTER IMPORT: UE4.19.2 lights + ${lightingNote}.`
       : "Each tile: ORIGINAL = Unreal editor thumbnail of that asset | AFTER IMPORT = our GLB, neutral light.";
   const scoreLine =
-    pictureLighting === "unreal-like"
+    options.referenceLabel !== undefined
+      ? "Score 0..100 = hue, saturation, silhouette fill and (weakly) lightness; camera and lighting differ. Under 70 is suspect."
+      : pictureLighting === "unreal-like"
       ? `Source floor math; ${floorNote}. Current camera; primary-only PCF shadows. Scores: neutral view.`
       : "Colour similarity compares object colour only (camera and lighting differ). It is not a match score.";
   const header = withThumbnails ? REFERENCE_BAND : HEADER;
@@ -1014,7 +1026,7 @@ export async function renderContactSheet(
     svg.push(
       text(referenceLeft, 28, 15, "#e8e8ee", clip(options.title, 70), 'font-weight="bold"'),
       ...(options.subtitle !== undefined ? [text(referenceLeft, 50, 12, "#c8c8d4", clip(options.subtitle, 110))] : []),
-      text(referenceLeft, 74, 12, "#9a9aaa", galleryPanel === undefined ? "no gallery image" : "Fab gallery image at left: reference only, a lit full scene"),
+      text(referenceLeft, 74, 12, "#9a9aaa", galleryPanel === undefined ? (options.referenceLabel === undefined ? "no gallery image" : `reference column: ${options.referenceLabel}`) : "Fab gallery image at left: reference only, a lit full scene"),
       text(referenceLeft, 94, 12, "#9a9aaa", clip(afterImportLine, noteWidth)),
       text(referenceLeft, 112, 12, "#9a9aaa", clip(scoreLine, noteWidth)),
     );
@@ -1030,7 +1042,7 @@ export async function renderContactSheet(
   }
   if (count === 0) {
     svg.push(
-      text(gridLeft + gridWidth / 2, header + bodyHeight / 2, 18, "#e8e8ee", withThumbnails ? "no pieces with an Unreal thumbnail" : "no meshes", 'text-anchor="middle"'),
+      text(gridLeft + gridWidth / 2, header + bodyHeight / 2, 18, "#e8e8ee", withThumbnails ? (options.referenceLabel === undefined ? "no pieces with an Unreal thumbnail" : "no pieces with a reference image") : "no meshes", 'text-anchor="middle"'),
     );
   }
   const layers: OverlayOptions[] = [];
@@ -1044,7 +1056,7 @@ export async function renderContactSheet(
       if (thumbnail !== undefined) layers.push({ input: thumbnail, left: cellX, top: y });
       svg.push(
         `<rect x="${cellX}" y="${y}" width="${tile}" height="18" fill="#000" fill-opacity="0.6"/>`,
-        text(cellX + 5, y + 13, 11, "#fff", "ORIGINAL (Unreal editor thumbnail)", 'font-weight="bold"'),
+        text(cellX + 5, y + 13, 11, "#fff", `ORIGINAL (${options.referenceLabel ?? "Unreal editor thumbnail"})`, 'font-weight="bold"'),
         `<rect x="${x}" y="${y}" width="${tile}" height="18" fill="#000" fill-opacity="0.6"/>`,
         text(x + 5, y + 13, 11, "#fff", "AFTER IMPORT", 'font-weight="bold"'),
         `<rect x="${cellX}" y="${y}" width="${tile * 2}" height="${tile}" fill="none" stroke="#000" stroke-width="2"/>`,
@@ -1053,7 +1065,8 @@ export async function renderContactSheet(
     if (!rendered[index]) {
       svg.push(text(x + tile / 2, y + tile / 2, 16, "#fff", "load failed", 'text-anchor="middle"'));
     }
-    const strip = withThumbnails ? PAIR_CAPTION : 36;
+    const note = lookup(options.tileNotes, candidate.path);
+    const strip = withThumbnails ? PAIR_CAPTION + (note === undefined ? 0 : 13) : 36;
     svg.push(
       `<rect x="${x}" y="${y + tile - strip}" width="${tile}" height="${strip}" fill="#000" fill-opacity="0.6"/>`,
       text(x + 6, y + tile - strip + 14, 12, "#fff", clip(candidate.name, Math.floor(tile / 7) - 5), 'font-weight="bold"'),
@@ -1061,12 +1074,21 @@ export async function renderContactSheet(
     );
     let line = y + tile - strip + 28;
     if (withThumbnails) {
+      const f = entry.fidelity;
       const similarityText =
-        entry.similarity === undefined
-          ? "colour similarity n/a"
-          : `colour similarity ${entry.similarity.toFixed(2)} (dE ${entry.meanColourDelta!.toFixed(0)})`;
+        options.referenceLabel !== undefined
+          ? f === undefined
+            ? "score n/a (not comparable)"
+            : `score ${Math.round(f.score)} hue ${f.hueEmdDegrees.toFixed(0)}° sat ${f.saturationRatio.toFixed(2)} fill ${f.densityRatio.toFixed(2)}`
+          : entry.similarity === undefined
+            ? "colour similarity n/a"
+            : `colour similarity ${entry.similarity.toFixed(2)} (dE ${entry.meanColourDelta!.toFixed(0)})`;
       svg.push(text(x + 6, line, 11, "#dfe6ff", similarityText));
       line += 13;
+      if (note !== undefined) {
+        svg.push(text(x + 6, line, 10, "#ff9f9f", clip(note, Math.floor(tile / 5.6) - 2)));
+        line += 13;
+      }
     }
     const reason = entry.reasons[0];
     svg.push(

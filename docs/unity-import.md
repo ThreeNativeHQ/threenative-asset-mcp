@@ -98,6 +98,15 @@ and HDR are not decoded: the slot stays empty and the material carries a warning
 Normal maps and masks stay linear: their bytes are not changed. A colour texture that Unity samples as linear
 (`sRGBTexture: 0`) is re-encoded to sRGB. `flipGreenChannel` is applied to normal maps.
 
+## Measuring fidelity
+
+`npx tsx scripts/fidelity-sheet.ts --unity-package <file> [--unity-reference <R1 dir>] [--import <dir>] --out <dir>` scores
+an import against a Unity picture and writes a reference | after sheet with the verdict and score (hue, saturation,
+silhouette fill, 0..100) under each render. The reference is `R1` when the folder has a `bounds.json` (rendered by
+`scripts/unity/ReferenceRender.cs`, which also gives the sizes the sheet checks to 1 %), else `R2`, the package's
+own `preview.png` files. `npm run parity:unity` does the same for the corpus packs `U1` to `U3` and writes the files
+`scripts/fidelity-baseline.ts check` reads. `tests/unity-visual-regression.test.ts` locks the material rules.
+
 ## Limits
 
 - The corpus packs of the epic (`U1` to `U3`) are not imported yet, so no row is Verified.

@@ -17,6 +17,8 @@ export interface FixtureFile {
   /** The importer block of the `.meta` (for example `ModelImporter:\n  meshes:\n    globalScale: 2`). */
   readonly importer?: string;
   readonly preview?: boolean;
+  /** A real `preview.png` (PNG bytes), instead of the placeholder text `preview` writes. */
+  readonly previewData?: Buffer;
   /** Path the guid derives from, when it differs from `path` (a UPM tarball stores relative paths). */
   readonly guidPath?: string;
 }
@@ -86,7 +88,8 @@ export async function writePackageTree(
     const guid = guidFor(file.path);
     folders.push(guid);
     if (!isFolder(file)) await put(join(staging, guid, "asset"), file.data ?? file.content!);
-    if (file.preview) await put(join(staging, guid, "preview.png"), "fake preview");
+    if (file.previewData) await put(join(staging, guid, "preview.png"), file.previewData);
+    else if (file.preview) await put(join(staging, guid, "preview.png"), "fake preview");
     await put(join(staging, guid, "asset.meta"), metaFor(file.path, isFolder(file), file.importer));
     await put(join(staging, guid, "pathname"), `${pathnameOf(file)}\n00`);
   }
@@ -113,4 +116,18 @@ export async function writeUpmTarball(archive: string, name: string, files: read
 /** Packs hostile members with GNU tar. `-P` keeps `..` and absolute names. */
 export function tarWith(archive: string, cwd: string, members: readonly string[], extra: readonly string[] = []): void {
   tar(["-czPf", archive, ...extra, ...members], cwd);
+}
+
+/**
+ * Runs a repo script through node's tsx loader with a private TMPDIR. tsx writes its transform cache into TMPDIR, which the
+ * leak gate counts as a leak, so the child gets a directory of its own that the test removes (as `tests/unity-intake.test.ts` does).
+ */
+export async function runScript(script: string, args: readonly string[], timeout = 120_000): Promise<{ stdout: string; stderr: string }> {
+  const { execFile } = await import("node:child_process");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const { promisify } = await import("node:util");
+  const loader = pathToFileURL(createRequire(import.meta.url).resolve("tsx/esm")).href;
+  const cache = await scratchDirectory("tsx-cache-");
+  return promisify(execFile)(process.execPath, ["--import", loader, script, ...args], { cwd: process.cwd(), timeout, env: { ...process.env, TMPDIR: cache } });
 }

@@ -1,6 +1,6 @@
 # PRD-617 — Unity import fidelity: references, visual locks and baseline
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS (AC-1 to AC-3 done on synthetic data; AC-4 to AC-6 and the real `R1` render wait for the corpus and a Unity licence)
 **Priority:** P2 — without AC-1..AC-6, no Unity import result can be measured on the corpus or locked against regression.
 **Complexity:** 3 (LOW) — 1–5 implementation files (1), new comparison path (+2); risk override: none
 **Owner:** João
@@ -39,22 +39,40 @@ prefab's world bounds, and the import's `sizeMeters` must match them.
 
 ## Acceptance Criteria
 
-- [ ] AC-1 [local]: `fidelity-sheet` scores a synthetic package's import against its `preview.png`, and a deliberately
-  wrong base colour drops the piece below 70 (suspect). proof: `npx vitest run tests/unity-fidelity.test.ts` — Evidence: pending.
-- [ ] AC-2 [local]: Given a synthetic `R1` folder (PNG plus `bounds.json`), the sheet uses it instead of `R2`, labels
+- [x] AC-1 [local]: `fidelity-sheet` scores a synthetic package's import against its `preview.png`, and a deliberately
+  wrong base colour drops the piece below 70 (suspect). proof: `npx vitest run tests/unity-fidelity.test.ts` — Evidence:
+  14 tests pass (2026-10-14). Correct pieces score 100 and 100, the wrong-colour piece 66 with verdict `fail`; one test
+  runs the real PRD-616 importer (Blender 4.5) on a synthetic package, with the right tint at 75 or more and a wrong
+  tint under 70. A hue-only error (red against blue) scores about 72, because hue carries 25 points of the score, while
+  its verdict is still `fail` (hue off by more than 45 degrees). The tests therefore use wrong colours that also move
+  lightness, as a missing texture does. The judge is unchanged.
+- [x] AC-2 [local]: Given a synthetic `R1` folder (PNG plus `bounds.json`), the sheet uses it instead of `R2`, labels
   the column `R1`, and flags a piece whose `sizeMeters` is more than 1 % off its bounds.
-  proof: `npx vitest run tests/unity-fidelity.test.ts -t reference` — Evidence: pending.
-- [ ] AC-3 [local]: Visual regression fixtures lock smoothness inversion, the HDRP mask split and cutout. Reverting
+  proof: `npx vitest run tests/unity-fidelity.test.ts -t reference` — Evidence: 4 tests pass. The R1 folder
+  beats deliberately wrong R2 previews (scores 85 or more with R1, under 70 without), `reference.json` and each piece
+  say `R1`, the column header reads "ORIGINAL (R1 Unity Editor render)", a piece 2 % off is flagged while 0.5 % passes,
+  a model with no R1 item is listed and not scored, and the script prints the reference line and table.
+- [x] AC-3 [local]: Visual regression fixtures lock smoothness inversion, the HDRP mask split and cutout. Reverting
   any one rule in `src/unity/materials.ts` turns the suite red.
-  proof: `npx vitest run tests/unity-visual-regression.test.ts` — Evidence: pending.
+  proof: `npx vitest run tests/unity-visual-regression.test.ts` — Evidence: 8 tests and 9 goldens
+  (`tests/fixtures/visual-golden/unity-*.png`), fixtures built through the production `.mat` path. Each of ten
+  one-line mutations of `src/unity/materials.ts` was applied alone and turned the suite red, then restored:
+  roughness `1 - smoothness`; the albedo-alpha smoothness switch; HDRP mask smoothness channel `a`; HDRP mask
+  metallic channel `r`; HDRP mask occlusion channel `g`; Standard `_Mode` 1 cut-out; its `_Cutoff` value; URP
+  `_AlphaClip`; HDRP `_AlphaCutoffEnable`; the sRGB to linear colour conversion.
 - [ ] AC-4 [local]: `npm run parity:unity` on `U1`–`U3` prints per pack the prefab count against the GLB count,
   bound slots, resolved textures and `fallback` materials with reasons. Its `fidelity.json` passes
-  `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: pending.
+  `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: pending. NOT MET: the corpus is not on this
+  machine. The script exists and `tests/unity-parity.test.ts` runs it on a synthetic corpus (counts, fallback reasons,
+  `update` then `check` exit 0, a score drop exits 1); with no corpus it prints "No corpus" and exits 0.
 - [ ] AC-5 [local]: The baseline holds `U1`–`U3` entries (numbers only) after the sheets are inspected. The ledger rows
   that pass on a named pack move to Verified. proof: `npx tsx scripts/fidelity-baseline.ts update` and the ledger diff — Evidence: pending.
+  NOT MET: needs the real packs and inspected sheets. No ledger row was moved to Verified.
 - [ ] AC-6 [local]: The PR comment embeds the `U1`–`U3` sheets per the epic's PR evidence rule (reference | before |
   after, with scores). Before and after are the same importer, so the judge must report no change on the shared
   pieces, and the new value is the reference column and the size check. proof: PR screenshot comment — Evidence: pending.
+  NOT MET: needs the real packs. Also open: the sheet writes reference | after only. A before column needs a second
+  import of the base commit, which no script does yet.
 
 ## Blocked on
 
@@ -64,6 +82,26 @@ prefab's world bounds, and the import's `sizeMeters` must match them.
   activate Personal). The agent then builds one project per pipeline (`U1` Built-in; `U2` Built-in, URP and HDRP;
   `U3` URP), imports the pack, runs `ReferenceRender.cs` through `-executeMethod` and copies the output. Until then,
   every comparison uses `R2` and says so on the sheet.
+
+## Findings and open points (2026-10-14, synthetic data only)
+
+- **`R2` channel order and gamma are unverified.** A `preview.png` is a PNG file, so unlike Unreal's raw UE4 thumbnails
+  its channel order is fixed by the format and `sharp` decodes it as stored. The sheet does not rely on that. After
+  the first pass it re-scores every piece with red and blue exchanged, and swaps the whole package only when at least
+  3 pieces are compared, at least 75 % of them gain 20 points and reach 85 with the swap (`decideChannelOrder`,
+  `src/unity/fidelity.ts`). It then says so on the sheet. A single wrong colour is never rescued. The PNG's `gAMA`,
+  `sRGB` and `iCCP` chunks are recorded in `reference.json` and not applied, because the judge reads sRGB pixels on
+  both sides. Whether Unity previews are stored as expected, and in which gamma, is settled only by measuring a real
+  preview from `U1`: do that before the first comparison.
+- **`scripts/unity/ReferenceRender.cs` has never run.** No Unity Editor or licence exists on this machine, so it was
+  not even compiled. Its `bounds.json` layout is the one the tests write and `readR1` reads. Expect small API fixes on
+  the first run. HDRP light intensity is a guess, and the project must be in the Linear colour space (the script
+  refuses otherwise). Until then every comparison uses `R2`, and the sheet says so.
+- **`R1` pieces map to GLBs** by the prefab's single model path, else by the same file name. Prefabs with several
+  models or a scaled or rotated root will not match or will flag a size difference: that is PRD-618's area.
+- **Shared code touched.** `renderContactSheet` takes two opt-in options (`referenceLabel`, `tileNotes`) for the
+  reference column title, the score line and the size note. Unreal sheets are unchanged (`tests/unreal-visual-regression.test.ts` passes).
+  The judge's reasons still say "than Unreal" (shared wording).
 
 ## Integration Ledger
 
@@ -76,11 +114,11 @@ prefab's world bounds, and the import's `sizeMeters` must match them.
 ## Execution Phases
 
 #### Phase 1: References
-**Status:** NOT STARTED
+**Status:** IN PROGRESS (code and tests done; `ReferenceRender.cs` never run, no `R1` produced)
 **Files:** `scripts/unity/ReferenceRender.cs` (new), `scripts/fidelity-sheet.ts`, `tests/unity-fidelity.test.ts` (new)
 **Verification:** AC-1, AC-2. Produce `R1` as soon as this phase lands and the licence is active, so it is ready for Phase 2.
 
 #### Phase 2: Locks and sweep
-**Status:** NOT STARTED
+**Status:** IN PROGRESS (locks done; sweep script done and tested on a synthetic corpus; no real run)
 **Files:** `tests/unity-visual-regression.test.ts` (new), `tests/fixtures/visual-golden/unity-*.png`, `scripts/unity-parity.ts` (new), `package.json`, `docs/unity-format-support.md`
 **Verification:** AC-3, AC-4, AC-5, AC-6.
