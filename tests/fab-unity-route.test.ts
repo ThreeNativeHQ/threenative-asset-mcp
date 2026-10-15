@@ -308,6 +308,16 @@ describe("fab_import_asset Unity route (import)", () => {
     expect(test.unrealCalls).toEqual([]);
   });
 
+  it("import: an artifact id that climbs out of the cache is refused before any path or directory exists", async () => {
+    const test = await harness({ formatsByListing: { [UNITY_ONLY]: [{ ...UNITY_ENTRY, versions: [{ artifactId: "../x" }] }] } });
+    const error = errorOf(await test.importAsset({ listingIdOrUrl: UNITY_ONLY, outputDir: test.outputDir, format: "unity", acceptFabEula: true }));
+    expect(error.message).toMatch(/"\.\.\/x" is not a valid Fab artifact id/);
+    await expect(stat(join(test.root, "downloads"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(test.root, "x"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await test.invocations()).find((argv) => argv[0] === "download")).toBeUndefined();
+    expect(test.unityCalls).toEqual([]);
+  });
+
   it("import: reuses the cached download on a second call", async () => {
     const test = await harness();
     const request = { listingIdOrUrl: UNITY_ONLY, outputDir: test.outputDir, format: "unity" as const, acceptFabEula: true as const };
