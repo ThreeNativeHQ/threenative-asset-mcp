@@ -55,6 +55,15 @@ references in the report.
 |---|---|---|---|
 | Prefab import | `asset_import_unity` → `src/unity/prefab.ts` | Extends PRD-616's tool | AC-1..AC-5 |
 
+## Unverified risk: Y rotation of prefab children
+
+UNVERIFIED, found in review on 2026-10-15, code unchanged. A reviewer suspects that the prefab node transforms
+(the Z flip in `toGltfTransform`, `src/unity/prefab.ts:93-97`, applied in `src/unity/prefab-glb.ts:164-189`) and the
+FBX mesh geometry (Blender's FBX import, unchanged by this PRD) differ by a 180-degree rotation about Y from
+Unity's own FBX import, which mirrors X. If so, the parts of a multi-part prefab sit in the wrong places relative to
+each other. Check it against a real pack's `R1` render or a Unity-rendered reference before the `U1`-`U3` sign-off
+(AC-6, AC-7). No synthetic test settles it: the fixtures build both sides with the same convention.
+
 ## Execution Phases
 
 #### Phase 1: Hierarchy and meshes

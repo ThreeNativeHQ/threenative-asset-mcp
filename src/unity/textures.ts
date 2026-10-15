@@ -43,8 +43,17 @@ export interface TextureSettings {
 
 // ---------------------------------------------------------------- decoding
 
+/** Largest texture, in pixels, any decoder allocates for (2^27: 16384x8192). A header can claim far more than its file holds. */
+export const MAX_TEXTURE_PIXELS = 2 ** 27;
+
+function assertPixelBudget(width: number, height: number, maxPixels: number, what: string): void {
+  if (width * height > maxPixels) {
+    throw new UnityTextureError(`${what} is ${width}x${height} pixels, more than the ${maxPixels} pixel limit.`);
+  }
+}
+
 /** Uncompressed and RLE TGA: colour-mapped, true-colour (15/16/24/32 bit) and grey, either origin. */
-export function decodeTga(buffer: Buffer): DecodedImage {
+export function decodeTga(buffer: Buffer, maxPixels = MAX_TEXTURE_PIXELS): DecodedImage {
   if (buffer.length < 18) throw new UnityTextureError("TGA file is shorter than its header.");
   const idLength = buffer[0]!;
   const mapType = buffer[1]!;
@@ -64,6 +73,7 @@ export function decodeTga(buffer: Buffer): DecodedImage {
   if (![8, 15, 16, 24, 32].includes(depth) || (base === 1 && depth !== 8)) {
     throw new UnityTextureError(`TGA pixel depth ${depth} is not supported.`);
   }
+  assertPixelBudget(width, height, maxPixels, "The TGA");
   const bytesPerPixel = Math.ceil(depth / 8);
   let position = 18 + idLength;
   const palette: number[][] = [];
@@ -136,7 +146,8 @@ function readTgaPixel(buffer: Buffer, at: number, depth: number, alphaBits: numb
 }
 
 let psdReady = false;
-function decodePsd(buffer: Buffer): DecodedImage {
+function decodePsd(buffer: Buffer, maxPixels: number): DecodedImage {
+  if (buffer.length >= 22) assertPixelBudget(buffer.readUInt32BE(18), buffer.readUInt32BE(14), maxPixels, "The PSD");
   if (!psdReady) {
     // ag-psd wants a canvas factory even when `useImageData` keeps it from drawing on one.
     initializeCanvas(
@@ -155,9 +166,10 @@ function decodePsd(buffer: Buffer): DecodedImage {
   return { width, height, data: Buffer.from(data.buffer, data.byteOffset, data.byteLength) };
 }
 
-async function decodeWithSharp(buffer: Buffer): Promise<DecodedImage> {
-  const metadata = await sharp(buffer).metadata();
-  const pipeline = sharp(buffer);
+async function decodeWithSharp(buffer: Buffer, maxPixels: number): Promise<DecodedImage> {
+  const options = { limitInputPixels: maxPixels };
+  const metadata = await sharp(buffer, options).metadata();
+  const pipeline = sharp(buffer, options);
   if (metadata.space === "cmyk") pipeline.toColourspace("srgb");
   const { data, info } = await pipeline.raw({ depth: "uchar" }).toBuffer({ resolveWithObject: true });
   const { width, height, channels } = info;
@@ -175,13 +187,13 @@ async function decodeWithSharp(buffer: Buffer): Promise<DecodedImage> {
 }
 
 /** Decodes a Unity texture file. `unityPath` supplies the extension, because packaged files have none. */
-export async function decodeTexture(file: string, unityPath: string): Promise<DecodedImage> {
+export async function decodeTexture(file: string, unityPath: string, maxPixels = MAX_TEXTURE_PIXELS): Promise<DecodedImage> {
   const extension = extname(unityPath).toLowerCase();
   const buffer = await readFile(file);
   try {
-    if (extension === ".tga") return decodeTga(buffer);
-    if (extension === ".psd" || buffer.subarray(0, 4).toString("latin1") === "8BPS") return decodePsd(buffer);
-    return await decodeWithSharp(buffer);
+    if (extension === ".tga") return decodeTga(buffer, maxPixels);
+    if (extension === ".psd" || buffer.subarray(0, 4).toString("latin1") === "8BPS") return decodePsd(buffer, maxPixels);
+    return await decodeWithSharp(buffer, maxPixels);
   } catch (error) {
     if (error instanceof UnityTextureError) throw error;
     throw new UnityTextureError(

@@ -159,6 +159,39 @@ describe("cycle", () => {
   }, 60_000);
 });
 
+describe("budgets", () => {
+  it("budgets: an acyclic chain whose every level nests the next twice fails fast instead of resolving 2^22 scopes (the objects cap never sees an empty leaf)", async () => {
+    const files: FixtureFile[] = folders("Assets");
+    const levels = 22;
+    for (let level = 0; level < levels; level += 1) {
+      files.push({
+        path: `Assets/D${level}.prefab`,
+        content:
+          level === levels - 1
+            ? prefabFile()
+            : prefabFile(prefabInstance(10, { source: `Assets/D${level + 1}.prefab` }), prefabInstance(11, { source: `Assets/D${level + 1}.prefab` })),
+      });
+    }
+    const started = Date.now();
+    const { report } = await importProject(files, { assets: ["D0"] });
+    expect(report.failed).toEqual([{ asset: "Assets/D0.prefab", reason: expect.stringMatching(/more than 50000 nested prefab instances/) }]);
+    expect(Date.now() - started).toBeLessThan(20_000);
+  }, 60_000);
+
+  it("budgets: a modification of a huge array index is reported unresolved and creates no array", async () => {
+    const { report } = await importProject([
+      ...folders("Assets"),
+      { path: "Assets/Base.prefab", content: prefabFile(gameObject(1, "Root", { components: [2, 3] }), transform(2, 1), meshRenderer(3, 1, [])) },
+      {
+        path: "Assets/Variant.prefab",
+        content: prefabFile(prefabInstance(10, { source: "Assets/Base.prefab", modifications: [{ target: 3, path: "m_Materials.Array.data[4294967294]", reference: asset("Assets/m.mat", 2100000) }] })),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Variant.prefab");
+    expect(prefab.unresolved).toEqual([expect.objectContaining({ kind: "modification", reason: expect.stringMatching(/array index is larger than 4096/) })]);
+  }, 60_000);
+});
+
 describe("nested", () => {
   const car = (): FixtureFile => ({
     path: "Assets/Prefabs/Car.prefab",

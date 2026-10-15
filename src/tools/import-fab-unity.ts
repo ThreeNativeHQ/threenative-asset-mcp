@@ -1,7 +1,7 @@
 import { mkdir, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
-import { type FabCli, FabCliError, type FabUnityFormat } from "../fab/fabcli.js";
+import { type FabCli, FabCliError, type FabUnityFormat, assertCatalogId } from "../fab/fabcli.js";
 import type { LicenseDecision } from "../fab/license.js";
 import { type importUnityPackage } from "../unity/importer.js";
 import { summarizeUnity } from "./import-unity.js";
@@ -59,7 +59,9 @@ export interface FabUnityImportRequest {
  */
 export async function importFabUnity(request: FabUnityImportRequest) {
   const { fabCli, listingId, unity, log } = request;
-  const artifactId = unityArtifactId(unity);
+  // Both ids become path segments below; validate them before any path is built.
+  const artifactId = assertCatalogId(unityArtifactId(unity), "artifact id");
+  assertCatalogId(listingId, "listing id");
   if (request.requestedArtifactId !== undefined && request.requestedArtifactId !== artifactId) {
     throw new FabCliError(
       "FABCLI_ENGINE_AMBIGUOUS",

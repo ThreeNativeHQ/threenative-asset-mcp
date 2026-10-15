@@ -1,5 +1,5 @@
 /**
- * The Blender-side conversion, run as `blender -b --factory-startup --python <file> -- <args>`.
+ * The Blender-side conversion, run as `blender -b --factory-startup --disable-autoexec --python <file> -- <args>`.
  * Written as a constant so it ships in `dist/` without a packaging change.
  *
  * Scale: Blender's FBX importer already multiplies by the file's UnitScaleFactor / 100 and by

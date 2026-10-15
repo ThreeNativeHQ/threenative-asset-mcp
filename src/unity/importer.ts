@@ -532,7 +532,7 @@ async function runBlender(
   await writeFile(script, BLENDER_CONVERT_SCRIPT);
   const run = await runBounded(
     blender.path,
-    ["-b", "--factory-startup", "--python-exit-code", "1", "--python", script, "--", source, target, String(settings.globalScale), settings.useFileScale ? "1" : "0"],
+    ["-b", "--factory-startup", "--disable-autoexec", "--python-exit-code", "1", "--python", script, "--", source, target, String(settings.globalScale), settings.useFileScale ? "1" : "0"],
     {
       timeoutMs: BLENDER_TIMEOUT_MS,
       maxOutputBytes: 16 * 1024 * 1024,
@@ -583,7 +583,6 @@ export async function importUnityPackage(options: UnityImportOptions): Promise<U
     const warnings = (options.assets ?? [])
       .filter((wanted) => !allModels.some((entry) => matchesAsset(entry, wanted)) && !prefabEntries.some((entry) => matchesAsset(entry, wanted)))
       .map((wanted) => `assets entry "${wanted}" matched no model or prefab`);
-    await mkdir(join(options.outputDir, "models"), { recursive: true });
     const importer = new Importer(database, options.outputDir, options.maxTextureSize);
 
     // Prefabs are resolved first: the models they use are converted even when `assets` did not name them.
@@ -612,6 +611,8 @@ export async function importUnityPackage(options: UnityImportOptions): Promise<U
     }
     const converting = [...toConvert.values()].sort((a, b) => (a.path < b.path ? -1 : 1));
     const blender = converting.length > 0 ? (options.blender ?? (await ensureBlender(environment, options.log))) : undefined;
+    // Created only now: a missing Blender above must not leave an output a retry would refuse.
+    await mkdir(join(options.outputDir, "models"), { recursive: true });
 
     const models: ReportModel[] = [];
     for (const [index, entry] of converting.entries()) {

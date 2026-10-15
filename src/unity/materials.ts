@@ -66,6 +66,11 @@ function pair(value: unknown, fallback: readonly [number, number]): readonly [nu
   return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : fallback;
 }
 
+const channel = (value: unknown, fallback: number): number => {
+  const number = Number(value ?? fallback);
+  return Number.isFinite(number) ? number : fallback;
+};
+
 /** `m_SavedProperties` lists are sequences of one-key maps. */
 function entries(list: unknown): [string, unknown][] {
   if (!Array.isArray(list)) return [];
@@ -80,11 +85,12 @@ export function readMaterial(documents: readonly UnityDocument[], fallbackName: 
   const saved = isRecord(fields.m_SavedProperties) ? fields.m_SavedProperties : {};
   const floats: Record<string, number> = {};
   for (const [key, value] of [...entries(saved.m_Floats), ...entries(saved.m_Ints)]) {
-    if (typeof value === "number") floats[key] = value;
+    if (typeof value === "number" && Number.isFinite(value)) floats[key] = value;
   }
   const colors: Record<string, Rgba> = {};
   for (const [key, value] of entries(saved.m_Colors)) {
-    if (isRecord(value)) colors[key] = [Number(value.r ?? 0), Number(value.g ?? 0), Number(value.b ?? 0), Number(value.a ?? 1)];
+    // YAML `.nan` and `.inf` parse as numbers; a non-finite channel takes its default instead of reaching a glTF factor.
+    if (isRecord(value)) colors[key] = [channel(value.r, 0), channel(value.g, 0), channel(value.b, 0), channel(value.a, 1)];
   }
   const textures: Record<string, TexEnv> = {};
   for (const [key, value] of entries(saved.m_TexEnvs)) {
