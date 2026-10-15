@@ -35,7 +35,12 @@ Fab:
   particle simulation.
 - `fab_import_asset` — downloads an owned listing through the user's existing
   FabCLI session, then runs the same Unreal importer. It never signs in, claims,
-  or purchases an asset.
+  or purchases an asset. For a Unity-format artifact (`format: "unity"`, or a
+  listing that publishes only Unity) it hands the `.unitypackage` to the Unity
+  importer, but only when FabCLI reports that artifact's catalog ids. Otherwise
+  it fails with `FABCLI_UNITY_DOWNLOAD_UNAVAILABLE` and points to
+  `asset_import_unity` on a hand-downloaded package. See
+  [docs/fab-contract.md](fab-contract.md).
 
 Unity (the user's own Unity Editor cache; see
 [docs/unity-format-support.md](unity-format-support.md)):

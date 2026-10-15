@@ -41,6 +41,9 @@ oldest listed engine, and that picks the decoder. When a listing has several art
 the MeshDescription converter, then UE Viewer; the newest source format breaks a tie) and says so
 in the report `warnings`. Pass `artifactId` or `engine` to override.
 
+`fab_list_owned` also lists a Unity-format artifact (route `unity`) unless `unrealOnly` is set; see
+[fab-contract.md](fab-contract.md) for what `fab_import_asset` does with it.
+
 **Graph-only colour.** Some Unreal materials compute BaseColor in the material graph (layered
 masters that blend colour textures by mask channels and tint them), so no texture binding can
 reproduce them. A section left without a base colour is baked from its graph: the pack's editor

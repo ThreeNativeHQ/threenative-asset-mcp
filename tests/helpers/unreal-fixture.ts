@@ -325,6 +325,8 @@ export interface FakeFabCliOptions {
   readonly version?: string;
   readonly authStatus?: unknown;
   readonly formats?: unknown;
+  /** `fabcli formats <uid>` answers per listing UID; a UID not named here gets `formats`. */
+  readonly formatsByListing?: Readonly<Record<string, unknown>>;
   readonly library?: unknown;
   /** Copied into `--output` when `download` runs. */
   readonly downloadInto?: string;
@@ -362,7 +364,8 @@ if (argv[0] === "auth" && argv[1] === "status") {
   process.exit(0);
 }
 if (argv[0] === "formats") {
-  process.stdout.write(JSON.stringify(options.formats || []) + "\\n");
+  const own = options.formatsByListing && options.formatsByListing[argv[1]];
+  process.stdout.write(JSON.stringify(own || options.formats || []) + "\\n");
   process.exit(0);
 }
 if (argv[0] === "library") {

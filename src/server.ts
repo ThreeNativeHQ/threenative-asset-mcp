@@ -184,6 +184,7 @@ import {
   FabImportAssetInputSchema,
   FabListOwnedInputSchema,
   FabListOwnedOutputSchema,
+  FabImportOutputSchema,
   ImportUnrealOutputSchema,
 } from "./tools/import-unreal.js";
 import {
@@ -551,7 +552,7 @@ export function createAssetServer(
     {
       title: "List the Fab assets this account owns",
       description:
-        "List every listing already in the signed-in Fab library, optionally filtered to the ones that publish an Unreal artifact fab_import_asset can convert. Each listing's `artifacts` array lists every Unreal artifact separately with its artifactId, oldest engine (its source format) and decoder route (umodel, mesh-description or cue4parse). Search free assets first with fab_search_assets; reach for this when you want something already paid for. Read-only — it never claims or purchases.",
+        "List every listing already in the signed-in Fab library, optionally filtered to the ones that publish an Unreal artifact fab_import_asset can convert. Each listing's `artifacts` array lists every Unreal artifact separately with its artifactId, oldest engine (its source format) and decoder route (umodel, mesh-description or cue4parse). Unless unrealOnly is set, a Unity-format artifact (a .unitypackage) is listed too, with route `unity`; this costs one `fabcli formats` lookup per listing. Search free assets first with fab_search_assets; reach for this when you want something already paid for. Read-only — it never claims or purchases.",
       inputSchema: FabListOwnedInputSchema,
       outputSchema: FabListOwnedOutputSchema,
       annotations: {
@@ -585,11 +586,11 @@ export function createAssetServer(
   server.registerTool(
     "fab_import_asset",
     {
-      title: "Import an owned Fab Unreal asset",
+      title: "Import an owned Fab Unreal or Unity asset",
       description:
-        "Download an Unreal asset the signed-in Fab account already owns and convert it to source GLBs in one step. Uses the FabCLI session the user established themselves; it never logs in, claims, or purchases anything. Every GLB result reports `sizeMeters`, its bounding-box size in the file's own units: a value near 890 for something meant to be 9 m means the source was authored in centimetres and the game must scale it.",
+        "Download an Unreal asset the signed-in Fab account already owns and convert it to source GLBs in one step. A Unity-format artifact (format \"unity\", or a listing that publishes only Unity) goes to the Unity importer instead and returns the asset_import_unity result shape; FabCLI does not yet report the catalog ids that download needs, so that route currently stops with FABCLI_UNITY_DOWNLOAD_UNAVAILABLE and points to asset_import_unity on a package downloaded by hand. Uses the FabCLI session the user established themselves; it never logs in, claims, or purchases anything. Every GLB result reports `sizeMeters`, its bounding-box size in the file's own units: a value near 890 for something meant to be 9 m means the source was authored in centimetres and the game must scale it.",
       inputSchema: FabImportAssetInputSchema,
-      outputSchema: ImportUnrealOutputSchema,
+      outputSchema: FabImportOutputSchema,
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
