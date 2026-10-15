@@ -20,6 +20,7 @@ import { createStderrLogger } from "../src/fab/errors.js";
 import { prerequisiteById } from "../scripts/prerequisites.js";
 import { writeProjectFolder } from "./helpers/unity-fixtures.js";
 import { SHADERS, materialYaml, modelImporter, writeCubeFbx } from "./helpers/unity-models.js";
+import { asset, gameObject, meshFilter, meshRenderer, prefabFile, transform } from "./helpers/unity-prefabs.js";
 
 const packageVersion = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -561,6 +562,15 @@ describe("built stdio package", () => {
           path: "Assets/Models/wood.mat",
           content: materialYaml({ name: "wood", shader: SHADERS.standard, colors: { _Color: [1, 0, 0, 1] } }),
         },
+        {
+          path: "Assets/Models/crate.prefab",
+          content: prefabFile(
+            gameObject(10, "Crate", { components: [11, 12, 13] }),
+            transform(11, 10, { position: [0, 1, 2] }),
+            meshFilter(12, 10, asset("Assets/Models/crate.fbx", 4300000)),
+            meshRenderer(13, 10, []),
+          ),
+        },
       ]);
       const outputDir = join(root, "out");
       const { child } = await startInitializedServer();
@@ -582,14 +592,17 @@ describe("built stdio package", () => {
         result: {
           isError?: boolean;
           structuredContent: {
-            counts: { models: number; boundSlots: number; failed: number };
+            counts: { models: number; prefabs: number; boundSlots: number; failed: number };
             models: Array<{ glb: string; sizeMeters: { x: number }; slots: Array<{ binding: string }> }>;
+            prefabs: Array<{ glb: string; nodes: number; meshNodes: number; unresolved: unknown[] }>;
           };
         };
       };
       expect(imported.result.isError).toBeFalsy();
       const summary = imported.result.structuredContent;
-      expect(summary.counts).toMatchObject({ models: 1, boundSlots: 1, failed: 0 });
+      expect(summary.counts).toMatchObject({ models: 1, prefabs: 1, boundSlots: 1, failed: 0 });
+      expect(summary.prefabs).toMatchObject([{ nodes: 1, meshNodes: 1, unresolved: [] }]);
+      expect(existsSync(join(outputDir, summary.prefabs[0]!.glb))).toBe(true);
       expect(summary.models[0]?.slots).toMatchObject([{ binding: "externalObjects" }]);
       expect(summary.models[0]?.sizeMeters.x).toBeCloseTo(2, 2);
       expect(existsSync(join(outputDir, summary.models[0]!.glb))).toBe(true);

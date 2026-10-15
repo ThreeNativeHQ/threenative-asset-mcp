@@ -57,7 +57,9 @@ Unity (the user's own Unity Editor cache; see
   `import-report.json`. It needs `acceptUnityAssetStoreEula: true`, applies each
   model's import scale, binds material slots (`externalObjects`, then by name) and
   maps Standard, URP Lit/SimpleLit/ComplexLit and HDRP Lit to glTF PBR. Other
-  shaders fall back to their saved colour and texture and are reported. It runs
+  shaders fall back to their saved colour and texture and are reported. It also
+  turns each prefab (nested prefabs and variants included) into one scene GLB under
+  `prefabs/` and lists colliders, LOD levels and unresolved references. It runs
   headless Blender (`THREENATIVE_BLENDER`, `PATH`, or a pinned download) and never
   contacts Unity. Details: [unity-import.md](unity-import.md).
 

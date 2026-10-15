@@ -163,13 +163,14 @@ export async function writeSyntheticImport(importDir: string, pieces: readonly S
     });
   }
   const report: UnityImportReport = {
-    importerVersion: 1,
+    importerVersion: 2,
     source: { shape: "unitypackage", name: "synthetic.unitypackage" },
     blender: { version: "not used", origin: "PATH" },
     materials: "complete",
-    counts: { models: models.length, materials: 0, textures: 0, fallbackMaterials: 0, boundSlots: 0, skipped: 0, failed: 0 },
+    counts: { models: models.length, prefabs: 0, materials: 0, textures: 0, fallbackMaterials: 0, boundSlots: 0, skipped: 0, failed: 0 },
     licenseFiles: [],
     models,
+    prefabs: [],
     materialAssets: [],
     textures: [],
     skipped: [],

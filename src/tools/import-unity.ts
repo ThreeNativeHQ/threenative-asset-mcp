@@ -20,6 +20,7 @@ const SummarySchema = z.object({
   materials: z.enum(["complete", "degraded"]),
   counts: z.object({
     models: z.number().int().nonnegative(),
+    prefabs: z.number().int().nonnegative(),
     materials: z.number().int().nonnegative(),
     textures: z.number().int().nonnegative(),
     fallbackMaterials: z.number().int().nonnegative(),
@@ -49,6 +50,26 @@ const SummarySchema = z.object({
             status: z.enum(["mapped", "fallback", "embedded"]),
           }),
         ).max(1_000),
+      }),
+    )
+    .max(5_000),
+  prefabs: z
+    .array(
+      z.object({
+        name: z.string().max(200),
+        source: z.string().max(1_024),
+        glb: z.string().max(1_024),
+        bytes: z.number().int().nonnegative(),
+        nodes: z.number().int().nonnegative(),
+        meshNodes: z.number().int().nonnegative(),
+        sizeMeters: SizeMetersSchema,
+        // Listed, not imported: colliders, scripts and other components, and LOD levels above 0.
+        colliders: z.number().int().nonnegative(),
+        components: z.number().int().nonnegative(),
+        lodLevels: z.number().int().nonnegative(),
+        unresolved: z
+          .array(z.object({ kind: z.enum(["prefab", "mesh", "material", "modification", "object"]), node: z.string().max(1_024).optional(), reference: z.string().max(1_024), reason: z.string().max(1_000) }))
+          .max(200),
       }),
     )
     .max(5_000),
@@ -100,7 +121,7 @@ export const AssetImportUnityInputSchema = z.object({
     .array(z.string().trim().min(1).max(500))
     .max(500)
     .optional()
-    .describe("Convert only these models: a project path (Assets/Models/crate.fbx), a file name or a name without extension. Omit to convert every FBX, OBJ and .blend model."),
+    .describe("Import only these models and prefabs: a project path (Assets/Models/crate.fbx), a file name or a name without extension. Omit to convert every FBX, OBJ and .blend model and import every prefab. Models a selected prefab uses are converted too."),
   maxTextureSize: z.coerce
     .number()
     .int()
@@ -139,6 +160,19 @@ export function summarizeUnity(report: UnityImportReport, outputDir: string): Un
         ...(slot.material ? { material: slot.material } : {}),
         status: slot.status,
       })),
+    })),
+    prefabs: report.prefabs.map((prefab) => ({
+      name: prefab.name,
+      source: prefab.source,
+      glb: prefab.glb,
+      bytes: prefab.bytes,
+      nodes: prefab.nodes,
+      meshNodes: prefab.meshNodes,
+      sizeMeters: prefab.sizeMeters,
+      colliders: prefab.colliders.length,
+      components: prefab.components.length,
+      lodLevels: prefab.lodLevels.length,
+      unresolved: prefab.unresolved.slice(0, 200),
     })),
     materialAssets: report.materialAssets.map((material) => ({
       name: material.name,

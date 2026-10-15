@@ -301,7 +301,7 @@ describeWithTools(["blender"], "unity models through Blender", () => {
     const outputDir = join(await scratchDirectory("unity-out-"), "import");
     const report = await importUnityPackage({ source: root, outputDir, assets: ["b", "nothing"] });
     expect(report.models.map((model) => model.source)).toEqual(["Assets/Models/b.fbx"]);
-    expect(report.warnings).toEqual(['assets entry "nothing" matched no model']);
+    expect(report.warnings).toEqual(['assets entry "nothing" matched no model or prefab']);
     await expect(importUnityPackage({ source: root, outputDir })).rejects.toMatchObject({ code: "UNITY_OUTPUT_EXISTS" });
     await expect(importUnityPackage({ source: root, outputDir: join(outputDir, "x"), assets: ["zzz"] })).rejects.toMatchObject({ code: "UNITY_IMPORT_INVALID_INPUT" });
   }, 90_000);

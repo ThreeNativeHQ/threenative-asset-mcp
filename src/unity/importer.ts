@@ -8,7 +8,7 @@ import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFi
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative } from "node:path";
 
-import { NodeIO } from "@gltf-transform/core";
+import { type Document, NodeIO } from "@gltf-transform/core";
 import { ALL_EXTENSIONS } from "@gltf-transform/extensions";
 import { getBounds } from "@gltf-transform/functions";
 
@@ -33,10 +33,12 @@ import {
   recipeTextures,
   renderRecipe,
 } from "./textures.js";
+import { type ComponentNote, type LodNote, PrefabResolver, type PrefabNode, type ResolvedPrefab, type Unresolved } from "./prefab.js";
+import { writePrefabDocument } from "./prefab-glb.js";
 import { parseUnityDocuments, resolveRef } from "./yaml.js";
 
 /** Bump when a change alters the GLBs or the report for the same package. */
-export const UNITY_IMPORTER_VERSION = 1;
+export const UNITY_IMPORTER_VERSION = 2;
 
 const SUPPORTED_MODELS = new Set([".fbx", ".obj", ".blend"]);
 const NEEDS_DCC = new Set([".max", ".ma", ".mb"]);
@@ -46,7 +48,7 @@ const BLENDER_TIMEOUT_MS = 900_000;
 export interface UnityImportOptions {
   readonly source: string;
   readonly outputDir: string;
-  /** Model paths, file names or names without extension. Omit to convert every supported model. */
+  /** Model and prefab paths, file names or names without extension. Omit to convert every supported model and prefab. */
   readonly assets?: readonly string[];
   /** Longest edge of written textures. Unset keeps the source size. */
   readonly maxTextureSize?: number;
@@ -75,6 +77,26 @@ export interface ReportModel {
   readonly sizeMeters: { readonly x: number; readonly y: number; readonly z: number };
   readonly scale: { readonly globalScale: number; readonly useFileScale: boolean; readonly fileUnitScale?: number };
   readonly slots: readonly ReportSlot[];
+  readonly warnings: readonly string[];
+}
+
+export interface ReportPrefab {
+  readonly name: string;
+  readonly source: string;
+  readonly glb: string;
+  readonly bytes: number;
+  readonly nodes: number;
+  readonly meshNodes: number;
+  readonly vertices: number;
+  readonly sizeMeters: { readonly x: number; readonly y: number; readonly z: number };
+  /** Colliders are listed, not imported. */
+  readonly colliders: readonly ComponentNote[];
+  /** Scripts, lights, audio, skinned meshes and other components that are not imported. */
+  readonly components: readonly ComponentNote[];
+  /** LOD levels above 0; LOD0 is imported. */
+  readonly lodLevels: readonly LodNote[];
+  readonly inactive: readonly string[];
+  readonly unresolved: readonly Unresolved[];
   readonly warnings: readonly string[];
 }
 
@@ -118,6 +140,7 @@ export interface UnityImportReport {
   readonly materials: "complete" | "degraded";
   readonly counts: {
     readonly models: number;
+    readonly prefabs: number;
     readonly materials: number;
     readonly textures: number;
     readonly fallbackMaterials: number;
@@ -127,6 +150,7 @@ export interface UnityImportReport {
   };
   readonly licenseFiles: readonly ReportLicenseFile[];
   readonly models: readonly ReportModel[];
+  readonly prefabs: readonly ReportPrefab[];
   readonly materialAssets: readonly ReportMaterial[];
   readonly textures: readonly ReportTexture[];
   readonly skipped: readonly { readonly asset: string; readonly reason: string }[];
@@ -155,31 +179,40 @@ async function requireFreshOutput(outputDir: string): Promise<void> {
   }
 }
 
+function matchesAsset(entry: UnityAssetEntry, wanted: string): boolean {
+  const lower = wanted.toLowerCase();
+  const path = entry.path.toLowerCase();
+  return path === lower || path.endsWith(`/${lower}`) || basename(path, extname(path)) === lower;
+}
+
+const unsupportedModelReason = (extension: string): string =>
+  NEEDS_DCC.has(extension)
+    ? `${extension} needs the authoring application (Max or Maya) to convert; export an FBX instead`
+    : `${extension} models are not converted yet`;
+
 function selectModels(database: UnityAssetDatabase, assets: readonly string[] | undefined): {
   chosen: UnityAssetEntry[];
   skipped: { asset: string; reason: string }[];
-  unmatched: string[];
 } {
   const skipped: { asset: string; reason: string }[] = [];
   const models = [...database.entries.values()]
     .filter((entry) => entry.assetFile !== undefined && unityKind(entry.path) === "model")
     .sort((a, b) => (a.path < b.path ? -1 : 1));
-  const matches = (entry: UnityAssetEntry, wanted: string): boolean => {
-    const lower = wanted.toLowerCase();
-    const path = entry.path.toLowerCase();
-    return path === lower || path.endsWith(`/${lower}`) || basename(path, extname(path)) === lower;
-  };
-  const unmatched = (assets ?? []).filter((wanted) => !models.some((entry) => matches(entry, wanted)));
   const chosen: UnityAssetEntry[] = [];
   for (const entry of models) {
-    if (assets && !assets.some((wanted) => matches(entry, wanted))) continue;
+    if (assets && !assets.some((wanted) => matchesAsset(entry, wanted))) continue;
     const extension = extname(entry.path).toLowerCase();
     if (SUPPORTED_MODELS.has(extension)) chosen.push(entry);
-    else if (NEEDS_DCC.has(extension)) {
-      skipped.push({ asset: entry.path, reason: `${extension} needs the authoring application (Max or Maya) to convert; export an FBX instead` });
-    } else skipped.push({ asset: entry.path, reason: `${extension} models are not converted yet` });
+    else skipped.push({ asset: entry.path, reason: unsupportedModelReason(extension) });
   }
-  return { chosen, skipped, unmatched };
+  return { chosen, skipped };
+}
+
+function selectPrefabs(database: UnityAssetDatabase, assets: readonly string[] | undefined): UnityAssetEntry[] {
+  return [...database.entries.values()]
+    .filter((entry) => entry.assetFile !== undefined && unityKind(entry.path) === "prefab")
+    .filter((entry) => !assets || assets.some((wanted) => matchesAsset(entry, wanted)))
+    .sort((a, b) => (a.path < b.path ? -1 : 1));
 }
 
 async function readLicenseFiles(database: UnityAssetDatabase): Promise<ReportLicenseFile[]> {
@@ -222,6 +255,9 @@ class Importer {
   private readonly imageCache = new Map<string, Promise<{ name: string; png: Buffer }>>();
   private readonly textureReport = new Map<string, ReportTexture>();
   private readonly modelNames = new Set<string>();
+  private readonly prefabNames = new Set<string>();
+  private readonly modelFiles = new Map<string, string>();
+  private readonly modelDocuments = new Map<string, Promise<Document>>();
 
   constructor(
     private readonly database: UnityAssetDatabase,
@@ -350,11 +386,59 @@ class Importer {
     return { name, png };
   }
 
-  modelFileName(entry: UnityAssetEntry): string {
+  private uniqueName(used: Set<string>, entry: UnityAssetEntry): string {
     const base = safeName(basename(entry.path, extname(entry.path)));
-    const name = this.modelNames.has(base.toLowerCase()) ? `${base}-${shortHash(entry.path)}` : base;
-    this.modelNames.add(name.toLowerCase());
+    const name = used.has(base.toLowerCase()) ? `${base}-${shortHash(entry.path)}` : base;
+    used.add(name.toLowerCase());
     return name;
+  }
+
+  modelFileName(entry: UnityAssetEntry): string {
+    return this.uniqueName(this.modelNames, entry);
+  }
+
+  /** Remembers where a converted model's final GLB is, so prefabs can take its meshes. */
+  recordModel(entry: UnityAssetEntry, glb: string): void {
+    this.modelFiles.set(entry.guid, glb);
+  }
+
+  /** The converted model's GLB (a prefab host method), read once per run. */
+  modelDocument(entry: UnityAssetEntry): Promise<Document | undefined> {
+    const file = this.modelFiles.get(entry.guid);
+    if (file === undefined) return Promise.resolve(undefined);
+    let pending = this.modelDocuments.get(entry.guid);
+    if (!pending) {
+      pending = new NodeIO().registerExtensions(ALL_EXTENSIONS).read(file);
+      this.modelDocuments.set(entry.guid, pending);
+    }
+    return pending;
+  }
+
+  /** Builds and writes the GLB of one resolved prefab. */
+  async finishPrefab(prefab: ResolvedPrefab): Promise<ReportPrefab> {
+    const built = await writePrefabDocument(prefab, this);
+    const name = this.uniqueName(this.prefabNames, prefab.entry);
+    const glb = join(this.outputDir, "prefabs", `${name}.glb`);
+    await mkdir(dirname(glb), { recursive: true });
+    const bytes = await new NodeIO().registerExtensions(ALL_EXTENSIONS).writeBinary(built.document);
+    await writeFile(glb, bytes);
+    const { vertices, size } = measure(built.document);
+    return {
+      name: basename(prefab.entry.path, extname(prefab.entry.path)),
+      source: prefab.entry.path,
+      glb: relative(this.outputDir, glb).split("\\").join("/"),
+      bytes: bytes.length,
+      nodes: prefab.nodeCount,
+      meshNodes: built.meshNodes,
+      vertices,
+      sizeMeters: size,
+      colliders: prefab.colliders,
+      components: prefab.components,
+      lodLevels: prefab.lodLevels,
+      inactive: prefab.inactive,
+      unresolved: [...prefab.unresolved, ...built.unresolved],
+      warnings: [...prefab.warnings, ...built.warnings],
+    };
   }
 
   /** Binds each embedded material of one converted model and writes the final GLB. */
@@ -487,33 +571,73 @@ export async function importUnityPackage(options: UnityImportOptions): Promise<U
   const work = await mkdtemp(join(tmpdir(), "threenative-unity-import-"));
   try {
     const inventory = inventoryUnityAssets(database);
-    const { chosen, skipped, unmatched } = selectModels(database, options.assets);
-    if (options.assets && chosen.length === 0) {
+    const { chosen, skipped } = selectModels(database, options.assets);
+    const prefabEntries = selectPrefabs(database, options.assets);
+    if (options.assets && chosen.length === 0 && prefabEntries.length === 0) {
       throw new UnityImportError(
         "UNITY_IMPORT_INVALID_INPUT",
-        `No convertible model matched ${JSON.stringify(options.assets)}. The package holds ${inventory.model} model file(s).`,
+        `No convertible model or prefab matched ${JSON.stringify(options.assets)}. The package holds ${inventory.model} model file(s) and ${inventory.prefab} prefab(s).`,
       );
     }
-    const warnings = unmatched.map((wanted) => `assets entry "${wanted}" matched no model`);
+    const allModels = [...database.entries.values()].filter((entry) => entry.assetFile !== undefined && unityKind(entry.path) === "model");
+    const warnings = (options.assets ?? [])
+      .filter((wanted) => !allModels.some((entry) => matchesAsset(entry, wanted)) && !prefabEntries.some((entry) => matchesAsset(entry, wanted)))
+      .map((wanted) => `assets entry "${wanted}" matched no model or prefab`);
     await mkdir(join(options.outputDir, "models"), { recursive: true });
     const importer = new Importer(database, options.outputDir, options.maxTextureSize);
-    const blender = chosen.length > 0 ? (options.blender ?? (await ensureBlender(environment, options.log))) : undefined;
+
+    // Prefabs are resolved first: the models they use are converted even when `assets` did not name them.
+    const failed: { asset: string; reason: string }[] = [];
+    const resolver = new PrefabResolver(database);
+    const resolved: ResolvedPrefab[] = [];
+    for (const entry of prefabEntries) {
+      try {
+        resolved.push(await resolver.resolve(entry));
+      } catch (error) {
+        failed.push({ asset: entry.path, reason: error instanceof Error ? error.message : "prefab could not be resolved" });
+      }
+    }
+    const toConvert = new Map(chosen.map((entry) => [entry.guid, entry]));
+    const used = new Map<string, UnityAssetEntry>();
+    const visit = (node: PrefabNode): void => {
+      for (const entry of [node.mesh?.model, node.model]) if (entry) used.set(entry.guid, entry);
+      node.children.forEach(visit);
+    };
+    resolved.forEach((prefab) => prefab.roots.forEach(visit));
+    for (const entry of used.values()) {
+      if (toConvert.has(entry.guid)) continue;
+      const extension = extname(entry.path).toLowerCase();
+      if (SUPPORTED_MODELS.has(extension)) toConvert.set(entry.guid, entry);
+      else if (!skipped.some((item) => item.asset === entry.path)) skipped.push({ asset: entry.path, reason: unsupportedModelReason(extension) });
+    }
+    const converting = [...toConvert.values()].sort((a, b) => (a.path < b.path ? -1 : 1));
+    const blender = converting.length > 0 ? (options.blender ?? (await ensureBlender(environment, options.log))) : undefined;
 
     const models: ReportModel[] = [];
-    const failed: { asset: string; reason: string }[] = [];
-    for (const [index, entry] of chosen.entries()) {
+    for (const [index, entry] of converting.entries()) {
       try {
         const settings = readModelSettings(entry.metaYaml);
         const converted = await runBlender(blender!, entry, work, index, settings, environment);
         const name = importer.modelFileName(entry);
-        models.push(await importer.finishModel(entry, converted.glb, join(options.outputDir, "models", `${name}.glb`), {
+        const finalGlb = join(options.outputDir, "models", `${name}.glb`);
+        models.push(await importer.finishModel(entry, converted.glb, finalGlb, {
           ...(converted.fileUnitScale !== undefined ? { fileUnitScale: converted.fileUnitScale } : {}),
           warnings: converted.warnings,
         }));
+        importer.recordModel(entry, finalGlb);
         await rm(converted.glb, { force: true });
       } catch (error) {
         if (error instanceof UnityImportError && error.code === "UNITY_OUTPUT_EXISTS") throw error;
         failed.push({ asset: entry.path, reason: error instanceof Error ? error.message : "conversion failed" });
+      }
+    }
+
+    const prefabs: ReportPrefab[] = [];
+    for (const prefab of resolved) {
+      try {
+        prefabs.push(await importer.finishPrefab(prefab));
+      } catch (error) {
+        failed.push({ asset: prefab.entry.path, reason: error instanceof Error ? error.message : "prefab could not be written" });
       }
     }
 
@@ -529,6 +653,7 @@ export async function importUnityPackage(options: UnityImportOptions): Promise<U
       materials: fallbackMaterials === 0 && unbound === 0 && failed.length === 0 ? "complete" : "degraded",
       counts: {
         models: models.length,
+        prefabs: prefabs.length,
         materials: materialAssets.length,
         textures: textures.length,
         fallbackMaterials,
@@ -538,6 +663,7 @@ export async function importUnityPackage(options: UnityImportOptions): Promise<U
       },
       licenseFiles: await readLicenseFiles(database),
       models,
+      prefabs,
       materialAssets,
       textures,
       skipped,
