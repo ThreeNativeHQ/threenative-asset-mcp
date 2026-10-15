@@ -484,6 +484,45 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(report.materialAssets.map((material) => material.path)).toEqual(["Assets/Mats/green.mat", "Assets/Mats/red.mat"]);
   }, 180_000);
 
+  it("meshes: a 64-bit id that no table lists and the derivation does not reproduce is matched by the GameObject name, with a warning (real Unity 2022 packs)", async () => {
+    const { report, outputDir } = await importProject([
+      ...folders("Assets", "Assets/C", "Assets/Prefabs"),
+      { path: "Assets/C/parts.fbx", data: parts, importer: importerWith("  internalIDToNameTable: []\n") },
+      {
+        path: "Assets/Prefabs/Wheel.prefab",
+        content: prefabFile(
+          gameObject(10, "Wheel", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "Model", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/C/parts.fbx", "-6579300303780749490")),
+          meshRenderer(23, 20, []),
+        ),
+      },
+      {
+        path: "Assets/Prefabs/Stranger.prefab",
+        content: prefabFile(
+          gameObject(10, "Stranger", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "Model", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/C/parts.fbx", "-6579300303780749490")),
+          meshRenderer(23, 20, []),
+        ),
+      },
+    ]);
+    const matched = prefabOf(report, "Assets/Prefabs/Wheel.prefab");
+    expect(matched.meshNodes).toBe(1);
+    expect(matched.unresolved).toEqual([]);
+    expect(matched.warnings.join(" ")).toMatch(/matched the mesh named "Wheel" by the GameObject name \(UNVERIFIED\)/);
+    const document = await read(join(outputDir, matched.glb));
+    expect(size(document, "Model")[0]).toBeCloseTo(0.2, 4);
+    // No GameObject on the path is called like a mesh: still unresolved, never guessed.
+    const stranger = prefabOf(report, "Assets/Prefabs/Stranger.prefab");
+    expect(stranger.meshNodes).toBe(0);
+    expect(stranger.unresolved).toEqual([expect.objectContaining({ kind: "mesh", reason: expect.stringMatching(/no mesh id matches/) })]);
+  }, 180_000);
+
   it("meshes: models only a prefab uses are converted when assets names just the prefab, and a model that cannot be converted is reported", async () => {
     const { report } = await importProject(
       [

@@ -110,6 +110,17 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
       (reference.name !== undefined ? byMeshName.find((candidate) => candidate.name === reference.name) : undefined) ??
       (reference.name === undefined ? byMeshName.find((candidate) => derivedMeshFileId(candidate.name) === reference.ref.fileID) : undefined);
     if (found) return found;
+    if (reference.name === undefined) {
+      // Real packs (Unity 2022, empty `internalIDToNameTable`) use 64-bit ids that the derived-id route does not reproduce.
+      // The prefab then usually names its mesh: a GameObject on the path, leaf first, is called like exactly one mesh.
+      for (const segment of node.split("/").reverse()) {
+        const named = candidates.filter((candidate) => candidate.name === segment || candidate.mesh.getName() === segment);
+        if (named.length === 1) {
+          warnings.push(`${node}: mesh ${reference.ref.fileID} is not in any table of ${reference.model.path}; matched the mesh named "${segment}" by the GameObject name (UNVERIFIED)`);
+          return named[0];
+        }
+      }
+    }
     if (reference.name === undefined && candidates.length === 1) {
       warnings.push(`${node}: mesh ${reference.ref.fileID} is not in any table of ${reference.model.path}; used the model's only mesh`);
       return candidates[0];

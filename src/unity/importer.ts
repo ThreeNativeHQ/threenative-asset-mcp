@@ -38,7 +38,7 @@ import { writePrefabDocument } from "./prefab-glb.js";
 import { parseUnityDocuments, resolveRef } from "./yaml.js";
 
 /** Bump when a change alters the GLBs or the report for the same package. */
-export const UNITY_IMPORTER_VERSION = 2;
+export const UNITY_IMPORTER_VERSION = 3;
 
 const SUPPORTED_MODELS = new Set([".fbx", ".obj", ".blend"]);
 const NEEDS_DCC = new Set([".max", ".ma", ".mb"]);
