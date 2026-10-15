@@ -88,13 +88,14 @@ interface Harness {
 }
 
 const REPORT: UnityImportReport = {
-  importerVersion: 1,
+  importerVersion: 2,
   source: { shape: "unitypackage", name: "Pack" },
   blender: { version: "4.2.0", origin: "path" },
   materials: "complete",
-  counts: { models: 0, materials: 0, textures: 0, fallbackMaterials: 0, boundSlots: 0, skipped: 0, failed: 0 },
+  counts: { models: 0, prefabs: 0, materials: 0, textures: 0, fallbackMaterials: 0, boundSlots: 0, skipped: 0, failed: 0 },
   licenseFiles: [],
   models: [],
+  prefabs: [],
   materialAssets: [],
   textures: [],
   skipped: [],
@@ -295,7 +296,7 @@ describe("fab_import_asset Unity route (import)", () => {
       assets: ["crate"],
     });
     expect(test.unrealCalls).toEqual([]);
-    expect(output.importerVersion).toBe(1);
+    expect(output.importerVersion).toBe(2);
     expect(output.warnings[0]).toMatch(/Licence check/);
     expect(output.warnings).toContain("from the importer");
   });
