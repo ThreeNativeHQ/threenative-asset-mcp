@@ -2,8 +2,8 @@
 
 **Status:** IN PROGRESS (2026-10-15). PRD-615..619 are built and tested on synthetic packages (PRs #56-#60). The corpus
 `U1`-`U3` was imported and swept on 2026-10-15 (importer 7; sheets stay local). Open: the PR comments (no PR yet),
-`R1` renders (need a Unity licence), and the three-pipeline `U2` check (the `U2` file holds Built-in only). PRD-620 is blocked
-on an owner decision.
+`R1` renders (need a Unity licence), and the three-pipeline `U2` check (the `U2` file holds Built-in only). PRD-620 is closed as moot
+(2026-10-15, no Editor installed, licence unclear).
 **Owner:** João
 
 Import a buyer's own Unity Asset Store packages into GLB, as `fab_import_asset` does for Unreal packs.
@@ -88,7 +88,7 @@ document the binary-only import semantics: the native FBX importer (unit scale, 
 material naming) and the TextureImporter conversions. PRD-620 holds that study. Two limits:
 
 - REA never analyzes the Asset Store download, decryption or Hub sign-in code (§3.8(ii)).
-- The Unity Editor's own license may forbid reverse engineering. PRD-620 stays blocked until João decides.
+- The Unity Editor's own license may forbid reverse engineering. PRD-620 is closed as moot (2026-10-15): the licence does not clearly allow it and no Editor is installed here.
 
 ## Shared rules
 

@@ -1,7 +1,7 @@
 # PRD-620 — REA reference study of Unity import semantics
 
-**Status:** BLOCKED
-**Blocker:** João must decide whether reverse engineering the Unity Editor is permitted under its license.
+**Status:** CLOSED AS MOOT (2026-10-15)
+**Decision (afk-work D-entry, reversible):** João asked not to be consulted. The Unity Editor licence does not clearly permit reverse engineering, and the study needs an Editor install this machine does not have. The PRD's own fallback applies: rely on manuals, open sources and the PRD-617 real-pack measurements. Reopen by setting the status back to BLOCKED and running Phase 1.
 **Priority:** P3 — optional accuracy input for PRD-616 and PRD-618. AC-1..AC-3 only start after the decision.
 **Complexity:** 1 (LOW) — documentation in a private repo, no implementation files here; risk override: none
 **Owner:** João
@@ -47,5 +47,5 @@ Integration: unchanged — this PRD produces private reference notes only.
 ## Execution Phases
 
 #### Phase 1: Study
-**Status:** NOT STARTED
+**Status:** NOT DONE (PRD closed as moot)
 **Verification:** AC-1, AC-2, AC-3.
