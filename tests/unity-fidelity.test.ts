@@ -16,6 +16,7 @@ import {
   inspectPng,
   isMissingShaderPink,
   runUnityFidelity,
+  summaryLine,
 } from "../src/unity/fidelity.js";
 import { importUnityPackage } from "../src/unity/importer.js";
 import { srgbToLinear } from "../src/unity/materials.js";
@@ -298,6 +299,15 @@ describe("fidelity sheet scores prefabs against prefab previews", () => {
     const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false });
     expect(result.pieces.map((piece) => piece.glb.replace(/^.*\//, ""))).toEqual(["rock.glb"]);
     expect(result.unmatched.map((glb) => glb.replace(/^.*\//, ""))).toEqual(["rock-urp.glb"]);
+  }, 120_000);
+
+  it("a slice that names models instead of prefabs says so instead of silently emptying the sheet", async () => {
+    const { root, packagePath, importDir } = await prefabSetup(pieces);
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false, slice: ["Assets/Models/crate.fbx", "Assets/Prefabs/barrel.prefab"] });
+    expect(result.pieces.map((piece) => piece.name)).toEqual(["barrel"]);
+    expect(result.sliceUnmatched).toBe(1);
+    expect(result.referenceNote).toMatch(/1 slice entries matched no prefab/);
+    expect(summaryLine(result)).toMatch(/sliceUnmatched=1/);
   }, 120_000);
 
   it("level: models still scores the model-level GLBs (the before column)", async () => {

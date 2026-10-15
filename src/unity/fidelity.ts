@@ -320,6 +320,8 @@ export interface UnityFidelityResult {
   readonly sheet: string;
   /** Assets whose package preview is Unity's generic icon; they have no reference. */
   readonly genericPreviews: number;
+  /** Slice entries that matched no piece of the scored level (a model path in a prefab-level slice). */
+  readonly sliceUnmatched: number;
   /** Assets whose package preview is Unity's missing-shader pink; they have no reference. */
   readonly errorPreviews: number;
   readonly pieces: UnityPiece[];
@@ -386,6 +388,8 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   const chosen = options.slice && options.slice.length > 0 ? new Set(options.slice) : undefined;
   const levelPieces = scoredPieces(report, options.level);
   const scored = chosen ? levelPieces.filter((piece) => chosen.has(piece.source)) : levelPieces;
+  // A slice names the sheet's pieces by their project path at the scored level (prefabs by default): a model path matches none.
+  const sliceUnmatched = chosen ? [...chosen].filter((path) => !levelPieces.some((piece) => piece.source === path)).length : 0;
   const absolute = (key: string): string => join(importDir, key);
   await mkdir(out, { recursive: true });
 
@@ -403,6 +407,7 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   } else {
     throw new Error("A Unity sheet needs a reference: pass the R1 folder with bounds.json, or the package for its R2 previews.");
   }
+  if (sliceUnmatched > 0) referenceNote += `; ${sliceUnmatched} slice entries matched no ${levelPieces === report.prefabs ? "prefab" : "model"} (the slice names pieces of the scored level by project path)`;
   if (references.errorPink && references.errorPink.length > 0) referenceNote += `; ${references.errorPink.length} package previews show Unity's missing-shader pink and are not a reference`;
   if (references.generic && references.generic.length > 0) referenceNote += `; ${references.generic.length} package previews are Unity's generic icon (one picture shared by many assets) and are not a reference`;
   const label = REFERENCE_LABELS[references.kind];
@@ -481,7 +486,7 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
     join(out, "reference.json"),
     `${JSON.stringify({ level: levelPieces === report.prefabs ? "prefabs" : "models", reference: references.kind, note: referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, summary }, null, 1)}\n`,
   );
-  return { level: levelPieces === report.prefabs ? "prefabs" : "models", reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, genericPreviews: references.generic?.length ?? 0, errorPreviews: references.errorPink?.length ?? 0, pieces, summary };
+  return { level: levelPieces === report.prefabs ? "prefabs" : "models", reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, genericPreviews: references.generic?.length ?? 0, sliceUnmatched, errorPreviews: references.errorPink?.length ?? 0, pieces, summary };
 }
 
 /** The per-piece table the PR evidence rule asks for (verdict, score, hue, saturation, fill, size). */
@@ -508,6 +513,7 @@ export function summaryLine(result: UnityFidelityResult): string {
     (result.reference === "R1" ? ` sizeMismatches=${s.sizeMismatches}` : "") +
     (result.unmatched.length > 0 ? ` withoutReference=${result.unmatched.length}` : "") +
     (result.genericPreviews > 0 ? ` genericPreviews=${result.genericPreviews}` : "") +
-    (result.errorPreviews > 0 ? ` errorPreviews=${result.errorPreviews}` : "")
+    (result.errorPreviews > 0 ? ` errorPreviews=${result.errorPreviews}` : "") +
+    (result.sliceUnmatched > 0 ? ` sliceUnmatched=${result.sliceUnmatched}` : "")
   );
 }
