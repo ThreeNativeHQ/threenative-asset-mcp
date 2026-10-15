@@ -72,7 +72,7 @@ async function isExecutable(path: string): Promise<boolean> {
 /** Runs `blender -b --version` and returns "4.5.14" when it is Blender, else undefined. */
 export async function probeBlender(path: string): Promise<string | undefined> {
   try {
-    const run = await runBounded(path, ["-b", "--factory-startup", "--version"], { timeoutMs: 60_000 });
+    const run = await runBounded(path, ["-b", "--factory-startup", "--disable-autoexec", "--version"], { timeoutMs: 60_000 });
     if (run.code !== 0) return undefined;
     return /^Blender (\d+\.\d+(?:\.\d+)?)/m.exec(run.stdout)?.[1];
   } catch {

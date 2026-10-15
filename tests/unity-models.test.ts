@@ -154,6 +154,31 @@ describeWithTools(["blender"], "unity models through Blender", () => {
     expect(JSON.parse(await readFile(join(outputDir, "import-report.json"), "utf8")).importerVersion).toBe(UNITY_IMPORTER_VERSION);
   }, 90_000);
 
+  it("leaves no output behind when Blender is missing, so a retry into the same directory succeeds", async () => {
+    const root = await scratchDirectory("unity-project-");
+    await writeProjectFolder(root, [...folders("Assets", "Assets/Models"), { path: "Assets/Models/crate.fbx", data: cube }]);
+    const outputDir = join(await scratchDirectory("unity-out-"), "import");
+    const missing = join(await scratchDirectory("unity-no-blender-"), "blender");
+    const failure = await importUnityPackage({ source: root, outputDir, environment: { ...process.env, THREENATIVE_BLENDER: missing } }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "UNITY_BLENDER_NOT_FOUND" });
+    expect(await stat(outputDir).catch(() => undefined)).toBeUndefined();
+    const report = await importUnityPackage({ source: root, outputDir });
+    expect(report.counts).toMatchObject({ models: 1, failed: 0 });
+  }, 90_000);
+
+  it("starts Blender with --disable-autoexec before any script runs", async () => {
+    const root = await scratchDirectory("unity-project-");
+    await writeProjectFolder(root, [...folders("Assets", "Assets/Models"), { path: "Assets/Models/crate.fbx", data: cube }]);
+    const outputDir = join(await scratchDirectory("unity-out-"), "import");
+    const bin = await scratchDirectory("unity-fake-argv-");
+    const log = join(bin, "argv.txt");
+    const fake = join(bin, "blender");
+    await writeFile(fake, `#!/bin/sh\necho "$@" >> ${log}\nexit 1\n`, { mode: 0o755 });
+    const report = await importUnityPackage({ source: root, outputDir, blender: { path: fake, version: "9.9.9", source: "PATH" } });
+    expect(report.counts.failed).toBe(1);
+    expect(await readFile(log, "utf8")).toMatch(/^-b --factory-startup --disable-autoexec --python-exit-code 1 --python /);
+  }, 90_000);
+
   it("converts a .unitypackage the same way", async () => {
     const archiveDirectory = await scratchDirectory("unity-pack-");
     const archive = join(archiveDirectory, "crate.unitypackage");
