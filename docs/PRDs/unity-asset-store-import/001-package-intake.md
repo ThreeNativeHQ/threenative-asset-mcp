@@ -1,6 +1,6 @@
 # PRD-615 — Unity package intake: cache discovery, extraction and asset database
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — AC-1..AC-6 done (2026-10-14); AC-7 and AC-8 wait for the corpus packs
 **Priority:** P2 — every later Unity step reads packages through this intake, and none of AC-1..AC-7 exists yet.
 **Complexity:** 3 (LOW) — 1–5 implementation files (1), new `src/unity/` module (+2); risk override: untrusted
 archive paths cross a trust boundary, so AC-2 gets its own traversal test.
@@ -43,32 +43,32 @@ modification time. It reads only local files. It never contacts Unity.
 
 ## Acceptance Criteria
 
-- [ ] AC-1 [local]: `unity_list_packages` through the MCP returns every `.unitypackage` under a temp cache set by
+- [x] AC-1 [local]: `unity_list_packages` through the MCP returns every `.unitypackage` under a temp cache set by
   `ASSETSTORE_CACHE_PATH`, with publisher, category and name. Without the override it uses the Linux default path.
-  proof: `npx vitest run tests/unity-intake.test.ts` — Evidence: pending.
-- [ ] AC-2 [local]: A synthetic `.unitypackage` whose `pathname` holds `../x`, `/abs` or `C:\x`, or whose tar holds a
+  proof: `npx vitest run tests/unity-intake.test.ts` — Evidence: passed 2026-10-14 (handler on a temp `ASSETSTORE_CACHE_PATH`, the Linux default path, and a missing cache; the packed-MCP call is AC-6).
+- [x] AC-2 [local]: A synthetic `.unitypackage` whose `pathname` holds `../x`, `/abs` or `C:\x`, or whose tar holds a
   symlink, is refused with the offending entry named, and nothing is written outside staging.
-  proof: `npx vitest run tests/unity-intake.test.ts -t traversal` — Evidence: pending.
-- [ ] AC-3 [local]: The same synthetic content as a `.unitypackage`, a UPM tarball and a project folder produces
+  proof: `npx vitest run tests/unity-intake.test.ts -t traversal` — Evidence: passed 2026-10-14 (8 tests: `../x`, `/abs`, `C:\x`, an embedded `..`, symlink and hardlink members, `..` and absolute member names, a project-folder symlink; staging removed, nothing else written). Mutation check: removing the link and `..` guards turned 4 of them red.
+- [x] AC-3 [local]: The same synthetic content as a `.unitypackage`, a UPM tarball and a project folder produces
   equal databases (same guid → path → meta).
-  proof: `npx vitest run tests/unity-intake.test.ts -t shapes` — Evidence: pending.
-- [ ] AC-4 [local]: The YAML reader returns classId, fileID, the `stripped` flag and parsed fields for a synthetic
+  proof: `npx vitest run tests/unity-intake.test.ts -t shapes` — Evidence: passed 2026-10-14 (`.unitypackage` = project folder under `Assets/`; `.unitypackage` = UPM tarball = UPM folder = project folder under `Packages/`).
+- [x] AC-4 [local]: The YAML reader returns classId, fileID, the `stripped` flag and parsed fields for a synthetic
   multi-document prefab and `.mat`. `resolveRef` resolves a material's texture ref to its asset path, and it
   marks the Standard shader ref as `builtin`.
-  proof: `npx vitest run tests/unity-yaml.test.ts` — Evidence: pending.
-- [ ] AC-5 [local]: An inventory reports counts per kind (model, texture, material, prefab, shader graph, scene,
+  proof: `npx vitest run tests/unity-yaml.test.ts` — Evidence: passed 2026-10-14 (5 tests, including a 64-bit fileID, digit-only and `e`-containing guids kept as strings, `stripped`, an unknown classId kept raw).
+- [x] AC-5 [local]: An inventory reports counts per kind (model, texture, material, prefab, shader graph, scene,
   other), and `docs/unity-format-support.md` exists with those kinds as rows.
-  proof: `npx vitest run tests/unity-intake.test.ts -t inventory` — Evidence: pending.
-- [ ] AC-6 [local]: The packed MCP lists `unity_list_packages`, and a call on an empty cache returns an empty list
+  proof: `npx vitest run tests/unity-intake.test.ts -t inventory` — Evidence: passed 2026-10-14 (inventory counts, ledger rows, and the corpus recorder run on a synthetic corpus).
+- [x] AC-6 [local]: The packed MCP lists `unity_list_packages`, and a call on an empty cache returns an empty list
   rather than an error.
-  proof: `npx vitest run tests/mcp-smoke.test.ts` — Evidence: pending.
+  proof: `npx vitest run tests/mcp-smoke.test.ts` — Evidence: passed 2026-10-14 (packed server lists the tool; empty cache returns `total: 0`, a populated cache returns publisher, category and name).
 - [ ] AC-7 [local]: The corpus packs `U1`, `U2` and `U3` (epic README, "Verification corpus") inventory with zero
   YAML parse failures and zero refused paths. `docs/parity/unity-corpus.json` records each pack's id, listing UID,
   size, SHA-256, pipelines and counts per kind, and no asset names.
-  proof: `npx tsx scripts/unity-inventory.ts --corpus ~/.cache/threenative-asset-mcp/unity-corpus --record` — Evidence: pending.
+  proof: `npx tsx scripts/unity-inventory.ts --corpus ~/.cache/threenative-asset-mcp/unity-corpus --record` — Evidence: pending. **Not done:** the corpus directory does not exist on the development machine and the packs need João's Fab account or download (PRD-619 or manual). The script and recorder are ready and tested on a synthetic corpus; a missing or empty corpus prints a note and exits 0 without writing. It also records `previews` and `yamlFailures` per pack, beyond the fields listed here.
 - [ ] AC-8 [local]: The PR comment carries the inventory table for `U1`–`U3` (counts per kind, preview count per
   pack, so PRD-617 knows where `R2` exists), following the epic's PR evidence rule. There is no render yet, so there
-  is no sheet. proof: PR comment link — Evidence: pending.
+  is no sheet. proof: PR comment link — Evidence: pending. **Not done:** needs the AC-7 run on `U1`–`U3`.
 
 ## Blocked on
 
@@ -86,20 +86,20 @@ modification time. It reads only local files. It never contacts Unity.
 ## Execution Phases
 
 #### Phase 1: Extraction and database
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-14)
 **Files:** `src/unity/package.ts` (new), `tests/unity-intake.test.ts` (new; builds packages with `tar` in a cleaned temp dir)
 **Implementation:** Detect the shape. Extract with `runBounded("tar", …)`, list members first (`tar tvzf`) to refuse
 links, validate every `pathname`, and build the database. Every temp dir is removed (`onTestFinished`).
 **Verification:** AC-2, AC-3.
 
 #### Phase 2: YAML and references
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-14)
 **Files:** `src/unity/yaml.ts` (new), `tests/unity-yaml.test.ts` (new), `package.json` (`yaml`)
 **Implementation:** Split documents, parse bodies, expose `resolveRef`. Keep unknown classIds as raw objects.
 **Verification:** AC-4.
 
 #### Phase 3: Tool, inventory and ledger
-**Status:** NOT STARTED
-**Files:** `src/tools/unity-packages.ts` (new), `src/server.ts`, `docs/unity-format-support.md` (new), `docs/tools.md`, `scripts/unity-inventory.ts` (new), `docs/parity/unity-corpus.json` (new)
+**Status:** PARTIAL — tool, inventory and ledger done; the corpus record (`docs/parity/unity-corpus.json`) and AC-7/AC-8 wait for the corpus packs
+**Files:** `src/tools/unity-packages.ts` (new), `src/unity/cache.ts` and `src/unity/inventory.ts` (new), `src/server.ts`, `docs/unity-format-support.md` (new), `docs/tools.md`, `scripts/unity-inventory.ts` (new), `docs/parity/unity-corpus.json` (new)
 **Implementation:** Register the tool, add the inventory, the corpus record and the ledger.
 **Verification:** AC-1, AC-5, AC-6, AC-7, AC-8.
