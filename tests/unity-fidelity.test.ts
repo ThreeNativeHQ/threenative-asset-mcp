@@ -1,7 +1,5 @@
-import { execFile } from "node:child_process";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
@@ -17,11 +15,9 @@ import {
 import { importUnityPackage } from "../src/unity/importer.js";
 import { srgbToLinear } from "../src/unity/materials.js";
 import { type SyntheticPiece, renderPreviewPng, writePlainCube, writeSyntheticImport } from "./helpers/unity-fidelity.js";
-import { type FixtureFile, scratchDirectory, writeUnityPackage } from "./helpers/unity-fixtures.js";
+import { type FixtureFile, runScript, scratchDirectory, writeUnityPackage } from "./helpers/unity-fixtures.js";
 import { SHADERS, materialYaml, modelImporter, writeCubeFbx } from "./helpers/unity-models.js";
 import { describeWithTools } from "./helpers/require-tool.js";
-
-const run = promisify(execFile);
 
 const RED = [0.6, 0.05, 0.05] as const;
 const GREEN = [0.05, 0.5, 0.1] as const;
@@ -258,10 +254,7 @@ describe("fidelity sheet reference", () => {
   it("reference: the script prints the reference column and the table for an existing import", async () => {
     const { packagePath, importDir, root } = await setup(pieces, await previews(pieces));
     const out = join(root, "out");
-    const { stdout } = await run("npx", ["tsx", "scripts/fidelity-sheet.ts", "--unity-package", packagePath, "--import", importDir, "--out", out, "--max", "3"], {
-      cwd: process.cwd(),
-      timeout: 150_000,
-    });
+    const { stdout } = await runScript("scripts/fidelity-sheet.ts", ["--unity-package", packagePath, "--import", importDir, "--out", out, "--max", "3"], 150_000);
     expect(stdout).toMatch(/Reference: R2/);
     expect(stdout).toMatch(/reference=R2 compared=3/);
     expect((await stat(join(out, "sheet.jpg"))).size).toBeGreaterThan(2000);

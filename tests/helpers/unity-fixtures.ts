@@ -117,3 +117,17 @@ export async function writeUpmTarball(archive: string, name: string, files: read
 export function tarWith(archive: string, cwd: string, members: readonly string[], extra: readonly string[] = []): void {
   tar(["-czPf", archive, ...extra, ...members], cwd);
 }
+
+/**
+ * Runs a repo script through node's tsx loader with a private TMPDIR. tsx writes its transform cache into TMPDIR, which the
+ * leak gate counts as a leak, so the child gets a directory of its own that the test removes (as `tests/unity-intake.test.ts` does).
+ */
+export async function runScript(script: string, args: readonly string[], timeout = 120_000): Promise<{ stdout: string; stderr: string }> {
+  const { execFile } = await import("node:child_process");
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const { promisify } = await import("node:util");
+  const loader = pathToFileURL(createRequire(import.meta.url).resolve("tsx/esm")).href;
+  const cache = await scratchDirectory("tsx-cache-");
+  return promisify(execFile)(process.execPath, ["--import", loader, script, ...args], { cwd: process.cwd(), timeout, env: { ...process.env, TMPDIR: cache } });
+}

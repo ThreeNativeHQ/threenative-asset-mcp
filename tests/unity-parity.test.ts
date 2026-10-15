@@ -1,18 +1,15 @@
-import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
 import { runUnityParity } from "../src/unity/parity.js";
 import { srgbToLinear } from "../src/unity/materials.js";
 import { renderPreviewPng, writePlainCube } from "./helpers/unity-fidelity.js";
-import { scratchDirectory, writeUnityPackage } from "./helpers/unity-fixtures.js";
+import { runScript, scratchDirectory, writeUnityPackage } from "./helpers/unity-fixtures.js";
 import { materialYaml, modelImporter, SHADERS, writeCubeFbx } from "./helpers/unity-models.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
-const run = promisify(execFile);
 
 describe("parity:unity without a corpus", () => {
   it("measures nothing, says so, and succeeds", async () => {
@@ -25,9 +22,9 @@ describe("parity:unity without a corpus", () => {
     expect(await readdir(join(out, "sheets"))).toEqual([]);
   });
 
-  it("the npm script exits 0 with the same note when the directory does not exist", async () => {
+  it("the script exits 0 with the same note when the directory does not exist", async () => {
     const out = await scratchDirectory("unity-parity-out-");
-    const { stdout } = await run("npm", ["run", "-s", "parity:unity", "--", "--dir", join(out, "no-corpus"), "--out", join(out, "sweep")], { cwd: process.cwd(), timeout: 60_000 });
+    const { stdout } = await runScript("scripts/unity-parity.ts", ["--dir", join(out, "no-corpus"), "--out", join(out, "sweep")], 60_000);
     expect(stdout).toMatch(/No corpus: none of U1, U2, U3 found/);
   }, 90_000);
 });
@@ -85,7 +82,7 @@ describeWithTools(["blender", "chromium"], "parity:unity on a synthetic corpus",
 
     // fidelity-baseline.ts: record, accept the same numbers, and refuse a drop.
     const baseline = join(root, "baseline.json");
-    const tool = (mode: string) => run("npx", ["tsx", "scripts/fidelity-baseline.ts", mode, out, baseline], { cwd: process.cwd(), timeout: 60_000 });
+    const tool = (mode: string) => runScript("scripts/fidelity-baseline.ts", [mode, out, baseline], 60_000);
     expect((await tool("update")).stdout).toMatch(/2 pack\(s\) recorded/);
     expect((await tool("check")).stdout).toMatch(/2 pack\(s\) checked, 2 with a baseline, 0 regression/);
     const dropped = JSON.parse(await readFile(join(out, "sheets", "U1.json"), "utf8")) as { judge: { fidelity: { score: number } }[] };
