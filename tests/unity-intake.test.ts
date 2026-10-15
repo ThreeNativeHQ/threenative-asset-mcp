@@ -284,7 +284,7 @@ describe("unity package inventory", () => {
 
   it("has a ledger row for every inventory kind", () => {
     const ledger = readFileSync(new URL("../docs/unity-format-support.md", import.meta.url), "utf8");
-    expect(ledger).toMatch(/^Last audited: 2026-10-14/m);
+    expect(ledger).toMatch(/^Last audited: 2026-10-15/m);
     const labels: Record<(typeof UNITY_KINDS)[number], string> = {
       model: "Model",
       texture: "Texture",
