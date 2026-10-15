@@ -14,6 +14,7 @@ import {
   compensatePreviewRig,
   decideChannelOrder,
   inspectPng,
+  isMissingShaderPink,
   runUnityFidelity,
 } from "../src/unity/fidelity.js";
 import { importUnityPackage } from "../src/unity/importer.js";
@@ -252,6 +253,29 @@ describe("fidelity sheet scores prefabs against prefab previews", () => {
     expect(result.pieces.map((piece) => piece.name)).toEqual(["d"]);
     expect(scoreOf(result, "d")).toBeGreaterThanOrEqual(85);
     expect(result.referenceNote).toMatch(/3 package previews are Unity's generic icon/);
+  }, 120_000);
+
+  it("a preview that is Unity's missing-shader pink is not a reference: that prefab is left out, not scored as a failure", async () => {
+    const two: SyntheticPiece[] = [
+      { name: "ok", factor: grey, prefabFactor: RED },
+      { name: "pink", factor: grey, prefabFactor: GREEN },
+    ];
+    const pink = (await previews([{ name: "pink", factor: [1, 0, 1] }])).get("pink")!;
+    const real = (await previews([{ name: "ok", factor: RED }])).get("ok")!;
+    expect(await isMissingShaderPink(pink)).toBe(true);
+    expect(await isMissingShaderPink(real)).toBe(false);
+    const root = await scratchDirectory("unity-fidelity-pink-");
+    const packagePath = join(root, "synthetic.unitypackage");
+    await writeUnityPackage(packagePath, [
+      { path: "Assets/Prefabs" },
+      ...two.map((piece) => ({ path: `Assets/Prefabs/${piece.name}.prefab`, content: "fake prefab", previewData: piece.name === "pink" ? pink : real })),
+    ]);
+    const importDir = join(root, "import");
+    await writeSyntheticImport(importDir, two);
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false });
+    expect(result.errorPreviews).toBe(1);
+    expect(result.pieces.map((piece) => piece.name)).toEqual(["ok"]);
+    expect(result.referenceNote).toMatch(/1 package previews show Unity's missing-shader pink/);
   }, 120_000);
 
   it("level: models still scores the model-level GLBs (the before column)", async () => {
