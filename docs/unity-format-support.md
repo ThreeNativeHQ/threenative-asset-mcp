@@ -5,10 +5,11 @@ are missing. It uses the same rules as `docs/unreal-format-support.md`. Update t
 or PR as any change that adds, verifies, removes or regresses support for a kind, a package shape or a
 decoder route. Epic: `docs/PRDs/unity-asset-store-import/README.md`.
 
-Last audited: 2026-10-14. Package intake (PRD-615) and the model, texture and material conversion (PRD-616,
-`asset_import_unity`, `UNITY_IMPORTER_VERSION` 1) exist and are tested with synthetic packages. Fidelity
-measurement (PRD-617: the R1/R2 reference sheet, the material visual locks and the corpus sweep) exists and is
-tested with synthetic data only. The corpus packs (`U1`-`U3`) are not on this machine, so no row is Verified.
+Last audited: 2026-10-14. Package intake (PRD-615), the model, texture and material conversion (PRD-616,
+`asset_import_unity`) and the prefab conversion (PRD-618, `UNITY_IMPORTER_VERSION` 2) exist and are tested with
+synthetic packages. Fidelity measurement (PRD-617: the R1/R2 reference sheet, the material visual locks and the
+corpus sweep) exists and is tested with synthetic data only. The corpus packs (`U1`-`U3`) are not on this machine,
+so no row is Verified.
 
 ## Status vocabulary
 
@@ -51,7 +52,11 @@ mapping, so a kind not listed lands in Other.
 | Material (Shader Graph and custom shaders) | `.mat` | Implemented | `fallback` | Saved colour and base texture, with the shader reference and reason in the report (`tests/unity-materials.test.ts`, `fallback`). The graph itself is not evaluated (out of scope). |
 | Material (slot binding) | `ModelImporter.externalObjects`, name search | Implemented | n/a | `tests/unity-models.test.ts` (`slots`): `externalObjects`, then the nearest `.mat` of the same name, with the binding recorded per slot. `materialImportMode: 0` binds nothing. |
 | Pack licence files | `LICENSE*` `COPYING*` `NOTICE*` `Third-Party Notices*` | Implemented | `licenseFiles` in the report | `tests/unity-models.test.ts`. Restricted Assets carry their own terms, which the tool cannot query. |
-| Prefab | `.prefab` | Reported | none yet | The YAML reader parses it, including `stripped` documents and 64-bit fileIDs. Hierarchy conversion is PRD-618. |
+| Prefab (hierarchy, MeshFilter, MeshRenderer) | `.prefab` | Implemented | `prefabs/<name>.glb` | `tests/unity-prefab.test.ts` (`hierarchy`, `meshes`): world matrices after the handedness conversion, per-slot materials, inactive objects skipped. Gap: slot order and the model's own node transform are unverified; no real pack. |
+| Prefab (nested prefab, variant) | `.prefab` | Implemented | same | `tests/unity-prefab.test.ts` (`nested`, `cycle`): `m_Modifications`, removed components and GameObjects, `m_AddedGameObjects`, `stripped` documents, a variant of a nested prefab, a cycle error that names the chain. The combined id (source id XOR instance id) is unverified on a real pack. |
+| Prefab (model as source) | `.prefab` | Implemented | node with the model scene | `tests/unity-prefab.test.ts` (`nested`, prefab instance of a model). Only the root GameObject and Transform of the model can be edited; edits of inner objects are reported as unresolved. Unverified on a real pack. |
+| LODGroup | `LODGroup` | Implemented | LOD0 only | `tests/unity-prefab.test.ts` (`report`): other levels are listed under `lodLevels`, not imported. |
+| Colliders, scripts and other components | `*Collider`, `MonoBehaviour`, `Light`, ... | Reported | none | `tests/unity-prefab.test.ts` (`report`): listed under `colliders` and `components` in the prefab report. |
 | Shader Graph | `.shadergraph` `.shadersubgraph` | Reported | none | Out of scope for the epic: no published schema. Materials on a graph fall back to saved properties (PRD-616). |
 | Scene | `.unity` | Reported | none | Out of scope for the epic. |
 | Other | everything else | Reported | none | Audio, animation, scripts, VFX and terrain are counted here until a pack shows them and earns a row. |
@@ -63,6 +68,9 @@ mapping, so a kind not listed lands in Other.
 | `{fileID, guid, type}` to a packaged asset | Implemented | `resolveRef` in `src/unity/yaml.ts`; `tests/unity-yaml.test.ts`. |
 | Built-in GUIDs `0000000000000000f000000000000000` (extra resources, including the Standard shader, fileID 46) and `0000000000000000e000000000000000` (default resources) | Implemented | Marked `builtin`, never looked up. Same test file. |
 | Local reference (no guid) and sub-object of another YAML asset | Implemented | Same test file. |
+| `MeshFilter.m_Mesh` to an FBX mesh by `internalIDToNameTable` (2019.1+) | Implemented | `tests/unity-prefab.test.ts` (`meshes`) on a synthetic `.meta`. No real pack. |
+| `MeshFilter.m_Mesh` by `fileIDToRecycleName` (older) | Implemented | Same test, synthetic `.meta`. No real pack. |
+| `MeshFilter.m_Mesh` by the derived id (no table) | Implemented | `src/unity/model-ids.ts`: first 8 bytes of MD4 of `Type:Mesh->{name}->0`, ported from memory of Unidot (MIT). **Unverified against a real pack**: the test only proves the lookup is consistent with the function. Falls back to the model's only mesh, with a warning. |
 
 ## Fidelity measurement (PRD-617)
 

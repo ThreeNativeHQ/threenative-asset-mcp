@@ -554,6 +554,34 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(nodeNamed(await read(join(outputDir, prefabOf(report, "Assets/Prefabs/Garage.prefab").glb)), "Garage").getTranslation()[0]).toBeCloseTo(10, 5);
   }, 180_000);
 
+  it("nested: a prefab instance of a model holds the converted model scene, and only its root can be edited", async () => {
+    const rootTable = `  internalIDToNameTable:\n  - first:\n      1: 100000\n    second: parts\n  - first:\n      4: 400000\n    second: parts\n`;
+    const { report, outputDir } = await importProject([
+      ...folders("Assets"),
+      { path: "Assets/parts.fbx", data: parts, importer: importerWith(rootTable) },
+      {
+        path: "Assets/Variant.prefab",
+        content: prefabFile(
+          prefabInstance(1000, {
+            source: "Assets/parts.fbx",
+            modifications: [
+              { target: 400000, path: "m_LocalPosition.x", value: 4 },
+              { target: 100000, path: "m_Name", value: "PartsRoot" },
+              { target: 400002, path: "m_LocalPosition.x", value: 1 },
+            ],
+          }),
+        ),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Variant.prefab");
+    const document = await read(join(outputDir, prefab.glb));
+    near(nodeNamed(document, "PartsRoot").getTranslation(), [4, 0, 0]);
+    expect(nodeNamed(document, "Body").getParentNode()?.getName()).toBe("PartsRoot");
+    expect(nodeNamed(document, "Wheel").getMesh()).not.toBeNull();
+    expect(prefab.meshNodes).toBe(2);
+    expect(prefab.unresolved).toEqual([expect.objectContaining({ kind: "modification", reason: expect.stringMatching(/only the root of a model can be edited/) })]);
+  }, 120_000);
+
   it("report: a LODGroup keeps LOD0 and lists the other levels", async () => {
     const { report, outputDir } = await importProject([
       ...folders("Assets"),

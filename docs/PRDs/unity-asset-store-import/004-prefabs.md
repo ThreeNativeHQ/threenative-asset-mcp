@@ -1,6 +1,6 @@
 # PRD-618 — Unity prefabs to GLB scenes
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS (AC-1..AC-5 done on synthetic packs; AC-6 and AC-7 wait for the corpus packs U1-U3)
 **Priority:** P2 — Asset Store packs are used through their prefabs, and AC-1..AC-6 do not exist yet.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new prefab resolver (+2), complex reference state (+2); risk override: none
 **Owner:** João
@@ -32,22 +32,22 @@ references in the report.
 
 ## Acceptance Criteria
 
-- [ ] AC-1 [local]: A synthetic prefab with a three-level hierarchy imports with the right world transforms after the
-  handedness conversion (node matrices compared to expected values). proof: `npx vitest run tests/unity-prefab.test.ts -t hierarchy` — Evidence: pending.
-- [ ] AC-2 [local]: `MeshFilter` refs resolve through `internalIDToNameTable`, `fileIDToRecycleName` and the derived
-  hash, and a two-slot `MeshRenderer` assigns its own materials. proof: `npx vitest run tests/unity-prefab.test.ts -t meshes` — Evidence: pending.
-- [ ] AC-3 [local]: A nested prefab with a transform modification, a material override and a removed child, and a
-  variant of it, both import with the modifications applied. proof: `npx vitest run tests/unity-prefab.test.ts -t nested` — Evidence: pending.
-- [ ] AC-4 [local]: A prefab that references itself through a variant chain fails with a cycle error naming the
-  chain, not a hang. proof: `npx vitest run tests/unity-prefab.test.ts -t cycle` — Evidence: pending.
-- [ ] AC-5 [local]: `LODGroup` keeps LOD0, and colliders, LOD levels and unknown components are listed in the report.
-  proof: `npx vitest run tests/unity-prefab.test.ts -t report` — Evidence: pending.
+- [x] AC-1 [local]: A synthetic prefab with a three-level hierarchy imports with the right world transforms after the
+  handedness conversion (node matrices compared to expected values). proof: `npx vitest run tests/unity-prefab.test.ts -t hierarchy` — Evidence: `tests/unity-prefab.test.ts` (3 tests): the world matrix of each of three nodes equals the mirrored Unity product, and a deliberate removal of the z flip turns it red. 2026-10-14.
+- [x] AC-2 [local]: `MeshFilter` refs resolve through `internalIDToNameTable`, `fileIDToRecycleName` and the derived
+  hash, and a two-slot `MeshRenderer` assigns its own materials. proof: `npx vitest run tests/unity-prefab.test.ts -t meshes` — Evidence: `tests/unity-prefab.test.ts` (6 tests with `-t meshes`; the resolution test builds one prefab over a name-table FBX, a recycle-table FBX, a table-less FBX and a one-mesh FBX): the two-slot `Body` takes `red` and `green`, an empty slot keeps `Paint`/`Glass`, and ignoring slot overrides turns it red. The derived id is only checked against the importer's own function, so it stays unverified against a real pack. 2026-10-14.
+- [x] AC-3 [local]: A nested prefab with a transform modification, a material override and a removed child, and a
+  variant of it, both import with the modifications applied. proof: `npx vitest run tests/unity-prefab.test.ts -t nested` — Evidence: `tests/unity-prefab.test.ts` (5 tests): a transform edit, a rename, a removed child (with its collider), an added child under a stripped Transform, a material override on slot 0 (`Wheel` becomes `chrome`), a variant of the nested prefab that edits an inner object by its combined id, and a model used as a source. 2026-10-14.
+- [x] AC-4 [local]: A prefab that references itself through a variant chain fails with a cycle error naming the
+  chain, not a hang. proof: `npx vitest run tests/unity-prefab.test.ts -t cycle` — Evidence: `tests/unity-prefab.test.ts` (3 tests): a three-prefab chain and a self-reference fail with `Prefab cycle: A -> B -> C -> A` in `failed`, the other prefab still imports, and nesting beyond 32 levels is refused. 2026-10-14.
+- [x] AC-5 [local]: `LODGroup` keeps LOD0, and colliders, LOD levels and unknown components are listed in the report.
+  proof: `npx vitest run tests/unity-prefab.test.ts -t report` — Evidence: `tests/unity-prefab.test.ts` (5 tests): `LOD0` keeps its mesh, `LOD1` and `LOD2` do not and are listed with their transition heights; `BoxCollider`, `MeshCollider`, `MonoBehaviour` and `Light` are listed; a missing guid, a built-in mesh and a built-in material are `unresolved`. 2026-10-14.
 - [ ] AC-6 [local]: On `U1`–`U3`, every prefab gives one GLB (`U3`: 458 in, 458 out) or a reported reason. Each
   prefab's size matches its `R1` bounds within 1 % where `R1` exists, and the sweep passes
-  `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: pending.
+  `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: pending. Not run: needs the corpus packs `U1`-`U3` (not on this machine) and PRD-617's sweep.
 - [ ] AC-7 [local]: The PR comment embeds sheets per the epic's PR evidence rule. Before is the model-level import
   from PRD-616, and after is the prefab import, on a slice that covers multi-part prefabs (`U1`), per-slot
-  material overrides (`U2`) and modular pieces (`U3`). Each piece is checked by eye. proof: PR screenshot comment — Evidence: pending.
+  material overrides (`U2`) and modular pieces (`U3`). Each piece is checked by eye. proof: PR screenshot comment — Evidence: pending. Not run: needs the corpus packs `U1`-`U3` and PRD-617's contact sheets.
 
 ## Integration Ledger
 
@@ -58,12 +58,12 @@ references in the report.
 ## Execution Phases
 
 #### Phase 1: Hierarchy and meshes
-**Status:** NOT STARTED
-**Files:** `src/unity/prefab.ts` (new), `src/unity/importer.ts`, `tests/unity-prefab.test.ts` (new)
+**Status:** DONE (synthetic packs)
+**Files:** `src/unity/prefab.ts` (new), `src/unity/prefab-glb.ts` (new), `src/unity/model-ids.ts` (new), `src/unity/importer.ts`, `tests/unity-prefab.test.ts` (new)
 **Verification:** AC-1, AC-2.
 
 #### Phase 2: Nested prefabs and variants
-**Status:** NOT STARTED
+**Status:** DONE (synthetic packs)
 **Files:** `src/unity/prefab.ts`, `tests/unity-prefab.test.ts`
 **Verification:** AC-3, AC-4, AC-5.
 
