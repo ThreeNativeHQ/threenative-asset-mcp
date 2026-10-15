@@ -1,6 +1,6 @@
 {
   "name": "threenative-asset-mcp",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "MCP server for discovering and safely downloading 3D and game-audio assets from curated public sources.",
   "type": "module",
   "main": "./dist/index.js",
