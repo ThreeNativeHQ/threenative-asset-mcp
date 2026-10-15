@@ -75,6 +75,7 @@
     "@modelcontextprotocol/server": "2.0.0",
     "@threenative/playtest": "0.3.2",
     "@zip.js/zip.js": "2.8.34",
+    "ag-psd": "31.0.3",
     "playwright": "1.62.0",
     "sharp": "0.35.4",
     "three": "0.185.1",

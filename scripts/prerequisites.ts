@@ -4,6 +4,8 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
+import { BLENDER_RELEASE, blenderCachePath } from "../src/unity/blender.js";
+
 /**
  * The external tools this repo's tests and Unreal importers rely on. Tests and `npm run doctor`
  * read the same catalog, so the list of what a host needs lives in one place. No test framework is
@@ -228,6 +230,13 @@ export const PREREQUISITES: readonly Prerequisite[] = [
   commandPrerequisite("tar", "toolchain", ["--version"], "tar", "gnu-tar"),
 ];
 
+/** Where `ensureBlender` would find Blender without installing it: THREENATIVE_BLENDER, PATH, then the toolchain cache. */
+function blenderLocation(env: NodeJS.ProcessEnv): string | undefined {
+  const override = env.THREENATIVE_BLENDER?.trim();
+  if (override) return fileExists(override) ? override : undefined;
+  return findOnPath(process.platform === "win32" ? "blender.exe" : "blender", env) ?? (fileExists(blenderCachePath(env)) ? blenderCachePath(env) : undefined);
+}
+
 /** The SharpGLTF assemblies the modern converter ships beside its executable. */
 const SHARPGLTF_ASSEMBLIES = ["SharpGLTF.Core.dll", "SharpGLTF.Runtime.dll", "SharpGLTF.Toolkit.dll"] as const;
 
@@ -250,9 +259,19 @@ const TEST_ONLY_PREREQUISITES: readonly Prerequisite[] = [
     },
     fix: `npx tsx -e 'import { ensureModernConverter } from "./src/unreal/provision.ts"; ensureModernConverter(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'`,
   },
+  {
+    id: "blender",
+    label: `Blender ${BLENDER_RELEASE.version} (Unity model import)`,
+    group: "toolchain",
+    check: (env) => {
+      const where = blenderLocation(env);
+      return { ok: where !== undefined, ...(where ? { detail: where } : {}) };
+    },
+    fix: `npx tsx -e 'import { ensureBlender } from "./src/unity/blender.ts"; ensureBlender(process.env, console.error).catch(error => { console.error(error); process.exitCode = 1; });'`,
+  },
 ];
 
-export type TestToolId = "node" | "ffmpeg" | "ffprobe" | "python-imaging" | "chromium" | "modern-converter" | "g++";
+export type TestToolId = "node" | "ffmpeg" | "ffprobe" | "python-imaging" | "chromium" | "modern-converter" | "g++" | "blender";
 
 export function prerequisiteById(id: string): Prerequisite {
   const found = [...PREREQUISITES, ...TEST_ONLY_PREREQUISITES].find((entry) => entry.id === id);
@@ -287,6 +306,7 @@ const CACHED_TOOLS: readonly (readonly [label: string, relative: string])[] = [
   ["FabCLI", "fabcli/fabcli"],
   ["uncooked converter", "uncooked/venv/bin/unreal-assets-to-glb"],
   ["modern converter", "modern/bin/ThreeNativeConverter"],
+  [`Blender ${BLENDER_RELEASE.version} (Unity import; downloaded on first use)`, `blender-${BLENDER_RELEASE.version}/blender`],
 ];
 
 /** Where FabCLI is, by the same precedence the importer uses. */
@@ -306,6 +326,10 @@ export function infoLines(env: NodeJS.ProcessEnv): InfoLine[] {
       detail: fileExists(join(cache, ...relative.split("/"))) ? `installed (${relative})` : `not installed (${relative})`,
     });
   }
+  lines.push({
+    label: "Blender in use",
+    detail: blenderLocation(env) ?? "none yet (the Unity import downloads the pinned release unless THREENATIVE_TOOLCHAIN_AUTOINSTALL=0)",
+  });
   const fabcli = findFabcli(env, cache);
   if (!fabcli) {
     lines.push({ label: "FabCLI session", detail: "FabCLI not found" });
