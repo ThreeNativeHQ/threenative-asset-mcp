@@ -117,6 +117,45 @@ describe("texture file formats", () => {
   });
 });
 
+describe("pixel budget", () => {
+  it("refuses a TGA or PSD header that claims more pixels than the limit before it allocates", async () => {
+    const directory = await scratchDirectory("unity-textures-");
+    const header = Buffer.alloc(18);
+    header[2] = 10;
+    header[16] = 24;
+    header.writeUInt16LE(30000, 12);
+    header.writeUInt16LE(30000, 14);
+    expect(() => decodeTga(header)).toThrow(/30000x30000 pixels, more than the 134217728 pixel limit/);
+    const psd = Buffer.alloc(26);
+    psd.write("8BPS", 0, "latin1");
+    psd.writeUInt16BE(1, 4);
+    psd.writeUInt32BE(30000, 14);
+    psd.writeUInt32BE(30000, 18);
+    const psdFile = join(directory, "big");
+    await writeFile(psdFile, psd);
+    await expect(decodeTexture(psdFile, "Assets/T/big.psd")).rejects.toThrow(/The PSD is 30000x30000 pixels/);
+  });
+
+  it("applies the limit to TGA, PSD and sharp-decoded files alike", async () => {
+    const directory = await scratchDirectory("unity-textures-");
+    const pixels = new Uint8ClampedArray(2 * 2 * 4).fill(200);
+    const raw = { raw: { width: 2, height: 2, channels: 4 as const } };
+    const files: [string, Buffer][] = [
+      ["a.tga", tga({ type: 2, depth: 24, rows: [[bgr(RED), bgr(GREEN)], [bgr(BLUE), bgr(WHITE)]] })],
+      ["b.psd", Buffer.from(writePsd({ width: 2, height: 2, imageData: { width: 2, height: 2, data: pixels } } as never, { generateThumbnail: false }))],
+      ["c.png", await sharp(Buffer.from(pixels.buffer), raw).png().toBuffer()],
+      ["d.tif", await sharp(Buffer.from(pixels.buffer), raw).tiff().toBuffer()],
+      ["e.jpg", await sharp(Buffer.from(pixels.buffer), raw).jpeg().toBuffer()],
+    ];
+    for (const [name, bytes] of files) {
+      const file = join(directory, name);
+      await writeFile(file, bytes);
+      expect((await decodeTexture(file, `Assets/T/${name}`, 4)).width, name).toBe(2);
+      await expect(decodeTexture(file, `Assets/T/${name}`, 3), name).rejects.toBeInstanceOf(UnityTextureError);
+    }
+  });
+});
+
 describe("colour spaces and sizes", () => {
   const normal: DecodedImage = { width: 1, height: 1, data: Buffer.from([128, 127, 255, 255]) };
   const context = (image: DecodedImage, settings = DEFAULT_TEXTURE) => ({ load: async () => image, settings: () => settings });
