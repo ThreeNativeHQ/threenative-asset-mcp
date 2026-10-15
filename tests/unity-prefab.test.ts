@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { UNITY_IMPORTER_VERSION, importUnityPackage } from "../src/unity/importer.js";
 import { derivedMeshFileId, md4 } from "../src/unity/model-ids.js";
+import { fbxMeshFrame, placeMeshFrame } from "../src/unity/prefab-glb.js";
 import { toGltfTransform } from "../src/unity/prefab.js";
 import { type FixtureFile, scratchDirectory, writeProjectFolder } from "./helpers/unity-fixtures.js";
 import { SHADERS, materialYaml } from "./helpers/unity-models.js";
@@ -141,6 +142,24 @@ describe("hierarchy", () => {
     expect(prefab.unresolved).toEqual([]);
     expect(prefab.nodes).toBe(1);
   }, 60_000);
+});
+
+describe("pivot offset of a file node", () => {
+  // The real U3 shape: a Maya node at T = (12.72, 0.5, 2.13) m with the file's turn about X and scale 0.01, vertices (raw cm) about -T.
+  const world = [0.01, 0, 0, 0, 0, 0, 0.01, 0, 0, -0.01, 0, 0, 12.72, 0.5, 2.13, 1];
+  const frame = fbxMeshFrame(0.01);
+
+  it("pivot: T is kept on all three axes (a sign error on Y or Z leaves the mesh metres off) when it cancels the vertices' offset", () => {
+    const centre = [-1272, -213, 50] as const;
+    const placed = placeMeshFrame(frame, world, centre);
+    const at = [0, 1, 2].map((row) => placed[row]! * centre[0] + placed[4 + row]! * centre[1] + placed[8 + row]! * centre[2] + placed[12 + row]!);
+    near(at, [0, 0, 0], 6);
+  });
+
+  it("pivot: an ordinary node (vertices about the origin, T placing the object) keeps no T, so the prefab's GameObject places it once", () => {
+    expect(placeMeshFrame(frame, world, [0, 0, 0]).slice(12, 15)).toEqual([0, 0, 0]);
+    expect(placeMeshFrame(frame, world, [12, -3, 2]).slice(12, 15)).toEqual([0, 0, 0]);
+  });
 });
 
 describe("cycle", () => {
@@ -561,6 +580,23 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     const { min, max } = getBounds((await read(join(outputDir, prefab.glb))).getRoot().listScenes()[0]!);
     expect((min[0]! + max[0]!) / 2).toBeCloseTo(0, 2);
     expect(max[0]! - min[0]!).toBeCloseTo(0.4, 3);
+  }, 180_000);
+
+  it("meshes: an ordinary file node (translation T, vertices about the origin) is placed by the prefab's own GameObject, not by T twice", async () => {
+    await writePartsFbx(join(fbxDirectory, "placed.fbx"), [{ name: "Block", size: [40, 20, 10], materials: ["Paint"], nodeAt: [300, 0, 0] }]);
+    const placed = await readFile(join(fbxDirectory, "placed.fbx"));
+    const { report, outputDir } = await importProject([
+      ...folders("Assets", "Assets/Prefabs"),
+      { path: "Assets/placed.fbx", data: placed, importer: importerWith("  internalIDToNameTable: []\n").replace("useFileScale: 0", "useFileScale: 1") },
+      {
+        path: "Assets/Prefabs/Block.prefab",
+        // Unity copies the node's translation onto the prefab's GameObject (3 m); the mesh itself is about the origin.
+        content: prefabFile(gameObject(10, "Block", { components: [11, 12, 13] }), transform(11, 10, { position: [3, 0, 0] }), meshFilter(12, 10, asset("Assets/placed.fbx", 4300000)), meshRenderer(13, 10, [])),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Prefabs/Block.prefab");
+    const { min, max } = getBounds((await read(join(outputDir, prefab.glb))).getRoot().listScenes()[0]!);
+    expect((min[0]! + max[0]!) / 2).toBeCloseTo(3, 2);
   }, 180_000);
 
   it("meshes: a 64-bit id that no table lists and the derivation does not reproduce is matched by the GameObject name, with a warning (real Unity 2022 packs)", async () => {

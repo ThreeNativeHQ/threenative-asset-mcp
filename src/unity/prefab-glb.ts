@@ -74,6 +74,44 @@ export function fbxMeshFrame(scale: number): number[] {
   return [-scale, 0, 0, 0, 0, 0, -scale, 0, 0, -scale, 0, 0, 0, 0, 0, 1];
 }
 
+/** The centre of a mesh's raw vertices (all primitives). */
+function meshCentre(mesh: Mesh): [number, number, number] {
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (const primitive of mesh.listPrimitives()) {
+    const position = primitive.getAttribute("POSITION");
+    if (!position) continue;
+    const min = position.getMin([0, 0, 0]);
+    const max = position.getMax([0, 0, 0]);
+    for (let axis = 0; axis < 3; axis += 1) {
+      lo[axis] = Math.min(lo[axis]!, min[axis]!);
+      hi[axis] = Math.max(hi[axis]!, max[axis]!);
+    }
+  }
+  return lo.map((value, axis) => (Number.isFinite(value) ? (value + hi[axis]!) / 2 : 0)) as [number, number, number];
+}
+
+/**
+ * Adds the file node's translation T to an FBX mesh frame when it is a pivot offset: the node sits at T and the vertices about -T
+ * (Maya), so Unity's mesh keeps T. MEASURED on U3 (crystals, cubes, planes: 6 models): with T every piece stands on the origin, without it
+ * each is 8-13 m off. An ordinary node (vertices about the origin, T placing the object) puts T on the prefab's GameObject instead, so
+ * adding it would place the part twice. T is kept only when it brings the mesh centre nearer the origin.
+ * ponytail: a heuristic on the centre; an FBX whose offset vertices and T do not cancel is left as Unity's mesh space says.
+ * T is in the node's raw units, so it takes the model's unit scale like the vertices do, then the half turn about Y.
+ */
+export function placeMeshFrame(frame: readonly number[], ownerWorld: readonly number[], rawCentre: readonly [number, number, number]): number[] {
+  const chainScale = Math.hypot(ownerWorld[0]!, ownerWorld[1]!, ownerWorld[2]!) || 1;
+  const k = -frame[0]! / chainScale;
+  const offset = [-ownerWorld[12]! * k, ownerWorld[13]! * k, -ownerWorld[14]! * k];
+  const [x, y, z] = rawCentre;
+  const base = [0, 1, 2].map((row) => frame[row]! * x + frame[4 + row]! * y + frame[8 + row]! * z);
+  const placed = base.map((value, row) => value + offset[row]!);
+  if (Math.hypot(...placed) >= Math.hypot(...base)) return [...frame];
+  const out = [...frame];
+  [out[12], out[13], out[14]] = [offset[0]!, offset[1]!, offset[2]!];
+  return out;
+}
+
 export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGlbHost): Promise<PrefabGlb> {
   const document = new Document().setLogger(new Logger(Logger.Verbosity.SILENT));
   document.createBuffer();
@@ -204,17 +242,8 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
     meshNodes += 1;
     // The frame is the mesh's place in Unity's space (see `fbxMeshFrame`); other model kinds keep their node chain, turned half about Y.
     const fbxFrame = host.meshFrame(reference.model);
-    const frame = fbxFrame ? [...fbxFrame] : multiplyMatrices(HALF_TURN_Y, picked.owner?.getWorldMatrix() ?? IDENTITY);
-    if (fbxFrame && picked.owner) {
-      // A file node that sits away from its pivot (Maya: node translation T, vertices about -T) keeps its place in Unity's mesh.
-      // T is in the node's raw units, so it takes the model's unit scale like the vertices do, then the half turn about Y.
-      const world = picked.owner.getWorldMatrix();
-      const chainScale = Math.hypot(world[0]!, world[1]!, world[2]!) || 1;
-      const k = -frame[0]! / chainScale;
-      frame[12] = -world[12]! * k;
-      frame[13] = world[13]! * k;
-      frame[14] = -world[14]! * k;
-    }
+    const frame: number[] = fbxFrame ? [...fbxFrame] : multiplyMatrices(HALF_TURN_Y, picked.owner?.getWorldMatrix() ?? IDENTITY);
+    if (fbxFrame && picked.owner) frame.splice(0, 16, ...placeMeshFrame(fbxFrame, picked.owner.getWorldMatrix(), meshCentre(picked.mesh)));
     if (!isIdentity(frame)) {
       node.addChild(document.createNode(`${item.name}:mesh`).setMatrix(frame as mat4).setMesh(mesh));
     } else node.setMesh(mesh);
