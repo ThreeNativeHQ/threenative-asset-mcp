@@ -151,7 +151,7 @@ than 32 levels) appears under `failed` with the reason, and the other prefabs st
 
 ## Limits
 
-- The corpus packs `U1` to `U3` were imported on 2026-10-15 (importer 6). `U2` holds Built-in materials only and its
+- The corpus packs `U1` to `U3` were imported on 2026-10-15 (importer 7). `U2` holds Built-in materials only and its
   previews are all Unity's generic icon, so HDRP and URP are verified on synthetic files and, for URP Lit, on `U3`.
 - Scenes, animation and skinned meshes are out of scope. Only LOD0 of a LODGroup is imported.
 - Prefabs: the combined id of an object in a nested instance (source id XOR instance id) is unverified on a real pack

@@ -54,7 +54,7 @@
   "minScore": 25.2,
   "suspect": 10,
   "fail": 11,
-  "basis": "31 of 31 prefabs, importer 6, R2 compensated. IN-SAMPLE: the two rig gains (UNITY_RIG_*) were fitted on these pieces."
+  "basis": "31 of 31 prefabs, importer 7, R2 compensated. IN-SAMPLE: the two rig gains (UNITY_RIG_*) were fitted on these pieces."
  },
  "U3": {
   "compared": 36,
@@ -62,6 +62,6 @@
   "minScore": 49.9,
   "suspect": 10,
   "fail": 1,
-  "basis": "Fixed slice of 36 Built-in prefabs (every 14th of the 505 sorted non-URP prefab paths, slice.json), importer 6, R2 compensated, out of sample for the gains. A 60-piece unsliced run of the same import scored mean 71.9 (ok 27, suspect 26, fail 7), the less selected figure."
+  "basis": "Fixed slice of 36 Built-in prefabs (every 14th of the 505 sorted non-URP prefab paths, slice.json), importer 7, R2 compensated, out of sample for the gains. A 60-piece unsliced run of the same import scored mean 71.9 (ok 27, suspect 26, fail 7), the less selected figure."
  }
 }

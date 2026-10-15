@@ -563,19 +563,19 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(expected[1]).toEqual([expect.closeTo(0.2, 4), expect.closeTo(0.3, 4)]);
   }, 180_000);
 
-  it("meshes: a file node that sits away from its pivot (node at T, vertices about -T, as the real U3 crystals) keeps the mesh at its pivot, not T metres off", async () => {
+  it("meshes: a file node that sits away from its pivot (node at T, vertices about -T, as in the real U3 pack) keeps the mesh at its pivot, not T metres off", async () => {
     // Centimetre vertices: a 40 x 20 x 10 cm part whose node sits 300 cm from the origin.
-    await writePartsFbx(join(fbxDirectory, "pivot.fbx"), [{ name: "Crystal", size: [40, 20, 10], materials: ["Paint"], pivot: [300, 0, 0] }]);
+    await writePartsFbx(join(fbxDirectory, "pivot.fbx"), [{ name: "Pivoted", size: [40, 20, 10], materials: ["Paint"], pivot: [300, 0, 0] }]);
     const pivot = await readFile(join(fbxDirectory, "pivot.fbx"));
     const { report, outputDir } = await importProject([
       ...folders("Assets", "Assets/Prefabs"),
       { path: "Assets/pivot.fbx", data: pivot, importer: importerWith("  internalIDToNameTable: []\n").replace("useFileScale: 0", "useFileScale: 1") },
       {
-        path: "Assets/Prefabs/Crystal.prefab",
-        content: prefabFile(gameObject(10, "Crystal", { components: [11, 12, 13] }), transform(11, 10), meshFilter(12, 10, asset("Assets/pivot.fbx", 4300000)), meshRenderer(13, 10, [])),
+        path: "Assets/Prefabs/Pivoted.prefab",
+        content: prefabFile(gameObject(10, "Pivoted", { components: [11, 12, 13] }), transform(11, 10), meshFilter(12, 10, asset("Assets/pivot.fbx", 4300000)), meshRenderer(13, 10, [])),
       },
     ]);
-    const prefab = prefabOf(report, "Assets/Prefabs/Crystal.prefab");
+    const prefab = prefabOf(report, "Assets/Prefabs/Pivoted.prefab");
     expect(prefab.unresolved).toEqual([]);
     const { min, max } = getBounds((await read(join(outputDir, prefab.glb))).getRoot().listScenes()[0]!);
     expect((min[0]! + max[0]!) / 2).toBeCloseTo(0, 2);

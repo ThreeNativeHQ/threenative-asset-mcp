@@ -67,7 +67,7 @@ export function multiplyMatrices(a: readonly number[], b: readonly number[]): nu
  * Unity's mesh holds the raw vertices times the unit scale, mirrored in X, with the node transforms left to the
  * prefab's own GameObject. So the model's own node chain must not be applied, and the vertices are taken back to
  * raw, scaled, mirrored in X and flipped in Z: (x, y, z) -> s * (-x, -z, -y). The one part of the node chain Unity keeps is its translation
- * (the mesh's offset from its pivot); the writer adds it, see `writePrefabDocument`. MEASURED on U3: crystals that Unity previews as one cluster
+ * (the mesh's offset from its pivot); the writer adds it, see `writePrefabDocument`. MEASURED on U3: parts that Unity previews as one cluster
  * are 12 m apart without it.
  */
 export function fbxMeshFrame(scale: number): number[] {
@@ -93,7 +93,7 @@ function meshCentre(mesh: Mesh): [number, number, number] {
 
 /**
  * Adds the file node's translation T to an FBX mesh frame when it is a pivot offset: the node sits at T and the vertices about -T
- * (Maya), so Unity's mesh keeps T. MEASURED on U3 (crystals, cubes, planes: 6 models): with T every piece stands on the origin, without it
+ * (Maya), so Unity's mesh keeps T. MEASURED on U3 (6 models): with T every piece stands on the origin, without it
  * each is 8-13 m off. An ordinary node (vertices about the origin, T placing the object) puts T on the prefab's GameObject instead, so
  * adding it would place the part twice. T is kept only when it brings the mesh centre nearer the origin.
  * ponytail: a heuristic on the centre; an FBX whose offset vertices and T do not cancel is left as Unity's mesh space says.

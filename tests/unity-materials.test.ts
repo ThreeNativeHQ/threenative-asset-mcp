@@ -260,7 +260,7 @@ describe("fallback materials", () => {
     expect(material.ignored).toEqual(["_NoiseMap"]);
   });
 
-  it("takes the base texture of a custom shader that names it _Albedo (the real U3 Surface_Shader), and still records the fallback", () => {
+  it("takes the base texture of a custom shader that names it _Albedo (a real U3 custom shader), and still records the fallback", () => {
     const material = resolve({ name: "custom", shader: { guid: guidFor("Assets/custom.shader"), fileID: "4800000" }, textures: { _Albedo: ALBEDO, _Specular: AO } }, { [ALBEDO]: {}, [AO]: {} });
     expect(material.status).toBe("fallback");
     expect(material.baseColor?.recipe).toMatchObject({ kind: "copy", texture: guidFor(ALBEDO) });
