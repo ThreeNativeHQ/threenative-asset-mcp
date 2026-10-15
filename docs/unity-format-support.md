@@ -5,11 +5,35 @@ are missing. It uses the same rules as `docs/unreal-format-support.md`. Update t
 or PR as any change that adds, verifies, removes or regresses support for a kind, a package shape or a
 decoder route. Epic: `docs/PRDs/unity-asset-store-import/README.md`.
 
-Last audited: 2026-10-14. Package intake (PRD-615), the model, texture and material conversion (PRD-616,
+Last audited: 2026-10-15 (import hardening: see "Hardening limits"). Package intake (PRD-615), the model, texture and material conversion (PRD-616,
 `asset_import_unity`) and the prefab conversion (PRD-618, `UNITY_IMPORTER_VERSION` 2) exist and are tested with
 synthetic packages. Fidelity measurement (PRD-617: the R1/R2 reference sheet, the material visual locks and the
 corpus sweep) exists and is tested with synthetic data only. The corpus packs (`U1`-`U3`) are not on this machine,
 so no row is Verified.
+
+## Hardening limits
+
+Added after the review of 2026-10-15; each is a named constant with a test. A package that exceeds one fails with a
+named error, and the rest of the import is unaffected where the limit is per prefab or per texture.
+
+| Limit | Value | Where |
+|---|---|---|
+| Archive members / declared uncompressed bytes | 200000 / 8 GiB, checked on the listing before `tar` extracts | `MAX_PACKAGE_MEMBERS`, `MAX_PACKAGE_BYTES` in `src/unity/package.ts` |
+| Prefab scopes (file plus nested-instance expansions) per prefab import | 50000 | `MAX_SCOPES` in `src/unity/prefab.ts` |
+| Array index a prefab modification may address | 4096 (above: reported unresolved) | `MAX_ARRAY_INDEX` |
+| Pixels per decoded texture (TGA, PSD, sharp formats) | 2^27 | `MAX_TEXTURE_PIXELS` in `src/unity/textures.ts` |
+
+Also: members stored with mode 000 are made owner-accessible after extraction so staging can be read and removed,
+non-finite (`.nan`, `.inf`) material floats and colour channels take their defaults, and Blender runs with
+`--disable-autoexec`.
+
+## Unverified risks
+
+- **Y rotation of prefab children and FBX geometry (UNVERIFIED, 2026-10-15).** A reviewer suspects the prefab node
+  transforms (Z flip, `src/unity/prefab.ts:93-97`, `src/unity/prefab-glb.ts:164-189`) and the FBX mesh geometry
+  (Blender import, unchanged) differ by a 180-degree Y rotation from Unity's own FBX import, which mirrors X.
+  Multi-part prefabs would then place children incorrectly. Not reproduced and not changed. Check against a real
+  pack's `R1` render or a Unity-rendered reference before the `U1`-`U3` sign-off. See PRD 004.
 
 ## Status vocabulary
 

@@ -157,3 +157,11 @@ than 32 levels) appears under `failed` with the reason, and the other prefabs st
   the model's own node transform (kept as a child node when it is not the identity) are unverified on a real pack.
 - The Standard shader identity (`fileID` 46 and 45 in the built-in extra resources) is from the Unity manuals and
   is unverified on a real pack.
+- Hardening limits (named constants, each with a test): an archive with more than 200000 members or 8 GiB of
+  declared uncompressed data is refused from its listing before extraction (`UNITY_PACKAGE_TOO_LARGE`). A prefab that
+  expands to more than 50000 nested prefab instances fails with a clear error, like a cycle, and a modification of an
+  array index above 4096 is reported as unresolved. A texture over 2^27 pixels is refused before it is decoded
+  (TGA, PSD and the formats `sharp` reads). Non-finite material values (`.nan`, `.inf`) take their defaults.
+  Blender runs with `--disable-autoexec`, and the output directory is created only after Blender resolves, so a retry
+  after `UNITY_BLENDER_NOT_FOUND` into the same directory works.
+- Unverified: the Y orientation of prefab children against Unity's own FBX import (see `docs/unity-format-support.md`).
