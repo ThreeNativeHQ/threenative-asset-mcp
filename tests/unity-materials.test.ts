@@ -36,6 +36,22 @@ const NORMAL = "Assets/T/normal.png";
 const AO = "Assets/T/ao.png";
 const EMISSIVE = "Assets/T/emissive.png";
 
+describe("non-finite material values", () => {
+  it("drops YAML .nan and .inf floats and colour channels instead of passing them to the glTF factors", () => {
+    const yaml = materialYaml({ name: "bad", shader: SHADERS.standard, floats: { _Metallic: 0.5, _Glossiness: 0.25 }, colors: { _Color: [0.5, 0.5, 0.5, 1] } })
+      .replace("_Metallic: 0.5", "_Metallic: .nan")
+      .replace("_Glossiness: 0.25", "_Glossiness: .inf")
+      .replace(/r: 0\.5/, "r: .nan")
+      .replace(/a: 1\b/, "a: -.inf");
+    expect(yaml).toMatch(/\.nan[\s\S]*\.inf/);
+    const material = readMaterial(parseUnityDocuments(yaml), "bad")!;
+    expect(material.floats).toEqual({});
+    expect(material.colors._Color).toEqual([0, 0.5, 0.5, 1]);
+    const resolved = resolveMaterial(material, identifyShader(material.shader, () => undefined), textureLookup({}));
+    for (const value of [resolved.metallicFactor, resolved.roughnessFactor, ...resolved.baseColorFactor, ...resolved.emissiveFactor]) expect(Number.isFinite(value)).toBe(true);
+  });
+});
+
 describe("standard shader materials", () => {
   it("maps the metallic setup factors, with colours converted from sRGB to linear", () => {
     const material = resolve({
