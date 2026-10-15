@@ -816,6 +816,10 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     const document = await read(join(outputDir, prefab.glb));
     near(nodeNamed(document, "PartsRoot").getTranslation(), [4, 0, 0]);
     expect(nodeNamed(document, "Body").getParentNode()?.getName()).toBe("PartsRoot");
+    // Unity mirrors X on import and the prefab chain flips Z: the model scene's top nodes carry a half turn about Y.
+    const turn = nodeNamed(document, "Body").getRotation();
+    expect(Math.abs(turn[1]!)).toBeCloseTo(1, 5);
+    expect(Math.abs(turn[3]!)).toBeCloseTo(0, 5);
     expect(meshNode(document, "Wheel").getMesh()).not.toBeNull();
     expect(prefab.meshNodes).toBe(2);
     expect(prefab.unresolved).toEqual([expect.objectContaining({ kind: "modification", reason: expect.stringMatching(/only the root of a model can be edited/) })]);
