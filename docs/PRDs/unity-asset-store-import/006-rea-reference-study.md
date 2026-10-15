@@ -29,8 +29,7 @@ Limits:
 
 - [x] AC-1 [local]: `unity-rea-docs` exists with the `unreal-rea-docs` layout (importers, reference, run log), and
   records the analyzed Editor version and its hashes. proof: repo listing — Evidence: private local repo `~/projects/unity-rea-docs`
-  (never pushed): Unity Editor 6000.0.64f1, changeset 5360b7cd7953, sha256 of the archive, the binary, the debug copy, `libfbxsdk.so`
-  and `libfreeimage`. 2026-10-15.
+  (never pushed), with the Editor version, changeset and file hashes. 2026-10-15.
 - [x] AC-2 [local]: Each gap above has a functional requirement with its evidence (REA command and excerpt) or the
   status Inferred. proof: `reference/functional-requirements.md` — Evidence: FR-M1..M6 (derived ids), FR-F1..F6 (FBX), FR-T1..T6 (textures),
   FR-S1..S2 (built-in shader ids), FR-X1..X2 (not found). Verified on real data: FR-M1, FR-M2, FR-S1. 2026-10-15.
