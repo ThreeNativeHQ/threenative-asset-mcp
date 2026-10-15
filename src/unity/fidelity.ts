@@ -17,6 +17,7 @@
  * gamma, sRGB and ICC chunks are recorded (`inspectPng`) and not applied, because the judge reads sRGB pixels
  * on both sides. Both points stay UNVERIFIED until a real package preview is measured.
  */
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
@@ -26,7 +27,7 @@ import { decodeRgba } from "../unreal/image-diff.js";
 import { swapRedBlue } from "../unreal/package-thumbnail.js";
 import { measureFidelity } from "../unreal/render-fidelity.js";
 import type { UnityImportReport } from "./importer.js";
-import { openUnityPackage } from "./package.js";
+import { type UnityAssetEntry, openUnityPackage } from "./package.js";
 
 export type ReferenceKind = "R1" | "R2";
 export const REFERENCE_LABELS: Record<ReferenceKind, string> = { R1: "R1 Unity Editor render", R2: "R2 package preview" };
@@ -67,6 +68,8 @@ export interface UnityReferences {
   readonly images: Map<string, ReferenceImage>;
   /** Models of the report that no reference picture was found for. */
   readonly unmatched: string[];
+  /** Assets whose preview is Unity's generic icon (one picture shared by many assets), so it shows nothing of the asset and is not a reference. */
+  readonly generic?: string[];
 }
 
 type ReportModelLike = Pick<UnityImportReport["models"][number], "name" | "source" | "glb" | "sizeMeters">;
@@ -158,6 +161,9 @@ export function inspectPng(png: Buffer): PngInspection | undefined {
   return { width, height, bitDepth, colorType, ...(gamma !== undefined ? { gamma } : {}), srgbChunk, iccProfile };
 }
 
+/** A preview picture shared by this many prefabs or models is an icon, not a render of any of them. */
+export const GENERIC_PREVIEW_MIN_ASSETS = 3;
+
 /**
  * Previews of the report's pieces. A prefab's own preview, else (for a model) the preview of the prefab of the same
  * name, else the model's own. A model's own preview is Unity's grey default-material render, so it is the last resort.
@@ -166,24 +172,39 @@ export async function readR2(packagePath: string, models: readonly ReportModelLi
   const database = await openUnityPackage(packagePath);
   try {
     const byPath = new Map([...database.entries.values()].map((entry) => [entry.path, entry]));
+    const isPiece = (path: string): boolean => /\.(prefab|fbx|obj|blend|dae|3ds)$/i.test(path);
+    // Unity writes its generic prefab icon as the preview of a prefab it could not render (found on a real pack: all
+    // 17 prefabs of U2 carry byte-identical previews, a plain cube). Judged against it, every piece would "fail".
+    const owners = new Map<string, string[]>();
+    for (const entry of database.entries.values()) {
+      if (!entry.previewFile || !isPiece(entry.path)) continue;
+      const digest = createHash("sha256").update(await readFile(entry.previewFile)).digest("hex");
+      owners.set(digest, [...(owners.get(digest) ?? []), entry.path]);
+    }
+    const genericDigests = new Set([...owners].filter(([, paths]) => paths.length >= GENERIC_PREVIEW_MIN_ASSETS).map(([digest]) => digest));
+    const generic = [...owners].filter(([digest]) => genericDigests.has(digest)).flatMap(([, paths]) => paths).sort();
+    const usable = async (path: string | undefined): Promise<UnityAssetEntry | undefined> => {
+      const entry = path ? byPath.get(path) : undefined;
+      if (!entry?.previewFile) return undefined;
+      return generic.includes(entry.path) ? undefined : entry;
+    };
     const prefabs = new Map<string, string>();
     for (const entry of [...database.entries.values()].sort((a, b) => (a.path < b.path ? -1 : 1))) {
-      if (entry.previewFile && entry.path.toLowerCase().endsWith(".prefab") && !prefabs.has(stem(entry.path))) prefabs.set(stem(entry.path), entry.path);
+      if (entry.previewFile && entry.path.toLowerCase().endsWith(".prefab") && !generic.includes(entry.path) && !prefabs.has(stem(entry.path))) prefabs.set(stem(entry.path), entry.path);
     }
     const images = new Map<string, ReferenceImage>();
     const unmatched: string[] = [];
     for (const model of models) {
-      const own = byPath.get(model.source);
-      const prefabPath = prefabs.get(model.name.toLowerCase());
-      const ownIsPrefab = own?.previewFile !== undefined && own.path.toLowerCase().endsWith(".prefab");
-      const entry = ownIsPrefab ? own : (prefabPath ? byPath.get(prefabPath) : undefined) ?? (own?.previewFile ? own : undefined);
+      const own = await usable(model.source);
+      const ownIsPrefab = own !== undefined && own.path.toLowerCase().endsWith(".prefab");
+      const entry = ownIsPrefab ? own : (await usable(prefabs.get(model.name.toLowerCase()))) ?? own;
       if (!entry?.previewFile) {
         unmatched.push(model.glb);
         continue;
       }
       images.set(model.glb, { png: await readFile(entry.previewFile), asset: entry.path });
     }
-    return { kind: "R2", images, unmatched };
+    return { kind: "R2", images, unmatched, generic };
   } finally {
     await database.dispose();
   }
@@ -232,6 +253,8 @@ export interface UnityFidelityResult {
   readonly previewInspection: (PngInspection & { readonly asset: string })[];
   readonly unmatched: string[];
   readonly sheet: string;
+  /** Assets whose package preview is Unity's generic icon; they have no reference. */
+  readonly genericPreviews: number;
   readonly pieces: UnityPiece[];
   readonly summary: { readonly compared: number; readonly meanScore: number | undefined; readonly ok: number; readonly suspect: number; readonly fail: number; readonly sizeMismatches: number };
 }
@@ -307,6 +330,7 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   } else {
     throw new Error("A Unity sheet needs a reference: pass the R1 folder with bounds.json, or the package for its R2 previews.");
   }
+  if (references.generic && references.generic.length > 0) referenceNote += `; ${references.generic.length} package previews are Unity's generic icon (one picture shared by many assets) and are not a reference`;
   const label = REFERENCE_LABELS[references.kind];
 
   const sizeChecks = new Map<string, SizeCheck>();
@@ -372,7 +396,7 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
     join(out, "reference.json"),
     `${JSON.stringify({ level: scored === report.prefabs ? "prefabs" : "models", reference: references.kind, note: referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, summary }, null, 1)}\n`,
   );
-  return { level: scored === report.prefabs ? "prefabs" : "models", reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, pieces, summary };
+  return { level: scored === report.prefabs ? "prefabs" : "models", reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, genericPreviews: references.generic?.length ?? 0, pieces, summary };
 }
 
 /** The per-piece table the PR evidence rule asks for (verdict, score, hue, saturation, fill, size). */
@@ -397,6 +421,7 @@ export function summaryLine(result: UnityFidelityResult): string {
   return (
     `scored=${result.level} reference=${result.reference} compared=${s.compared} meanScore=${s.meanScore ?? "-"} ok=${s.ok} suspect=${s.suspect} fail=${s.fail}` +
     (result.reference === "R1" ? ` sizeMismatches=${s.sizeMismatches}` : "") +
-    (result.unmatched.length > 0 ? ` withoutReference=${result.unmatched.length}` : "")
+    (result.unmatched.length > 0 ? ` withoutReference=${result.unmatched.length}` : "") +
+    (result.genericPreviews > 0 ? ` genericPreviews=${result.genericPreviews}` : "")
   );
 }

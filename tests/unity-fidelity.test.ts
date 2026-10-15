@@ -211,6 +211,32 @@ describe("fidelity sheet scores prefabs against prefab previews", () => {
     expect(result.unmatched).toEqual([]);
   }, 120_000);
 
+  it("a preview picture shared by three prefabs is Unity's generic icon: those prefabs have no reference and are not scored against it", async () => {
+    const four: SyntheticPiece[] = [
+      { name: "a", factor: grey, prefabFactor: RED },
+      { name: "b", factor: grey, prefabFactor: GREEN },
+      { name: "c", factor: grey, prefabFactor: ORANGE },
+      { name: "d", factor: grey, prefabFactor: RED },
+    ];
+    const icon = (await previews([{ name: "icon", factor: BLUE }])).get("icon")!;
+    const real = (await previews([{ name: "d", factor: RED }])).get("d")!;
+    const root = await scratchDirectory("unity-fidelity-icon-");
+    const packagePath = join(root, "synthetic.unitypackage");
+    await writeUnityPackage(packagePath, [
+      { path: "Assets/Prefabs" },
+      ...four.map((piece) => ({ path: `Assets/Prefabs/${piece.name}.prefab`, content: "fake prefab", previewData: piece.name === "d" ? real : icon })),
+    ]);
+    const importDir = join(root, "import");
+    await writeSyntheticImport(importDir, four);
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160 });
+
+    expect(result.genericPreviews).toBe(3);
+    expect(result.unmatched.map((glb) => glb.replace(/^.*\//, "")).sort()).toEqual(["a.glb", "b.glb", "c.glb"]);
+    expect(result.pieces.map((piece) => piece.name)).toEqual(["d"]);
+    expect(scoreOf(result, "d")).toBeGreaterThanOrEqual(85);
+    expect(result.referenceNote).toMatch(/3 package previews are Unity's generic icon/);
+  }, 120_000);
+
   it("level: models still scores the model-level GLBs (the before column)", async () => {
     const { root, packagePath, importDir } = await prefabSetup(pieces);
     const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, level: "models" });
