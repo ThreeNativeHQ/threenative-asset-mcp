@@ -45,8 +45,8 @@ const isIdentity = (matrix: readonly number[]): boolean => matrix.every((value, 
  * Unity mirrors X when it imports a model, and a prefab's node chain is converted with a Z flip, so a mesh that
  * Unity places in a prefab needs both: that is a half turn about Y of the model's own conversion. Column-major.
  * MEASURED on a real pack (U1, 2026-10-15): with the prefab chain left alone, every asymmetric piece matched
- * Unity's own preview only after a further 100 degrees of yaw, which is exactly this half turn plus Unity's
- * preview camera (120 degrees about Y in glTF space) against ours (40 degrees).
+ * Unity's own preview only after a further 100 degrees of yaw, close to what this half turn plus Unity's preview
+ * camera predict (about 280 degrees after the fix; the camera values are from memory of Unity's preview code and unconfirmed).
  */
 export const HALF_TURN_Y = [-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1];
 

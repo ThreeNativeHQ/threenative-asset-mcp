@@ -42,4 +42,9 @@ describe("fidelity ratchet", () => {
     const next = ratchetUp(baseline, { "pack-a": { compared: 12, meanScore: 80, minScore: 75, suspect: 0, fail: 0 } });
     expect(next["pack-a"]).toEqual({ compared: 12, meanScore: 84, minScore: 75, suspect: 0, fail: 0 });
   });
+
+  it("keeps a hand-written basis note through an update", () => {
+    const noted: FidelityBaseline = { "pack-a": { ...baseline["pack-a"]!, basis: "fixed slice of 36" } };
+    expect(ratchetUp(noted, { "pack-a": { compared: 12, meanScore: 80, minScore: 75, suspect: 0, fail: 0 } })["pack-a"]!.basis).toBe("fixed slice of 36");
+  });
 });

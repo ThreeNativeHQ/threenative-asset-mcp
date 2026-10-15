@@ -1,6 +1,6 @@
 # PRD-617 — Unity import fidelity: references, visual locks and baseline
 
-**Status:** IN PROGRESS (AC-1 to AC-4 done; AC-5 and AC-6 partly, 2026-10-15; the real `R1` render waits for the Unity licence and a Unity licence)
+**Status:** IN PROGRESS (AC-1 to AC-4 done; AC-5 and AC-6 partly, 2026-10-15; the real `R1` render waits for a Unity licence)
 **Priority:** P2 — without AC-1..AC-6, no Unity import result can be measured on the corpus or locked against regression.
 **Complexity:** 3 (LOW) — 1–5 implementation files (1), new comparison path (+2); risk override: none
 **Owner:** João

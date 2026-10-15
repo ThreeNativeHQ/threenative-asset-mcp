@@ -14,6 +14,8 @@ export interface PackFidelity {
   /** Tiles the judge marked suspect / fail (any rule, not only fidelity). */
   readonly suspect: number;
   readonly fail: number;
+  /** How the numbers were taken (slice, in-sample or not). Written by hand, kept by `ratchetUp`, never compared. */
+  readonly basis?: string;
 }
 
 export type FidelityBaseline = Readonly<Record<string, PackFidelity>>;
@@ -66,6 +68,7 @@ export function ratchetUp(baseline: FidelityBaseline, current: FidelityBaseline)
           minScore: Math.max(was.minScore, now.minScore),
           suspect: Math.min(was.suspect, now.suspect),
           fail: Math.min(was.fail, now.fail),
+          ...(was.basis ?? now.basis ? { basis: (was.basis ?? now.basis)! } : {}),
         }
       : now;
   }

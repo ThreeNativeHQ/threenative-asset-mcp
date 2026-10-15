@@ -240,8 +240,10 @@ export async function readR2(packagePath: string, models: readonly ReportModelLi
  * compensation: median saturation ratio (ours over Unity's) 1.46, median lightness ratio 2.62, silhouette mass ratio 1.04.
  * A texture's own preview equals its pixels (RGB order, sRGB), so this is lighting, not decoding. The two gains below
  * bring both U1 medians to 0.98 and 0.96 (the lightness gain is in sRGB values, the metric reads linear light, and
- * saturation and lightness interact, so neither equals its median). Fixed once: never tuned per asset or per pack, and
- * checked out of sample on U2 and U3. Only the measured copy of the reference is compensated; the sheet shows Unity's picture as it is.
+ * saturation and lightness interact, so neither equals its median). FITTED CONSTANTS, fixed once and never tuned per asset or
+ * per pack: the U1 numbers are in-sample. U2 has no usable preview, so it checks nothing. On U3 (60 pieces, out of sample) the mean
+ * score moved from 69.3 to 71.9 while the pieces rated ok fell from 30 to 27: a mixed result, not a confirmation. Only the
+ * measured copy of the reference is compensated; the sheet shows Unity's picture as it is.
  */
 export const UNITY_RIG_SATURATION_GAIN = 2.0;
 export const UNITY_RIG_LIGHTNESS_GAIN = 1.7;

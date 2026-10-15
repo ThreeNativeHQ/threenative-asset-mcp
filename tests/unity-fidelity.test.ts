@@ -440,6 +440,10 @@ describeWithTools(["blender", "chromium"], "fidelity of a real importer run", ()
 });
 
 describe("Unity preview rig compensation", () => {
+  it("the gains are the constants fitted on U1 (changing them changes every R2 score: refit, re-run the sweeps and update the baseline)", () => {
+    expect([UNITY_RIG_SATURATION_GAIN, UNITY_RIG_LIGHTNESS_GAIN]).toEqual([2.0, 1.7]);
+  });
+
   const pixel = async (rgb: readonly [number, number, number]): Promise<Buffer> =>
     sharp(Buffer.from([...rgb, 255]), { raw: { width: 1, height: 1, channels: 4 } }).png().toBuffer();
   const read = async (png: Buffer): Promise<number[]> => [...(await sharp(png).ensureAlpha().raw().toBuffer())];
