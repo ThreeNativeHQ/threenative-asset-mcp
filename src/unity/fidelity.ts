@@ -9,13 +9,14 @@
  *
  * Only the camera-robust scores count (hue, saturation, silhouette fill; lightness weakly), as for Unreal.
  *
- * R2 channel order and gamma. A `preview.png` is a PNG file, so unlike Unreal's raw editor thumbnails (stored
- * red/blue swapped in UE4) its channel order is fixed by the format and `sharp` decodes it correctly. Nothing
- * proves that the Editor wrote it that way, and no real preview was available when this was written, so the
- * code does not assume it: after the first pass it re-scores every piece with red and blue exchanged
- * (`decideChannelOrder`) and swaps the whole package only when that is overwhelming evidence. The PNG's own
- * gamma, sRGB and ICC chunks are recorded (`inspectPng`) and not applied, because the judge reads sRGB pixels
- * on both sides. Both points stay UNVERIFIED until a real package preview is measured.
+ * R2 channel order and gamma: VERIFIED on a real pack (U1, 2026-10-15). A `preview.png` is RGB and sRGB-encoded, with no
+ * gamma, sRGB or ICC chunk: a texture asset's preview equals its source texture downsampled, and a lit preview fits
+ * `preview ~ albedo^0.47`, not a 2.2 curve. The code still re-scores every piece with red and blue exchanged
+ * (`decideChannelOrder`) and swaps the whole package only on overwhelming evidence; it found none on U1. The PNG's
+ * chunks are recorded (`inspectPng`) and not applied.
+ *
+ * R2 is not a render of our picture: Unity lights it with its own rig, so `compensatePreviewRig` rescales the measured
+ * copy by two fixed gains, and a preview that is Unity's generic icon or its missing-shader pink is no reference.
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";

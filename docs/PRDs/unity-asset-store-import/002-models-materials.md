@@ -1,6 +1,6 @@
 # PRD-616 — Unity models, textures and materials to GLB
 
-**Status:** IN PROGRESS — AC-1..AC-8 pass on synthetic packages; AC-9 (real-pack evidence) is open.
+**Status:** IN PROGRESS — AC-1..AC-8 pass on synthetic packages; AC-9 (real-pack evidence) is only partly met (2026-10-15, see its note).
 **Priority:** P2 — `asset_import_unity` is the epic's user-facing import.
 **Complexity:** 4 (MEDIUM) — 6–10 implementation files (2), new importer module (+2); risk override: none
 **Owner:** João
@@ -19,10 +19,10 @@ Material mapping, ported from UnityGLTF `ExporterMaterials.cs` (MIT) and the Uni
 
 | Shader | Identified by | Mapping notes |
 |---|---|---|
-| Built-in Standard / Standard (Specular setup) | `fileID: 46` / `45`, guid `0000000000000000f000000000000000` (verify on a real pack) | `_MainTex`·`_Color`; `_MetallicGlossMap` R = metallic, A = smoothness × `_GlossMapScale`, else `_Glossiness`; `_SmoothnessTextureChannel` 1 = albedo alpha; roughness = 1 − smoothness; `_BumpMap`·`_BumpScale`; `_OcclusionMap` (G); `_EmissionMap`·`_EmissionColor`; `_Mode` 1 = cutout (`_Cutoff`), 2/3 = blend |
+| Built-in Standard / Standard (Specular setup) | `fileID: 46` / `45`, guid `0000000000000000f000000000000000` (verified on `U1`, `U2`, `U3`) | `_MainTex`·`_Color`; `_MetallicGlossMap` R = metallic, A = smoothness × `_GlossMapScale`, else `_Glossiness`; `_SmoothnessTextureChannel` 1 = albedo alpha; roughness = 1 − smoothness; `_BumpMap`·`_BumpScale`; `_OcclusionMap` (G); `_EmissionMap`·`_EmissionColor`; `_Mode` 1 = cutout (`_Cutoff`), 2/3 = blend |
 | URP Lit / SimpleLit / ComplexLit | `933532a4fcc9baf4fa0491de14d08ed7` / `8d2bb70cbf9db8d4da26e15b26e74248` / `ee7e4c9a5f6364b688a332c67fc32cca` | `_BaseMap`·`_BaseColor`, `_Smoothness`, `_WorkflowMode`, `_Surface`, `_AlphaClip` |
 | HDRP Lit | `6e4ae4064600d784cac1e41a9e6f2e59` | `_MaskMap`: R metallic, G AO, B detail mask, A smoothness |
-| Anything else (Shader Graph, custom) | — | Saved `_BaseColor`/`_Color` and `_BaseMap`/`_MainTex` when present; else neutral. Recorded as `fallback` with the shader ref |
+| Anything else (Shader Graph, custom) | — | Saved `_BaseColor`/`_Color` and `_BaseMap`/`_MainTex`/`_BaseColorMap`/`_Albedo` when present; else neutral. Recorded as `fallback` with the shader ref |
 
 Specular setup converts to metallic-roughness with `KHR_materials_specular`, which is already supported through
 `@gltf-transform/extensions`. Reuse: `@gltf-transform/*` (GLB writing), `sharp` (textures), `sizeMeters`
@@ -67,7 +67,7 @@ returns `SummarySchema`.
   `U2` pieces in each of its three pipelines. The sheet shows reference (`R2` previews, `R1` if available) | "no
   importer" | after, with judge scores. No Standard, URP Lit or HDRP Lit piece fails (score under 50), and each
   suspect piece names its cause. The same `U2` piece scores within 10 points across the three pipelines. Every
-  sheet is checked by eye and posted to the PR. proof: PR screenshot comment — Evidence: pending. **Blocked on João:** the corpus packs `U1`-`U3` are not on this machine (the Fab download route was unavailable), so no real pack was imported, no `R2` sheet was built and no judge score exists. Put the three `.unitypackage` files in `~/.cache/threenative-asset-mcp/unity-corpus/<id>/`, then build the sheet with `renderTiles` and `judgeRender`.
+  sheet is checked by eye and posted to the PR. proof: PR screenshot comment — Evidence: PARTLY MET, NOT TICKED. `npm run parity:unity -- --ids U1,U2 --max 40` and `--ids U3 --max 60` (importer 6, 2026-10-15). `U1` (Built-in Standard, shader `fileID` 46 on all 31 materials): 31 prefabs, 105 textures resolved, 0 fallback, 0 failed; judge on prefab GLBs against prefab previews (R2): mean 60.7, ok 10, suspect 10, fail 11 (after the Unity preview rig compensation of `src/unity/fidelity.ts`; 48.7 and 15 fails without it). The 11 fails are not import errors: Unity's preview rig, a fully metallic bottle in a neutral picture, and a grey-on-grey mask; each is named on the sheet. `U3` slice of 36: mean 78.3, ok 25, suspect 10, fail 1 (the one fail has the right shape and a colour 21 degrees off). Not met: (1) the `U2` file on this machine is the free Built-in "RustyCarsFree" (1 FBX, 21 Standard and 1 other material); it has no HDRP or URP variants, so "the same piece in three pipelines within 10 points" and the HDRP mask-map and URP Lit checks on real files cannot be run; (2) all 17 `U2` previews are Unity's generic icon, so `U2` has no reference; (3) the "no importer" column does not exist, and no PR comment was posted; (4) 11 of 31 `U1` pieces score under 50 against the `R2` previews.
 
 ## Integration Ledger
 

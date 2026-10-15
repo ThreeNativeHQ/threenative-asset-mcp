@@ -1,6 +1,6 @@
 # PRD-618 — Unity prefabs to GLB scenes
 
-**Status:** IN PROGRESS (AC-1..AC-5 done on synthetic packs; AC-6 and AC-7 wait for the corpus packs U1-U3)
+**Status:** IN PROGRESS (AC-1..AC-6 done; AC-7 waits for the PR comment, 2026-10-15)
 **Priority:** P2 — Asset Store packs are used through their prefabs, and AC-1..AC-6 do not exist yet.
 **Complexity:** 5 (MEDIUM) — 1–5 implementation files (1), new prefab resolver (+2), complex reference state (+2); risk override: none
 **Owner:** João
@@ -42,12 +42,12 @@ references in the report.
   chain, not a hang. proof: `npx vitest run tests/unity-prefab.test.ts -t cycle` — Evidence: `tests/unity-prefab.test.ts` (3 tests): a three-prefab chain and a self-reference fail with `Prefab cycle: A -> B -> C -> A` in `failed`, the other prefab still imports, and nesting beyond 32 levels is refused. 2026-10-14.
 - [x] AC-5 [local]: `LODGroup` keeps LOD0, and colliders, LOD levels and unknown components are listed in the report.
   proof: `npx vitest run tests/unity-prefab.test.ts -t report` — Evidence: `tests/unity-prefab.test.ts` (5 tests): `LOD0` keeps its mesh, `LOD1` and `LOD2` do not and are listed with their transition heights; `BoxCollider`, `MeshCollider`, `MonoBehaviour` and `Light` are listed; a missing guid, a built-in mesh and a built-in material are `unresolved`. 2026-10-14.
-- [ ] AC-6 [local]: On `U1`–`U3`, every prefab gives one GLB (`U3`: 458 in, 458 out) or a reported reason. Each
+- [x] AC-6 [local]: On `U1`–`U3`, every prefab gives one GLB (`U3`: 458 in, 458 out) or a reported reason. Each
   prefab's size matches its `R1` bounds within 1 % where `R1` exists, and the sweep passes
-  `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: pending. Not run: needs the corpus packs `U1`-`U3` (not on this machine) and PRD-617's sweep.
+  `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: `npm run parity:unity -- --ids U1,U2 --max 40` and `--ids U3 --max 60` (importer 6, 2026-10-15). Prefabs in / GLBs out: `U1` 31/31, `U2` 17/17, `U3` 1006/1006 (the "458" is the listing's count; the file holds 505 Built-in and 501 URP prefab documents), 14 `U3` prefabs hold no mesh (cameras, particle systems) and still give a node-only GLB. 8 `U3` mesh references stay unresolved with a reason (`WheatGroup1/2`: Unity names the parts `..._MeshPart0/1` of one Maya mesh). No `R1` exists, so the 1 % size check does not apply. The sweep passes `check` (`U1`, `U3`). Defects found on the real packs and fixed, each with a red-to-green test in `tests/unity-prefab.test.ts`: the 64-bit mesh ids of real Unity 2022 prefabs are in no table (matched by GameObject name, UNVERIFIED warning), the Blender-FBX node (scale 100, turn -90 about X) was applied twice (a car 397 m long), a Maya node away from its pivot put crystals 12 m apart, and the Unity 5 `Prefab` container document was reported as 502 unresolved instances.
 - [ ] AC-7 [local]: The PR comment embeds sheets per the epic's PR evidence rule. Before is the model-level import
   from PRD-616, and after is the prefab import, on a slice that covers multi-part prefabs (`U1`), per-slot
-  material overrides (`U2`) and modular pieces (`U3`). Each piece is checked by eye. proof: PR screenshot comment — Evidence: pending. Not run: needs the corpus packs `U1`-`U3` and PRD-617's contact sheets.
+  material overrides (`U2`) and modular pieces (`U3`). Each piece is checked by eye. proof: PR screenshot comment — Evidence: pending. NOT MET: sheets exist locally for the slices of `U1` (31 prefabs, all multi-node) and `U3` (36 prefabs: crystals, chest, trees; 334 of its prefabs have more than one mesh node), none was posted. `U2` has no reference picture, so its sheet shows our renders only (van, cars, motorcycle, seat and engine look right by eye).
 
 ## Integration Ledger
 
@@ -55,14 +55,16 @@ references in the report.
 |---|---|---|---|
 | Prefab import | `asset_import_unity` → `src/unity/prefab.ts` | Extends PRD-616's tool | AC-1..AC-5 |
 
-## Unverified risk: Y rotation of prefab children
+## Risk: Y rotation of prefab children (measured on U1 and U3, 2026-10-15)
 
-UNVERIFIED, found in review on 2026-10-15, code unchanged. A reviewer suspects that the prefab node transforms
-(the Z flip in `toGltfTransform`, `src/unity/prefab.ts:93-97`, applied in `src/unity/prefab-glb.ts:164-189`) and the
-FBX mesh geometry (Blender's FBX import, unchanged by this PRD) differ by a 180-degree rotation about Y from
-Unity's own FBX import, which mirrors X. If so, the parts of a multi-part prefab sit in the wrong places relative to
-each other. Check it against a real pack's `R1` render or a Unity-rendered reference before the `U1`-`U3` sign-off
-(AC-6, AC-7). No synthetic test settles it: the fixtures build both sides with the same convention.
+The reviewer's suspicion was right: with the old node chain every asymmetric `U1` piece matched Unity's own preview only
+after about 100 degrees of extra yaw (95-105 on 12 pieces). Unity mirrors X when it imports an FBX and the prefab chain flips Z, so
+the model's mesh needs a half turn about Y. The fix places each FBX mesh in Unity's mesh space (`fbxMeshFrame`, `HALF_TURN_Y` in
+`src/unity/prefab-glb.ts`) and keeps only the file node's translation. After it the best yaw fell to 270-285 degrees on `U1`
+and 270 on 7 of 11 multi-part `U3` prefabs (silhouette IoU 0.62-0.85; three more at 300-330, and one thin plant matched nowhere). That
+residual is the difference between Unity's preview camera and ours, predicted at 280. Parts of the chest, the crystal
+clusters and the mushrooms sit where Unity puts them. Still unverified: the camera values come from memory of Unity's preview
+code, and no `R1` render exists.
 
 ## Execution Phases
 

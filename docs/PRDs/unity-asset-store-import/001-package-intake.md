@@ -1,6 +1,6 @@
 # PRD-615 — Unity package intake: cache discovery, extraction and asset database
 
-**Status:** IN PROGRESS — AC-1..AC-6 done (2026-10-14); AC-7 and AC-8 wait for the corpus packs
+**Status:** IN PROGRESS — AC-1..AC-7 done (AC-7 on 2026-10-15); AC-8 waits for the PR comment
 **Priority:** P2 — every later Unity step reads packages through this intake, and none of AC-1..AC-7 exists yet.
 **Complexity:** 3 (LOW) — 1–5 implementation files (1), new `src/unity/` module (+2); risk override: untrusted
 archive paths cross a trust boundary, so AC-2 gets its own traversal test.
@@ -62,13 +62,13 @@ modification time. It reads only local files. It never contacts Unity.
 - [x] AC-6 [local]: The packed MCP lists `unity_list_packages`, and a call on an empty cache returns an empty list
   rather than an error.
   proof: `npx vitest run tests/mcp-smoke.test.ts` — Evidence: passed 2026-10-14 (packed server lists the tool; empty cache returns `total: 0`, a populated cache returns publisher, category and name).
-- [ ] AC-7 [local]: The corpus packs `U1`, `U2` and `U3` (epic README, "Verification corpus") inventory with zero
+- [x] AC-7 [local]: The corpus packs `U1`, `U2` and `U3` (epic README, "Verification corpus") inventory with zero
   YAML parse failures and zero refused paths. `docs/parity/unity-corpus.json` records each pack's id, listing UID,
   size, SHA-256, pipelines and counts per kind, and no asset names.
-  proof: `npx tsx scripts/unity-inventory.ts --corpus ~/.cache/threenative-asset-mcp/unity-corpus --record` — Evidence: pending. **Not done:** the corpus directory does not exist on the development machine and the packs need João's Fab account or download (PRD-619 or manual). The script and recorder are ready and tested on a synthetic corpus; a missing or empty corpus prints a note and exits 0 without writing. It also records `previews` and `yamlFailures` per pack, beyond the fields listed here.
+  proof: `npx tsx scripts/unity-inventory.ts --corpus ~/.cache/threenative-asset-mcp/unity-corpus --record` — Evidence: `docs/parity/unity-corpus.json` (U1 31 prefabs, U2 17, U3 1006; `yamlFailures` 0 on all three). The 2026-10-15 sweeps imported every prefab with `failed 0, skipped 0` on all three packs. The script also records `previews` and `yamlFailures` per pack. The U3 pack mixes Unity 5 `.meta` files (`serializedVersion: 19`, `fileIDToRecycleName`) and the old `Prefab` container document; both parse (see PRD-004 AC-6).
 - [ ] AC-8 [local]: The PR comment carries the inventory table for `U1`–`U3` (counts per kind, preview count per
   pack, so PRD-617 knows where `R2` exists), following the epic's PR evidence rule. There is no render yet, so there
-  is no sheet. proof: PR comment link — Evidence: pending. **Not done:** needs the AC-7 run on `U1`–`U3`.
+  is no sheet. proof: PR comment link — Evidence: pending. **Not done:** the AC-7 run exists, but no PR was opened (the corpus work stays local until João asks for one).
 
 ## Blocked on
 

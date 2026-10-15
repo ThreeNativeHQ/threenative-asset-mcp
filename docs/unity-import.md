@@ -84,7 +84,7 @@ Each material in the FBX binds to a `.mat` in this order. The report records the
 | Built-in Standard (Specular setup) | Metallic 0 plus `KHR_materials_specular` (`specularColor = F0 / 0.04`). |
 | URP Lit, SimpleLit, ComplexLit | `_BaseMap`, `_BaseColor`, `_Metallic`, `_Smoothness`, `_WorkflowMode`, `_Surface`, `_AlphaClip`, `_Cull`. SimpleLit becomes a non-metal. Clear coat is reported as unsupported. |
 | HDRP Lit | The `_MaskMap` is split into a metallic-roughness image and an occlusion image, with the `_MetallicRemap`, `_SmoothnessRemap` and `_AORemap` ranges applied. |
-| Anything else (Shader Graph, custom) | Status `fallback`. The saved `_BaseColor` or `_Color` and `_BaseMap` or `_MainTex` are kept, with the shader reference and the reason in the report. |
+| Anything else (Shader Graph, custom) | Status `fallback`. The saved `_BaseColor` or `_Color` and `_BaseMap`, `_MainTex`, `_BaseColorMap` or `_Albedo` are kept, with the shader reference and the reason in the report. |
 
 Colours are converted from sRGB to linear. The base map's tiling and offset become `KHR_texture_transform` on
 every slot. Textures that the mapping does not carry (detail maps, parallax) are listed under `ignored`. A
@@ -129,8 +129,9 @@ reuses the same geometry, textures and slot bindings.
 1. `internalIDToNameTable` in the model's `.meta` (Unity 2019.1 and newer).
 2. `fileIDToRecycleName` (older files).
 3. The id Unity derives from the type and the name. The importer compares it with the names in the converted
-   model. This route is not verified on a real pack.
-4. The model's only mesh, with a warning, when the model has exactly one.
+   model. A real pack (`U2`, Unity 2022) refuted this route: its ids match no derivation.
+4. The unique mesh or node named like a GameObject on the node path (leaf first), with an UNVERIFIED warning.
+5. The model's only mesh, with a warning, when the model has exactly one.
 
 Otherwise the mesh is unresolved. The name is then matched with the node names of the converted model, then with its
 mesh names.
@@ -150,13 +151,15 @@ than 32 levels) appears under `failed` with the reason, and the other prefabs st
 
 ## Limits
 
-- The corpus packs of the epic (`U1` to `U3`) are not imported yet, so no row is Verified.
+- The corpus packs `U1` to `U3` were imported on 2026-10-15 (importer 6). `U2` holds Built-in materials only and its
+  previews are all Unity's generic icon, so HDRP and URP are verified on synthetic files and, for URP Lit, on `U3`.
 - Scenes, animation and skinned meshes are out of scope. Only LOD0 of a LODGroup is imported.
-- Prefabs are tested on synthetic packages only. The mesh slot order (MeshRenderer slot `n` is the model mesh's
-  part `n`), the combined id of an object in a nested instance (source id XOR instance id), the derived mesh id and
-  the model's own node transform (kept as a child node when it is not the identity) are unverified on a real pack.
-- The Standard shader identity (`fileID` 46 and 45 in the built-in extra resources) is from the Unity manuals and
-  is unverified on a real pack.
+- Prefabs: the combined id of an object in a nested instance (source id XOR instance id) is unverified on a real pack
+  (the corpus has no resolved nested prefab). An FBX mesh sits in Unity's mesh space (a half turn about Y, the file's unit scale
+  and its node's translation); that is measured against previews on `U1` and `U3` but not against an `R1` render.
+- The Standard shader identity (`fileID` 46, and 45 for the specular setup, in the built-in extra resources) is verified on
+  `U1`, `U2` and `U3`. Other built-in ids (`200`, `10704`, `10720`, `10721`, `210`) are not identified and fall back.
+- `R2` previews are lit by Unity's own rig: the judge compensates them with two fixed gains and notes it on the sheet.
 - Hardening limits (named constants, each with a test): an archive with more than 200000 members or 8 GiB of
   declared uncompressed data is refused from its listing before extraction (`UNITY_PACKAGE_TOO_LARGE`). A prefab that
   expands to more than 50000 nested prefab instances fails with a clear error, like a cycle, and a modification of an
@@ -164,4 +167,4 @@ than 32 levels) appears under `failed` with the reason, and the other prefabs st
   (TGA, PSD and the formats `sharp` reads). Non-finite material values (`.nan`, `.inf`) take their defaults.
   Blender runs with `--disable-autoexec`, and the output directory is created only after Blender resolves, so a retry
   after `UNITY_BLENDER_NOT_FOUND` into the same directory works.
-- Unverified: the Y orientation of prefab children against Unity's own FBX import (see `docs/unity-format-support.md`).
+- The Y orientation of prefab children was wrong against Unity's FBX import and is fixed (see `docs/unity-format-support.md`).

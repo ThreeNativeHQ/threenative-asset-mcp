@@ -1,7 +1,8 @@
 # Epic: Unity Asset Store import
 
-**Status:** IN PROGRESS (2026-10-15). PRD-615..619 are built and tested on synthetic packages (PRs #56-#60). Every
-real-pack acceptance criterion waits for the corpus `U1`-`U3`, which is not on any machine yet. PRD-620 is blocked
+**Status:** IN PROGRESS (2026-10-15). PRD-615..619 are built and tested on synthetic packages (PRs #56-#60). The corpus
+`U1`-`U3` was imported and swept on 2026-10-15 (importer 6; sheets stay local). Open: the PR comments (no PR yet),
+`R1` renders (need a Unity licence), and the three-pipeline `U2` check (the `U2` file holds Built-in only). PRD-620 is blocked
 on an owner decision.
 **Owner:** João
 

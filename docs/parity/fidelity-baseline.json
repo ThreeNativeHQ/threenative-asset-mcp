@@ -47,5 +47,19 @@
   "minScore": 18.7,
   "suspect": 1,
   "fail": 1
+ },
+ "U1": {
+  "compared": 31,
+  "meanScore": 60.7,
+  "minScore": 25.2,
+  "suspect": 10,
+  "fail": 11
+ },
+ "U3": {
+  "compared": 36,
+  "meanScore": 78.3,
+  "minScore": 49.9,
+  "suspect": 10,
+  "fail": 1
  }
 }
