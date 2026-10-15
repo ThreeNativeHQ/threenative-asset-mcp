@@ -89,6 +89,9 @@ export interface ReportPrefab {
   readonly meshNodes: number;
   readonly vertices: number;
   readonly sizeMeters: { readonly x: number; readonly y: number; readonly z: number };
+  /** MeshRenderer slots a `.mat` replaced, and the distinct `.mat` paths used: what colours the prefab. */
+  readonly boundSlots: number;
+  readonly materials: readonly string[];
   /** Colliders are listed, not imported. */
   readonly colliders: readonly ComponentNote[];
   /** Scripts, lights, audio, skinned meshes and other components that are not imported. */
@@ -432,6 +435,8 @@ class Importer {
       meshNodes: built.meshNodes,
       vertices,
       sizeMeters: size,
+      boundSlots: built.boundSlots,
+      materials: built.boundMaterials,
       colliders: prefab.colliders,
       components: prefab.components,
       lodLevels: prefab.lodLevels,

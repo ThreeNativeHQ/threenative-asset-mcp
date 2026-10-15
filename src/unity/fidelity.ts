@@ -75,10 +75,11 @@ const stem = (path: string): string => basename(path, extname(path)).toLowerCase
 
 // ---------------------------------------------------------------- R1
 
-/** R1 item for a model: the one prefab whose only model is it, else the asset of the same name. */
+/** R1 item for a piece: the item of that very asset (a prefab), the one prefab whose only model is it, else the asset of the same name. */
 export function matchR1(items: readonly R1Item[], model: ReportModelLike): R1Item | undefined {
   const sorted = [...items].sort((a, b) => (a.asset < b.asset ? -1 : 1));
   return (
+    sorted.find((item) => item.asset === model.source) ??
     sorted.find((item) => item.models?.length === 1 && item.models[0] === model.source) ??
     sorted.find((item) => stem(item.asset) === model.name.toLowerCase())
   );
@@ -157,7 +158,10 @@ export function inspectPng(png: Buffer): PngInspection | undefined {
   return { width, height, bitDepth, colorType, ...(gamma !== undefined ? { gamma } : {}), srgbChunk, iccProfile };
 }
 
-/** Previews of the report's models: the model's own, else the prefab of the same name. */
+/**
+ * Previews of the report's pieces. A prefab's own preview, else (for a model) the preview of the prefab of the same
+ * name, else the model's own. A model's own preview is Unity's grey default-material render, so it is the last resort.
+ */
 export async function readR2(packagePath: string, models: readonly ReportModelLike[]): Promise<UnityReferences> {
   const database = await openUnityPackage(packagePath);
   try {
@@ -171,7 +175,8 @@ export async function readR2(packagePath: string, models: readonly ReportModelLi
     for (const model of models) {
       const own = byPath.get(model.source);
       const prefabPath = prefabs.get(model.name.toLowerCase());
-      const entry = own?.previewFile ? own : prefabPath ? byPath.get(prefabPath) : undefined;
+      const ownIsPrefab = own?.previewFile !== undefined && own.path.toLowerCase().endsWith(".prefab");
+      const entry = ownIsPrefab ? own : (prefabPath ? byPath.get(prefabPath) : undefined) ?? (own?.previewFile ? own : undefined);
       if (!entry?.previewFile) {
         unmatched.push(model.glb);
         continue;
@@ -219,6 +224,8 @@ export interface UnityPiece extends TileJudgement {
 }
 
 export interface UnityFidelityResult {
+  /** Which GLBs were scored: the prefabs, or the model-level GLBs (no prefab GLBs, or asked for). */
+  readonly level: "prefabs" | "models";
   readonly reference: ReferenceKind;
   readonly referenceNote: string;
   readonly channelOrder: ChannelDecision | undefined;
@@ -239,16 +246,28 @@ export interface UnityFidelityOptions {
   readonly referenceDir?: string;
   readonly max?: number;
   readonly tile?: number;
+  /** `models` scores the model-level GLBs (the "before" of PRD-618's evidence); the default scores prefabs when the import has any. */
+  readonly level?: "prefabs" | "models";
 }
 
 export async function readImportReport(importDir: string): Promise<UnityImportReport> {
   return JSON.parse(await readFile(join(resolve(importDir), "import-report.json"), "utf8")) as UnityImportReport;
 }
 
+/**
+ * What the sheet scores: the prefab GLBs when the import has any, else the model GLBs. A model GLB carries no `.mat`
+ * binding (its materials are the FBX's own), and Unity renders a model's preview with its grey default material, so
+ * model against model preview compares two grey pictures. The prefab carries the `.mat` colours and has its own preview.
+ */
+export function scoredPieces(report: UnityImportReport, level: "prefabs" | "models" = "prefabs"): readonly (ReportModelLike & { readonly materials?: readonly string[] })[] {
+  return level === "prefabs" && report.prefabs.length > 0 ? report.prefabs : report.models;
+}
+
 /** GLB keys whose bound materials carry a texture (so a flat grey render is wrong). */
 function texturedModels(report: UnityImportReport): string[] {
   const textured = new Set(report.materialAssets.filter((material) => material.textures.length > 0).map((material) => material.path));
-  return report.models.filter((model) => model.slots.some((slot) => slot.material !== undefined && textured.has(slot.material))).map((model) => model.glb);
+  const prefabGlbs = report.prefabs.filter((prefab) => prefab.materials.some((path) => textured.has(path))).map((prefab) => prefab.glb);
+  return report.models.filter((model) => model.slots.some((slot) => slot.material !== undefined && textured.has(slot.material))).map((model) => model.glb).concat(prefabGlbs);
 }
 
 /** Tile dump names written by `renderContactSheet` (`dumpTilesDir`). */
@@ -270,16 +289,17 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   const importDir = resolve(options.importDir);
   const out = resolve(options.out);
   const report = await readImportReport(importDir);
+  const scored = scoredPieces(report, options.level);
   const absolute = (key: string): string => join(importDir, key);
   await mkdir(out, { recursive: true });
 
   let references: UnityReferences;
   let referenceNote: string;
   if (options.referenceDir !== undefined && existsSync(join(resolve(options.referenceDir), "bounds.json"))) {
-    references = await readR1(options.referenceDir, report.models);
+    references = await readR1(options.referenceDir, scored);
     referenceNote = "R1: Unity Editor reference render";
   } else if (options.packagePath !== undefined) {
-    references = await readR2(options.packagePath, report.models);
+    references = await readR2(options.packagePath, scored);
     referenceNote =
       options.referenceDir === undefined
         ? "R2: package previews (no R1 folder given)"
@@ -291,7 +311,7 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
 
   const sizeChecks = new Map<string, SizeCheck>();
   const notes = new Map<string, string>();
-  for (const model of report.models) {
+  for (const model of scored) {
     const bounds = references.images.get(model.glb)?.bounds;
     if (!bounds) continue;
     const check = checkSize(model.sizeMeters, bounds);
@@ -307,10 +327,10 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   const tilesDir = join(out, "tiles");
   const draw = (swapped: ReadonlyMap<string, Buffer> | undefined) =>
     renderContactSheet({
-      glbPaths: report.models.map((model) => absolute(model.glb)),
+      glbPaths: scored.map((model) => absolute(model.glb)),
       outPath: join(out, "sheet.jpg"),
       title: `Unity fidelity (${references.kind})`,
-      subtitle: `${referenceNote}; ${report.models.length} model(s), importer v${report.importerVersion}`,
+      subtitle: `${referenceNote}; ${scored.length} ${scored === report.prefabs ? "prefab" : "model"}(s), importer v${report.importerVersion}`,
       selection: "spread",
       maxMeshes: options.max ?? 36,
       ...(options.tile !== undefined ? { tile: options.tile } : {}),
@@ -333,7 +353,7 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
     }
   }
 
-  const byGlb = new Map(report.models.map((model) => [absolute(model.glb), model.glb]));
+  const byGlb = new Map(scored.map((model) => [absolute(model.glb), model.glb]));
   const pieces: UnityPiece[] = result.judge.map((judge) => {
     const check = sizeChecks.get(byGlb.get(judge.glb) ?? "");
     return { ...judge, reference: references.kind, ...(check ? { sizeCheck: check } : {}) };
@@ -350,9 +370,9 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   await writeFile(join(out, "fidelity.json"), `${JSON.stringify(pieces, null, 1)}\n`);
   await writeFile(
     join(out, "reference.json"),
-    `${JSON.stringify({ reference: references.kind, note: referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, summary }, null, 1)}\n`,
+    `${JSON.stringify({ level: scored === report.prefabs ? "prefabs" : "models", reference: references.kind, note: referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, summary }, null, 1)}\n`,
   );
-  return { reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, pieces, summary };
+  return { level: scored === report.prefabs ? "prefabs" : "models", reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, pieces, summary };
 }
 
 /** The per-piece table the PR evidence rule asks for (verdict, score, hue, saturation, fill, size). */
@@ -375,7 +395,7 @@ export function unityTable(result: UnityFidelityResult): Record<string, string |
 export function summaryLine(result: UnityFidelityResult): string {
   const s = result.summary;
   return (
-    `reference=${result.reference} compared=${s.compared} meanScore=${s.meanScore ?? "-"} ok=${s.ok} suspect=${s.suspect} fail=${s.fail}` +
+    `scored=${result.level} reference=${result.reference} compared=${s.compared} meanScore=${s.meanScore ?? "-"} ok=${s.ok} suspect=${s.suspect} fail=${s.fail}` +
     (result.reference === "R1" ? ` sizeMismatches=${s.sizeMismatches}` : "") +
     (result.unmatched.length > 0 ? ` withoutReference=${result.unmatched.length}` : "")
   );

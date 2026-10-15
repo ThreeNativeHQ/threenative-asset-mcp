@@ -25,6 +25,9 @@ export interface PrefabGlb {
   readonly unresolved: Unresolved[];
   readonly warnings: string[];
   readonly meshNodes: number;
+  /** MeshRenderer slots that a `.mat` replaced (counted per mesh node), and the distinct `.mat` paths they used. */
+  readonly boundSlots: number;
+  readonly boundMaterials: string[];
 }
 
 interface Source {
@@ -48,6 +51,8 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
   const materials = new Map<string, Material | null>();
   const variants = new Map<string, Mesh>();
   let meshNodes = 0;
+  let boundSlots = 0;
+  const boundMaterials = new Set<string>();
 
   const sourceFor = async (model: UnityAssetEntry): Promise<Source | null> => {
     const known = sources.get(model.guid);
@@ -141,7 +146,11 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
         const copy = primitive.clone();
         const slot = item.slots[index];
         const override = slot ? await materialFor(slot, item.path) : undefined;
-        if (override) copy.setMaterial(override);
+        if (override) {
+          copy.setMaterial(override);
+          boundSlots += 1;
+          boundMaterials.add(slot!.path);
+        }
         mesh.addPrimitive(copy);
       }
       variants.set(key, mesh);
@@ -195,5 +204,5 @@ export async function writePrefabDocument(prefab: ResolvedPrefab, host: PrefabGl
     prune({ propertyTypes: [PropertyType.MESH, PropertyType.MATERIAL, PropertyType.ACCESSOR, PropertyType.TEXTURE], keepLeaves: true, keepAttributes: true, keepSolidTextures: true }),
     unpartition(),
   );
-  return { document, unresolved, warnings, meshNodes };
+  return { document, unresolved, warnings, meshNodes, boundSlots, boundMaterials: [...boundMaterials].sort() };
 }

@@ -142,14 +142,41 @@ export interface SyntheticPiece {
   readonly size?: number;
   /** Name of a shared material path to mark the model as textured in the report. */
   readonly textured?: boolean;
+  /**
+   * Also writes a prefab GLB (`prefabs/<name>.glb`, source `Assets/Prefabs/<name>.prefab`) of this linear colour, with the
+   * piece itself then standing for the model-level GLB, which carries no `.mat` binding: that one is neutral grey.
+   */
+  readonly prefabFactor?: readonly [number, number, number];
 }
 
 /** An import folder as `importUnityPackage` leaves it, with cube GLBs standing in for converted models. */
 export async function writeSyntheticImport(importDir: string, pieces: readonly SyntheticPiece[]): Promise<UnityImportReport> {
   const models = [];
+  const prefabs: UnityImportReport["prefabs"][number][] = [];
   for (const piece of pieces) {
     const size = piece.size ?? 1;
-    await writePlainCube(join(importDir, "models", `${piece.name}.glb`), piece.name, piece.factor, size);
+    await writePlainCube(join(importDir, "models", `${piece.name}.glb`), piece.name, piece.prefabFactor ? [0.2, 0.2, 0.2] : piece.factor, size);
+    if (piece.prefabFactor) {
+      await writePlainCube(join(importDir, "prefabs", `${piece.name}.glb`), piece.name, piece.prefabFactor, size);
+      prefabs.push({
+        name: piece.name,
+        source: `Assets/Prefabs/${piece.name}.prefab`,
+        glb: `prefabs/${piece.name}.glb`,
+        bytes: 0,
+        nodes: 2,
+        meshNodes: 1,
+        vertices: 24,
+        sizeMeters: { x: size, y: size, z: size },
+        boundSlots: 1,
+        materials: [],
+        colliders: [],
+        components: [],
+        lodLevels: [],
+        inactive: [],
+        unresolved: [],
+        warnings: [],
+      });
+    }
     models.push({
       name: piece.name,
       source: piece.source ?? `Assets/Models/${piece.name}.fbx`,
@@ -167,10 +194,10 @@ export async function writeSyntheticImport(importDir: string, pieces: readonly S
     source: { shape: "unitypackage", name: "synthetic.unitypackage" },
     blender: { version: "not used", origin: "PATH" },
     materials: "complete",
-    counts: { models: models.length, prefabs: 0, materials: 0, textures: 0, fallbackMaterials: 0, boundSlots: 0, skipped: 0, failed: 0 },
+    counts: { models: models.length, prefabs: prefabs.length, materials: 0, textures: 0, fallbackMaterials: 0, boundSlots: 0, skipped: 0, failed: 0 },
     licenseFiles: [],
     models,
-    prefabs: [],
+    prefabs,
     materialAssets: [],
     textures: [],
     skipped: [],

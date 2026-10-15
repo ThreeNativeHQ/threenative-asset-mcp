@@ -2,7 +2,7 @@
  * PRD-617 Unity parity sweep: imports the corpus packs U1-U3 with the PRD-616 importer, scores each against R1 (else R2)
  * and writes sheets, structural numbers and `sheets/<id>.json` for `scripts/fidelity-baseline.ts`.
  *
- *   npm run parity:unity -- [--dir <corpus dir>] [--out <dir>] [--ids U1,U2] [--max 36]
+ *   npm run parity:unity -- [--dir <corpus dir>] [--out <dir>] [--ids U1,U2] [--max 36] [--level prefabs|models]
  *
  * The corpus defaults to ~/.cache/threenative-asset-mcp/unity-corpus (<id>/*.unitypackage, optional <id>/reference/ for R1
  * and <id>/slice.json). With no pack present it prints a note and exits 0. Output defaults to artifacts/parity/unity and
@@ -20,7 +20,7 @@ function arg(name: string): string | undefined {
 }
 
 if (process.argv.includes("--help")) {
-  console.log("usage: npm run parity:unity -- [--dir <corpus dir>] [--out <dir>] [--ids U1,U2,U3] [--max N]");
+  console.log("usage: npm run parity:unity -- [--dir <corpus dir>] [--out <dir>] [--ids U1,U2,U3] [--max N] [--level prefabs|models]");
   process.exit(0);
 }
 const corpus = resolve((arg("--dir") ?? DEFAULT_CORPUS).replace(/^~(?=\/)/, homedir()));
@@ -29,4 +29,5 @@ await runUnityParity({
   outDir: resolve(arg("--out") ?? "artifacts/parity/unity"),
   ...(arg("--ids") ? { ids: arg("--ids")!.split(",").map((id) => id.trim()).filter(Boolean) } : {}),
   ...(arg("--max") ? { max: Number(arg("--max")) } : {}),
+  ...(arg("--level") ? { level: arg("--level") as "prefabs" | "models" } : {}),
 });

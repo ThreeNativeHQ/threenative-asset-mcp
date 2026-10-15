@@ -171,6 +171,54 @@ function chunk(type: string, data: Buffer): Buffer {
   return Buffer.concat([head, data, Buffer.alloc(4)]);
 }
 
+describe("fidelity sheet scores prefabs against prefab previews", () => {
+  // A model's own Editor preview is a grey default-material render, a prefab's preview carries its materials' colours.
+  const grey = [0.2, 0.2, 0.2] as const;
+  const pieces: SyntheticPiece[] = [
+    { name: "crate", factor: grey, prefabFactor: RED },
+    { name: "barrel", factor: grey, prefabFactor: GREEN },
+    { name: "lamp", factor: grey, prefabFactor: ORANGE },
+  ];
+
+  /** A package whose models preview grey and whose prefabs preview in the colour each piece really has. */
+  async function prefabSetup(imported: readonly SyntheticPiece[]) {
+    const greyPreviews = await previews(pieces.map((piece) => ({ name: piece.name, factor: grey })));
+    const colourPreviews = await previews(pieces.map((piece) => ({ name: piece.name, factor: piece.prefabFactor! })));
+    const root = await scratchDirectory("unity-fidelity-prefab-");
+    const packagePath = join(root, "synthetic.unitypackage");
+    await writeUnityPackage(packagePath, [
+      { path: "Assets/Models" },
+      { path: "Assets/Prefabs" },
+      ...pieces.flatMap((piece) => [
+        { path: `Assets/Models/${piece.name}.fbx`, content: "fake fbx", previewData: greyPreviews.get(piece.name)! },
+        { path: `Assets/Prefabs/${piece.name}.prefab`, content: "fake prefab", previewData: colourPreviews.get(piece.name)! },
+      ]),
+    ]);
+    const importDir = join(root, "import");
+    await writeSyntheticImport(importDir, imported);
+    return { root, packagePath, importDir };
+  }
+
+  it("a wrong prefab colour is caught: the grey model-level pair cannot hide it", async () => {
+    const imported = pieces.map((piece) => (piece.name === "lamp" ? { ...piece, prefabFactor: BLUE } : piece));
+    const { root, packagePath, importDir } = await prefabSetup(imported);
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160 });
+
+    expect(result.pieces.map((piece) => piece.glb).sort()).toEqual(["prefabs/barrel.glb", "prefabs/crate.glb", "prefabs/lamp.glb"].map((glb) => expect.stringMatching(glb)));
+    expect(scoreOf(result, "crate")).toBeGreaterThanOrEqual(85);
+    expect(scoreOf(result, "barrel")).toBeGreaterThanOrEqual(85);
+    expect(scoreOf(result, "lamp")).toBeLessThan(70);
+    expect(result.unmatched).toEqual([]);
+  }, 120_000);
+
+  it("level: models still scores the model-level GLBs (the before column)", async () => {
+    const { root, packagePath, importDir } = await prefabSetup(pieces);
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, level: "models" });
+    expect(result.pieces.every((piece) => piece.glb.includes("/models/"))).toBe(true);
+    expect(result.pieces).toHaveLength(3);
+  }, 120_000);
+});
+
 describe("fidelity sheet reference", () => {
   const pieces: SyntheticPiece[] = [
     { name: "crate", factor: RED, size: 1 },
@@ -256,7 +304,7 @@ describe("fidelity sheet reference", () => {
     const out = join(root, "out");
     const { stdout } = await runScript("scripts/fidelity-sheet.ts", ["--unity-package", packagePath, "--import", importDir, "--out", out, "--max", "3"], 150_000);
     expect(stdout).toMatch(/Reference: R2/);
-    expect(stdout).toMatch(/reference=R2 compared=3/);
+    expect(stdout).toMatch(/scored=models reference=R2 compared=3/);
     expect((await stat(join(out, "sheet.jpg"))).size).toBeGreaterThan(2000);
   }, 180_000);
 });

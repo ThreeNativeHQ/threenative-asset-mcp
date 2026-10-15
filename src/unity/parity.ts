@@ -22,8 +22,16 @@ export interface PackStructure {
   /** Prefabs in the package against GLBs out: the PRD-618 gap shows here. */
   readonly prefabsIn: number;
   readonly modelsIn: number;
+  /** Prefab GLBs out (the figure to set against `prefabsIn`) and model GLBs out (against `modelsIn`). */
   readonly glbsOut: number;
+  readonly modelGlbsOut: number;
+  /** Model-level slots a `.mat` bound (PRD-616: 0 on a pack whose FBXs have no external-object bindings). */
   readonly boundSlots: number;
+  /** MeshRenderer slots a `.mat` bound across all prefab GLBs, and the prefabs with at least one. */
+  readonly prefabBoundSlots: number;
+  readonly prefabsWithMaterials: number;
+  /** Prefab references the importer could not resolve (meshes, materials, nested prefabs). */
+  readonly prefabUnresolved: number;
   readonly embeddedSlots: number;
   readonly texturesResolved: number;
   readonly materials: number;
@@ -42,8 +50,12 @@ export function structureOf(report: UnityImportReport, prefabsIn: number, models
   return {
     prefabsIn,
     modelsIn,
-    glbsOut: report.counts.models,
+    glbsOut: report.counts.prefabs,
+    modelGlbsOut: report.counts.models,
     boundSlots: report.counts.boundSlots,
+    prefabBoundSlots: report.prefabs.reduce((sum, prefab) => sum + prefab.boundSlots, 0),
+    prefabsWithMaterials: report.prefabs.filter((prefab) => prefab.materials.length > 0).length,
+    prefabUnresolved: report.prefabs.reduce((sum, prefab) => sum + prefab.unresolved.length, 0),
     embeddedSlots: report.models.reduce((sum, model) => sum + model.slots.filter((slot) => slot.status === "embedded").length, 0),
     texturesResolved: report.counts.textures,
     materials: report.counts.materials,
@@ -69,6 +81,8 @@ export interface ParityOptions {
   readonly ids?: readonly string[];
   /** Pieces drawn per sheet. */
   readonly max?: number;
+  /** `models` scores the model-level GLBs (the "before" column of PRD-618's evidence). */
+  readonly level?: "prefabs" | "models";
   readonly environment?: NodeJS.ProcessEnv;
   readonly log?: (line: string) => void;
   /** Tests inject the importer's Blender. */
@@ -117,6 +131,7 @@ export async function runUnityParity(options: ParityOptions): Promise<PackOutcom
       packagePath,
       ...((await exists(referenceDir)) ? { referenceDir } : {}),
       ...(options.max !== undefined ? { max: options.max } : {}),
+      ...(options.level ? { level: options.level } : {}),
     });
 
     // The ratchet reads `{ judge }`; the rest is for people. Numbers and verdicts, no pixels.
@@ -126,7 +141,7 @@ export async function runUnityParity(options: ParityOptions): Promise<PackOutcom
     );
     log(`${id}: ${fidelity.referenceNote}`);
     log(
-      `${id}: prefabs in ${structure.prefabsIn} vs GLBs out ${structure.glbsOut} (models in ${structure.modelsIn}); bound slots ${structure.boundSlots}, ` +
+      `${id}: prefabs in ${structure.prefabsIn} vs prefab GLBs out ${structure.glbsOut} (models in ${structure.modelsIn}, model GLBs out ${structure.modelGlbsOut}); bound slots: prefab ${structure.prefabBoundSlots} in ${structure.prefabsWithMaterials} prefabs, model ${structure.boundSlots}; unresolved refs ${structure.prefabUnresolved}; ` +
         `unbound ${structure.embeddedSlots}; textures resolved ${structure.texturesResolved}; materials ${structure.materials}; ` +
         `fallback materials ${structure.fallbackMaterials}; failed ${structure.failed}, skipped ${structure.skipped}`,
     );
