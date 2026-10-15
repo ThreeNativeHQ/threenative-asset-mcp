@@ -462,6 +462,7 @@ describe("built stdio package", () => {
       "fab_list_owned",
       "asset_import_unreal",
       "fab_import_asset",
+      "unity_list_packages",
       "blendkit_status",
       "blendkit_import_asset",
       "polyhaven_search_assets",
@@ -509,6 +510,29 @@ describe("built stdio package", () => {
     const lines = stdout.join("").split("\n").filter(Boolean);
     expect(lines.length).toBeGreaterThanOrEqual(3);
     expect(() => lines.map((line) => JSON.parse(line))).not.toThrow();
+  });
+
+  it("should list cached Unity packages over stdio and return an empty list for an empty cache", async () => {
+    const cache = await mkdtemp(join(tmpdir(), "asset-mcp-unity-cache-"));
+    temporaryDirectories.push(cache);
+    const empty = await startInitializedServer({ environment: { ASSETSTORE_CACHE_PATH: cache } });
+    const none = (await callTool(empty.child, 2, "unity_list_packages")) as {
+      result: { isError?: boolean; structuredContent: { total: number; packages: unknown[]; cacheExists: boolean } };
+    };
+    expect(none.result.isError).toBeFalsy();
+    expect(none.result.structuredContent).toMatchObject({ total: 0, packages: [], cacheExists: true });
+    await stopServer(empty.child);
+
+    await mkdir(join(cache, "Publisher", "Category"), { recursive: true });
+    await writeFile(join(cache, "Publisher", "Category", "Pack.unitypackage"), "x");
+    const populated = await startInitializedServer({ environment: { ASSETSTORE_CACHE_PATH: cache } });
+    const some = (await callTool(populated.child, 2, "unity_list_packages")) as {
+      result: { structuredContent: { packages: Array<Record<string, unknown>> } };
+    };
+    expect(some.result.structuredContent.packages).toMatchObject([
+      { publisher: "Publisher", category: "Category", name: "Pack", sizeBytes: 1 },
+    ]);
+    await stopServer(populated.child);
   });
 
   it("should inspect a rig and its local library over stdio", async () => {

@@ -129,6 +129,7 @@ changing its configuration.
 | Audio | `audio_search_assets`, `audio_download_asset`, `audio_inspect_asset`, `audio_generate_sound` |
 | itch.io bundles | `itch_list_downloads`, `asset_list_bundle_entries`, `asset_download_bundle_animation` |
 | Unreal | `asset_import_unreal` |
+| Unity | `unity_list_packages` |
 
 Recommended flow: `asset_search_sources` → the returned search tool → the returned files tool → the returned
 download tool with `acceptLicense: true`. All discovery tools are read-only. Download tools write only inside
