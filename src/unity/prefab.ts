@@ -278,7 +278,8 @@ export class PrefabResolver {
       scope.objects.set(document.fileId, this.newObject(scope, document.classId, document.typeName, structuredClone(document.fields)));
     }
     for (const document of documents) {
-      if (document.classId === CLASS_PREFAB_INSTANCE && !document.stripped) {
+      // Unity 5 to 2017 keep a `Prefab` document as the prefab's own container (`m_IsPrefabParent: 1`), not an instance of a source.
+      if (document.classId === CLASS_PREFAB_INSTANCE && !document.stripped && Number(document.fields.m_IsPrefabParent) !== 1) {
         await this.instance(document, scope, stripped, [...chain, entry.path], unresolved);
       }
     }

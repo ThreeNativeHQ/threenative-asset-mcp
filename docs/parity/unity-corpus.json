@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "packs": [
+    {
+      "id": "U1",
+      "listingUid": "fbc35597-dbcf-4da8-bb29-4fdbf203c46e",
+      "sizeBytes": 1125084050,
+      "sha256": "15dec4fbe209cb1239366c04550cd3148aff1f3db226a547f843ea73cc66289d",
+      "pipelines": [
+        "Built-in"
+      ],
+      "counts": {
+        "model": 31,
+        "texture": 138,
+        "material": 31,
+        "prefab": 31,
+        "shaderGraph": 0,
+        "scene": 2,
+        "other": 0,
+        "previews": 231
+      },
+      "yamlFailures": 0
+    },
+    {
+      "id": "U2",
+      "listingUid": "ed740921-9f30-4444-8c8e-c55db80c7304",
+      "sizeBytes": 87470767,
+      "sha256": "fbc3db3fecb61696a6ab0088218e040165c679f7a43195b3135eddaed01b15de",
+      "pipelines": [
+        "HDRP",
+        "URP",
+        "Built-in"
+      ],
+      "counts": {
+        "model": 1,
+        "texture": 10,
+        "material": 22,
+        "prefab": 17,
+        "shaderGraph": 0,
+        "scene": 1,
+        "other": 0,
+        "previews": 50
+      },
+      "yamlFailures": 0,
+      "observedPipelines": [
+        "Built-in"
+      ]
+    },
+    {
+      "id": "U3",
+      "listingUid": "7bbf72cf-03bd-458f-9a74-1ab85bd1f2e5",
+      "sizeBytes": 254559876,
+      "sha256": "4eb52b835610aca19a79681a81a744fc9a69b8414426e2f18a270e20f229e24e",
+      "pipelines": [
+        "URP",
+        "Built-in",
+        "custom"
+      ],
+      "counts": {
+        "model": 176,
+        "texture": 186,
+        "material": 177,
+        "prefab": 1006,
+        "shaderGraph": 0,
+        "scene": 9,
+        "other": 38,
+        "previews": 1539
+      },
+      "yamlFailures": 0
+    }
+  ]
+}

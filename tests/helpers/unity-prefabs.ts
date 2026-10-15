@@ -155,12 +155,30 @@ out, *specs = sys.argv[sys.argv.index("--") + 1:]
 bpy.ops.wm.read_factory_settings(use_empty=True)
 for spec in specs:
     name, sx, sy, sz, *materials = spec.split(",")
+    offsets = [m for m in materials if m.startswith("@")]
+    pivots = [m for m in materials if m.startswith("^")]
+    nodes = [m for m in materials if m.startswith("~")]
+    materials = [m for m in materials if not m.startswith("@") and not m.startswith("^") and not m.startswith("~")]
     bpy.ops.mesh.primitive_cube_add(size=1.0)
     part = bpy.context.object
     part.name = name
     part.data.name = name
     part.scale = (float(sx), float(sy), float(sz))
-    bpy.ops.object.transform_apply(scale=True)
+    if offsets:
+        part.location = tuple(float(v) for v in offsets[0][1:].split(":"))
+    if pivots:
+        # Maya-style: the node sits at the pivot and the vertices are about its negative.
+        pivot = tuple(float(v) for v in pivots[0][1:].split(":"))
+        bpy.ops.object.transform_apply(scale=True, location=False)
+        for vertex in part.data.vertices:
+            vertex.co.x -= pivot[0]; vertex.co.y -= pivot[1]; vertex.co.z -= pivot[2]
+        part.location = pivot
+    elif nodes:
+        # An ordinary node: it stays at its position and the vertices stay about the origin.
+        part.location = tuple(float(v) for v in nodes[0][1:].split(":"))
+        bpy.ops.object.transform_apply(scale=True, location=False)
+    else:
+        bpy.ops.object.transform_apply(scale=True, location=True)
     for material in materials:
         part.data.materials.append(bpy.data.materials.new(material))
     for index, polygon in enumerate(part.data.polygons):
@@ -172,6 +190,12 @@ export interface PartSpec {
   readonly name: string;
   readonly size: Vec3;
   readonly materials: readonly string[];
+  /** Blender-space (Z up) centre of the part's geometry, baked into its vertices: the part sits off its pivot. */
+  readonly offset?: Vec3;
+  /** Blender-space node position kept on the node, with the vertices about its negative (a Maya pivot offset). */
+  readonly pivot?: Vec3;
+  /** Blender-space node position kept on the node with the vertices left about the origin (an ordinary placed node). */
+  readonly nodeAt?: Vec3;
 }
 
 /** An FBX of one box per part, all at the origin, each with its own material slots, made by the importer's Blender. */
@@ -180,7 +204,7 @@ export async function writePartsFbx(target: string, parts: readonly PartSpec[]):
   await mkdir(dirname(target), { recursive: true });
   const script = `${target}.py`;
   await writeFile(script, PARTS_SCRIPT);
-  const specs = parts.map((part) => [part.name, ...part.size, ...part.materials].join(","));
+  const specs = parts.map((part) => [part.name, ...part.size, ...part.materials, ...(part.offset ? [`@${part.offset.join(":")}`] : []), ...(part.pivot ? [`^${part.pivot.join(":")}`] : []), ...(part.nodeAt ? [`~${part.nodeAt.join(":")}`] : [])].join(","));
   const run = await runBounded(blender.path, ["-b", "--factory-startup", "--python-exit-code", "1", "--python", script, "--", target, ...specs], {
     timeoutMs: 120_000,
   });

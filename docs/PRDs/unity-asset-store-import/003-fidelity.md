@@ -1,6 +1,6 @@
 # PRD-617 — Unity import fidelity: references, visual locks and baseline
 
-**Status:** IN PROGRESS (AC-1 to AC-3 done on synthetic data; AC-4 to AC-6 and the real `R1` render wait for the corpus and a Unity licence)
+**Status:** IN PROGRESS (AC-1 to AC-4 done; AC-5 and AC-6 partly, 2026-10-15; the real `R1` render waits for a Unity licence)
 **Priority:** P2 — without AC-1..AC-6, no Unity import result can be measured on the corpus or locked against regression.
 **Complexity:** 3 (LOW) — 1–5 implementation files (1), new comparison path (+2); risk override: none
 **Owner:** João
@@ -60,19 +60,16 @@ prefab's world bounds, and the import's `sizeMeters` must match them.
   roughness `1 - smoothness`; the albedo-alpha smoothness switch; HDRP mask smoothness channel `a`; HDRP mask
   metallic channel `r`; HDRP mask occlusion channel `g`; Standard `_Mode` 1 cut-out; its `_Cutoff` value; URP
   `_AlphaClip`; HDRP `_AlphaCutoffEnable`; the sRGB to linear colour conversion.
-- [ ] AC-4 [local]: `npm run parity:unity` on `U1`–`U3` prints per pack the prefab count against the GLB count,
+- [x] AC-4 [local]: `npm run parity:unity` on `U1`–`U3` prints per pack the prefab count against the GLB count,
   bound slots, resolved textures and `fallback` materials with reasons. Its `fidelity.json` passes
-  `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: pending. NOT MET: the corpus is not on this
-  machine. The script exists and `tests/unity-parity.test.ts` runs it on a synthetic corpus (counts, fallback reasons,
-  `update` then `check` exit 0, a score drop exits 1); with no corpus it prints "No corpus" and exits 0.
+  `fidelity-baseline.ts check`. proof: `npm run parity:unity` — Evidence: `npm run parity:unity -- --ids U1,U2 --max 40` and `--ids U3 --max 60` (importer 7, 2026-10-15). `U1`: prefabs 31 in, 31 GLBs out, prefab bound slots 31, textures 105, materials 30, fallback 0. `U2`: 17 in, 17 out, bound slots 32, textures 10, materials 22, fallback 1 (`builtin/210`). `U3`: 1006 in, 1006 out, prefab bound slots 6138 in 992 prefabs (importer 7 counts every mesh node; the earlier 2304 undercounted reused variants), unresolved refs 8, textures 76, materials 152, fallback 121 with the reasons printed (custom KUBIKOS shaders: Surface, Water, PlaneWater, Lava, PlaneLava, Magma, Ice, Cloud, Sun, WaterGreen, CustomStandardSpecular; and `builtin/10704`). `fidelity-baseline.ts check` on `U1` and `U3`: 0 regressions. `tests/unity-parity.test.ts` runs it on a synthetic corpus.
 - [ ] AC-5 [local]: The baseline holds `U1`–`U3` entries (numbers only) after the sheets are inspected. The ledger rows
-  that pass on a named pack move to Verified. proof: `npx tsx scripts/fidelity-baseline.ts update` and the ledger diff — Evidence: pending.
-  NOT MET: needs the real packs and inspected sheets. No ledger row was moved to Verified.
+  that pass on a named pack move to Verified. proof: `npx tsx scripts/fidelity-baseline.ts update` and the ledger diff — Evidence: `U1` (31 pieces, mean 60.7, min 25.2) and `U3` (36 pieces, mean 78.3, min 49.9) recorded after the sheets were looked at piece by piece; the ledger rows that pass moved to Verified. The `U3` slice is fixed in `~/.cache/threenative-asset-mcp/unity-corpus/U3/slice.json`: every 14th of the 505 sorted non-URP prefab paths. A 60-piece unsliced run of the same import scored mean 71.9 (ok 27, suspect 26, fail 7), the less selected figure. The `U1` numbers are in-sample for the rig gains (`UNITY_RIG_*`); on `U3`, out of sample, the gains moved the 60-piece mean from 69.3 to 71.9 and the ok count from 30 to 27. Both entries carry this in their `basis` field. NOT MET for `U2`: its previews are all the generic icon, so it has no scored piece and no baseline entry.
 - [ ] AC-6 [local]: The PR comment embeds the `U1`–`U3` sheets per the epic's PR evidence rule (reference | before |
   after, with scores). Before and after are the same importer, so the judge must report no change on the shared
   pieces, and the new value is the reference column and the size check. proof: PR screenshot comment — Evidence: pending.
-  NOT MET: needs the real packs. Also open: the sheet writes reference | after only. A before column needs a second
-  import of the base commit, which no script does yet.
+  NOT MET: no PR comment was posted (sheets stay under `~/.cache/threenative-asset-mcp/unity-parity-*`). Also open: the sheet writes
+  reference | after only. The before score is measured with `--level models` (model GLBs, which carry no `.mat` binding: `U1` 28.9, `U3` 28.8), not as a column.
 
 ## Blocked on
 

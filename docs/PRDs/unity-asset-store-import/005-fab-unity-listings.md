@@ -17,7 +17,7 @@ Store terms apply to this route.
 
 Probe on 2026-10-14: `fabcli formats` shows that 3 of the owner's 50 Fab listings offer a `unity` format with the
 extension `unitypackage` (`versions: null`). Their tech details list the render pipelines Built-in only;
-URP + Built-in + custom shaders (458 prefabs); and HDRP + URP + Built-in. Each one is also on the Unity Asset Store
+URP + Built-in + custom shaders (458 prefabs by the listing; the file holds 1006 prefab documents); and HDRP + URP + Built-in. Each one is also on the Unity Asset Store
 (`isInUnityAssetStore: true`). `fabcli library` lists only Unreal `projectVersions`, so how to download the Unity
 artifact is still unknown: FabCLI, or the Fab web download path that `src/fab/api-download.ts` uses for free assets.
 

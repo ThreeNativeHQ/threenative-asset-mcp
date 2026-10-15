@@ -9,24 +9,28 @@
  *
  * Only the camera-robust scores count (hue, saturation, silhouette fill; lightness weakly), as for Unreal.
  *
- * R2 channel order and gamma. A `preview.png` is a PNG file, so unlike Unreal's raw editor thumbnails (stored
- * red/blue swapped in UE4) its channel order is fixed by the format and `sharp` decodes it correctly. Nothing
- * proves that the Editor wrote it that way, and no real preview was available when this was written, so the
- * code does not assume it: after the first pass it re-scores every piece with red and blue exchanged
- * (`decideChannelOrder`) and swaps the whole package only when that is overwhelming evidence. The PNG's own
- * gamma, sRGB and ICC chunks are recorded (`inspectPng`) and not applied, because the judge reads sRGB pixels
- * on both sides. Both points stay UNVERIFIED until a real package preview is measured.
+ * R2 channel order and gamma: VERIFIED on a real pack (U1, 2026-10-15). A `preview.png` is RGB and sRGB-encoded, with no
+ * gamma, sRGB or ICC chunk: a texture asset's preview equals its source texture downsampled, and a lit preview fits
+ * `preview ~ albedo^0.47`, not a 2.2 curve. The code still re-scores every piece with red and blue exchanged
+ * (`decideChannelOrder`) and swaps the whole package only on overwhelming evidence; it found none on U1. The PNG's
+ * chunks are recorded (`inspectPng`) and not applied.
+ *
+ * R2 is not a render of our picture: Unity lights it with its own rig, so `compensatePreviewRig` rescales the measured
+ * copy by two fixed gains, and a preview that is Unity's generic icon or its missing-shader pink is no reference.
  */
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
+
+import sharp from "sharp";
 
 import { renderContactSheet, type TileJudgement } from "../unreal/contact-sheet.js";
 import { decodeRgba } from "../unreal/image-diff.js";
 import { swapRedBlue } from "../unreal/package-thumbnail.js";
 import { measureFidelity } from "../unreal/render-fidelity.js";
 import type { UnityImportReport } from "./importer.js";
-import { openUnityPackage } from "./package.js";
+import { type UnityAssetEntry, openUnityPackage } from "./package.js";
 
 export type ReferenceKind = "R1" | "R2";
 export const REFERENCE_LABELS: Record<ReferenceKind, string> = { R1: "R1 Unity Editor render", R2: "R2 package preview" };
@@ -67,6 +71,10 @@ export interface UnityReferences {
   readonly images: Map<string, ReferenceImage>;
   /** Models of the report that no reference picture was found for. */
   readonly unmatched: string[];
+  /** Assets whose preview is Unity's generic icon (one picture shared by many assets), so it shows nothing of the asset and is not a reference. */
+  readonly generic?: string[];
+  /** Assets whose preview is Unity's missing-shader pink (a render of nothing the asset looks like), so it is not a reference either. */
+  readonly errorPink?: string[];
 }
 
 type ReportModelLike = Pick<UnityImportReport["models"][number], "name" | "source" | "glb" | "sizeMeters">;
@@ -75,10 +83,11 @@ const stem = (path: string): string => basename(path, extname(path)).toLowerCase
 
 // ---------------------------------------------------------------- R1
 
-/** R1 item for a model: the one prefab whose only model is it, else the asset of the same name. */
+/** R1 item for a piece: the item of that very asset (a prefab), the one prefab whose only model is it, else the asset of the same name. */
 export function matchR1(items: readonly R1Item[], model: ReportModelLike): R1Item | undefined {
   const sorted = [...items].sort((a, b) => (a.asset < b.asset ? -1 : 1));
   return (
+    sorted.find((item) => item.asset === model.source) ??
     sorted.find((item) => item.models?.length === 1 && item.models[0] === model.source) ??
     sorted.find((item) => stem(item.asset) === model.name.toLowerCase())
   );
@@ -157,31 +166,115 @@ export function inspectPng(png: Buffer): PngInspection | undefined {
   return { width, height, bitDepth, colorType, ...(gamma !== undefined ? { gamma } : {}), srgbChunk, iccProfile };
 }
 
-/** Previews of the report's models: the model's own, else the prefab of the same name. */
+/** True when most of a preview's object pixels are Unity's missing-shader magenta (a URP material drawn by a Built-in preview). */
+export async function isMissingShaderPink(png: Buffer): Promise<boolean> {
+  const { data, info } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const [bgR, bgG, bgB] = [data[0]!, data[1]!, data[2]!];
+  let object = 0;
+  let pink = 0;
+  for (let at = 0; at < info.width * info.height * 4; at += 4) {
+    const [r, g, b] = [data[at]!, data[at + 1]!, data[at + 2]!];
+    if (Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB) < 24) continue;
+    object += 1;
+    if (r > 200 && g < 70 && b > 200) pink += 1;
+  }
+  return object > 0 && pink / object >= 0.5;
+}
+
+/** A preview picture shared by this many prefabs or models is an icon, not a render of any of them. */
+export const GENERIC_PREVIEW_MIN_ASSETS = 3;
+
+/**
+ * Previews of the report's pieces. A prefab's own preview, else (for a model) the preview of the prefab of the same
+ * name, else the model's own. A model's own preview is Unity's grey default-material render, so it is the last resort.
+ */
 export async function readR2(packagePath: string, models: readonly ReportModelLike[]): Promise<UnityReferences> {
   const database = await openUnityPackage(packagePath);
   try {
     const byPath = new Map([...database.entries.values()].map((entry) => [entry.path, entry]));
+    const isPiece = (path: string): boolean => /\.(prefab|fbx|obj|blend|dae|3ds)$/i.test(path);
+    // Unity writes its generic prefab icon as the preview of a prefab it could not render (found on a real pack: all
+    // 17 prefabs of U2 carry byte-identical previews, a plain cube). Judged against it, every piece would "fail".
+    const owners = new Map<string, string[]>();
+    const errorPink: string[] = [];
+    for (const entry of database.entries.values()) {
+      if (!entry.previewFile || !isPiece(entry.path)) continue;
+      const bytes = await readFile(entry.previewFile);
+      if (await isMissingShaderPink(bytes)) errorPink.push(entry.path);
+      const digest = createHash("sha256").update(bytes).digest("hex");
+      owners.set(digest, [...(owners.get(digest) ?? []), entry.path]);
+    }
+    const genericDigests = new Set([...owners].filter(([, paths]) => paths.length >= GENERIC_PREVIEW_MIN_ASSETS).map(([digest]) => digest));
+    const generic = [...owners].filter(([digest]) => genericDigests.has(digest)).flatMap(([, paths]) => paths).sort();
+    const usable = async (path: string | undefined): Promise<UnityAssetEntry | undefined> => {
+      const entry = path ? byPath.get(path) : undefined;
+      if (!entry?.previewFile) return undefined;
+      return generic.includes(entry.path) || errorPink.includes(entry.path) ? undefined : entry;
+    };
     const prefabs = new Map<string, string>();
     for (const entry of [...database.entries.values()].sort((a, b) => (a.path < b.path ? -1 : 1))) {
-      if (entry.previewFile && entry.path.toLowerCase().endsWith(".prefab") && !prefabs.has(stem(entry.path))) prefabs.set(stem(entry.path), entry.path);
+      if (entry.previewFile && entry.path.toLowerCase().endsWith(".prefab") && !generic.includes(entry.path) && !errorPink.includes(entry.path) && !prefabs.has(stem(entry.path))) prefabs.set(stem(entry.path), entry.path);
     }
     const images = new Map<string, ReferenceImage>();
     const unmatched: string[] = [];
     for (const model of models) {
-      const own = byPath.get(model.source);
-      const prefabPath = prefabs.get(model.name.toLowerCase());
-      const entry = own?.previewFile ? own : prefabPath ? byPath.get(prefabPath) : undefined;
+      const own = await usable(model.source);
+      const ownIsPrefab = own !== undefined && own.path.toLowerCase().endsWith(".prefab");
+      // A prefab has its own preview or none: a prefab of the same name elsewhere (Built-in and URP twins) is another piece.
+      const entry = ownIsPrefab || /\.prefab$/i.test(model.source) ? own : (await usable(prefabs.get(model.name.toLowerCase()))) ?? own;
       if (!entry?.previewFile) {
         unmatched.push(model.glb);
         continue;
       }
       images.set(model.glb, { png: await readFile(entry.previewFile), asset: entry.path });
     }
-    return { kind: "R2", images, unmatched };
+    return { kind: "R2", images, unmatched, generic, errorPink: errorPink.sort() };
   } finally {
     await database.dispose();
   }
+}
+
+/**
+ * Unity lights a package preview with its own rig (a dim sky and a reflection probe), so against our neutral picture the
+ * same piece reads darker and greyer, whatever its import. MEASURED on U1 (31 prefabs, importer v4, 2026-10-15) before any
+ * compensation: median saturation ratio (ours over Unity's) 1.46, median lightness ratio 2.62, silhouette mass ratio 1.04.
+ * A texture's own preview equals its pixels (RGB order, sRGB), so this is lighting, not decoding. The two gains below
+ * bring both U1 medians to 0.98 and 0.96 (the lightness gain is in sRGB values, the metric reads linear light, and
+ * saturation and lightness interact, so neither equals its median). FITTED CONSTANTS, fixed once and never tuned per asset or
+ * per pack: the U1 numbers are in-sample. U2 has no usable preview, so it checks nothing. On U3 (60 pieces, out of sample) the mean
+ * score moved from 69.3 to 71.9 while the pieces rated ok fell from 30 to 27: a mixed result, not a confirmation. Only the
+ * measured copy of the reference is compensated; the sheet shows Unity's picture as it is.
+ */
+export const UNITY_RIG_SATURATION_GAIN = 2.0;
+export const UNITY_RIG_LIGHTNESS_GAIN = 1.7;
+
+/** The reference with Unity's preview rig compensated: saturation and value scaled by the two fixed gains, hue untouched. */
+export async function compensatePreviewRig(png: Buffer, gains = { saturation: UNITY_RIG_SATURATION_GAIN, lightness: UNITY_RIG_LIGHTNESS_GAIN }): Promise<Buffer> {
+  const { data, info } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  for (let at = 0; at < data.length; at += 4) {
+    const r = data[at]! / 255;
+    const g = data[at + 1]! / 255;
+    const b = data[at + 2]! / 255;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const delta = max - min;
+    let hue = 0;
+    if (delta > 0) {
+      if (max === r) hue = ((g - b) / delta + 6) % 6;
+      else if (max === g) hue = (b - r) / delta + 2;
+      else hue = (r - g) / delta + 4;
+    }
+    const saturation = Math.min(1, (max === 0 ? 0 : delta / max) * gains.saturation);
+    const value = Math.min(1, max * gains.lightness);
+    const chroma = value * saturation;
+    const x = chroma * (1 - Math.abs((hue % 2) - 1));
+    const [rr, gg, bb] = hue < 1 ? [chroma, x, 0] : hue < 2 ? [x, chroma, 0] : hue < 3 ? [0, chroma, x] : hue < 4 ? [0, x, chroma] : hue < 5 ? [x, 0, chroma] : [chroma, 0, x];
+    const offset = value - chroma;
+    data[at] = Math.round((rr + offset) * 255);
+    data[at + 1] = Math.round((gg + offset) * 255);
+    data[at + 2] = Math.round((bb + offset) * 255);
+  }
+  return sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
 }
 
 export interface ChannelDecision {
@@ -219,12 +312,20 @@ export interface UnityPiece extends TileJudgement {
 }
 
 export interface UnityFidelityResult {
+  /** Which GLBs were scored: the prefabs, or the model-level GLBs (no prefab GLBs, or asked for). */
+  readonly level: "prefabs" | "models";
   readonly reference: ReferenceKind;
   readonly referenceNote: string;
   readonly channelOrder: ChannelDecision | undefined;
   readonly previewInspection: (PngInspection & { readonly asset: string })[];
   readonly unmatched: string[];
   readonly sheet: string;
+  /** Assets whose package preview is Unity's generic icon; they have no reference. */
+  readonly genericPreviews: number;
+  /** Slice entries that matched no piece of the scored level (a model path in a prefab-level slice). */
+  readonly sliceUnmatched: number;
+  /** Assets whose package preview is Unity's missing-shader pink; they have no reference. */
+  readonly errorPreviews: number;
   readonly pieces: UnityPiece[];
   readonly summary: { readonly compared: number; readonly meanScore: number | undefined; readonly ok: number; readonly suspect: number; readonly fail: number; readonly sizeMismatches: number };
 }
@@ -239,16 +340,32 @@ export interface UnityFidelityOptions {
   readonly referenceDir?: string;
   readonly max?: number;
   readonly tile?: number;
+  /** `models` scores the model-level GLBs (the "before" of PRD-618's evidence); the default scores prefabs when the import has any. */
+  readonly level?: "prefabs" | "models";
+  /** Project paths of the pieces to score and draw (the corpus slice); the rest of the import is left out of the sheet. */
+  readonly slice?: readonly string[];
+  /** R2 only: `false` measures against Unity's preview as it is (the default compensates its rig, see `UNITY_RIG_SATURATION_GAIN`). */
+  readonly compensate?: boolean;
 }
 
 export async function readImportReport(importDir: string): Promise<UnityImportReport> {
   return JSON.parse(await readFile(join(resolve(importDir), "import-report.json"), "utf8")) as UnityImportReport;
 }
 
+/**
+ * What the sheet scores: the prefab GLBs when the import has any, else the model GLBs. A model GLB carries no `.mat`
+ * binding (its materials are the FBX's own), and Unity renders a model's preview with its grey default material, so
+ * model against model preview compares two grey pictures. The prefab carries the `.mat` colours and has its own preview.
+ */
+export function scoredPieces(report: UnityImportReport, level: "prefabs" | "models" = "prefabs"): readonly (ReportModelLike & { readonly materials?: readonly string[] })[] {
+  return level === "prefabs" && report.prefabs.length > 0 ? report.prefabs : report.models;
+}
+
 /** GLB keys whose bound materials carry a texture (so a flat grey render is wrong). */
 function texturedModels(report: UnityImportReport): string[] {
   const textured = new Set(report.materialAssets.filter((material) => material.textures.length > 0).map((material) => material.path));
-  return report.models.filter((model) => model.slots.some((slot) => slot.material !== undefined && textured.has(slot.material))).map((model) => model.glb);
+  const prefabGlbs = report.prefabs.filter((prefab) => prefab.materials.some((path) => textured.has(path))).map((prefab) => prefab.glb);
+  return report.models.filter((model) => model.slots.some((slot) => slot.material !== undefined && textured.has(slot.material))).map((model) => model.glb).concat(prefabGlbs);
 }
 
 /** Tile dump names written by `renderContactSheet` (`dumpTilesDir`). */
@@ -270,16 +387,21 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   const importDir = resolve(options.importDir);
   const out = resolve(options.out);
   const report = await readImportReport(importDir);
+  const chosen = options.slice && options.slice.length > 0 ? new Set(options.slice) : undefined;
+  const levelPieces = scoredPieces(report, options.level);
+  const scored = chosen ? levelPieces.filter((piece) => chosen.has(piece.source)) : levelPieces;
+  // A slice names the sheet's pieces by their project path at the scored level (prefabs by default): a model path matches none.
+  const sliceUnmatched = chosen ? [...chosen].filter((path) => !levelPieces.some((piece) => piece.source === path)).length : 0;
   const absolute = (key: string): string => join(importDir, key);
   await mkdir(out, { recursive: true });
 
   let references: UnityReferences;
   let referenceNote: string;
   if (options.referenceDir !== undefined && existsSync(join(resolve(options.referenceDir), "bounds.json"))) {
-    references = await readR1(options.referenceDir, report.models);
+    references = await readR1(options.referenceDir, scored);
     referenceNote = "R1: Unity Editor reference render";
   } else if (options.packagePath !== undefined) {
-    references = await readR2(options.packagePath, report.models);
+    references = await readR2(options.packagePath, scored);
     referenceNote =
       options.referenceDir === undefined
         ? "R2: package previews (no R1 folder given)"
@@ -287,11 +409,14 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   } else {
     throw new Error("A Unity sheet needs a reference: pass the R1 folder with bounds.json, or the package for its R2 previews.");
   }
+  if (sliceUnmatched > 0) referenceNote += `; ${sliceUnmatched} slice entries matched no ${levelPieces === report.prefabs ? "prefab" : "model"} (the slice names pieces of the scored level by project path)`;
+  if (references.errorPink && references.errorPink.length > 0) referenceNote += `; ${references.errorPink.length} package previews show Unity's missing-shader pink and are not a reference`;
+  if (references.generic && references.generic.length > 0) referenceNote += `; ${references.generic.length} package previews are Unity's generic icon (one picture shared by many assets) and are not a reference`;
   const label = REFERENCE_LABELS[references.kind];
 
   const sizeChecks = new Map<string, SizeCheck>();
   const notes = new Map<string, string>();
-  for (const model of report.models) {
+  for (const model of scored) {
     const bounds = references.images.get(model.glb)?.bounds;
     if (!bounds) continue;
     const check = checkSize(model.sizeMeters, bounds);
@@ -305,16 +430,27 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   });
 
   const tilesDir = join(out, "tiles");
+  // R2 only: R1 is rendered by our own rig and needs no compensation.
+  const compensated = new Map<string, Buffer>();
+  const swappedCompensated = new Map<string, Buffer>();
+  if (references.kind === "R2" && options.compensate !== false) {
+    for (const [glb, image] of references.images) {
+      compensated.set(glb, await compensatePreviewRig(image.png));
+      swappedCompensated.set(glb, await compensatePreviewRig(await swapRedBlue(image.png)));
+    }
+  }
   const draw = (swapped: ReadonlyMap<string, Buffer> | undefined) =>
     renderContactSheet({
-      glbPaths: report.models.map((model) => absolute(model.glb)),
+      glbPaths: scored.map((model) => absolute(model.glb)),
       outPath: join(out, "sheet.jpg"),
       title: `Unity fidelity (${references.kind})`,
-      subtitle: `${referenceNote}; ${report.models.length} model(s), importer v${report.importerVersion}`,
+      subtitle: `${referenceNote}; ${scored.length} ${levelPieces === report.prefabs ? "prefab" : "model"}(s), importer v${report.importerVersion}`,
       selection: "spread",
       maxMeshes: options.max ?? 36,
       ...(options.tile !== undefined ? { tile: options.tile } : {}),
-      thumbnails: new Map([...references.images].map(([glb, image]) => [absolute(glb), swapped?.get(glb) ?? image.png])),
+      // With no reference at all (generic icons only) the sheet still shows our renders, so they can be looked at.
+      ...(references.images.size > 0 ? { thumbnails: new Map([...references.images].map(([glb, image]) => [absolute(glb), swapped?.get(glb) ?? image.png])) } : {}),
+      ...(compensated.size > 0 ? { measuredThumbnails: new Map([...compensated].map(([glb, png]) => [absolute(glb), swapped ? (swappedCompensated.get(glb) ?? png) : png])) } : {}),
       expectColoured: new Set(texturedModels(report).map(absolute)),
       dumpTilesDir: tilesDir,
       referenceLabel: label,
@@ -333,7 +469,7 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
     }
   }
 
-  const byGlb = new Map(report.models.map((model) => [absolute(model.glb), model.glb]));
+  const byGlb = new Map(scored.map((model) => [absolute(model.glb), model.glb]));
   const pieces: UnityPiece[] = result.judge.map((judge) => {
     const check = sizeChecks.get(byGlb.get(judge.glb) ?? "");
     return { ...judge, reference: references.kind, ...(check ? { sizeCheck: check } : {}) };
@@ -350,9 +486,9 @@ export async function runUnityFidelity(options: UnityFidelityOptions): Promise<U
   await writeFile(join(out, "fidelity.json"), `${JSON.stringify(pieces, null, 1)}\n`);
   await writeFile(
     join(out, "reference.json"),
-    `${JSON.stringify({ reference: references.kind, note: referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, summary }, null, 1)}\n`,
+    `${JSON.stringify({ level: levelPieces === report.prefabs ? "prefabs" : "models", reference: references.kind, note: referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, summary }, null, 1)}\n`,
   );
-  return { reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, pieces, summary };
+  return { level: levelPieces === report.prefabs ? "prefabs" : "models", reference: references.kind, referenceNote, channelOrder, previewInspection, unmatched: references.unmatched, sheet: result.outPath, genericPreviews: references.generic?.length ?? 0, sliceUnmatched, errorPreviews: references.errorPink?.length ?? 0, pieces, summary };
 }
 
 /** The per-piece table the PR evidence rule asks for (verdict, score, hue, saturation, fill, size). */
@@ -375,8 +511,11 @@ export function unityTable(result: UnityFidelityResult): Record<string, string |
 export function summaryLine(result: UnityFidelityResult): string {
   const s = result.summary;
   return (
-    `reference=${result.reference} compared=${s.compared} meanScore=${s.meanScore ?? "-"} ok=${s.ok} suspect=${s.suspect} fail=${s.fail}` +
+    `scored=${result.level} reference=${result.reference} compared=${s.compared} meanScore=${s.meanScore ?? "-"} ok=${s.ok} suspect=${s.suspect} fail=${s.fail}` +
     (result.reference === "R1" ? ` sizeMismatches=${s.sizeMismatches}` : "") +
-    (result.unmatched.length > 0 ? ` withoutReference=${result.unmatched.length}` : "")
+    (result.unmatched.length > 0 ? ` withoutReference=${result.unmatched.length}` : "") +
+    (result.genericPreviews > 0 ? ` genericPreviews=${result.genericPreviews}` : "") +
+    (result.errorPreviews > 0 ? ` errorPreviews=${result.errorPreviews}` : "") +
+    (result.sliceUnmatched > 0 ? ` sliceUnmatched=${result.sliceUnmatched}` : "")
   );
 }

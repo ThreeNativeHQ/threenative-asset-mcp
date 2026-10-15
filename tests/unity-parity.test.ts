@@ -66,10 +66,10 @@ describeWithTools(["blender", "chromium"], "parity:unity on a synthetic corpus",
 
     const out = join(root, "sweep");
     const lines: string[] = [];
-    const outcomes = await runUnityParity({ corpusDir: join(root, "corpus"), outDir: out, log: (line) => lines.push(line) });
+    const outcomes = await runUnityParity({ corpusDir: join(root, "corpus"), outDir: out, level: "models", log: (line) => lines.push(line) });
     const text = lines.join("\n");
     expect(outcomes.map((outcome) => `${outcome.id}:${outcome.status}:${outcome.reference ?? "-"}`)).toEqual(["U1:measured:R2", "U2:measured:R1", "U3:absent:-"]);
-    expect(text).toMatch(/U1: prefabs in 2 vs GLBs out 1 \(models in 1\); bound slots 1, unbound 0; textures resolved 0; materials 1; fallback materials 0/);
+    expect(text).toMatch(/U1: prefabs in 2 vs prefab GLBs out 2 \(models in 1, model GLBs out 1\); bound slots: prefab 0 in 0 prefabs, model 1; unresolved refs 0; unbound 0; textures resolved 0; materials 1; fallback materials 0/);
     expect(text).toMatch(/U2: .*fallback materials 1/);
     expect(text).toMatch(/U2:\s+fallback x1: shader a{32}\/4800000 is not Standard/);
     expect(text).toMatch(/Next: npx tsx scripts\/fidelity-baseline\.ts check/);

@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { UNITY_IMPORTER_VERSION, importUnityPackage } from "../src/unity/importer.js";
 import { derivedMeshFileId, md4 } from "../src/unity/model-ids.js";
+import { fbxMeshFrame, placeMeshFrame } from "../src/unity/prefab-glb.js";
 import { toGltfTransform } from "../src/unity/prefab.js";
 import { type FixtureFile, scratchDirectory, writeProjectFolder } from "./helpers/unity-fixtures.js";
 import { SHADERS, materialYaml } from "./helpers/unity-models.js";
@@ -46,6 +47,12 @@ function nodeNamed(document: Document, name: string) {
   const found = document.getRoot().listNodes().filter((node) => node.getName() === name);
   expect(found, `node ${name}`).toHaveLength(1);
   return found[0]!;
+}
+
+/** The node that holds a named GameObject's mesh: the node itself, or its `:mesh` child that carries Unity's mesh frame. */
+function meshNode(document: Document, name: string) {
+  const node = nodeNamed(document, name);
+  return node.getMesh() ? node : (node.listChildren().find((child) => child.getMesh()) ?? node);
 }
 
 const near = (actual: readonly number[], expected: readonly number[], digits = 5): void => {
@@ -124,6 +131,35 @@ describe("hierarchy", () => {
     expect(prefab.inactive).toEqual(["Root/Off"]);
     expect((await read(join(outputDir, prefab.glb))).getRoot().listNodes().map((node) => node.getName())).toEqual(["Root"]);
   }, 60_000);
+
+  it("hierarchy: a Unity 5 / 2017 prefab keeps a `Prefab` container document that is the prefab itself, not an instance of another one (real U3 pack)", async () => {
+    const container = "--- !u!1001 &100100000\nPrefab:\n  m_Modification:\n    m_TransformParent: {fileID: 0}\n    m_Modifications: []\n    m_RemovedComponents: []\n  m_ParentPrefab: {fileID: 0}\n  m_RootGameObject: {fileID: 10}\n  m_IsPrefabParent: 1\n";
+    const { report } = await importProject([
+      ...folders("Assets"),
+      { path: "Assets/old.prefab", content: prefabFile(container, gameObject(10, "Root", { components: [11] }), transform(11, 10)) },
+    ]);
+    const prefab = prefabOf(report, "Assets/old.prefab");
+    expect(prefab.unresolved).toEqual([]);
+    expect(prefab.nodes).toBe(1);
+  }, 60_000);
+});
+
+describe("pivot offset of a file node", () => {
+  // The real U3 shape: a Maya node at T = (12.72, 0.5, 2.13) m with the file's turn about X and scale 0.01, vertices (raw cm) about -T.
+  const world = [0.01, 0, 0, 0, 0, 0, 0.01, 0, 0, -0.01, 0, 0, 12.72, 0.5, 2.13, 1];
+  const frame = fbxMeshFrame(0.01);
+
+  it("pivot: T is kept on all three axes (a sign error on Y or Z leaves the mesh metres off) when it cancels the vertices' offset", () => {
+    const centre = [-1272, -213, 50] as const;
+    const placed = placeMeshFrame(frame, world, centre);
+    const at = [0, 1, 2].map((row) => placed[row]! * centre[0] + placed[4 + row]! * centre[1] + placed[8 + row]! * centre[2] + placed[12 + row]!);
+    near(at, [0, 0, 0], 6);
+  });
+
+  it("pivot: an ordinary node (vertices about the origin, T placing the object) keeps no T, so the prefab's GameObject places it once", () => {
+    expect(placeMeshFrame(frame, world, [0, 0, 0]).slice(12, 15)).toEqual([0, 0, 0]);
+    expect(placeMeshFrame(frame, world, [12, -3, 2]).slice(12, 15)).toEqual([0, 0, 0]);
+  });
 });
 
 describe("cycle", () => {
@@ -375,7 +411,8 @@ let fbxDirectory = "";
 let parts: Buffer;
 let single: Buffer;
 
-const importerWith = (table: string): string => `ModelImporter:\n  serializedVersion: 22200\n${table}  materials:\n    materialImportMode: 2\n    materialSearch: 1\n  meshes:\n    globalScale: 1\n    useFileScale: 1`;
+// These prefabs have identity transforms, so the FBX unit conversion is off to keep their sizes in metres (the real-pack shape is its own test).
+const importerWith = (table: string): string => `ModelImporter:\n  serializedVersion: 22200\n${table}  materials:\n    materialImportMode: 2\n    materialSearch: 1\n  meshes:\n    globalScale: 1\n    useFileScale: 0`;
 const nameTable = (entries: Record<string, string>): string =>
   `  internalIDToNameTable:\n${Object.entries(entries).map(([id, name]) => `  - first:\n      43: ${id}\n    second: ${name}\n`).join("")}`;
 const recycleTable = (entries: Record<string, string>): string =>
@@ -400,9 +437,9 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
   });
 
   const baseColor = (document: Document, node: string): number[][] =>
-    nodeNamed(document, node).getMesh()!.listPrimitives().map((primitive) => primitive.getMaterial()!.getBaseColorFactor().slice(0, 3));
+    meshNode(document, node).getMesh()!.listPrimitives().map((primitive) => primitive.getMaterial()!.getBaseColorFactor().slice(0, 3));
   const materialNames = (document: Document, node: string): string[] =>
-    nodeNamed(document, node).getMesh()!.listPrimitives().map((primitive) => primitive.getMaterial()!.getName());
+    meshNode(document, node).getMesh()!.listPrimitives().map((primitive) => primitive.getMaterial()!.getName());
   const size = (document: Document, node: string): number[] => {
     const { min, max } = getBounds(nodeNamed(document, node));
     return max.map((value, index) => value - min[index]!);
@@ -482,6 +519,175 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     expect(report.models.map((model) => model.source)).toEqual(["Assets/A/parts.fbx", "Assets/B/parts.fbx", "Assets/C/parts.fbx", "Assets/D/single.fbx"]);
     expect(report.counts).toMatchObject({ models: 4, prefabs: 1, failed: 0 });
     expect(report.materialAssets.map((material) => material.path)).toEqual(["Assets/Mats/green.mat", "Assets/Mats/red.mat"]);
+  }, 180_000);
+
+  it("meshes: a Blender-exported FBX (node scale 100, turned -90 about X) under a prefab that repeats that node lands where Unity puts it, not 100 times too large or turned", async () => {
+    await writePartsFbx(join(fbxDirectory, "offset.fbx"), [{ name: "Foot", size: [0.4, 0.2, 0.1], materials: ["Paint"], offset: [1, 0.5, 0.25] }]);
+    const offset = await readFile(join(fbxDirectory, "offset.fbx"));
+    const half = Math.SQRT1_2;
+    const { report, outputDir } = await importProject([
+      ...folders("Assets", "Assets/Prefabs"),
+      { path: "Assets/offset.fbx", data: offset, importer: importerWith("  internalIDToNameTable: []\n").replace("useFileScale: 0", "useFileScale: 1") },
+      {
+        path: "Assets/Prefabs/Foot.prefab",
+        content: prefabFile(
+          gameObject(10, "Foot", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "Model", { components: [21, 22, 23] }),
+          // The node Unity gives a Blender FBX object: scale 100 and a quarter turn about X.
+          transform(21, 20, { father: 11, rotation: [-half, 0, 0, half], scale: [100, 100, 100] }),
+          meshFilter(22, 20, asset("Assets/offset.fbx", 4300000)),
+          meshRenderer(23, 20, []),
+        ),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Prefabs/Foot.prefab");
+    expect(prefab.unresolved).toEqual([]);
+    expect(prefab.sizeMeters.x).toBeCloseTo(0.4, 3);
+    // Unity: the mesh holds the raw vertices times 0.01 (centimetre file), mirrored in X; the node scales them back and turns Z up into Y up.
+    const unity = multiply(unityMatrix([0, 0, 0], [-half, 0, 0, half], [100, 100, 100]), unityMatrix([0, 0, 0], [0, 0, 0, 1], [-0.01, 0.01, 0.01]));
+    const corners: number[][] = [];
+    for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+      const raw = [1 + sx * 0.2, 0.5 + sy * 0.1, 0.25 + sz * 0.05];
+      const world = [0, 1, 2].map((row) => unity[row]! * raw[0]! + unity[4 + row]! * raw[1]! + unity[8 + row]! * raw[2]!);
+      corners.push([world[0]!, world[1]!, -world[2]!]); // Unity to glTF
+    }
+    const expected = [0, 1, 2].map((axis) => [Math.min(...corners.map((c) => c[axis]!)), Math.max(...corners.map((c) => c[axis]!))]);
+    const document = await read(join(outputDir, prefab.glb));
+    const { min, max } = getBounds(document.getRoot().listScenes()[0]!);
+    for (const axis of [0, 1, 2]) {
+      expect(min[axis], `min ${axis}`).toBeCloseTo(expected[axis]![0]!, 4);
+      expect(max[axis], `max ${axis}`).toBeCloseTo(expected[axis]![1]!, 4);
+    }
+    // Sanity on the expectation itself: the Blender part's Z (up) is the prefab's height, 0.25 m with the part 0.1 m thick.
+    expect(expected[1]).toEqual([expect.closeTo(0.2, 4), expect.closeTo(0.3, 4)]);
+  }, 180_000);
+
+  it("meshes: a file node that sits away from its pivot (node at T, vertices about -T, as in the real U3 pack) keeps the mesh at its pivot, not T metres off", async () => {
+    // Centimetre vertices: a 40 x 20 x 10 cm part whose node sits 300 cm from the origin.
+    await writePartsFbx(join(fbxDirectory, "pivot.fbx"), [{ name: "Pivoted", size: [40, 20, 10], materials: ["Paint"], pivot: [300, 0, 0] }]);
+    const pivot = await readFile(join(fbxDirectory, "pivot.fbx"));
+    const { report, outputDir } = await importProject([
+      ...folders("Assets", "Assets/Prefabs"),
+      { path: "Assets/pivot.fbx", data: pivot, importer: importerWith("  internalIDToNameTable: []\n").replace("useFileScale: 0", "useFileScale: 1") },
+      {
+        path: "Assets/Prefabs/Pivoted.prefab",
+        content: prefabFile(gameObject(10, "Pivoted", { components: [11, 12, 13] }), transform(11, 10), meshFilter(12, 10, asset("Assets/pivot.fbx", 4300000)), meshRenderer(13, 10, [])),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Prefabs/Pivoted.prefab");
+    expect(prefab.unresolved).toEqual([]);
+    const { min, max } = getBounds((await read(join(outputDir, prefab.glb))).getRoot().listScenes()[0]!);
+    expect((min[0]! + max[0]!) / 2).toBeCloseTo(0, 2);
+    expect(max[0]! - min[0]!).toBeCloseTo(0.4, 3);
+  }, 180_000);
+
+  it("meshes: an ordinary file node (translation T, vertices about the origin) is placed by the prefab's own GameObject, not by T twice", async () => {
+    await writePartsFbx(join(fbxDirectory, "placed.fbx"), [{ name: "Block", size: [40, 20, 10], materials: ["Paint"], nodeAt: [300, 0, 0] }]);
+    const placed = await readFile(join(fbxDirectory, "placed.fbx"));
+    const { report, outputDir } = await importProject([
+      ...folders("Assets", "Assets/Prefabs"),
+      { path: "Assets/placed.fbx", data: placed, importer: importerWith("  internalIDToNameTable: []\n").replace("useFileScale: 0", "useFileScale: 1") },
+      {
+        path: "Assets/Prefabs/Block.prefab",
+        // Unity copies the node's translation onto the prefab's GameObject (3 m); the mesh itself is about the origin.
+        content: prefabFile(gameObject(10, "Block", { components: [11, 12, 13] }), transform(11, 10, { position: [3, 0, 0] }), meshFilter(12, 10, asset("Assets/placed.fbx", 4300000)), meshRenderer(13, 10, [])),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Prefabs/Block.prefab");
+    const { min, max } = getBounds((await read(join(outputDir, prefab.glb))).getRoot().listScenes()[0]!);
+    expect((min[0]! + max[0]!) / 2).toBeCloseTo(3, 2);
+  }, 180_000);
+
+  it("meshes: a 64-bit id that no table lists and the derivation does not reproduce is matched by the GameObject name, with a warning (real Unity 2022 packs)", async () => {
+    const { report, outputDir } = await importProject([
+      ...folders("Assets", "Assets/C", "Assets/Prefabs"),
+      { path: "Assets/C/parts.fbx", data: parts, importer: importerWith("  internalIDToNameTable: []\n") },
+      {
+        path: "Assets/Prefabs/Wheel.prefab",
+        content: prefabFile(
+          gameObject(10, "Wheel", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "Model", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/C/parts.fbx", "-6579300303780749490")),
+          meshRenderer(23, 20, []),
+        ),
+      },
+      {
+        path: "Assets/Prefabs/Stranger.prefab",
+        content: prefabFile(
+          gameObject(10, "Stranger", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "Model", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/C/parts.fbx", "-6579300303780749490")),
+          meshRenderer(23, 20, []),
+        ),
+      },
+    ]);
+    const matched = prefabOf(report, "Assets/Prefabs/Wheel.prefab");
+    expect(matched.meshNodes).toBe(1);
+    expect(matched.unresolved).toEqual([]);
+    expect(matched.warnings.join(" ")).toMatch(/matched the mesh named "Wheel" by the GameObject name \(UNVERIFIED\)/);
+    const document = await read(join(outputDir, matched.glb));
+    expect(size(document, "Model")[0]).toBeCloseTo(0.2, 4);
+    // No GameObject on the path is called like a mesh: still unresolved, never guessed.
+    const stranger = prefabOf(report, "Assets/Prefabs/Stranger.prefab");
+    expect(stranger.meshNodes).toBe(0);
+    expect(stranger.unresolved).toEqual([expect.objectContaining({ kind: "mesh", reason: expect.stringMatching(/no mesh id matches/) })]);
+  }, 180_000);
+
+  it("meshes: every mesh node counts its bound slots, also when two nodes share one material variant", async () => {
+    const red = asset("Assets/Mats/red.mat", 2100000, 2);
+    const { report } = await importProject([
+      ...folders("Assets", "Assets/A", "Assets/Mats", "Assets/Prefabs"),
+      { path: "Assets/A/parts.fbx", data: parts, importer: importerWith(nameTable({ 4300000: "Body", 4300002: "Wheel" })) },
+      { path: "Assets/Mats/red.mat", content: std("red", [1, 0, 0]) },
+      {
+        path: "Assets/Prefabs/wheels.prefab",
+        content: prefabFile(
+          gameObject(10, "Root", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "WheelA", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/A/parts.fbx", 4300002)),
+          meshRenderer(23, 20, [red]),
+          gameObject(30, "WheelB", { components: [31, 32, 33] }),
+          transform(31, 30, { father: 11, position: [1, 0, 0] }),
+          meshFilter(32, 30, asset("Assets/A/parts.fbx", 4300002)),
+          meshRenderer(33, 30, [red]),
+        ),
+      },
+    ]);
+    expect(prefabOf(report, "Assets/Prefabs/wheels.prefab").boundSlots).toBe(2);
+  }, 180_000);
+
+  it("meshes: an ancestor's name does not pick a child's mesh (a `Body` root must not give its `Door` child the Body mesh)", async () => {
+    const { report } = await importProject([
+      ...folders("Assets", "Assets/C", "Assets/Prefabs"),
+      { path: "Assets/C/parts.fbx", data: parts, importer: importerWith("  internalIDToNameTable: []\n") },
+      {
+        path: "Assets/Prefabs/Body.prefab",
+        content: prefabFile(
+          gameObject(10, "Body", { components: [11] }),
+          transform(11, 10),
+          gameObject(20, "Door", { components: [21, 22, 23] }),
+          transform(21, 20, { father: 11 }),
+          meshFilter(22, 20, asset("Assets/C/parts.fbx", "-6579300303780749490")),
+          meshRenderer(23, 20, []),
+          gameObject(30, "Wheel", { components: [31, 32, 33] }),
+          transform(31, 30, { father: 11 }),
+          meshFilter(32, 30, asset("Assets/C/parts.fbx", "-5429810754378104994")),
+          meshRenderer(33, 30, []),
+        ),
+      },
+    ]);
+    const prefab = prefabOf(report, "Assets/Prefabs/Body.prefab");
+    expect(prefab.meshNodes).toBe(1);
+    expect(prefab.unresolved).toEqual([expect.objectContaining({ kind: "mesh", node: "Body/Door" })]);
+    expect(prefab.warnings.join(" ")).toMatch(/matched the mesh named "Wheel"/);
+    expect(prefab.warnings.join(" ")).not.toMatch(/named "Body"/);
   }, 180_000);
 
   it("meshes: models only a prefab uses are converted when assets names just the prefab, and a model that cannot be converted is reported", async () => {
@@ -568,14 +774,14 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     ]);
     const car = await read(join(outputDir, prefabOf(report, "Assets/Prefabs/Car.prefab").glb));
     expect(materialNames(car, "Wheel")).toEqual(["rubber"]);
-    expect(nodeNamed(car, "Antenna").getMesh()).not.toBeNull();
+    expect(meshNode(car, "Antenna").getMesh()).not.toBeNull();
 
     for (const name of ["Garage", "GarageVariant"]) {
       const prefab = prefabOf(report, `Assets/Prefabs/${name}.prefab`);
       expect(prefab.unresolved).toEqual([]);
       expect(prefab.meshNodes).toBe(2); // Antenna was removed
       const document = await read(join(outputDir, prefab.glb));
-      expect(document.getRoot().listNodes().map((node) => node.getName()).sort()).toEqual(["Body", "Car", "Garage", "Wheel"]);
+      expect(document.getRoot().listNodes().map((node) => node.getName()).filter((name) => !name.endsWith(":mesh")).sort()).toEqual(["Body", "Car", "Garage", "Wheel"]);
       expect(materialNames(document, "Wheel")).toEqual(["chrome"]);
       expect(baseColor(document, "Wheel")).toEqual([[1, 1, 1]]);
       expect(materialNames(document, "Body")).toEqual(["paint", "glass"]);
@@ -610,7 +816,11 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     const document = await read(join(outputDir, prefab.glb));
     near(nodeNamed(document, "PartsRoot").getTranslation(), [4, 0, 0]);
     expect(nodeNamed(document, "Body").getParentNode()?.getName()).toBe("PartsRoot");
-    expect(nodeNamed(document, "Wheel").getMesh()).not.toBeNull();
+    // Unity mirrors X on import and the prefab chain flips Z: the model scene's top nodes carry a half turn about Y.
+    const turn = nodeNamed(document, "Body").getRotation();
+    expect(Math.abs(turn[1]!)).toBeCloseTo(1, 5);
+    expect(Math.abs(turn[3]!)).toBeCloseTo(0, 5);
+    expect(meshNode(document, "Wheel").getMesh()).not.toBeNull();
     expect(prefab.meshNodes).toBe(2);
     expect(prefab.unresolved).toEqual([expect.objectContaining({ kind: "modification", reason: expect.stringMatching(/only the root of a model can be edited/) })]);
   }, 120_000);
@@ -647,9 +857,9 @@ describeWithTools(["blender"], "unity prefab meshes through Blender", () => {
     ]);
     const prefab = prefabOf(report, "Assets/lod.prefab");
     const document = await read(join(outputDir, prefab.glb));
-    expect(nodeNamed(document, "LOD0").getMesh()).not.toBeNull();
-    expect(nodeNamed(document, "LOD1").getMesh()).toBeNull();
-    expect(nodeNamed(document, "LOD2").getMesh()).toBeNull();
+    expect(meshNode(document, "LOD0").getMesh()).not.toBeNull();
+    expect(meshNode(document, "LOD1").getMesh()).toBeNull();
+    expect(meshNode(document, "LOD2").getMesh()).toBeNull();
     expect(prefab.meshNodes).toBe(1);
     expect(prefab.lodLevels).toEqual([
       { group: "Tree", level: 1, transitionHeight: 0.2, nodes: ["Tree/LOD1"] },
