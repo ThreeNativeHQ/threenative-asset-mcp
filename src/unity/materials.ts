@@ -450,7 +450,7 @@ function resolveFallback(material: UnityMaterial, identity: ShaderIdentity, reas
   const r = makeResolver(material, lookup);
   const colorName = material.colors._BaseColor ? "_BaseColor" : "_Color";
   const tint = material.colors[colorName] ?? ([1, 1, 1, 1] as Rgba);
-  const mapName = (["_BaseMap", "_MainTex", "_BaseColorMap"] as const).find((name) => material.textures[name]?.ref !== undefined);
+  const mapName = (["_BaseMap", "_MainTex", "_BaseColorMap", "_Albedo"] as const).find((name) => material.textures[name]?.ref !== undefined);
   const binding = mapName ? r.texture(mapName) : undefined;
   const transform = mapName ? uvTransform(material.textures[mapName]) : undefined;
   const rgb = linearRgb(tint);
