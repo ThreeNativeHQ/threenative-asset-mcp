@@ -278,6 +278,28 @@ describe("fidelity sheet scores prefabs against prefab previews", () => {
     expect(result.referenceNote).toMatch(/1 package previews show Unity's missing-shader pink/);
   }, 120_000);
 
+  it("an unusable preview is not replaced by the preview of a prefab with the same name (twin prefabs in two folders)", async () => {
+    const twins: SyntheticPiece[] = [
+      { name: "rock", factor: grey, prefabFactor: RED },
+      { name: "rock", glbStem: "rock-urp", factor: grey, prefabFactor: RED, prefabSource: "Assets/Urp/rock.prefab" },
+    ];
+    const pink = (await previews([{ name: "pink", factor: [1, 0, 1] }])).get("pink")!;
+    const real = (await previews([{ name: "rock", factor: RED }])).get("rock")!;
+    const root = await scratchDirectory("unity-fidelity-twin-");
+    const packagePath = join(root, "synthetic.unitypackage");
+    await writeUnityPackage(packagePath, [
+      { path: "Assets/Prefabs" },
+      { path: "Assets/Urp" },
+      { path: "Assets/Prefabs/rock.prefab", content: "fake prefab", previewData: real },
+      { path: "Assets/Urp/rock.prefab", content: "fake prefab", previewData: pink },
+    ]);
+    const importDir = join(root, "import");
+    await writeSyntheticImport(importDir, twins);
+    const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false });
+    expect(result.pieces.map((piece) => piece.glb.replace(/^.*\//, ""))).toEqual(["rock.glb"]);
+    expect(result.unmatched.map((glb) => glb.replace(/^.*\//, ""))).toEqual(["rock-urp.glb"]);
+  }, 120_000);
+
   it("level: models still scores the model-level GLBs (the before column)", async () => {
     const { root, packagePath, importDir } = await prefabSetup(pieces);
     const result = await runUnityFidelity({ importDir, packagePath, out: join(root, "out"), tile: 160, compensate: false, level: "models" });

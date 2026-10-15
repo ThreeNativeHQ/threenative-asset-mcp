@@ -220,7 +220,8 @@ export async function readR2(packagePath: string, models: readonly ReportModelLi
     for (const model of models) {
       const own = await usable(model.source);
       const ownIsPrefab = own !== undefined && own.path.toLowerCase().endsWith(".prefab");
-      const entry = ownIsPrefab ? own : (await usable(prefabs.get(model.name.toLowerCase()))) ?? own;
+      // A prefab has its own preview or none: a prefab of the same name elsewhere (Built-in and URP twins) is another piece.
+      const entry = ownIsPrefab || /\.prefab$/i.test(model.source) ? own : (await usable(prefabs.get(model.name.toLowerCase()))) ?? own;
       if (!entry?.previewFile) {
         unmatched.push(model.glb);
         continue;

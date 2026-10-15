@@ -147,6 +147,10 @@ export interface SyntheticPiece {
    * piece itself then standing for the model-level GLB, which carries no `.mat` binding: that one is neutral grey.
    */
   readonly prefabFactor?: readonly [number, number, number];
+  /** Project path of the prefab, `Assets/Prefabs/<name>.prefab` unless given (twins share a name in two folders). */
+  readonly prefabSource?: string;
+  /** File stem of the GLBs, `name` unless given (the importer adds a hash to twin names). */
+  readonly glbStem?: string;
 }
 
 /** An import folder as `importUnityPackage` leaves it, with cube GLBs standing in for converted models. */
@@ -155,13 +159,13 @@ export async function writeSyntheticImport(importDir: string, pieces: readonly S
   const prefabs: UnityImportReport["prefabs"][number][] = [];
   for (const piece of pieces) {
     const size = piece.size ?? 1;
-    await writePlainCube(join(importDir, "models", `${piece.name}.glb`), piece.name, piece.prefabFactor ? [0.2, 0.2, 0.2] : piece.factor, size);
+    await writePlainCube(join(importDir, "models", `${piece.glbStem ?? piece.name}.glb`), piece.name, piece.prefabFactor ? [0.2, 0.2, 0.2] : piece.factor, size);
     if (piece.prefabFactor) {
-      await writePlainCube(join(importDir, "prefabs", `${piece.name}.glb`), piece.name, piece.prefabFactor, size);
+      await writePlainCube(join(importDir, "prefabs", `${piece.glbStem ?? piece.name}.glb`), piece.name, piece.prefabFactor, size);
       prefabs.push({
         name: piece.name,
-        source: `Assets/Prefabs/${piece.name}.prefab`,
-        glb: `prefabs/${piece.name}.glb`,
+        source: piece.prefabSource ?? `Assets/Prefabs/${piece.name}.prefab`,
+        glb: `prefabs/${piece.glbStem ?? piece.name}.glb`,
         bytes: 0,
         nodes: 2,
         meshNodes: 1,
@@ -180,7 +184,7 @@ export async function writeSyntheticImport(importDir: string, pieces: readonly S
     models.push({
       name: piece.name,
       source: piece.source ?? `Assets/Models/${piece.name}.fbx`,
-      glb: `models/${piece.name}.glb`,
+      glb: `models/${piece.glbStem ?? piece.name}.glb`,
       bytes: 0,
       vertices: 24,
       sizeMeters: { x: size, y: size, z: size },
