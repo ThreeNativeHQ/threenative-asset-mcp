@@ -98,6 +98,10 @@ export function toGltfTransform(position: Vec3, rotation: Quat, scale: Vec3): { 
 
 const MAX_DEPTH = 32;
 const MAX_OBJECTS = 200_000;
+/** Prefab scopes (the file itself plus every nested instance expansion) one prefab import may build. */
+export const MAX_SCOPES = 50_000;
+/** Highest array index a modification may address; Unity arrays of materials, children and the like are far smaller. */
+export const MAX_ARRAY_INDEX = 4096;
 const MAX_PREFAB_BYTES = 128 * 1024 * 1024;
 
 const CLASS_GAME_OBJECT = 1;
@@ -166,6 +170,8 @@ function pathTokens(path: string): (string | number)[] {
   return tokens;
 }
 
+const hasHugeIndex = (path: string): boolean => pathTokens(path).some((token) => typeof token === "number" && token > MAX_ARRAY_INDEX);
+
 /** Sets `path` inside `root` the way Unity's `propertyPath` addresses it. Returns false for paths it skips. */
 function setProperty(root: Record<string, unknown>, path: string, value: unknown): boolean {
   if (path.endsWith(".Array.size")) return false;
@@ -209,6 +215,7 @@ interface Built {
 export class PrefabResolver {
   private readonly documents = new Map<string, Promise<readonly UnityDocument[]>>();
   private objectCount = 0;
+  private scopeCount = 0;
 
   constructor(private readonly database: Pick<UnityAssetDatabase, "entries">) {}
 
@@ -239,6 +246,7 @@ export class PrefabResolver {
 
   async resolve(entry: UnityAssetEntry): Promise<ResolvedPrefab> {
     this.objectCount = 0;
+    this.scopeCount = 0;
     const unresolved: Unresolved[] = [];
     const scope = await this.scope(entry, [], unresolved);
     return this.build(entry, scope, unresolved);
@@ -251,6 +259,10 @@ export class PrefabResolver {
     }
     if (chain.length >= MAX_DEPTH) {
       throw new UnityPrefabError("UNITY_PREFAB_TOO_DEEP", `Prefab nesting is deeper than ${MAX_DEPTH}: ${[...chain, entry.path].slice(0, 6).join(" -> ")} -> ...`);
+    }
+    this.scopeCount += 1;
+    if (this.scopeCount > MAX_SCOPES) {
+      throw new UnityPrefabError("UNITY_PREFAB_TOO_LARGE", `The prefab expands to more than ${MAX_SCOPES} nested prefab instances (nested instances multiply)`);
     }
     const documents = await this.load(entry);
     const scope = new Scope(entry.path);
@@ -327,6 +339,10 @@ export class PrefabResolver {
           reference: `${where}: ${path} on ${edit ? refText(edit) : "?"}`,
           reason: kind === "model" ? "only the root of a model can be edited; its inner objects are not addressable" : `no such object in ${source.path}`,
         });
+        continue;
+      }
+      if (hasHugeIndex(path)) {
+        unresolved.push({ kind: "modification", reference: `${where}: ${path} on ${edit ? refText(edit) : "?"}`, reason: `an array index is larger than ${MAX_ARRAY_INDEX}` });
         continue;
       }
       setProperty(object.fields, path, objectReference && objectReference.fileID !== "0" ? item.objectReference : item.value);
