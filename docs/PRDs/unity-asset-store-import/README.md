@@ -1,6 +1,8 @@
 # Epic: Unity Asset Store import
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS (2026-10-15). PRD-615..619 are built and tested on synthetic packages (PRs #56-#60). Every
+real-pack acceptance criterion waits for the corpus `U1`-`U3`, which is not on any machine yet. PRD-620 is blocked
+on an owner decision.
 **Owner:** João
 
 Import a buyer's own Unity Asset Store packages into GLB, as `fab_import_asset` does for Unreal packs.
@@ -108,6 +110,12 @@ Together they cover the three render pipelines. They are the epic's real-pack co
 | `U1` | Apocalypse: Playground Environment (`fbc35597-dbcf-4da8-bb29-4fdbf203c46e`) | [352674](https://assetstore.unity.com/packages/3d/environments/urban/apocalypse-playground-environment-352674) | Built-in | Standard shader baseline: 31 meshes, 141 textures (512–4096 px), 1 master material with 31 instances, 2 scenes |
 | `U2` | Old Abandoned Rusty Cars – Overgrown (`ed740921-9f30-4444-8c8e-c55db80c7304`) | [364602](https://assetstore.unity.com/packages/3d/vehicles/land/abandoned-rusty-vehicles-and-props-3d-game-ready-mini-set-364602) | HDRP, URP, Built-in | The same pieces in three pipelines (HDRP mask maps against URP Lit and Standard); 17 prefabs, about 1.1 M triangles, no LODs |
 | `U3` | KUBIKOS - Cube World (`7bbf72cf-03bd-458f-9a74-1ab85bd1f2e5`) | [117341](https://assetstore.unity.com/packages/3d/environments/kubikos-3d-cube-world-117341) | URP, Built-in, custom | Scale and fallbacks: 458 prefabs, custom lava, water, magma, ice and fog shaders (expected `fallback`), minimum Unity 5 (old `.meta` layout) |
+
+**Probe result (2026-10-14).** The automated Fab route cannot download these packs today. `fabcli library` and
+`fabcli listing` expose only the Unreal project version, so the Unity file has no Epic catalog coordinates. The Fab
+web path is behind a Cloudflare challenge and needs a signed-in Fab session (`fabcli ownership` answers
+`auth_required`). **Blocked on:** João runs `fabcli auth login`, or downloads the three `.unitypackage` files into
+`~/.cache/threenative-asset-mcp/unity-corpus/<id>/`. Real `R1` renders also need a Unity Personal licence (PRD-617).
 
 Rules:
 
