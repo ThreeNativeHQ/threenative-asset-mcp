@@ -1,6 +1,6 @@
 # PRD-615 — Unity package intake: cache discovery, extraction and asset database
 
-**Status:** IN PROGRESS — AC-1..AC-7 done (AC-7 on 2026-10-15); AC-8 waits for the PR comment
+**Status:** IN PROGRESS — AC-1..AC-8 done (AC-7 and AC-8 on 2026-10-15)
 **Priority:** P2 — every later Unity step reads packages through this intake, and none of AC-1..AC-7 exists yet.
 **Complexity:** 3 (LOW) — 1–5 implementation files (1), new `src/unity/` module (+2); risk override: untrusted
 archive paths cross a trust boundary, so AC-2 gets its own traversal test.
@@ -66,9 +66,9 @@ modification time. It reads only local files. It never contacts Unity.
   YAML parse failures and zero refused paths. `docs/parity/unity-corpus.json` records each pack's id, listing UID,
   size, SHA-256, pipelines and counts per kind, and no asset names.
   proof: `npx tsx scripts/unity-inventory.ts --corpus ~/.cache/threenative-asset-mcp/unity-corpus --record` — Evidence: `docs/parity/unity-corpus.json` (U1 31 prefabs, U2 17, U3 1006; `yamlFailures` 0 on all three). The 2026-10-15 sweeps imported every prefab with `failed 0, skipped 0` on all three packs. The script also records `previews` and `yamlFailures` per pack. The U3 pack mixes Unity 5 `.meta` files (`serializedVersion: 19`, `fileIDToRecycleName`) and the old `Prefab` container document; both parse (see PRD-004 AC-6).
-- [ ] AC-8 [local]: The PR comment carries the inventory table for `U1`–`U3` (counts per kind, preview count per
+- [x] AC-8 [local]: The PR comment carries the inventory table for `U1`–`U3` (counts per kind, preview count per
   pack, so PRD-617 knows where `R2` exists), following the epic's PR evidence rule. There is no render yet, so there
-  is no sheet. proof: PR comment link — Evidence: pending. **Not done:** the AC-7 run exists, but no PR was opened (the corpus work stays local until João asks for one).
+  is no sheet. proof: PR comment link — Evidence: https://github.com/ThreeNativeHQ/threenative-asset-mcp/pull/63#issuecomment-6198151490 (inventory table for U1-U3 with the preview count per pack, 2026-10-15).
 
 ## Blocked on
 
