@@ -148,6 +148,36 @@ describe("unity package traversal", () => {
     await expect(openUnityPackage(encrypted)).rejects.toThrow(/not a gzip tar.*encrypted/);
   });
 
+  it("refuses an archive over the member or declared-size limit before it extracts anything", async () => {
+    const work = await ownedTmp();
+    const archive = join(work, "p.unitypackage");
+    const staging = await scratchDirectory("unity-stage-", work);
+    tarWith(archive, staging, await writePackageTree(staging, [{ path: "Assets/a.txt", content: "a".repeat(100) }]));
+    await expect(openUnityPackage(archive, { maxMembers: 3 })).rejects.toMatchObject({ code: "UNITY_PACKAGE_TOO_LARGE", message: expect.stringMatching(/members, more than the limit of 3/) });
+    await expect(openUnityPackage(archive, { maxBytes: 99 })).rejects.toMatchObject({ code: "UNITY_PACKAGE_TOO_LARGE", message: expect.stringMatching(/uncompressed bytes, more than the limit of 99/) });
+    expect(await readdir(join(work, "tmp"))).toEqual([]);
+    const database = await open(archive);
+    expect(database.entries.size).toBe(1);
+  });
+
+  it("opens a package whose members are stored with mode 000, and cleans staging up on success and on failure", async () => {
+    const work = await ownedTmp();
+    const staging = await scratchDirectory("unity-stage-", work);
+    const files = [{ path: "Assets/a.txt", content: "a" }];
+    const archive = join(work, "p.unitypackage");
+    tarWith(archive, staging, await writePackageTree(staging, files), ["--mode=a-rwx"]);
+    const database = await openUnityPackage(archive);
+    expect(readFileSync([...database.entries.values()][0]?.assetFile ?? "", "utf8")).toBe("a");
+    await database.dispose();
+    expect(await readdir(join(work, "tmp"))).toEqual([]);
+
+    const hostile = await scratchDirectory("unity-stage-", work);
+    const hostileArchive = join(work, "h.unitypackage");
+    tarWith(hostileArchive, hostile, await writePackageTree(hostile, files, () => "../x"), ["--mode=a-rwx"]);
+    await expect(openUnityPackage(hostileArchive)).rejects.toMatchObject({ code: "UNITY_PACKAGE_UNSAFE_ENTRY" });
+    expect(await readdir(join(work, "tmp"))).toEqual([]);
+  });
+
   it("removes the staging directory on dispose", async () => {
     const work = await ownedTmp();
     const archive = join(work, "p.unitypackage");

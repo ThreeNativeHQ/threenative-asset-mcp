@@ -12,7 +12,7 @@
  * only then is `tar` run, into a private staging directory that `dispose()` removes.
  */
 import { existsSync } from "node:fs";
-import { lstat, mkdtemp, open, readdir, readFile, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, open, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 
@@ -40,7 +40,8 @@ export interface UnityAssetDatabase {
 export type UnityPackageErrorCode =
   | "UNITY_PACKAGE_UNREADABLE"
   | "UNITY_PACKAGE_UNSAFE_ENTRY"
-  | "UNITY_PACKAGE_INVALID";
+  | "UNITY_PACKAGE_INVALID"
+  | "UNITY_PACKAGE_TOO_LARGE";
 
 export class UnityPackageError extends Error {
   constructor(
@@ -55,6 +56,14 @@ export class UnityPackageError extends Error {
 const GUID = /^[0-9a-f]{32}$/;
 const MEMBER_DIRECTORY_OR_FILE = /^([0-9a-f]{32})(?:\/(asset|asset\.meta|pathname|preview\.png))?$/;
 const LISTING_BYTES = 128 * 1024 * 1024;
+/** Generous caps on an archive's member count and declared uncompressed bytes, checked on the listing before `tar` extracts. */
+export const MAX_PACKAGE_MEMBERS = 200_000;
+export const MAX_PACKAGE_BYTES = 8 * 1024 ** 3;
+
+export interface OpenUnityPackageOptions {
+  readonly maxMembers?: number;
+  readonly maxBytes?: number;
+}
 
 function unsafe(what: string, entry: string): UnityPackageError {
   return new UnityPackageError(
@@ -95,18 +104,27 @@ async function tarNames(archive: string, verbose: boolean): Promise<string[]> {
  * the verbose listing are read in step: the verbose one gives each member's type letter, the plain one
  * gives its exact name.
  */
-async function listSafeMembers(archive: string): Promise<string[]> {
+async function listSafeMembers(archive: string, maxMembers: number, maxBytes: number): Promise<string[]> {
   const names = await tarNames(archive, false);
+  if (names.length > maxMembers) {
+    throw new UnityPackageError("UNITY_PACKAGE_TOO_LARGE", `${archive} has ${names.length} members, more than the limit of ${maxMembers}.`);
+  }
   const verbose = await tarNames(archive, true);
   if (names.length !== verbose.length) {
     throw unsafe("archive member with a line break in its name", archive);
   }
+  let declaredBytes = 0;
   names.forEach((name, index) => {
     const type = verbose[index]?.[0] ?? "?";
+    // GNU verbose line: `-rw-r--r-- owner/group SIZE date time name`.
+    if (type === "-") declaredBytes += Number(verbose[index]?.split(/\s+/)[2]) || 0;
     if (type === "l" || type === "h") throw unsafe(type === "l" ? "symlink member" : "hardlink member", name);
     if (type !== "-" && type !== "d") throw unsafe("special file member", name);
     assertSafeRelativePath(name, "archive member");
   });
+  if (declaredBytes > maxBytes) {
+    throw new UnityPackageError("UNITY_PACKAGE_TOO_LARGE", `${archive} declares ${declaredBytes} uncompressed bytes, more than the limit of ${maxBytes}.`);
+  }
   return names.map((name) => name.replace(/^(\.\/)+/, "").replace(/\/$/, "")).filter((name) => name !== "" && name !== ".");
 }
 
@@ -122,6 +140,15 @@ async function extract(archive: string, into: string): Promise<void> {
       `Extracting ${archive} failed (tar exit ${run.code}).`,
     );
   }
+}
+
+/** A member stored with mode 000 extracts unreadable and blocks `rm`. Gives the owner access to everything under `path`. */
+async function restoreOwnerAccess(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink()) return;
+  await chmod(path, info.mode | (info.isDirectory() ? 0o700 : 0o600));
+  if (!info.isDirectory()) return;
+  for (const name of await readdir(path)) await restoreOwnerAccess(join(path, name));
 }
 
 async function isGzip(file: string): Promise<boolean> {
@@ -235,7 +262,7 @@ async function buildFromProject(root: string): Promise<{ entries: Map<string, Un
  * Opens a `.unitypackage`, a UPM tarball (`.tgz`) or a project folder. Call `dispose()` when done: for
  * archives it removes the staging directory. The database stays valid until then.
  */
-export async function openUnityPackage(source: string): Promise<UnityAssetDatabase> {
+export async function openUnityPackage(source: string, limits: OpenUnityPackageOptions = {}): Promise<UnityAssetDatabase> {
   const info = await stat(source).catch(() => undefined);
   if (!info) throw new UnityPackageError("UNITY_PACKAGE_UNREADABLE", `${source} does not exist.`);
   if (info.isDirectory()) {
@@ -248,11 +275,15 @@ export async function openUnityPackage(source: string): Promise<UnityAssetDataba
       `${source} is not a gzip tar. An encrypted Asset Store download cannot be read: use the imported project folder instead.`,
     );
   }
-  const members = await listSafeMembers(source);
+  const members = await listSafeMembers(source, limits.maxMembers ?? MAX_PACKAGE_MEMBERS, limits.maxBytes ?? MAX_PACKAGE_BYTES);
   const staging = await mkdtemp(join(tmpdir(), "threenative-unity-"));
-  const dispose = () => rm(staging, { recursive: true, force: true });
+  const dispose = async (): Promise<void> => {
+    await restoreOwnerAccess(staging).catch(() => undefined);
+    await rm(staging, { recursive: true, force: true });
+  };
   try {
     await extract(source, staging);
+    await restoreOwnerAccess(staging);
     if (members.includes("package/package.json")) {
       const root = join(staging, "package");
       const entries = new Map<string, UnityAssetEntry>();
