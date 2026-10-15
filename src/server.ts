@@ -167,6 +167,11 @@ import {
   createBundleListEntriesHandler,
 } from "./tools/bundle.js";
 import {
+  AssetImportUnityInputSchema,
+  AssetImportUnityOutputSchema,
+  createAssetImportUnityHandler,
+} from "./tools/import-unity.js";
+import {
   UnityListPackagesInputSchema,
   UnityListPackagesOutputSchema,
   createUnityListPackagesHandler,
@@ -611,6 +616,24 @@ export function createAssetServer(
       },
     },
     createUnityListPackagesHandler(),
+  );
+
+  server.registerTool(
+    "asset_import_unity",
+    {
+      title: "Import a Unity Asset Store package",
+      description:
+        "Convert models (FBX, OBJ, .blend), textures and materials of a Unity package the user owns into self-contained GLBs plus import-report.json. Accepts a .unitypackage, a UPM tarball or a project folder, applies each model's import scale, binds FBX material slots to .mat files (externalObjects, then by name) and maps Standard, URP Lit/SimpleLit/ComplexLit and HDRP Lit to glTF PBR; other shaders fall back to their saved colour and texture and are reported. Needs Blender: THREENATIVE_BLENDER, PATH, or a pinned download (disable with THREENATIVE_TOOLCHAIN_AUTOINSTALL=0). Requires acceptUnityAssetStoreEula: true. It never contacts or signs in to Unity.",
+      inputSchema: AssetImportUnityInputSchema,
+      outputSchema: AssetImportUnityOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    createAssetImportUnityHandler(),
   );
 
   server.registerTool(
