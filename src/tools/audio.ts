@@ -232,17 +232,18 @@ const InspectionExpectationShape = {
   peakMax: z.number().positive().max(10).optional(),
   silenceRms: z.number().positive().max(1).optional(),
   seamMaxRatio: z.number().positive().max(1_000).optional(),
-  semantic: z.enum(["off", "clap"]).default("off"),
+  semantic: z.enum(["off", "clap", "earshot"]).default("off"),
 };
 
 /** `semantic: "clap"` must actually ask for something, and a content check needs real distractors. */
-function refineSemantics<T extends z.ZodTypeAny>(schema: T) {
+function refineSemantics<T extends z.ZodTypeAny>(schema: T, promptSupplied = false) {
   return schema
     .refine(
       (raw) => {
         const input = raw as Record<string, unknown>;
         return (
-          input.semantic !== "clap" ||
+          input.semantic === "off" ||
+          (promptSupplied && input.semantic === "earshot") ||
           input.expectedPrompt !== undefined ||
           input.emotion !== undefined
         );
@@ -255,9 +256,16 @@ function refineSemantics<T extends z.ZodTypeAny>(schema: T) {
     .refine(
       (raw) => {
         const input = raw as Record<string, unknown>;
+        return input.semantic !== "earshot" || input.emotion === undefined;
+      },
+      { message: 'emotion checking is not available with semantic: "earshot"; use semantic: "clap".' },
+    )
+    .refine(
+      (raw) => {
+        const input = raw as Record<string, unknown>;
         return (
           input.expectedPrompt === undefined ||
-          input.semantic !== "clap" ||
+          input.semantic === "off" ||
           (Array.isArray(input.alternativePrompts) && input.alternativePrompts.length > 0)
         );
       },
@@ -397,7 +405,7 @@ export const AudioGenerateInputSchema = z
     durationSeconds: z.number().min(0.5).max(30).default(5),
     loop: z.boolean().default(false),
     promptInfluence: z.number().min(0).max(1).default(0.3),
-    inspection: refineSemantics(z.object({ ...InspectionExpectationShape }).strict()).optional(),
+    inspection: refineSemantics(z.object({ ...InspectionExpectationShape }).strict(), true).optional(),
   })
   .strict();
 

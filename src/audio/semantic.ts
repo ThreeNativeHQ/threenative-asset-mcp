@@ -27,6 +27,15 @@ export const SEMANTIC_SETUP_INSTRUCTION =
   "Local CLAP is not provisioned. Install the optional extras (see README 'Optional local CLAP setup') " +
   "and set AUDIO_CLAP_PYTHON to that interpreter; until then prompt and emotion fit stay unverified.";
 
+export const EARSHOT_SETUP_INSTRUCTION =
+  "earshot is not provisioned. Install it as described in docs/audio.md 'earshot companion' " +
+  "and set AUDIO_EARSHOT_BIN to its `earshot` executable; until then prompt fit stays unverified.";
+
+const EARSHOT_TIMEOUT_MS = 180_000;
+/** Commit the verdict mapping and fixtures were recorded against. */
+export const EARSHOT_COMMIT = "108763c62648c78dbac14f5bebcd3c61ac7931cd";
+export const EARSHOT_CALIBRATION_ID = `earshot-${EARSHOT_COMMIT.slice(0, 7)}/match-z`;
+
 export interface SemanticEmotionRequest {
   sourceDescription: string;
   targetMood: string;
@@ -34,6 +43,8 @@ export interface SemanticEmotionRequest {
 }
 
 export interface SemanticRequest {
+  /** Content backend. CLAP is the default and the only mood backend. */
+  backend?: "clap" | "earshot";
   expectedPrompt?: string;
   alternativePrompts?: string[];
   emotion?: SemanticEmotionRequest;
@@ -91,6 +102,7 @@ function notRequested(): SemanticResult {
 }
 
 function unavailable(request: SemanticRequest, reason: string): SemanticResult {
+  const earshot = request.backend === "earshot";
   const contentRequested = request.expectedPrompt !== undefined;
   return {
     content: {
@@ -98,7 +110,7 @@ function unavailable(request: SemanticRequest, reason: string): SemanticResult {
       status: "unverified",
       reason: contentRequested ? reason : "content_comparison_not_requested",
       ranked: [],
-      calibrationId: CALIBRATION_ID,
+      calibrationId: earshot ? EARSHOT_CALIBRATION_ID : CALIBRATION_ID,
     },
     emotionFit: {
       status: request.emotion === undefined ? "not_requested" : "unverified",
@@ -108,7 +120,7 @@ function unavailable(request: SemanticRequest, reason: string): SemanticResult {
       calibrationId: CALIBRATION_ID,
       moodTemplateVersion: MOOD_TEMPLATE_VERSION,
     },
-    unavailableReason: SEMANTIC_SETUP_INSTRUCTION,
+    unavailableReason: earshot ? EARSHOT_SETUP_INSTRUCTION : SEMANTIC_SETUP_INSTRUCTION,
   };
 }
 
@@ -118,7 +130,14 @@ export function adapterScriptPath(): string {
 }
 
 /** True when a caller could actually get a semantic verdict right now. Used by generation preflight. */
-export async function semanticAvailable(): Promise<boolean> {
+export async function semanticAvailable(backend: "clap" | "earshot" = "clap"): Promise<boolean> {
+  if (backend === "earshot") {
+    const bin = process.env.AUDIO_EARSHOT_BIN;
+    if (!bin) return false;
+    return await new Promise<boolean>((done) => {
+      execFile(bin, ["--help"], { timeout: 20_000, windowsHide: true }, (error) => done(!error));
+    });
+  }
   const python = process.env.AUDIO_CLAP_PYTHON;
   if (!python) return false;
   try {
@@ -141,6 +160,7 @@ export async function inspectSemantics(
   audioPath: string,
 ): Promise<SemanticResult> {
   if (!request) return notRequested();
+  if (request.backend === "earshot") return inspectEarshot(request, audioPath);
 
   const python = process.env.AUDIO_CLAP_PYTHON;
   if (!python) return unavailable(request, "semantic_model_unavailable");
@@ -272,5 +292,55 @@ function emotionResultOf(
     ...(scored.windows === undefined ? {} : { windows: scored.windows }),
     calibrationId: CALIBRATION_ID,
     moodTemplateVersion: MOOD_TEMPLATE_VERSION,
+  };
+}
+
+interface EarshotMatch {
+  verdict: string;
+  results: { query: string; z: number }[];
+  alts?: { query: string; z: number }[];
+}
+
+/** Prompt fit through earshot's calibrated `match`. strong | plausible is consistent; weaker is a mismatch. */
+async function inspectEarshot(request: SemanticRequest, audioPath: string): Promise<SemanticResult> {
+  const bin = process.env.AUDIO_EARSHOT_BIN;
+  if (!bin) return unavailable(request, "semantic_model_unavailable");
+  const expected = request.expectedPrompt;
+  if (expected === undefined) return unavailable(request, "content_comparison_not_requested");
+  const alts = request.alternativePrompts ?? [];
+  // Each prompt is its own argv item and no shell runs, so prompt text cannot inject commands.
+  const args = ["match", audioPath, expected, ...(alts.length > 0 ? ["--alts", ...alts] : []), "--json"];
+  const raw = await new Promise<string | undefined>((done) => {
+    execFile(
+      bin,
+      args,
+      { timeout: EARSHOT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+      (error, stdout) => done(error ? undefined : stdout),
+    );
+  });
+  if (raw === undefined) return unavailable(request, "semantic_run_failed");
+  let parsed: EarshotMatch;
+  try {
+    parsed = JSON.parse(raw) as EarshotMatch;
+    const top = parsed.results?.[0];
+    if (typeof parsed.verdict !== "string" || typeof top?.z !== "number") throw new Error("shape");
+  } catch {
+    return unavailable(request, "semantic_output_unreadable");
+  }
+  const ranked = [parsed.results[0]!, ...(parsed.alts ?? [])]
+    .map((row) => ({ text: row.query, score: row.z }))
+    .sort((a, b) => b.score - a.score);
+  const consistent = parsed.verdict === "strong" || parsed.verdict === "plausible";
+  const second = ranked[1];
+  return {
+    content: {
+      requested: true,
+      status: consistent ? "consistent" : "possible_mismatch",
+      reason: `earshot match verdict: ${parsed.verdict} (z ${ranked.find((r) => r.text === expected)?.score ?? parsed.results[0]!.z}).`,
+      ranked,
+      ...(second === undefined ? {} : { margin: ranked[0]!.score - second.score }),
+      calibrationId: EARSHOT_CALIBRATION_ID,
+    },
+    emotionFit: emotionResultOf(request, undefined),
   };
 }

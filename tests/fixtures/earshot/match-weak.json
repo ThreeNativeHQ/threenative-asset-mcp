@@ -1,0 +1,124 @@
+{
+ "summary": "pop_01.wav: 'a dog barking' -> no match (z -1.0; would rank #279 among 322 vocabulary descriptions; cosine -0.18). Forced choice vs your alternatives: 'a dog barking' <1%, 'a small bubble pop' >99%, 'heavy rain on a tin roof' <1%. It sounds most like: 'a mouth pop' (z +4.3), 'a bubble pop' (z +4.2), 'a cork pop' (z +4.2), 'a liquid bloop' (z +3.5).",
+ "path": "clip.wav",
+ "start": null,
+ "end": null,
+ "peak_dbfs": -1.0,
+ "query": "a dog barking",
+ "cosine": -0.184,
+ "z": -0.99,
+ "percentile": 13.4,
+ "rank_in_vocab": 279,
+ "p_vs_alts": 0.0,
+ "verdict": "no match",
+ "validated": true,
+ "alts": [
+  {
+   "query": "a small bubble pop",
+   "p": 1.0,
+   "z": 4.41,
+   "cosine": 0.502
+  },
+  {
+   "query": "heavy rain on a tin roof",
+   "p": 0.0,
+   "z": 0.55,
+   "cosine": 0.041
+  }
+ ],
+ "results": [
+  {
+   "query": "a dog barking",
+   "cosine": -0.184,
+   "z": -0.99,
+   "percentile": 13.4,
+   "rank_in_vocab": 279,
+   "vocab_size": 322,
+   "verdict": "no match",
+   "validated": true,
+   "p_vs_alts": 0.0,
+   "alts": [
+    {
+     "query": "a small bubble pop",
+     "p": 1.0,
+     "z": 4.41,
+     "cosine": 0.502
+    },
+    {
+     "query": "heavy rain on a tin roof",
+     "p": 0.0,
+     "z": 0.55,
+     "cosine": 0.041
+    }
+   ]
+  }
+ ],
+ "closest_vocab": [
+  {
+   "term": "a mouth pop",
+   "category": "foley",
+   "z": 4.33,
+   "cosine": 0.475
+  },
+  {
+   "term": "a bubble pop",
+   "category": "foley",
+   "z": 4.29,
+   "cosine": 0.503
+  },
+  {
+   "term": "a cork pop",
+   "category": "foley",
+   "z": 4.21,
+   "cosine": 0.477
+  },
+  {
+   "term": "a liquid bloop",
+   "category": "water",
+   "z": 3.56,
+   "cosine": 0.398
+  }
+ ],
+ "verdict_thresholds_z": {
+  "strong": 3.0,
+  "plausible": 2.5,
+  "weak": 2.0
+ },
+ "verdict_evidence": {
+  "strong": {
+   "z": ">= 3",
+   "lr": 1289,
+   "precision_library": 0.98,
+   "precision_even_odds": 1.0,
+   "lr_strict": 51,
+   "precision_library_strict": 0.61,
+   "recall_at_or_above": 0.51
+  },
+  "plausible": {
+   "z": "2.5 - 3",
+   "lr": 21,
+   "precision_library": 0.41,
+   "precision_even_odds": 0.95,
+   "lr_strict": 9.1,
+   "precision_library_strict": 0.22,
+   "recall_at_or_above": 0.63
+  },
+  "weak": {
+   "z": "2 - 2.5",
+   "lr": 12,
+   "precision_library": 0.28,
+   "precision_even_odds": 0.92,
+   "lr_strict": 6.6,
+   "precision_library_strict": 0.17,
+   "recall_at_or_above": 0.76
+  },
+  "no match": {
+   "z": "< 2",
+   "lr": 0.25,
+   "precision_library": 0.008,
+   "precision_even_odds": 0.2,
+   "lr_strict": 0.25,
+   "precision_library_strict": 0.008
+  }
+ }
+}
