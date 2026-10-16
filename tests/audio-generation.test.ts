@@ -472,5 +472,28 @@ describeWithTools(["ffmpeg"], "audio generation", () => {
         if (saved !== undefined) process.env.AUDIO_CLAP_PYTHON = saved;
       }
     });
+
+    it("refuses semantic earshot when AUDIO_EARSHOT_BIN does not answer, before spending", async () => {
+      const audioDir = await temporaryDirectory();
+      const { generator, recorded } = await generatorIn(audioDir, () => audioResponse(mp3Bytes));
+      const saved = process.env.AUDIO_EARSHOT_BIN;
+      delete process.env.AUDIO_EARSHOT_BIN;
+      try {
+        await expect(
+          generator.generate({
+            requestId: ID_A,
+            prompt: PROMPT,
+            durationSeconds: 2,
+            inspection: {
+              semantic: "earshot",
+              alternativePrompts: ["a dog barking"],
+            },
+          }),
+        ).rejects.toMatchObject({ code: "AUDIO_GENERATE_PREREQUISITE_MISSING" });
+        expect(recorded.calls).toHaveLength(0);
+      } finally {
+        if (saved !== undefined) process.env.AUDIO_EARSHOT_BIN = saved;
+      }
+    });
   });
 });

@@ -25,6 +25,7 @@ Environment variables read by the server.
 | `ELEVENLABS_API_KEY`            | unset                                              | **Your own** key; required only by `audio_generate_sound`. Never bundled or logged. |
 | `AUDIO_INSPECT_ROOTS`           | the audio dir plus the launch directory            | Extra `:`-separated roots `audio_inspect_asset` may read. |
 | `AUDIO_CLAP_PYTHON`             | unset                                              | Interpreter with LAION-CLAP installed; enables `semantic: "clap"`. |
+| `AUDIO_EARSHOT_BIN`             | unset                                              | Path to the `earshot` executable; enables `semantic: "earshot"` (prompt fit only). |
 | `AUDIO_CLAP_CHECKPOINT`         | unset                                              | Path to the `630k-audioset-best.pt` checkpoint.          |
 | `AUDIO_CLAP_CHECKPOINT_SHA256`  | unset                                              | Optional pin; a mismatched checkpoint is refused.        |
 | `ASSET_DOWNLOAD_DIR`            | `~/Downloads/threenative-asset-mcp/assets`         | Dedicated directory for direct provider downloads.       |
@@ -39,10 +40,8 @@ Environment variables read by the server.
 | `BLENDKIT_PROVIDER_PERMISSION`  | unset                                              | Citation of documented Blendkit permission for this use. Unset keeps live Blendkit search and import off. |
 | `BLENDKIT_API_KEY`              | unset                                              | **Your own** key from the official Blendkit sign-in; sent only to the loopback Client, never logged or returned. |
 | `BLENDKIT_BLENDER_PATH`         | Client-stored Blender                              | Absolute path to the Blender that runs the `export_glb` recipe. |
-| `ASSETSTORE_CACHE_PATH`         | OS default (Linux `~/.local/share/unity3d/Asset Store-5.x`) | Where `unity_list_packages` looks for the Unity Editor's cached `.unitypackage` files. Local reads only. |
 | `THREENATIVE_TOOLCHAIN_AUTOINSTALL` | `1`                                            | Set to `0` to disable first-use external-tool installs.  |
-| `THREENATIVE_TOOLCHAIN_DIR`     | OS cache under `threenative-asset-mcp/toolchain`   | UE Viewer, FabCLI, uncooked-converter and Blender cache.          |
-| `THREENATIVE_BLENDER`           | `blender` on `PATH`, else a pinned download         | Absolute path to a Blender 3.6+ executable for `asset_import_unity`. |
+| `THREENATIVE_TOOLCHAIN_DIR`     | OS cache under `threenative-asset-mcp/toolchain`   | UE Viewer, FabCLI, and uncooked-converter cache.          |
 | `THREENATIVE_UMODEL_PATH`       | auto-detected/provisioned                           | Absolute path to a UE Viewer executable override.        |
 | `THREENATIVE_UNCOOKED_CONVERTER_PATH` | auto-detected/provisioned                     | Absolute path to `unreal-assets-to-glb`.                  |
 | `THREENATIVE_FABCLI_PATH`       | auto-detected/provisioned                           | Absolute path to FabCLI; login remains user-controlled.  |

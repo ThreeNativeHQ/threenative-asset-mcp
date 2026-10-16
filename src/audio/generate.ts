@@ -370,10 +370,11 @@ export class AudioGenerator {
     });
     this.inspector.resolveInspectorBin();
     // An explicitly requested semantic model that is not provisioned is refused before spending.
-    if (request.inspection?.semantic === "clap" && !(await semanticAvailable())) {
+    const backend = request.inspection?.semantic;
+    if ((backend === "clap" || backend === "earshot") && !(await semanticAvailable(backend))) {
       throw new AudioGenerateError(
         "AUDIO_GENERATE_PREREQUISITE_MISSING",
-        "Semantic inspection was requested but local CLAP is not provisioned. Nothing was requested or charged.",
+        `Semantic inspection was requested but ${backend === "clap" ? "local CLAP" : "earshot"} is not provisioned. Nothing was requested or charged.`,
       );
     }
   }

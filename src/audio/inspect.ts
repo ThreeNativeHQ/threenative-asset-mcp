@@ -91,7 +91,7 @@ export interface AudioInspectRequest {
   peakMax?: number | undefined;
   silenceRms?: number | undefined;
   seamMaxRatio?: number | undefined;
-  semantic?: "off" | "clap" | undefined;
+  semantic?: "off" | "clap" | "earshot" | undefined;
 }
 
 export interface AudioFinding {
@@ -555,8 +555,9 @@ function effectiveExpectations(request: AudioInspectRequest): Record<string, unk
 }
 
 function semanticRequestOf(request: AudioInspectRequest): SemanticRequest | undefined {
-  if (request.semantic !== "clap") return undefined;
+  if (request.semantic !== "clap" && request.semantic !== "earshot") return undefined;
   return {
+    backend: request.semantic,
     ...(request.expectedPrompt === undefined ? {} : { expectedPrompt: request.expectedPrompt }),
     ...(request.alternativePrompts === undefined
       ? {}

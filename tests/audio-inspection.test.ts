@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { AudioInspectError, AudioInspector } from "../src/audio/inspect.js";
-import { createAudioInspectHandler } from "../src/tools/audio.js";
+import { AudioInspectInputSchema, createAudioInspectHandler } from "../src/tools/audio.js";
 import { describeWithTools } from "./helpers/require-tool.js";
 
 /**
@@ -21,6 +21,8 @@ import { describeWithTools } from "./helpers/require-tool.js";
  * genuinely bad seam needs a clip that *ends* at full amplitude — a quarter cycle of a 1 Hz tone.
  */
 
+const EARSHOT_PROMPT = "a short metal latch closing";
+const EARSHOT_ALTS = ["a dog barking", "heavy rain on a tin roof"];
 const temporaryDirectories: string[] = [];
 let root: string;
 
@@ -239,6 +241,95 @@ describeWithTools(["ffmpeg"], "audio inspection", () => {
       } finally {
         if (saved !== undefined) process.env.AUDIO_CLAP_PYTHON = saved;
       }
+    });
+  });
+
+  describe("semantic: earshot", () => {
+    const fixtureDir = join(import.meta.dirname, "fixtures", "earshot");
+
+    /** A stand-in `earshot` executable that prints recorded real `match --json` output. */
+    async function fakeEarshot(fixture: string | undefined, script = ""): Promise<string> {
+      const stub = await temporaryDirectory();
+      const bin = join(stub, "earshot");
+      const body =
+        fixture === undefined
+          ? script
+          : `if (process.argv[2] === "match") process.stdout.write(require("fs").readFileSync(${JSON.stringify(
+              join(fixtureDir, fixture),
+            )}, "utf8"));`;
+      await writeFile(bin, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
+      return bin;
+    }
+
+    async function withBin<T>(bin: string | undefined, run: () => Promise<T>): Promise<T> {
+      const saved = process.env.AUDIO_EARSHOT_BIN;
+      if (bin === undefined) delete process.env.AUDIO_EARSHOT_BIN;
+      else process.env.AUDIO_EARSHOT_BIN = bin;
+      try {
+        return await run();
+      } finally {
+        if (saved === undefined) delete process.env.AUDIO_EARSHOT_BIN;
+        else process.env.AUDIO_EARSHOT_BIN = saved;
+      }
+    }
+
+    const ask = (inspector: AudioInspector) =>
+      inspector.inspect({
+        path: join(root, "clean.wav"),
+        loop: true,
+        semantic: "earshot",
+        expectedPrompt: EARSHOT_PROMPT,
+        alternativePrompts: EARSHOT_ALTS,
+      });
+
+    it("maps a strong verdict to consistent through the tool handler", async () => {
+      const bin = await fakeEarshot("match-strong.json");
+      const result = await withBin(bin, async () => {
+        const handler = createAudioInspectHandler(await isolatedInspector());
+        const out = await handler({
+          path: join(root, "clean.wav"),
+          loop: true,
+          semantic: "earshot",
+          expectedPrompt: EARSHOT_PROMPT,
+          alternativePrompts: EARSHOT_ALTS,
+        });
+        return (out as { structuredContent: Record<string, unknown> }).structuredContent;
+      });
+      expect(result.promptFit).toBe("consistent");
+      expect(result.artisticQuality).toBe("unverified");
+    });
+
+    it("maps a weak verdict to possible_mismatch and review", async () => {
+      const bin = await fakeEarshot("match-weak.json");
+      const result = await withBin(bin, async () => ask(await isolatedInspector()));
+      expect(result.promptFit).toBe("possible_mismatch");
+      expect(result.recommendation).toBe("review");
+      expect(result.semantic.calibrationId).toMatch(/^earshot-[0-9a-f]{7}\/match-z$/);
+    });
+
+    it("stays unverified, with the setup instruction, when unset, failing or unreadable", async () => {
+      const cases: (string | undefined)[] = [
+        undefined,
+        await fakeEarshot(undefined, "process.exit(1);"),
+        await fakeEarshot(undefined, 'if (process.argv[2] === "match") process.stdout.write("not json");'),
+      ];
+      for (const bin of cases) {
+        const result = await withBin(bin, async () => ask(await isolatedInspector()));
+        expect(result.promptFit).toBe("unverified");
+        expect(result.recommendation).toBe("review");
+        expect(result.notes.join(" ")).toMatch(/AUDIO_EARSHOT_BIN/);
+      }
+    });
+
+    it("rejects emotion and names semantic: clap", () => {
+      const parsed = AudioInspectInputSchema.safeParse({
+        path: "x.wav",
+        loop: true,
+        semantic: "earshot",
+        emotion: { sourceDescription: "a latch", targetMood: "calm", alternativeMoods: ["tense"] },
+      });
+      expect(parsed.success).toBe(false);
+      expect(parsed.error?.issues.map((issue) => issue.message).join(" ")).toContain('semantic: "clap"');
     });
   });
 

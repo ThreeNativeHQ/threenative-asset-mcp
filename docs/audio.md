@@ -23,7 +23,8 @@ Game audio:
   peak ceiling, DC offset, a five-band spectrum, the loop seam of a **declared**
   loop, and the requested duration, plus a spectrogram PNG. Needs no ElevenLabs
   key and never modifies or repairs the file. Optionally compares prompt and
-  emotional tone when local CLAP is provisioned.
+  emotional tone when local CLAP is provisioned, or prompt fit through the
+  [earshot companion](#earshot-companion).
 - `audio_generate_sound` — **spends ElevenLabs credits.** Generates one sound
   effect or ambience from a prompt using *your own* `ELEVENLABS_API_KEY`, saves
   the original response plus a PCM16 WAV, and runs the same inspection
@@ -95,3 +96,50 @@ so only the mood clause differs, and **this use of CLAP is a proposed heuristic,
 not a demonstrated emotion-recognition capability**: mood status stays
 `unverified` until the held-out emotion calibration qualifies your domain. Check
 the CLAP code and checkpoint licensing separately before redistributing either.
+
+## earshot companion
+
+[earshot](https://github.com/Leonxlnx/earshot) (MIT, CPU) gives agents ears. It is **alpha** (`0.1.0`, created
+2026-10-15, one author) and downloads about 1.4 GB of models on first use. Pin an exact commit.
+Install it in its own venv. Torch comes from the CPU wheel index. The record below was verified with
+`torch 2.14.1+cpu` and `transformers 5.20.1`; upstream leaves both unpinned, so add `==` pins if a new
+release breaks it:
+
+```sh
+python3 -m venv ~/.venvs/earshot
+~/.venvs/earshot/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+~/.venvs/earshot/bin/pip install "transformers==5.20.1" \
+    "git+https://github.com/Leonxlnx/earshot@108763c62648c78dbac14f5bebcd3c61ac7931cd"
+~/.venvs/earshot/bin/earshot doctor --load      # must end with "problems: []"
+export AUDIO_EARSHOT_BIN=~/.venvs/earshot/bin/earshot
+```
+
+Two ways to use it, and neither needs a fork:
+
+1. **Prompt fit backend.** `semantic: "earshot"` with `expectedPrompt` and `alternativePrompts` runs
+   `earshot match`. A `strong` or `plausible` verdict is `consistent`. A `weak` or `no match` verdict is
+   `possible_mismatch` and `recommendation: "review"`. Unset binary, timeout (180 s) or unreadable output is
+   `unverified` with the setup instruction, never a pass. `generation` refuses before spending when the binary
+   does not answer. Each call loads both models (20–40 s). `emotion` is not available: use `semantic: "clap"`.
+   Scores are the z values of `match`; they are evidence, not quality grades.
+2. **Companion MCP server and CLI.** Run `earshot mcp` beside this server (install with the `mcp` extra) for
+   `describe`, `match`, `rank`, `ab` and `find`, and use the CLI for `forge`.
+
+The loop: find or download (`audio_download_asset`, then `unzip` the archive: no tool extracts them) →
+generate or forge → `audio_inspect_asset` for defects → earshot `match` / `rank` / `ab` to listen → change one
+property → repeat.
+
+Custom game recipes (coin, laser, footstep) need no fork. `earshot.forge.forge()` accepts a recipe module with
+the same attributes as the shipped ones (`earshot/forge/recipes/pop.py`):
+
+```python
+import importlib.util, sys
+from earshot.forge import forge
+spec = importlib.util.spec_from_file_location("coin", sys.argv[1])
+recipe = importlib.util.module_from_spec(spec); spec.loader.exec_module(recipe)
+print(forge(recipe, target="a bright coin pickup chime", alts=["a door bell", "a glass clink"]))
+```
+
+Limits. earshot's vocabulary is general-purpose: music genre, mood, instrument and voice verdicts are hints.
+`forge` optimizes earshot's own models, so a forged sound can please the models and still sound wrong. Judge it
+by model-free tone measurements (`earshot measure`) and by listening.
