@@ -38,6 +38,8 @@ export interface PreviewOptions {
   angles?: number;
   width?: number;
   height?: number;
+  /** Camera distance as a multiple of the model's largest dimension. Default: 1.7. */
+  fitMargin?: number;
   timeoutMs?: number;
 }
 
@@ -76,6 +78,7 @@ function pageHtml(options: PreviewOptions): string {
     angles: options.angles ?? 3,
     width: options.width ?? 384,
     height: options.height ?? 384,
+    fitMargin: options.fitMargin ?? 1.7,
   }).replace(/</g, "\\u003c");
   return `<!doctype html><html><body>
 <script type="importmap">{"imports":{"three":"/three.module.js","three/addons/":"/jsm/"}}</script>
@@ -101,6 +104,11 @@ try {
       const box = new THREE.Box3().setFromObject(model);
       const size = box.getSize(new THREE.Vector3()); const center = box.getCenter(new THREE.Vector3());
       const radius = Math.max(size.x,size.y,size.z) || 1;
+      // Scans arrive in millimetres, props in metres. A fixed near/far of 0.01/1000 clipped a chair
+      // whose framed camera distance was ~2100 units, so derive the depth range from the bounds.
+      camera.near = Math.max(radius * 0.001, 1e-6);
+      camera.far = radius * 100;
+      camera.updateProjectionMatrix();
       const mixer = new THREE.AnimationMixer(model);
       const clips = gltf.animations ?? [];
       const clip = options.clipName !== null ? clips.find(c => c.name === options.clipName) : clips[0];
@@ -183,7 +191,7 @@ try {
             camera.position.set(focusCenter.x + Math.sin(azimuth)*focusDistance, focusCenter.y + focusDistance*0.2, focusCenter.z + Math.cos(azimuth)*focusDistance);
             camera.lookAt(focusCenter);
           } else {
-            const distance = radius * 1.7;
+            const distance = radius * options.fitMargin;
             camera.position.set(center.x + Math.sin(azimuth)*distance, center.y + size.y*0.12, center.z + Math.cos(azimuth)*distance);
             camera.lookAt(center);
           }

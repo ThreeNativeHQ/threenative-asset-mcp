@@ -135,6 +135,10 @@ changing its configuration.
 | itch.io bundles | `itch_list_downloads`, `asset_list_bundle_entries`, `asset_download_bundle_animation` |
 | Unreal | `asset_import_unreal` |
 | Unity | `unity_list_packages`, `asset_import_unity` |
+| Mesh optimization | `mesh_optimize` |
+
+`mesh_optimize` shrinks a heavy static GLB behind a rendered before/after gate; it never overwrites its
+input and keeps the original when the gate fails. See [docs/tools.md](docs/tools.md#mesh-optimization).
 
 Recommended flow: `asset_search_sources` → the returned search tool → the returned files tool → the returned
 download tool with `acceptLicense: true`. All discovery tools are read-only. Download tools write only inside

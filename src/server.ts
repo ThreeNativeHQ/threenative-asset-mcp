@@ -209,6 +209,11 @@ import {
   createAssetPreviewAnimationHandler,
   createAssetRetargetAnimationsHandler,
 } from "./tools/rig.js";
+import {
+  createMeshOptimizeHandler,
+  MeshOptimizeInputSchema,
+  MeshOptimizeOutputSchema,
+} from "./tools/mesh-optimize.js";
 
 function packageVersion(): string {
   const manifest = JSON.parse(
@@ -456,6 +461,24 @@ export function createAssetServer(
       },
     },
     createAssetRetargetAnimationsHandler(),
+  );
+
+  server.registerTool(
+    "mesh_optimize",
+    {
+      title: "Shrink a static mesh without a visible change",
+      description:
+        "Simplify a heavy static GLB with meshoptimizer under a rendered before/after gate: each error-ladder candidate must keep its silhouette (IoU >= 0.98) and mean grayscale difference (<= 2%) from six angles, or the original is kept and nothing is written. Resizes textures above maxTextureSize, never compresses the output, never overwrites the input, and refuses skinned or morph-target meshes.",
+      inputSchema: MeshOptimizeInputSchema,
+      outputSchema: MeshOptimizeOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createMeshOptimizeHandler(),
   );
 
   server.registerTool(

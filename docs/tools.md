@@ -197,6 +197,17 @@ or extracts archives. One official Mini Dungeon archive was qualified through
 the packed public MCP on 2026-10-06. Broader catalog coverage and runtime import
 remain unverified; ordinary tests use hand-authored local fixtures.
 
+Mesh optimization:
+
+- `mesh_optimize` — simplifies a heavy static GLB (a scan, an AI-generated prop) with meshoptimizer under a
+  rendered before/after gate. It refuses a GLB with a skin or a morph target with
+  `MESH_OPTIMIZE_UNSUPPORTED` and writes nothing. The ladder tries `error` 0.005, then 0.002, then 0.0005;
+  the first candidate that keeps silhouette IoU >= 0.98 and mean grayscale difference <= 2% in all six views
+  wins. A texture longer than `maxTextureSize` (default 2048) is downscaled in its own format. Output is
+  always uncompressed and never overwrites the input; a passing run also writes `.before.png` and
+  `.after.png`. When no candidate passes, the call succeeds with `kept: "original"`, no output file and the
+  metrics of every attempt. `scripts/probe-mesh-optimize.ts` runs the real-scan path on Smithsonian GLBs.
+
 Recommended agent flow:
 
 1. Call `asset_search_sources` with the requested category/query. Its default
