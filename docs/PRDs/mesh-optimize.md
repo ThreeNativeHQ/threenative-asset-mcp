@@ -68,7 +68,7 @@ Risks:
 ## Acceptance Criteria
 
 - [ ] AC-1 [local]: An MCP call `mesh_optimize` on a dense static fixture (≥200k triangles, mostly flat with one fine detail) writes a GLB with ≥90% fewer triangles and reports a passed gate. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts` — Evidence: pending.
-- [ ] AC-2 [local]: The gate fails a candidate with a visible change (fixture with one detail removed) and passes an identical copy. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t gate` — Evidence: pending.
+- [x] AC-2 [local]: The gate fails a candidate with a visible change (fixture with one detail removed) and passes an identical copy. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t gate` — Evidence: 2026-10-29, 1 test passed; changed fixture scored IoU 0.652 / 29.2% gray difference, identical copy scored 1.0 / 0%.
 - [ ] AC-3 [local]: The input file is unchanged after the call (same SHA-256), and `sizeMeters` reads the output (no Draco or meshopt extensions). — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t output` — Evidence: pending.
 - [ ] AC-4 [local]: A skinned GLB and a GLB with morph targets each return `MESH_OPTIMIZE_UNSUPPORTED`, and no output file is written. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t unsupported` — Evidence: pending.
 - [ ] AC-5 [local]: A 4096 px texture comes out at `maxTextureSize` (2048), and the gate still passes. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t texture` — Evidence: pending.
@@ -83,7 +83,7 @@ Risks:
 ## Execution Phases
 
 #### Phase 1: Core pipeline and visual gate
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-29)
 **Files:**
 - `src/optimize/mesh.ts` (new) — `optimizeMesh(path, options)`: unsupported check, pipeline, error ladder, gate.
 - `package.json` — add `meshoptimizer` 1.1.1 as a direct dependency.
@@ -109,6 +109,24 @@ Risks:
 - `README.md` — `mesh_optimize` section: what it does, the static-only limit, what `kept: "original"` means.
 **Implementation:** Run on 2–3 scans. When the gate passes a visible nerf or rejects a clean result, retune the IoU and grayscale thresholds and record the values under `## Decisions`. When no Smithsonian scan reaches 500k triangles, use the densest one available and record that.
 **Verification:** `npx tsx scripts/probe-mesh-optimize.ts` + visual check of the contact sheet — AC-6.
+
+## Decisions
+
+### Phase 1 — gate mechanics (2026-10-29)
+
+- **Camera framing.** `renderPreview`'s 1.7×max-dimension camera cropped a 2×2×1 static plate at the near edge
+  (the plate touched the frame border in all six angles). Added `fitMargin` to `PreviewOptions` (default 1.7,
+  so rig previews are unchanged); the mesh gate passes **2.2**, which leaves a visible margin on every angle.
+  A 207k-triangle fixture renders six 384² angles in ~2 s under SwiftShader, so the gate is cheap enough to
+  run once per ladder rung.
+- **Silhouette mask.** Scene background is `0x202830`. A pixel belongs to the model when the sum of absolute
+  RGB differences from that background exceeds **24**, which ignores the flat background exactly while keeping
+  antialiased edge pixels.
+- **Grayscale metric.** Rec.709 luma per pixel; score is the mean |Δluma| over the union of both silhouettes
+  divided by 255. 2% therefore means ~5.1 gray levels. The union excludes background, so a large empty frame
+  cannot dilute a real change.
+- **Thresholds unchanged in Phase 1:** IoU ≥ 0.98 and gray ≤ 2% as specified. Phase 3 calibrates them on real
+  scans.
 
 ## Out of scope (next PRDs)
 

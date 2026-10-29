@@ -77,6 +77,7 @@
     "@threenative/playtest": "0.3.2",
     "@zip.js/zip.js": "2.8.34",
     "ag-psd": "31.0.3",
+    "meshoptimizer": "1.1.1",
     "playwright": "1.62.0",
     "sharp": "0.35.4",
     "three": "0.185.1",
