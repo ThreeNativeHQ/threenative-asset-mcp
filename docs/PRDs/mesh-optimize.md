@@ -1,0 +1,117 @@
+# PRD — `mesh_optimize`: shrink heavy static meshes without a visible change
+
+**Status:** NOT STARTED
+**Priority:** P2 — new feature; every AC below is open and nothing else is blocked on it.
+**Complexity:** 3 (LOW) — 1 new module, 4 implementation files; risk override: none.
+**Owner:** João Paulo Furtado
+**Depends on:** None
+
+## Context
+
+Scans and AI-generated meshes arrive with 500k to 1M+ triangles, where a game wants 2k to 150k.
+Smithsonian scans and Sketchfab downloads from this server are often in that range. The server can
+find and download such assets, but it cannot make them engine-sized.
+
+Source idea: Nikhil Shahane, "How to shrink a 3D model from a million triangles to 20,000"
+(x.com/Bingeljell, 2026-10-28). Points that drive this design:
+
+- QEM simplification keeps the big shape but removes fine, shallow detail (eyes, lips) first.
+- A fixed triangle target (AssetFurnace uses 10k/20k/40k) lets that loss happen without a check.
+- Simplified meshes have long thin triangles. That is fine for props, bad for meshes that deform.
+- Baking a normal map gets the lost detail back, but needs a bake step (out of scope for v1).
+
+Inspected:
+
+- `package.json` — `@gltf-transform/{core,extensions,functions}` 4.4.2, `sharp` 0.35.4, `three`,
+  `playwright` are direct dependencies. `meshoptimizer` 1.1.1 is only an indirect one.
+- `node_modules/@gltf-transform/functions/dist/index.d.ts:1303` — `simplify({ simplifier, ratio,
+  error, lockBorder })`. It stops at the target `ratio` or when `error` (fraction of mesh radius) is
+  reached, whichever comes first.
+- `src/rig/preview.ts:168` — `renderPreview(modelBytes, { times, angles, width, height })` renders
+  a GLB in headless Chromium + three.js and returns one PNG per angle.
+- `src/gltf-size.ts` — reads GLBs without Draco or meshopt decoders. Output must stay
+  uncompressed so this server can still measure it.
+- `src/server.ts` — every tool is a `server.registerTool(...)` call with zod input/output schemas
+  and a handler from `src/tools/*`.
+
+## Solution
+
+One new tool, `mesh_optimize`. The caps are on visual change, not on triangle count:
+
+1. **Refuse what v1 cannot keep safe.** A GLB with any skin or morph target returns
+   `MESH_OPTIMIZE_UNSUPPORTED` and writes nothing.
+2. **Pipeline (gltf-transform):** `dedup` → `weld` → `simplify` (meshoptimizer, `ratio: 0`,
+   bounded only by `error`) → `prune` → `textureCompress` to resize textures above
+   `maxTextureSize` (default 2048, same format). No Draco or meshopt compression on output.
+3. **Error ladder:** try `error` = 0.005, then 0.002, then 0.0005. Flat areas collapse almost
+   completely and detailed areas keep their triangles, so each asset finds its own count.
+4. **Visual gate:** render original and candidate from 6 angles with `renderPreview`. A candidate
+   passes when every view has silhouette IoU ≥ 0.98 and mean grayscale difference ≤ 2%.
+   The first passing candidate wins. When no candidate passes, the tool keeps the original,
+   writes nothing and reports `kept: "original"`. Phase 3 calibrates both thresholds on real scans.
+5. **Output:** `<name>.optimized.glb` next to the input, or `outputPath`. Never overwrites the
+   input. The result reports triangles and bytes before/after, every attempt with its error and
+   gate metrics, and the before/after PNG paths.
+
+Consumer flow: MCP client → `mesh_optimize { path, outputPath?, maxTextureSize? }` →
+`src/tools/mesh-optimize.ts` handler → `src/optimize/mesh.ts` (`optimizeMesh`) → GLB on disk
++ structured result.
+
+Risks:
+
+- ⚠️ `renderPreview` was built for rigged models. Unverified: camera framing from bounds, a usable
+  background for a silhouette mask, and render time at 1M triangles. Phase 1 checks all three.
+- ⚠️ Simplification across UV seams can tear textures. `weld` first, then the gate catches tears.
+- ⚠️ Mean grayscale difference is a cheap stand-in for SSIM.
+  `ponytail:` add SSIM only if Phase 3 finds a nerf that passes this gate.
+
+## Acceptance Criteria
+
+- [ ] AC-1 [local]: An MCP call `mesh_optimize` on a dense static fixture (≥200k triangles, mostly flat with one fine detail) writes a GLB with ≥90% fewer triangles and reports a passed gate. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts` — Evidence: pending.
+- [ ] AC-2 [local]: The gate fails a candidate with a visible change (fixture with one detail removed) and passes an identical copy. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t gate` — Evidence: pending.
+- [ ] AC-3 [local]: The input file is unchanged after the call (same SHA-256), and `sizeMeters` reads the output (no Draco or meshopt extensions). — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t output` — Evidence: pending.
+- [ ] AC-4 [local]: A skinned GLB and a GLB with morph targets each return `MESH_OPTIMIZE_UNSUPPORTED`, and no output file is written. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t unsupported` — Evidence: pending.
+- [ ] AC-5 [local]: A 4096 px texture comes out at `maxTextureSize` (2048), and the gate still passes. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t texture` — Evidence: pending.
+- [ ] AC-6 [local]: A real scan of ≥500k triangles (Smithsonian 3D through this server) comes out ≥80% smaller with a passed gate. A before/after contact sheet goes to `~/Downloads/mesh-optimize/`, and the agent views it. — proof: `npx tsx scripts/probe-mesh-optimize.ts` — Evidence: pending.
+
+## Integration Ledger
+
+| Capability | Reachable consumer/trigger | Replaces / disposition | Evidence |
+|---|---|---|---|
+| Visual-safe mesh optimization | MCP `tools/call mesh_optimize` → `src/server.ts` registration (line: fill in Phase 2) → `src/tools/mesh-optimize.ts` → `src/optimize/mesh.ts` | New, nothing replaced | AC-1, AC-6 |
+
+## Execution Phases
+
+#### Phase 1: Core pipeline and visual gate
+**Status:** NOT STARTED
+**Files:**
+- `src/optimize/mesh.ts` (new) — `optimizeMesh(path, options)`: unsupported check, pipeline, error ladder, gate.
+- `package.json` — add `meshoptimizer` 1.1.1 as a direct dependency.
+**Implementation:**
+- `await MeshoptSimplifier.ready` once per process.
+- Gate reuses `renderPreview(bytes, { times: [0], angles: 6 })` from `src/rig/preview.ts`. Build the silhouette mask from the background color, then compute IoU and mean grayscale difference with `sharp` raw pixels.
+- First, render one static GLB and look at the PNGs: confirm framing, background and time at 1M triangles. When `renderPreview` cannot serve a static mesh, add the smallest option it needs. Do not fork it.
+- Errors use the existing error-envelope style of `src/tools/*`.
+**Verification:** `npx vitest run tests/mesh-optimize.integration.test.ts -t gate` — AC-2. The test builds both fixtures in code with gltf-transform (no large binary in Git).
+
+#### Phase 2: MCP tool wiring
+**Status:** NOT STARTED
+**Files:**
+- `src/tools/mesh-optimize.ts` (new) — zod input/output schemas + handler.
+- `src/server.ts` — `registerTool("mesh_optimize", …)` with `readOnlyHint: false`, `destructiveHint: false`, `openWorldHint: false`.
+**Implementation:** The handler resolves paths, calls `optimizeMesh` and maps the result to structured content. Tests call the exported handler factory, as `tests/rig-preview.integration.test.ts` does with `createAssetAutoRigHandler`. Fixtures go in a new `tests/helpers/mesh-fixture.ts`, modeled on `tests/helpers/rig-fixture.ts`. `tests/mcp-smoke.test.ts` covers the `server.ts` registration.
+**Verification:** `npx vitest run tests/mesh-optimize.integration.test.ts` — AC-1, AC-3, AC-4, AC-5. Then `npm run typecheck`.
+
+#### Phase 3: Real-scan proof, calibration, docs
+**Status:** NOT STARTED
+**Files:**
+- `scripts/probe-mesh-optimize.ts` (new) — downloads one dense Smithsonian scan with this server's tools, runs `mesh_optimize`, writes the contact sheet.
+- `README.md` — `mesh_optimize` section: what it does, the static-only limit, what `kept: "original"` means.
+**Implementation:** Run on 2–3 scans. When the gate passes a visible nerf or rejects a clean result, retune the IoU and grayscale thresholds and record the values under `## Decisions`. When no Smithsonian scan reaches 500k triangles, use the densest one available and record that.
+**Verification:** `npx tsx scripts/probe-mesh-optimize.ts` + visual check of the contact sheet — AC-6.
+
+## Out of scope (next PRDs)
+
+- Normal-map baking from the original onto the simplified mesh (needs Blender or a ray-cast baker).
+- Skinned and morph-target meshes (needs weight-aware simplification and a posed gate).
+- LOD chains, KTX2 textures, Draco or meshopt output compression.
