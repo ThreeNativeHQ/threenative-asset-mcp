@@ -459,6 +459,7 @@ describe("built stdio package", () => {
       "asset_auto_rig",
       "asset_preview_animation",
       "asset_retarget_animations",
+      "mesh_optimize",
       "fab_search_assets",
       "fab_get_asset",
       "fab_list_filters",

@@ -28,16 +28,18 @@ function unit(values: [number, number, number]): [number, number, number] {
 }
 
 async function texturePng(size: number): Promise<Buffer> {
-  return sharp({
-    create: {
-      width: size,
-      height: size,
-      channels: 3,
-      background: { r: 212, g: 138, b: 74 },
-    },
-  })
-    .png()
-    .toBuffer();
+  // A gradient, not a solid colour: `prune()` legitimately folds a solid texture into a material
+  // factor, and AC-5 needs a real texture to resize.
+  const pixels = Buffer.alloc(size * size * 3);
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const offset = (y * size + x) * 3;
+      pixels[offset] = 150 + Math.floor((80 * x) / size);
+      pixels[offset + 1] = 100 + Math.floor((90 * y) / size);
+      pixels[offset + 2] = 60 + Math.floor((40 * x) / size);
+    }
+  }
+  return sharp(pixels, { raw: { width: size, height: size, channels: 3 } }).png().toBuffer();
 }
 
 export async function densePlateGlb(options: PlateOptions = {}): Promise<Uint8Array> {

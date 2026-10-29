@@ -67,18 +67,18 @@ Risks:
 
 ## Acceptance Criteria
 
-- [ ] AC-1 [local]: An MCP call `mesh_optimize` on a dense static fixture (≥200k triangles, mostly flat with one fine detail) writes a GLB with ≥90% fewer triangles and reports a passed gate. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts` — Evidence: pending.
+- [x] AC-1 [local]: An MCP call `mesh_optimize` on a dense static fixture (≥200k triangles, mostly flat with one fine detail) writes a GLB with ≥90% fewer triangles and reports a passed gate. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts` — Evidence: 2026-10-29, 5 tests passed; 207,362-triangle fixture → 1,298 triangles (99.4% fewer), 5,950,740 → 40,080 bytes, gate passed at error 0.005 (worst IoU 0.9985, worst gray difference 0.10%).
 - [x] AC-2 [local]: The gate fails a candidate with a visible change (fixture with one detail removed) and passes an identical copy. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t gate` — Evidence: 2026-10-29, 1 test passed; changed fixture scored IoU 0.652 / 29.2% gray difference, identical copy scored 1.0 / 0%.
-- [ ] AC-3 [local]: The input file is unchanged after the call (same SHA-256), and `sizeMeters` reads the output (no Draco or meshopt extensions). — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t output` — Evidence: pending.
-- [ ] AC-4 [local]: A skinned GLB and a GLB with morph targets each return `MESH_OPTIMIZE_UNSUPPORTED`, and no output file is written. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t unsupported` — Evidence: pending.
-- [ ] AC-5 [local]: A 4096 px texture comes out at `maxTextureSize` (2048), and the gate still passes. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t texture` — Evidence: pending.
+- [x] AC-3 [local]: The input file is unchanged after the call (same SHA-256), and `sizeMeters` reads the output (no Draco or meshopt extensions). — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t output` — Evidence: 2026-10-29, test passes; input SHA-256 identical before/after, output readable by `sizeMeters`, and neither `KHR_draco_mesh_compression` nor `EXT_meshopt_compression` appears in `extensionsUsed`/`extensionsRequired`.
+- [x] AC-4 [local]: A skinned GLB and a GLB with morph targets each return `MESH_OPTIMIZE_UNSUPPORTED`, and no output file is written. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t unsupported` — Evidence: 2026-10-29, test passes; both fixtures return `MESH_OPTIMIZE_UNSUPPORTED` and no `.glb`/`.before.png`/`.after.png` output exists.
+- [x] AC-5 [local]: A 4096 px texture comes out at `maxTextureSize` (2048), and the gate still passes. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t texture` — Evidence: 2026-10-29, test passes; 4096×4096 PNG → 2048×2048 PNG (MIME preserved), gate passed.
 - [ ] AC-6 [local]: A real scan of ≥500k triangles (Smithsonian 3D through this server) comes out ≥80% smaller with a passed gate. A before/after contact sheet goes to `~/Downloads/mesh-optimize/`, and the agent views it. — proof: `npx tsx scripts/probe-mesh-optimize.ts` — Evidence: pending.
 
 ## Integration Ledger
 
 | Capability | Reachable consumer/trigger | Replaces / disposition | Evidence |
 |---|---|---|---|
-| Visual-safe mesh optimization | MCP `tools/call mesh_optimize` → `src/server.ts` registration (line: fill in Phase 2) → `src/tools/mesh-optimize.ts` → `src/optimize/mesh.ts` | New, nothing replaced | AC-1, AC-6 |
+| Visual-safe mesh optimization | MCP `tools/call mesh_optimize` → `src/server.ts:350` registration → `src/tools/mesh-optimize.ts` → `src/optimize/mesh.ts` | New, nothing replaced | AC-1, AC-3, AC-4, AC-5; AC-6 pending |
 
 ## Execution Phases
 
@@ -95,7 +95,7 @@ Risks:
 **Verification:** `npx vitest run tests/mesh-optimize.integration.test.ts -t gate` — AC-2. The test builds both fixtures in code with gltf-transform (no large binary in Git).
 
 #### Phase 2: MCP tool wiring
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-29)
 **Files:**
 - `src/tools/mesh-optimize.ts` (new) — zod input/output schemas + handler.
 - `src/server.ts` — `registerTool("mesh_optimize", …)` with `readOnlyHint: false`, `destructiveHint: false`, `openWorldHint: false`.
