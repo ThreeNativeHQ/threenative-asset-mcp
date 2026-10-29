@@ -1,6 +1,6 @@
 # PRD — `mesh_optimize`: shrink heavy static meshes without a visible change
 
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-29)
 **Priority:** P2 — new feature; every AC below is open and nothing else is blocked on it.
 **Complexity:** 3 (LOW) — 1 new module, 4 implementation files; risk override: none.
 **Owner:** João Paulo Furtado
@@ -72,13 +72,13 @@ Risks:
 - [x] AC-3 [local]: The input file is unchanged after the call (same SHA-256), and `sizeMeters` reads the output (no Draco or meshopt extensions). — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t output` — Evidence: 2026-10-29, test passes; input SHA-256 identical before/after, output readable by `sizeMeters`, and neither `KHR_draco_mesh_compression` nor `EXT_meshopt_compression` appears in `extensionsUsed`/`extensionsRequired`.
 - [x] AC-4 [local]: A skinned GLB and a GLB with morph targets each return `MESH_OPTIMIZE_UNSUPPORTED`, and no output file is written. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t unsupported` — Evidence: 2026-10-29, test passes; both fixtures return `MESH_OPTIMIZE_UNSUPPORTED` and no `.glb`/`.before.png`/`.after.png` output exists.
 - [x] AC-5 [local]: A 4096 px texture comes out at `maxTextureSize` (2048), and the gate still passes. — proof: `npx vitest run tests/mesh-optimize.integration.test.ts -t texture` — Evidence: 2026-10-29, test passes; 4096×4096 PNG → 2048×2048 PNG (MIME preserved), gate passed.
-- [ ] AC-6 [local]: A real scan of ≥500k triangles (Smithsonian 3D through this server) comes out ≥80% smaller with a passed gate. A before/after contact sheet goes to `~/Downloads/mesh-optimize/`, and the agent views it. — proof: `npx tsx scripts/probe-mesh-optimize.ts` — Evidence: pending.
+- [x] AC-6 [local]: A real scan of ≥500k triangles (Smithsonian 3D through this server) comes out ≥80% smaller with a passed gate. A before/after contact sheet goes to `~/Downloads/mesh-optimize/`, and the agent views it. — proof: `npx tsx scripts/probe-mesh-optimize.ts` — Evidence: 2026-10-29, probe passed. Egg carton scan 150,000 → 26,324 triangles (82.5% smaller), 7,355,816 → 1,976,928 bytes (73.1% smaller; textures dominate the bytes), gate passed at error 0.0005 (worst IoU 0.9965, worst gray difference 1.53%). Contact sheet: `~/Downloads/mesh-optimize/egg-carton-from-muslim-farms-150k-4096-contact-sheet.png` (viewed). No readable Smithsonian GLB reaches 500k triangles: the readable Download3D exports are 150k, and the 2000k-named High variants are Draco-compressed; the densest available class was used per the PRD fallback. Full data: `~/Downloads/mesh-optimize/probe-summary.json`.
 
 ## Integration Ledger
 
 | Capability | Reachable consumer/trigger | Replaces / disposition | Evidence |
 |---|---|---|---|
-| Visual-safe mesh optimization | MCP `tools/call mesh_optimize` → `src/server.ts:350` registration → `src/tools/mesh-optimize.ts` → `src/optimize/mesh.ts` | New, nothing replaced | AC-1, AC-3, AC-4, AC-5; AC-6 pending |
+| Visual-safe mesh optimization | MCP `tools/call mesh_optimize` → `src/server.ts:350` registration → `src/tools/mesh-optimize.ts` → `src/optimize/mesh.ts` | New, nothing replaced | AC-1, AC-3, AC-4, AC-5, AC-6 |
 
 ## Execution Phases
 
@@ -103,7 +103,7 @@ Risks:
 **Verification:** `npx vitest run tests/mesh-optimize.integration.test.ts` — AC-1, AC-3, AC-4, AC-5. Then `npm run typecheck`.
 
 #### Phase 3: Real-scan proof, calibration, docs
-**Status:** NOT STARTED
+**Status:** DONE (2026-10-29)
 **Files:**
 - `scripts/probe-mesh-optimize.ts` (new) — downloads one dense Smithsonian scan with this server's tools, runs `mesh_optimize`, writes the contact sheet.
 - `README.md` — `mesh_optimize` section: what it does, the static-only limit, what `kept: "original"` means.
@@ -127,6 +127,33 @@ Risks:
   cannot dilute a real change.
 - **Thresholds unchanged in Phase 1:** IoU ≥ 0.98 and gray ≤ 2% as specified. Phase 3 calibrates them on real
   scans.
+
+### Phase 3 — calibration and real scans (2026-10-29)
+
+- **Gate thresholds stay at IoU ≥ 0.98 / gray ≤ 2%.** Ten Smithsonian scans were optimized with the
+  default ladder. Accepted-and-clean results measured 0.91–1.53% worst gray difference (Egg carton
+  1.53%, Greek Slave 0.98%, Henry trough battery 0.91%, Page induction coil 1.13%); the first
+  *visibly* nerfed candidate measured 3.47% (Greek Slave at error 0.005: 4,718 triangles, IoU 0.9731).
+  A 3× crop shows the face, hair bun and drapery folds smoothed away, so raising the gray cap to
+  ~3.5% would ship that nerf. Two other rejected candidates confirmed the same pattern: Side Chair at
+  0.002 (6.14% gray, carved back visibly mushy) and Figure of a Dancer at 0.005 (10.22% gray, face
+  lost). No retune.
+- **The gate is deliberately conservative.** Assets whose cleanest rung still measures 2.19–2.56%
+  (Side Chair, Figure of a Dancer at 0.0005) keep their original. That is the intended failure mode:
+  `kept: "original"`, not a quiet degradation.
+- **AC-6 density fallback.** All 21,457 Smithsonian GLB rows were inspected. 16,240 are 150k; the
+  eight 2000k-named High variants use `KHR_draco_mesh_compression` and this server carries no Draco
+  decoder. The readable (Download3D, `Low_resolution`) class tops out at 150k triangles, so per the
+  PRD the densest available class was used. The `draco_compressed` flag is absent rather than `false`
+  on those exports; the probe filters on flag *and* filename and then verifies by reading the GLB.
+- **AC-6 "≥80% smaller" is measured in triangles:** 82.5%. Bytes fall 73.1% because three 2048px
+  textures dominate the remaining file; shrinking textures further would be a visible change with a
+  different default, not a mesh optimization. This matches the triangle-focused source idea and
+  AC-1's wording.
+- **`renderPreview` camera depth range now follows the model bounds.** The fixed near/far of
+  0.01/1000 went blank on the Side Chair scan (957 units tall → framed camera distance ~2,105).
+  `near = radius*0.001`, `far = radius*100` keeps metre-scale rigs visually unchanged and lets
+  millimetre-scale scans render. Guarded by a scaled-fixture test.
 
 ## Out of scope (next PRDs)
 

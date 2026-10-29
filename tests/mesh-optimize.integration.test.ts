@@ -81,6 +81,28 @@ describe("mesh_optimize", () => {
   );
 
   it(
+    "renders a mesh scaled in the hundreds instead of clipping it",
+    async () => {
+      const io = new NodeIO();
+      const document = await io.readBinary(await densePlateGlb({ grid: 8 }));
+      document.getRoot().listNodes()[0]!.setScale([500, 500, 500]);
+      const scaled = await io.writeBinary(document);
+      const preview = await renderPreview(scaled, {
+        times: [0],
+        angles: 2,
+        width: 128,
+        height: 128,
+        fitMargin: 2.2,
+        timeoutMs: 120_000,
+      });
+      expect(preview.bounds?.max[0]).toBeCloseTo(500, 3);
+      expect(preview.images).toHaveLength(2);
+      expect(preview.images.every((image) => image.nonBlank)).toBe(true);
+    },
+    120_000,
+  );
+
+  it(
     "optimizes a dense static fixture to under 10% of its triangles",
     async () => {
       const directory = await temporaryDirectory();
