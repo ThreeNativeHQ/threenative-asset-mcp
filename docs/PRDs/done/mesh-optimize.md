@@ -1,7 +1,7 @@
 # PRD — `mesh_optimize`: shrink heavy static meshes without a visible change
 
 **Status:** DONE (2026-10-29)
-**Priority:** P2 — new feature; every AC below is open and nothing else is blocked on it.
+**Priority:** P2 — new feature; every AC below is met and nothing else was blocked on it.
 **Complexity:** 3 (LOW) — 1 new module, 4 implementation files; risk override: none.
 **Owner:** João Paulo Furtado
 **Depends on:** None
