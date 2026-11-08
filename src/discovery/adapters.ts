@@ -681,7 +681,7 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
             ? {
                 continuation: {
                   tool: "polyfork_search_models",
-                  arguments: { query, limit: perPage, cursor: String(result.page + 1) },
+                  arguments: { query, free: true, limit: perPage, cursor: String(result.page + 1) },
                 },
               }
             : {}),

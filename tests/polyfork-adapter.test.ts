@@ -75,6 +75,8 @@ describe("Polyfork federated adapter", () => {
     const next = PolyforkSearchInputSchema.safeParse(result.continuation?.arguments);
     expect(next.success).toBe(true);
     expect(Number(url.searchParams.get("per_page"))).toBe(next.data?.limit);
+    expect(next.data?.free).toBe(true);
+    expect(next.data?.sort).toBe("relevance");
   });
 
   it("does not search a catalogue for non-model asset types", async () => {
