@@ -56,6 +56,35 @@ can preserve that distinction. See the
 [official API page](https://polyhaven.com/our-api) and
 [API documentation](https://api.polyhaven.com/).
 
+## Polyfork API behavior
+
+Polyfork requests go only to `https://polyfork.dev/api/assets` and
+`https://polyfork.dev/api/assets/{id}` (the singular `/api/asset/{id}` is 404),
+with a User-Agent that names this MCP (`threenative-asset-mcp/0.15.0`). The
+catalogue answers 403 to clients that send none. Responses are read with a 20 s
+timeout, no redirects and a 2 MB metadata cap. Search is one bounded catalogue
+page (at most 100 rows) with word-matched `q`; there is no global cursor and no
+catalogue census.
+
+Every free low-poly model's full GLB is anonymous at
+`https://polyfork.dev/cdn/<id>.glb`. Previews (`-preview.glb`) are never planned
+and the `.mjs` source modules are never fetched or executed. HD editions and
+packaged exports are Pro or account routes, so the tools report that
+requirement instead of planning them. The generic downloader accepts exactly
+`https://polyfork.dev/cdn/<id>.glb`, rejects every other path and host, and
+revalidates redirects against the same contract.
+
+Free low-poly mesh files come under CC BY 4.0 or the Polyfork licence, the
+user's choice. CC BY allows redistribution and resale with the asset's `credit`
+line, a model-page link and a change notice; the Polyfork licence needs no
+attribution but forbids standalone redistribution of the files. The `.mjs`
+source, HD editions, renders and thumbnails are Polyfork-licence only, and
+neither they nor mesh files taken under the Polyfork licence may be used to
+build or train a commercial 3D asset generator; CC BY 4.0 sets no such limit on
+the free mesh files. HD editions need Pro. When a product lets its users pick
+these models, credit Polyfork as their source there and fetch each model on use
+rather than the catalogue in bulk. See <https://polyfork.dev/licensing>.
+
 ## Other provider behavior
 
 ambientCG uses its anonymous, read-only v3 API. Its files are CC0 and its API
@@ -80,9 +109,10 @@ without a stable, verified direct contract remain discoverable as
 
 The generic direct downloader is intentionally narrower than an arbitrary URL
 fetcher. It accepts only official Poly Haven, ambientCG, Smithsonian,
-Game-icons.net, and curated Kenney URL contracts. The itch.io downloader uses
-fresh signed mirror URLs internally but never exposes them. Sketchfab signed
-downloads are exposed through `sketchfab_get_downloads` but are not persisted
-by the generic downloader because their temporary CDN hosts vary and require
-the user's token-backed session. Provider-page-only sources stay provider-page-only until a stable,
-license-safe download contract is verified.
+Game-icons.net, Polyfork and curated Kenney URL contracts. The itch.io
+downloader uses fresh signed mirror URLs internally but never exposes them.
+Sketchfab signed downloads are exposed through `sketchfab_get_downloads` but
+are not persisted by the generic downloader because their temporary CDN hosts
+vary and require the user's token-backed session. Provider-page-only sources
+stay provider-page-only until a stable, license-safe download contract is
+verified.

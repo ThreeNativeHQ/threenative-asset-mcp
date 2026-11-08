@@ -42,6 +42,7 @@ search, metadata and guarded downloads, and it converts owned Unreal/Fab packs a
 | [Poly Haven](https://polyhaven.com/) | HDRIs, textures, models | CC0 (API use needs a visible credit) | Nothing |
 | [ambientCG](https://ambientcg.com/) | Materials, HDRIs, decals, models | CC0 | Nothing |
 | [Smithsonian 3D](https://3d.si.edu/) | Open Access scanned models | Open Access | Nothing |
+| [Polyfork](https://polyfork.dev/characters) | Free low-poly characters, props, animals, vehicles, kits | Mesh files CC BY 4.0 or the Polyfork licence (your choice); HD is Pro | Nothing |
 | [Sketchfab](https://sketchfab.com/) | Public models | Varies per model | `SKETCHFAB_API_TOKEN` for downloads only |
 | [Kenney](https://kenney.nl/) | 3D packs, audio | CC0 | Nothing |
 | [itch.io](https://itch.io/) (curated) | Quaternius animations, KayKit, Brackeys VFX, Tallbeard music | CC0 | Nothing |
@@ -129,6 +130,7 @@ changing its configuration.
 | Poly Haven | `polyhaven_search_assets`, `polyhaven_get_asset`, `polyhaven_list_files` |
 | ambientCG | `ambientcg_search_assets`, `ambientcg_get_asset`, `ambientcg_list_files` |
 | Smithsonian 3D | `smithsonian_search_assets`, `smithsonian_get_asset`, `smithsonian_list_files` |
+| Polyfork | `polyfork_search_models`, `polyfork_get_model`, `polyfork_list_files` |
 | Sketchfab | `sketchfab_search_models`, `sketchfab_get_model`, `sketchfab_get_downloads` |
 | Blendkit | `blendkit_status`, `blendkit_import_asset` |
 | Audio | `audio_search_assets`, `audio_download_asset`, `audio_inspect_asset`, `audio_generate_sound` |

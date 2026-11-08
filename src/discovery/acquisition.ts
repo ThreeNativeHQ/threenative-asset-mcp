@@ -71,6 +71,7 @@ export function validateFiles(detail: AssetDetail): void {
     const hosts: Record<string, string[]> = {
       polyhaven: ["dl.polyhaven.org"],
       ambientcg: ["ambientcg.com"],
+      polyfork: ["polyfork.dev"],
       kenney: ["kenney.nl"],
     };
     if (!hosts[detail.asset.provider]?.includes(url.hostname))

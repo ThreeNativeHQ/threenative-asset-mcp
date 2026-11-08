@@ -79,6 +79,26 @@ describe("unified asset source directory", () => {
     });
   });
 
+  it("lists Polyfork as an agent-ready low-poly model source with its licence choice", async () => {
+    const result = await createAssetListSourcesHandler()({});
+    if ("isError" in result) throw new Error("unexpected error");
+    const polyfork = result.structuredContent.sources.find((source) => source.id === "polyfork");
+    expect(polyfork).toMatchObject({
+      access: "mcp-api",
+      downloadSupport: "mcp-managed",
+      searchTool: "polyfork_search_models",
+      detailTool: "polyfork_get_model",
+      filesTool: "polyfork_list_files",
+      downloadTool: "asset_download",
+      agentReady: true,
+      licenseTags: expect.arrayContaining(["cc-by", "per-asset"]),
+    });
+    expect(polyfork?.categories).toEqual(expect.arrayContaining(["3d-model", "animation"]));
+    expect(polyfork?.browseUrls).toContain("https://polyfork.dev/characters");
+    expect(polyfork?.licenseSummary).toContain("CC BY 4.0");
+    expect(polyfork?.caution).toContain("Pro");
+  });
+
   it("searches sources by category, query, license simplicity, and access mode", async () => {
     const handler = createAssetSearchSourcesHandler();
     const shaders = await handler({
