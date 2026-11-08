@@ -190,7 +190,11 @@ export interface GraphBakerOptions {
   readonly dumpGraphs?: typeof dumpMaterialGraphs;
 }
 
-const MAX_BAKE_SIZE = 1024;
+// The default bake edge: bake time grows with its square, so an unasked import stays at 1024. An explicit
+// `maxTextureSize` is the caller's own ceiling and is honoured up to the importer's 8192 schema limit, so a 4096
+// source atlas baked through a graph can keep its resolution.
+const DEFAULT_BAKE_SIZE = 1024;
+const MAX_REQUESTED_BAKE_SIZE = 8192;
 const MAX_PARENT_DEPTH = 8;
 const RASTER_CACHE_BYTES = 256 * 1024 * 1024;
 const BAKE_CACHE_BYTES = 256 * 1024 * 1024;
@@ -528,7 +532,7 @@ function recoverUnresolvedTextures(
 export function createGraphBaker(options: GraphBakerOptions): GraphBaker | undefined {
   const dump = options.dumpGraphs ?? dumpMaterialGraphs;
   const environment = options.environment ?? process.env;
-  const size = Math.max(1, Math.min(options.maxTextureSize ?? MAX_BAKE_SIZE, MAX_BAKE_SIZE));
+  const size = Math.max(1, Math.min(options.maxTextureSize ?? DEFAULT_BAKE_SIZE, MAX_REQUESTED_BAKE_SIZE));
 
   let packages: Promise<Set<string>> | undefined;
   let graphs: Promise<DumpedGraphs | { readonly error: string }> | undefined;
