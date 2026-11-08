@@ -978,7 +978,12 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   // base colour's RGB and takes the map's red channel as alpha. Without it the card is a solid rectangle, and an
   // instance colour with a zero alpha would clip all of it.
   const colourForAlpha = bindings.get("baseColor");
-  const opacityMap = opacityTextures.find((texture) => request.availableTextures.has(texture) && texture !== colourForAlpha?.texture);
+  // A colour map is never a red-channel cut-out: UE Viewer can name a moss or bark albedo in a masked master's
+  // Opacity slot (Project Nature's spruce trunk), and its red channel as alpha punches holes through an opaque surface.
+  const colourMapName = /(?:^|_)(?:a|d|albedo|basecolou?r|diffuse|colou?r)_?$/i;
+  const opacityMap = opacityTextures.find(
+    (texture) => request.availableTextures.has(texture) && texture !== colourForAlpha?.texture && !colourMapName.test(texture),
+  );
   if (
     opacityMap && colourForAlpha && alphaMode !== "OPAQUE" && colourForAlpha.secondaryTexture === undefined &&
     colourForAlpha.transform === "none" && request.availableTextures.has(colourForAlpha.texture)
