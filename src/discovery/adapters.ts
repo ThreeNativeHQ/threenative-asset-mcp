@@ -656,12 +656,15 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
       id: "polyfork",
       async search(query, types, limit, signal) {
         if (!types.includes("3d-model")) return { items: [], truncated: false };
+        // Same filter and page size as polyfork_search_models (max 48), so the continuation pages on.
+        const perPage = Math.min(48, Math.max(1, limit));
         const result = await polyfork.search(
           {
             ...(query ? { query } : {}),
+            free: true,
             sort: "relevance",
             page: 1,
-            perPage: Math.min(50, Math.max(1, limit)),
+            perPage,
           },
           { signal },
         );
@@ -678,7 +681,7 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
             ? {
                 continuation: {
                   tool: "polyfork_search_models",
-                  arguments: { query, limit, cursor: String(result.page + 1) },
+                  arguments: { query, limit: perPage, cursor: String(result.page + 1) },
                 },
               }
             : {}),

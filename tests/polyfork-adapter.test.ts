@@ -9,6 +9,7 @@ import { createAssetAdapters } from "../src/discovery/adapters.js";
 import { AssetFederation } from "../src/discovery/federation.js";
 import { DirectAssetDownloader } from "../src/download/direct-asset-downloader.js";
 import { PolyforkClient } from "../src/polyfork/client.js";
+import { PolyforkSearchInputSchema } from "../src/tools/polyfork.js";
 import {
   POLYFORK_FIXTURE_ID,
   polyforkDetailPayload,
@@ -59,6 +60,21 @@ describe("Polyfork federated adapter", () => {
       tool: "polyfork_search_models",
       arguments: { query: "musician", cursor: "2" },
     });
+  });
+
+  it("hands back a continuation that polyfork_search_models accepts at the federation's top limit", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const perPage = Number(new URL(String(input)).searchParams.get("per_page"));
+      return Response.json(polyforkSearchPage([polyforkRow()], { total: 3086, per_page: perPage }));
+    });
+    // The federation asks each adapter for min(50, limit * 2) items.
+    const result = await adapter(fetchMock).search("musician", ["3d-model"], 50, signal());
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.searchParams.get("free")).toBe("1");
+    expect(result.continuation?.tool).toBe("polyfork_search_models");
+    const next = PolyforkSearchInputSchema.safeParse(result.continuation?.arguments);
+    expect(next.success).toBe(true);
+    expect(Number(url.searchParams.get("per_page"))).toBe(next.data?.limit);
   });
 
   it("does not search a catalogue for non-model asset types", async () => {
