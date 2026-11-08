@@ -86,6 +86,18 @@ describe("a separate opacity map becomes the base colour's alpha", () => {
     expect(resolved.bindings.find((b) => b.slot === "baseColor")).toMatchObject({ secondaryTexture: "Grass_Opacity_8k", transform: "redToBaseColorAlpha" });
   });
 
+  it("never takes a colour map's red channel as a cut-out", () => {
+    // Shaped like Project Nature's spruce trunk: a masked master shared with the needles, and UE Viewer
+    // names the moss albedo in the trunk's Opacity slot. Its red channel is moss colour, not coverage:
+    // as alpha it punched holes through an opaque trunk.
+    for (const colour of ["Moss_A", "Moss_D", "Moss_Albedo", "T_Moss_BaseColor", "Moss_Diffuse", "Moss_Color"]) {
+      const trunk = resolve(grass("Diffuse=Bark_A_\n", `Diffuse=Bark_A_\nOpacity=${colour}\n`), ["Bark_A_", colour]);
+      const base = trunk.bindings.find((b) => b.slot === "baseColor");
+      expect(base, colour).toMatchObject({ texture: "Bark_A_" });
+      expect(base?.transform, colour).not.toBe("redToBaseColorAlpha");
+    }
+  });
+
   it("leaves an opaque material and an opacity that is the colour texture itself alone", () => {
     const opaque = resolve(
       { Grass_Mat: { mat: "Diffuse=Grass_Albedo\nOther[0]=Grass_Opacity_8k\n", props: "Parent = Material3'Content/Pack/Materials/MA_Plain.MA_Plain'\n" }, MA_Plain: { props: "BlendMode = BLEND_Opaque (0)\n" } },
