@@ -10,6 +10,7 @@ const ProviderSchema = z.enum([
   "ambientcg",
   "smithsonian",
   "game-icons",
+  "polyfork",
   "kenney",
 ]);
 

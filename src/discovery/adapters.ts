@@ -2,6 +2,13 @@ import { AmbientCgClient, type AmbientCgAsset } from "../ambientcg/client.js";
 import { ITCH_PACKS } from "../itch/catalog.js";
 import { KenneyClient, type KenneyDetail, type KenneyEntry } from "../kenney/client.js";
 import { PolyHavenClient, type PolyHavenAsset, type PolyHavenFile } from "../polyhaven/client.js";
+import {
+  PolyforkClient,
+  parsePolyforkIdOrUrl,
+  type PolyforkAsset,
+  type PolyforkDetail,
+} from "../polyfork/client.js";
+import { POLYFORK_TERMS, polyforkLicense } from "../polyfork/license.js";
 import { SketchfabClient, type SketchfabModel } from "../sketchfab/client.js";
 import { SmithsonianClient, type SmithsonianFile } from "../smithsonian/client.js";
 import { safeRelativePath } from "./acquisition.js";
@@ -379,11 +386,34 @@ function kenneyAsset(item: KenneyEntry | KenneyDetail): Asset {
   });
 }
 
+function polyforkAsset(item: PolyforkAsset, extra: Partial<Asset> = {}): Asset {
+  return base("polyfork", item.id, item.pageUrl, item.title, "3d-model", {
+    free: item.free ? "yes" : "no",
+    license: polyforkLicense(),
+    author: "Polyfork",
+    ...(item.thumbnailUrl ? { thumbnailUrl: item.thumbnailUrl } : {}),
+    downloadStatus: "unknown",
+    canDownloadNow: false,
+    downloadReason:
+      "Free low-poly terms are catalogue-wide; call asset_get (or polyfork_get_model) for this item's exact licence credit and the verified full GLB.",
+    rankingFactors: [
+      "official free low-poly catalogue",
+      ...(item.hd ? ["HD edition needs Polyfork Pro"] : []),
+    ],
+    ...extra,
+  });
+}
+
+function polyforkDetailAsset(item: PolyforkDetail): Asset {
+  return polyforkAsset(item, { license: polyforkLicense(item.credit, item.licenseText) });
+}
+
 export interface AssetAdapterClients {
   polyhaven?: PolyHavenClient;
   ambientcg?: AmbientCgClient;
   smithsonian?: SmithsonianClient;
   sketchfab?: SketchfabClient;
+  polyfork?: PolyforkClient;
   /** Optional injection; the server includes the qualified adapter unless explicitly disabled. */
   kenney?: KenneyClient;
 }
@@ -393,6 +423,7 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
   const ambientcg = clients.ambientcg ?? new AmbientCgClient();
   const smithsonian = clients.smithsonian ?? new SmithsonianClient();
   const sketchfab = clients.sketchfab ?? new SketchfabClient(fetch, { token: null });
+  const polyfork = clients.polyfork ?? new PolyforkClient();
   const adapters: AssetAdapter[] = [
     {
       id: "polyhaven",
@@ -619,6 +650,109 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
           item.archives.map((archive) => archive.format),
           "Use sketchfab_get_downloads for explicitly authorized URL resolution; generic disk acquisition is unavailable.",
         );
+      },
+    },
+    {
+      id: "polyfork",
+      async search(query, types, limit, signal) {
+        if (!types.includes("3d-model")) return { items: [], truncated: false };
+        // Same filter and page size as polyfork_search_models (max 48), so the continuation pages on.
+        const perPage = Math.min(48, Math.max(1, limit));
+        const result = await polyfork.search(
+          {
+            ...(query ? { query } : {}),
+            free: true,
+            sort: "relevance",
+            page: 1,
+            perPage,
+          },
+          { signal },
+        );
+        const truncated = result.total > result.page * result.perPage;
+        return {
+          items: ranked(
+            result.items
+              .filter((item) => item.free)
+              .slice(0, limit)
+              .map((item) => polyforkAsset(item)),
+          ),
+          truncated,
+          ...(truncated
+            ? {
+                continuation: {
+                  tool: "polyfork_search_models",
+                  arguments: { query, free: true, limit: perPage, cursor: String(result.page + 1) },
+                },
+              }
+            : {}),
+        };
+      },
+      async get(id, selection, signal) {
+        const item = await polyfork.getAsset(parsePolyforkIdOrUrl(id), { signal, fresh: true });
+        const asset = polyforkDetailAsset(item);
+        const alternatives = [
+          "glb/low-poly/full",
+          ...(item.previewGlbUrl ? ["glb/low-poly/preview"] : []),
+          ...(item.hd ? ["hd/full (Polyfork Pro)"] : []),
+        ];
+        const requested = selection.format?.toLowerCase().replace(/^\./, "");
+        if ((requested && requested !== "glb") || selection.resolution || selection.mapRoles?.length)
+          return unavailable(
+            asset,
+            alternatives,
+            "Only the free full low-poly GLB can be planned; Polyfork's other formats and HD editions go through account or Pro routes this MCP does not automate.",
+          );
+        if (!item.free || item.download.auth !== "none")
+          return unavailable(
+            { ...asset, downloadStatus: "auth-required" },
+            alternatives,
+            "Polyfork gates this model's full GLB behind an account or Pro plan; this MCP does not sign in, hold keys or bypass that gate.",
+          );
+        if (!item.download.glb)
+          return unavailable(
+            { ...asset, downloadStatus: "unsupported" },
+            alternatives,
+            "Polyfork's full-GLB URL did not match its verified /cdn contract; no download is planned.",
+          );
+        return {
+          asset: {
+            ...asset,
+            downloadStatus: "direct",
+            canDownloadNow: true,
+            downloadReason:
+              "The anonymous full low-poly GLB and the per-item licence credit were verified; acquisition re-validates the payload before publication.",
+          },
+          files: [
+            {
+              id: "low-poly-glb",
+              path: item.id + ".glb",
+              url: item.download.glb,
+              role: "main-model",
+            },
+          ],
+          selectedVariant: "glb/low-poly/full",
+          selectionExplanation:
+            "Selected the free full low-poly GLB from Polyfork's anonymous /cdn contract; the preview GLB and HD editions are not planned.",
+          alternatives,
+          termsText: POLYFORK_TERMS,
+          providerDetails: {
+            class: item.assetClass,
+            kit: item.kit ?? null,
+            triangles: item.triangles ?? null,
+            previewTriangles: item.previewTriangles ?? null,
+            size: item.size ?? null,
+            originY: item.originY ?? null,
+            massKg: item.massKg ?? null,
+            hasRig: item.hasRig,
+            hasSkeleton: item.hasSkeleton,
+            clips: item.clips,
+            skeleton: item.skeleton ?? null,
+            hd: item.hd,
+            credit: item.credit ?? null,
+            licenseText: item.licenseText ?? null,
+            pageUrl: item.pageUrl,
+          },
+        };
       },
     },
   ];

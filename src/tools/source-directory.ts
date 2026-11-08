@@ -145,6 +145,27 @@ export const ASSET_SOURCES: readonly AssetSource[] = [
     downloadTool: "asset_download_file",
   }),
   source({
+    id: "polyfork",
+    name: "Polyfork",
+    categories: ["3d-model", "animation"],
+    bestFor:
+      "Free low-poly, flat-shaded characters, props, animals, vehicles and kits with anonymous GLB downloads and rig/clip metadata",
+    browseUrls: ["https://polyfork.dev/characters", "https://polyfork.dev/"],
+    licenseSummary:
+      "Free low-poly mesh files: CC BY 4.0 or the Polyfork licence, your choice. The .mjs source, HD editions and renders/thumbnails are Polyfork-licence only",
+    licenseTags: ["cc-by", "per-asset"],
+    attribution:
+      "CC BY route: the asset's credit line and model-page link; Polyfork licence route: none, but no standalone file redistribution",
+    access: "mcp-api",
+    downloadSupport: "mcp-managed",
+    searchTool: "polyfork_search_models",
+    detailTool: "polyfork_get_model",
+    filesTool: "polyfork_list_files",
+    downloadTool: "asset_download",
+    caution:
+      "HD editions are Polyfork Pro; the .mjs source is never fetched or executed. Thumbnails and renders are not CC BY. Fetch one model on use rather than the catalogue in bulk, and credit Polyfork where users pick models.",
+  }),
+  source({
     id: "blendkit",
     name: "Blendkit (formerly BlenderKit)",
     categories: ["3d-model", "texture", "hdri"],

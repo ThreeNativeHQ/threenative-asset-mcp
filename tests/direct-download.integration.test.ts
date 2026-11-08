@@ -259,3 +259,105 @@ describe("direct provider file downloads", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("Polyfork CDN downloads", () => {
+  const glbUrl = "https://polyfork.dev/cdn/cueca-musician-d71a2e.glb";
+
+  it("accepts the exact anonymous full-GLB contract", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("glTF"));
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch,
+    });
+    const result = await downloader.download({
+      provider: "polyfork",
+      url: glbUrl,
+      fileName: "cueca-musician-d71a2e.glb",
+    });
+    expect(result).toMatchObject({
+      provider: "polyfork",
+      sourceUrl: glbUrl,
+      sizeBytes: 4,
+      alreadyExisted: false,
+    });
+    expect(result.sha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("rejects every other Polyfork route, host and authority", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch,
+    });
+    for (const url of [
+      "https://polyfork.dev/dl/cueca-musician-d71a2e.fbx",
+      "https://polyfork.dev/dl/kit-chile-fiestas-patrias.zip",
+      "https://polyfork.dev/cdn/cueca-musician-d71a2e.mjs",
+      "https://polyfork.dev/cdn/cueca-musician-d71a2e-preview.glb",
+      "https://polyfork.dev/cdn/cueca-musician-d71a2e-hd-preview.glb",
+      "https://polyfork.dev/files/cueca-musician-d71a2e/renders/hero.png",
+      "https://evil.example/cdn/cueca-musician-d71a2e.glb",
+      "https://polyfork.dev.evil.example/cdn/cueca-musician-d71a2e.glb",
+      "https://user:secret@polyfork.dev/cdn/cueca-musician-d71a2e.glb",
+      "https://polyfork.dev:8443/cdn/cueca-musician-d71a2e.glb",
+      "https://polyfork.dev/cdn/../x.glb",
+      "https://polyfork.dev/cdn/UPPER.glb",
+      "https://polyfork.dev/cdn/",
+    ]) {
+      await expect(
+        downloader.download({ provider: "polyfork", url, fileName: "x.glb" }),
+      ).rejects.toThrow(/official download contract/);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("revalidates Polyfork redirects and refuses a foreign host or path", async () => {
+    let calls = 0;
+    const allowed = vi.fn<typeof globalThis.fetch>(async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response(null, {
+            status: 302,
+            headers: { location: "/cdn/cueca-musician-d71a2e.glb" },
+          })
+        : new Response("abc");
+    });
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch: allowed,
+    });
+    const result = await downloader.download({
+      provider: "polyfork",
+      url: glbUrl,
+      fileName: "a.glb",
+    });
+    expect(result.sourceUrl).toBe(glbUrl);
+
+    for (const location of [
+      "https://evil.example/x.glb",
+      "/files/cueca-musician-d71a2e/renders/hero.png",
+      "/dl/cueca-musician-d71a2e.fbx",
+    ]) {
+      const refused = new DirectAssetDownloader({
+        downloadDir: await temporaryDirectory(),
+        fetch: vi.fn<typeof globalThis.fetch>(
+          async () => new Response(null, { status: 302, headers: { location } }),
+        ),
+      });
+      await expect(
+        refused.download({ provider: "polyfork", url: glbUrl, fileName: "b.glb" }),
+      ).rejects.toThrow(/rejected|contract|redirect/i);
+    }
+  });
+
+  it("keeps the tightened byte budget for a Polyfork GLB", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("12345"));
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch,
+    });
+    await expect(
+      downloader.download({ provider: "polyfork", url: glbUrl, fileName: "c.glb", maxBytes: 3 }),
+    ).rejects.toThrow(/exceeds/i);
+  });
+});

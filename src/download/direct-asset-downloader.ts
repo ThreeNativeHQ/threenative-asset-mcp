@@ -20,6 +20,7 @@ export type DirectAssetProvider =
   | "ambientcg"
   | "smithsonian"
   | "game-icons"
+  | "polyfork"
   | "kenney"
   | "itch";
 
@@ -65,6 +66,7 @@ const PROVIDER_HOSTS: Record<DirectAssetProvider, ReadonlySet<string>> = {
   ambientcg: new Set(["ambientcg.com", "acg-download.struffelproductions.com"]),
   smithsonian: new Set(["3d-api.si.edu"]),
   "game-icons": new Set(["game-icons.net"]),
+  polyfork: new Set(["polyfork.dev"]),
   kenney: new Set(["kenney.nl"]),
   itch: new Set(),
 };
@@ -76,6 +78,14 @@ function isAllowedProviderHost(provider: DirectAssetProvider, hostname: string):
   return PROVIDER_HOSTS[provider].has(hostname);
 }
 
+/** The only anonymous Polyfork download: one full low-poly GLB on the official CDN. */
+function isPolyforkCdnPath(pathname: string): boolean {
+  return (
+    /^\/cdn\/[a-z0-9][a-z0-9-]{2,78}[a-z0-9]\.glb$/.test(pathname) &&
+    !/-preview\.glb$/.test(pathname)
+  );
+}
+
 function validateInitialUrl(provider: DirectAssetProvider, url: URL): boolean {
   if (url.username || url.password || url.port || url.hash) return false;
   if (url.protocol !== "https:" || !isAllowedProviderHost(provider, url.hostname)) {
@@ -85,6 +95,9 @@ function validateInitialUrl(provider: DirectAssetProvider, url: URL): boolean {
     return (
       url.hostname === "ambientcg.com" && url.pathname === "/get" && url.searchParams.has("file")
     );
+  }
+  if (provider === "polyfork") {
+    return url.hostname === "polyfork.dev" && url.search === "" && isPolyforkCdnPath(url.pathname);
   }
   if (provider === "smithsonian") {
     return (
@@ -404,6 +417,11 @@ export class DirectAssetDownloader {
           "The provider redirected outside its official download-host allowlist.",
         );
       }
+      if (provider === "polyfork" && !isPolyforkCdnPath(current.pathname))
+        throw new DirectAssetDownloadError(
+          "ASSET_DOWNLOAD_URL_REJECTED",
+          "The provider redirect left its official download contract.",
+        );
       signal.throwIfAborted();
       const response = await this.fetch(current, {
         redirect: "manual",

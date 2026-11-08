@@ -115,6 +115,34 @@ Smithsonian 3D:
 - `smithsonian_list_files` — returns direct model files with format, quality,
   compression, and orientation metadata.
 
+Polyfork (free low-poly models; <https://polyfork.dev/characters>):
+
+- `polyfork_search_models` — searches the catalogue by text and class
+  (`character`, `prop`, `animal`, `vehicle`, `building`, `ultra`,
+  `attachment`, `terrain`, `hand`), with kit, triangle bounds, free-only,
+  sort and a 1-based page cursor. Items carry triangles, rig/skeleton flags
+  and the HD-edition marker.
+- `polyfork_get_model` — returns one model's canonical page, its per-item
+  licence text and CC BY credit line, the clips and skeleton its GLB actually
+  carries, the anonymous full-GLB and preview choices, the Pro HD edition, and
+  non-GLB export links (manual, account/Pro routes). The `.mjs` source is never
+  fetched or executed.
+- `polyfork_list_files` — lists the verified anonymous full low-poly GLB (the
+  preferred file), the preview-only GLB, and the Pro-gated HD edition. When
+  upstream gates a file it returns a structured requirement instead of a plan.
+
+Licences: free low-poly **mesh files** are CC BY 4.0 (keep the asset's `credit`
+line, link its model page and say what changed; redistribution and resale are
+allowed) or the Polyfork licence (no attribution, no standalone file
+redistribution) — the user chooses. The `.mjs` source modules, HD editions,
+renders and thumbnails stay under the Polyfork licence only: no redistribution,
+and neither they nor mesh files taken under the Polyfork licence may be used to
+build or train a commercial 3D asset generator. CC BY 4.0 sets no such limit on
+the free mesh files. HD editions need Pro. If your product lets users pick these
+models, credit Polyfork there and fetch each model on use rather than the
+catalogue in bulk.
+See <https://polyfork.dev/licensing>.
+
 Sketchfab:
 
 - `sketchfab_search_models` — anonymously searches public models, defaulting to
