@@ -208,6 +208,18 @@ Mesh optimization:
   `.after.png`. When no candidate passes, the call succeeds with `kept: "original"`, no output file and the
   metrics of every attempt. `scripts/probe-mesh-optimize.ts` runs the real-scan path on Smithsonian GLBs.
 
+Procedural vegetation:
+
+- `vegetation_generate` — bakes an Arbor preset (28 trees, plus grass, ferns and flowers) with
+  `@threenative/procedural-vegetation` into one GLB per level of detail (`lods` 0 full, 1 mid, 2 far).
+  Each GLB has `COLOR_0`, `TEXCOORD_0`, embedded bark and leaf textures, alpha-masked leaves and a `_WIND`
+  vec4 per vertex (x trunk sway m, y branch sway m, z leaf flutter m, w phase). The same preset and seed
+  write the same bytes. `outDir` is an absolute directory (the game's `assets/trees`); the default is
+  `<ASSET_DOWNLOAD_DIR>/arbor`. `asset_search` lists the presets under the provider `arbor` (price 0,
+  generated, user-owned, `canDownloadNow: false`); `asset_get` returns no download plan and names this
+  tool, because a generated file has no URL for the guarded downloader. The package is an npm dependency
+  of this MCP.
+
 Recommended agent flow:
 
 1. Call `asset_search_sources` with the requested category/query. Its default

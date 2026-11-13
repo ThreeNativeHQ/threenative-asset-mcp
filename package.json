@@ -75,6 +75,7 @@
     "@gltf-transform/functions": "4.4.2",
     "@modelcontextprotocol/server": "2.0.0",
     "@threenative/playtest": "0.3.2",
+    "@threenative/procedural-vegetation": "0.1.0",
     "@zip.js/zip.js": "2.8.34",
     "ag-psd": "31.0.3",
     "meshoptimizer": "1.1.1",

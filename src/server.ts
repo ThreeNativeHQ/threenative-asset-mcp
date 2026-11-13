@@ -210,6 +210,12 @@ import {
   createAssetRetargetAnimationsHandler,
 } from "./tools/rig.js";
 import {
+  createArborAdapter,
+  createVegetationGenerateHandler,
+  VegetationGenerateInputSchema,
+  VegetationGenerateOutputSchema,
+} from "./discovery/arbor.js";
+import {
   createMeshOptimizeHandler,
   MeshOptimizeInputSchema,
   MeshOptimizeOutputSchema,
@@ -299,6 +305,8 @@ export function createAssetServer(
       }).concat(
         // Live Blendkit search joins the federation only with documented provider permission.
         blendkit.options.permissionEvidence ? [blendkit] : [],
+        // Procedural Arbor trees are generated here: price 0, user-owned, baked by vegetation_generate.
+        [createArborAdapter()],
       ),
       directDownloader,
       { toolVersion: packageVersion() },
@@ -479,6 +487,24 @@ export function createAssetServer(
       },
     },
     createMeshOptimizeHandler(),
+  );
+
+  server.registerTool(
+    "vegetation_generate",
+    {
+      title: "Bake a procedural tree (Arbor) to GLBs",
+      description:
+        "Bake an Arbor preset (oak, spruce, baobab, palm and 25 more trees, plus grass, ferns and flowers; asset_search lists them under the provider `arbor`) to one GLB per level of detail. Each GLB has COLOR_0, TEXCOORD_0, embedded bark and leaf textures, alpha-masked leaves and a per-vertex _WIND attribute (x trunk sway m, y branch sway m, z leaf flutter m, w phase) for the game's own wind shader. The same preset and seed write the same bytes; files are written atomically. Price 0, generated, user-owned.",
+      inputSchema: VegetationGenerateInputSchema,
+      outputSchema: VegetationGenerateOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createVegetationGenerateHandler(),
   );
 
   server.registerTool(
