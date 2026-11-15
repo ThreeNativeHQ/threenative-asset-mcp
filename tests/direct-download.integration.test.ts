@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DirectAssetDownloader } from "../src/download/direct-asset-downloader.js";
 import { createDirectAssetDownloadHandler } from "../src/tools/direct-download.js";
+import { withKenneyLinks } from "./helpers/kenney-links.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -118,16 +119,67 @@ describe("direct provider file downloads", () => {
     expect(await readFile(result.structuredContent.path)).toEqual(Buffer.from([1, 2, 3, 4]));
   });
 
+  it("asks Kenney for a signed link, since its archive paths now redirect to the asset page", async () => {
+    // kenney.nl, 2026-11: `/media/pages/assets/<slug>/<hash>/kenney_<slug>.zip` answers 302 to the HTML
+    // asset page. The page's button calls `/download-link/<hex("assets/<slug>")>` with the page as
+    // Referer and follows the signed `/download/...?expires=` URL it returns.
+    const requests: { url: string; referer: string | null }[] = [];
+    const id = Buffer.from("assets/particle-pack").toString("hex");
+    const signed = `https://kenney.nl/download/${id}/${"b".repeat(64)}?expires=1794773763`;
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch: async (input, init) => {
+        const url = String(input);
+        requests.push({ url, referer: new Headers(init?.headers).get("referer") });
+        if (url === `https://kenney.nl/download-link/${id}`) return Response.json({ url: signed });
+        if (url === signed)
+          return new Response(new Uint8Array([80, 75, 3, 4]), {
+            headers: { "content-type": "application/zip" },
+          });
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://kenney.nl/assets/particle-pack" },
+        });
+      },
+    });
+    const result = await downloader.download({
+      provider: "kenney",
+      url: "https://kenney.nl/media/pages/assets/particle-pack/f8fe0f8cb8-1677578741/kenney_particle-pack.zip",
+      fileName: "kenney_particle-pack.zip",
+    });
+    expect(result.sizeBytes).toBe(4);
+    expect(requests).toEqual([
+      { url: `https://kenney.nl/download-link/${id}`, referer: "https://kenney.nl/assets/particle-pack" },
+      { url: signed, referer: null },
+    ]);
+  });
+
+  it("refuses a Kenney link that leaves its signed download path", async () => {
+    const downloader = new DirectAssetDownloader({
+      downloadDir: await temporaryDirectory(),
+      fetch: async () => Response.json({ url: "https://evil.example/kenney.zip" }),
+    });
+    await expect(
+      downloader.download({
+        provider: "kenney",
+        url: "https://kenney.nl/assets/particle-pack",
+        fileName: "kenney_particle-pack.zip",
+      }),
+    ).rejects.toThrow(/did not issue a download link/);
+  });
+
   it("supports ambientCG, Smithsonian, Game-icons, and Kenney URL contracts", async () => {
     const downloadDir = await temporaryDirectory();
     const handler = createDirectAssetDownloadHandler(
       new DirectAssetDownloader({
         downloadDir,
-        fetch: async () =>
-          new Response(new Uint8Array([1]), {
-            status: 200,
-            headers: { "content-length": "1" },
-          }),
+        fetch: withKenneyLinks(
+          async () =>
+            new Response(new Uint8Array([1]), {
+              status: 200,
+              headers: { "content-length": "1" },
+            }),
+        ),
       }),
     );
 

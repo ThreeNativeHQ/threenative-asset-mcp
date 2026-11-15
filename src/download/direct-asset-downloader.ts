@@ -1,3 +1,4 @@
+import { kenneySlug, resolveKenneyDownload } from "../kenney/download-link.js";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import {
@@ -112,11 +113,7 @@ function validateInitialUrl(provider: DirectAssetProvider, url: URL): boolean {
       )
     );
   }
-  if (provider === "kenney") {
-    return /^\/media\/pages\/assets\/[a-z0-9-]+\/[a-z0-9-]+\/kenney_[a-z0-9_.-]+\.zip$/i.test(
-      url.pathname,
-    );
-  }
+  if (provider === "kenney") return kenneySlug(url) !== undefined;
   if (provider === "itch") {
     return (
       /^\/upload2\/game\/\d+\/\d+$/.test(url.pathname) && url.searchParams.has("X-Amz-Signature")
@@ -416,6 +413,16 @@ export class DirectAssetDownloader {
     signal: AbortSignal,
   ): Promise<Response> {
     let current = initial;
+    if (provider === "kenney") {
+      const signed = await resolveKenneyDownload(initial, this.fetch, signal);
+      if (!signed)
+        throw new DirectAssetDownloadError(
+          "ASSET_DOWNLOAD_UPSTREAM_DENIED",
+          "Kenney did not issue a download link for this pack.",
+          true,
+        );
+      current = signed;
+    }
     for (let redirects = 0; redirects <= 5; redirects += 1) {
       if (
         current.username ||

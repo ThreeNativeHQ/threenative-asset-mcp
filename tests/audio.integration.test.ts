@@ -10,6 +10,7 @@ import {
   createAudioListSourcesHandler,
   createAudioSearchHandler,
 } from "../src/tools/audio.js";
+import { withKenneyLinks } from "./helpers/kenney-links.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -93,7 +94,7 @@ describe("audio downloads", () => {
         },
       }),
     );
-    const client = new AudioCatalogClient({ fetch, downloadDir, maxDownloadBytes: 1024 });
+    const client = new AudioCatalogClient({ fetch: withKenneyLinks(fetch), downloadDir, maxDownloadBytes: 1024 });
     const handler = createAudioDownloadHandler(client);
 
     const result = await handler({
@@ -126,7 +127,7 @@ describe("audio downloads", () => {
       }),
     );
     const handler = createAudioDownloadHandler(
-      new AudioCatalogClient({ fetch, downloadDir, maxDownloadBytes: 1024 }),
+      new AudioCatalogClient({ fetch: withKenneyLinks(fetch), downloadDir, maxDownloadBytes: 1024 }),
     );
 
     await handler({ assetId: "kenney-music-jingles", acceptLicense: true });
@@ -145,11 +146,13 @@ describe("audio downloads", () => {
       new AudioCatalogClient({
         downloadDir,
         maxDownloadBytes: 4,
-        fetch: async () =>
-          new Response(new Uint8Array([1, 2, 3, 4, 5]), {
-            status: 200,
-            headers: { "content-length": "5" },
-          }),
+        fetch: withKenneyLinks(
+          async () =>
+            new Response(new Uint8Array([1, 2, 3, 4, 5]), {
+              status: 200,
+              headers: { "content-length": "5" },
+            }),
+        ),
       }),
     );
 
@@ -181,11 +184,13 @@ describe("audio downloads", () => {
     const handler = createAudioDownloadHandler(
       new AudioCatalogClient({
         downloadDir: await temporaryDirectory(),
-        fetch: async () =>
-          new Response(null, {
-            status: 302,
-            headers: { location: "https://evil.example/audio.zip" },
-          }),
+        fetch: withKenneyLinks(
+          async () =>
+            new Response(null, {
+              status: 302,
+              headers: { location: "https://evil.example/audio.zip" },
+            }),
+        ),
       }),
     );
 

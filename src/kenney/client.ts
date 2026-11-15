@@ -1,5 +1,7 @@
 import { MetadataRequests, readMetadata } from "../discovery/metadata.js";
 
+import { kenneyDownloadId } from "./download-link.js";
+
 const BASE = "https://kenney.nl";
 const PAGE_BYTES = 1024 * 1024;
 export interface KenneyEntry {
@@ -132,7 +134,10 @@ export function parseKenneyDetail(html: string, id: string): KenneyDetail {
     .find((tag) => attribute(tag, "id") === "donate-text");
   const downloadHref = downloadTag && attribute(downloadTag, "href");
   let downloadUrl: string | undefined;
-  if (downloadHref) {
+  // Since 2026-11 the link is `href='#'` with the pack's id; the downloader asks Kenney for a signed URL.
+  if (downloadTag && attribute(downloadTag, "data-download-id") === kenneyDownloadId(id)) {
+    downloadUrl = `${BASE}/assets/${id}`;
+  } else if (downloadHref) {
     const url = officialUrl(downloadHref);
     if (
       !new RegExp(`^/media/pages/assets/${id}/[a-z0-9-]+/kenney_[a-z0-9_.-]+\\.zip$`, "i").test(
