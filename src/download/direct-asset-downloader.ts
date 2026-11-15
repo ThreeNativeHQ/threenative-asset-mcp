@@ -335,6 +335,13 @@ export class DirectAssetDownloader {
       const hash = createHash("sha256");
       const md5 = createHash("md5");
       let sizeBytes = 0;
+      // Writes queue behind the reads instead of pausing them. A paused body is a paused HTTP parser,
+      // and when the server ends the socket meanwhile (`Connection: close`, as a TLS-intercepting egress
+      // answers) Node's bundled undici fails `assert(!this.paused)` in `Parser.finish` and the process
+      // dies with no error to catch: the hosted sandbox lost the asset server on every download.
+      // ponytail: unbounded queue, capped by maxBytes; bound it if a disk ever runs slower than the network.
+      let written: Promise<void> = Promise.resolve();
+      let writeFailure: unknown;
       try {
         const reader = response.body.getReader();
         const cancel = () => {
@@ -357,13 +364,19 @@ export class DirectAssetDownloader {
             }
             hash.update(value);
             md5.update(value);
-            await writeAll(file, value);
+            if (writeFailure !== undefined) throw writeFailure;
+            written = written.then(() => writeAll(file, value));
+            written.catch((error: unknown) => {
+              writeFailure ??= error;
+            });
           }
         } finally {
           signal.removeEventListener("abort", cancel);
           await reader.cancel().catch(() => undefined);
           reader.releaseLock();
+          await written.catch(() => undefined);
         }
+        if (writeFailure !== undefined) throw writeFailure;
         await verify(temporaryPath, sizeBytes, md5.digest("hex"));
         await file.sync();
       } finally {
