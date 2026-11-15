@@ -20,6 +20,9 @@ export interface BlenderRelease {
   readonly url: string;
   /** From the release's published `blender-<version>.sha256`, fetched 2026-10-14. */
   readonly sha256: string;
+  /** Tried in order when `url` refuses: download.blender.org answers some CI runners 403. The pinned
+   * SHA-256 is what makes a mirror safe. */
+  readonly mirrors?: readonly string[];
 }
 
 /** Blender 4.5 LTS, Linux x64. Pinned: changing the URL means changing the digest in the same commit. */
@@ -27,6 +30,10 @@ export const BLENDER_RELEASE: BlenderRelease = Object.freeze({
   version: "4.5.14",
   url: "https://download.blender.org/release/Blender4.5/blender-4.5.14-linux-x64.tar.xz",
   sha256: "9ba871ff2ecd36526b77432745980b7e6664ecd0c7ca11c48849073dcfe06da3",
+  mirrors: [
+    "https://mirror.clarkson.edu/blender/release/Blender4.5/blender-4.5.14-linux-x64.tar.xz",
+    "https://ftp.halifax.rwth-aachen.de/blender/release/Blender4.5/blender-4.5.14-linux-x64.tar.xz",
+  ],
 });
 
 /** The oldest Blender whose glTF exporter and `import_scene.fbx` the conversion script uses. */
@@ -134,7 +141,18 @@ async function provision(
   try {
     log(`Downloading Blender ${release.version} (about 380 MB)...`);
     const archive = join(staging, "blender.tar.xz");
-    const actual = await download(release.url, archive);
+    let actual: string | undefined;
+    let refused: unknown;
+    for (const url of [release.url, ...(release.mirrors ?? [])]) {
+      try {
+        actual = await download(url, archive);
+        break;
+      } catch (error) {
+        refused = error;
+        log(`Blender download from ${url} failed; trying the next source.`);
+      }
+    }
+    if (actual === undefined) throw refused;
     if (actual !== release.sha256) {
       throw new UnityImportError(
         "UNITY_BLENDER_UNUSABLE",
