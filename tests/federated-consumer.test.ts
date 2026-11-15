@@ -206,18 +206,19 @@ async function providerFixtures(): Promise<{
   const archive = await writer.close();
   const listing =
     "<h1>Assets</h1><div class='asset'><h2><a href='/assets/chair-kit'>Chair Kit</a></h2><a href='/assets/category:3D'>3D</a></div>";
+  // kenney.nl since 2026-11: the button carries the pack id and the page asks for a signed link.
+  const kenneyId = Buffer.from("assets/chair-kit").toString("hex");
+  const kenneySigned = `https://kenney.nl/download/${kenneyId}/${"c".repeat(64)}?expires=1794773763`;
   const detail =
-    "<h1>Chair Kit</h1><table><tr><td>Category</td><td><a href='/assets/category:3D'>3D</a></td></tr><tr><td>License</td><td><a href='https://creativecommons.org/publicdomain/zero/1.0/'>Creative Commons CC0</a></td></tr></table><p>The game assets you're about to download are available for free.</p><a id='donate-text' href='https://kenney.nl/media/pages/assets/chair-kit/fixture-123/kenney_chair-kit.zip'>Continue without donating...</a>";
+    `<h1>Chair Kit</h1><table><tr><td>Category</td><td><a href='/assets/category:3D'>3D</a></td></tr><tr><td>License</td><td><a href='https://creativecommons.org/publicdomain/zero/1.0/'>Creative Commons CC0</a></td></tr></table><p>The game assets you're about to download are available for free.</p><a id='donate-text' href='#' data-download-id='${kenneyId}' onclick='return initiateDownload(this)'>Continue without donating...</a>`;
   routes["https://kenney.nl/assets?search=chair"] = route(Buffer.from(listing), {
     "content-type": "text/html",
   });
   routes["https://kenney.nl/assets/chair-kit"] = route(Buffer.from(detail), {
     "content-type": "text/html",
   });
-  routes["https://kenney.nl/media/pages/assets/chair-kit/fixture-123/kenney_chair-kit.zip"] = route(
-    archive,
-    { "content-type": "application/zip" },
-  );
+  routes[`https://kenney.nl/download-link/${kenneyId}`] = json({ url: kenneySigned });
+  routes[kenneySigned] = route(archive, { "content-type": "application/zip" });
   return { routes, resources, archive };
 }
 

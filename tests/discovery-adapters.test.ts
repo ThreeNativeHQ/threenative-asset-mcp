@@ -250,6 +250,15 @@ describe("bounded Kenney metadata", () => {
       freeConfirmed: true,
       downloadUrl: expect.stringContaining("kenney_nature-kit.zip"),
     });
+    // kenney.nl since 2026-11: the button carries the pack id, and the downloader asks for a signed link.
+    const signedMarkup = detail.replace(
+      "href='https://kenney.nl/media/pages/assets/nature-kit/abc-123/kenney_nature-kit.zip'",
+      `href='#' data-download-id='${Buffer.from("assets/nature-kit").toString("hex")}' onclick='return initiateDownload(this)'`,
+    );
+    expect(parseKenneyDetail(signedMarkup, "nature-kit")).toMatchObject({
+      freeConfirmed: true,
+      downloadUrl: "https://kenney.nl/assets/nature-kit",
+    });
     expect(
       parseKenneyDetail(
         detail

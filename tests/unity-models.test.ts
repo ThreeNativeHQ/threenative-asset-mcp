@@ -73,6 +73,23 @@ describe("provision", () => {
     expect((await readdir(cache)).filter((name) => name.startsWith(".blender-staging"))).toEqual([]);
   });
 
+  it("falls back to a mirror when the official host refuses, still pinned by SHA-256", async () => {
+    // GitHub-hosted runners, 2026-11-15: download.blender.org answered 403 to some legs and not others.
+    const { release } = await fakeBlenderServer();
+    const refusing: Server = createServer((_request, response) => {
+      response.writeHead(403);
+      response.end();
+    });
+    await new Promise<void>((done) => refusing.listen(0, "127.0.0.1", done));
+    onTestFinished(() => new Promise<void>((done) => refusing.close(() => done())));
+    const official = `http://127.0.0.1:${(refusing.address() as AddressInfo).port}/blender.tar.xz`;
+    const cache = await scratchDirectory("unity-toolchain-");
+    const tool = await ensureBlender(noBlender(cache), undefined, {
+      release: { ...release, url: official, mirrors: [release.url] },
+    });
+    expect(tool).toMatchObject({ version: "9.9.9", source: "download" });
+  });
+
   it("discards a download whose SHA-256 differs and installs nothing", async () => {
     const { release } = await fakeBlenderServer();
     const cache = await scratchDirectory("unity-toolchain-");

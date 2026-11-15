@@ -842,7 +842,8 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
           files: [
             {
               id: "original-pack",
-              path: filename(item.downloadUrl),
+              // A signed-link pack is named after its asset page; Kenney serves it as kenney_<slug>.zip.
+              path: /\.zip$/i.test(item.downloadUrl) ? filename(item.downloadUrl) : `kenney_${item.id}.zip`,
               url: item.downloadUrl,
               role: "archive",
             },

@@ -1,3 +1,4 @@
+import { resolveKenneyDownload } from "../kenney/download-link.js";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import {
@@ -252,7 +253,18 @@ export class AudioCatalogClient {
   }
 
   private async fetchDownload(initialUrl: string): Promise<Response> {
-    let current = new URL(initialUrl);
+    const resolved = await resolveKenneyDownload(
+      new URL(initialUrl),
+      this.fetch,
+      AbortSignal.timeout(this.downloadTimeoutMs),
+    );
+    if (!resolved)
+      throw new AudioCatalogError(
+        "AUDIO_UPSTREAM_DENIED",
+        "Kenney did not issue a download link for this pack.",
+        true,
+      );
+    let current = resolved;
     for (let redirects = 0; redirects <= 5; redirects += 1) {
       if (current.protocol !== "https:" || !this.allowedDownloadHosts.has(current.hostname)) {
         throw new AudioCatalogError(
