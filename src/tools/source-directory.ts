@@ -166,6 +166,22 @@ export const ASSET_SOURCES: readonly AssetSource[] = [
       "HD editions are Polyfork Pro; the .mjs source is never fetched or executed. Thumbnails and renders are not CC BY. Fetch one model on use rather than the catalogue in bulk, and credit Polyfork where users pick models.",
   }),
   source({
+    id: "procedural",
+    name: "Procedural environment (bake-first)",
+    categories: ["3d-model"],
+    bestFor:
+      "Trees, shrubs, cover, logs, rocks and city modules generated offline into a GLB the game owns, found by name or biome",
+    browseUrls: ["https://www.npmjs.com/package/@threenative/procedural-environment"],
+    licenseSummary: "Generators MIT; vendored textures CC0 Poly Haven scans",
+    licenseTags: ["mit", "cc0"],
+    attribution: "None for the baked GLB",
+    access: "package-manager",
+    downloadSupport: "package-manager",
+    installCommand: "npm i -D @threenative/procedural-environment",
+    caution:
+      "asset_search returns the exact bake call per element (bakeCall). Run it in a script after installing the package; nothing is downloaded by the MCP.",
+  }),
+  source({
     id: "blendkit",
     name: "Blendkit (formerly BlenderKit)",
     categories: ["3d-model", "texture", "hdri"],
