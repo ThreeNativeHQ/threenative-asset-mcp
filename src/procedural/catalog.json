@@ -1,0 +1,1418 @@
+{
+ "package": "@threenative/procedural-environment",
+ "version": "0.1.2",
+ "elements": [
+  {
+   "id": "oak",
+   "kind": "tree",
+   "name": "English oak",
+   "latin": "Quercus robur",
+   "biomes": [
+    "forest",
+    "hills"
+   ],
+   "bake": "bakeVegetation({ preset: \"oak\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "beech",
+   "kind": "tree",
+   "name": "European beech",
+   "latin": "Fagus sylvatica",
+   "biomes": [
+    "forest"
+   ],
+   "bake": "bakeVegetation({ preset: \"beech\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "birch",
+   "kind": "tree",
+   "name": "Silver birch",
+   "latin": "Betula pendula",
+   "biomes": [
+    "forest",
+    "hills",
+    "alpine",
+    "tundra",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"birch\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "spruce",
+   "kind": "tree",
+   "name": "Norway spruce",
+   "latin": "Picea abies",
+   "biomes": [
+    "forest",
+    "alpine"
+   ],
+   "bake": "bakeVegetation({ preset: \"spruce\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "scotspine",
+   "kind": "tree",
+   "name": "Scots pine",
+   "latin": "Pinus sylvestris",
+   "biomes": [
+    "forest",
+    "coastal",
+    "alpine"
+   ],
+   "bake": "bakeVegetation({ preset: \"scotspine\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "blackspruce",
+   "kind": "tree",
+   "name": "Black spruce",
+   "latin": "Picea mariana",
+   "biomes": [
+    "tundra",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"blackspruce\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "aspen",
+   "kind": "tree",
+   "name": "Quaking aspen",
+   "latin": "Populus tremuloides",
+   "biomes": [
+    "forest"
+   ],
+   "bake": "bakeVegetation({ preset: \"aspen\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "douglasfir",
+   "kind": "tree",
+   "name": "Douglas fir",
+   "latin": "Pseudotsuga menziesii",
+   "biomes": [
+    "forest",
+    "alpine"
+   ],
+   "bake": "bakeVegetation({ preset: \"douglasfir\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "redcedar",
+   "kind": "tree",
+   "name": "Western red cedar",
+   "latin": "Thuja plicata",
+   "biomes": [
+    "forest",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"redcedar\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "bigleafmaple",
+   "kind": "tree",
+   "name": "Bigleaf maple",
+   "latin": "Acer macrophyllum",
+   "biomes": [
+    "forest"
+   ],
+   "bake": "bakeVegetation({ preset: \"bigleafmaple\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "cypress",
+   "kind": "tree",
+   "name": "Italian cypress",
+   "latin": "Cupressus sempervirens",
+   "biomes": [
+    "coastal",
+    "mediterranean"
+   ],
+   "bake": "bakeVegetation({ preset: \"cypress\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "olive",
+   "kind": "tree",
+   "name": "Olive",
+   "latin": "Olea europaea",
+   "biomes": [
+    "mediterranean"
+   ],
+   "bake": "bakeVegetation({ preset: \"olive\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "stonepine",
+   "kind": "tree",
+   "name": "Stone pine",
+   "latin": "Pinus pinea",
+   "biomes": [
+    "coastal",
+    "mediterranean"
+   ],
+   "bake": "bakeVegetation({ preset: \"stonepine\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "acacia",
+   "kind": "tree",
+   "name": "Umbrella thorn",
+   "latin": "Vachellia tortilis",
+   "biomes": [
+    "savanna"
+   ],
+   "bake": "bakeVegetation({ preset: \"acacia\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "baobab",
+   "kind": "tree",
+   "name": "Baobab",
+   "latin": "Adansonia digitata",
+   "biomes": [
+    "savanna"
+   ],
+   "bake": "bakeVegetation({ preset: \"baobab\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "coconut",
+   "kind": "tree",
+   "name": "Coconut palm",
+   "latin": "Cocos nucifera",
+   "biomes": [
+    "coastal",
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"coconut\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "banana",
+   "kind": "tree",
+   "name": "Banana",
+   "latin": "Musa acuminata",
+   "biomes": [
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"banana\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "kapok",
+   "kind": "tree",
+   "name": "Kapok",
+   "latin": "Ceiba pentandra",
+   "biomes": [
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"kapok\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "sakura",
+   "kind": "tree",
+   "name": "Yoshino cherry",
+   "latin": "Prunus × yedoensis",
+   "biomes": [
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"sakura\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "jmaple",
+   "kind": "tree",
+   "name": "Japanese maple",
+   "latin": "Acer palmatum",
+   "biomes": [
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"jmaple\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "ginkgo",
+   "kind": "tree",
+   "name": "Ginkgo",
+   "latin": "Ginkgo biloba",
+   "biomes": [
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"ginkgo\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "bamboo",
+   "kind": "tree",
+   "name": "Moso bamboo",
+   "latin": "Phyllostachys edulis",
+   "biomes": [
+    "tropical",
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"bamboo\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "saguaro",
+   "kind": "tree",
+   "name": "Saguaro",
+   "latin": "Carnegiea gigantea",
+   "biomes": [
+    "desert"
+   ],
+   "bake": "bakeVegetation({ preset: \"saguaro\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "joshua",
+   "kind": "tree",
+   "name": "Joshua tree",
+   "latin": "Yucca brevifolia",
+   "biomes": [
+    "desert"
+   ],
+   "bake": "bakeVegetation({ preset: \"joshua\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "fanpalm",
+   "kind": "tree",
+   "name": "California fan palm",
+   "latin": "Washingtonia filifera",
+   "biomes": [
+    "desert"
+   ],
+   "bake": "bakeVegetation({ preset: \"fanpalm\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "araucaria",
+   "kind": "tree",
+   "name": "Paraná pine",
+   "latin": "Araucaria angustifolia",
+   "biomes": [
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"araucaria\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "ipe",
+   "kind": "tree",
+   "name": "Yellow ipê",
+   "latin": "Handroanthus albus",
+   "biomes": [
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"ipe\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "jacaranda",
+   "kind": "tree",
+   "name": "Jacaranda",
+   "latin": "Jacaranda mimosifolia",
+   "biomes": [
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"jacaranda\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "meadowgrass",
+   "kind": "cover",
+   "name": "Meadow grass",
+   "biomes": [
+    "hills",
+    "alpine",
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"meadowgrass\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "lushgrass",
+   "kind": "cover",
+   "name": "Lush grass",
+   "biomes": [
+    "hills",
+    "tropical",
+    "wetland",
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"lushgrass\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "forestgrass",
+   "kind": "cover",
+   "name": "Woodland grass",
+   "biomes": [
+    "forest"
+   ],
+   "bake": "bakeVegetation({ preset: \"forestgrass\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "tundragrass",
+   "kind": "cover",
+   "name": "Sedge",
+   "biomes": [
+    "alpine",
+    "tundra"
+   ],
+   "bake": "bakeVegetation({ preset: \"tundragrass\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "drygrass",
+   "kind": "cover",
+   "name": "Dry grass",
+   "biomes": [
+    "coastal",
+    "desert",
+    "volcanic",
+    "savanna",
+    "mediterranean"
+   ],
+   "bake": "bakeVegetation({ preset: \"drygrass\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "savannagrass",
+   "kind": "cover",
+   "name": "Red oat grass",
+   "biomes": [
+    "savanna"
+   ],
+   "bake": "bakeVegetation({ preset: \"savannagrass\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "bunchgrass",
+   "kind": "cover",
+   "name": "Desert bunchgrass",
+   "biomes": [
+    "desert",
+    "savanna"
+   ],
+   "bake": "bakeVegetation({ preset: \"bunchgrass\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "sasa",
+   "kind": "cover",
+   "name": "Sasa bamboo",
+   "biomes": [
+    "tropical",
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"sasa\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "bracken",
+   "kind": "cover",
+   "name": "Bracken",
+   "biomes": [
+    "forest"
+   ],
+   "bake": "bakeVegetation({ preset: \"bracken\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "swordfern",
+   "kind": "cover",
+   "name": "Sword fern",
+   "biomes": [
+    "forest"
+   ],
+   "bake": "bakeVegetation({ preset: \"swordfern\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "treefernling",
+   "kind": "cover",
+   "name": "Forest fern",
+   "biomes": [
+    "forest",
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"treefernling\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "daisy",
+   "kind": "cover",
+   "name": "Oxeye daisy",
+   "biomes": [
+    "hills"
+   ],
+   "bake": "bakeVegetation({ preset: \"daisy\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "poppy",
+   "kind": "cover",
+   "name": "Field poppy",
+   "biomes": [
+    "hills",
+    "mediterranean"
+   ],
+   "bake": "bakeVegetation({ preset: \"poppy\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "marigold",
+   "kind": "cover",
+   "name": "Desert marigold",
+   "biomes": [
+    "desert"
+   ],
+   "bake": "bakeVegetation({ preset: \"marigold\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "fireweed",
+   "kind": "cover",
+   "name": "Fireweed",
+   "biomes": [
+    "hills",
+    "alpine",
+    "tundra",
+    "volcanic"
+   ],
+   "bake": "bakeVegetation({ preset: \"fireweed\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "lavender",
+   "kind": "cover",
+   "name": "Lavender",
+   "biomes": [
+    "mediterranean",
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"lavender\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "bluebell",
+   "kind": "cover",
+   "name": "Bluebell",
+   "biomes": [
+    "forest",
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"bluebell\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "hazel",
+   "kind": "cover",
+   "name": "Hazel",
+   "biomes": [
+    "forest",
+    "hills"
+   ],
+   "bake": "bakeVegetation({ preset: \"hazel\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "blueberry",
+   "kind": "cover",
+   "name": "Bog blueberry",
+   "biomes": [
+    "alpine",
+    "tundra",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"blueberry\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "salal",
+   "kind": "cover",
+   "name": "Salal",
+   "biomes": [
+    "forest"
+   ],
+   "bake": "bakeVegetation({ preset: \"salal\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "rosemary",
+   "kind": "cover",
+   "name": "Rosemary",
+   "biomes": [
+    "mediterranean"
+   ],
+   "bake": "bakeVegetation({ preset: \"rosemary\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "thornbush",
+   "kind": "cover",
+   "name": "Thorn scrub",
+   "biomes": [
+    "desert",
+    "savanna",
+    "mediterranean"
+   ],
+   "bake": "bakeVegetation({ preset: \"thornbush\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "creosote",
+   "kind": "cover",
+   "name": "Creosote bush",
+   "biomes": [
+    "desert"
+   ],
+   "bake": "bakeVegetation({ preset: \"creosote\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "azalea",
+   "kind": "cover",
+   "name": "Azalea",
+   "biomes": [
+    "alpine",
+    "garden"
+   ],
+   "bake": "bakeVegetation({ preset: \"azalea\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "agave",
+   "kind": "cover",
+   "name": "Agave",
+   "biomes": [
+    "desert",
+    "mediterranean"
+   ],
+   "bake": "bakeVegetation({ preset: \"agave\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "bromeliad",
+   "kind": "cover",
+   "name": "Bromeliad",
+   "biomes": [
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"bromeliad\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "elephantear",
+   "kind": "cover",
+   "name": "Elephant ear",
+   "biomes": [
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"elephantear\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "branch",
+   "kind": "debris",
+   "name": "Fallen branch",
+   "biomes": [
+    "forest",
+    "coastal"
+   ],
+   "bake": "bakeVegetation({ preset: \"branch\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "clover",
+   "kind": "cover",
+   "name": "Clover patch",
+   "biomes": [
+    "forest",
+    "hills",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"clover\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "dock",
+   "kind": "cover",
+   "name": "Dock seed spike",
+   "biomes": [
+    "forest",
+    "hills",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"dock\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "leaflitter",
+   "kind": "debris",
+   "name": "Leaf litter",
+   "biomes": [
+    "forest",
+    "tropical"
+   ],
+   "bake": "bakeVegetation({ preset: \"leaflitter\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "log",
+   "kind": "debris",
+   "name": "Fallen mossy log",
+   "biomes": [
+    "forest",
+    "alpine",
+    "tropical",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"log\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "plume",
+   "kind": "cover",
+   "name": "Plume stalk",
+   "biomes": [
+    "hills",
+    "coastal",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"plume\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "reeds",
+   "kind": "cover",
+   "name": "Reeds and cattails",
+   "biomes": [
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"reeds\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "rock",
+   "kind": "debris",
+   "name": "Mossy boulder",
+   "biomes": [
+    "forest",
+    "hills",
+    "alpine",
+    "tundra"
+   ],
+   "bake": "bakeVegetation({ preset: \"rock\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "seedgrass",
+   "kind": "cover",
+   "name": "Seeding grass",
+   "biomes": [
+    "forest",
+    "hills",
+    "coastal",
+    "tundra"
+   ],
+   "bake": "bakeVegetation({ preset: \"seedgrass\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "stump",
+   "kind": "debris",
+   "name": "Tree stump",
+   "biomes": [
+    "forest",
+    "alpine",
+    "tropical",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"stump\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "tussock",
+   "kind": "cover",
+   "name": "Sedge tussock",
+   "biomes": [
+    "hills",
+    "coastal",
+    "alpine",
+    "tundra",
+    "volcanic",
+    "wetland"
+   ],
+   "bake": "bakeVegetation({ preset: \"tussock\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "twig",
+   "kind": "debris",
+   "name": "Fallen twig",
+   "biomes": [
+    "forest"
+   ],
+   "bake": "bakeVegetation({ preset: \"twig\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "boulder",
+   "kind": "rock",
+   "name": "Boulder",
+   "biomes": [
+    "forest",
+    "hills",
+    "coastal",
+    "alpine",
+    "desert",
+    "tundra",
+    "volcanic",
+    "savanna",
+    "tropical",
+    "mediterranean",
+    "wetland",
+    "garden"
+   ],
+   "bake": "bakeRock({ form: \"boulder\", biome: \"forest\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "slab",
+   "kind": "rock",
+   "name": "Slab",
+   "biomes": [
+    "forest",
+    "hills",
+    "coastal",
+    "alpine",
+    "desert",
+    "tundra",
+    "volcanic",
+    "savanna",
+    "mediterranean",
+    "garden"
+   ],
+   "bake": "bakeRock({ form: \"slab\", biome: \"forest\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "spire",
+   "kind": "rock",
+   "name": "Spire",
+   "biomes": [
+    "alpine",
+    "desert",
+    "volcanic"
+   ],
+   "bake": "bakeRock({ form: \"spire\", biome: \"alpine\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "hoodoo",
+   "kind": "rock",
+   "name": "Hoodoo",
+   "biomes": [
+    "desert"
+   ],
+   "bake": "bakeRock({ form: \"hoodoo\", biome: \"desert\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "stack",
+   "kind": "rock",
+   "name": "Sea stack",
+   "biomes": [
+    "coastal"
+   ],
+   "bake": "bakeRock({ form: \"stack\", biome: \"coastal\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "mesa",
+   "kind": "rock",
+   "name": "Mesa",
+   "biomes": [
+    "desert"
+   ],
+   "bake": "bakeRock({ form: \"mesa\", biome: \"desert\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "arch",
+   "kind": "rock",
+   "name": "Arch",
+   "biomes": [
+    "coastal",
+    "desert"
+   ],
+   "bake": "bakeRock({ form: \"arch\", biome: \"coastal\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "cliff",
+   "kind": "rock",
+   "name": "Cliff",
+   "biomes": [
+    "forest",
+    "hills",
+    "coastal",
+    "alpine",
+    "desert",
+    "tundra",
+    "volcanic",
+    "tropical",
+    "mediterranean"
+   ],
+   "bake": "bakeRock({ form: \"cliff\", biome: \"forest\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "mountain",
+   "kind": "rock",
+   "name": "Mountain",
+   "biomes": [
+    "alpine",
+    "tundra",
+    "volcanic"
+   ],
+   "bake": "bakeRock({ form: \"mountain\", biome: \"alpine\", seed: 1, out: \"assets/environment\" })"
+  },
+  {
+   "id": "cross",
+   "kind": "city",
+   "name": "Four-way intersection",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"cross\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "straight",
+   "kind": "city",
+   "name": "Two-lane straight",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"straight\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "curve",
+   "kind": "city",
+   "name": "90° road bend",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"curve\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "tee",
+   "kind": "city",
+   "name": "T-junction",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"tee\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "alley",
+   "kind": "city",
+   "name": "Service alley",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"alley\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "parking",
+   "kind": "city",
+   "name": "Parking bay",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"parking\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "store",
+   "kind": "city",
+   "name": "Corner storefront",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"store\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "apartments",
+   "kind": "city",
+   "name": "Brick apartments",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"apartments\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "office",
+   "kind": "city",
+   "name": "Glass office",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"office\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "garage",
+   "kind": "city",
+   "name": "Tuning garage",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"garage\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "warehouse",
+   "kind": "city",
+   "name": "Loading warehouse",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"warehouse\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "signal",
+   "kind": "city",
+   "name": "Traffic signal",
+   "biomes": [],
+   "category": "Street Props",
+   "alias": "traffic light stoplight",
+   "bake": "bakeCity({ module: \"signal\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "lamp",
+   "kind": "city",
+   "name": "Twin streetlight",
+   "biomes": [],
+   "category": "Street Props",
+   "bake": "bakeCity({ module: \"lamp\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "shelter",
+   "kind": "city",
+   "name": "Bus shelter",
+   "biomes": [],
+   "category": "Street Props",
+   "bake": "bakeCity({ module: \"shelter\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "hydrant",
+   "kind": "city",
+   "name": "Fire hydrant",
+   "biomes": [],
+   "category": "Street Props",
+   "bake": "bakeCity({ module: \"hydrant\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "street",
+   "kind": "city",
+   "name": "Street furniture",
+   "biomes": [],
+   "category": "Street Props",
+   "bake": "bakeCity({ module: \"street\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "coupe",
+   "kind": "city",
+   "name": "Track coupe",
+   "biomes": [],
+   "category": "Vehicles",
+   "bake": "bakeCity({ module: \"coupe\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "sedan",
+   "kind": "city",
+   "name": "Traffic sedan",
+   "biomes": [],
+   "category": "Vehicles",
+   "bake": "bakeCity({ module: \"sedan\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "van",
+   "kind": "city",
+   "name": "Service van",
+   "biomes": [],
+   "category": "Vehicles",
+   "bake": "bakeCity({ module: \"van\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "kart",
+   "kind": "city",
+   "name": "Sprint kart",
+   "biomes": [],
+   "category": "Vehicles",
+   "bake": "bakeCity({ module: \"kart\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "grid",
+   "kind": "city",
+   "name": "Starting grid",
+   "biomes": [],
+   "category": "Race Kit",
+   "bake": "bakeCity({ module: \"grid\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "gantry",
+   "kind": "city",
+   "name": "Timing gantry",
+   "biomes": [],
+   "category": "Race Kit",
+   "bake": "bakeCity({ module: \"gantry\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "barrier",
+   "kind": "city",
+   "name": "Race barriers",
+   "biomes": [],
+   "category": "Race Kit",
+   "bake": "bakeCity({ module: \"barrier\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "kerb",
+   "kind": "city",
+   "name": "Rumble strip",
+   "biomes": [],
+   "category": "Race Kit",
+   "bake": "bakeCity({ module: \"kerb\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "tire",
+   "kind": "city",
+   "name": "Tire wall",
+   "biomes": [],
+   "category": "Race Kit",
+   "bake": "bakeCity({ module: \"tire\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "ramp",
+   "kind": "city",
+   "name": "Kart jump ramp",
+   "biomes": [],
+   "category": "Race Kit",
+   "bake": "bakeCity({ module: \"ramp\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "checkpoint",
+   "kind": "city",
+   "name": "Checkpoint arch",
+   "biomes": [],
+   "category": "Race Kit",
+   "bake": "bakeCity({ module: \"checkpoint\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "pit",
+   "kind": "city",
+   "name": "Pit lane",
+   "biomes": [],
+   "category": "Race Kit",
+   "bake": "bakeCity({ module: \"pit\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "formula",
+   "kind": "city",
+   "name": "Formula race car",
+   "biomes": [],
+   "category": "Vehicles",
+   "bake": "bakeCity({ module: \"formula\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "roundabout",
+   "kind": "city",
+   "name": "Four-way roundabout",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"roundabout\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "highway",
+   "kind": "city",
+   "name": "Highway straight",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"highway\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "highway-ramp",
+   "kind": "city",
+   "name": "Banked highway ramp",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"highway-ramp\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "cul-de-sac",
+   "kind": "city",
+   "name": "Cul-de-sac",
+   "biomes": [],
+   "category": "Roads",
+   "bake": "bakeCity({ module: \"cul-de-sac\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "house",
+   "kind": "city",
+   "name": "Detached suburban house",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"house\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "skyscraper",
+   "kind": "city",
+   "name": "Setback skyscraper",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"skyscraper\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "rowhouses",
+   "kind": "city",
+   "name": "Brick rowhouses",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"rowhouses\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "city-block",
+   "kind": "city",
+   "name": "Mixed-use city block",
+   "biomes": [],
+   "category": "Blocks & Lots",
+   "bake": "bakeCity({ module: \"city-block\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "corner-parcel",
+   "kind": "city",
+   "name": "Commercial corner parcel",
+   "biomes": [],
+   "category": "Blocks & Lots",
+   "bake": "bakeCity({ module: \"corner-parcel\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "infill-parcel",
+   "kind": "city",
+   "name": "Residential infill parcel",
+   "biomes": [],
+   "category": "Blocks & Lots",
+   "bake": "bakeCity({ module: \"infill-parcel\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-sidewalk",
+   "kind": "city",
+   "name": "Sidewalk segment",
+   "biomes": [],
+   "category": "Sidewalks",
+   "bake": "bakeCity({ module: \"civic-sidewalk\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-ramp",
+   "kind": "city",
+   "name": "Dropped curb ramp",
+   "biomes": [],
+   "category": "Sidewalks",
+   "bake": "bakeCity({ module: \"civic-ramp\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-crosswalk",
+   "kind": "city",
+   "name": "Zebra crossing",
+   "biomes": [],
+   "category": "Sidewalks",
+   "bake": "bakeCity({ module: \"civic-crosswalk\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-island",
+   "kind": "city",
+   "name": "Pedestrian refuge",
+   "biomes": [],
+   "category": "Sidewalks",
+   "bake": "bakeCity({ module: \"civic-island\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-signs",
+   "kind": "city",
+   "name": "Street signpost",
+   "biomes": [],
+   "category": "Street Props",
+   "bake": "bakeCity({ module: \"civic-signs\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-power",
+   "kind": "city",
+   "name": "Overhead utility span",
+   "biomes": [],
+   "category": "Utilities",
+   "bake": "bakeCity({ module: \"civic-power\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-rail",
+   "kind": "city",
+   "name": "Double-track rail",
+   "biomes": [],
+   "category": "Transit",
+   "bake": "bakeCity({ module: \"civic-rail\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-subway",
+   "kind": "city",
+   "name": "Subway entrance",
+   "biomes": [],
+   "category": "Transit",
+   "bake": "bakeCity({ module: \"civic-subway\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-bridge",
+   "kind": "city",
+   "name": "Road bridge",
+   "biomes": [],
+   "category": "Transit",
+   "bake": "bakeCity({ module: \"civic-bridge\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-tunnel",
+   "kind": "city",
+   "name": "Road underpass",
+   "biomes": [],
+   "category": "Transit",
+   "bake": "bakeCity({ module: \"civic-tunnel\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-dumpster",
+   "kind": "city",
+   "name": "Commercial dumpster",
+   "biomes": [],
+   "category": "Street Props",
+   "bake": "bakeCity({ module: \"civic-dumpster\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-mailbox",
+   "kind": "city",
+   "name": "Public mailbox",
+   "biomes": [],
+   "category": "Street Props",
+   "bake": "bakeCity({ module: \"civic-mailbox\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-fence",
+   "kind": "city",
+   "name": "Metal fence panel",
+   "biomes": [],
+   "category": "Street Props",
+   "bake": "bakeCity({ module: \"civic-fence\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-plaza",
+   "kind": "city",
+   "name": "Public plaza",
+   "biomes": [],
+   "category": "Public Spaces",
+   "bake": "bakeCity({ module: \"civic-plaza\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-playground",
+   "kind": "city",
+   "name": "Playground equipment",
+   "biomes": [],
+   "category": "Public Spaces",
+   "bake": "bakeCity({ module: \"civic-playground\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-court",
+   "kind": "city",
+   "name": "Basketball court",
+   "biomes": [],
+   "category": "Public Spaces",
+   "bake": "bakeCity({ module: \"civic-court\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-garage",
+   "kind": "city",
+   "name": "Parking structure",
+   "biomes": [],
+   "category": "Public Spaces",
+   "bake": "bakeCity({ module: \"civic-garage\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-courtyard",
+   "kind": "city",
+   "name": "Brick courtyard",
+   "biomes": [],
+   "category": "Public Spaces",
+   "bake": "bakeCity({ module: \"civic-courtyard\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-transformer",
+   "kind": "city",
+   "name": "Pad-mounted transformer",
+   "biomes": [],
+   "category": "Utilities",
+   "bake": "bakeCity({ module: \"civic-transformer\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-manhole",
+   "kind": "city",
+   "name": "Manhole cover",
+   "biomes": [],
+   "category": "Utilities",
+   "bake": "bakeCity({ module: \"civic-manhole\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-drain",
+   "kind": "city",
+   "name": "Storm drain grate",
+   "biomes": [],
+   "category": "Utilities",
+   "bake": "bakeCity({ module: \"civic-drain\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-hvac",
+   "kind": "city",
+   "name": "Rooftop HVAC",
+   "biomes": [],
+   "category": "Utilities",
+   "bake": "bakeCity({ module: \"civic-hvac\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-antenna",
+   "kind": "city",
+   "name": "Roof antenna",
+   "biomes": [],
+   "category": "Utilities",
+   "bake": "bakeCity({ module: \"civic-antenna\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-graffiti",
+   "kind": "city",
+   "name": "Graffiti decal",
+   "biomes": [],
+   "category": "Decals & Works",
+   "bake": "bakeCity({ module: \"civic-graffiti\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-ad",
+   "kind": "city",
+   "name": "Street billboard",
+   "biomes": [],
+   "category": "Decals & Works",
+   "bake": "bakeCity({ module: \"civic-ad\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-works",
+   "kind": "city",
+   "name": "Construction frontage",
+   "biomes": [],
+   "category": "Decals & Works",
+   "bake": "bakeCity({ module: \"civic-works\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "civic-decals",
+   "kind": "city",
+   "name": "Pavement markings",
+   "biomes": [],
+   "category": "Decals & Works",
+   "bake": "bakeCity({ module: \"civic-decals\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "surface-parking",
+   "kind": "city",
+   "name": "Surface parking lot",
+   "biomes": [],
+   "category": "Blocks & Lots",
+   "bake": "bakeCity({ module: \"surface-parking\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "road-grime",
+   "kind": "city",
+   "name": "Road grime decal",
+   "biomes": [],
+   "category": "Decals & Works",
+   "bake": "bakeCity({ module: \"road-grime\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "ranch-bungalow",
+   "kind": "city",
+   "name": "Ranch Bungalow",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"ranch-bungalow\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "detached-garage-house",
+   "kind": "city",
+   "name": "Detached House · Two-Car Garage",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"detached-garage-house\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "modern-townhouses",
+   "kind": "city",
+   "name": "Modern Townhouses",
+   "biomes": [],
+   "category": "Buildings",
+   "bake": "bakeCity({ module: \"modern-townhouses\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "community-center",
+   "kind": "city",
+   "name": "Community Center",
+   "biomes": [],
+   "category": "Public Spaces",
+   "bake": "bakeCity({ module: \"community-center\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "residential-block",
+   "kind": "city",
+   "name": "Residential Neighborhood Block",
+   "biomes": [],
+   "category": "Blocks & Lots",
+   "bake": "bakeCity({ module: \"residential-block\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "corner-neighborhood-shops",
+   "kind": "city",
+   "name": "Corner Neighborhood Shops",
+   "biomes": [],
+   "category": "Blocks & Lots",
+   "bake": "bakeCity({ module: \"corner-neighborhood-shops\", out: \"assets/environment\" })"
+  },
+  {
+   "id": "public-market-pavilion",
+   "kind": "city",
+   "name": "Public Market Pavilion",
+   "biomes": [],
+   "category": "Public Spaces",
+   "bake": "bakeCity({ module: \"public-market-pavilion\", out: \"assets/environment\" })"
+  }
+ ]
+}

@@ -116,3 +116,12 @@ are not persisted by the generic downloader because their temporary CDN hosts
 vary and require the user's token-backed session. Provider-page-only sources
 stay provider-page-only until a stable, license-safe download contract is
 verified.
+
+## Procedural environment
+
+`asset_search` provider `procedural` lists the elements of `@threenative/procedural-environment`
+from the static `src/procedural/catalog.json` (no network call). Each result has `canDownloadNow:
+false` and a `bakeCall` field: install the package, then run that call in a script to write a GLB.
+Refresh the catalog after each package release:
+`npx tsx scripts/gen-procedural-catalog.ts <path to packages/procedural-environment>`. The JSON
+records the package version it came from. Add a search word the names lack to `ALIASES` in that script.

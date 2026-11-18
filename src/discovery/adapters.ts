@@ -1,6 +1,7 @@
 import { AmbientCgClient, type AmbientCgAsset } from "../ambientcg/client.js";
 import { ITCH_PACKS } from "../itch/catalog.js";
 import { KenneyClient, type KenneyDetail, type KenneyEntry } from "../kenney/client.js";
+import catalog from "../procedural/catalog.json" with { type: "json" };
 import { PolyHavenClient, type PolyHavenAsset, type PolyHavenFile } from "../polyhaven/client.js";
 import {
   PolyforkClient,
@@ -100,6 +101,35 @@ function unavailable(
     termsText,
   };
 }
+
+const PROCEDURAL_PACKAGE = catalog.package;
+type ProceduralElement = (typeof catalog.elements)[number] & { alias?: string };
+const proceduralAsset = (e: ProceduralElement): Asset => {
+  const install = `npm i -D ${PROCEDURAL_PACKAGE}`;
+  return base(
+    "procedural",
+    `${e.kind}-${e.id}`,
+    `https://www.npmjs.com/package/${PROCEDURAL_PACKAGE}`,
+    `${e.name} (${e.kind}${e.alias ? `, ${e.alias}` : ""})`,
+    "3d-model",
+    {
+      free: "yes",
+      license: {
+        name: "MIT generator, CC0 scans",
+        evidence: `Generated GLB; the generators are MIT and the vendored textures are CC0 Poly Haven scans (${PROCEDURAL_PACKAGE} ${catalog.version}).`,
+        commercialUse: "yes",
+        attributionRequired: "no",
+      },
+      author: "ThreeNative",
+      downloadStatus: "manual",
+      downloadReason: `Not a file download. Run \`${install}\`, then this call in a script: ${e.bake}`.slice(0, 1000),
+      bakeCall: e.bake,
+      rankingFactors: ["bake-first procedural asset"],
+    },
+  );
+};
+const proceduralWords = (e: ProceduralElement) =>
+  [e.id, e.name, e.latin ?? "", e.kind, e.category ?? "", e.alias ?? "", ...e.biomes];
 
 function polyAsset(item: PolyHavenAsset): Asset {
   return base(
@@ -756,6 +786,22 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
       },
     },
   ];
+  adapters.push({
+    id: "procedural",
+    async search(query, types, limit, signal) {
+      signal.throwIfAborted();
+      if (!types.includes("3d-model")) return { items: [], truncated: false };
+      const hits = (catalog.elements as ProceduralElement[]).filter((e) => matches(query, proceduralWords(e)));
+      return { items: ranked(hits.slice(0, limit).map(proceduralAsset)), truncated: hits.length > limit };
+    },
+    async get(id, _selection, signal) {
+      signal.throwIfAborted();
+      const e = (catalog.elements as ProceduralElement[]).find((x) => `${x.kind}-${x.id}` === id);
+      if (!e) throw new Error("Procedural element not found.");
+      const asset = proceduralAsset(e);
+      return unavailable(asset, [], asset.downloadReason);
+    },
+  });
   for (const provider of ["quaternius", "kaykit"]) {
     const packs = ITCH_PACKS.filter(
       (pack) => pack.sourceId === provider && ["animation", "3d-model"].includes(pack.kind),

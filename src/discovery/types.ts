@@ -23,6 +23,7 @@ export const AssetSchema = z.object({
   downloadStatus: z.enum(["direct", "auth-required", "manual", "unsupported", "unknown"]),
   downloadReason: z.string().max(1000),
   canDownloadNow: z.boolean(),
+  bakeCall: z.string().max(500).optional(),
   providerRank: z.number().int().nonnegative(),
   rankingFactors: z.array(z.string().max(200)).max(8),
 });
