@@ -466,6 +466,16 @@ describe("createGraphBaker", () => {
     expect(await firstPixel(bare.png)).toEqual([encode(200 / 255), encode(100 / 255), encode(50 / 255)]);
   });
 
+  it("bakes at a requested maxTextureSize above the 1024 default instead of clamping it", async () => {
+    const { sourceDir, assets, readProps } = await fixture();
+    // The default stays 1024 (bake time grows with the square), but an explicit request is honoured:
+    // a 4096 source atlas baked through a graph must be able to keep its resolution.
+    const baker = createGraphBaker({ sourceDir, maxTextureSize: 1100, dumpGraphs: async () => new Map([["M_Master", masterGraph()]]) })!;
+    const bake = await baker({ materialName: "s", lookupName: "MI_Rock", assets, readProps });
+    if (bake.status !== "baked") throw new Error(`expected a bake, got ${JSON.stringify(bake)}`);
+    expect((await sharp(bake.png).metadata()).width).toBe(1100);
+  });
+
   it("builds the surface map only for a graph that reads it, and bakes a separate texture per surface", async () => {
     const { sourceDir, assets, readProps } = await fixture();
     const aligned = moss();
