@@ -16,8 +16,10 @@ import { safeRelativePath } from "./acquisition.js";
 import {
   assetId,
   AssetSchema,
+  CLOSE_MATCH_LIMIT,
   type Asset,
   type AssetAdapter,
+  type AssetCloseMatch,
   type AssetDetail,
   type AssetFile,
   type Selection,
@@ -68,7 +70,23 @@ function base(
 function ranked(items: Asset[]): Asset[] {
   return items.map((item, providerRank) => ({ ...item, providerRank }));
 }
-function matches(query: string, fields: string[]): boolean {
+/** Text splits on anything that is not a letter or a digit, so "two-car" is two words. */
+const WORD = /[^\p{L}\p{N}]+/u;
+/** A candidate sharing at least half the query words is a suggestion, never a result (PRD-063). */
+const CLOSE_FLOOR = 0.5;
+
+/** The query splits on the same rule as the fields, so the slug `cul-de-sac` is still one search. */
+const queryWords = (query: string): string[] => [
+  ...new Set(query.toLowerCase().split(WORD).filter(Boolean)),
+];
+
+/**
+ * Every query word appears somewhere in the fields, as a substring. This is the rule `wordMatch()`
+ * replaced, kept for the one remote provider a word rule cannot serve: Poly Haven names its assets
+ * `cobblestone_floor_08`, so "stone" belongs to it as a substring and never as a word. PRD-063's
+ * Non-Goal leaves remote providers on their own matching, so this stays exactly as it was.
+ */
+function everyWordAppears(query: string, fields: string[]): boolean {
   const text = fields.join(" ").toLowerCase();
   return query
     .toLowerCase()
@@ -76,6 +94,26 @@ function matches(query: string, fields: string[]): boolean {
     .split(/\s+/)
     .filter(Boolean)
     .every((word) => text.includes(word));
+}
+
+/**
+ * The fraction of query words that appear in the fields as a whole word or a word prefix, so `car`
+ * finds `car` and `cars` and never `scarf`. 1 is a full match, whatever the word order; below 1 the
+ * candidate is a suggestion. Word overlap replaced stored synonyms as the match rule (PRD-063),
+ * because a synonym table answers one phrase and still answers nothing for the next one.
+ */
+function wordMatch(
+  query: string,
+  fields: string[],
+): { score: number; matchedWords: string[]; missingWords: string[] } {
+  const words = queryWords(query);
+  const tokens = fields.join(" ").toLowerCase().split(WORD).filter(Boolean);
+  const matchedWords = words.filter((word) => tokens.some((token) => token.startsWith(word)));
+  return {
+    score: words.length === 0 ? 0 : matchedWords.length / words.length,
+    matchedWords,
+    missingWords: words.filter((word) => !matchedWords.includes(word)),
+  };
 }
 function nativeId(id: string): void {
   if (!/^[a-z0-9][a-z0-9_-]{0,199}$/i.test(id))
@@ -130,6 +168,68 @@ const proceduralAsset = (e: ProceduralElement): Asset => {
 };
 const proceduralWords = (e: ProceduralElement) =>
   [e.id, e.name, e.latin ?? "", e.kind, e.category ?? "", e.alias ?? "", ...e.biomes];
+/**
+ * The normalized form two names are compared in, so ids and queries agree on punctuation.
+ */
+const nameKey = (value: string): string => queryWords(value).join(" ");
+/**
+ * True when the element's own catalog id *is* the query, not merely covered by it. `civic-decals`
+ * must answer with that element and not its whole family, while `road` must stay in catalog order:
+ * a prefix rule promoted `road-grime` over `curve`, and a name rule promoted a "Joshua tree".
+ */
+const namedExactly = (e: ProceduralElement, key: string): boolean => nameKey(e.id) === key;
+
+/**
+ * Close rows for one procedural query (PRD-063). A direct hit shares at least half the query words;
+ * the rows rank by score, then by the category that produced the most of them. That category's
+ * remaining members then join, ranked at the category's own best score rather than at a score of
+ * their own: a sibling shares no query word, so the category is the whole evidence for it.
+ *
+ * Two consequences the shape is built for. "muscle car" reaches the sedan and the kart parked beside
+ * the coupe it matched, and the saguaro (latin *Carnegiea*) drops off the cap of five. And a 3-of-4
+ * direct hit still outranks a 2-of-4 sibling set, because inheriting a category's rank can only
+ * ever tie it, never beat a better row.
+ */
+function proceduralCloseItems(
+  scored: readonly (ReturnType<typeof wordMatch> & { element: ProceduralElement })[],
+): AssetCloseMatch[] {
+  const taken = new Set(scored.filter((entry) => entry.score === 1).map((entry) => entry.element.id));
+  const rows = scored
+    .filter((entry) => entry.score >= CLOSE_FLOOR && entry.score < 1)
+    .map((entry) => ({ ...entry }));
+  for (const entry of rows) taken.add(entry.element.id);
+  const counts = new Map<string, number>();
+  for (const { element } of rows)
+    if (element.category !== undefined)
+      counts.set(element.category, (counts.get(element.category) ?? 0) + 1);
+  const [winner] =
+    [...counts].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0] ?? [];
+  if (winner !== undefined) {
+    // The weakest member that earned the category its win, not its best: a member with no matched
+    // word must never outrank a direct hit that shares one, and inheriting the best would do exactly
+    // that whenever the winning category holds one strong row and many weak siblings.
+    const rank = Math.min(...rows.filter((e) => e.element.category === winner).map((e) => e.score));
+    for (const entry of scored)
+      if (entry.element.category === winner && !taken.has(entry.element.id)) {
+        taken.add(entry.element.id);
+        // A sibling keeps its own matched/missing words, so one that really did share a query word
+        // says so instead of reporting no overlap at all.
+        rows.push({ ...entry, score: rank });
+      }
+  }
+  return rows
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        Number(left.element.category !== winner) - Number(right.element.category !== winner),
+    )
+    .slice(0, CLOSE_MATCH_LIMIT)
+    .map(({ element, matchedWords, missingWords }) => ({
+      asset: proceduralAsset(element),
+      matchedWords,
+      missingWords,
+    }));
+}
 
 function polyAsset(item: PolyHavenAsset): Asset {
   return base(
@@ -463,7 +563,7 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
         const result = (await polyhaven.listAssets("all", { signal })).filter(
           (item) =>
             types.includes(typeOf(item.type)) &&
-            matches(query, [item.id, item.name, ...item.tags, item.category ?? ""]),
+            everyWordAppears(query, [item.id, item.name, ...item.tags, item.category ?? ""]),
         );
         const items = result.slice(0, limit).map(polyAsset);
         for (const item of items.slice(0, 3)) {
@@ -791,8 +891,26 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
     async search(query, types, limit, signal) {
       signal.throwIfAborted();
       if (!types.includes("3d-model")) return { items: [], truncated: false };
-      const hits = (catalog.elements as ProceduralElement[]).filter((e) => matches(query, proceduralWords(e)));
-      return { items: ranked(hits.slice(0, limit).map(proceduralAsset)), truncated: hits.length > limit };
+      const scored = (catalog.elements as ProceduralElement[]).map((element) => ({
+        element,
+        ...wordMatch(query, proceduralWords(element)),
+      }));
+      // A query that names one element exactly must answer with it, even when a classification word
+      // (`civic` kind, `Decals & Works` category) makes the whole family a full match. Ordering by
+      // id-or-name coverage keeps `civic-decals` at the head of its family instead of the alphabet.
+      const key = nameKey(query);
+      const hits = scored
+        .filter((entry) => entry.score === 1)
+        .sort(
+          (left, right) =>
+            Number(namedExactly(right.element, key)) - Number(namedExactly(left.element, key)),
+        )
+        .map((entry) => entry.element);
+      return {
+        items: ranked(hits.slice(0, limit).map(proceduralAsset)),
+        truncated: hits.length > limit,
+        closeItems: proceduralCloseItems(scored),
+      };
     },
     async get(id, _selection, signal) {
       signal.throwIfAborted();
@@ -823,16 +941,26 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
       id: provider,
       async search(query, types, limit, signal) {
         signal.throwIfAborted();
-        const items = packs.filter(
-          (pack) =>
-            types.includes(pack.kind as "animation" | "3d-model") &&
-            matches(query, [pack.id, pack.name]),
-        );
+        const scored = packs
+          .filter((pack) => types.includes(pack.kind as "animation" | "3d-model"))
+          .map((pack) => ({ pack, ...wordMatch(query, [pack.id, pack.name]) }));
+        const hits = scored.filter((entry) => entry.score === 1).map((entry) => entry.pack);
         return {
-          items: ranked(items.slice(0, limit).map(asAsset)),
-          truncated: items.length > limit,
-          ...(items[0]
-            ? { continuation: { tool: "itch_list_downloads", arguments: { packId: items[0].id } } }
+          items: ranked(hits.slice(0, limit).map(asAsset)),
+          truncated: hits.length > limit,
+          // Sorted before the cap: a 4-of-5 suggestion must not lose its slot to a 3-of-5 one
+          // that happens to sit earlier in the curated catalog.
+          closeItems: scored
+            .filter((entry) => entry.score >= CLOSE_FLOOR && entry.score < 1)
+            .sort((left, right) => right.score - left.score)
+            .slice(0, CLOSE_MATCH_LIMIT)
+            .map((entry) => ({
+              asset: asAsset(entry.pack),
+              matchedWords: entry.matchedWords,
+              missingWords: entry.missingWords,
+            })),
+          ...(hits[0]
+            ? { continuation: { tool: "itch_list_downloads", arguments: { packId: hits[0].id } } }
             : {}),
         };
       },

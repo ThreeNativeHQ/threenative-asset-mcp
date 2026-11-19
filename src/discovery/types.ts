@@ -48,6 +48,28 @@ export type AssetDetail = {
   termsText: string;
   providerDetails?: Record<string, unknown>;
 };
+/**
+ * A suggestion from a local catalog: a candidate that shares only part of the query (PRD-063).
+ * It never goes into `items`/`results`, because a caller reads a result row as proof the query
+ * was fully searched and matched.
+ */
+export type AssetCloseMatch = {
+  asset: Asset;
+  matchedWords: string[];
+  missingWords: string[];
+};
+/** How many close matches one search answers with, across every provider. */
+export const CLOSE_MATCH_LIMIT = 5;
+/**
+ * How many words one suggestion may carry, and how long each may be. The query is capped at 200
+ * characters, and lowercasing can double a code point (U+0130 gains a combining mark), which splits
+ * rather than lengthens the word — so a word is at most 200 characters and a query of one-character
+ * words holds at most 100 of them. 200 leaves room for both without letting a provider send a page
+ * the output schema would reject for every provider at once.
+ */
+export const CLOSE_WORD_LIMIT = 200;
+export const CLOSE_WORD_MAX_LENGTH = 200;
+
 export interface AssetAdapter {
   id: string;
   search(
@@ -58,6 +80,7 @@ export interface AssetAdapter {
   ): Promise<{
     items: Asset[];
     truncated: boolean;
+    closeItems?: AssetCloseMatch[];
     continuation?: { tool: string; arguments: Record<string, unknown> };
   }>;
   get(nativeId: string, selection: Selection, signal: AbortSignal): Promise<AssetDetail>;
