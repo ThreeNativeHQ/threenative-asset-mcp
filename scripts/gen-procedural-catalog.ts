@@ -5,7 +5,10 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 // Search words the package names do not carry. Add one when an agent asks by a common name.
-const ALIASES: Record<string, string> = { "city:signal": "traffic light stoplight" };
+const ALIASES: Record<string, string> = {
+  "city:coupe": "sports car",
+  "city:signal": "traffic light stoplight",
+};
 
 const dir = resolve(process.argv[2] ?? "");
 const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { version: string };

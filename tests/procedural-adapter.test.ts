@@ -12,6 +12,7 @@ describe("procedural adapter", () => {
     ["oak tree", "tree-oak", 'bakeVegetation({ preset: "oak"'],
     ["mossy boulder", "debris-rock", 'bakeVegetation({ preset: "rock"'],
     ["traffic light", "city-signal", 'bakeCity({ module: "signal"'],
+    ["sports car", "city-coupe", 'bakeCity({ module: "coupe"'],
   ])("finds %s first with its bake call", async (query, nativeId, bake) => {
     const { items } = await adapter().search(query, ["3d-model"], 10, signal());
     expect(items[0]).toMatchObject({
