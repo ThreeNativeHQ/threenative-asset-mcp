@@ -17,6 +17,7 @@ import {
   assetId,
   AssetSchema,
   CLOSE_MATCH_LIMIT,
+  WORD,
   type Asset,
   type AssetAdapter,
   type AssetCloseMatch,
@@ -71,7 +72,6 @@ function ranked(items: Asset[]): Asset[] {
   return items.map((item, providerRank) => ({ ...item, providerRank }));
 }
 /** Text splits on anything that is not a letter or a digit, so "two-car" is two words. */
-const WORD = /[^\p{L}\p{N}]+/u;
 /** A candidate sharing at least half the query words is a suggestion, never a result (PRD-063). */
 const CLOSE_FLOOR = 0.5;
 
