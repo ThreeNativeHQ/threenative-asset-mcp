@@ -9,7 +9,7 @@ import {
   AssetDownloadInputSchema,
   FederationError,
 } from "../discovery/federation.js";
-import { AssetSchema } from "../discovery/types.js";
+import { AssetSchema, CLOSE_WORD_LIMIT, CLOSE_WORD_MAX_LENGTH } from "../discovery/types.js";
 export { AssetSearchInputSchema, AssetGetInputSchema, AssetDownloadInputSchema };
 
 const PublicFileSchema = z.object({
@@ -39,8 +39,14 @@ const ProviderReportSchema = z.object({
     .object({ tool: z.string().max(100), arguments: z.record(z.string(), z.unknown()) })
     .optional(),
 });
+/** A suggestion: a row that shares only part of the query, so it is never proof of a full match. */
+const AssetCloseMatchSchema = AssetSchema.extend({
+  matchedWords: z.array(z.string().max(CLOSE_WORD_MAX_LENGTH)).max(CLOSE_WORD_LIMIT),
+  missingWords: z.array(z.string().max(CLOSE_WORD_MAX_LENGTH)).max(CLOSE_WORD_LIMIT),
+});
 export const AssetSearchOutputSchema = z.object({
   results: z.array(AssetSchema).max(50),
+  closeMatches: z.array(AssetCloseMatchSchema).max(5),
   providers: z.array(ProviderReportSchema).max(20),
   partial: z.boolean(),
   searchedAt: z.string(),

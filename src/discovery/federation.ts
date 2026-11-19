@@ -7,8 +7,12 @@ import {
   AssetSchema,
   AssetTypeSchema,
   assetId,
+  CLOSE_MATCH_LIMIT,
+  CLOSE_WORD_LIMIT,
+  CLOSE_WORD_MAX_LENGTH,
   type Asset,
   type AssetAdapter,
+  type AssetCloseMatch,
   type AssetDetail,
   type Selection,
 } from "./types.js";
@@ -110,6 +114,22 @@ function bounded(
   return parsed;
 }
 
+/**
+ * A suggestion's word lists, as they arrive from a provider, not as the type says they do. Bounded
+ * here as well as in the output schema: an oversized page used to pass this check and then fail the
+ * whole search at the tool, where one bad row REPLACES every provider's answer with an error.
+ */
+function isWords(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > CLOSE_WORD_LIMIT) return false;
+  // Indexed rather than `.every()`, which skips the holes of a sparse array and would let
+  // `new Array(3)` through to a schema that then rejects the whole reply.
+  for (let index = 0; index < value.length; index += 1) {
+    const word: unknown = value[index];
+    if (typeof word !== "string" || word.length > CLOSE_WORD_MAX_LENGTH) return false;
+  }
+  return true;
+}
+
 export function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
   return new Promise((resolve, reject) => {
@@ -185,6 +205,14 @@ export class AssetFederation {
         throw new FederationError("ASSET_INVALID_PROVIDER", "Unknown provider: " + provider);
     const reports: ProviderReport[] = [];
     const found = new Map<string, Asset>();
+    const closeFound = new Map<string, AssetCloseMatch[]>();
+    const accepts = (item: Asset) =>
+      input.types.includes(item.type) &&
+      (!input.freeOnly || item.free === "yes") &&
+      (!input.downloadableOnly || item.canDownloadNow) &&
+      (!input.commercialUse || item.license.commercialUse === "yes") &&
+      (input.attributionRequired === undefined ||
+        item.license.attributionRequired === (input.attributionRequired ? "yes" : "no"));
     let next = 0;
     const worker = async () => {
       while (next < selected.length) {
@@ -225,24 +253,39 @@ export class AssetFederation {
             adapter.search(input.query, input.types, Math.min(50, input.limit * 2), providerSignal),
             providerSignal,
           );
-          if (result.items.length > 100) throw new Error("Provider returned too many candidates.");
+          if (result.items.length + (result.closeItems?.length ?? 0) > 100)
+            throw new Error("Provider returned too many candidates.");
           const accepted: Asset[] = [];
           for (const candidate of result.items) {
             const item = publicAsset(candidate);
             if (item.provider !== provider || item.assetId !== assetId(provider, item.nativeId))
               throw new Error("Invalid provider identity.");
-            if (
-              !input.types.includes(item.type) ||
-              (input.freeOnly && item.free !== "yes") ||
-              (input.downloadableOnly && !item.canDownloadNow) ||
-              (input.commercialUse && item.license.commercialUse !== "yes") ||
-              (input.attributionRequired !== undefined &&
-                item.license.attributionRequired !== (input.attributionRequired ? "yes" : "no"))
-            )
-              continue;
+            if (!accepts(item)) continue;
             accepted.push(item);
           }
+          // Suggestions keep the adapter's own order: only the adapter knows which category the
+          // words pointed at, and a score re-sort here would drop the siblings it ranked (PRD-063).
+          // They also never repeat a result or each other, so `closeMatches` cannot claim a row that
+          // `results` already proves was searched.
+          const seen = new Set(accepted.map((item) => item.assetId));
+          const closes: AssetCloseMatch[] = [];
+          for (const candidate of result.closeItems ?? []) {
+            // The word lists cross a provider boundary like every other field here, so they are
+            // checked here rather than at the tool, where one malformed row would fail the search
+            // for every provider instead of just this one.
+            if (!isWords(candidate.matchedWords) || !isWords(candidate.missingWords))
+              throw new Error("Invalid provider suggestion.");
+            const item = publicAsset(candidate.asset);
+            if (item.provider !== provider || item.assetId !== assetId(provider, item.nativeId))
+              throw new Error("Invalid provider identity.");
+            if (seen.has(item.assetId) || !accepts(item)) continue;
+            seen.add(item.assetId);
+            closes.push({ ...candidate, asset: item });
+          }
+          // Both lists are complete before either is published, so a malformed suggestion cannot
+          // leave this provider's results behind while its report says `error`.
           for (const item of accepted) if (!found.has(item.assetId)) found.set(item.assetId, item);
+          closeFound.set(provider, closes.slice(0, CLOSE_MATCH_LIMIT));
           reports.push({
             ...base,
             status: "ok",
@@ -312,6 +355,14 @@ export class AssetFederation {
       }));
     return {
       results,
+      closeMatches: selected
+        .flatMap((provider) => closeFound.get(provider) ?? [])
+        .slice(0, CLOSE_MATCH_LIMIT)
+        .map(({ asset, matchedWords, missingWords }) => ({
+          ...asset,
+          matchedWords,
+          missingWords,
+        })),
       providers: reports,
       partial: reports.some((report) => report.status !== "ok"),
       searchedAt: new Date().toISOString(),

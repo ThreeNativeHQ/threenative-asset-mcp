@@ -948,6 +948,7 @@
    "name": "Track coupe",
    "biomes": [],
    "category": "Vehicles",
+   "alias": "sports car",
    "bake": "bakeCity({ module: \"coupe\", out: \"assets/environment\" })"
   },
   {

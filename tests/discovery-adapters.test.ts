@@ -29,7 +29,39 @@ const poly = (files: unknown, type = 2) =>
 const adapter = (client: PolyHavenClient) =>
   createAssetAdapters({ polyhaven: client }).find((entry) => entry.id === "polyhaven")!;
 
+/** A catalogue of Poly Haven ids, so a query is answered from what the provider actually calls things. */
+const polyCatalogue = (assets: Record<string, unknown>) =>
+  new PolyHavenClient(
+    vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/assets") return Response.json(assets);
+      if (path.startsWith("/files/")) return Response.json({});
+      const id = decodeURIComponent(path.slice(1));
+      return Response.json(assets[id] ?? model);
+    }),
+  );
+
 describe("federated provider adapters", () => {
+  it("answers a Poly Haven query whose word is only part of the asset's name", async () => {
+    // `cobblestone_floor_08` is one id, so "stone" is a substring and never a word. PRD-063's
+    // Non-Goal keeps remote providers on their own matching, and a word rule would return nothing.
+    const provider = createAssetAdapters({
+      polyhaven: polyCatalogue({
+        cobblestone_floor_08: {
+          name: "Cobblestone Floor 08",
+          type: 1,
+          tags: ["outdoor"],
+          authors: { Artist: "all" },
+        },
+        wooden_chair: { name: "Wooden Chair", type: 2, tags: ["wood"], authors: { Artist: "all" } },
+      }),
+    }).find((entry) => entry.id === "polyhaven")!;
+    const { items } = await provider.search("stone", ["texture"], 10, signal());
+    expect(items.map((item) => item.nativeId)).toEqual(["cobblestone_floor_08"]);
+    // A word still has to appear somewhere, and "scarf" is in no name, tag or category.
+    expect((await provider.search("scarf", ["texture"], 10, signal())).items).toEqual([]);
+  });
+
   it("prefers GLB at 2k and returns an honest unavailable-format alternative", async () => {
     const provider = adapter(
       poly({
