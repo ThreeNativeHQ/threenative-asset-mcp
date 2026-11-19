@@ -1,0 +1,89 @@
+name: Publish
+
+# npm trusted publishing, the same road the engine repository uses: no stored token. GitHub mints
+# this job an OIDC token and npm trades it for a publish token, because `threenative-asset-mcp` has
+# this repository and this file named as its trusted publisher.
+#
+# `NPM_TOKEN` was the old road and it is dead here — a classic or account token answers
+# `403 You may not perform that action with these credentials` when it is scoped, and `404 Not Found`
+# when it is not, which is the same E404 the engine hit on 0.3.10 and 0.3.11 before it moved to OIDC.
+#
+# One manual step per package, once, on npmjs.com: package → Settings → Trusted Publisher → GitHub
+# Actions → owner `ThreeNativeHQ`, repository `threenative-asset-mcp`, workflow `publish.yml`.
+on:
+  # A green CI run on main publishes the version in package.json, if the registry does not have it.
+  # The publish below does not re-run the suite: that suite needs Blender, the Unreal converter and
+  # Playwright fixtures, and this job deliberately provisions none of them — the CI run this is
+  # chained to is the gate, and `--ignore-scripts` is what stops `prepublishOnly` re-running a
+  # provisioned suite in an unprovisioned job.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The tag trigger is gone on purpose: the version in package.json is the release, so a
+          # rerun of an old commit cannot publish over a newer one.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24.x"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # npm only trades the OIDC token for a publish token from 11.5.1. Node 24 bundles 11, and a
+      # pin here is what keeps that version visible in the log when the trade fails.
+      - name: Use an npm that can exchange the OIDC token
+        run: npm install -g npm@11.18.0
+
+      # `files` names `dist/`, and `dist/` is gitignored: publishing without this ships a manifest
+      # pointing at files that are not in the tarball.
+      - name: Install and build the distributable
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      # A main commit whose version is already on the registry does nothing, which is the case for
+      # every push that is not a release: the version in package.json is the release.
+      - name: Read the version
+        id: version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "threenative-asset-mcp@$version" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::threenative-asset-mcp@$version is already on the registry; nothing to publish."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # No `prepublishOnly`: see the header. Provenance is signed, so the tarball names the commit
+      # and this workflow instead of a person's shell.
+      - name: Publish to the registry
+        if: steps.version.outputs.published == 'false'
+        run: npm publish --ignore-scripts --access public --provenance
