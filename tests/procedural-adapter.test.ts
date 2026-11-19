@@ -114,6 +114,22 @@ describe("close matches on a miss (PRD-063)", () => {
     expect(pack.results.map((row) => row.assetId)).toEqual(["kaykit:kaykit-platformer"]);
   });
 
+  it("keeps the adapter's id ranking when it merges providers", async () => {
+    // The federation re-sorts every provider's rows by a title score, and the exact element is
+    // titled "Four-way intersection (city)": a title-only score matched "cross" inside "crossing"
+    // and put `city-civic-crosswalk` first, undoing the adapter's own order. Whole tokens on the id
+    // and the title, with fewer extra id words winning, keeps the element that *is* the query.
+    const { results } = await federation().search({
+      query: "cross",
+      providers: ["procedural"],
+      limit: 5,
+    });
+    expect(results.slice(0, 2).map((row) => row.nativeId)).toEqual([
+      "city-cross",
+      "city-civic-crosswalk",
+    ]);
+  });
+
   it("answers a composite catalog id with that element first, not its whole family", async () => {
     // `civic` is a kind and `Decals & Works` a category, so four elements answer the query at score
     // 1. The one whose own id carries both words has to lead, or limit: 1 returns the graffiti.

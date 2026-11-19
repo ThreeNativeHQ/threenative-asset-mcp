@@ -10,6 +10,7 @@ import {
   CLOSE_MATCH_LIMIT,
   CLOSE_WORD_LIMIT,
   CLOSE_WORD_MAX_LENGTH,
+  WORD,
   type Asset,
   type AssetAdapter,
   type AssetCloseMatch,
@@ -327,13 +328,26 @@ export class AssetFederation {
         "All selected providers failed or require a specialized action.",
         reports,
       );
-    const words = input.query.toLowerCase().split(/\s+/u);
+    const asked = input.query.toLowerCase();
+    const words = asked.split(WORD).filter(Boolean);
     const score = (item: Asset) => {
       const title = item.title.toLowerCase();
+      // The adapter ranks on the id as well as the title, and this score used to undo that: the
+      // procedural element called `city-cross` is titled "Four-way intersection (city)", so a
+      // search for "cross" ranked "Zebra crossing" above it — `city-civic-crosswalk` inherited the
+      // query word from a substring of `crossing`. Whole tokens on both fields, and the id counts
+      // the same as the title, because that is where the term a person typed usually lives.
+      const idTokens = item.nativeId.toLowerCase().split(WORD).filter(Boolean);
+      const titleTokens = title.split(WORD).filter(Boolean);
+      const found = (word: string) =>
+        titleTokens.some((token) => token === word || token.startsWith(word)) ||
+        idTokens.some((token) => token === word || token.startsWith(word));
       return (
-        (title === input.query.toLowerCase() ? 40 : 0) +
-        words.filter((word) => title.includes(word)).length * 5 +
+        (title === asked ? 40 : 0) +
+        words.filter(found).length * 5 +
         (item.canDownloadNow ? 2 : 0) -
+        // Fewer words beyond the query win, so an exact id beats the family it belongs to.
+        idTokens.length * 0.5 -
         Math.min(item.providerRank, 100) / 100
       );
     };

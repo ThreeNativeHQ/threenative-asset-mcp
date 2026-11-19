@@ -69,6 +69,8 @@ export const CLOSE_MATCH_LIMIT = 5;
  */
 export const CLOSE_WORD_LIMIT = 200;
 export const CLOSE_WORD_MAX_LENGTH = 200;
+/** What separates words in a query, an id or a title. `cul-de-sac` is three words, not one. */
+export const WORD = /[^\p{L}\p{N}]+/u;
 
 export interface AssetAdapter {
   id: string;
