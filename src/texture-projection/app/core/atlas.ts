@@ -164,7 +164,8 @@ uniform sampler2D src;
 layout(location = 0) out vec4 outColor;
 void main() {
   vec4 c = texelFetch(src, ivec2(gl_FragCoord.xy), 0);
-  // alpha keeps "painted" so readBytes can fill the rest on the CPU from the painted texels around it
+  // alpha keeps "painted" so readBytes can fill the rest on the CPU from the painted texels around it,
+  // then becomes the exported painted-coverage mask (phase 2s)
   outColor = vec4(c.rgb, c.a > 0.0 ? 1.0 : 0.0);
 }`;
 

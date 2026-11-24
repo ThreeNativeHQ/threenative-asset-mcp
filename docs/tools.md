@@ -286,6 +286,12 @@ Texture projection (gray blockout levels and environments):
   smear a tone-only fill leaves, and an island with no such square borrows the patch of the one nearest it in colour.
   `fill: "debug"` paints never-painted texels hot pink (#FF69B4) instead, so a capture can count bake gaps with
   `scripts/count-debug-pink.ts`; use it for verification, never ship it.
+  The exported alpha is a painted-coverage mask: 255 where an accepted view painted the texel, 0 where the fill made
+  the colour up, feathered over six texels inwards from the paint edge and copied out into the UV gutters, which
+  `extras.threenative.textureProjection.paintedAlpha = true` on the GLB says. The material stays `alphaMode: OPAQUE`,
+  so no renderer reads that alpha as transparency, and a game can swap the atlas for the paint's own swatch exactly
+  where no view painted. A filled texel's RGB is black, not its fill colour: the canvas the GLB is exported through
+  premultiplies, so colour cannot be carried at alpha 0, and a reader that needs colour there must supply its own.
   `cookConfigHint` is the
   `threenative.config.ts` `assets.models.textures` snippet that keeps the atlas' size (at most 4096, the engine
   cook's KTX2 ceiling) and UASTC encoding; the engine cook of the release that ships PRD-916 honours the GLB's

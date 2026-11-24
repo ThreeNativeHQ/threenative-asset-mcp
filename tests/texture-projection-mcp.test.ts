@@ -252,7 +252,11 @@ describe("texture projection MCP tools", () => {
 
       // C.3: the painted GLB marks its atlas image with the atlas size and run id.
       const glb = new Uint8Array(await readFile(join(project, "assets", "painted", "courtyard.glb")));
-      expect(readProjectedAtlasMarker(glb)).toEqual({ atlas: 256, runId: run["runId"] });
+      expect(readProjectedAtlasMarker(glb)).toEqual({
+        atlas: 256,
+        runId: run["runId"],
+        paintedAlpha: true,
+      });
 
       // promptTestView buys exactly one image and writes a new, incomplete run.
       const requestsBeforePromptTest = stub.requests.length;

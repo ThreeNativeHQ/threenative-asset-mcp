@@ -895,9 +895,17 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     }
 
     // The debug fill only changes this export: nothing bought, nothing stored a second time (phase 2r).
+    // A debug bake writes no coverage mask, so its marker says so (phase 2s).
     const base64 = await app.call<string>("glb", request.fill ?? "detail");
     const outputPath = request.outputPath ?? join(runRoot, runId, "level_textured.glb");
-    await atomicWrite(outputPath, markProjectedAtlas(Buffer.from(base64, "base64"), { atlas: run.atlas, runId }));
+    await atomicWrite(
+      outputPath,
+      markProjectedAtlas(Buffer.from(base64, "base64"), {
+        atlas: run.atlas,
+        runId,
+        paintedAlpha: request.fill !== "debug",
+      }),
+    );
     // A prompt test buys one view; it does not make the level's run complete.
     run.complete = request.promptTestView === undefined;
     run.cost = summary.cost;
