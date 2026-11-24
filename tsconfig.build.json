@@ -9,5 +9,5 @@
     "noEmit": false
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["tests", "scripts", "dist"]
+  "exclude": ["tests", "scripts", "dist", "src/texture-projection/app"]
 }
