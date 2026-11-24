@@ -268,7 +268,10 @@ export async function quoteTextureProjection(
   const uvStretch = await measureUvStretch(level.absolute);
   const alias = request.firstModel ?? DEFAULT_MODEL;
   const model = resolveModel(alias);
-  const price = model?.price ?? 0;
+  if (model === undefined) {
+    throw new TextureProjectionError("TEXTURE_PROJECT_INVALID_INPUT", `unknown model alias: ${alias}`);
+  }
+  const price = model.price;
   const requestedAtlas = request.atlas ?? "auto";
   const measurementAtlas =
     requestedAtlas === "auto" ? MEASUREMENT_ATLAS : Math.min(requestedAtlas, MEASUREMENT_ATLAS);
@@ -298,7 +301,7 @@ export async function quoteTextureProjection(
     return {
       level: level.name,
       model: alias,
-      modelId: model?.id ?? alias,
+      modelId: model.id,
       pricePerView: price,
       views: plan.views,
       aerial: plan.aerial,
