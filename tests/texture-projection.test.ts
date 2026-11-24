@@ -11,9 +11,11 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   ATLAS_GUTTER_TEXELS,
-  PAINTED_ALPHA_FEATHER,
+  PAINTED_MASK_DOWNSCALE,
+  PAINTED_MASK_FEATHER,
   aerialPassOnlyHidden,
   cropRgba,
+  downsampleCoverage,
   inpaintUnpainted,
   islandLabels,
   paintedWindow,
@@ -727,28 +729,56 @@ describe("texture-projection runner", () => {
       const pink = await pinkOf(debugPath);
       expect(pink.pink).toBeGreaterThan(0);
       expect(pink.share).toBeGreaterThan(0);
+      // A debug bake is a verification export: it writes no coverage mask, and no marker names one.
+      expect(debug.paintedMask).toBeNull();
+      expect(existsSync(join(cwd, "assets", "debug.painted.png"))).toBe(false);
+      expect(readProjectedAtlasMarker(new Uint8Array(await readFile(debugPath)))).toEqual({
+        atlas: resumed.atlas,
+        runId: "reuse-run",
+      });
 
-      // The default bake's alpha is a painted-coverage mask, not transparency (phase 2s): the material
-      // stays OPAQUE so no renderer treats it as a cutout, the marker says the mask is there, and the
-      // texture really carries 255 where a view painted and 0 where the fill made the colour up.
+      // The default bake's atlas is opaque RGB and "a view painted this" ships as its own file (phase
+      // 2t): the material stays OPAQUE, the marker names the mask PNG beside the GLB, and the atlas
+      // carries the fill's colour instead of black where that mask says the fill made it up.
       const resumedRoot = (await new NodeIO().read(join(cwd, "assets", "resumed.glb"))).getRoot();
       expect(resumedRoot.listMaterials()[0]!.getAlphaMode()).toBe("OPAQUE");
-      const marker = readProjectedAtlasMarker(
-        new Uint8Array(await readFile(join(cwd, "assets", "resumed.glb"))),
-      );
-      expect(marker?.paintedAlpha).toBe(true);
+      const marker = readProjectedAtlasMarker(new Uint8Array(await readFile(join(cwd, "assets", "resumed.glb"))));
+      expect(marker?.paintedMask).toBe("resumed.painted.png");
+      expect(resumed.paintedMask).toEqual({
+        file: "resumed.painted.png",
+        path: join(cwd, "assets", "resumed.painted.png"),
+      });
+      const maskPath = join(cwd, "assets", "resumed.painted.png");
+      const maskMeta = await sharp(maskPath).metadata();
+      // A quarter of the 256 atlas, one 8-bit channel: a mask a game loads as linear data, not colour.
+      expect(maskMeta).toMatchObject({ width: 64, height: 64, channels: 1, depth: "uchar" });
+      const mask = await sharp(maskPath).raw().toBuffer();
       const raw = await sharp(resumedRoot.listMaterials()[0]!.getBaseColorTexture()!.getImage()!)
         .ensureAlpha()
         .raw()
         .toBuffer();
-      let paintedTexels = 0;
-      let filledTexels = 0;
-      for (let i = 3; i < raw.length; i += 4) {
-        if (raw[i] === 255) paintedTexels += 1;
-        else if (raw[i] === 0) filledTexels += 1;
+      let paintTexels = 0;
+      let fillTexels = 0;
+      let opaqueTexels = 0;
+      for (let i = 3; i < raw.length; i += 4) if (raw[i] === 255) opaqueTexels += 1;
+      expect(opaqueTexels).toBe((raw.length / 4)); // every texel, exactly
+      let colouredFill = 0;
+      for (let i = 0; i < mask.length; i++) {
+        if (mask[i]! > 0) {
+          paintTexels += 1;
+          continue;
+        }
+        fillTexels += 1;
+        // The 4x4 atlas block under this mask texel: a filled texel is the fill's own colour now, never
+        // the black a premultiplied canvas left there (phase 2s finding 4).
+        const x = (i % 64) * 4;
+        const y = Math.floor(i / 64) * 4;
+        const p = 4 * (y * 256 + x);
+        if (raw[p] !== 0 || raw[p + 1] !== 0 || raw[p + 2] !== 0) colouredFill += 1;
       }
-      expect(paintedTexels).toBeGreaterThan(0);
-      expect(filledTexels).toBeGreaterThan(0);
+      expect(paintTexels).toBeGreaterThan(0);
+      expect(fillTexels).toBeGreaterThan(0);
+      expect(colouredFill / fillTexels).toBeGreaterThan(0.9);
     },
     300_000,
   );
@@ -1358,13 +1388,17 @@ describe("texture-projection atlas marker (C.3)", () => {
     const marked = markProjectedAtlas(new Uint8Array(await readFile(path)), {
       atlas: 4096,
       runId: "courtyard-abc",
-      paintedAlpha: true,
+      paintedMask: "courtyard.painted.png",
     });
     expect(readProjectedAtlasMarker(marked)).toEqual({
       atlas: 4096,
       runId: "courtyard-abc",
-      paintedAlpha: true,
+      paintedMask: "courtyard.painted.png",
     });
+    // Phase 2s put the mask in the atlas' alpha and marked it with a flag: that GLB's marker names no
+    // file, so it reads back as a bake whose mask is absent (phase 2t).
+    const legacy = markProjectedAtlas(new Uint8Array(await readFile(path)), { atlas: 4096, runId: "courtyard-abc" });
+    expect(readProjectedAtlasMarker(legacy)).toEqual({ atlas: 4096, runId: "courtyard-abc" });
     // The bytes are still a readable GLB with its texture intact.
     const reread = await new NodeIO().readBinary(marked);
     expect(reread.getRoot().listTextures()).toHaveLength(1);
@@ -1467,9 +1501,11 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
       const filled = [data[p]!, data[p + 1]!, data[p + 2]!];
       const toCobble = Math.hypot(...filled.map((v, c) => v - cobble[c]!));
       const toMean = Math.hypot(...filled.map((v, c) => v - mean[c]!));
-      // The gap continues the cobbles around it, and is nothing like the atlas' mean colour. Its alpha
-      // says no accepted view painted it (phase 2s), whatever the fill made of its colour.
-      expect(data[p + 3]).toBe(0);
+      // The gap continues the cobbles around it, and is nothing like the atlas' mean colour. Its bytes
+      // stay opaque with that colour (phase 2t), and the mask — not the alpha — says no accepted view
+      // painted it (phase 2s).
+      expect(data[p + 3]).toBe(255);
+      expect(report.mask?.[y * size + x]).toBe(0);
       expect(toCobble).toBeLessThan(28);
       expect(toMean).toBeGreaterThan(toCobble);
     }
@@ -1477,15 +1513,22 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     expect(ATLAS_GUTTER_TEXELS).toBeGreaterThanOrEqual(8);
   });
 
-  it("fills a whole unpainted half from the painted half and marks the fill 0 in alpha", () => {
+  it("fills a whole unpainted half from the painted half, opaque, and marks the fill 0 in the mask", () => {
     const size = 8;
     const { data, islands } = atlasOf(size, (x, y) => (x < 4 ? [40, 80, 40] : undefined));
     const report = inpaintUnpainted(data, islands, size);
     for (let i = 0; i < size * size; i++) {
-      const alpha = data[4 * i + 3]!;
+      const texel = `texel ${i % size},${Math.floor(i / size)}`;
+      // Opaque everywhere: the atlas is a base colour, and its alpha is not a carry channel any more.
+      expect(data[4 * i + 3], texel).toBe(255);
       // Four columns are painted and four are made up, so the whole paint side is inside the feather.
-      if (i % size >= 4) expect(alpha, `filled texel ${i % size},${Math.floor(i / size)}`).toBe(0);
-      else expect(alpha, `painted texel ${i % size},${Math.floor(i / size)}`).toBeGreaterThan(0);
+      if (i % size >= 4) {
+        // The fill's own RGB, exactly what the atlas carried at 4f31afc: not black, not the atlas' mean.
+        expect(Array.from(data.subarray(4 * i, 4 * i + 4)), texel).toEqual([40, 80, 40, 255]);
+        expect(report.mask?.[i], texel).toBe(0);
+      } else {
+        expect(report.mask?.[i], texel).toBeGreaterThan(0);
+      }
     }
     expect(report.unpaintedPercent).toBe(50);
   });
@@ -1586,7 +1629,7 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     expect(report.unpaintedPercent).toBe(50);
   });
 
-  it("leaves every texel a view painted byte-identical in colour (phase 2i)", () => {
+  it("leaves every texel a view painted byte-identical (phase 2i, phase 2t)", () => {
     const size = 64;
     const dark: [number, number, number] = [70, 62, 52];
     const light: [number, number, number] = [190, 178, 158];
@@ -1597,45 +1640,50 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     inpaintUnpainted(data, islands, size);
     for (let i = 0; i < size * size; i++) {
       if (before[4 * i + 3]! < 128) continue;
-      const texel = Array.from(data.subarray(4 * i, 4 * i + 3));
+      // All four bytes: the atlas carries no mask, so a painted texel is untouched, alpha included.
+      const texel = Array.from(data.subarray(4 * i, 4 * i + 4));
       expect(texel, `painted texel ${i % size},${Math.floor(i / size)}`).toEqual(
-        Array.from(before.subarray(4 * i, 4 * i + 3)),
+        Array.from(before.subarray(4 * i, 4 * i + 4)),
       );
     }
   });
 
-  it("marks painted texels 255 in alpha and the fill 0, feathering inwards from the paint edge (phase 2s)", () => {
+  it("marks painted texels 255 in the mask and the fill 0, feathering inwards from the paint edge (phase 2s, phase 2t)", () => {
     // A 64^2 island: a 32-texel-wide checker painted by views on the left, no view on the right. The
-    // alpha is the game's answer to "did a view paint this texel": 255 deep inside the paint, 0
-    // everywhere the fill made the colour up, and a six-texel ramp on the painted side of the edge.
+    // mask is the game's answer to "did a view paint this texel": 255 deep inside the paint, 0
+    // everywhere the fill made the colour up, and a six-texel ramp on the painted side of the edge. It
+    // ships as its own file (phase 2t), so the atlas keeps its opaque colour.
     const size = 64;
     const dark: [number, number, number] = [70, 62, 52];
     const light: [number, number, number] = [190, 178, 158];
     const { data, islands } = atlasOf(size, (x, y) =>
       x < 32 ? ((Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light) : undefined,
     );
-    inpaintUnpainted(data, islands, size);
-    const alpha = (x: number, y: number) => data[4 * (y * size + x) + 3]!;
-    expect(alpha(2, 30)).toBe(255);
-    expect(alpha(25, 30)).toBe(255);
-    expect(alpha(32, 30)).toBe(0);
-    expect(alpha(63, 63)).toBe(0);
+    const mask = inpaintUnpainted(data, islands, size).mask!;
+    const value = (x: number, y: number) => mask[y * size + x]!;
+    expect(value(2, 30)).toBe(255);
+    expect(value(25, 30)).toBe(255);
+    expect(value(32, 30)).toBe(0);
+    expect(value(63, 63)).toBe(0);
+    // The atlas is opaque where the mask is 0, and the filled texel keeps a colour, not black.
+    expect(data[4 * (30 * size + 63) + 3]).toBe(255);
+    expect(data[4 * (30 * size + 63)]).toBeGreaterThan(0);
     // Monotone from the fill into the paint, with the feather strictly between 0 and 255 for a while.
     let previous = -1;
     const ramp: number[] = [];
     for (let x = 32; x >= 20; x--) {
-      const value = alpha(x, 47);
-      expect(value, `alpha at x ${x}`).toBeGreaterThanOrEqual(previous);
-      previous = value;
-      if (value > 0 && value < 255) ramp.push(value);
+      const step = value(x, 47);
+      expect(step, `mask at x ${x}`).toBeGreaterThanOrEqual(previous);
+      previous = step;
+      if (step > 0 && step < 255) ramp.push(step);
     }
     // Six texels of feather: five partial steps and the sixth texel already at full paint.
-    expect(ramp.length).toBe(PAINTED_ALPHA_FEATHER - 1);
-    expect(new Set(ramp).size).toBe(PAINTED_ALPHA_FEATHER - 1);
-    expect(alpha(32 - PAINTED_ALPHA_FEATHER, 47)).toBe(255);
+    expect(ramp.length).toBe(PAINTED_MASK_FEATHER - 1);
+    expect(new Set(ramp).size).toBe(PAINTED_MASK_FEATHER - 1);
+    expect(value(32 - PAINTED_MASK_FEATHER, 47)).toBe(255);
   });
 
-  it("copies the island edge's alpha into the UV gutters, and nothing else (phase 2s)", () => {
+  it("copies the island edge's coverage into the UV gutters, and nothing else (phase 2s, phase 2t)", () => {
     // One 32x32 island at (16,16); its rightmost three columns are a fill, everything else is painted.
     // The gutter is where `Atlas.pad` dilated the colour out of an island, so a bilinear or mipped
     // sample there must read the same coverage as the edge it came from, not the empty atlas.
@@ -1653,15 +1701,49 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
         data[p + 3] = 255;
       }
     }
-    inpaintUnpainted(data, islands, size);
-    const alpha = (x: number, y: number) => data[4 * (y * size + x) + 3]!;
-    expect(alpha(20, 20)).toBe(255); // painted, well inside
-    expect(alpha(45, 30)).toBe(0); // filled
+    const mask = inpaintUnpainted(data, islands, size).mask!;
+    const value = (x: number, y: number) => mask[y * size + x]!;
+    expect(value(20, 20)).toBe(255); // painted, well inside
+    expect(value(45, 30)).toBe(0); // filled
     // The gutter beside the painted edge carries its coverage; the one beside the fill carries 0.
-    expect(alpha(15, 20)).toBe(255);
-    expect(alpha(48, 30)).toBe(0);
-    expect(alpha(12, 20)).toBe(255); // still inside the pad's eight texels
-    expect(alpha(6, 20)).toBe(0); // past the gutter: never painted, never bled
+    expect(value(15, 20)).toBe(255);
+    expect(value(48, 30)).toBe(0);
+    expect(value(12, 20)).toBe(255); // still inside the pad's eight texels
+    expect(value(6, 20)).toBe(0); // past the gutter: never painted, never bled
+    // The atlas stays opaque in the gutter too: the mask is the only place coverage lives.
+    expect(data[4 * (20 * size + 6) + 3]).toBe(255);
+  });
+
+  it("ships the mask at a quarter of the atlas' side, box-averaged and still monotone across the edge (phase 2t)", () => {
+    // The same 64^2 island, so the file a game loads is a 16x16 PNG: 255 deep in the paint, 0 deep in
+    // the fill, and the six-texel feather arrives as one or two texels of ramp between them.
+    const size = 64;
+    const { data, islands } = atlasOf(size, (x) => (x < 32 ? [70, 62, 52] : undefined));
+    const mask = inpaintUnpainted(data, islands, size).mask!;
+    const small = downsampleCoverage(mask, size);
+    const side = size / PAINTED_MASK_DOWNSCALE;
+    expect(small.length).toBe(side * side);
+    const value = (x: number, y: number) => small[y * side + x]!;
+    expect(value(0, 8)).toBe(255);
+    expect(value(side - 1, 8)).toBe(0);
+    let previous = -1;
+    const ramp: number[] = [];
+    for (let x = side - 1; x >= 0; x--) {
+      const step = value(x, 8);
+      expect(step, `mask at x ${x}`).toBeGreaterThanOrEqual(previous);
+      previous = step;
+      if (step > 0 && step < 255) ramp.push(step);
+    }
+    expect(ramp.length).toBeGreaterThan(0);
+    expect(ramp.length).toBeLessThanOrEqual(Math.ceil(PAINTED_MASK_FEATHER / PAINTED_MASK_DOWNSCALE) + 1);
+  });
+
+  it("writes no mask for the debug fill, and none for an atlas no view painted (phase 2t)", () => {
+    const size = 8;
+    const { data, islands } = atlasOf(size, (x) => (x < 4 ? [40, 80, 40] : undefined));
+    expect(inpaintUnpainted(data, islands, size, undefined, "debug").mask).toBeUndefined();
+    const blank = atlasOf(size, () => undefined);
+    expect(inpaintUnpainted(blank.data, blank.islands, size).mask).toBeUndefined();
   });
 
   /** Pearson correlation of a crop's luminance with its own mirror about the line `line2 / 2` (a whole or half texel). */
@@ -1805,8 +1887,8 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     for (let y = 2; y < 38; y++) {
       for (let x = 74; x < 86; x++) {
         const p = 4 * (y * size + x);
-        // The plain fill's own stone, and the alpha saying no view painted it (phase 2s).
-        expect(Array.from(data.subarray(p, p + 4)), `B ${x},${y}`).toEqual([...stone, 0]);
+        // The plain fill's own stone, opaque (phase 2t): the mask, not the alpha, says no view painted it.
+        expect(Array.from(data.subarray(p, p + 4)), `B ${x},${y}`).toEqual([...stone, 255]);
       }
     }
   });

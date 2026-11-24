@@ -354,7 +354,8 @@ export function mountUi(session: Session, panel: HTMLElement, api: ReturnType<ty
   };
   glbBtn.onclick = async () => {
     if (!session.engine) return;
-    download(new Blob([await session.exportGlb()], { type: "model/gltf-binary" }), `${session.level!.name}_textured.glb`);
+    const { glb } = await session.exportGlb();
+    download(new Blob([glb], { type: "model/gltf-binary" }), `${session.level!.name}_textured.glb`);
   };
   texDl.onclick = async () => {
     if (!session.engine) return;

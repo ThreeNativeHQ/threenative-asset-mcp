@@ -250,13 +250,19 @@ describe("texture projection MCP tools", () => {
       // One image per painted view, and not a single chat completion.
       expect(stub.requests).toHaveLength(run["viewsPainted"] as number);
 
-      // C.3: the painted GLB marks its atlas image with the atlas size and run id.
+      // C.3: the painted GLB marks its atlas image with the atlas size, the run id and the mask it ships
+      // beside itself (phase 2t).
       const glb = new Uint8Array(await readFile(join(project, "assets", "painted", "courtyard.glb")));
       expect(readProjectedAtlasMarker(glb)).toEqual({
         atlas: 256,
         runId: run["runId"],
-        paintedAlpha: true,
+        paintedMask: "courtyard.painted.png",
       });
+      expect(run["paintedMask"]).toMatchObject({
+        file: "courtyard.painted.png",
+        path: expect.stringContaining(join("assets", "painted", "courtyard.painted.png")),
+      });
+      expect(existsSync(join(project, "assets", "painted", "courtyard.painted.png"))).toBe(true);
 
       // promptTestView buys exactly one image and writes a new, incomplete run.
       const requestsBeforePromptTest = stub.requests.length;

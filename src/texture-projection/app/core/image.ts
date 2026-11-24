@@ -34,6 +34,15 @@ export async function urlToRGBA(url: string, w: number, h: number): Promise<Uint
   return bitmapToRGBA(bmp, w, h);
 }
 
+/** Bytes as base64, chunked so a multi-megabyte GLB does not blow the argument limit. */
+export function toBase64(buffer: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < buffer.length; i += 0x8000) {
+    binary += String.fromCharCode(...buffer.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
 /** Read a blob as a data URL (style images travel to the model as references). */
 export function blobDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {

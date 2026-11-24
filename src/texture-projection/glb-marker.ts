@@ -1,17 +1,17 @@
 /**
  * The marker a projected GLB carries: glTF `extras.threenative.textureProjection = { atlas, runId,
- * paintedAlpha }` on the painted atlas' texture and image (C.3). The engine cook reads it to keep the
+ * paintedMask }` on the painted atlas' texture and image (C.3). The engine cook reads it to keep the
  * authored atlas size and encode UASTC instead of the default 2048 cap; it is written here, on the bytes,
  * because three's exporter writes `extras` for nodes and materials but not for textures/images.
- * `paintedAlpha` (phase 2s) says the atlas image's alpha channel is a painted-coverage mask, not
- * transparency: 255 where an accepted view painted the texel, 0 where the fill made it up. A filled
- * texel's RGB is black — the canvas a GLB is exported through premultiplies, so no colour can travel
- * at alpha 0 — and a reader that needs colour there must take it from somewhere else.
+ * `paintedMask` (phase 2t) is the file name, relative to the GLB, of the painted-coverage mask written
+ * beside it: an 8-bit grayscale PNG, one texel per 4 x 4 atlas texels, 255 where an accepted view
+ * painted and 0 where the fill made the colour up. The atlas image itself stays opaque RGB with the
+ * fill's own colour, so it keeps its UASTC cook. Absent for an older GLB.
  */
 export interface ProjectedAtlasMarker {
   readonly atlas: number;
   readonly runId: string;
-  readonly paintedAlpha: boolean;
+  readonly paintedMask?: string;
 }
 
 const GLB_MAGIC = 0x46546c67;
@@ -98,7 +98,11 @@ export function markProjectedAtlas(glb: Uint8Array, marker: ProjectedAtlasMarker
   const { json, binary } = readChunks(glb);
   const document = json as JsonArray;
   const imageIndex = baseColorImageIndex(document);
-  const projection = { atlas: marker.atlas, runId: marker.runId, paintedAlpha: marker.paintedAlpha };
+  const projection = {
+    atlas: marker.atlas,
+    runId: marker.runId,
+    ...(marker.paintedMask === undefined ? {} : { paintedMask: marker.paintedMask }),
+  };
   const merge = (target: { extras?: Record<string, unknown> }): void => {
     target.extras = { ...(target.extras ?? {}), [MARKER_KEY]: { textureProjection: projection } };
   };
@@ -116,8 +120,13 @@ export function readProjectedAtlasMarker(glb: Uint8Array): ProjectedAtlasMarker 
   const candidate =
     document.images?.find((image) => image.extras?.[MARKER_KEY] !== undefined)?.extras?.[MARKER_KEY] ??
     document.textures?.find((texture) => texture.extras?.[MARKER_KEY] !== undefined)?.extras?.[MARKER_KEY];
-  const marker = (candidate as { textureProjection?: { atlas?: unknown; runId?: unknown; paintedAlpha?: unknown } } |
+  const marker = (candidate as { textureProjection?: { atlas?: unknown; runId?: unknown; paintedMask?: unknown } } |
     undefined)?.textureProjection;
   if (!marker || typeof marker.atlas !== "number" || typeof marker.runId !== "string") return undefined;
-  return { atlas: marker.atlas, runId: marker.runId, paintedAlpha: marker.paintedAlpha === true };
+  // An older GLB (phase 2s) carried `paintedAlpha` instead, which is not a mask file: read as absent.
+  return {
+    atlas: marker.atlas,
+    runId: marker.runId,
+    ...(typeof marker.paintedMask === "string" ? { paintedMask: marker.paintedMask } : {}),
+  };
 }

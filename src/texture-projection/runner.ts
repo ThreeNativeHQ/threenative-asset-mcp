@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 import { NodeIO, Primitive } from "@gltf-transform/core";
+import sharp from "sharp";
 
 import { markProjectedAtlas } from "./glb-marker.js";
 import { VISIBLE_COVERAGE_WARN, type PaintFill } from "./atlas-pixels.js";
@@ -191,6 +192,20 @@ export interface TextureProjectionResult {
    * test, which bakes nothing; a class with no qualifying patch is null and reported in `warnings`.
    */
   readonly swatches: TextureProjectionSwatches | null;
+  /**
+   * The painted-coverage mask written beside the GLB (phase 2t): where an accepted view painted the atlas
+   * (255) and where the fill made the colour up (0), at a quarter of the atlas' side. The atlas itself is
+   * opaque RGB with the fill's own colour. Null for the debug fill, which writes no mask.
+   */
+  readonly paintedMask: TextureProjectionPaintedMask | null;
+}
+
+/** The baked mask beside the GLB: an 8-bit grayscale PNG, atlas side / 4 square (phase 2t). */
+export interface TextureProjectionPaintedMask {
+  /** File name beside the GLB, e.g. `courtyard.painted.png`. */
+  readonly file: string;
+  /** Absolute path of that file. */
+  readonly path: string;
 }
 
 /** How many painted views must all invent geometry before the run stops buying (B.2, fail closed). */
@@ -268,6 +283,12 @@ interface BrowserSwatch {
 interface BrowserSwatches {
   readonly wall?: BrowserSwatch;
   readonly floor?: BrowserSwatch;
+}
+
+/** What the app's `glb` call returns: the baked GLB, and the base64 coverage mask that ships beside it (phase 2t). */
+interface BrowserGlb {
+  readonly glb: string;
+  readonly paintedMask?: string;
 }
 
 /** What the app's measurement returns (see app/session.ts, `Session.measure`). */
@@ -452,6 +473,36 @@ async function copySwatches(
   const jsonPath = join(directory, `${base}.swatches.json`);
   await atomicWrite(jsonPath, Buffer.from(`${JSON.stringify(content, null, 1)}\n`));
   return { jsonPath, wall, floor };
+}
+
+/**
+ * Write the bake's painted-coverage mask (phase 2t) beside the GLB as `<name>.painted.png`: an 8-bit
+ * grayscale PNG at a quarter of the atlas' side, exactly the bytes the app measured, so a game reads
+ * "did a view paint this texel" without asking the atlas' alpha (which stays opaque, so it keeps its
+ * UASTC cook). `undefined` for a bake with no mask (the debug fill): nothing is written and no marker
+ * names a file.
+ */
+async function writePaintedMask(
+  outputPath: string,
+  base64: string | undefined,
+): Promise<TextureProjectionPaintedMask | null> {
+  if (base64 === undefined) return null;
+  const bytes = Buffer.from(base64, "base64");
+  const side = Math.round(Math.sqrt(bytes.byteLength));
+  if (side * side !== bytes.byteLength) {
+    throw new TextureProjectionError(
+      "TEXTURE_PROJECT_FAILED",
+      `the baked coverage mask is ${bytes.byteLength} bytes, not a square of one-byte texels`,
+    );
+  }
+  const file = `${basename(outputPath).replace(/\.\w+$/, "")}.painted.png`;
+  const path = join(dirname(outputPath), file);
+  const png = await sharp(bytes, { raw: { width: side, height: side, channels: 1 } })
+    .toColourspace("b-w") // one 8-bit channel, not a greyscale-looking sRGB PNG
+    .png()
+    .toBuffer();
+  await atomicWrite(path, png);
+  return { file, path };
 }
 
 /** One swatch without its absolute path: what `swatches.json` records. */
@@ -895,15 +946,16 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     }
 
     // The debug fill only changes this export: nothing bought, nothing stored a second time (phase 2r).
-    // A debug bake writes no coverage mask, so its marker says so (phase 2s).
-    const base64 = await app.call<string>("glb", request.fill ?? "detail");
+    // A debug bake writes no coverage mask, so nothing beside the GLB says it did (phase 2t).
+    const exported = await app.call<BrowserGlb>("glb", request.fill ?? "detail");
     const outputPath = request.outputPath ?? join(runRoot, runId, "level_textured.glb");
+    const paintedMask = await writePaintedMask(outputPath, exported.paintedMask);
     await atomicWrite(
       outputPath,
-      markProjectedAtlas(Buffer.from(base64, "base64"), {
+      markProjectedAtlas(Buffer.from(exported.glb, "base64"), {
         atlas: run.atlas,
         runId,
-        paintedAlpha: request.fill !== "debug",
+        ...(paintedMask === null ? {} : { paintedMask: paintedMask.file }),
       }),
     );
     // A prompt test buys one view; it does not make the level's run complete.
@@ -951,6 +1003,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       verifyModel:
         run.options.verify === true ? ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id) : null,
       swatches,
+      paintedMask,
     };
   } catch (error) {
     // Let the events already in flight finish writing run.json: a stopped or interrupted run must

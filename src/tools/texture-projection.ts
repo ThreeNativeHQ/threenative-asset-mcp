@@ -251,6 +251,16 @@ export const TextureProjectPaintOutputSchema = z
       .describe(
         "True-scale, tileable material swatches cut from the stored paint: a game tiles them in world space for close range and keeps the atlas for macro variation. Null for a prompt test; a class no accepted view could give a patch for is null and named in warnings.",
       ),
+    paintedMask: z
+      .object({
+        file: z.string().describe("File name beside the GLB, e.g. courtyard.painted.png."),
+        path: z.string().describe("Absolute path of that file."),
+      })
+      .strict()
+      .nullable()
+      .describe(
+        "The painted-coverage mask written beside the GLB: an 8-bit grayscale PNG at a quarter of the atlas' side, 255 where an accepted view painted the texel and 0 where the fill made the colour up, feathered and bled into the UV gutters. A game samples it as a linear data texture at the atlas' uv to swap the atlas for the paint's swatch exactly where no view painted. The atlas itself stays opaque RGB with the fill's own colour, so it cooks UASTC. Null for the debug fill, which writes no mask.",
+      ),
   })
   .strict();
 
@@ -474,6 +484,7 @@ export function createTextureProjectPaintHandler() {
         estimatedUsd: result.estimatedUsd,
         cookConfigHint: cookConfigHint(result.atlas),
         swatches: result.swatches,
+        paintedMask: result.paintedMask,
       });
       return { content: [{ type: "text" as const, text: JSON.stringify(output) }], structuredContent: output };
     } catch (error) {

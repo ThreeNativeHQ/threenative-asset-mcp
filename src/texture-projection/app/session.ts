@@ -3,7 +3,7 @@ import { aerialPassOnlyHidden, type PaintFill } from "../atlas-pixels.js";
 import { ATLAS_GAP_CELLS, MAX_TEXELS_PER_PIXEL } from "./core/atlas.js";
 import { INDOOR, OUTDOOR, OVERCAST, type Lighting } from "./core/clay.js";
 import { Engine } from "./core/engine.js";
-import { exportGlb } from "./core/export.js";
+import { exportGlb, type ExportedGlb } from "./core/export.js";
 import { Gpu } from "./core/gpu.js";
 import { toBlob, urlToRGBA } from "./core/image.js";
 import {
@@ -548,8 +548,11 @@ export class Session {
     this.viewer!.sky.addView(v.spec, v.comp, this.engine!.geometryMask(v.spec), this.engine!.size);
   }
 
-  /** Textured GLB of the level (unlit or lit material, depending on the lighting it was painted in). */
-  async exportGlb(fill: PaintFill = "detail"): Promise<ArrayBuffer> {
+  /**
+   * Textured GLB of the level (unlit or lit material, depending on the lighting it was painted in), and the
+   * painted-coverage mask that ships beside it (phase 2t).
+   */
+  async exportGlb(fill: PaintFill = "detail"): Promise<ExportedGlb> {
     if (!this.engine) throw new Error("nothing to export");
     return exportGlb(this.engine, fill);
   }

@@ -164,8 +164,8 @@ uniform sampler2D src;
 layout(location = 0) out vec4 outColor;
 void main() {
   vec4 c = texelFetch(src, ivec2(gl_FragCoord.xy), 0);
-  // alpha keeps "painted" so readBytes can fill the rest on the CPU from the painted texels around it,
-  // then becomes the exported painted-coverage mask (phase 2s)
+  // alpha keeps "painted" so readBytes can fill the rest on the CPU from the painted texels around it;
+  // the exported bytes then go opaque again and the coverage mask ships as its own file (phase 2t)
   outColor = vec4(c.rgb, c.a > 0.0 ? 1.0 : 0.0);
 }`;
 
@@ -533,10 +533,11 @@ export class Atlas {
   }
 
   /**
-   * RGBA8 export of the padded texture in glTF image order (first row = v 0). Texels no view
-   * painted are filled from the painted texels around them (push-pull, per island), never with one
-   * global mean, so a gap continues the material that surrounds it (A, phase 2d); `fill: "debug"`
-   * writes them hot pink instead, so a capture can count them (phase 2r).
+   * RGBA8 export of the padded texture in glTF image order (first row = v 0), opaque everywhere. Texels
+   * no view painted are filled from the painted texels around them (push-pull, per island), never with
+   * one global mean, so a gap continues the material that surrounds it (A, phase 2d); `fill: "debug"`
+   * writes them hot pink instead, so a capture can count them (phase 2r). The report also carries the
+   * painted-coverage mask at atlas resolution (phase 2t).
    */
   readBytes(fill: PaintFill = 'detail'): { data: Uint8ClampedArray; size: number; inpaint: InpaintReport } {
     const rt = byteTarget(this.size, this.size, { linear: false });

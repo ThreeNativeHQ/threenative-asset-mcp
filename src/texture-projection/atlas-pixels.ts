@@ -14,6 +14,12 @@ export const ATLAS_GUTTER_TEXELS = 8;
 export interface InpaintReport {
   /** Share of the atlas' island texels no view painted, filled from the material around them. */
   readonly unpaintedPercent: number;
+  /**
+   * The painted-coverage mask the detail fill measured, one byte per atlas texel (phase 2t): 255 where
+   * an accepted view painted, 0 where the fill made the colour up, feathered and gutter-bled like the
+   * exported alpha was in phase 2s. Absent for the debug fill and an atlas with no paint at all.
+   */
+  readonly mask?: Uint8Array;
 }
 
 /** What the exported atlas does with an island texel no accepted view painted (PRD-916 phase 2r). */
@@ -26,7 +32,7 @@ const DEBUG_FILL_RGB = [255, 105, 180] as const;
  * Fill the texels no view painted (alpha < 128) from the painted texels of the same UV island: a
  * breadth-first fill inwards, each texel taking the average of the filled texels around it, so a gap
  * continues the material that surrounds it inside its own UV island. The alpha those texels leave with
- * is the painted-coverage mask (phase 2s), not opacity: 0 for a filled texel, 255 for a painted one.
+ * is 255, as every texel's is: the painted-coverage mask ships separately (phase 2t).
  *
  * `fill: "debug"` (phase 2r) writes such a texel as hot pink (#FF69B4) instead, and skips the fill and
  * its grain: a capture then counts the bake's gaps as pink pixels, which is a number, where reading a
@@ -48,10 +54,11 @@ const DEBUG_FILL_RGB = [255, 105, 180] as const;
  * atlas' paint as its exported colour — nothing closer exists — and no grain, and `unpaintedPercent`
  * counts it, so the hole pass can still buy a view for it.
  *
- * The exported alpha is a painted-coverage mask (phase 2s), not transparency: 255 where an accepted view
- * painted the texel, 0 where the fill made it up, feathered inwards from the paint edge — see
- * `paintCoverageAlpha`. A caller that only wants the colour (the debug fill, an atlas with no paint at
- * all) gets the opaque bytes, as before.
+ * The exported bytes are opaque everywhere and carry the fill's own colour, as before phase 2s: the
+ * painted-coverage mask is measured separately (`paintCoverageMask`, phase 2t) and handed back in the
+ * report, because a mask in the atlas' alpha cost the atlas its UASTC cook and every filled texel its
+ * colour. A caller that only wants the colour (the debug fill, an atlas with no paint at all) gets no
+ * mask.
  */
 export function inpaintUnpainted(
   data: Uint8ClampedArray,
@@ -110,53 +117,57 @@ export function inpaintUnpainted(
   const distance = new Uint8Array(n);
   if (paintedTexels > 0) fillWithinIslands(data, labels, filled, distance, size);
   for (let i = 0; i < n; i++) {
-    if (data[4 * i + 3]! >= 128) continue;
-    // A filled texel already holds its own island's material; anything else is the atlas' guess.
-    if (!filled[i]) {
-      data[4 * i] = guess[0]!;
-      data[4 * i + 1] = guess[1]!;
-      data[4 * i + 2] = guess[2]!;
+    if (!painted[i]) {
+      // A filled texel already holds its own island's material; anything else is the atlas' guess.
+      if (!filled[i]) {
+        data[4 * i] = guess[0]!;
+        data[4 * i + 1] = guess[1]!;
+        data[4 * i + 2] = guess[2]!;
+      }
     }
+    // Opaque everywhere, whatever the fill wrote: the atlas cooks as an OPAQUE base colour.
     data[4 * i + 3] = 255;
   }
-  if (paintedTexels > 0) {
-    transferDetail(data, labels, islands, painted, distance, size);
-    paintCoverageAlpha(data, labels, islands, painted, size);
-  }
-  return { unpaintedPercent: islandTexels ? (100 * unpainted) / islandTexels : 0 };
+  const mask = paintedTexels > 0 ? paintCoverageMask(labels, islands, painted, size) : undefined;
+  if (paintedTexels > 0) transferDetail(data, labels, islands, painted, distance, size);
+  return {
+    unpaintedPercent: islandTexels ? (100 * unpainted) / islandTexels : 0,
+    ...(mask === undefined ? {} : { mask }),
+  };
 }
 
-/** Texels over which the exported alpha ramps up inside painted texels, inwards from the fill edge. */
-export const PAINTED_ALPHA_FEATHER = 6;
+/** Texels over which the mask ramps up inside painted texels, inwards from the fill edge. */
+export const PAINTED_MASK_FEATHER = 6;
+
+/** Atlas texels per mask texel: the mask ships at a quarter of the atlas' side (phase 2t). */
+export const PAINTED_MASK_DOWNSCALE = 4;
 
 /**
- * The exported alpha as a painted-coverage mask (PRD-916 phase 2s): 255 where an accepted view painted
- * the texel, 0 where the fill made it up, and a `PAINTED_ALPHA_FEATHER`-texel ramp inside the painted
- * side of that edge, so a shader that swaps the atlas for a stand-in (the paint's own swatch) there has
- * no hard line to show. The material stays OPAQUE: this alpha is a mask, never transparency.
+ * The painted-coverage mask (PRD-916 phases 2s and 2t): 255 where an accepted view painted the texel, 0
+ * where the fill made it up, and a `PAINTED_MASK_FEATHER`-texel ramp inside the painted side of that
+ * edge, so a shader that swaps the atlas for a stand-in (the paint's own swatch) there has no hard line
+ * to show. It ships as its own single-channel file beside the GLB, never in the atlas' alpha: a lossy
+ * alpha on an OPAQUE material drops the atlas off its UASTC cook, and a canvas premultiplies, so a
+ * filled texel's colour would not survive the export at alpha 0.
  *
  * The ramp is one-sided on purpose. A filled texel is exactly 0 wherever it sits, so "no view painted
  * this" is exact, and only the paint's own edge gives part of its weight away.
  *
  * The island is the boundary here too: a texel only ramps against a fill of its own island, and a UV
- * gutter copies the alpha of the island edge it was dilated from (`bleedGutterAlpha`), so a bilinear
+ * gutter copies the value of the island edge it was dilated from (`bleedGutterMask`), so a bilinear
  * sample that reaches into a gutter reads coverage rather than the unpainted atlas outside the island.
- *
- * The RGB under an alpha of 0 does not survive the export: the GLB is written through a canvas, which
- * premultiplies, so a filled texel exports black. The mask is what a reader gets there; colour it must
- * supply itself.
  */
-function paintCoverageAlpha(
-  data: Uint8ClampedArray,
+function paintCoverageMask(
   labels: Int32Array,
   islands: Uint8Array,
   painted: Uint8Array,
   size: number,
-): void {
+): Uint8Array {
   const n = size * size;
+  const mask = new Uint8Array(n);
   // Every texel no view painted reads as no paint at all, wherever it sits; the gutters below then take
-  // the alpha of the island edge they were dilated from, as the pad's colour does.
-  for (let i = 0; i < n; i++) if (!painted[i]) data[4 * i + 3] = 0;
+  // the value of the island edge they were dilated from, as the pad's colour does.
+  for (let i = 0; i < n; i++) mask[i] = painted[i] ? 255 : 0;
   const depth = new Uint8Array(n);
   const neighbours: number[] = [];
   // The paint edge: painted texels with a fill texel of their own island beside them.
@@ -168,9 +179,9 @@ function paintCoverageAlpha(
     depth[i] = 1;
     frontier.push(i);
   }
-  for (let level = 1; level <= PAINTED_ALPHA_FEATHER && frontier.length > 0; level++) {
-    for (const i of frontier) data[4 * i + 3] = Math.round((255 * level) / PAINTED_ALPHA_FEATHER);
-    if (level === PAINTED_ALPHA_FEATHER) break;
+  for (let level = 1; level <= PAINTED_MASK_FEATHER && frontier.length > 0; level++) {
+    for (const i of frontier) mask[i] = Math.round((255 * level) / PAINTED_MASK_FEATHER);
+    if (level === PAINTED_MASK_FEATHER) break;
     const next: number[] = [];
     for (const i of frontier) {
       const id = labels[i]!;
@@ -182,7 +193,30 @@ function paintCoverageAlpha(
     }
     frontier = next;
   }
-  bleedGutterAlpha(data, islands, size);
+  bleedGutterMask(mask, islands, size);
+  return mask;
+}
+
+/**
+ * The mask every renderer samples, from the atlas-space one: a plain box average over each
+ * `PAINTED_MASK_DOWNSCALE` x `PAINTED_MASK_DOWNSCALE` block, so a fourth of the side (1024 texels for a
+ * 4096 atlas) still holds the six-texel feather as one or two texels of ramp and the fill stays exactly
+ * 0. The mask covers the same UVs as the atlas, so a shader reads it at the atlas' own uv.
+ */
+export function downsampleCoverage(mask: Uint8Array, size: number, factor = PAINTED_MASK_DOWNSCALE): Uint8Array {
+  const side = Math.floor(size / factor);
+  const out = new Uint8Array(side * side);
+  for (let y = 0; y < side; y++) {
+    for (let x = 0; x < side; x++) {
+      let total = 0;
+      for (let dy = 0; dy < factor; dy++) {
+        const row = (y * factor + dy) * size + x * factor;
+        for (let dx = 0; dx < factor; dx++) total += mask[row + dx]!;
+      }
+      out[y * side + x] = Math.round(total / (factor * factor));
+    }
+  }
+  return out;
 }
 
 /** The 8-connected texels of `i` in a re-used array, so a per-texel walk allocates nothing. */
@@ -203,12 +237,12 @@ function around(i: number, size: number, out: number[]): number[] {
 }
 
 /**
- * A UV gutter copies the alpha of the island edge the colour was dilated from (`Atlas.pad`): a bilinear
+ * A UV gutter copies the mask of the island edge the colour was dilated from (`Atlas.pad`): a bilinear
  * or mipped sample at an island's border reads into the gutter, and the unbled atlas outside the island
  * is 0, which would make a painted edge read as a fill. Breadth-first out of the islands for as many
  * texels of gutter as the pad writes, each gutter texel taking the mean of the ones already known.
  */
-function bleedGutterAlpha(data: Uint8ClampedArray, islands: Uint8Array, size: number): void {
+function bleedGutterMask(mask: Uint8Array, islands: Uint8Array, size: number): void {
   const n = size * size;
   const depth = new Uint8Array(n).fill(255);
   for (let i = 0; i < n; i++) if (islands[i]) depth[i] = 0;
@@ -239,11 +273,11 @@ function bleedGutterAlpha(data: Uint8ClampedArray, islands: Uint8Array, size: nu
       let count = 0;
       for (const j of ring) {
         if (depth[j]! >= level) continue;
-        total += data[4 * j + 3]!;
+        total += mask[j]!;
         count += 1;
       }
       // The ring is the pad's own dilation of an island, so it always meets one known texel.
-      data[4 * i + 3] = count === 0 ? 0 : Math.round(total / count);
+      mask[i] = count === 0 ? 0 : Math.round(total / count);
       for (const j of ring) {
         if (depth[j] !== 255) continue;
         depth[j] = level + 1;
