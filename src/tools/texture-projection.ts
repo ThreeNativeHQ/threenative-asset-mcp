@@ -112,12 +112,18 @@ export const TextureProjectPaintInputSchema = z
       "Painted GLB to write, project-relative and under the project's assets/ directory (atomically replaced).",
     ),
     model: ModelSchema,
-    fill: z
+    fillModel: z
       .string()
       .min(1)
       .max(128)
       .optional()
       .describe("Model alias for fill and hole views (defaults to model); the first views always use model."),
+    fill: z
+      .enum(["detail", "debug"])
+      .optional()
+      .describe(
+        'What the exported atlas writes in a texel no accepted view painted: "detail" (default) continues the material around the gap; "debug" writes it hot pink (#FF69B4) so a capture can count the bake gaps. Use "debug" for verification, never ship it.',
+      ),
     atlas: AtlasSchema,
     viewSize: z
       .number()
@@ -438,7 +444,8 @@ export function createTextureProjectPaintHandler() {
         outputPath,
         ...(styleImagePath === undefined ? {} : { styleImagePath }),
         firstModel: input.model,
-        ...(input.fill === undefined ? {} : { fillModel: input.fill }),
+        ...(input.fillModel === undefined ? {} : { fillModel: input.fillModel }),
+        ...(input.fill === undefined ? {} : { fill: input.fill }),
         atlas: input.atlas,
         viewSize: input.viewSize,
         lighting: input.lighting,

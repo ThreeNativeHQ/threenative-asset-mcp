@@ -284,6 +284,8 @@ Texture projection (gray blockout levels and environments):
   around it and a masked strip continues the wall; the fill also tiles that island's own largest fully painted square
   (at least 32x32 texels, mirrored, mean subtracted) over the texels it fills, so a filled gap has grain instead of the
   smear a tone-only fill leaves, and an island with no such square borrows the patch of the one nearest it in colour.
+  `fill: "debug"` paints never-painted texels hot pink (#FF69B4) instead, so a capture can count bake gaps with
+  `scripts/count-debug-pink.ts`; use it for verification, never ship it.
   `cookConfigHint` is the
   `threenative.config.ts` `assets.models.textures` snippet that keeps the atlas' size (at most 4096, the engine
   cook's KTX2 ceiling) and UASTC encoding; the engine cook of the release that ships PRD-916 honours the GLB's

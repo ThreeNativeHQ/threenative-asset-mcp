@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { ATLAS_GUTTER_TEXELS, inpaintUnpainted, type InpaintReport } from '../../atlas-pixels.js';
+import { ATLAS_GUTTER_TEXELS, inpaintUnpainted, type InpaintReport, type PaintFill } from '../../atlas-pixels.js';
 import { byteTarget, floatTarget, passMaterial, type Gpu } from './gpu.js';
 import type { Level } from './scene.js';
 
@@ -534,15 +534,16 @@ export class Atlas {
   /**
    * RGBA8 export of the padded texture in glTF image order (first row = v 0). Texels no view
    * painted are filled from the painted texels around them (push-pull, per island), never with one
-   * global mean, so a gap continues the material that surrounds it (A, phase 2d).
+   * global mean, so a gap continues the material that surrounds it (A, phase 2d); `fill: "debug"`
+   * writes them hot pink instead, so a capture can count them (phase 2r).
    */
-  readBytes(): { data: Uint8ClampedArray; size: number; inpaint: InpaintReport } {
+  readBytes(fill: PaintFill = 'detail'): { data: Uint8ClampedArray; size: number; inpaint: InpaintReport } {
     const rt = byteTarget(this.size, this.size, { linear: false });
     this.bytesMat.uniforms.src.value = this.display.texture;
     this.gpu.pass(this.bytesMat, rt);
     const data = this.gpu.readU8(rt, 0, false);
     rt.dispose();
-    const inpaint = inpaintUnpainted(data, this.islandMask, this.size);
+    const inpaint = inpaintUnpainted(data, this.islandMask, this.size, undefined, fill);
     return { data, size: this.size, inpaint };
   }
 

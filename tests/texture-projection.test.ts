@@ -25,6 +25,7 @@ import {
   structureDeviation,
 } from "../src/texture-projection/app/core/structure.js";
 import { auditCookConfig } from "../src/texture-projection/config-audit.js";
+import { countDebugPink } from "../src/texture-projection/debug-pink.js";
 import { cookConfigHint } from "../src/tools/texture-projection.js";
 import { markProjectedAtlas, readProjectedAtlasMarker } from "../src/texture-projection/glb-marker.js";
 import { MODEL_ALIASES, DEFAULT_MODEL, prompts, resolveModel } from "../src/texture-projection/models.js";
@@ -701,6 +702,30 @@ describe("texture-projection runner", () => {
       expect(run.complete).toBe(true);
       expect(run.views.filter((view) => view.rejected !== undefined)).toHaveLength(0);
       expect(existsSync(join(cwd, "assets", "resumed.glb"))).toBe(true);
+
+      // A debug resume bakes the same stored images with every texel no view painted as hot pink (phase
+      // 2r): the provider is still gone, so the fill buys nothing, and the default bake has no pink at
+      // all — the debug fill only changes the GLB this call writes.
+      const debugPath = join(cwd, "assets", "debug.glb");
+      const debug = await paintTextureProjection({
+        resumeRunId: "reuse-run",
+        cwd,
+        env,
+        fill: "debug",
+        outputPath: debugPath,
+      });
+      expect(debug.estimatedUsd).toBe(0);
+      expect(debug.viewsPainted).toBe(bought);
+      expect(stub.requests).toHaveLength(bought);
+      const pinkOf = async (path: string) => {
+        const root = (await new NodeIO().read(path)).getRoot();
+        const image = root.listMaterials()[0]!.getBaseColorTexture()!.getImage()!;
+        return countDebugPink(await sharp(image).ensureAlpha().raw().toBuffer());
+      };
+      expect((await pinkOf(join(cwd, "assets", "resumed.glb"))).pink).toBe(0);
+      const pink = await pinkOf(debugPath);
+      expect(pink.pink).toBeGreaterThan(0);
+      expect(pink.share).toBeGreaterThan(0);
     },
     300_000,
   );
@@ -1686,6 +1711,68 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
         expect(Array.from(data.subarray(p, p + 4)), `B ${x},${y}`).toEqual([...stone, 255]);
       }
     }
+  });
+
+  it("writes the debug fill's hot pink in every texel no view painted, and leaves paint alone (phase 2r)", () => {
+    const size = 32;
+    const cobble: [number, number, number] = [92, 70, 48];
+    // One cobbled island over the whole atlas (as atlasOf packs it): a 6x6 gap inside it and a 6-row
+    // band no view reached at all.
+    const hole = (x: number, y: number) => (x >= 13 && x < 19 && y >= 13 && y < 19) || y >= 26;
+    const { data, islands } = atlasOf(size, (x, y) => (hole(x, y) ? undefined : cobble));
+    const painted = Array.from(data);
+    const report = inpaintUnpainted(data, islands, size, undefined, "debug");
+    let holes = 0;
+    for (let i = 0; i < size * size; i++) {
+      const p = 4 * i;
+      if (painted[p + 3]! >= 128) {
+        // A texel a view painted keeps its colour: no pink, no grain, no tone of the fill.
+        expect(Array.from(data.subarray(p, p + 4)), `painted ${i}`).toEqual(painted.slice(p, p + 4));
+        continue;
+      }
+      holes += 1;
+      // Exactly #FF69B4 and opaque: not the cobbles around it, not the detail fill.
+      expect(Array.from(data.subarray(p, p + 4)), `hole ${i}`).toEqual([255, 105, 180, 255]);
+    }
+    expect(holes).toBe(6 * 6 + 6 * size);
+    expect(report.unpaintedPercent).toBeCloseTo((100 * holes) / (size * size), 6);
+    // The default fill is unchanged: the same atlas in detail mode continues the cobbles there.
+    const detail = new Uint8ClampedArray(painted);
+    inpaintUnpainted(detail, islands, size);
+    const middle = 4 * (16 * size + 16);
+    expect(Array.from(detail.subarray(middle, middle + 3))).not.toEqual([255, 105, 180]);
+  });
+
+  it("counts a capture's hot pink, letting the light move it and ignoring sky and pale walls (phase 2r)", () => {
+    // A synthetic capture: the debug pink as baked, lit and in shadow, beside a blue sky, a pale plaster
+    // wall and grey stone. Exactly 30% of the pixels are the fill, which is the share to recover.
+    const width = 100;
+    const height = 100;
+    const data = new Uint8ClampedArray(width * height * 4);
+    const swatches: [number, [number, number, number]][] = [
+      [20, [255, 105, 180]], // #FF69B4 as baked
+      [5, [255, 130, 195]], // lit: the same hue, a brighter key light
+      [5, [150, 40, 96]], // in shadow: the same hue, darker
+      [40, [140, 190, 235]], // sky
+      [20, [242, 238, 228]], // pale plaster
+      [10, [120, 118, 112]], // grey stone
+    ];
+    let index = 0;
+    for (const [count, rgb] of swatches) {
+      for (let n = 0; n < count * height; n++, index++) {
+        const p = 4 * index;
+        data[p] = rgb[0];
+        data[p + 1] = rgb[1];
+        data[p + 2] = rgb[2];
+        data[p + 3] = 255;
+      }
+    }
+    const count = countDebugPink(data);
+    expect(count.pixels).toBe(width * height);
+    expect(count.pink).toBe(30 * height);
+    expect(Math.abs(count.share - 0.3)).toBeLessThan(0.01);
+    // A transparent pixel is not a bake gap: it leaves both counts.
+    expect(countDebugPink(new Uint8ClampedArray([255, 105, 180, 0]))).toEqual({ pixels: 0, pink: 0, share: 0 });
   });
 
   it("leaves only passes that look down on the level to the texels no player camera sees", () => {

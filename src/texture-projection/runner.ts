@@ -4,7 +4,7 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 import { NodeIO, Primitive } from "@gltf-transform/core";
 
 import { markProjectedAtlas } from "./glb-marker.js";
-import { VISIBLE_COVERAGE_WARN } from "./atlas-pixels.js";
+import { VISIBLE_COVERAGE_WARN, type PaintFill } from "./atlas-pixels.js";
 import { DEFAULT_VERIFY_MODEL, verifyCostUsd, verifyModelFor } from "./verify.js";
 import { DEFAULT_MODEL, resolveModel } from "./models.js";
 import {
@@ -64,6 +64,12 @@ export interface TextureProjectionRequest {
   readonly promptTestView?: number;
   readonly runId?: string;
   readonly outputPath?: string;
+  /**
+   * What the exported atlas writes where no accepted view painted: `"detail"` (the default, and today's
+   * output) fills the gap from its island, `"debug"` writes hot pink so a capture can count the gaps
+   * (phase 2r). Debug never changes what the run stores or buys: it only changes this call's GLB.
+   */
+  readonly fill?: PaintFill;
   readonly firstModel?: string;
   readonly fillModel?: string;
   readonly style?: string;
@@ -359,6 +365,7 @@ function pipelineOptions(request: TextureProjectionRequest): Record<string, unkn
   if (request.roofStyle !== undefined) options.roofStyle = request.roofStyle;
   if (request.firstModel !== undefined) options.firstModel = request.firstModel;
   if (request.fillModel !== undefined) options.fillModel = request.fillModel;
+  if (request.fill !== undefined) options.fill = request.fill;
   if (request.verifyModel !== undefined) options.verifyModel = request.verifyModel;
   return options;
 }
@@ -887,7 +894,8 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       );
     }
 
-    const base64 = await app.call<string>("glb");
+    // The debug fill only changes this export: nothing bought, nothing stored a second time (phase 2r).
+    const base64 = await app.call<string>("glb", request.fill ?? "detail");
     const outputPath = request.outputPath ?? join(runRoot, runId, "level_textured.glb");
     await atomicWrite(outputPath, markProjectedAtlas(Buffer.from(base64, "base64"), { atlas: run.atlas, runId }));
     // A prompt test buys one view; it does not make the level's run complete.

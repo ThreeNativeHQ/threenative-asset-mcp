@@ -1,5 +1,5 @@
 import { DEFAULT_MODEL, prompts, resolveModel, type EditModel, type PromptContext } from "../../models.js";
-import { VISIBLE_COVERAGE_TARGET, cropRgba, paintedWindow } from "../../atlas-pixels.js";
+import { VISIBLE_COVERAGE_TARGET, cropRgba, paintedWindow, type PaintFill } from "../../atlas-pixels.js";
 import { DEFAULT_VERIFY_MODEL, verifyPrompt, type ViewVerify } from "../../verify.js";
 import { runEdit, runVerify } from "../openrouter.js";
 import {
@@ -49,6 +49,11 @@ export interface PipelineOptions {
   verify: boolean;
   /** OpenRouter chat model id the vision check calls (`verify.ts` picks the default). */
   verifyModel: string;
+  /**
+   * What the exported atlas writes in a texel no accepted view painted: the detail fill, or hot pink for
+   * counting the bake's gaps (phase 2r). The painting passes never read it; the export does.
+   */
+  fill?: PaintFill;
 }
 
 export const DEFAULT_PIPELINE: PipelineOptions = {

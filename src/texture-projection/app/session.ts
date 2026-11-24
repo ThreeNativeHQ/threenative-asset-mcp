@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { aerialPassOnlyHidden } from "../atlas-pixels.js";
+import { aerialPassOnlyHidden, type PaintFill } from "../atlas-pixels.js";
 import { ATLAS_GAP_CELLS, MAX_TEXELS_PER_PIXEL } from "./core/atlas.js";
 import { INDOOR, OUTDOOR, OVERCAST, type Lighting } from "./core/clay.js";
 import { Engine } from "./core/engine.js";
@@ -549,9 +549,9 @@ export class Session {
   }
 
   /** Textured GLB of the level (unlit or lit material, depending on the lighting it was painted in). */
-  async exportGlb(): Promise<ArrayBuffer> {
+  async exportGlb(fill: PaintFill = "detail"): Promise<ArrayBuffer> {
     if (!this.engine) throw new Error("nothing to export");
-    return exportGlb(this.engine);
+    return exportGlb(this.engine, fill);
   }
 
   /** One PNG of a run file, or undefined when the run directory does not hold it. */

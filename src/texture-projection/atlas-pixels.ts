@@ -16,10 +16,22 @@ export interface InpaintReport {
   readonly unpaintedPercent: number;
 }
 
+/** What the exported atlas does with an island texel no accepted view painted (PRD-916 phase 2r). */
+export type PaintFill = "detail" | "debug";
+
+/** The debug fill's colour, #FF69B4: a texel of this colour was painted by no view at all. */
+const DEBUG_FILL_RGB = [255, 105, 180] as const;
+
 /**
  * Fill the texels no view painted (alpha < 128) from the painted texels of the same UV island and
  * make the atlas opaque: a breadth-first fill inwards, each texel taking the average of the filled
  * texels around it, so a gap continues the material that surrounds it inside its own UV island.
+ *
+ * `fill: "debug"` (phase 2r) writes such a texel as hot pink (#FF69B4) instead, and skips the fill and
+ * its grain: a capture then counts the bake's gaps as pink pixels, which is a number, where reading a
+ * filled gap is an opinion. Painted texels keep their colour, and so do the gutters: they were dilated
+ * from paint before this pass, so a mip still samples the level rather than a hole. A hole's pink does
+ * reach its neighbours at a high mip level, which is what a verification bake is for.
  *
  * A single global mean colour was the 2c fill, and it is what made the courtyard floor look painted
  * (PRD-916 phase 2d): every texel the magnification guard or a rejected view left empty became the
@@ -41,9 +53,9 @@ export function inpaintUnpainted(
   islands: Uint8Array,
   size: number,
   fallback: [number, number, number] = [128, 128, 128],
+  fill: PaintFill = "detail",
 ): InpaintReport {
   const n = size * size;
-  const labels = islandLabels(islands, size);
   let islandTexels = 0;
   let paintedTexels = 0;
   // Counted before the fill runs: a filled texel is still a texel no view painted, and the hole pass
@@ -65,18 +77,33 @@ export function inpaintUnpainted(
     meanG += data[4 * i + 1]!;
     meanB += data[4 * i + 2]!;
   }
-  // A copy, because the fill marks what it filled and the detail pass still needs to know which texels a
-  // view painted (those are never changed).
-  const filled = painted.slice();
-  // Texels from paint, read out of the fill's own breadth-first order: the detail's fade-in (phase 2k).
-  const distance = new Uint8Array(n);
-  if (paintedTexels > 0) fillWithinIslands(data, labels, filled, distance, size);
   // Nothing painted (a run that projected no view): keep the level's own clay-neutral tone rather
   // than filling from zeroes, which would be black.
   const guess =
     paintedTexels > 0
       ? [meanR / paintedTexels, meanG / paintedTexels, meanB / paintedTexels]
       : [fallback[0], fallback[1], fallback[2]];
+  if (fill === "debug") {
+    // No fill and no grain: a texel no accepted view painted is exactly #FF69B4, so a capture's share of
+    // pink is the bake's gap count. Painted texels (and the dilated gutters, which are painted) keep
+    // the colour they had, and everything ends opaque, as in the detail fill.
+    for (let i = 0; i < n; i++) {
+      if (data[4 * i + 3]! >= 128) continue;
+      const inIsland = islands[i] !== 0;
+      data[4 * i] = inIsland ? DEBUG_FILL_RGB[0] : guess[0]!;
+      data[4 * i + 1] = inIsland ? DEBUG_FILL_RGB[1] : guess[1]!;
+      data[4 * i + 2] = inIsland ? DEBUG_FILL_RGB[2] : guess[2]!;
+      data[4 * i + 3] = 255;
+    }
+    return { unpaintedPercent: islandTexels ? (100 * unpainted) / islandTexels : 0 };
+  }
+  const labels = islandLabels(islands, size);
+  // A copy, because the fill marks what it filled and the detail pass still needs to know which texels a
+  // view painted (those are never changed).
+  const filled = painted.slice();
+  // Texels from paint, read out of the fill's own breadth-first order: the detail's fade-in (phase 2k).
+  const distance = new Uint8Array(n);
+  if (paintedTexels > 0) fillWithinIslands(data, labels, filled, distance, size);
   for (let i = 0; i < n; i++) {
     if (data[4 * i + 3]! >= 128) continue;
     // A filled texel already holds its own island's material; anything else is the atlas' guess.

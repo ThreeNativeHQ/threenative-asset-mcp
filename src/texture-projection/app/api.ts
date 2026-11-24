@@ -1,3 +1,4 @@
+import type { PaintFill } from "../atlas-pixels.js";
 import { MODEL_ALIASES } from "../models.js";
 import { blobDataUrl } from "./core/image.js";
 import { getStyleImage, setStyleImage } from "./openrouter.js";
@@ -229,9 +230,9 @@ export function makeApi(session: Session) {
     async swatches(runId: string): Promise<SwatchReport> {
       return session.swatches(runId);
     },
-    /** Base64 GLB of the level with the painted texture. */
-    async glb(): Promise<string> {
-      const buffer = new Uint8Array(await session.exportGlb());
+    /** Base64 GLB of the level with the painted texture; `fill: "debug"` bakes the holes hot pink (phase 2r). */
+    async glb(fill?: PaintFill): Promise<string> {
+      const buffer = new Uint8Array(await session.exportGlb(fill));
       let binary = "";
       for (let i = 0; i < buffer.length; i += 0x8000) {
         binary += String.fromCharCode(...buffer.subarray(i, i + 0x8000));
