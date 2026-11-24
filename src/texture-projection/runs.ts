@@ -24,6 +24,10 @@ const StoredViewSchema = z.object({
   price: z.number(),
   coverage: z.number(),
   predicted: z.number(),
+  /** Why nothing was projected: grazing surfaces only, or an image that invented geometry. */
+  rejected: z.enum(["grazing", "structure"]).optional(),
+  structureDeviation: z.number().optional(),
+  grazingFraction: z.number().optional(),
 });
 
 const PlanSchema = z.object({

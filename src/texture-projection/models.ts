@@ -66,12 +66,21 @@ function forbidden(parts: string) {
 }
 
 const shapes = (c: PromptContext) => (c.parts ? `: ${c.parts}` : "");
+
+/**
+ * Every prompt ends with this, after the caller's style text, so no style can talk the model into
+ * inventing architecture (B.1): a painted arch, doorway, passage, staircase or extra building is
+ * geometry the level does not have, and it will not line up with the blockout from any other angle.
+ */
+export const SURFACE_ONLY_CONSTRAINT =
+  " Paint surface materials only. Keep every edge, opening and silhouette of the clay image exactly;" +
+  " add no doors, windows, arches, passages, openings, stairs, people, plants or objects that are not in the clay image.";
 /** How the light should look: the render's own sun and shadows, or soft overcast light with no cast shadows. */
 const light = (c: PromptContext) => (c.overcast
   ? "soft, even overcast daylight with no cast shadows and no sunlit patches"
   : "the same light direction and shadows");
 const surfaces = (c: PromptContext) =>
-  "Walls may show flat details such as windows, doors, shutters and stonework, but nothing sticks out of them and " +
+  "Every detail you paint follows a shape that is already in the first image; nothing sticks out of the walls and " +
   `nothing new is added: no ${forbidden(c.parts)}.` + (c.floor ? " The ground stays clear: bare paving." : "");
 
 /**
@@ -82,16 +91,16 @@ export const prompts = {
   view(c: PromptContext): string {
     if (c.mode === "roof") {
       return `A photo identical to the first image, except that its plain gray roofs are now ${c.roofLook}, following each ` +
-        `roof's exact outline and slope, with ${light(c)}; nothing is added on the roofs.`;
+        `roof's exact outline and slope, with ${light(c)}; nothing is added on the roofs.` + SURFACE_ONLY_CONSTRAINT;
     }
     if (c.mode === "first") {
       return `A photorealistic photo of ${c.look}, with exactly the camera, perspective and composition of the first ` +
         `image and ${light(c)}. Every gray shape of the first image keeps its exact outline and is now the real ` +
-        `surface it is${shapes(c)}. ${surfaces(c)}`;
+        `surface it is${shapes(c)}. ${surfaces(c)}` + SURFACE_ONLY_CONSTRAINT;
     }
     return `A photorealistic photo of ${c.look}, with ${light(c)}, identical to the first image in camera, perspective, ` +
       "composition and in every area that already has texture; the plain gray untextured surfaces of the first image now " +
-      `continue those textures seamlessly and keep their exact outlines${shapes(c)}. ${surfaces(c)}`;
+      `continue those textures seamlessly and keep their exact outlines${shapes(c)}. ${surfaces(c)}` + SURFACE_ONLY_CONSTRAINT;
   },
 };
 

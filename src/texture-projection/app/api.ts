@@ -69,8 +69,10 @@ export function makeApi(session: Session) {
         }
         const { view, cost, elapsed } = e;
         saving = saving.then(async () => {
-          await session.saveView(runId, view);
-          painted += 1;
+          // A view rejected for grazing never called the model, so it has no images to store.
+          if (view.rejected !== "grazing") await session.saveView(runId, view);
+          // "Painted" counts bought images; a rejected view painted nothing.
+          if (view.rejected === undefined) painted += 1;
           emit(viewDone(view, cost, elapsed));
         });
       },
@@ -117,6 +119,18 @@ export function makeApi(session: Session) {
       }
       return info;
     },
+    /** Measure a stored plan without repainting it (inspect). */
+    usePlan(plan: PlanJson) {
+      session.usePlan(plan);
+    },
+    /** Footprint the plan resolves, texel by texel: no model calls, no cost (A.2, C.1). */
+    async measure(opts: Partial<PlanOptions> = {}, paintedOnly = false) {
+      return session.measure(opts, paintedOnly);
+    },
+    /** The measured footprint at another atlas size (a quote reports it for the atlas it chose). */
+    blurredPercentAt(atlasSize: number) {
+      return session.blurredPercentAt(atlasSize);
+    },
     /** Camera planning only: no model calls, so no key and no cost. */
     plan(opts: Partial<PlanOptions> = {}): PlanSummary {
       const p = session.makePlan(opts);
@@ -149,13 +163,15 @@ export function makeApi(session: Session) {
     /** Paint a single planned view: a prompt test for the price of one image. */
     async promptTest(input: { runId: string; viewIndex: number; options: Partial<PipelineOptions> }) {
       const view = await session.promptTest(input.viewIndex, input.options, forward);
-      await session.saveView(input.runId, view);
+      if (view.rejected !== "grazing") await session.saveView(input.runId, view);
       return {
         index: view.index,
         model: view.model,
         seconds: view.seconds,
         price: view.price,
         coverage: view.coverage,
+        rejected: view.rejected,
+        structureDeviation: view.structureDeviation,
       };
     },
     /** Base64 GLB of the level with the painted texture. */
@@ -188,6 +204,9 @@ function viewDone(view: ViewRecord, cost: number, elapsed: number) {
     price: view.price,
     prompt: view.prompt,
     spec: view.spec,
+    rejected: view.rejected,
+    structureDeviation: view.structureDeviation === undefined ? undefined : +view.structureDeviation.toFixed(3),
+    grazingFraction: view.grazingFraction === undefined ? undefined : +view.grazingFraction.toFixed(3),
     cost: +cost.toFixed(4),
     elapsed: +elapsed.toFixed(1),
   };

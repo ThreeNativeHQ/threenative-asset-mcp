@@ -27,7 +27,12 @@ export function makeCamera(v: ViewSpec, aspect = 1, near = 0.05, far = 2000): TH
   return cam;
 }
 
-/** Writes per-pixel world position + distance, normal + geometry flag, and UV + capture quality. */
+/**
+ * Writes per-pixel world position + distance, normal + geometry flag, UV + capture quality, and the
+ * view's own footprint: how many atlas texels one image pixel covers here (UV area per pixel times
+ * the atlas' texels per unit UV area). That number, not the distance, says whether the atlas can be
+ * sharp from this view (see A.2: over ~2x2 texels per pixel is magnification blur).
+ */
 const GEOMETRY_VERT = /* glsl */ `
 in float label;
 out vec3 vWorld;
@@ -44,6 +49,7 @@ void main() {
 }`;
 
 const GEOMETRY_FRAG = /* glsl */ `
+uniform float atlasTexels;   // N * N: atlas texels per unit UV area
 in vec3 vWorld;
 in vec3 vNormal;
 in vec2 vUv;
@@ -51,14 +57,19 @@ flat in float vLabel;
 layout(location = 0) out vec4 gPos;
 layout(location = 1) out vec4 gNrm;
 layout(location = 2) out vec4 gUvq;
+layout(location = 3) out vec4 gFoot;
 void main() {
   vec3 toCam = cameraPosition - vWorld;
   float dist = length(toCam);
   vec3 n = normalize(vNormal) * (gl_FrontFacing ? 1.0 : -1.0);
   float cosv = dot(n, toCam / dist);
+  vec2 uvDx = dFdx(vUv);
+  vec2 uvDy = dFdy(vUv);
+  float texelsPerPixel = abs(uvDx.x * uvDy.y - uvDx.y * uvDy.x) * atlasTexels;
   gPos = vec4(vWorld, dist);
   gNrm = vec4(n, vLabel + 1.0);   // a > 0.5 means geometry; a - 1 is the part label
   gUvq = vec4(vUv, cosv / max(dist, 0.5), cosv);
+  gFoot = vec4(texelsPerPixel, sqrt(max(texelsPerPixel, 0.0)), 0.0, 1.0);
 }`;
 
 /** Composites what a view's image model sees: known texels in colour, the rest as lit clay. */
@@ -88,14 +99,15 @@ export class ViewRenderer {
   readonly stateTarget: THREE.WebGLRenderTarget;
   private readonly stateMaterial: THREE.ShaderMaterial;
 
-  constructor(private readonly gpu: Gpu, level: Level, readonly size = 1024) {
+  constructor(private readonly gpu: Gpu, level: Level, readonly size = 1024, atlasSize = 4096) {
     const mat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: GEOMETRY_VERT, fragmentShader: GEOMETRY_FRAG, side: THREE.DoubleSide,
+      uniforms: { atlasTexels: { value: atlasSize * atlasSize } },
     });
     const mesh = new THREE.Mesh(level.geometry, mat);
     mesh.frustumCulled = false;
     this.geometryScene.add(mesh);
-    this.geometryTarget = floatTarget(size, size, { count: 3, depth: true });
+    this.geometryTarget = floatTarget(size, size, { count: 4, depth: true });
     this.stateTarget = new THREE.WebGLRenderTarget(size, size, {
       count: 2, type: THREE.UnsignedByteType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
       depthBuffer: false, generateMipmaps: false,

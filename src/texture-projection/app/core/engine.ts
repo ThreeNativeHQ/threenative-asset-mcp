@@ -27,7 +27,7 @@ export class Engine {
     this.options = { ...DEFAULT_ENGINE, ...opts };
     const s = this.options.viewSize;
     this.clay = new ClayRenderer(gpu, level, this.options.lighting, s);
-    this.views = new ViewRenderer(gpu, level, s);
+    this.views = new ViewRenderer(gpu, level, s, this.options.atlasSize);
     this.atlas = new Atlas(gpu, level, this.options.atlasSize);
     this.clayTarget = this.clay.makeTarget(s);
     this.compTexture = new THREE.DataTexture(new Uint8Array(s * s * 4), s, s, THREE.RGBAFormat, THREE.UnsignedByteType);

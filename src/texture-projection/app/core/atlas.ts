@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { ATLAS_GUTTER_TEXELS, infillUnpainted } from '../../atlas-pixels.js';
 import { byteTarget, floatTarget, passMaterial, type Gpu } from './gpu.js';
 import type { Level } from './scene.js';
 
@@ -66,6 +67,51 @@ const ISLAND_FRAG = /* glsl */ `
 layout(location = 0) out vec4 outColor;
 void main() { outColor = vec4(1.0); }`;
 
+/**
+ * The paint pass without a model image: which view would win each texel, and how many atlas texels
+ * that view's image pixel covers there (r = capture quality, g = texels per image pixel). The plan's
+ * own footprint, measured before a single image is bought.
+ */
+const QUALITY_FRAG = /* glsl */ `
+precision highp float;
+uniform sampler2D prev;
+uniform sampler2D gPos;
+uniform sampler2D gFoot;
+uniform mat4 viewProj;
+uniform vec3 camPos;
+uniform float ratio;
+uniform vec2 texel;
+uniform float edgeRadius;
+in vec3 vWorld;
+in vec3 vNormal;
+layout(location = 0) out vec4 outColor;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 old = texelFetch(prev, p, 0);
+  outColor = old;
+  vec4 clip = viewProj * vec4(vWorld, 1.0);
+  if (clip.w <= 0.0) return;
+  vec3 ndc = clip.xyz / clip.w;
+  if (abs(ndc.x) > 0.999 || abs(ndc.y) > 0.999) return;
+  vec2 suv = ndc.xy * 0.5 + 0.5;
+  vec3 toCam = camPos - vWorld;
+  float dist = length(toCam);
+  float cosv = dot(normalize(vNormal), toCam / dist);
+  if (cosv < 0.35) return;
+  vec4 g = texture(gPos, suv);
+  if (g.w > 0.0 && dist > g.w + 0.02 + 0.01 * dist) return;
+  float q = cosv / max(dist, 0.5);
+  float edge = 0.0;
+  for (int k = 0; k < 8; k++) {
+    float a = 0.7853982 * float(k);
+    vec4 n = texture(gPos, suv + vec2(cos(a), sin(a)) * edgeRadius * texel);
+    if (n.w <= 0.0 || abs(n.w - g.w) > 0.04 * g.w) edge = 1.0;
+  }
+  q *= mix(1.0, 0.3, edge);
+  if (old.r > 0.0 && old.r >= ratio * q) return;
+  outColor = vec4(q, texture(gFoot, suv).r, 0.0, 1.0);
+}`;
+
 const COPY_FRAG = /* glsl */ `
 uniform sampler2D src;
 layout(location = 0) out vec4 outColor;
@@ -93,11 +139,11 @@ void main() {
 
 const BYTES_FRAG = /* glsl */ `
 uniform sampler2D src;
-uniform vec3 fill;
 layout(location = 0) out vec4 outColor;
 void main() {
   vec4 c = texelFetch(src, ivec2(gl_FragCoord.xy), 0);
-  outColor = vec4(c.a > 0.0 ? c.rgb : fill, 1.0);
+  // alpha keeps "painted" so readBytes can infill the rest on the CPU with the atlas' own mean colour
+  outColor = vec4(c.rgb, c.a > 0.0 ? 1.0 : 0.0);
 }`;
 
 const CELL_FRAG = /* glsl */ `
@@ -123,6 +169,14 @@ void main() {
   outColor = vec4(island, known * island, 0.0, 1.0);
 }`;
 
+const MASK_FRAG = /* glsl */ `
+uniform sampler2D src;
+layout(location = 0) out vec4 outColor;
+void main() {
+  bool painted = texelFetch(src, ivec2(gl_FragCoord.xy), 0).a > 0.0;
+  outColor = painted ? vec4(1.0) : vec4(0.0);
+}`;
+
 export class Atlas {
   private a: THREE.WebGLRenderTarget;
   private b: THREE.WebGLRenderTarget;
@@ -134,10 +188,11 @@ export class Atlas {
   private readonly uvMesh: THREE.Mesh;
   private readonly uvCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private readonly projectMat: THREE.ShaderMaterial;
+  private readonly qualityMat: THREE.ShaderMaterial;
   private readonly islandMat: THREE.ShaderMaterial;
   private readonly copyMat = passMaterial(COPY_FRAG, { src: { value: null } });
   private readonly dilateMat = passMaterial(DILATE_FRAG, { src: { value: null }, islands: { value: null } });
-  private readonly bytesMat = passMaterial(BYTES_FRAG, { src: { value: null }, fill: { value: new THREE.Vector3(0.5, 0.5, 0.5) } });
+  private readonly bytesMat = passMaterial(BYTES_FRAG, { src: { value: null } });
   private readonly cellMat = passMaterial(CELL_FRAG, { src: { value: null }, cell: { value: 32 } });
   private readonly statsMat = passMaterial(STATS_FRAG, { src: { value: null }, islands: { value: null }, step: { value: 8 } });
 
@@ -157,6 +212,13 @@ export class Atlas {
     this.islandMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: UV_VERT, fragmentShader: ISLAND_FRAG, side: THREE.DoubleSide,
       depthTest: false, depthWrite: false,
+    });
+    this.qualityMat = new THREE.ShaderMaterial({
+      glslVersion: THREE.GLSL3, vertexShader: UV_VERT, fragmentShader: QUALITY_FRAG, side: THREE.DoubleSide,
+      depthTest: false, depthWrite: false,
+      uniforms: { prev: { value: null }, gPos: { value: null }, gFoot: { value: null }, viewProj: { value: new THREE.Matrix4() },
+        camPos: { value: new THREE.Vector3() }, ratio: { value: 0.4 }, texel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+        edgeRadius: { value: 6 } },
     });
     this.uvMesh = new THREE.Mesh(level.geometry, this.islandMat);
     this.uvMesh.frustumCulled = false;
@@ -195,8 +257,12 @@ export class Atlas {
     this.pad();
   }
 
-  /** Fill UV gutters around islands so bilinear sampling never pulls in unpainted texels. */
-  pad(iterations = 6) {
+  /**
+   * Fill UV gutters around islands so bilinear sampling never pulls in unpainted texels. Eight
+   * 3x3 dilations are eight texels of gutter, the >= 8 px guard C.2 asks for; readBytes then fills
+   * what is still empty at any mip level.
+   */
+  pad(iterations = ATLAS_GUTTER_TEXELS) {
     this.copyMat.uniforms.src.value = this.a.texture;
     this.gpu.pass(this.copyMat, this.display);
     this.dilateMat.uniforms.islands.value = this.islands.texture;
@@ -211,6 +277,58 @@ export class Atlas {
       this.copyMat.uniforms.src.value = src.texture;
       this.gpu.pass(this.copyMat, this.display);
     }
+  }
+
+  /**
+   * What the painter would win from these views, texel by texel: r = the winning view's capture quality,
+   * g = atlas texels that view's image pixel covers. No model image is involved, so a quote can report
+   * the footprint before anything is bought. Targets are transient; the atlas is left untouched.
+   */
+  measureProjection(
+    count: number,
+    prepare: (index: number) => { camera: THREE.Camera; gPos: THREE.Texture; foot: THREE.Texture },
+    ratio: number,
+  ): Float32Array {
+    let from = floatTarget(this.size, this.size);
+    let into = floatTarget(this.size, this.size);
+    try {
+      for (const target of [from, into]) this.gpu.draw(new THREE.Scene(), this.uvCam, target, 0x000000, 0);
+      for (let index = 0; index < count; index++) {
+        // Geometry must be rendered for this view *now*: the buffers are one target, reused per view.
+        const view = prepare(index);
+        const u = this.qualityMat.uniforms;
+        u.prev.value = from.texture;
+        u.gPos.value = view.gPos;
+        u.gFoot.value = view.foot;
+        u.viewProj.value.multiplyMatrices(view.camera.projectionMatrix, view.camera.matrixWorldInverse);
+        u.camPos.value.setFromMatrixPosition(view.camera.matrixWorld);
+        u.ratio.value = ratio;
+        const img = view.gPos.image as { width: number; height: number };
+        u.texel.value.set(1 / img.width, 1 / img.height);
+        u.edgeRadius.value = (6 * img.width) / 1024;
+        this.uvMesh.material = this.qualityMat;
+        this.gpu.draw(this.uvScene, this.uvCam, into, null);
+        this.uvMesh.material = this.islandMat;
+        [from, into] = [into, from];
+      }
+      return this.gpu.readF32(from, 0, false);
+    } finally {
+      this.uvMesh.material = this.islandMat;
+      from.dispose();
+      into.dispose();
+    }
+  }
+
+  /** 1 where the texture holds any paint at all (alpha > 0), for measuring a finished run. */
+  paintedMask(): Uint8Array {
+    const rt = byteTarget(this.size, this.size, { linear: false });
+    const mat = passMaterial(MASK_FRAG, { src: { value: this.a.texture } });
+    this.gpu.pass(mat, rt);
+    const px = this.gpu.readU8(rt, 0, false);
+    rt.dispose();
+    const out = new Uint8Array(this.size * this.size);
+    for (let i = 0; i < out.length; i++) out[i] = px[4 * i]! > 127 ? 1 : 0;
+    return out;
   }
 
   /** Share of island texels painted so far (sampled every 8th texel). */
@@ -244,14 +362,18 @@ export class Atlas {
     return q;
   }
 
-  /** RGBA8 export of the padded texture in glTF image order (first row = v 0). */
-  readBytes(fill: [number, number, number] = [0.5, 0.5, 0.5]): { data: Uint8ClampedArray; size: number } {
+  /**
+   * RGBA8 export of the padded texture in glTF image order (first row = v 0). Texels no view
+   * painted are infilled with the atlas' mean painted colour, not with clay gray: a mip level
+   * coarser than the 8 px gutter then blends toward the atlas, never toward a flat foreign colour.
+   */
+  readBytes(): { data: Uint8ClampedArray; size: number } {
     const rt = byteTarget(this.size, this.size, { linear: false });
     this.bytesMat.uniforms.src.value = this.display.texture;
-    this.bytesMat.uniforms.fill.value.set(...fill);
     this.gpu.pass(this.bytesMat, rt);
     const data = this.gpu.readU8(rt, 0, false);
     rt.dispose();
+    infillUnpainted(data);
     return { data, size: this.size };
   }
 

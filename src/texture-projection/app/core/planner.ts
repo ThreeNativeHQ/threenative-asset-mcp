@@ -332,7 +332,7 @@ export function holeViews(level: Level, o: PlanOptions, points: THREE.Vector3[])
  */
 export function probeCells(gpu: Gpu, views: ViewRenderer, specs: ViewSpec[], o: PlanOptions,
   only?: (label: number, ny: number, y: number) => boolean): CellList[] {
-  const rt = floatTarget(o.probeSize, o.probeSize, { count: 3, depth: true });
+  const rt = floatTarget(o.probeSize, o.probeSize, { count: 4, depth: true });
   const G = o.grid;
   const scratch = new Float32Array(G * G);
   const out: CellList[] = [];

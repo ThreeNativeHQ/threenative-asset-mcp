@@ -3,10 +3,12 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 
 import { NodeIO, Primitive } from "@gltf-transform/core";
 
+import { markProjectedAtlas } from "./glb-marker.js";
 import { DEFAULT_MODEL, resolveModel } from "./models.js";
 import { defaultRunRoot, readRun, writeRun, type StoredPlan, type StoredRun, type StoredView } from "./runs.js";
 import { openAppSession, type AppEvent } from "./session.js";
 import { startUiServer } from "./ui-server.js";
+import { measureUvStretch, type UvStretchReport } from "./uv-stretch.js";
 
 export type TextureProjectionErrorCode =
   | "TEXTURE_PROJECT_MISSING_UV"
@@ -14,6 +16,8 @@ export type TextureProjectionErrorCode =
   | "TEXTURE_PROJECT_LEVEL_NOT_FOUND"
   | "TEXTURE_PROJECT_LEVEL_UNREADABLE"
   | "TEXTURE_PROJECT_RUN_NOT_FOUND"
+  | "TEXTURE_PROJECT_UNSAFE_PATH"
+  | "TEXTURE_PROJECT_INVALID_INPUT"
   | "TEXTURE_PROJECT_FAILED";
 
 export class TextureProjectionError extends Error {
@@ -53,7 +57,8 @@ export interface TextureProjectionRequest {
   readonly style?: string;
   readonly roofStyle?: string;
   readonly lighting?: "outdoor" | "overcast" | "indoor";
-  readonly atlas?: number;
+  /** "auto" (the default) measures the plan and picks the smallest atlas that matches it (C.1). */
+  readonly atlas?: number | "auto";
   readonly viewSize?: number;
   readonly styleImagePath?: string;
   readonly plan?: TextureProjectionPlanInput;
@@ -68,6 +73,7 @@ export interface TextureProjectionRequest {
 export interface TextureProjectionQuote {
   readonly level: string;
   readonly model: string;
+  readonly modelId: string;
   readonly pricePerView: number;
   readonly views: number;
   readonly aerial: number;
@@ -76,6 +82,10 @@ export interface TextureProjectionQuote {
   readonly points: number;
   readonly predicted: number;
   readonly estimatedUsd: number;
+  /** The atlas size the run would bake (C.1), and what it would resolve there (A.2). */
+  readonly atlas: number;
+  readonly estimatedBlurredTexelPercent: number;
+  readonly uvStretch: UvStretchReport;
 }
 
 export interface TextureProjectionResult {
@@ -88,6 +98,32 @@ export interface TextureProjectionResult {
   readonly estimatedUsd: number;
   readonly seconds: number;
   readonly complete: boolean;
+  readonly atlas: number;
+  /** Painted texels whose best view resolves more than ~2x2 atlas texels per image pixel (A.2). */
+  readonly blurredTexelPercent: number;
+  readonly viewsRejected: { readonly grazing: number; readonly structure: number };
+}
+
+/** Atlas size a plan is measured at: small enough to read back, exact after scaling by area. */
+export const MEASUREMENT_ATLAS = 1024;
+/** No atlas below this can hold a level's islands without wasting the views' resolution. */
+export const MIN_AUTO_ATLAS = 512;
+export const MAX_AUTO_ATLAS = 8192;
+
+/**
+ * C.1: the smallest power of two whose texel size matches the best view's pixel footprint on the
+ * median surface. Footprints are texels per image pixel, so an atlas `k` times larger has `k^2`
+ * times as many texels under one pixel: the size that puts one texel under a pixel is the
+ * measurement atlas divided by the square root of the measured median footprint.
+ *
+ * The nearest power of two, not the next one up: rounding up can pick an atlas four times finer than
+ * the views resolve (a 4.2K match became 8K on the sample courtyard), which is the wasted texels
+ * C.1 forbids. The nearest is within sqrt(2) of the match, so a texel still matches a pixel.
+ */
+export function autoAtlasSize(measurementAtlas: number, medianFoot: number): number {
+  const candidate = medianFoot > 0 ? measurementAtlas / Math.sqrt(medianFoot) : measurementAtlas;
+  const power = 2 ** Math.round(Math.log2(Math.max(candidate, MIN_AUTO_ATLAS)));
+  return Math.min(MAX_AUTO_ATLAS, Math.max(MIN_AUTO_ATLAS, power));
 }
 
 /** Plan summary the browser app returns (see app/api.ts). */
@@ -116,6 +152,17 @@ interface BrowserPromptTest {
   readonly price: number;
   readonly seconds: number;
   readonly coverage: number;
+  readonly rejected?: "grazing" | "structure";
+}
+
+/** What the app's measurement returns (see app/session.ts, `Session.measure`). */
+interface BrowserMeasurement {
+  readonly atlas: number;
+  readonly views: number;
+  readonly islandTexels: number;
+  readonly paintedTexels: number;
+  readonly medianFoot: number;
+  readonly blurredTexelPercent: number;
 }
 
 interface PreparedLevel {
@@ -209,14 +256,22 @@ async function atomicWrite(path: string, bytes: Uint8Array): Promise<void> {
   }
 }
 
-/** Plans cameras in the browser and reports what a run would buy. No model calls, so no key is needed. */
+/**
+ * Plans cameras in the browser and reports what a run would buy: view counts, the atlas it would
+ * bake, the UV stretch of the mesh and what that atlas would blur. No model calls, so no key.
+ */
 export async function quoteTextureProjection(
   request: TextureProjectionRequest & { readonly levelPath: string },
 ): Promise<TextureProjectionQuote> {
   const cwd = request.cwd ?? process.cwd();
   const level = await prepareLevel(request.levelPath, cwd);
+  const uvStretch = await measureUvStretch(level.absolute);
   const alias = request.firstModel ?? DEFAULT_MODEL;
-  const price = resolveModel(alias)?.price ?? 0;
+  const model = resolveModel(alias);
+  const price = model?.price ?? 0;
+  const requestedAtlas = request.atlas ?? "auto";
+  const measurementAtlas =
+    requestedAtlas === "auto" ? MEASUREMENT_ATLAS : Math.min(requestedAtlas, MEASUREMENT_ATLAS);
   const server = await startUiServer({
     levelPath: level.absolute,
     runRoot: defaultRunRoot(cwd),
@@ -231,15 +286,19 @@ export async function quoteTextureProjection(
   try {
     await app.call("load", "/api/level", {
       lighting: request.lighting ?? "overcast",
-      atlasSize: request.atlas ?? 4096,
+      atlasSize: measurementAtlas,
       viewSize: request.viewSize ?? 1024,
       name: level.name,
     });
     const plan = await app.call<BrowserPlan>("plan", planInput(request));
+    const measurement = await app.call<BrowserMeasurement>("measure", planInput(request), false);
+    const atlas = requestedAtlas === "auto" ? autoAtlasSize(measurementAtlas, measurement.medianFoot) : requestedAtlas;
+    const estimatedBlurredTexelPercent = await app.call<number>("blurredPercentAt", atlas);
     // Every planned view is one image, and the hole pass may add up to its budget on top.
     return {
       level: level.name,
       model: alias,
+      modelId: model?.id ?? alias,
       pricePerView: price,
       views: plan.views,
       aerial: plan.aerial,
@@ -248,9 +307,60 @@ export async function quoteTextureProjection(
       points: plan.points,
       predicted: plan.predicted,
       estimatedUsd: (plan.views + plan.holes) * price,
+      atlas,
+      estimatedBlurredTexelPercent,
+      uvStretch,
     };
   } finally {
     await app.close();
+    await server.close();
+  }
+}
+
+/**
+ * Measure the finished run's footprint at its own atlas size. At or below the measurement atlas the
+ * painting session already holds the real texture, so the painted texels are the run's own; a larger
+ * atlas is measured at the cap and scaled (A.2's count is a share, so scaling is exact per texel).
+ */
+async function measureBlurredPercent(app: Awaited<ReturnType<typeof openAppSession>>, run: StoredRun, measurementAtlas: number): Promise<number> {
+  if (run.atlas > measurementAtlas) {
+    await app.call("load", "/api/level", {
+      lighting: run.lighting,
+      atlasSize: measurementAtlas,
+      viewSize: run.viewSize,
+      name: run.level,
+    });
+    await app.call("usePlan", run.plan);
+    await app.call<BrowserMeasurement>("measure", {}, false);
+  } else {
+    await app.call<BrowserMeasurement>("measure", {}, true);
+  }
+  return app.call<number>("blurredPercentAt", run.atlas);
+}
+
+/**
+ * Measure a stored run's blur at its own atlas size, from its stored plan: inspect's number. No model
+ * calls, no key, and the run directory is only read.
+ */
+export async function measureStoredRunBlurredPercent(runRoot: string, run: StoredRun): Promise<number> {
+  const measurementAtlas = Math.min(run.atlas, MEASUREMENT_ATLAS);
+  const server = await startUiServer({ levelPath: run.levelPath, runRoot });
+  try {
+    const app = await openAppSession({ url: server.url });
+    try {
+      await app.call("load", "/api/level", {
+        lighting: run.lighting,
+        atlasSize: measurementAtlas,
+        viewSize: run.viewSize,
+        name: run.level,
+      });
+      await app.call("usePlan", run.plan);
+      await app.call<BrowserMeasurement>("measure", {}, false);
+      return await app.call<number>("blurredPercentAt", run.atlas);
+    } finally {
+      await app.close();
+    }
+  } finally {
     await server.close();
   }
 }
@@ -296,7 +406,9 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     throw new TextureProjectionError("TEXTURE_PROJECT_FAILED", `unknown model alias: ${request.fillModel}`);
   }
   const lighting = stored?.lighting ?? request.lighting ?? "overcast";
-  const atlas = stored?.atlas ?? request.atlas ?? 4096;
+  // "auto" (C.1) is decided from a measurement below, once the browser has planned the cameras.
+  const requested = stored?.atlas ?? request.atlas ?? "auto";
+  const measurementAtlas = requested === "auto" ? MEASUREMENT_ATLAS : Math.min(requested, MEASUREMENT_ATLAS);
   const viewSize = stored?.viewSize ?? request.viewSize ?? 1024;
   const runId = request.runId ?? stored?.runId ?? `${level.name}-${Date.now().toString(36)}`;
   const now = new Date().toISOString();
@@ -306,7 +418,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     level: level.name,
     levelPath: level.absolute,
     lighting,
-    atlas,
+    atlas: measurementAtlas,
     viewSize,
     options: pipelineOptions(request),
     plan: { points: [], views: [], waves: [], predicted: [], grid: 1, reachableCells: 0 },
@@ -371,6 +483,9 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       price: number;
       coverage: number;
       predicted: number;
+      rejected?: "grazing" | "structure";
+      structureDeviation?: number;
+      grazingFraction?: number;
       cost: number;
       elapsed: number;
     };
@@ -387,6 +502,9 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       predicted: view.predicted,
       ...(view.prompt === undefined ? {} : { prompt: view.prompt }),
       ...(view.left === undefined ? {} : { left: view.left }),
+      ...(view.rejected === undefined ? {} : { rejected: view.rejected }),
+      ...(view.structureDeviation === undefined ? {} : { structureDeviation: view.structureDeviation }),
+      ...(view.grazingFraction === undefined ? {} : { grazingFraction: view.grazingFraction }),
     };
     run.views = [...run.views.filter((v) => v.index !== storedView.index), storedView].sort(
       (a, b) => a.index - b.index,
@@ -399,7 +517,18 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
   }
 
   try {
-    await app.call("load", "/api/level", { lighting, atlasSize: atlas, viewSize, name: level.name });
+    let atlas = requested === "auto" ? 0 : requested;
+    await app.call("load", "/api/level", { lighting, atlasSize: measurementAtlas, viewSize, name: level.name });
+    if (atlas === 0) {
+      await app.call<BrowserPlan>("plan", planInput(request));
+      const measured = await app.call<BrowserMeasurement>("measure", planInput(request), false);
+      atlas = autoAtlasSize(measurementAtlas, measured.medianFoot);
+    }
+    // Paint at the chosen size: the plan only depends on the cameras, so it is planned again as is.
+    if (atlas !== measurementAtlas) {
+      await app.call("load", "/api/level", { lighting, atlasSize: atlas, viewSize, name: level.name });
+    }
+    run.atlas = atlas;
 
     let summary: BrowserRun;
     if (request.promptTestView !== undefined) {
@@ -433,7 +562,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
 
     const base64 = await app.call<string>("glb");
     const outputPath = request.outputPath ?? join(runRoot, runId, "level_textured.glb");
-    await atomicWrite(outputPath, Buffer.from(base64, "base64"));
+    await atomicWrite(outputPath, markProjectedAtlas(Buffer.from(base64, "base64"), { atlas: run.atlas, runId }));
     // A prompt test buys one view; it does not make the level's run complete.
     run.complete = request.promptTestView === undefined;
     run.cost = summary.cost;
@@ -450,6 +579,12 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       estimatedUsd: summary.cost,
       seconds: summary.seconds,
       complete: run.complete,
+      atlas: run.atlas,
+      blurredTexelPercent: await measureBlurredPercent(app, run, measurementAtlas),
+      viewsRejected: {
+        grazing: run.views.filter((view) => view.rejected === "grazing").length,
+        structure: run.views.filter((view) => view.rejected === "structure").length,
+      },
     };
   } finally {
     // Closing the browser is what interrupts a run whose hook threw: its page stops mid-view.

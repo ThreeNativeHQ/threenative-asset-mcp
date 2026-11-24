@@ -6,6 +6,7 @@ import { Gpu } from "./core/gpu.js";
 import { toBlob, urlToRGBA } from "./core/image.js";
 import {
   DEFAULT_PIPELINE,
+  GRAZING_VIEW_LIMIT,
   generateView,
   prepareView,
   promptText,
@@ -18,10 +19,29 @@ import {
 } from "./core/pipeline.js";
 import { plan as makePlan, type Plan, type PlanOptions } from "./core/planner.js";
 import { loadLevel, type Level } from "./core/scene.js";
-import type { ViewSpec } from "./core/views.js";
+import { makeCamera, type ViewSpec } from "./core/views.js";
 import { Viewer } from "./core/viewer.js";
 
 export const LIGHTING: Record<string, Lighting> = { outdoor: OUTDOOR, overcast: OVERCAST, indoor: INDOOR };
+
+/**
+ * An image pixel that covers more than ~2x2 atlas texels is magnification blur (A.2): the atlas is
+ * oversampled where the views cannot resolve more detail. Four texels per pixel is that 2x2.
+ */
+export const BLUR_TEXELS_PER_PIXEL = 4;
+
+/** What a plan resolves at one atlas size: the footprint of the winning view per painted texel. */
+export interface ProjectionMeasurement {
+  /** Atlas size the footprints were measured at. */
+  readonly atlas: number;
+  readonly views: number;
+  readonly islandTexels: number;
+  readonly paintedTexels: number;
+  /** Median texels per image pixel over painted island texels; 1 = one texel per pixel. */
+  readonly medianFoot: number;
+  /** Share of painted texels whose best view has one pixel covering more than 2x2 texels, in percent. */
+  readonly blurredTexelPercent: number;
+}
 
 import { postHeaders } from "./token.js";
 
@@ -34,6 +54,7 @@ export class Session {
   plan?: Plan;
   record?: RunRecord;
   private abort?: AbortController;
+  private measurement?: { atlas: number; foot: Float32Array; painted: Uint8Array; islandTexels: number; paintedTexels: number };
 
   constructor(readonly canvas: HTMLCanvasElement) {
     this.gpu = new Gpu(canvas);
@@ -103,6 +124,13 @@ export class Session {
     return record;
   }
 
+  /** Adopt a stored plan (inspect re-measures a finished run without repainting it). */
+  usePlan(json: PlanJson) {
+    this.plan = decodePlan(json);
+    this.viewer?.showPlan(this.plan.points, this.plan.views);
+    if (this.viewer) this.viewer.dirty = true;
+  }
+
   /** Load a stored run's plan and composites into the engine; returns what still has to be painted. */
   async restore(runId: string, meta: StoredRun): Promise<{ plan: Plan; skip: Set<number>; prior: RunPrior }> {
     if (!this.engine || !this.viewer) throw new Error("load the level first");
@@ -113,7 +141,8 @@ export class Session {
     this.viewer.setMode("textured");
     const saved = [...meta.views].sort((a, b) => a.index - b.index);
     const prior: ViewRecord[] = [];
-    for (const v of saved) {
+    // A rejected view was never projected and has no images on disk; it is skipped, not re-bought.
+    for (const v of saved.filter((view) => view.rejected === undefined)) {
       const comp = await urlToRGBA(`/api/runs/${encodeURIComponent(runId)}/view_${v.index}_comp.png`, S, S);
       const spec: ViewSpec = plan.views[v.index] ?? { ...v.spec, id: v.index };
       this.engine.paint(spec, comp);
@@ -150,12 +179,7 @@ export class Session {
     if (!spec) throw new Error(`no planned view ${viewIndex}`);
     const o: PipelineOptions = { ...DEFAULT_PIPELINE, ...opts };
     const p = prepareView(this.engine, spec, o, true);
-    onEvent({ type: "view-start", index: viewIndex, wave: 0, model: p.model.key, state: p.state });
-    const r = await generateView(p, this.engine.size, o.seed + viewIndex, o.feather, this.abort?.signal);
-    this.engine.paint(p.spec, r.comp);
-    this.viewer.setMode("textured");
-    this.viewer.dirty = true;
-    const view: ViewRecord = {
+    const base: ViewRecord = {
       index: viewIndex,
       wave: 0,
       spec: p.spec,
@@ -163,19 +187,108 @@ export class Session {
       first: p.isFirst,
       unknownFraction: p.unknownFraction,
       prompt: promptText(p),
-      left: r.left,
-      seconds: r.seconds,
-      price: p.model.price,
+      seconds: 0,
+      price: 0,
       clay: p.clay,
       state: p.state,
       edit: p.edit,
+      gen: new Uint8ClampedArray(0),
+      comp: new Uint8ClampedArray(0),
+      coverage: this.engine.atlas.coverage(),
+      predicted: plan.predicted[viewIndex] ?? 0,
+      grazingFraction: p.grazingFraction,
+    };
+    if (p.grazingFraction > GRAZING_VIEW_LIMIT) {
+      // A prompt test on a view that is almost all grazing surface buys nothing: no request is made.
+      const view: ViewRecord = { ...base, rejected: "grazing" };
+      onEvent({ type: "view-done", view, cost: 0, elapsed: 0 });
+      return view;
+    }
+    onEvent({ type: "view-start", index: viewIndex, wave: 0, model: p.model.key, state: p.state });
+    const r = await generateView(p, this.engine.size, o.seed + viewIndex, o.feather, this.abort?.signal);
+    if (!r.rejected) {
+      this.engine.paint(p.spec, r.comp);
+      this.viewer.setMode("textured");
+      this.viewer.dirty = true;
+    }
+    const view: ViewRecord = {
+      ...base,
+      left: r.left,
+      seconds: r.seconds,
+      price: p.model.price,
       gen: r.gen,
       comp: r.comp,
       coverage: this.engine.atlas.coverage(),
-      predicted: plan.predicted[viewIndex] ?? 0,
+      structureDeviation: r.structureDeviation,
+      ...(r.rejected ? { rejected: "structure" as const } : {}),
     };
     onEvent({ type: "view-done", view, cost: p.model.price, elapsed: r.seconds });
     return view;
+  }
+
+  /**
+   * Measure what the current plan resolves, texel by texel, without buying an image: the winning
+   * view's footprint per atlas texel. Run it at the measurement atlas (<= 1024 px): the readback and
+   * the transient sim targets are sized by the loaded atlas. `paintedOnly` masks to what this run
+   * actually painted, so the number describes the bake, not only the plan.
+   */
+  async measure(opts: Partial<PlanOptions> = {}, paintedOnly = false): Promise<ProjectionMeasurement> {
+    if (!this.engine) throw new Error("load a level first");
+    const plan = this.plan ?? this.makePlan(opts);
+    const engine = this.engine;
+    const size = engine.options.atlasSize;
+    const pixels = engine.atlas.measureProjection(
+      plan.views.length,
+      (index) => {
+        const camera = makeCamera(plan.views[index]!);
+        engine.views.renderGeometry(camera);
+        return {
+          camera,
+          gPos: engine.views.geometryTarget.textures[0]!,
+          foot: engine.views.geometryTarget.textures[3]!,
+        };
+      },
+      engine.options.qualityRatio,
+    );
+    const islands = this.gpu.readU8(engine.atlas.islands, 0, false);
+    const paintedMask = paintedOnly ? engine.atlas.paintedMask() : undefined;
+    const foot = new Float32Array(size * size);
+    const painted = new Uint8Array(size * size);
+    let islandTexels = 0;
+    let paintedTexels = 0;
+    for (let i = 0; i < foot.length; i++) {
+      const island = islands[4 * i]! > 127;
+      if (island) islandTexels += 1;
+      painted[i] = paintedMask ? paintedMask[i]! : pixels[4 * i]! > 0 ? 1 : 0;
+      if (!island || !painted[i] || !(pixels[4 * i]! > 0)) continue;
+      paintedTexels += 1;
+      foot[i] = pixels[4 * i + 1]!;
+    }
+    this.measurement = { atlas: size, foot, painted, islandTexels, paintedTexels };
+    return {
+      atlas: size,
+      views: plan.views.length,
+      islandTexels,
+      paintedTexels,
+      medianFoot: medianOfPainted(this.measurement),
+      blurredTexelPercent: this.blurredPercentAt(size),
+    };
+  }
+
+  /**
+   * The same footprint at another atlas size: an atlas twice as large puts four times as many texels
+   * under one image pixel, so the blur threshold scales with the square of the size ratio. This is
+   * what a quote reports for the atlas it just chose.
+   */
+  blurredPercentAt(atlasSize: number): number {
+    const measurement = this.measurement;
+    if (!measurement) throw new Error("measure before reading a blur percent");
+    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize) ** 2;
+    if (measurement.paintedTexels === 0) return 0;
+    let blurred = 0;
+    const foot = measurement.foot;
+    for (let i = 0; i < foot.length; i++) if (foot[i]! > 0 && foot[i]! > threshold) blurred += 1;
+    return (100 * blurred) / measurement.paintedTexels;
   }
 
   stop() {
@@ -213,6 +326,25 @@ export class Session {
     view.edit = new Uint8Array(0);
     view.gen = new Uint8ClampedArray(0);
   }
+}
+
+/** Median of the painted texels' footprints, from a log2 histogram (no 1M-element sort). */
+function medianOfPainted(measurement: { foot: Float32Array; painted: Uint8Array; paintedTexels: number }): number {
+  if (measurement.paintedTexels === 0) return 0;
+  const buckets = new Float64Array(128);
+  for (let i = 0; i < measurement.foot.length; i++) {
+    const value = measurement.foot[i]!;
+    if (!(value > 0)) continue;
+    const bucket = Math.min(127, Math.max(0, Math.floor((Math.log2(value) + 24) * 4)));
+    buckets[bucket] = buckets[bucket]! + 1;
+  }
+  const half = measurement.paintedTexels / 2;
+  let seen = 0;
+  for (let b = 0; b < buckets.length; b++) {
+    seen += buckets[b]!;
+    if (seen >= half) return 2 ** ((b + 0.5) / 4 - 24);
+  }
+  return 0;
 }
 
 /** What `/api/runs/<id>/run.json` holds, as far as the app reads it back. */

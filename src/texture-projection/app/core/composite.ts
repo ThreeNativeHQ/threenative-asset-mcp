@@ -47,6 +47,32 @@ export function untouched(state: Uint8ClampedArray, gen: Uint8ClampedArray, area
   return out;
 }
 
+/**
+ * Share of a view's geometry pixels the projection's grazing gate rejects (cos(view angle) below
+ * `threshold`): a view that is almost all wall seen edge-on cannot put its image anywhere useful.
+ * The same 0.35 threshold the shader applies (A.1), measured per view before any model call.
+ */
+export function grazingShare(
+  position: Float32Array,
+  normal: Float32Array,
+  camera: { x: number; y: number; z: number },
+  threshold = 0.35,
+): number {
+  let geometry = 0;
+  let grazing = 0;
+  for (let i = 0; i < normal.length; i += 4) {
+    if (normal[i + 3]! < 0.5) continue; // sky
+    geometry += 1;
+    const dx = camera.x - position[i]!;
+    const dy = camera.y - position[i + 1]!;
+    const dz = camera.z - position[i + 2]!;
+    const dist = Math.hypot(dx, dy, dz) || 1;
+    const cosv = (normal[i]! * dx + normal[i + 1]! * dy + normal[i + 2]! * dz) / dist;
+    if (!(cosv >= threshold)) grazing += 1;
+  }
+  return geometry > 0 ? grazing / geometry : 1;
+}
+
 /** Square-kernel binary dilation (Chebyshev radius r), separable. */
 export function dilate(m: Uint8Array, w: number, h: number, r: number): Uint8Array {
   if (r <= 0) return m.slice();

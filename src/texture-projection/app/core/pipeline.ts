@@ -6,6 +6,7 @@ import {
   editMask,
   featherComposite,
   fraction,
+  grazingShare,
   keepOnly,
   masksFromState,
   paintedFromState,
@@ -16,6 +17,7 @@ import type { Engine } from "./engine.js";
 import { bitmapToRGBA, toDataUrl } from "./image.js";
 import { DEFAULT_PLAN, holeViews, plan as makePlan, type Plan, type PlanOptions } from "./planner.js";
 import { classifyView, describeView } from "./semantics.js";
+import { rejectsStructure, structureDeviation } from "./structure.js";
 import { makeCamera, ViewRenderer, type ViewSpec } from "./views.js";
 
 export interface PipelineOptions {
@@ -45,6 +47,9 @@ export const DEFAULT_PIPELINE: PipelineOptions = {
   plan: {},
 };
 
+/** Why a view's image was not projected: it shows almost only grazing surfaces, or it invents geometry. */
+export type ViewRejection = "grazing" | "structure";
+
 export interface ViewRecord {
   index: number;
   wave: number;
@@ -52,6 +57,12 @@ export interface ViewRecord {
   model: string;
   first: boolean;
   unknownFraction: number;
+  /** Set when nothing was projected: the image was not bought (grazing) or not trusted (structure). */
+  rejected?: ViewRejection;
+  /** Low-frequency luminance the model added over the image it was given; rejected above 0.13. */
+  structureDeviation?: number;
+  /** Share of this view's geometry the 0.35 grazing gate rejects. */
+  grazingFraction?: number;
   /** The prompt text sent with this view. */
   prompt?: string;
   /** Share of the area to paint that the model handed back unpainted (left out of the projection). */
@@ -113,6 +124,8 @@ export interface PreparedView {
   skip: boolean;
   model: EditModel;
   prompt: PromptContext;
+  /** Share of the view's geometry below the shader's 0.35 grazing gate. */
+  grazingFraction: number;
 }
 
 /**
@@ -131,8 +144,9 @@ export function prepareView(
   if (!first || !fill) throw new Error(`unknown model ${!first ? o.firstModel : o.fillModel}`);
   const S = engine.size;
   // hole views keep everything painted, however poor, so the model sees it as it is
-  const { state, mask, clay } = engine.renderView(spec, spec.kind === "fill" ? 0 : undefined);
+  const { camera, state, mask, clay } = engine.renderView(spec, spec.kind === "fill" ? 0 : undefined);
   const { pos, nrm } = engine.readGeometry();
+  const grazingFraction = grazingShare(pos, nrm, camera.position);
   const labels = engine.level.labels;
   const cls = classifyView(nrm, pos, labels, engine.level.bounds.min.y);
   let masks = masksFromState(mask);
@@ -175,8 +189,15 @@ export function prepareView(
     floor: desc.floorShare > 0.5,
     overcast: !!engine.clay.lighting.overcast,
   };
-  return { spec, clay, state, masks, geometry, edit, keep, unknownFraction, isFirst, skip, model, prompt };
+  return { spec, clay, state, masks, geometry, edit, keep, unknownFraction, isFirst, skip, model, prompt, grazingFraction };
 }
+
+/**
+ * A view whose geometry is almost entirely below the grazing gate puts no texel worth having: buying
+ * its image would project nothing (A.1 leaves those texels for the hole pass). Measured on the
+ * sample courtyard, street views stay under 0.6 while a wall seen edge-on is over 0.9.
+ */
+export const GRAZING_VIEW_LIMIT = 0.85;
 
 export const promptText = (p: Pick<PreparedView, "prompt">) => prompts.view(p.prompt);
 
@@ -206,7 +227,19 @@ export async function generateView(p: PreparedView, size: number, seed: number, 
   }
   const keep = nLeft ? (p.keep ?? p.geometry).map((v, i) => v & (1 - leftOver[i])) : p.keep;
   if (keep) comp = keepOnly(comp, keep, p.geometry);
-  return { gen, comp, seconds: r.seconds, left: nUnknown ? nLeft / nUnknown : 0 };
+  // B.2: the model must keep the image it was given. A painted arch, doorway or new volume moves the
+  // low-frequency luminance far more than any material does, so that view is logged and not projected.
+  const deviation = structureDeviation(corrected, p.state, size, size);
+  const rejected = rejectsStructure(deviation);
+  return {
+    gen,
+    // A rejected view paints nothing: its composite stays the state the model was handed.
+    comp: rejected ? p.state : comp,
+    seconds: r.seconds,
+    left: nUnknown ? nLeft / nUnknown : 0,
+    structureDeviation: deviation,
+    rejected,
+  };
 }
 
 /** Views a resumed run already has on disk: their pixels are replayed from the saved composites. */
@@ -240,15 +273,36 @@ export async function runPipeline(
   const roofsByPass = (o.plan.roofs ?? 0) > 0 || plan.views.some((v) => v.kind === "roof");
   const startOfRun = (prior?.views.length ?? 0) === 0;
 
+  const empty = (): { clay: Uint8ClampedArray; state: Uint8ClampedArray; edit: Uint8Array; gen: Uint8ClampedArray; comp: Uint8ClampedArray } => ({
+    clay: new Uint8ClampedArray(0),
+    state: new Uint8ClampedArray(0),
+    edit: new Uint8Array(0),
+    gen: new Uint8ClampedArray(0),
+    comp: new Uint8ClampedArray(0),
+  });
+
   const runView = async (spec: ViewSpec, vi: number, wave: number) => {
     const p = prepareView(engine, { ...spec, id: vi }, o, startOfRun && vi === 0, roofsByPass);
     if (p.skip) return;
+    if (p.grazingFraction > GRAZING_VIEW_LIMIT) {
+      // Almost everything in view is below the grazing gate: no image is bought for it.
+      const view: ViewRecord = {
+        index: vi, wave, spec: p.spec, model: p.model.key, first: p.isFirst,
+        unknownFraction: p.unknownFraction, prompt: promptText(p), seconds: 0, price: 0,
+        coverage: engine.atlas.coverage(), predicted: plan.predicted[vi] ?? 0,
+        rejected: "grazing", grazingFraction: p.grazingFraction, ...empty(),
+      };
+      views.push(view);
+      done.add(vi);
+      onEvent({ type: "view-done", view, cost, elapsed: (performance.now() - t0) / 1000 });
+      return;
+    }
     onEvent({ type: "view-start", index: vi, wave, model: p.model.key, state: p.state });
     try {
       const r = await withRetry((attempt) =>
         generateView(p, S, o.seed + 1000 * attempt + vi, o.feather, signal),
       );
-      engine.paint(p.spec, r.comp);
+      if (!r.rejected) engine.paint(p.spec, r.comp);
       cost += p.model.price;
       const view: ViewRecord = {
         index: vi,
@@ -268,6 +322,9 @@ export async function runPipeline(
         comp: r.comp,
         coverage: engine.atlas.coverage(),
         predicted: plan.predicted[vi] ?? 0,
+        structureDeviation: r.structureDeviation,
+        grazingFraction: p.grazingFraction,
+        ...(r.rejected ? { rejected: "structure" as const } : {}),
       };
       views.push(view);
       done.add(vi);
