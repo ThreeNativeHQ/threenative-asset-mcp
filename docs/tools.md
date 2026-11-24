@@ -277,7 +277,10 @@ Texture projection (gray blockout levels and environments):
   with a shadow, and the strip is 0.25 m along the wall where the sky or a farther surface is behind the edge
   (`edgeBandMask`; `edgeBandShare` in run.json records what it took). The atlas is then filled per UV island from that
   island's own painted texels (`inpaintUnpainted`), never across the atlas packing, so a gap continues the material
-  around it and a masked strip continues the wall. `cookConfigHint` is the
+  around it and a masked strip continues the wall; the fill also tiles that island's own largest fully painted square
+  (at least 32x32 texels, mirrored, mean subtracted) over the texels it fills, so a filled gap has grain instead of the
+  smear a tone-only fill leaves, and an island with no such square borrows the patch of the one nearest it in colour.
+  `cookConfigHint` is the
   `threenative.config.ts` `assets.models.textures` snippet that keeps the atlas' size (at most 4096, the engine
   cook's KTX2 ceiling) and UASTC encoding; the engine cook of the release that ships PRD-916 honours the GLB's
   marker on its own.

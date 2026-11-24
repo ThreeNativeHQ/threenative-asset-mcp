@@ -1421,6 +1421,118 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     expect(labels[8 * size + 9]).toBe(1);
   });
 
+  /** Mean over a crop of each texel's 3x3 luminance variance: 0 for a smear, high for real grain. */
+  function localVariance(data: Uint8ClampedArray, size: number, x0: number, x1: number, y0: number, y1: number) {
+    const lum = (x: number, y: number) => {
+      const p = 4 * (Math.min(size - 1, Math.max(0, y)) * size + Math.min(size - 1, Math.max(0, x)));
+      return (data[p]! + data[p + 1]! + data[p + 2]!) / 3;
+    };
+    let total = 0;
+    let texels = 0;
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const window: number[] = [];
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) window.push(lum(x + dx, y + dy));
+        const mean = window.reduce((a, b) => a + b, 0) / window.length;
+        total += window.reduce((a, v) => a + (v - mean) ** 2, 0) / window.length;
+        texels += 1;
+      }
+    }
+    return total / texels;
+  }
+
+  /** Mean RGB over a crop. */
+  function cropMean(data: Uint8ClampedArray, size: number, x0: number, x1: number, y0: number, y1: number) {
+    const sum: [number, number, number] = [0, 0, 0];
+    let texels = 0;
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const p = 4 * (y * size + x);
+        sum[0] += data[p]!;
+        sum[1] += data[p + 1]!;
+        sum[2] += data[p + 2]!;
+        texels += 1;
+      }
+    }
+    return [sum[0]! / texels, sum[1]! / texels, sum[2]! / texels];
+  }
+
+  it("gives the unpainted half of an island its painted half's grain, not the fill's smear (phase 2i)", () => {
+    // A 64^2 island: the left half is an 8-texel checker (so it holds a fully painted 32x32 square),
+    // the right half no view painted. The BFS fill alone leaves the right half flat: the smeared
+    // streaks and flat beige the owner saw in game.
+    const size = 64;
+    const dark: [number, number, number] = [70, 62, 52];
+    const light: [number, number, number] = [190, 178, 158];
+    const { data, islands } = atlasOf(size, (x, y) =>
+      x < 32 ? ((Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light) : undefined,
+    );
+    const paintedVariance = localVariance(data, size, 1, 30, 1, size - 2);
+    expect(paintedVariance).toBeGreaterThan(100);
+    const report = inpaintUnpainted(data, islands, size);
+    const filledVariance = localVariance(data, size, 35, 62, 1, size - 2);
+    expect(filledVariance).toBeGreaterThanOrEqual(0.5 * paintedVariance);
+    // Subtracting the patch's mean keeps the fill's tone: the hole continues its neighbours' colour.
+    const paintedMean = cropMean(data, size, 0, 31, 0, size - 1);
+    const filledMean = cropMean(data, size, 32, size - 1, 0, size - 1);
+    for (let c = 0; c < 3; c++) expect(Math.abs(filledMean[c]! - paintedMean[c]!)).toBeLessThanOrEqual(5);
+    expect(report.unpaintedPercent).toBe(50);
+  });
+
+  it("leaves every texel a view painted byte-identical (phase 2i)", () => {
+    const size = 64;
+    const dark: [number, number, number] = [70, 62, 52];
+    const light: [number, number, number] = [190, 178, 158];
+    const { data, islands } = atlasOf(size, (x, y) =>
+      x < 32 ? ((Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light) : undefined,
+    );
+    const before = Uint8ClampedArray.from(data);
+    inpaintUnpainted(data, islands, size);
+    for (let i = 0; i < size * size; i++) {
+      if (before[4 * i + 3]! < 128) continue;
+      const texel = Array.from(data.subarray(4 * i, 4 * i + 4));
+      expect(texel, `painted texel ${i % size},${Math.floor(i / size)}`).toEqual(
+        Array.from(before.subarray(4 * i, 4 * i + 4)),
+      );
+    }
+  });
+
+  it("borrows the patch of the painted island nearest in colour when it has no square of its own (phase 2i)", () => {
+    const size = 96;
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size);
+    const paint = (x: number, y: number, rgb: [number, number, number]) => {
+      const p = 4 * (y * size + x);
+      data[p] = rgb[0];
+      data[p + 1] = rgb[1];
+      data[p + 2] = rgb[2];
+      data[p + 3] = 255;
+    };
+    const dark: [number, number, number] = [60, 55, 50];
+    const light: [number, number, number] = [140, 135, 130];
+    // Donor A (40x40 checker, mean [100, 95, 90]) and decoy C (40x40 flat pale stone, zero detail:
+    // borrowing it would leave the borrower as flat as the fill). Borrower B is a 16x40 island whose
+    // only paint is a two-texel strip of A's mean colour, so it can hold no 32x32 square of its own and
+    // is nearest A in colour.
+    for (let y = 0; y < 40; y++) {
+      for (let x = 0; x < 40; x++) {
+        islands[y * size + x] = 1;
+        paint(x, y, (Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light);
+        islands[(y + 48) * size + x] = 1;
+        paint(x, y + 48, [230, 230, 230]);
+      }
+    }
+    for (let y = 0; y < 40; y++) for (let x = 48; x < 64; x++) islands[y * size + x] = 1;
+    for (let y = 0; y < 2; y++) for (let x = 48; x < 64; x++) paint(x, y, [100, 95, 90]);
+    const donorVariance = localVariance(data, size, 1, 38, 1, 38);
+    expect(donorVariance).toBeGreaterThan(100);
+    inpaintUnpainted(data, islands, size);
+    const borrowedVariance = localVariance(data, size, 50, 61, 4, 37);
+    expect(borrowedVariance).toBeGreaterThanOrEqual(0.5 * donorVariance);
+    const borrowedMean = cropMean(data, size, 50, 61, 4, 37);
+    for (let c = 0; c < 3; c++) expect(Math.abs(borrowedMean[c]! - [100, 95, 90][c]!)).toBeLessThanOrEqual(5);
+  });
+
   it("leaves only passes that look down on the level to the texels no player camera sees", () => {
     // The aerial-mask rule (phase 2e): the courtyard's floor mosaic came from an aerial view that was
     // allowed to paint ground a player walks on. Only aerials and roof passes get restricted.

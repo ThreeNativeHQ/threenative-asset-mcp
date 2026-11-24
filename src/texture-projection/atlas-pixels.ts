@@ -30,9 +30,11 @@ export interface InpaintReport {
  * texels of its own island, so a gap in a floor island cannot take the white plaster of a wall island
  * that happens to sit next to it in the atlas' packing.
  *
- * An island with no painted texel at all gets the mean of the atlas' paint as its exported colour —
- * nothing closer exists — and `unpaintedPercent` counts it, so the hole pass can still buy a view for
- * it. The exported image is opaque everywhere, so no reader samples a hole.
+ * The fill's tone is all it had, so a filled texel also borrows the grain of a real painted patch of its
+ * island (`transferDetail`, phase 2i). An island with no painted texel at all gets the mean of the
+ * atlas' paint as its exported colour — nothing closer exists — plus borrowed grain, and
+ * `unpaintedPercent` counts it, so the hole pass can still buy a view for it. The exported image is
+ * opaque everywhere, so no reader samples a hole.
  */
 export function inpaintUnpainted(
   data: Uint8ClampedArray,
@@ -50,7 +52,7 @@ export function inpaintUnpainted(
   let meanR = 0;
   let meanG = 0;
   let meanB = 0;
-  const filled = new Uint8Array(n);
+  const painted = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
     if (islands[i]) islandTexels += 1;
     if (data[4 * i + 3]! < 128) {
@@ -58,11 +60,14 @@ export function inpaintUnpainted(
       continue;
     }
     paintedTexels += 1;
-    filled[i] = 1;
+    painted[i] = 1;
     meanR += data[4 * i]!;
     meanG += data[4 * i + 1]!;
     meanB += data[4 * i + 2]!;
   }
+  // A copy, because the fill marks what it filled and the detail pass still needs to know which texels a
+  // view painted (those are never changed).
+  const filled = painted.slice();
   if (paintedTexels > 0) fillWithinIslands(data, labels, filled, size);
   // Nothing painted (a run that projected no view): keep the level's own clay-neutral tone rather
   // than filling from zeroes, which would be black.
@@ -80,6 +85,7 @@ export function inpaintUnpainted(
     }
     data[4 * i + 3] = 255;
   }
+  if (paintedTexels > 0) transferDetail(data, labels, islands, painted, size);
   return { unpaintedPercent: islandTexels ? (100 * unpainted) / islandTexels : 0 };
 }
 
@@ -175,6 +181,168 @@ function fillWithinIslands(data: Uint8ClampedArray, labels: Int32Array, filled: 
     filled[i] = 1;
     enqueueNeighboursOf(i);
   }
+}
+
+/** Smallest square of painted texels a patch is cut from: smaller is a streak, not a texture. */
+const DETAIL_PATCH_MIN = 32;
+/** Longest side a patch is cut at, so a patch's mean stays a fixed cost per island. */
+const DETAIL_PATCH_MAX = 128;
+
+/** A square of painted texels of one island, and its own mean (subtracted: the detail carries no tone). */
+interface DetailPatch {
+  readonly x: number;
+  readonly y: number;
+  readonly side: number;
+  readonly mean: readonly [number, number, number];
+}
+
+/**
+ * High-frequency half of the fill (PRD-916 phase 2i): every filled texel also gets the grain of a real
+ * painted patch of its island, tiled over the island with mirrored repeat and added to the fill's tone.
+ *
+ * The breadth-first fill continued a gap's tone and nothing else, so in game the courtyard floor's
+ * unpainted texels read as long smeared streaks and the step and pillar faces as flat beige. The grain
+ * is the island's own largest fully painted square: same island, so the same orientation and texel
+ * scale, and its mean is subtracted so the seam is a seam in grain, not in colour. Mirroring the tile
+ * keeps a filled texel next to a painted one continuous, and the tile is aligned to the patch's own
+ * corner, so the fill picks up where the island's paint stops. An island too narrow to hold a 32x32
+ * square (a parapet strip, a pillar face) borrows the patch of the island whose paint is nearest in
+ * colour. An atlas with no square anywhere keeps the plain fill, as before.
+ */
+function transferDetail(
+  data: Uint8ClampedArray,
+  labels: Int32Array,
+  islands: Uint8Array,
+  painted: Uint8Array,
+  size: number,
+): void {
+  let islandCount = 0;
+  for (let i = 0; i < labels.length; i++) if (labels[i]! >= islandCount) islandCount = labels[i]! + 1;
+  if (islandCount === 0) return;
+  const largest = new Int32Array(islandCount);
+  const cornerX = new Int32Array(islandCount);
+  const cornerY = new Int32Array(islandCount);
+  const sumR = new Float64Array(islandCount);
+  const sumG = new Float64Array(islandCount);
+  const sumB = new Float64Array(islandCount);
+  const paintCount = new Int32Array(islandCount);
+  const hasHole = new Uint8Array(islandCount);
+  // One pass: each island's paint mean, which islands have holes, and the largest fully painted square
+  // per island (the usual three-neighbour minimum, so it costs nothing beyond the pass).
+  let prev = new Int32Array(size);
+  let cur = new Int32Array(size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = y * size + x;
+      cur[x] = 0;
+      const id = labels[i]!;
+      if (id < 0) continue;
+      if (!painted[i]) {
+        hasHole[id] = 1;
+        continue;
+      }
+      sumR[id] = sumR[id]! + data[4 * i]!;
+      sumG[id] = sumG[id]! + data[4 * i + 1]!;
+      sumB[id] = sumB[id]! + data[4 * i + 2]!;
+      paintCount[id] = paintCount[id]! + 1;
+      let square = 1;
+      if (x > 0 && y > 0) {
+        // A neighbour of another island (or unpainted) ends the square: cur/prev hold its side.
+        const left = labels[i - 1] === id ? cur[x - 1]! : 0;
+        const up = labels[i - size] === id ? prev[x]! : 0;
+        const diagonal = labels[i - size - 1] === id ? prev[x - 1]! : 0;
+        square += Math.min(left, up, diagonal);
+      }
+      cur[x] = square;
+      if (square > largest[id]!) {
+        largest[id] = square;
+        cornerX[id] = x;
+        cornerY[id] = y;
+      }
+    }
+    const swap = prev;
+    prev = cur;
+    cur = swap;
+  }
+  const mean: (readonly [number, number, number] | undefined)[] = new Array(islandCount).fill(undefined);
+  const patches: (DetailPatch | undefined)[] = new Array(islandCount).fill(undefined);
+  const donors: number[] = [];
+  for (let id = 0; id < islandCount; id++) {
+    const texels = paintCount[id]!;
+    if (texels === 0) continue;
+    mean[id] = [sumR[id]! / texels, sumG[id]! / texels, sumB[id]! / texels];
+    const side = Math.min(largest[id]!, DETAIL_PATCH_MAX);
+    if (side < DETAIL_PATCH_MIN) continue;
+    patches[id] = detailPatch(data, size, cornerX[id]! - side + 1, cornerY[id]! - side + 1, side);
+    donors.push(id);
+  }
+  if (donors.length === 0) return; // no painted square anywhere: keep the plain fill
+  // An island with no square of its own borrows the nearest-colour donor's patch. Its own paint (or, with
+  // none, the atlas' paint) is what "nearest" is measured from; ties keep the lowest island id.
+  // ponytail: a scan over the donors per island; index them by colour if a pack ever has thousands.
+  let allR = 0;
+  let allG = 0;
+  let allB = 0;
+  let allTexels = 0;
+  for (let id = 0; id < islandCount; id++) {
+    allR += sumR[id]!;
+    allG += sumG[id]!;
+    allB += sumB[id]!;
+    allTexels += paintCount[id]!;
+  }
+  for (let id = 0; id < islandCount; id++) {
+    if (!hasHole[id] || patches[id]) continue;
+    const from = mean[id] ?? [allR / allTexels, allG / allTexels, allB / allTexels];
+    let best = donors[0]!;
+    let bestDistance = Infinity;
+    for (const donor of donors) {
+      const by = mean[donor]!;
+      const distance = (by[0] - from[0]) ** 2 + (by[1] - from[1]) ** 2 + (by[2] - from[2]) ** 2;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = donor;
+      }
+    }
+    patches[id] = patches[best]!;
+  }
+  for (let i = 0; i < painted.length; i++) {
+    if (painted[i] || !islands[i]) continue;
+    const patch = patches[labels[i]!];
+    if (!patch) continue;
+    const x = i % size;
+    const y = (i - x) / size;
+    const px = patch.x + mirrorOffset(x - patch.x, patch.side);
+    const py = patch.y + mirrorOffset(y - patch.y, patch.side);
+    const p = 4 * (py * size + px);
+    data[4 * i] = data[4 * i]! + data[p]! - patch.mean[0];
+    data[4 * i + 1] = data[4 * i + 1]! + data[p + 1]! - patch.mean[1];
+    data[4 * i + 2] = data[4 * i + 2]! + data[p + 2]! - patch.mean[2];
+  }
+}
+
+/** A fully painted square of `side` x `side` texels at (`x`, `y`), with its own mean colour. */
+function detailPatch(data: Uint8ClampedArray, size: number, x: number, y: number, side: number): DetailPatch {
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  for (let row = 0; row < side; row++) {
+    const from = (y + row) * size + x;
+    for (let col = 0; col < side; col++) {
+      const p = 4 * (from + col);
+      r += data[p]!;
+      g += data[p + 1]!;
+      b += data[p + 2]!;
+    }
+  }
+  const texels = side * side;
+  return { x, y, side, mean: [r / texels, g / texels, b / texels] };
+}
+
+/** Mirrored repeat: an offset of `v` texels from a patch's corner, wrapped into `[0, side)` and folded back. */
+function mirrorOffset(v: number, side: number): number {
+  const period = 2 * side;
+  const wrapped = ((v % period) + period) % period;
+  return wrapped < side ? wrapped : period - 1 - wrapped;
 }
 
 /**
