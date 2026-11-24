@@ -1441,6 +1441,13 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     return total / texels;
   }
 
+  /** Deterministic value noise: a pattern a mirrored copy matches exactly and a wrapped tile does not. */
+  function noise(x: number, y: number) {
+    const h = Math.imul(x + 1, 0x27d4eb2d) ^ Math.imul(y + 1, 0x165667b1);
+    const mixed = Math.imul(h ^ (h >>> 15), 0x2545f491);
+    return (mixed ^ (mixed >>> 13)) & 255;
+  }
+
   /** Mean RGB over a crop. */
   function cropMean(data: Uint8ClampedArray, size: number, x0: number, x1: number, y0: number, y1: number) {
     const sum: [number, number, number] = [0, 0, 0];
@@ -1497,7 +1504,115 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     }
   });
 
-  it("borrows the patch of the painted island nearest in colour when it has no square of its own (phase 2i)", () => {
+  /** Pearson correlation of a crop's luminance with its own mirror about the line `line2 / 2` (a whole or half texel). */
+  function mirrorCorrelation(
+    data: Uint8ClampedArray,
+    size: number,
+    box: { x0: number; x1: number; y0: number; y1: number },
+    axis: "x" | "y",
+    line2: number,
+  ) {
+    const lum = (x: number, y: number) => {
+      const p = 4 * (y * size + x);
+      return (data[p]! + data[p + 1]! + data[p + 2]!) / 3;
+    };
+    let n = 0;
+    let sa = 0;
+    let sb = 0;
+    let saa = 0;
+    let sbb = 0;
+    let sab = 0;
+    for (let y = box.y0; y <= box.y1; y++) {
+      for (let x = box.x0; x <= box.x1; x++) {
+        const mx = axis === "x" ? line2 - x : x;
+        const my = axis === "y" ? line2 - y : y;
+        if (mx < box.x0 || mx > box.x1 || my < box.y0 || my > box.y1) continue;
+        const a = lum(x, y);
+        const b = lum(mx, my);
+        n += 1;
+        sa += a;
+        sb += b;
+        saa += a * a;
+        sbb += b * b;
+        sab += a * b;
+      }
+    }
+    if (n < 16) return 0;
+    const meanA = sa / n;
+    const meanB = sb / n;
+    const spread = Math.sqrt((saa / n - meanA * meanA) * (sbb / n - meanB * meanB));
+    return spread > 0 ? (sab / n - meanA * meanB) / spread : 0;
+  }
+
+  it("tiles the fill with plain wrap, never a mirror: no symmetry about any tile border (phase 2k)", () => {
+    // The judge saw a wall end face come back a mirror-symmetric kaleidoscope and the floor a rosette at
+    // every tile corner: mirrored repeat folds the patch back on itself, so the fill is exactly its own
+    // mirror about every fold line — the patch's border and its own middle, half a patch apart. A 32x32
+    // noise patch in the corner of a 128^2 island tiles four times over the fill, so both kinds of fold
+    // line sit well inside the filled area; noise is what a mirrored copy matches perfectly and a plainly
+    // wrapped one does not.
+    const size = 128;
+    const { data, islands } = atlasOf(size, (x, y) => {
+      if (x >= 32 || y >= 32) return undefined;
+      const value = noise(x, y);
+      return [value, value, value];
+    });
+    inpaintUnpainted(data, islands, size);
+    // The filled area past the grain's fade-in (8 texels from the patch's corner is texel 40).
+    const box = { x0: 40, x1: 126, y0: 40, y1: 126 };
+    let worst = 0;
+    // Whole and half texel lines, and lines too near the crop edge skipped: their mirrored copy would be
+    // mostly the cropped window itself.
+    for (let line2 = 2 * (box.x0 + 16); line2 <= 2 * (box.x1 - 16); line2++) {
+      worst = Math.max(worst, Math.abs(mirrorCorrelation(data, size, box, "x", line2)));
+    }
+    for (let line2 = 2 * (box.y0 + 16); line2 <= 2 * (box.y1 - 16); line2++) {
+      worst = Math.max(worst, Math.abs(mirrorCorrelation(data, size, box, "y", line2)));
+    }
+    expect(worst).toBeLessThan(0.5);
+  });
+
+  it("fades the grain in over the first 8 texels of fill, so paint and fill meet in grain (phase 2k)", () => {
+    // A 128x64 island: a 64x64 noise patch on the left (its own largest square, so the source of the
+    // grain) and flat stone on the right with a 40x40 hole in it, so the hole's plain fill is exactly the
+    // stone's own value and every bit of variance in it is the grain. A hard switch would make the rim
+    // as grainy as the middle; phase 2i did exactly that, which is the abrupt pattern change the judge
+    // saw where the filled floor met the painted one.
+    const size = 128;
+    const stone = 150;
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size);
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < size; x++) {
+        islands[y * size + x] = 1;
+        if (x >= 80 && x < 120 && y >= 12 && y < 52) continue; // the hole
+        const p = 4 * (y * size + x);
+        const value = x < 64 ? noise(x, y) : stone;
+        data[p] = value;
+        data[p + 1] = value;
+        data[p + 2] = value;
+        data[p + 3] = 255;
+      }
+    }
+    const painted = localVariance(data, size, 2, 60, 2, 60);
+    expect(painted).toBeGreaterThan(100);
+    inpaintUnpainted(data, islands, size);
+    // 1 to 3 texels in, 4 to 6 in, and 9 or more in (past the fade).
+    const rim = localVariance(data, size, 80, 82, 14, 50);
+    const step = localVariance(data, size, 83, 85, 14, 50);
+    const core = localVariance(data, size, 89, 111, 21, 43);
+    expect(core).toBeGreaterThanOrEqual(0.5 * painted);
+    expect(rim).toBeLessThan(0.2 * core);
+    expect(step).toBeGreaterThan(2 * rim);
+    expect(step).toBeLessThan(0.8 * core);
+  });
+
+  it("leaves an island with no painted square of its own as the plain fill, borrowing nothing (phase 2k)", () => {
+    // Two islands: A carries a loud 8-texel checker with a hole in it, B is a thin box whose only paint
+    // is a two-texel rim around a hole, so B can hold no 32x32 square. Phase 2i lent B A's checkers —
+    // grain at another island's scale, which is what the judge saw on the narrow wall ends. A flat rim's
+    // hole fills flat, texel for texel, so that is exactly what "the plain fill" means here; that the
+    // grain arrives at all where an island does own a square is the phase 2i test above.
     const size = 96;
     const data = new Uint8ClampedArray(size * size * 4);
     const islands = new Uint8Array(size * size);
@@ -1508,29 +1623,31 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
       data[p + 2] = rgb[2];
       data[p + 3] = 255;
     };
-    const dark: [number, number, number] = [60, 55, 50];
-    const light: [number, number, number] = [140, 135, 130];
-    // Donor A (40x40 checker, mean [100, 95, 90]) and decoy C (40x40 flat pale stone, zero detail:
-    // borrowing it would leave the borrower as flat as the fill). Borrower B is a 16x40 island whose
-    // only paint is a two-texel strip of A's mean colour, so it can hold no 32x32 square of its own and
-    // is nearest A in colour.
-    for (let y = 0; y < 40; y++) {
-      for (let x = 0; x < 40; x++) {
+    const dark: [number, number, number] = [170, 150, 130];
+    const light: [number, number, number] = [230, 210, 190];
+    const stone: [number, number, number] = [200, 180, 160];
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 64; x++) {
         islands[y * size + x] = 1;
+        if (x >= 2 && x < 22 && y >= 2 && y < 22) continue; // A's own hole: the grain has somewhere to go
         paint(x, y, (Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light);
-        islands[(y + 48) * size + x] = 1;
-        paint(x, y + 48, [230, 230, 230]);
       }
     }
-    for (let y = 0; y < 40; y++) for (let x = 48; x < 64; x++) islands[y * size + x] = 1;
-    for (let y = 0; y < 2; y++) for (let x = 48; x < 64; x++) paint(x, y, [100, 95, 90]);
-    const donorVariance = localVariance(data, size, 1, 38, 1, 38);
-    expect(donorVariance).toBeGreaterThan(100);
+    // B: 16x40 at x 72, flat stone rim two texels thick around a hole; its longest painted run is 2.
+    for (let y = 0; y < 40; y++) {
+      for (let x = 72; x < 88; x++) {
+        islands[y * size + x] = 1;
+        const rim = x < 74 || x > 85 || y < 2 || y > 37;
+        if (rim) paint(x, y, stone);
+      }
+    }
     inpaintUnpainted(data, islands, size);
-    const borrowedVariance = localVariance(data, size, 50, 61, 4, 37);
-    expect(borrowedVariance).toBeGreaterThanOrEqual(0.5 * donorVariance);
-    const borrowedMean = cropMean(data, size, 50, 61, 4, 37);
-    for (let c = 0; c < 3; c++) expect(Math.abs(borrowedMean[c]! - [100, 95, 90][c]!)).toBeLessThanOrEqual(5);
+    for (let y = 2; y < 38; y++) {
+      for (let x = 74; x < 86; x++) {
+        const p = 4 * (y * size + x);
+        expect(Array.from(data.subarray(p, p + 4)), `B ${x},${y}`).toEqual([...stone, 255]);
+      }
+    }
   });
 
   it("leaves only passes that look down on the level to the texels no player camera sees", () => {
