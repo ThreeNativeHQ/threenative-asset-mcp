@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { aerialPassOnlyHidden } from "../atlas-pixels.js";
 import { ATLAS_GAP_CELLS, MAX_TEXELS_PER_PIXEL } from "./core/atlas.js";
 import { INDOOR, OUTDOOR, OVERCAST, type Lighting } from "./core/clay.js";
 import { Engine } from "./core/engine.js";
@@ -63,6 +64,8 @@ export class Session {
   private measurement?: { atlas: number; foot: Float32Array; painted: Uint8Array; islandTexels: number; paintedTexels: number };
   /** 128 px renderer the hole pass ranks candidate cameras with (B, phase 2d). */
   private holeProbe?: ViewRenderer;
+  /** 1 per texel a player-height view sees: an aerial or roof pass must not paint those (phase 2e). */
+  private playerVisible?: { plan: Plan; target: THREE.WebGLRenderTarget };
 
   constructor(readonly canvas: HTMLCanvasElement) {
     this.gpu = new Gpu(canvas);
@@ -80,6 +83,7 @@ export class Session {
     this.level = await loadLevel(source, name);
     this.engine = new Engine(this.gpu, this.level, { lighting, atlasSize, viewSize });
     this.viewer = new Viewer(this.engine, this.canvas);
+    this.clearPlayerVisible();
     this.plan = undefined;
     this.record = undefined;
     return { triangles: this.level.triangles, area: Math.round(this.level.surfaceArea) };
@@ -93,6 +97,7 @@ export class Session {
 
   makePlan(opts: Partial<PlanOptions> = {}) {
     if (!this.engine) throw new Error("load a level first");
+    this.clearPlayerVisible();
     this.plan = makePlan(this.gpu, this.engine.level, this.engine.views, opts);
     this.viewer!.showPlan(this.plan.points, this.plan.views);
     return this.plan;
@@ -133,8 +138,44 @@ export class Session {
     return record;
   }
 
+  /**
+   * Project one view into the atlas, honouring phase 2e: a pass that looks down on the level from above
+   * (aerial, roof) may only paint the texels no player-height view sees, so the ground a player walks on
+   * can never be an aerial camera's invention.
+   */
+  paintView(plan: Plan, spec: ViewSpec, comp: Uint8ClampedArray) {
+    if (!this.engine) return;
+    this.engine.paint(spec, comp, aerialPassOnlyHidden(spec.kind) ? this.playerVisibleMask(plan) : undefined);
+  }
+
+  /**
+   * The player-height projection mask for `plan`, built once per session and reused by every aerial and
+   * roof pass (it depends on the cameras and the geometry only, never on what has been painted).
+   */
+  private playerVisibleMask(plan: Plan): THREE.Texture | undefined {
+    if (!this.engine) return undefined;
+    if (this.playerVisible?.plan === plan) return this.playerVisible.target.texture;
+    const player = plan.views.filter((view) => view.kind === undefined || view.kind === "ground");
+    if (player.length === 0) return undefined;
+    this.playerVisible?.target.dispose();
+    const target = this.engine.atlas.projectionMask(player.length, (index) => {
+      const camera = makeCamera(player[index]!);
+      this.engine!.views.renderGeometry(camera);
+      return { camera, gPos: this.engine!.views.geometryTarget.textures[0]! };
+    });
+    this.playerVisible = { plan, target };
+    return target.texture;
+  }
+
+  /** Drop the cached player-visible mask (a new plan or a new level invalidates it). */
+  private clearPlayerVisible() {
+    this.playerVisible?.target.dispose();
+    this.playerVisible = undefined;
+  }
+
   /** Adopt a stored plan (inspect re-measures a finished run without repainting it). */
   usePlan(json: PlanJson) {
+    this.clearPlayerVisible();
     this.plan = decodePlan(json);
     this.viewer?.showPlan(this.plan.points, this.plan.views);
     if (this.viewer) this.viewer.dirty = true;
@@ -193,7 +234,7 @@ export class Session {
         comp = (await this.readRunImage(runId, `view_${v.index}_comp.png`, S)) ?? new Uint8ClampedArray(0);
       }
       if (view.rejected === undefined && comp.length > 0) {
-        this.engine.paint(spec, comp);
+        this.paintView(plan, spec, comp);
         await this.writeRunImage(runId, `view_${v.index}_comp.png`, comp, S);
         view = { ...view, comp };
         this.addSky(view);
@@ -249,7 +290,7 @@ export class Session {
     const consistency = consistencyReference(p, this.engine.size);
     const r = await paintPreparedView(p, this.engine.size, o, o.seed + viewIndex, o.feather, this.abort?.signal, consistency);
     if (r.rejected === undefined) {
-      this.engine.paint(p.spec, r.comp);
+      this.paintView(plan, p.spec, r.comp);
       this.viewer.setMode("textured");
       this.viewer.dirty = true;
     }

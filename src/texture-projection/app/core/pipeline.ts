@@ -12,6 +12,7 @@ import {
   keepOnly,
   masksFromState,
   paintedFromState,
+  removePixels,
   untouched,
   type ViewMasks,
 } from "./composite.js";
@@ -19,6 +20,7 @@ import type { Engine } from "./engine.js";
 import { bitmapToRGBA, toDataUrl } from "./image.js";
 import { DEFAULT_PLAN, holeViews, plan as makePlan, type Plan, type PlanOptions } from "./planner.js";
 import { classifyView, describeView } from "./semantics.js";
+import { edgeBandMask } from "./silhouette.js";
 import { rejectsStructure, structureDeviation } from "./structure.js";
 import { type ViewSpec } from "./views.js";
 import { measureScaleAnchor, type ScaleAnchor } from "./scale.js";
@@ -76,6 +78,8 @@ export interface ViewRecord {
   repainted?: boolean;
   /** Share of this view's geometry the 0.35 grazing gate rejects. */
   grazingFraction?: number;
+  /** Share of this view's pixels the edge strip left out of the projection (phase 2e). */
+  edgeBandShare?: number;
   /** The prompt text sent with this view. */
   prompt?: string;
   /** Share of the area to paint that the model handed back unpainted (left out of the projection). */
@@ -149,6 +153,10 @@ export interface PreparedView {
   scale: ScaleAnchor;
   /** Share of the view's geometry below the shader's 0.35 grazing gate. */
   grazingFraction: number;
+  /** 1 where this view's paint is not projected: the strip along its clay edges (phase 2e). */
+  edgeBand: Uint8Array;
+  /** Share of the view's geometry the edge strip leaves out of the projection. */
+  edgeBandShare: number;
 }
 
 /**
@@ -170,6 +178,13 @@ export function prepareView(
   const { camera, state, mask, clay } = engine.renderView(spec, spec.kind === "fill" ? 0 : undefined);
   const { pos, nrm } = engine.readGeometry();
   const grazingFraction = grazingShare(pos, nrm, camera.position);
+  // A coping slab along every wall top, and a lit face with its shadow at every corner, is what both
+  // painters do: the strip along the clay's own edges stays out of the projection and the fill
+  // continues the wall's own stone to the edge (phase 2e).
+  const edgeBand = edgeBandMask(pos, nrm, S, S);
+  let edgeBandPixels = 0;
+  for (let i = 0; i < edgeBand.length; i++) edgeBandPixels += edgeBand[i]!;
+  const edgeBandShare = edgeBandPixels / Math.max(1, S * S);
   const labels = engine.level.labels;
   const cls = classifyView(nrm, pos, labels, engine.level.bounds.min.y);
   let masks = masksFromState(mask);
@@ -210,13 +225,15 @@ export function prepareView(
     roofLook: o.roofStyle,
     parts: desc.parts,
     mode: roofPass ? "roof" : isFirst ? "first" : "fill",
-    floor: desc.floorShare > 0.5,
+    // Any ground in the frame, not only a mostly-ground view: an aerial view of the courtyard is 30%
+    // floor, and its floor is where the mosaic came from (phase 2e).
+    floor: desc.floorShare > 0.05,
     overcast: !!engine.clay.lighting.overcast,
     scale: { cameraHeight: scale.cameraHeight, centreDistance: scale.centreDistance },
   };
   return {
     spec, clay, state, masks, geometry, edit, keep, unknownFraction, isFirst, skip, model, prompt, scale,
-    grazingFraction,
+    grazingFraction, edgeBand, edgeBandShare,
   };
 }
 
@@ -251,6 +268,7 @@ export function judgeView(p: PreparedView, gen: Uint8ClampedArray, size: number,
     falloff: 120 * k,
   });
   let comp = featherComposite(p.state, corrected, p.masks, size, size, feather * k);
+  comp = removePixels(comp, p.edgeBand);
   // Whatever the model left as gray clay stays unpainted, so a later view (or the hole pass) gets another go at it.
   const unknown = p.masks.geometry.map((g, i) => (g && !p.masks.known[i] ? 1 : 0));
   const leftOver = untouched(p.state, gen, unknown, size, size);
@@ -461,6 +479,12 @@ export interface VisibleCoverage {
 export interface RunCoverage {
   visibleCoverage(plan: Plan): VisibleCoverage;
   gapScore(spec: ViewSpec, gapCells: Float32Array): { score: number; pixels: number };
+  /**
+   * Project one view. The session owns the GPU state an aerial or roof pass also needs — the mask of
+   * the texels player-height views see (phase 2e) — so the pipeline asks it to paint instead of calling
+   * `engine.paint` itself.
+   */
+  paintView?(plan: Plan, spec: ViewSpec, comp: Uint8ClampedArray): void;
 }
 
 /** How many texels of a 128 px probe a hole camera must leave unpainted to be worth a paid view. */
@@ -529,7 +553,10 @@ export async function runPipeline(
       const r = await withRetry((attempt) =>
         paintPreparedView(p, S, o, o.seed + 1000 * attempt + vi, o.feather, signal, consistency),
       );
-      if (r.rejected === undefined) engine.paint(p.spec, r.comp);
+      if (r.rejected === undefined) {
+        if (coverage?.paintView) coverage.paintView(plan, p.spec, r.comp);
+        else engine.paint(p.spec, r.comp);
+      }
       if (r.rejected === undefined && firstReference === undefined) firstReference = firstViewReference(r.comp, S);
       cost += r.price;
       const view: ViewRecord = {
@@ -555,6 +582,7 @@ export async function runPipeline(
         ...(r.rejected === undefined ? {} : { rejected: r.rejected }),
         ...(r.verify === undefined ? {} : { verify: r.verify }),
         ...(r.attempts > 1 ? { repainted: true } : {}),
+        edgeBandShare: p.edgeBandShare,
       };
       views.push(view);
       done.add(vi);

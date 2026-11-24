@@ -38,6 +38,8 @@ const StoredViewSchema = z.object({
   rejected: z.enum(["grazing", "structure", "verify"]).optional(),
   structureDeviation: z.number().optional(),
   grazingFraction: z.number().optional(),
+  /** Share of the view's pixels the strip along the clay's own edges left out of the projection. */
+  edgeBandShare: z.number().optional(),
   /** The vision check's verdict on the image this view kept (a repaint's verdict when it was repainted). */
   verify: ViewVerifySchema.optional(),
   /** The vision check rejected the first attempt, so the view was painted once more. */

@@ -179,6 +179,16 @@ export function verifyPrompt(c: VerifyPromptContext): string {
     "separate slab, with its own shadow line or a tone of its own; a coping, capstone or parapet laid along a wall " +
     "top, and a row of roof tiles or terracotta along it; carved relief; a doorway, window or arch painted into a " +
     "flat wall; a passage or hole; an awning, balcony, railing, bench, cart, crate, lamp, person or plant.\n" +
+    // Phase 2e: three paintings that passed this check on the courtyard and were visible in play. Each is
+    // named as what it looks like, because the general clauses read as "material" to the model.
+    "Wall faces, in particular: a ring, arc or curved band of different coursing on a flat wall is an arch " +
+    "painted into it, and it is added even when it is the same stone and lies flat; a flat wall painted in two " +
+    "tones that meet along an edge, one lit and one in shadow, so that the wall reads as a face standing out of " +
+    "it, is added; a thin dark crease in the clay continued as the shadowed edge of a slab or buttress is added.\n" +
+    "Floors: paving must be one material in one laying pattern. A mosaic, motif, inlay, medallion, rosette, " +
+    "circular or leaf-shaped pattern in the paving, a change from one paving material to another across the " +
+    "floor, or a large patch of plaster or concrete on the paving is added structure (a drawing on the ground " +
+    "that the clay does not have), even though it is flat and uses the floor's own stones.\n" +
     "Wall tops: a strip, band or slab of a different tone laid along or above the clay's thin edge is added, and so " +
     "is a whole pitched roof or a chimney. A course of the same stone, in the wall's own coursing, continuing the " +
     "wall to that edge and reading as the same wall, is material and is not added.\n" +

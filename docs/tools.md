@@ -246,7 +246,11 @@ Texture projection (gray blockout levels and environments):
   user's `OPENROUTER_API_KEY`, projects them into the level's UV atlas, and writes the baked GLB atomically
   under the project's `assets/`. Every prompt keeps the clay image's edges, openings and silhouette, names the
   camera's height and the depth of the middle of the frame so material detail is painted at its true real-world
-  size, and forbids roofs, tiles or coping above a wall top.
+  size, and forbids roofs, tiles or coping above a wall top. A view that shows ground is also told the ground is one
+  uniform paving with no pattern, mosaic, motif, inlay, medallion or change of material (the courtyard's aerial views
+  turned a blank floor plan into a decorative leaf mosaic), and a pass that looks down on the level — the aerial ring,
+  the roof passes — may only paint texels no player-height view sees, so a wall top or an outer face is textured and
+  the ground a player walks on never is (`aerialPassOnlyHidden`).
   Each painted view is then checked by a vision model (`verify`, default true; `verifyModel`, default
   `google/gemini-2.5-flash`) that compares the clay with the painting and returns strict JSON: the structures it
   adds ("ruined stone pillar on the wall", "red roof-tile coping along the wall top") and whether the detail's
@@ -263,7 +267,12 @@ Texture projection (gray blockout levels and environments):
   paid for twice (and a resume that reuses stored images needs no key); `viewsPainted` counts what reached the
   atlas, bought or reused. `promptTestView` buys exactly one image. A view pixel that would cover more than
   2x2 atlas texels is never projected (it would only blur the atlas): those texels wait for a closer view or the
-  hole pass, and `magnificationSkippedPercent` reports how many. `cookConfigHint` is the
+  hole pass, and `magnificationSkippedPercent` reports how many. The strip along a view's own clay edges is left out of
+  the projection for the same reason: both image models give a wall top a grey coping and an inner corner a lit face
+  with a shadow, and the strip is 0.25 m along the wall where the sky or a farther surface is behind the edge
+  (`edgeBandMask`; `edgeBandShare` in run.json records what it took). The atlas is then filled per UV island from that
+  island's own painted texels (`inpaintUnpainted`), never across the atlas packing, so a gap continues the material
+  around it and a masked strip continues the wall. `cookConfigHint` is the
   `threenative.config.ts` `assets.models.textures` snippet that keeps the atlas' size (at most 4096, the engine
   cook's KTX2 ceiling) and UASTC encoding; the engine cook of the release that ships PRD-916 honours the GLB's
   marker on its own.

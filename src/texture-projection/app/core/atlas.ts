@@ -41,6 +41,7 @@ uniform float ratio;
 uniform vec2 texel;
 uniform float edgeRadius;
 uniform float maxTexelsPerPixel;
+uniform sampler2D playerVisible;
 in vec3 vWorld;
 in vec3 vNormal;
 layout(location = 0) out vec4 outColor;
@@ -48,6 +49,9 @@ void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 old = texelFetch(prev, p, 0);
   outColor = old;
+  // Aerial and roof passes get the mask of the texels a player-height view sees (phase 2e): a pass that
+  // looks down on the level paints wall tops and outer faces, never the ground a player walks on.
+  if (texelFetch(playerVisible, p, 0).r > 0.5) return;
   vec4 clip = viewProj * vec4(vWorld, 1.0);
   if (clip.w <= 0.0) return;
   vec3 ndc = clip.xyz / clip.w;
@@ -259,6 +263,8 @@ export class Atlas {
   private readonly uvMesh: THREE.Mesh;
   private readonly uvCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private readonly projectMat: THREE.ShaderMaterial;
+  /** 1x1 black: the default player-visible mask, so a player-height view projects everywhere it can see. */
+  private readonly noPlayerVisible = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
   private readonly qualityMat: THREE.ShaderMaterial;
   private readonly visibleMat: THREE.ShaderMaterial;
   private readonly islandMat: THREE.ShaderMaterial;
@@ -274,6 +280,7 @@ export class Atlas {
   });
 
   constructor(private readonly gpu: Gpu, level: Level, readonly size = 4096) {
+    this.noPlayerVisible.needsUpdate = true;
     this.a = floatTarget(size, size, { half: true, linear: true });
     this.b = floatTarget(size, size, { half: true, linear: true });
     this.display = floatTarget(size, size, { half: true, linear: true });
@@ -285,7 +292,7 @@ export class Atlas {
       uniforms: { prev: { value: null }, gPos: { value: null }, gFoot: { value: null }, comp: { value: null },
         viewProj: { value: new THREE.Matrix4() },
         camPos: { value: new THREE.Vector3() }, ratio: { value: 0.4 }, texel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
-        edgeRadius: { value: 6 }, maxTexelsPerPixel: { value: MAX_TEXELS_PER_PIXEL } },
+        edgeRadius: { value: 6 }, maxTexelsPerPixel: { value: MAX_TEXELS_PER_PIXEL }, playerVisible: { value: null } },
     });
     this.islandMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: UV_VERT, fragmentShader: ISLAND_FRAG, side: THREE.DoubleSide,
@@ -323,8 +330,12 @@ export class Atlas {
     for (const t of [this.a, this.b, this.display, this.temp]) this.gpu.draw(new THREE.Scene(), this.uvCam, t, 0x000000, 0);
   }
 
-  /** Paint from one view: `gPos` is that view's position/distance buffer, `gFoot` its texels-per-pixel buffer, `comp` its composited image. */
-  project(camera: THREE.Camera, gPos: THREE.Texture, gFoot: THREE.Texture, comp: THREE.Texture, ratio: number) {
+  /**
+   * Paint from one view: `gPos` is that view's position/distance buffer, `gFoot` its texels-per-pixel buffer,
+   * `comp` its composited image. `playerVisible` (1 per texel a player-height view sees) restricts an aerial or
+   * roof pass to the texels no player camera can see; undefined lets the projection's own gates decide.
+   */
+  project(camera: THREE.Camera, gPos: THREE.Texture, gFoot: THREE.Texture, comp: THREE.Texture, ratio: number, playerVisible?: THREE.Texture) {
     this.copyMat.uniforms.src.value = this.a.texture;
     this.gpu.pass(this.copyMat, this.b);
     const u = this.projectMat.uniforms;
@@ -338,6 +349,7 @@ export class Atlas {
     const img = gPos.image as { width: number; height: number };
     u.texel.value.set(1 / img.width, 1 / img.height);
     u.edgeRadius.value = (6 * img.width) / 1024;   // same angular band at any view size
+    u.playerVisible.value = playerVisible ?? this.noPlayerVisible;
     this.uvMesh.material = this.projectMat;
     this.gpu.draw(this.uvScene, this.uvCam, this.b, null);
     this.uvMesh.material = this.islandMat;

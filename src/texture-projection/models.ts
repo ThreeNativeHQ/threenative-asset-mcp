@@ -16,7 +16,7 @@ export interface PromptContext {
   parts: string;
   /** first: nothing painted in view yet; fill: continue the texture around the gaps; roof: paint roofs only. */
   mode: "first" | "fill" | "roof";
-  /** The area to paint is mostly ground. */
+  /** The view shows ground a player could stand on: the paving clause goes in (phase 2e). */
   floor: boolean;
   /** Painting under overcast light (no cast shadows wanted) rather than keeping the render's sun and shadows. */
   overcast?: boolean;
@@ -142,9 +142,19 @@ export const ROOF_PASS_CONSTRAINT =
 const light = (c: PromptContext) => (c.overcast
   ? "soft, even overcast daylight with no cast shadows and no sunlit patches"
   : "the same light direction and shadows");
+/**
+ * The ground clause (PRD-916 phase 2e). The courtyard's aerial views see the floor as one big blank
+ * plane, and the model fills a blank plane with a *design*: a leaf mosaic of dark cobbles on white
+ * plaster that a consistency crop then carried into every later view. Paving is one material laid in
+ * rows; a pattern is a drawing on the ground, and nothing in the clay draws one.
+ */
+const GROUND_CLAUSE =
+  " The ground is one uniform paving material over the whole floor: no pattern, mosaic, motif, inlay, medallion," +
+  " rosette or decorative layout, no change of paving material across the floor, and no plaster or concrete patch.";
+
 const surfaces = (c: PromptContext) =>
   "Every detail you paint follows a shape that is already in the first image; nothing sticks out of the walls and " +
-  `nothing new is added: no ${forbidden(c.parts)}.` + (c.floor ? " The ground stays clear: bare paving." : "");
+  `nothing new is added: no ${forbidden(c.parts)}.` + (c.floor ? GROUND_CLAUSE : "");
 
 /**
  * Caption-style prompts: the model is told what the result looks like, which is what maskless

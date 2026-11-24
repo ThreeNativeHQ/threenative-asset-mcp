@@ -11,8 +11,10 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   ATLAS_GUTTER_TEXELS,
+  aerialPassOnlyHidden,
   cropRgba,
   inpaintUnpainted,
+  islandLabels,
   paintedWindow,
   pushPull,
 } from "../src/texture-projection/atlas-pixels.js";
@@ -1284,6 +1286,47 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     const report = inpaintUnpainted(data, islands, size);
     for (let i = 0; i < size * size; i++) expect(data[4 * i + 3]).toBe(255);
     expect(report.unpaintedPercent).toBe(50);
+  });
+
+  it("never fills a gap with another island's material (phase 2e)", () => {
+    // Two islands side by side in the packing: cobbles on the left, white plaster on the right with a
+    // hole in it. The hole must continue the plaster, not the cobbles next to it in the atlas.
+    const size = 16;
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size);
+    const paint = (x: number, y: number, rgb: [number, number, number]) => {
+      const p = 4 * (y * size + x);
+      data[p] = rgb[0];
+      data[p + 1] = rgb[1];
+      data[p + 2] = rgb[2];
+      data[p + 3] = 255;
+    };
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        islands[y * size + x] = x < 6 || x > 7 ? 1 : 0; // the gutter between the islands
+        const hole = x === 9 && y === 8;
+        if (x < 6) paint(x, y, [80, 60, 40]); // cobbles
+        else if (x > 7 && !hole) paint(x, y, [240, 235, 220]); // plaster with one hole near the gutter
+      }
+    }
+    const labels = islandLabels(islands, size);
+    expect(labels[0]).toBe(0);
+    expect(labels[15]).toBe(1);
+    inpaintUnpainted(data, islands, size);
+    const p = 4 * (8 * size + 9);
+    // The plaster island's hole is filled from the plaster, not from the cobbles across the gutter.
+    expect(data[p]).toBeGreaterThan(200);
+    expect(labels[8 * size + 9]).toBe(1);
+  });
+
+  it("leaves only passes that look down on the level to the texels no player camera sees", () => {
+    // The aerial-mask rule (phase 2e): the courtyard's floor mosaic came from an aerial view that was
+    // allowed to paint ground a player walks on. Only aerials and roof passes get restricted.
+    expect(aerialPassOnlyHidden("aerial")).toBe(true);
+    expect(aerialPassOnlyHidden("roof")).toBe(true);
+    expect(aerialPassOnlyHidden("ground")).toBe(false);
+    expect(aerialPassOnlyHidden("fill")).toBe(false);
+    expect(aerialPassOnlyHidden(undefined)).toBe(false);
   });
 
   it("pushes known values into everything unknown, from the neighbours outward", () => {

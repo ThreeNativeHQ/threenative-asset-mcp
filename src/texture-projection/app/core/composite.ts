@@ -271,6 +271,16 @@ export function keepOnly(comp: Uint8ClampedArray, keep: Uint8Array, geometry: Ui
   return out;
 }
 
+/** Clear the pixels a view must not project (alpha 0), leaving the rest of the composite as it is. */
+export function removePixels(comp: Uint8ClampedArray, remove: Uint8Array): Uint8ClampedArray {
+  const out = comp.slice();
+  for (let i = 0; i < remove.length; i++) {
+    if (!remove[i]) continue;
+    out[4 * i] = out[4 * i + 1] = out[4 * i + 2] = out[4 * i + 3] = 0;
+  }
+  return out;
+}
+
 /** Mask image for a provider: 255 where the model should edit (or inverted for black-means-edit APIs). */
 export function maskImage(edit: Uint8Array, invert = false): Uint8ClampedArray {
   const out = new Uint8ClampedArray(edit.length * 4);

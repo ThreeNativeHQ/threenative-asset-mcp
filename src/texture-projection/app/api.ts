@@ -245,6 +245,7 @@ function viewDone(view: ViewRecord, cost: number, elapsed: number) {
     rejected: view.rejected,
     structureDeviation: view.structureDeviation === undefined ? undefined : +view.structureDeviation.toFixed(3),
     grazingFraction: view.grazingFraction === undefined ? undefined : +view.grazingFraction.toFixed(3),
+    edgeBandShare: view.edgeBandShare === undefined ? undefined : +view.edgeBandShare.toFixed(3),
     verify: view.verify,
     repainted: view.repainted,
     cost: +cost.toFixed(4),

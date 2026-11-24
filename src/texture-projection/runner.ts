@@ -620,6 +620,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       rejected?: "grazing" | "structure" | "verify";
       structureDeviation?: number;
       grazingFraction?: number;
+      edgeBandShare?: number;
       verify?: StoredView["verify"];
       repainted?: boolean;
       cost: number;
@@ -641,6 +642,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       ...(view.rejected === undefined ? {} : { rejected: view.rejected }),
       ...(view.structureDeviation === undefined ? {} : { structureDeviation: view.structureDeviation }),
       ...(view.grazingFraction === undefined ? {} : { grazingFraction: view.grazingFraction }),
+      ...(view.edgeBandShare === undefined ? {} : { edgeBandShare: view.edgeBandShare }),
       ...(view.verify === undefined ? {} : { verify: view.verify }),
       ...(view.repainted === undefined ? {} : { repainted: view.repainted }),
     };

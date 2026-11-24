@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 
+import { edgeBandMask } from "../src/texture-projection/app/core/silhouette.js";
 import {
   STRUCTURE_DEVIATION_LIMIT,
   rejectsStructure,
@@ -130,4 +131,70 @@ describe("texture-projection structure check on the paid courtyard run (B.2)", (
     },
     60_000,
   );
+});
+
+describe("the strip along a view's clay edges is left out of the projection (phase 2e)", () => {
+  const W = 16;
+  const H = 16;
+  /** A view of one flat wall filling the frame (normal -Z), `metresPerPixel` at every pixel. */
+  const wallGeometry = (skyAbove = 0, metresPerPixel = 0.1) => {
+    const pos = new Float32Array(W * H * 4);
+    const nrm = new Float32Array(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        pos[4 * i] = x * metresPerPixel;
+        pos[4 * i + 1] = (H - y) * metresPerPixel;
+        pos[4 * i + 2] = -10;
+        pos[4 * i + 3] = 10;
+        nrm[4 * i + 1] = 0;
+        nrm[4 * i + 2] = 1;
+        nrm[4 * i + 3] = y >= skyAbove ? 1 : 0; // the columns above `skyAbove` are sky
+      }
+    }
+    return { pos, nrm };
+  };
+
+  it("masks the wall under its top edge and leaves the wall below it alone", () => {
+    // Sky above row 2, then wall: a 0.4 m strip is 4 pixels of 0.1 m at a constant depth.
+    const { pos, nrm } = wallGeometry(2);
+    const mask = edgeBandMask(pos, nrm, W, H, 0.4);
+    for (let x = 0; x < W; x++) {
+      expect(mask[2 * W + x]).toBe(1); // the edge pixel itself
+      expect(mask[5 * W + x]).toBe(1); // 0.3 m below it: still the cap's strip
+      expect(mask[3 * W + x]).toBe(1);
+      expect(mask[10 * W + x]).toBe(0); // 0.8 m below the edge: the wall's own stone courses
+      expect(mask[15 * W + x]).toBe(0);
+    }
+  });
+
+  it("never masks a floor, and never masks a wall away from an edge", () => {
+    const { pos, nrm } = wallGeometry(2);
+    const floor = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      nrm[4 * i + 1] = 1;
+      nrm[4 * i + 2] = 0;
+      floor[i] = edgeBandMask(pos, nrm, W, H, 0.4)[i]!;
+    }
+    expect(floor.some((value) => value)).toBe(false);
+  });
+
+  it("masks a wall that ends under a farther one (the corner both painters give a face)", () => {
+    // The right half is a wall 2 m nearer than the left half: the nearer wall's edge between them
+    // gets the strip, on the nearer side only.
+    const { pos, nrm } = wallGeometry(0);
+    for (let y = 0; y < H; y++) {
+      for (let x = 8; x < W; x++) {
+        const i = y * W + x;
+        pos[4 * i + 3] = 7;
+      }
+    }
+    const mask = edgeBandMask(pos, nrm, W, H, 0.4);
+    for (let y = 0; y < H; y++) {
+      expect(mask[y * W + 8]).toBe(1);
+      expect(mask[y * W + 11]).toBe(1); // 0.3 m into the nearer wall
+      expect(mask[y * W + 7]).toBe(0); // the farther wall keeps its stone
+      expect(mask[y * W + 15]).toBe(0);
+    }
+  });
 });

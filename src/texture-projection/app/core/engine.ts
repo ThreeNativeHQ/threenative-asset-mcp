@@ -56,14 +56,18 @@ export class Engine {
     return { pos: this.gpu.readF32(t, 0), nrm: this.gpu.readF32(t, 1) };
   }
 
-  /** Project a composited image (top-down RGBA, view size) into the texture from `spec`'s camera. */
-  paint(spec: ViewSpec, comp: Uint8ClampedArray) {
+  /**
+   * Project a composited image (top-down RGBA, view size) into the texture from `spec`'s camera.
+   * `playerVisible` is the mask of texels a player-height view sees: an aerial or roof pass must not paint
+   * them (phase 2e).
+   */
+  paint(spec: ViewSpec, comp: Uint8ClampedArray, playerVisible?: THREE.Texture) {
     const camera = makeCamera(spec);
     this.views.renderGeometry(camera);
     (this.compTexture.image.data as Uint8Array).set(comp);
     this.compTexture.needsUpdate = true;
     const g = this.views.geometryTarget.textures;
-    this.atlas.project(camera, g[0]!, g[3]!, this.compTexture, this.options.qualityRatio);
+    this.atlas.project(camera, g[0]!, g[3]!, this.compTexture, this.options.qualityRatio, playerVisible);
   }
 
   /** 1 where a view's pixels show level geometry (0 = sky), top-down. */

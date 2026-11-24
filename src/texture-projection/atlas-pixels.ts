@@ -17,18 +17,22 @@ export interface InpaintReport {
 }
 
 /**
- * Fill the texels no view painted (alpha < 128) from the painted texels around them and make the
- * atlas opaque: push-pull, a mip pyramid of weighted averages, so a gap continues the material that
- * surrounds it inside its own UV island.
+ * Fill the texels no view painted (alpha < 128) from the painted texels of the same UV island and
+ * make the atlas opaque: a breadth-first fill inwards, each texel taking the average of the filled
+ * texels around it, so a gap continues the material that surrounds it inside its own UV island.
  *
  * A single global mean colour was the 2c fill, and it is what made the courtyard floor look painted
  * (PRD-916 phase 2d): every texel the magnification guard or a rejected view left empty became the
  * atlas' average tone, so gaps between cobbles read as smooth white plaster patches with a tan seam.
- * Push-pull replaces that with the nearest painted material: a hole in the paving fills with paving.
+ * The fill replaces that with the nearest painted material: a hole in the paving fills with paving.
  *
- * An island with no painted texel at all keeps alpha 0 in the atlas, so a later view or the hole pass
- * can still paint it; its exported colour is a guess pulled from the islands around it (nothing
- * closer exists), and `unpaintedPercent` says how much of the atlas that is.
+ * The island is the boundary, not the atlas (phase 2e): a texel is only ever filled from painted
+ * texels of its own island, so a gap in a floor island cannot take the white plaster of a wall island
+ * that happens to sit next to it in the atlas' packing.
+ *
+ * An island with no painted texel at all gets the mean of the atlas' paint as its exported colour —
+ * nothing closer exists — and `unpaintedPercent` counts it, so the hole pass can still buy a view for
+ * it. The exported image is opaque everywhere, so no reader samples a hole.
  */
 export function inpaintUnpainted(
   data: Uint8ClampedArray,
@@ -37,33 +41,151 @@ export function inpaintUnpainted(
   fallback: [number, number, number] = [128, 128, 128],
 ): InpaintReport {
   const n = size * size;
-  const val = new Float32Array(n * 3);
-  const wt = new Float32Array(n);
+  const labels = islandLabels(islands, size);
   let islandTexels = 0;
   let paintedTexels = 0;
+  // Counted before the fill runs: a filled texel is still a texel no view painted, and the hole pass
+  // buys its views by this number.
+  let unpainted = 0;
+  let meanR = 0;
+  let meanG = 0;
+  let meanB = 0;
+  const filled = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
     if (islands[i]) islandTexels += 1;
-    if (data[4 * i + 3]! < 128) continue;
+    if (data[4 * i + 3]! < 128) {
+      if (islands[i]) unpainted += 1;
+      continue;
+    }
     paintedTexels += 1;
-    for (let c = 0; c < 3; c++) val[3 * i + c] = data[4 * i + c]!;
-    wt[i] = 1;
+    filled[i] = 1;
+    meanR += data[4 * i]!;
+    meanG += data[4 * i + 1]!;
+    meanB += data[4 * i + 2]!;
   }
+  if (paintedTexels > 0) fillWithinIslands(data, labels, filled, size);
   // Nothing painted (a run that projected no view): keep the level's own clay-neutral tone rather
-  // than inpainting from zeroes, which would be black.
-  const field =
+  // than filling from zeroes, which would be black.
+  const guess =
     paintedTexels > 0
-      ? pushPull(val, wt, size, size)
-      : Float32Array.from({ length: n * 3 }, (_, k) => fallback[k % 3]!);
-  let unpainted = 0;
+      ? [meanR / paintedTexels, meanG / paintedTexels, meanB / paintedTexels]
+      : [fallback[0], fallback[1], fallback[2]];
   for (let i = 0; i < n; i++) {
     if (data[4 * i + 3]! >= 128) continue;
-    if (islands[i]) unpainted += 1;
-    data[4 * i] = field[3 * i]!;
-    data[4 * i + 1] = field[3 * i + 1]!;
-    data[4 * i + 2] = field[3 * i + 2]!;
+    // A filled texel already holds its own island's material; anything else is the atlas' guess.
+    if (!filled[i]) {
+      data[4 * i] = guess[0]!;
+      data[4 * i + 1] = guess[1]!;
+      data[4 * i + 2] = guess[2]!;
+    }
     data[4 * i + 3] = 255;
   }
   return { unpaintedPercent: islandTexels ? (100 * unpainted) / islandTexels : 0 };
+}
+
+/** Island id per texel (-1 outside every island), from 4-connected components of the island mask. */
+export function islandLabels(islands: Uint8Array, size: number): Int32Array {
+  const labels = new Int32Array(islands.length).fill(-1);
+  const stack: number[] = [];
+  let next = 0;
+  for (let start = 0; start < islands.length; start++) {
+    if (!islands[start] || labels[start] !== -1) continue;
+    const id = next++;
+    labels[start] = id;
+    stack.push(start);
+    while (stack.length > 0) {
+      const i = stack.pop()!;
+      const x = i % size;
+      const y = (i - x) / size;
+      if (x > 0 && islands[i - 1] && labels[i - 1] === -1) {
+        labels[i - 1] = id;
+        stack.push(i - 1);
+      }
+      if (x + 1 < size && islands[i + 1] && labels[i + 1] === -1) {
+        labels[i + 1] = id;
+        stack.push(i + 1);
+      }
+      if (y > 0 && islands[i - size] && labels[i - size] === -1) {
+        labels[i - size] = id;
+        stack.push(i - size);
+      }
+      if (y + 1 < size && islands[i + size] && labels[i + size] === -1) {
+        labels[i + size] = id;
+        stack.push(i + size);
+      }
+    }
+  }
+  return labels;
+}
+
+/**
+ * Breadth-first fill of each island's unpainted texels from its own painted ones: a texel takes the
+ * mean of the filled texels 8-connected to it, nearest paint first, so the gap continues the material
+ * around it and never reaches into another island.
+ */
+function fillWithinIslands(data: Uint8ClampedArray, labels: Int32Array, filled: Uint8Array, size: number): void {
+  const queue = new Int32Array(labels.length);
+  let head = 0;
+  let tail = 0;
+  const enqueueNeighboursOf = (i: number) => {
+    const x = i % size;
+    const y = (i - x) / size;
+    const id = labels[i]!;
+    for (let dy = -1; dy <= 1; dy++) {
+      const ny = y + dy;
+      if (ny < 0 || ny >= size) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx;
+        if ((dx === 0 && dy === 0) || nx < 0 || nx >= size) continue;
+        const j = ny * size + nx;
+        if (filled[j] || labels[j] !== id) continue;
+        queue[tail++] = j;
+      }
+    }
+  };
+  for (let i = 0; i < labels.length && tail < queue.length; i++) if (filled[i]) enqueueNeighboursOf(i);
+  while (head < tail) {
+    const i = queue[head++]!;
+    if (filled[i]) continue;
+    const x = i % size;
+    const y = (i - x) / size;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    let count = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      const ny = y + dy;
+      if (ny < 0 || ny >= size) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx;
+        if ((dx === 0 && dy === 0) || nx < 0 || nx >= size) continue;
+        const j = ny * size + nx;
+        if (!filled[j]) continue;
+        r += data[4 * j]!;
+        g += data[4 * j + 1]!;
+        b += data[4 * j + 2]!;
+        count += 1;
+      }
+    }
+    if (count === 0) continue; // its paint is further away: a later owner of the queue will fill it
+    data[4 * i] = r / count;
+    data[4 * i + 1] = g / count;
+    data[4 * i + 2] = b / count;
+    data[4 * i + 3] = 255;
+    filled[i] = 1;
+    enqueueNeighboursOf(i);
+  }
+}
+
+/**
+ * Whether a pass may only paint what no player-height camera sees: the passes that look down on the
+ * level from above (an aerial ring, a close pass over the roofs). It is the rule phase 2e added for the
+ * courtyard's floor — an aerial view sees the courtyard as one blank plane and paints a decorative
+ * mosaic on it, which then became what a player walks on — so those passes are restricted to wall tops,
+ * roof tops and outer faces, and the ground is left to the views that stand on it.
+ */
+export function aerialPassOnlyHidden(kind: "ground" | "aerial" | "roof" | "fill" | undefined): boolean {
+  return kind === "aerial" || kind === "roof";
 }
 
 /**
