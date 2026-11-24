@@ -147,6 +147,10 @@ export function makeApi(session: Session) {
     magnificationSkippedPercentAt(atlasSize: number) {
       return session.magnificationSkippedPercentAt(atlasSize);
     },
+    /** The bake's blur pair under the projection's own guard rule (blur 0 by construction). */
+    guardedPercentAt(atlasSize: number) {
+      return session.guardedPercentAt(atlasSize);
+    },
     /** Camera planning only: no model calls, so no key and no cost. */
     plan(opts: Partial<PlanOptions> = {}): PlanSummary {
       const p = session.makePlan(opts);

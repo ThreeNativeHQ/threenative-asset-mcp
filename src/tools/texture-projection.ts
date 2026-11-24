@@ -10,6 +10,7 @@ import { auditCookConfig } from "../texture-projection/config-audit.js";
 import { buildAtlasSheet, buildContactSheet } from "../texture-projection/contact-sheet.js";
 import { readProjectedAtlasMarker } from "../texture-projection/glb-marker.js";
 import { DEFAULT_MODEL } from "../texture-projection/models.js";
+import { DEFAULT_VERIFY_MODEL } from "../texture-projection/verify.js";
 import { defaultRunRoot, readRun, type StoredRun } from "../texture-projection/runs.js";
 import {
   TextureProjectionError,
@@ -198,6 +199,7 @@ export const TextureProjectInspectOutputSchema = z
     atlas: z.number().int().positive().nullable(),
     coveragePercent: z.number().min(0).max(100).nullable(),
     blurredTexelPercent: z.number().min(0).max(100).nullable(),
+    magnificationSkippedPercent: z.number().min(0).max(100).nullable(),
     views: z.number().int().nonnegative(),
     rejectedViews: z.array(z.object({ index: z.number().int(), reason: z.string() }).strict()),
     /** The vision check's own verdicts, so a bake's invented structure is visible without the run.json. */
@@ -458,10 +460,11 @@ export function createTextureProjectInspectHandler() {
           .filter((view) => view.rejected !== undefined)
           .map((view) => ({ index: view.index, reason: view.rejected! }));
         // Measured from the run's own plan at its atlas size; no image is bought.
-        const blurredTexelPercent = await measureStoredRunBlurredPercent(runRoot, run);
+        const measured = await measureStoredRunBlurredPercent(runRoot, run);
+        const blurredTexelPercent = measured.blurred;
         const summary = `${run.views.length} views · ${run.complete ? "complete" : "incomplete"} · ${run.cost.toFixed(3)} USD · ${
           rejectedViews.length
-        } rejected · blurred ${blurredTexelPercent.toFixed(1)}%`;
+        } rejected · blurred ${blurredTexelPercent.toFixed(1)}% · magnified texels left empty ${measured.magnificationSkipped.toFixed(1)}%`;
         const sheet = await buildContactSheet(runRoot, run, summary);
         const coverage = run.views
           .filter((view) => view.rejected === undefined)
@@ -473,9 +476,13 @@ export function createTextureProjectInspectHandler() {
           atlas: run.atlas,
           coveragePercent: coverage === undefined ? null : Math.round(coverage * 100),
           blurredTexelPercent,
+          magnificationSkippedPercent: measured.magnificationSkipped,
           views: run.views.length,
           rejectedViews,
-          verifyModel: run.options.verify === false ? null : ((run.options.verifyModel as string | undefined) ?? null),
+          verifyModel:
+            run.options.verify === false
+              ? null
+              : ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id),
           verifyRejected: run.views
             .filter((view) => view.rejected === "verify" && view.verify !== undefined)
             .map((view) => ({

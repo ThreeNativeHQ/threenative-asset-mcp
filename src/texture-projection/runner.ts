@@ -272,7 +272,13 @@ function planInput(request: TextureProjectionRequest): Record<string, number> {
 
 /** Only what the caller chose; the pipeline's own defaults fill the rest, on resume too. */
 function pipelineOptions(request: TextureProjectionRequest): Record<string, unknown> {
-  const options: Record<string, unknown> = { plan: planInput(request) };
+  const options: Record<string, unknown> = {
+    plan: planInput(request),
+    // Recorded even when defaulted: run.json has to say which check judged its views, so inspect and a
+    // resume report the model that ran instead of guessing the default of the day.
+    verify: request.verify !== false,
+    verifyModel: request.verifyModel?.trim() || DEFAULT_VERIFY_MODEL.id,
+  };
   // Only an explicit size: "auto" is the default and is re-measured (and capped) on a resume.
   if (typeof request.atlas === "number") options.atlas = request.atlas;
   if (request.style !== undefined) options.style = request.style;
@@ -385,6 +391,9 @@ async function measureBlurredPercent(
   measurementAtlas: number,
 ): Promise<{ blurred: number; magnificationSkipped: number }> {
   if (run.atlas > measurementAtlas) {
+    // Measured at the cap and scaled: the bake itself is too large to measure 1:1 here, so the pair
+    // is the guard's own rule — no texel a view resolves at more than 2x2 is painted (blur 0), and
+    // the texels it refuses are reported separately.
     await app.call("load", "/api/level", {
       lighting: run.lighting,
       atlasSize: measurementAtlas,
@@ -393,9 +402,10 @@ async function measureBlurredPercent(
     });
     await app.call("usePlan", run.plan);
     await app.call<BrowserMeasurement>("measure", {}, false);
-  } else {
-    await app.call<BrowserMeasurement>("measure", {}, true);
+    const guarded = await app.call<{ blurred: number; skipped: number }>("guardedPercentAt", run.atlas);
+    return { blurred: guarded.blurred, magnificationSkipped: guarded.skipped };
   }
+  await app.call<BrowserMeasurement>("measure", {}, true);
   return {
     blurred: await app.call<number>("blurredPercentAt", run.atlas),
     magnificationSkipped: await app.call<number>("magnificationSkippedPercentAt", run.atlas),
@@ -406,12 +416,17 @@ async function measureBlurredPercent(
  * Measure a stored run's blur at its own atlas size, from its stored plan: inspect's number. No model
  * calls, no key, and the run directory is only read.
  */
-export async function measureStoredRunBlurredPercent(runRoot: string, run: StoredRun): Promise<number> {
+export async function measureStoredRunBlurredPercent(
+  runRoot: string,
+  run: StoredRun,
+): Promise<{ blurred: number; magnificationSkipped: number }> {
   const measurementAtlas = Math.min(run.atlas, MEASUREMENT_ATLAS);
   const server = await startUiServer({ levelPath: run.levelPath, runRoot });
   try {
     const app = await openAppSession({ url: server.url });
     try {
+      // Inspect reads a stored run and never repaints it, so there is no atlas content to measure
+      // against: the pair is the projection's own guard rule (see `Session.guardedPercentAt`).
       await app.call("load", "/api/level", {
         lighting: run.lighting,
         atlasSize: measurementAtlas,
@@ -420,7 +435,8 @@ export async function measureStoredRunBlurredPercent(runRoot: string, run: Store
       });
       await app.call("usePlan", run.plan);
       await app.call<BrowserMeasurement>("measure", {}, false);
-      return await app.call<number>("blurredPercentAt", run.atlas);
+      const guarded = await app.call<{ blurred: number; skipped: number }>("guardedPercentAt", run.atlas);
+      return { blurred: guarded.blurred, magnificationSkipped: guarded.skipped };
     } finally {
       await app.close();
     }

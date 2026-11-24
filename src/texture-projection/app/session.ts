@@ -335,6 +335,26 @@ export class Session {
   }
 
   /**
+   * What a bake painted under the projection's own guard rule: a texel no view resolves within 2x2
+   * atlas texels is left unpainted, so the blur share is 0 by construction and the magnified texels
+   * show up as `skipped` instead. This is the honest pair for a finished run measured at a coarser
+   * atlas than the one it baked: the real atlas content says which texels were painted there, and
+   * that is exactly this rule.
+   */
+  guardedPercentAt(atlasSize: number): { blurred: number; skipped: number } {
+    const measurement = this.measurement;
+    if (!measurement) throw new Error("measure before reading the guard's share");
+    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize) ** 2;
+    let skipped = 0;
+    const foot = measurement.foot;
+    for (let i = 0; i < foot.length; i++) if (foot[i]! > threshold) skipped += 1;
+    return {
+      blurred: 0,
+      skipped: measurement.islandTexels === 0 ? 0 : (100 * skipped) / measurement.islandTexels,
+    };
+  }
+
+  /**
    * Texels the magnification guard leaves unpainted, as a share of the island: a view sees them but
    * one of its pixels would cover more than 2x2 atlas texels there, so projecting it would only
    * stretch one pixel over many texels. They wait for a closer view or the hole pass.

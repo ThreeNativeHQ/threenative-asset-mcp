@@ -461,6 +461,25 @@ describe("texture-projection runner", () => {
       expect(result.blurredTexelPercent).toBe(0);
       expect(result.magnificationSkippedPercent).toBeGreaterThan(1);
       expect(result.coveragePercent).toBeGreaterThan(0);
+
+      // A bake at an atlas above the measurement cap reports the guard's own rule: blur 0 by
+      // construction, the refused texels counted instead.
+      const big = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan,
+        atlas: 4096,
+        viewSize: 128,
+        verify: false,
+        runId: "magnification-4k-run",
+        outputPath: join(cwd, "assets", "magnification-4k.glb"),
+      });
+      expect(big.atlas).toBe(4096);
+      expect(big.blurredTexelPercent).toBe(0);
+      // At 4096 px from 128 px views almost every texel is refused: that is the guard doing its job.
+      expect(big.magnificationSkippedPercent).toBeGreaterThan(5);
+      expect(existsSync(big.outputPath)).toBe(true);
     },
     300_000,
   );
