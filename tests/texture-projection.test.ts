@@ -9,13 +9,19 @@ import { Document, NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
+import { ATLAS_GUTTER_TEXELS, infillUnpainted } from "../src/texture-projection/atlas-pixels.js";
+import { lowFrequencyLuminance, rejectsStructure, structureDeviation } from "../src/texture-projection/app/core/structure.js";
+import { auditCookConfig } from "../src/texture-projection/config-audit.js";
+import { markProjectedAtlas, readProjectedAtlasMarker } from "../src/texture-projection/glb-marker.js";
 import { MODEL_ALIASES, DEFAULT_MODEL, resolveModel } from "../src/texture-projection/models.js";
 import { MISSING_API_KEY_CODE, forwardImageRequest } from "../src/texture-projection/openrouter-proxy.js";
 import {
   TextureProjectionError,
+  autoAtlasSize,
   paintTextureProjection,
   quoteTextureProjection,
 } from "../src/texture-projection/runner.js";
+import { UV_STRETCH_LIMIT, measureUvStretch } from "../src/texture-projection/uv-stretch.js";
 import type { StoredRun } from "../src/texture-projection/runs.js";
 import { startOpenRouterStub as startStub, type OpenRouterStub } from "./helpers/openrouter-stub.js";
 
@@ -27,7 +33,7 @@ const PLAN = { maxViews: 3, aerial: 0, roofs: 0, holes: 0, spacing: 6 };
 const temporaryDirectories: string[] = [];
 const stubs: OpenRouterStub[] = [];
 
-async function startOpenRouterStub(png: string, options: { holdAt?: number } = {}) {
+async function startOpenRouterStub(png: string, options: { holdAt?: number; paint?: "material" | "arch" } = {}) {
   const stub = await startStub(png, options);
   stubs.push(stub);
   return stub;
@@ -296,6 +302,42 @@ describe("texture-projection runner", () => {
   );
 
   it(
+    "rejects a view that paints an arch the level does not have and projects nothing",
+    async () => {
+      const cwd = await scratchDir("structure");
+      const stub = await startOpenRouterStub(pngBase64, { paint: "arch" });
+      const outputPath = join(cwd, "assets", "courtyard_textured.glb");
+      const result = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan: PLAN,
+        atlas: 256,
+        viewSize: 128,
+        runId: "arch-run",
+        outputPath,
+      });
+
+      // Every bought view invented a dark arch, so none of them reached the atlas.
+      expect(stub.requests.length).toBeGreaterThan(0);
+      expect(result.viewsPainted).toBe(0);
+      expect(result.viewsRejected.structure).toBe(stub.requests.length);
+      expect(result.coveragePercent).toBe(0);
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "arch-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views.filter((view) => view.rejected === "structure")).toHaveLength(stub.requests.length);
+      for (const view of run.views) {
+        expect(view.structureDeviation).toBeGreaterThan(0.13);
+        // Rejected views keep their images for the contact sheet, so the reason stays checkable.
+        expect(existsSync(join(cwd, ".threenative", "texture-projection", "arch-run", `view_${view.index}_gen.png`))).toBe(true);
+      }
+      expect(existsSync(outputPath)).toBe(true);
+    },
+    240_000,
+  );
+
+  it(
     "paints exactly one view for a prompt test, persists it and leaves the run incomplete",
     async () => {
       const cwd = await scratchDir("prompt-test");
@@ -382,4 +424,241 @@ describe("texture-projection runner", () => {
     },
     300_000,
   );
+});
+
+describe("texture-projection UV stretch (A.3)", () => {
+  it("measures a uniformly mapped level at 1x and reports it uniform", async () => {
+    const report = await measureUvStretch(LEVEL);
+    expect(report.triangles).toBeGreaterThan(0);
+    expect(report.p95).toBeGreaterThan(0.9);
+    expect(report.p95).toBeLessThanOrEqual(UV_STRETCH_LIMIT);
+    expect(report.uniform).toBe(true);
+  });
+
+  it("reports the material whose texels are coarsest and warns past 4x", async () => {
+    const cwd = await scratchDir("uvstretch");
+    const path = join(cwd, "stretched.glb");
+    await writeStretchedGlb(path);
+    const report = await measureUvStretch(path);
+    expect(report.worstMaterial).toBe("stretched");
+    expect(report.p95).toBeGreaterThan(UV_STRETCH_LIMIT);
+    expect(report.uniform).toBe(false);
+  });
+});
+
+describe("texture-projection structure check (B.2)", () => {
+  const SIZE = 256;
+
+  it("accepts the image the model was given", () => {
+    const clay = syntheticClay(SIZE);
+    expect(structureDeviation(clay, clay, SIZE, SIZE)).toBe(0);
+    expect(rejectsStructure(structureDeviation(clay, clay, SIZE, SIZE))).toBe(false);
+  });
+
+  it("accepts a painted material and a global lighting change, rejects an invented dark arch", () => {
+    const clay = syntheticClay(SIZE);
+    // A painted material: bricks and grain over the same shading.
+    const material = new Uint8ClampedArray(clay);
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        const p = 4 * (y * SIZE + x);
+        const brick = ((x >> 3) + (y >> 2)) % 2 ? 16 : -14;
+        for (let channel = 0; channel < 3; channel++) {
+          material[p + channel] = brick > 0 ? material[p + channel]! * 0.9 + 30 : material[p + channel]! * 0.9 + 4;
+        }
+      }
+    }
+    const materialDeviation = structureDeviation(material, clay, SIZE, SIZE);
+    expect(materialDeviation).toBeLessThan(0.13);
+    expect(rejectsStructure(materialDeviation)).toBe(false);
+
+    // A big dark arch painted on the flat wall: low-frequency luminance the clay does not have.
+    const arch = new Uint8ClampedArray(clay);
+    const cx = SIZE * 0.5;
+    const half = SIZE * 0.14;
+    const top = SIZE * 0.2;
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        const inside =
+          x > cx - half && x < cx + half && y > top && (y > top + half || (x - cx) ** 2 + (y - (top + half)) ** 2 < half ** 2);
+        if (!inside) continue;
+        const p = 4 * (y * SIZE + x);
+        arch[p] = 34;
+        arch[p + 1] = 28;
+        arch[p + 2] = 26;
+      }
+    }
+    const archDeviation = structureDeviation(arch, clay, SIZE, SIZE);
+    expect(archDeviation).toBeGreaterThan(0.3);
+    expect(rejectsStructure(archDeviation)).toBe(true);
+    // The grid it compares on is the documented 64 cells.
+    expect(lowFrequencyLuminance(clay, SIZE, SIZE)).toHaveLength(64 * 64);
+  });
+});
+
+describe("texture-projection atlas choice (C.1)", () => {
+  it("picks the power of two that matches the measured footprint, without wasting texels", () => {
+    // One texel per image pixel already: keep the measurement atlas.
+    expect(autoAtlasSize(1024, 1)).toBe(1024);
+    // Four texels per pixel (the views resolve half the linear size): a 512 atlas matches.
+    expect(autoAtlasSize(1024, 4)).toBe(512);
+    // A pixel covers a quarter texel: the views resolve twice the linear size, so 2048 matches.
+    expect(autoAtlasSize(1024, 0.25)).toBe(2048);
+    expect(autoAtlasSize(1024, 0.0625)).toBe(4096);
+    // Never above 8K, never below 512.
+    expect(autoAtlasSize(1024, 1e-9)).toBe(8192);
+    expect(autoAtlasSize(1024, 1e9)).toBe(512);
+    // A 4.2K match must not become an 8K atlas: the nearest power of two, not the next one up.
+    expect(autoAtlasSize(1024, 0.0573)).toBe(4096);
+  });
+});
+
+describe("texture-projection atlas marker (C.3)", () => {
+  it("writes extras.threenative.textureProjection on the base-colour image and texture", async () => {
+    const cwd = await scratchDir("marker");
+    const path = join(cwd, "painted.glb");
+    const png = await sharp({ create: { width: 4, height: 4, channels: 4, background: { r: 9, g: 8, b: 7, alpha: 1 } } })
+      .png()
+      .toBuffer();
+    const document = new Document();
+    const buffer = document.createBuffer();
+    const texture = document.createTexture("atlas").setImage(new Uint8Array(png)).setMimeType("image/png");
+    const material = document.createMaterial("painted").setBaseColorTexture(texture);
+    const position = document
+      .createAccessor()
+      .setType("VEC3")
+      .setArray(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]))
+      .setBuffer(buffer);
+    const uv = document
+      .createAccessor()
+      .setType("VEC2")
+      .setArray(new Float32Array([0, 0, 1, 0, 0, 1]))
+      .setBuffer(buffer);
+    document
+      .createMesh("level")
+      .addPrimitive(document.createPrimitive().setAttribute("POSITION", position).setAttribute("TEXCOORD_0", uv).setMaterial(material));
+    document.createScene().addChild(document.createNode("level").setMesh(document.getRoot().listMeshes()[0]!));
+    await new NodeIO().write(path, document);
+
+    expect(readProjectedAtlasMarker(new Uint8Array(await readFile(path)))).toBeUndefined();
+    const marked = markProjectedAtlas(new Uint8Array(await readFile(path)), { atlas: 4096, runId: "courtyard-abc" });
+    expect(readProjectedAtlasMarker(marked)).toEqual({ atlas: 4096, runId: "courtyard-abc" });
+    // The bytes are still a readable GLB with its texture intact.
+    const reread = await new NodeIO().readBinary(marked);
+    expect(reread.getRoot().listTextures()).toHaveLength(1);
+  });
+});
+
+/** A flat gray wall over a floor with soft shading: what the clay render looks like to the check. */
+function syntheticClay(size: number): Uint8ClampedArray {
+  const pixels = new Uint8ClampedArray(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const p = 4 * (y * size + x);
+      const floor = y > size * 0.62;
+      const value = (floor ? 148 : 186) + (floor ? (y / size - 0.62) * -40 : (x / size - 0.5) * 18 - (y / size) * 24);
+      pixels[p] = value;
+      pixels[p + 1] = value;
+      pixels[p + 2] = value;
+      pixels[p + 3] = 255;
+    }
+  }
+  return pixels;
+}
+
+/** Two quads: the "flat" one maps its 1x1 m to 0.5x0.5 UV, the "stretched" one to 0.05x0.05. */
+async function writeStretchedGlb(path: string): Promise<void> {
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const quad = (name: string, uvScale: number, offset: number) => {
+    const position = document
+      .createAccessor()
+      .setType("VEC3")
+      .setArray(new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]))
+      .setBuffer(buffer);
+    const uv = document
+      .createAccessor()
+      .setType("VEC2")
+      .setArray(
+        new Float32Array([
+          offset,
+          0,
+          offset + uvScale,
+          0,
+          offset + uvScale,
+          uvScale,
+          offset,
+          uvScale,
+        ]),
+      )
+      .setBuffer(buffer);
+    const indices = document.createAccessor().setType("SCALAR").setArray(new Uint16Array([0, 1, 2, 0, 2, 3])).setBuffer(buffer);
+    const primitive = document
+      .createPrimitive()
+      .setAttribute("POSITION", position)
+      .setAttribute("TEXCOORD_0", uv)
+      .setIndices(indices)
+      .setMaterial(document.createMaterial(name));
+    return document.createMesh(name).addPrimitive(primitive);
+  };
+  const flat = quad("flat", 0.5, 0);
+  const stretched = quad("stretched", 0.05, 0.5);
+  const scene = document.createScene("Scene");
+  scene.addChild(document.createNode("flat").setMesh(flat));
+  scene.addChild(document.createNode("stretched").setMesh(stretched));
+  await new NodeIO().write(path, document);
+}
+
+describe("texture-projection atlas infill (C.2)", () => {
+  it("fills never-painted texels with the atlas mean colour and keeps at least an 8 px gutter", () => {
+    // Two painted texels, two unpainted ones that would otherwise export as clay gray or black.
+    const data = new Uint8ClampedArray([
+      100, 50, 10, 255,
+      200, 150, 110, 255,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+    ]);
+    infillUnpainted(data);
+    expect(Array.from(data.subarray(8))).toEqual([150, 100, 60, 255, 150, 100, 60, 255]);
+    expect(ATLAS_GUTTER_TEXELS).toBeGreaterThanOrEqual(8);
+  });
+});
+
+describe("texture-projection cook config audit (C.3)", () => {
+  it("flags a missing config as the 2048 ETC1S-eligible default", () => {
+    const audit = auditCookConfig(undefined, 4096, null);
+    expect(audit).toMatchObject({ path: null, baseColorMaxSize: 2048, flagged: true });
+    expect(audit.findings.join(" ")).toMatch(/maxSize 2048/u);
+  });
+
+  it("reads maxSize and the base-colour codec out of TypeScript, comments and all", () => {
+    const good = auditCookConfig(
+      [
+        "export default {",
+        "  // the painted courtyard atlas is 4096",
+        "  assets: {",
+        "    models: {",
+        "      textures: {",
+        "        maxSize: { baseColorTexture: 4096, normalTexture: 1024 },",
+        '        overrides: [{ slot: "normalTexture", codec: "uastc" }, { slot: "baseColorTexture", codec: "uastc" }],',
+        "      },",
+        "    },",
+        "  },",
+        "} as const;",
+      ].join("\n"),
+      4096,
+      "threenative.config.ts",
+    );
+    expect(good).toMatchObject({ baseColorMaxSize: 4096, baseColorCodec: "uastc", flagged: false });
+    expect(good.findings).toEqual([]);
+
+    const downscaled = auditCookConfig(
+      "export default { assets: { models: { textures: { maxSize: { baseColorTexture: 1024 }, overrides: [{ slot: \"baseColorTexture\", codec: \"etc1s\" }] } } } };",
+      8192,
+      "threenative.config.ts",
+    );
+    expect(downscaled.flagged).toBe(true);
+    expect(downscaled.findings.join(" ")).toMatch(/1024 < the 8192 atlas/u);
+    expect(downscaled.findings.join(" ")).toMatch(/ETC1S/u);
+  });
 });
