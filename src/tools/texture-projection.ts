@@ -1,0 +1,468 @@
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+
+import { NodeIO } from "@gltf-transform/core";
+import sharp from "sharp";
+import { z } from "zod";
+
+import { canonicalPath, isInside } from "../config.js";
+import { auditCookConfig } from "../texture-projection/config-audit.js";
+import { buildAtlasSheet, buildContactSheet } from "../texture-projection/contact-sheet.js";
+import { readProjectedAtlasMarker } from "../texture-projection/glb-marker.js";
+import { DEFAULT_MODEL } from "../texture-projection/models.js";
+import { defaultRunRoot, readRun, type StoredRun } from "../texture-projection/runs.js";
+import {
+  TextureProjectionError,
+  measureStoredRunBlurredPercent,
+  paintTextureProjection,
+  quoteTextureProjection,
+} from "../texture-projection/runner.js";
+
+/**
+ * Texture projection for gray blockout levels and environments: an image model paints the level
+ * from planned camera views, the views are projected into the level's UV atlas, and the baked GLB
+ * comes back ready to cook. Quote first (free), then paint, then inspect the bake by eye.
+ */
+
+const PathSchema = z.string().min(1).max(4_096);
+const ModelSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .default(DEFAULT_MODEL)
+  .describe(`Image model alias: "or-klein" (default), "muse-image", "or-seedream-lite" or "or:<model id>".`);
+const AtlasSchema = z
+  .union([z.number().int().min(256).max(8_192), z.literal("auto")])
+  .default("auto")
+  .describe(
+    'Atlas size in pixels, or "auto" (default) for the smallest power of two that matches what the planned views resolve.',
+  );
+const PlanShape = {
+  views: z.number().int().min(1).max(96).optional().describe("Maximum number of camera views to plan (default 36)."),
+  aerial: z.number().int().min(0).max(24).optional().describe("Aerial ring cameras around the level (default 0)."),
+  roofs: z.number().int().min(0).max(24).optional().describe("Close roof passes painted with the roof prompt (default 0)."),
+  holes: z.number().int().min(0).max(24).optional().describe("Extra views over texels nothing painted (default 0)."),
+} as const;
+
+const UvStretchSchema = z
+  .object({
+    p95: z.number().nonnegative(),
+    worstMaterial: z.string(),
+    worstMaterialP95: z.number().nonnegative(),
+    triangles: z.number().int().nonnegative(),
+    uniform: z.boolean(),
+  })
+  .strict();
+
+export const TextureProjectQuoteInputSchema = z
+  .object({
+    levelPath: PathSchema.describe(
+      "Gray blockout level or environment GLB, project-relative; it must carry TEXCOORD_0 (unwrapped).",
+    ),
+    ...PlanShape,
+    model: ModelSchema,
+    atlas: AtlasSchema,
+  })
+  .strict();
+
+export const TextureProjectQuoteOutputSchema = z
+  .object({
+    views: z.number().int().nonnegative(),
+    aerial: z.number().int().nonnegative(),
+    roofs: z.number().int().nonnegative(),
+    holes: z.number().int().nonnegative(),
+    model: z.string(),
+    modelId: z.string(),
+    estimatedUsd: z.number().nonnegative(),
+    atlas: z.number().int().positive(),
+    estimatedBlurredTexelPercent: z.number().min(0).max(100),
+    uvStretch: UvStretchSchema,
+  })
+  .strict();
+
+export const TextureProjectPaintInputSchema = z
+  .object({
+    levelPath: PathSchema.describe(
+      "Gray blockout level or environment GLB, project-relative; it must carry TEXCOORD_0 (unwrapped).",
+    ),
+    outputPath: PathSchema.describe(
+      "Painted GLB to write, project-relative and under the project's assets/ directory (atomically replaced).",
+    ),
+    model: ModelSchema,
+    fill: z
+      .string()
+      .min(1)
+      .max(128)
+      .optional()
+      .describe("Model alias for fill and hole views (defaults to model); the first views always use model."),
+    atlas: AtlasSchema,
+    viewSize: z
+      .number()
+      .int()
+      .min(128)
+      .max(2_048)
+      .default(1_024)
+      .describe("Pixels per view image sent to the model (default 1024)."),
+    lighting: z
+      .enum(["outdoor", "overcast", "indoor"])
+      .default("overcast")
+      .describe('Light the clay render is painted under; "overcast" (default) keeps albedo free of baked sun.'),
+    style: z.string().min(1).max(2_000).optional().describe("Material style for the level, e.g. its architecture and wear."),
+    styleImagePath: PathSchema.optional().describe("Reference image whose materials and palette ride along, project-relative."),
+    ...PlanShape,
+    promptTestView: z
+      .number()
+      .int()
+      .min(0)
+      .max(95)
+      .optional()
+      .describe("Paint only this planned view, for one image: a prompt test that leaves the run incomplete."),
+    resumeRunId: z
+      .string()
+      .min(1)
+      .max(128)
+      .optional()
+      .describe("Continue a stored run: its paid views are replayed and only the missing ones are requested."),
+  })
+  .strict();
+
+export const TextureProjectPaintOutputSchema = z
+  .object({
+    runId: z.string(),
+    outputPath: z.string(),
+    coveragePercent: z.number().min(0).max(100),
+    viewsPainted: z.number().int().nonnegative(),
+    viewsRejected: z.object({ grazing: z.number().int().nonnegative(), structure: z.number().int().nonnegative() }).strict(),
+    blurredTexelPercent: z.number().min(0).max(100),
+    atlas: z.number().int().positive(),
+    estimatedUsd: z.number().nonnegative(),
+    cookConfigHint: z.string(),
+  })
+  .strict();
+
+export const TextureProjectInspectInputSchema = z
+  .object({
+    runId: z.string().min(1).max(128).optional().describe("Stored run under the project's .threenative/texture-projection."),
+    glbPath: PathSchema.optional().describe(
+      "A projected GLB, project-relative; its extras marker names the run when one exists.",
+    ),
+  })
+  .strict()
+  .refine((value) => value.runId !== undefined || value.glbPath !== undefined, {
+    message: "pass runId or glbPath",
+  });
+
+export const TextureProjectInspectOutputSchema = z
+  .object({
+    runId: z.string().nullable(),
+    glbPath: z.string().nullable(),
+    atlas: z.number().int().positive().nullable(),
+    coveragePercent: z.number().min(0).max(100).nullable(),
+    blurredTexelPercent: z.number().min(0).max(100).nullable(),
+    views: z.number().int().nonnegative(),
+    rejectedViews: z.array(z.object({ index: z.number().int(), reason: z.string() }).strict()),
+    cookConfig: z
+      .object({
+        path: z.string().nullable(),
+        baseColorMaxSize: z.number().int().positive(),
+        baseColorCodec: z.string().nullable(),
+        flagged: z.boolean(),
+        findings: z.array(z.string()),
+      })
+      .strict(),
+    contactSheetPath: z.string(),
+    contactSheetViews: z.array(z.number().int()),
+  })
+  .strict();
+
+function projectRoot(): string {
+  // The MCP launch root is the game project; every path the tools take is relative to it.
+  return process.cwd();
+}
+
+/** Resolve one project-relative path and refuse anything that canonicalises outside `parent`. */
+function containedPath(parent: string, value: string, label: string): string {
+  const canonicalRoot = canonicalPath(parent);
+  const target = canonicalPath(isAbsolute(value) ? value : resolve(canonicalRoot, value));
+  if (target === canonicalRoot || !isInside(target, canonicalRoot)) {
+    throw new TextureProjectionError(
+      "TEXTURE_PROJECT_UNSAFE_PATH",
+      `${label} must stay inside ${label === "outputPath" ? "the project's assets/ directory" : "the project root"} (a relative path is resolved from there)`,
+    );
+  }
+  return target;
+}
+
+function planRequest(input: {
+  views?: number | undefined;
+  aerial?: number | undefined;
+  roofs?: number | undefined;
+  holes?: number | undefined;
+}) {
+  return {
+    ...(input.views === undefined ? {} : { maxViews: input.views }),
+    ...(input.aerial === undefined ? {} : { aerial: input.aerial }),
+    ...(input.roofs === undefined ? {} : { roofs: input.roofs }),
+    ...(input.holes === undefined ? {} : { holes: input.holes }),
+  };
+}
+
+/** The explicit threenative.config.ts override for one painted atlas (C.3): size kept, UASTC encoded. */
+export function cookConfigHint(atlas: number): string {
+  return [
+    "// threenative.config.ts — explicit override for the painted atlas. The engine cook also honours the",
+    "// GLB's extras.threenative.textureProjection marker (this MCP writes it; the cook side ships separately).",
+    "// The game sets anisotropy 8 on the level's base colour map so the atlas stays sharp at a graze.",
+    "assets: {",
+    "  models: {",
+    "    textures: {",
+    `      maxSize: { baseColorTexture: ${atlas} },`,
+    '      overrides: [{ slot: "baseColorTexture", codec: "uastc" }],',
+    "    },",
+    "  },",
+    "},",
+  ].join("\n");
+}
+
+function failure(error: unknown): {
+  isError: true;
+  content: [{ type: "text"; text: string }];
+} {
+  const code =
+    error instanceof TextureProjectionError
+      ? error.code
+      : error instanceof z.ZodError
+        ? "TEXTURE_PROJECT_INVALID_INPUT"
+        : "TEXTURE_PROJECT_FAILED";
+  const message =
+    error instanceof TextureProjectionError
+      ? error.message
+      : error instanceof z.ZodError
+        ? error.issues.map((issue) => `${issue.path.join(".") || "input"}: ${issue.message}`).join("; ")
+        : error instanceof Error
+          ? error.message
+          : String(error);
+  return { isError: true, content: [{ type: "text", text: `${code}: ${message}` }] };
+}
+
+export function createTextureProjectQuoteHandler() {
+  return async (raw: z.input<typeof TextureProjectQuoteInputSchema>) => {
+    try {
+      const input = TextureProjectQuoteInputSchema.parse(raw);
+      const root = projectRoot();
+      const levelPath = containedPath(root, input.levelPath, "levelPath");
+      const quote = await quoteTextureProjection({
+        levelPath,
+        cwd: root,
+        // No key: a quote plans cameras and measures the plan, it never buys an image.
+        env: {},
+        atlas: input.atlas,
+        plan: planRequest(input),
+        firstModel: input.model,
+      });
+      const output = TextureProjectQuoteOutputSchema.parse({
+        views: quote.views,
+        aerial: quote.aerial,
+        roofs: quote.roofs,
+        holes: quote.holes,
+        model: quote.model,
+        modelId: quote.modelId,
+        estimatedUsd: quote.estimatedUsd,
+        atlas: quote.atlas,
+        estimatedBlurredTexelPercent: quote.estimatedBlurredTexelPercent,
+        uvStretch: quote.uvStretch,
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(output) }], structuredContent: output };
+    } catch (error) {
+      return failure(error);
+    }
+  };
+}
+
+export function createTextureProjectPaintHandler() {
+  return async (raw: z.input<typeof TextureProjectPaintInputSchema>) => {
+    try {
+      const input = TextureProjectPaintInputSchema.parse(raw);
+      const root = projectRoot();
+      const levelPath = input.levelPath === undefined ? undefined : containedPath(root, input.levelPath, "levelPath");
+      const outputPath = containedPath(root, input.outputPath, "outputPath");
+      const assetsRoot = canonicalPath(join(root, "assets"));
+      if (!isInside(canonicalPath(outputPath), assetsRoot)) {
+        throw new TextureProjectionError(
+          "TEXTURE_PROJECT_UNSAFE_PATH",
+          "outputPath must be under the project's assets/ directory, project-relative",
+        );
+      }
+      const styleImagePath =
+        input.styleImagePath === undefined ? undefined : containedPath(root, input.styleImagePath, "styleImagePath");
+      const result = await paintTextureProjection({
+        cwd: root,
+        env: process.env,
+        ...(levelPath === undefined ? {} : { levelPath }),
+        outputPath,
+        ...(styleImagePath === undefined ? {} : { styleImagePath }),
+        firstModel: input.model,
+        ...(input.fill === undefined ? {} : { fillModel: input.fill }),
+        atlas: input.atlas,
+        viewSize: input.viewSize,
+        lighting: input.lighting,
+        ...(input.style === undefined ? {} : { style: input.style }),
+        ...(input.promptTestView === undefined ? {} : { promptTestView: input.promptTestView }),
+        ...(input.resumeRunId === undefined ? {} : { resumeRunId: input.resumeRunId }),
+        plan: planRequest(input),
+      });
+      const output = TextureProjectPaintOutputSchema.parse({
+        runId: result.runId,
+        outputPath: relative(root, result.outputPath) || basename(result.outputPath),
+        coveragePercent: result.coveragePercent,
+        viewsPainted: result.viewsPainted,
+        viewsRejected: result.viewsRejected,
+        blurredTexelPercent: result.blurredTexelPercent,
+        atlas: result.atlas,
+        estimatedUsd: result.estimatedUsd,
+        cookConfigHint: cookConfigHint(result.atlas),
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(output) }], structuredContent: output };
+    } catch (error) {
+      return failure(error);
+    }
+  };
+}
+
+/** The painted atlas image inside a projected GLB, for a sheet with no stored views. */
+async function atlasImageOf(glbPath: string): Promise<{ image: Uint8Array | undefined; runId: string | undefined }> {
+  const bytes = new Uint8Array(await readFile(glbPath));
+  const marker = readProjectedAtlasMarker(bytes);
+  const document = await new NodeIO().read(glbPath);
+  const root = document.getRoot();
+  const material = root.listMaterials()[0];
+  const image = material?.getBaseColorTexture()?.getImage() ?? root.listTextures()[0]?.getImage();
+  return { image: image ?? undefined, runId: marker?.runId };
+}
+
+async function readConfigAudit(root: string, atlas: number) {
+  const path = join(root, "threenative.config.ts");
+  let text: string | undefined;
+  try {
+    if ((await stat(path)).isFile()) text = await readFile(path, "utf8");
+  } catch {
+    text = undefined;
+  }
+  const audit = auditCookConfig(text, atlas, text === undefined ? null : relative(root, path));
+  return {
+    path: audit.path,
+    baseColorMaxSize: audit.baseColorMaxSize,
+    baseColorCodec: audit.baseColorCodec ?? null,
+    flagged: audit.flagged,
+    findings: [...audit.findings],
+  };
+}
+
+export function createTextureProjectInspectHandler() {
+  return async (raw: z.input<typeof TextureProjectInspectInputSchema>) => {
+    try {
+      const input = TextureProjectInspectInputSchema.parse(raw);
+      const root = projectRoot();
+      const runRoot = defaultRunRoot(root);
+      const glbPath = input.glbPath === undefined ? undefined : containedPath(root, input.glbPath, "glbPath");
+      let runId = input.runId;
+      let atlasFromGlb: number | undefined;
+      let glbImage: Uint8Array | undefined;
+      if (glbPath !== undefined) {
+        const fromGlb = await atlasImageOf(glbPath);
+        glbImage = fromGlb.image;
+        if (runId === undefined && fromGlb.runId !== undefined) runId = fromGlb.runId;
+        const marker = readProjectedAtlasMarker(new Uint8Array(await readFile(glbPath)));
+        atlasFromGlb = marker?.atlas;
+      }
+      const run: StoredRun | undefined =
+        runId === undefined
+          ? undefined
+          : await readRun(runRoot, runId).then((stored) => {
+              if (!stored) {
+                throw new TextureProjectionError(
+                  "TEXTURE_PROJECT_RUN_NOT_FOUND",
+                  `no stored run ${runId} under ${runRoot}`,
+                );
+              }
+              return stored;
+            });
+
+      if (run !== undefined) {
+        const rejectedViews = run.views
+          .filter((view) => view.rejected !== undefined)
+          .map((view) => ({ index: view.index, reason: view.rejected! }));
+        // Measured from the run's own plan at its atlas size; no image is bought.
+        const blurredTexelPercent = await measureStoredRunBlurredPercent(runRoot, run);
+        const summary = `${run.views.length} views · ${run.complete ? "complete" : "incomplete"} · ${run.cost.toFixed(3)} USD · ${
+          rejectedViews.length
+        } rejected · blurred ${blurredTexelPercent.toFixed(1)}%`;
+        const sheet = await buildContactSheet(runRoot, run, summary);
+        const coverage = run.views
+          .filter((view) => view.rejected === undefined)
+          .map((view) => view.coverage)
+          .at(-1);
+        const output = TextureProjectInspectOutputSchema.parse({
+          runId: run.runId,
+          glbPath: glbPath === undefined ? null : relative(root, glbPath),
+          atlas: run.atlas,
+          coveragePercent: coverage === undefined ? null : Math.round(coverage * 100),
+          blurredTexelPercent,
+          views: run.views.length,
+          rejectedViews,
+          cookConfig: await readConfigAudit(root, run.atlas),
+          contactSheetPath: relative(root, sheet.path),
+          contactSheetViews: [...sheet.views],
+        });
+        return {
+          content: [
+            { type: "image" as const, mimeType: "image/png", data: sheet.png.toString("base64") },
+            { type: "text" as const, text: JSON.stringify(output) },
+          ],
+          structuredContent: output,
+        };
+      }
+
+      if (glbPath === undefined) {
+        throw new TextureProjectionError(
+          "TEXTURE_PROJECT_INVALID_INPUT",
+          "pass a runId or a glbPath; no stored run was named",
+        );
+      }
+      // A GLB without a stored run: report what the bytes themselves say, and show the atlas.
+      const imageSize = glbImage === undefined ? undefined : await atlasSize(glbImage);
+      const atlas = atlasFromGlb ?? imageSize?.width ?? 2_048;
+      const png = await buildAtlasSheet(glbImage, `${basename(glbPath)} · atlas ${atlas}px · no stored run`);
+      const directory = join(runRoot, "inspect");
+      await mkdir(directory, { recursive: true });
+      const sheetPath = join(directory, `${basename(glbPath).replace(/\.\w+$/, "")}_atlas.png`);
+      await writeFile(sheetPath, png);
+      const output = TextureProjectInspectOutputSchema.parse({
+        runId: runId ?? null,
+        glbPath: relative(root, glbPath),
+        atlas,
+        coveragePercent: null,
+        blurredTexelPercent: null,
+        views: 0,
+        rejectedViews: [],
+        cookConfig: await readConfigAudit(root, atlas),
+        contactSheetPath: relative(root, sheetPath),
+        contactSheetViews: [],
+      });
+      return {
+        content: [
+          { type: "image" as const, mimeType: "image/png", data: png.toString("base64") },
+          { type: "text" as const, text: JSON.stringify(output) },
+        ],
+        structuredContent: output,
+      };
+    } catch (error) {
+      return failure(error);
+    }
+  };
+}
+
+async function atlasSize(image: Uint8Array): Promise<{ width: number; height: number }> {
+  const metadata = await sharp(Buffer.from(image)).metadata();
+  return { width: metadata.width ?? 0, height: metadata.height ?? 0 };
+}
