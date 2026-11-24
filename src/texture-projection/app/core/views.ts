@@ -135,11 +135,11 @@ export class ViewRenderer {
   /** State image + mask for the current geometry buffers. Returns top-down RGBA8 arrays. */
   renderState(clay: THREE.Texture, atlas: THREE.Texture, ratio: number) {
     const u = this.stateMaterial.uniforms;
-    u.clay.value = clay;
-    u.gNrm.value = this.geometryTarget.textures[1];
-    u.gUvq.value = this.geometryTarget.textures[2];
-    u.atlas.value = atlas;
-    u.ratio.value = ratio;
+    u.clay!.value = clay;
+    u.gNrm!.value = this.geometryTarget.textures[1];
+    u.gUvq!.value = this.geometryTarget.textures[2];
+    u.atlas!.value = atlas;
+    u.ratio!.value = ratio;
     this.gpu.pass(this.stateMaterial, this.stateTarget);
     return {
       state: this.gpu.readU8(this.stateTarget, 0),

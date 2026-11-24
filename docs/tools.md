@@ -283,7 +283,10 @@ Texture projection (gray blockout levels and environments):
   `cookConfigHint` is the
   `threenative.config.ts` `assets.models.textures` snippet that keeps the atlas' size (at most 4096, the engine
   cook's KTX2 ceiling) and UASTC encoding; the engine cook of the release that ships PRD-916 honours the GLB's
-  marker on its own.
+  marker on its own. The bake also cuts two true-scale, tileable material swatches from its own stored paint
+  (`swatch_wall.png`, `swatch_floor.png`, `swatches.json`): the atlas is the macro variation, and at arm's length
+  its texels read as blotches, so a game tiles the swatch in world space for close-range detail — and the swatch
+  keeps its patch's view, metres per pixel, incidence and world corners so the tiling is true scale.
 - `texture_project_inspect` — returns a contact sheet (clay render, model image and projected composite per
   view, rejected views labelled) with coverage, atlas size, measured blurred-texel share, rejected views by reason
   (the caller's own `rejected: "caller"` verdicts included), the opt-in vision check's verdicts when one ran

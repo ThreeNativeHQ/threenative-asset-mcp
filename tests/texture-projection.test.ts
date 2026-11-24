@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Document, NodeIO } from "@gltf-transform/core";
@@ -446,10 +446,13 @@ describe("texture-projection runner", () => {
       // B: how much of what a player sees the bake actually painted, and the warning rule that goes with it.
       expect(result.visibleCoveragePercent).toBeGreaterThan(0);
       expect(result.visibleCoveragePercent).toBeLessThanOrEqual(100);
+      // The swatch step's own shortfall is a warning of its own (phase 2m), so the coverage rule is
+      // read on the warnings that are not about swatches.
+      const bakeOnly = result.warnings.filter((warning) => !warning.includes("swatch"));
       if (result.visibleCoveragePercent < 90) {
-        expect(result.warnings.join(" ")).toContain("visible coverage");
+        expect(bakeOnly.join(" ")).toContain("visible coverage");
       } else {
-        expect(result.warnings).toEqual([]);
+        expect(bakeOnly).toEqual([]);
       }
       const references = stub.requests[0]?.body["input_references"] as
         | { type: string; image_url: { url: string } }[]
@@ -484,6 +487,29 @@ describe("texture-projection runner", () => {
           expect(image.subarray(1, 4).toString("utf8")).toBe("PNG");
         }
       }
+
+      // The swatches (phase 2m): true-scale patches cut from the stored paint, written both into the run
+      // directory and beside the GLB, with swatches.json saying which view and scale they came from.
+      expect(result.swatches).not.toBeNull();
+      const swatches = result.swatches!;
+      const cut = (["wall", "floor"] as const).filter((klass) => swatches[klass] !== null);
+      expect(cut.length).toBeGreaterThan(0);
+      for (const klass of cut) {
+        const swatch = swatches[klass]!;
+        expect(swatch.file).toBe(`${basename(outputPath).replace(/\.\w+$/, "")}.swatch_${klass}.png`);
+        expect(swatch.metres).toBe(klass === "wall" ? 1.5 : 2);
+        expect(swatch.metresPerPixel).toBeCloseTo(swatch.metres / 1024, 9);
+        expect(swatch.incidence).toBeLessThan(50);
+        expect(swatch.corners).toHaveLength(4);
+        expect((await readFile(swatch.path)).subarray(1, 4).toString("utf8")).toBe("PNG");
+        const inRun = await readFile(join(cwd, ".threenative", "texture-projection", result.runId, `swatch_${klass}.png`));
+        expect(inRun.subarray(1, 4).toString("utf8")).toBe("PNG");
+        expect(swatch.sourceMetresPerPixel).toBeGreaterThan(0);
+        expect(swatch.view).toBeGreaterThanOrEqual(0);
+      }
+      const swatchFile = JSON.parse(await readFile(swatches.jsonPath, "utf8")) as Record<string, { file: string }>;
+      expect(Object.keys(swatchFile).sort()).toEqual([...cut].sort());
+      for (const klass of cut) expect(swatchFile[klass]?.file).toBe(swatches[klass]!.file);
 
       const everything = [runText, JSON.stringify(result), logged.join("\n"), stdout.mock.calls.flat().join("\n"), stderr.mock.calls.flat().join("\n")].join("\n");
       expect(everything).not.toContain(FAKE_KEY);

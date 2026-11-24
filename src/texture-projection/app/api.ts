@@ -10,6 +10,7 @@ import {
   type PlanJson,
   type Session,
   type StoredRun,
+  type SwatchReport,
 } from "./session.js";
 
 /** How many views of each kind a plan holds, without the geometry. */
@@ -219,6 +220,13 @@ export function makeApi(session: Session) {
         structureDeviation: view.structureDeviation,
         silhouetteMismatch: view.silhouetteMismatch,
       };
+    },
+    /**
+     * Cut the true-scale, tileable material swatches from this run's stored paint (phase 2m) and write
+     * `swatch_<class>.png` plus `swatches.json` into the run directory. Nothing is bought or re-judged.
+     */
+    async swatches(runId: string): Promise<SwatchReport> {
+      return session.swatches(runId);
     },
     /** Base64 GLB of the level with the painted texture. */
     async glb(): Promise<string> {

@@ -24,6 +24,21 @@ import {
 } from "./core/pipeline.js";
 import { plan as makePlan, type Plan, type PlanOptions } from "./core/planner.js";
 import { loadLevel, type Level } from "./core/scene.js";
+import { classifyView } from "./core/semantics.js";
+import { edgeBandMask } from "./core/silhouette.js";
+import {
+  SWATCH_CLASSES,
+  SWATCH_PROBE_PX,
+  SWATCH_SIDE_METRES,
+  SWATCH_SIZE,
+  WALL_MAX_NY,
+  makeSwatchTileable,
+  patchPainted,
+  pickSwatch,
+  rectifySwatch,
+  type SwatchCandidate,
+  type ViewGeometry,
+} from "./core/swatch.js";
 import { makeCamera, ViewRenderer, type ViewSpec } from "./core/views.js";
 import { Viewer } from "./core/viewer.js";
 
@@ -34,6 +49,30 @@ export const LIGHTING: Record<string, Lighting> = { outdoor: OUTDOOR, overcast: 
  * the footprint the projection measures is that worse axis, so the guard's threshold is 2, not 4.
  */
 export const BLUR_TEXELS_PER_PIXEL = MAX_TEXELS_PER_PIXEL;
+
+/** How many of a class' ranked patch candidates are tried against the stored paint before it is given up. */
+const SWATCH_ATTEMPTS = 4;
+
+/** One material swatch a run cut, as `swatches.json` records it and the paint result carries it. */
+export interface SwatchReportEntry {
+  /** Run file: `swatch_wall.png` or `swatch_floor.png`. */
+  readonly file: string;
+  /** Patch side in metres. */
+  readonly metres: number;
+  /** Index of the accepted view it was cut from. */
+  readonly view: number;
+  /** Metres of surface per swatch pixel: the scale a game tiles it at. */
+  readonly metresPerPixel: number;
+  /** Metres of surface per pixel of that view (below the above means the swatch is an upsample). */
+  readonly sourceMetresPerPixel: number;
+  /** Angle between the patch's normal and the direction to its view, in degrees. */
+  readonly incidence: number;
+  /** The patch's four world corners, in order: -u-v, +u-v, +u+v, -u+v (from its centre). */
+  readonly corners: [number, number, number][];
+}
+
+/** What a run could cut: a class with no qualifying patch is absent, never faked. */
+export type SwatchReport = { wall?: SwatchReportEntry; floor?: SwatchReportEntry };
 
 /** What a plan resolves at one atlas size: the footprint of the winning view per painted texel. */
 export interface ProjectionMeasurement {
@@ -64,6 +103,8 @@ export class Session {
   private measurement?: { atlas: number; foot: Float32Array; painted: Uint8Array; islandTexels: number; paintedTexels: number };
   /** 128 px renderer the hole pass ranks candidate cameras with (B, phase 2d). */
   private holeProbe?: ViewRenderer;
+  /** Probe renderer the swatch search reads a view's geometry back with (phase 2m). */
+  private swatchProbe?: ViewRenderer;
   /** 1 per texel a player-height view sees: an aerial or roof pass must not paint those (phase 2e). */
   private playerVisible?: { plan: Plan; target: THREE.WebGLRenderTarget };
 
@@ -517,14 +558,24 @@ export class Session {
     }
   }
 
-  /** Write one RGBA image as a run file through the local server. */
-  private async writeRunImage(runId: string, file: string, pixels: Uint8ClampedArray, size: number) {
+  /** Write one run file through the local server (a view's image, a swatch, swatches.json). */
+  private async writeRunFile(
+    runId: string,
+    file: string,
+    body: string | Blob,
+    contentType: "application/json" | "application/octet-stream",
+  ) {
     const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/${file}`, {
       method: "POST",
-      headers: postHeaders("application/octet-stream"),
-      body: await toBlob(pixels, size, size, "image/png"),
+      headers: postHeaders(contentType),
+      body,
     });
     if (!res.ok) throw new Error(`saving ${file} failed: ${res.status}`);
+  }
+
+  /** Write one RGBA image as a run file through the local server. */
+  private async writeRunImage(runId: string, file: string, pixels: Uint8ClampedArray, size: number) {
+    await this.writeRunFile(runId, file, await toBlob(pixels, size, size, "image/png"), "application/octet-stream");
   }
 
   /** Write one finished view's images to the run directory through the local server, then drop them. */
@@ -537,6 +588,95 @@ export class Session {
     view.state = new Uint8ClampedArray(0);
     view.edit = new Uint8Array(0);
     view.gen = new Uint8ClampedArray(0);
+  }
+
+  /** One view's geometry at the probe size the swatch search reads back (not the view's own image). */
+  private swatchGeometry(spec: ViewSpec, size: number): ViewGeometry {
+    if (!this.level) throw new Error("load a level first");
+    const probe = (this.swatchProbe ??= new ViewRenderer(this.gpu, this.level, size));
+    probe.renderGeometry(makeCamera(spec));
+    return {
+      spec,
+      size,
+      position: this.gpu.readF32(probe.geometryTarget, 0),
+      normal: this.gpu.readF32(probe.geometryTarget, 1),
+    };
+  }
+
+  /**
+   * Cut the true-scale material swatches (PRD-916 phase 2m) from the paint this run already holds: for
+   * each of the wall and floor classes, the accepted view that sees a planar patch of it best, the
+   * patch rectified onto its own plane and made tileable, written into the run directory as
+   * `swatch_<class>.png` with `swatches.json` beside them. A class no accepted view can give a patch
+   * for is left out (the runner reports it), never faked from a stretched or lower-resolution crop.
+   */
+  async swatches(runId: string): Promise<SwatchReport> {
+    const engine = this.engine;
+    const level = this.level;
+    const views = this.record?.views ?? [];
+    const report: SwatchReport = {};
+    if (!engine || !level || views.length === 0) return report;
+    const size = SWATCH_PROBE_PX;
+    const pixels = size * size;
+    const candidates: SwatchCandidate[] = [];
+    for (const view of views) {
+      if (view.rejected !== undefined) continue;
+      const geometry = this.swatchGeometry(view.spec, size);
+      const classes = classifyView(geometry.normal, geometry.position, level.labels, level.bounds.min.y);
+      const wall = new Uint8Array(pixels);
+      const floor = new Uint8Array(pixels);
+      for (let i = 0; i < pixels; i++) {
+        if (geometry.normal[4 * i + 3]! < 0.5) continue;
+        if (classes.floor[i]) floor[i] = 1;
+        else if (!classes.roof[i] && Math.abs(geometry.normal[4 * i + 1]!) <= WALL_MAX_NY) wall[i] = 1;
+      }
+      // The strip along the clay's own edges is projected nowhere (a coping, a plinth is invented there),
+      // so no swatch may straddle it: its paint only exists in the image, not in the atlas.
+      const avoid = edgeBandMask(geometry.position, geometry.normal, size, size);
+      for (const klass of SWATCH_CLASSES) {
+        const candidate = pickSwatch(geometry, {
+          klass,
+          side: SWATCH_SIDE_METRES[klass],
+          view: view.index,
+          viewSize: engine.size,
+          area: klass === "wall" ? wall : floor,
+          avoid,
+        });
+        if (candidate) candidates.push(candidate);
+      }
+    }
+    for (const klass of SWATCH_CLASSES) {
+      const ranked = candidates
+        .filter((candidate) => candidate.klass === klass)
+        .sort((a, b) => a.sourceMetresPerPixel - b.sourceMetresPerPixel);
+      for (const candidate of ranked.slice(0, SWATCH_ATTEMPTS)) {
+        const view = views.find((entry) => entry.index === candidate.view);
+        if (!view) continue;
+        const generation = await this.readRunImage(runId, `view_${candidate.view}_gen.png`, engine.size);
+        const composite = await this.readRunImage(runId, `view_${candidate.view}_comp.png`, engine.size);
+        if (generation === undefined || composite === undefined) continue;
+        // Alpha is where this very view projected its own paint: not the clay it was handed, not the
+        // strip along its edges, not a texel it left unpainted. Nothing else proves the swatch is paint.
+        const painted = new Uint8Array(composite.length / 4);
+        for (let i = 0; i < painted.length; i++) painted[i] = composite[4 * i + 3]! > 127 ? 1 : 0;
+        if (!patchPainted(candidate.patch, view.spec, painted, engine.size)) continue;
+        const swatch = makeSwatchTileable(rectifySwatch(candidate.patch, view.spec, generation, engine.size));
+        const file = `swatch_${klass}.png`;
+        await this.writeRunImage(runId, file, swatch, SWATCH_SIZE);
+        report[klass] = {
+          file,
+          metres: candidate.patch.side,
+          view: candidate.view,
+          metresPerPixel: candidate.metresPerPixel,
+          sourceMetresPerPixel: candidate.sourceMetresPerPixel,
+          incidence: candidate.incidence,
+          corners: candidate.patch.corners.map((corner) => [corner[0], corner[1], corner[2]]),
+        };
+        break;
+      }
+    }
+    await this.writeRunFile(runId, "swatches.json", `${JSON.stringify(report, null, 1)}\n`, "application/json");
+    return report;
   }
 }
 

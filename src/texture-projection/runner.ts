@@ -1,4 +1,4 @@
-import { mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 import { NodeIO, Primitive } from "@gltf-transform/core";
@@ -114,6 +114,33 @@ export interface TextureProjectionQuote {
   readonly estimatedVerifyUsd: number;
 }
 
+/** A material swatch beside the baked GLB: the run directory's copy, cut and made tileable (phase 2m). */
+export interface TextureProjectionSwatch {
+  /** File name beside the GLB, e.g. `courtyard.swatch_wall.png`. */
+  readonly file: string;
+  /** Absolute path of that file. */
+  readonly path: string;
+  /** Patch side in metres. */
+  readonly metres: number;
+  /** Index of the accepted view it was cut from. */
+  readonly view: number;
+  /** Metres of surface per swatch pixel: the scale a game tiles it at in world space. */
+  readonly metresPerPixel: number;
+  /** Metres of surface per pixel of that view (below the above means the swatch is an upsample). */
+  readonly sourceMetresPerPixel: number;
+  /** Angle between the patch's normal and the direction to its view, in degrees. */
+  readonly incidence: number;
+  /** The patch's four world corners, in order: -u-v, +u-v, +u+v, -u+v (from its centre). */
+  readonly corners: [number, number, number][];
+}
+
+/** The swatches a bake wrote: `swatches.json`'s content, with absolute paths, and null for an absent class. */
+export interface TextureProjectionSwatches {
+  readonly jsonPath: string;
+  readonly wall: TextureProjectionSwatch | null;
+  readonly floor: TextureProjectionSwatch | null;
+}
+
 export interface TextureProjectionResult {
   readonly runId: string;
   readonly level: string;
@@ -148,6 +175,12 @@ export interface TextureProjectionResult {
   readonly viewsBanded: number;
   /** The vision model that judged the views, or null when the run was painted without `verify: true`. */
   readonly verifyModel: string | null;
+  /**
+   * True-scale material swatches cut from the stored paint and written beside the GLB (phase 2m): a game
+   * tiles them in world space for close range and keeps the atlas for macro variation. Null for a prompt
+   * test, which bakes nothing; a class with no qualifying patch is null and reported in `warnings`.
+   */
+  readonly swatches: TextureProjectionSwatches | null;
 }
 
 /** How many painted views must all invent geometry before the run stops buying (B.2, fail closed). */
@@ -206,6 +239,23 @@ interface BrowserPromptTest {
   readonly seconds: number;
   readonly coverage: number;
   readonly rejected?: "grazing" | "structure";
+}
+
+/** One swatch the app cut, as `Session.swatches` reports it. */
+interface BrowserSwatch {
+  readonly file: string;
+  readonly metres: number;
+  readonly view: number;
+  readonly metresPerPixel: number;
+  readonly sourceMetresPerPixel: number;
+  readonly incidence: number;
+  readonly corners: [number, number, number][];
+}
+
+/** What the app's swatch step returns: a class it could not cut a patch for is absent. */
+interface BrowserSwatches {
+  readonly wall?: BrowserSwatch;
+  readonly floor?: BrowserSwatch;
 }
 
 /** What the app's measurement returns (see app/session.ts, `Session.measure`). */
@@ -343,6 +393,83 @@ async function atomicWrite(path: string, bytes: Uint8Array): Promise<void> {
     await rm(temporary, { force: true });
     throw error;
   }
+}
+
+/**
+ * Copy the swatches a run cut from its run directory to beside the baked GLB, under the GLB's own
+ * name, and rewrite `swatches.json` so its `file` fields point at those copies (they are what a game
+ * loads next to the GLB). `path` is absolute, for a caller that has to find the files it was told about.
+ */
+async function copySwatches(
+  runRoot: string,
+  runId: string,
+  outputPath: string,
+  report: BrowserSwatches,
+): Promise<TextureProjectionSwatches> {
+  const base = basename(outputPath).replace(/\.\w+$/, "");
+  const directory = dirname(outputPath);
+  const copy = async (
+    klass: "wall" | "floor",
+    swatch: BrowserSwatch | undefined,
+  ): Promise<TextureProjectionSwatch | null> => {
+    if (!swatch) return null;
+    const file = `${base}.swatch_${klass}.png`;
+    const path = join(directory, file);
+    await atomicWrite(path, new Uint8Array(await readFile(join(runDirectory(runRoot, runId), swatch.file))));
+    return {
+      file,
+      path,
+      metres: swatch.metres,
+      view: swatch.view,
+      metresPerPixel: swatch.metresPerPixel,
+      sourceMetresPerPixel: swatch.sourceMetresPerPixel,
+      incidence: swatch.incidence,
+      corners: swatch.corners,
+    };
+  };
+  const wall = await copy("wall", report.wall);
+  const floor = await copy("floor", report.floor);
+  // JSON.stringify drops the undefined entries: a class that could not be cut is absent, not null.
+  const content = {
+    wall: wall === null ? undefined : swatchEntry(wall),
+    floor: floor === null ? undefined : swatchEntry(floor),
+  };
+  const jsonPath = join(directory, `${base}.swatches.json`);
+  await atomicWrite(jsonPath, Buffer.from(`${JSON.stringify(content, null, 1)}\n`));
+  return { jsonPath, wall, floor };
+}
+
+/** One swatch without its absolute path: what `swatches.json` records. */
+function swatchEntry(swatch: TextureProjectionSwatch) {
+  return {
+    file: swatch.file,
+    metres: swatch.metres,
+    view: swatch.view,
+    metresPerPixel: swatch.metresPerPixel,
+    sourceMetresPerPixel: swatch.sourceMetresPerPixel,
+    incidence: swatch.incidence,
+    corners: swatch.corners,
+  };
+}
+
+/**
+ * What a reader has to know about the swatches (phase 2m): a class the run could not cut one for is
+ * left out of `swatches.json` rather than faked, and this is where that shortfall is said out loud.
+ */
+function swatchWarnings(swatches: TextureProjectionSwatches | null): string[] {
+  if (swatches === null) return [];
+  const warnings: string[] = [];
+  for (const klass of ["wall", "floor"] as const) {
+    if (swatches[klass] !== null) continue;
+    warnings.push(
+      `no accepted view sees a ${klass === "wall" ? "1.5" : "2"} m ${klass} patch at under 50° of its normal, so the bake has no` +
+        ` ${klass} swatch: close-range ${klass} detail stays at the atlas' own resolution.` +
+        (klass === "floor"
+          ? " The ground is only seen this head-on by a view that looks down at it (a lower camera pitch, or an aerial pass)."
+          : " A closer, more head-on view of that surface would give one."),
+    );
+  }
+  return warnings;
 }
 
 /**
@@ -757,6 +884,12 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     run.seconds = summary.seconds;
     run.updatedAt = new Date().toISOString();
     await writeRun(runRoot, run);
+    // True-scale material swatches (phase 2m) from the paint this run holds: cut and written into the
+    // run directory by the app, then copied beside the GLB. A prompt test bakes no swatch.
+    const swatches =
+      request.promptTestView === undefined
+        ? await copySwatches(runRoot, runId, outputPath, await app.call<BrowserSwatches>("swatches", runId))
+        : null;
     const measured = await measureBlurredPercent(app, run, measurementAtlas);
     const visibleCoveragePercent = Math.round(summary.visibleCoverage * 10) / 10;
     return {
@@ -767,7 +900,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       viewsPainted: summary.painted,
       coveragePercent: Math.round(summary.coverage * 100),
       visibleCoveragePercent,
-      warnings: bakeWarnings(visibleCoveragePercent, run),
+      warnings: [...bakeWarnings(visibleCoveragePercent, run), ...swatchWarnings(swatches)],
       // What this call spent (not rounded: it is money already spent): a resume that only reused
       // stored images reports 0.
       estimatedUsd: summary.cost - priorCost,
@@ -789,6 +922,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       viewsBanded: run.views.filter((view) => (view.verify?.bands?.length ?? 0) > 0).length,
       verifyModel:
         run.options.verify === true ? ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id) : null,
+      swatches,
     };
   } catch (error) {
     // Let the events already in flight finish writing run.json: a stopped or interrupted run must

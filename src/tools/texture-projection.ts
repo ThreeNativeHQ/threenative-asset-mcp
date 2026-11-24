@@ -167,6 +167,25 @@ export const TextureProjectPaintInputSchema = z
   })
   .strict();
 
+const SwatchSchema = z
+  .object({
+    file: z.string().describe("File name beside the GLB, e.g. courtyard.swatch_wall.png."),
+    path: z.string().describe("Absolute path of that file."),
+    metres: z.number().positive().describe("Patch side in metres: the tile a game repeats."),
+    view: z.number().int().nonnegative().describe("Accepted view the swatch was cut from."),
+    metresPerPixel: z.number().positive().describe("Metres of surface per swatch pixel (its true scale)."),
+    sourceMetresPerPixel: z
+      .number()
+      .positive()
+      .describe("Metres of surface per pixel of that view; below metresPerPixel means the swatch is an upsample."),
+    incidence: z.number().min(0).max(90).describe("Angle between the patch's normal and its view, in degrees."),
+    corners: z
+      .array(z.tuple([z.number(), z.number(), z.number()]))
+      .length(4)
+      .describe("The patch's four world corners, in order: -u-v, +u-v, +u+v, -u+v from its centre."),
+  })
+  .strict();
+
 export const TextureProjectPaintOutputSchema = z
   .object({
     runId: z.string(),
@@ -207,6 +226,17 @@ export const TextureProjectPaintOutputSchema = z
     atlas: z.number().int().positive(),
     estimatedUsd: z.number().nonnegative(),
     cookConfigHint: z.string(),
+    swatches: z
+      .object({
+        jsonPath: z.string().describe("The swatches.json written beside the GLB; the run directory keeps its own copy."),
+        wall: SwatchSchema.nullable(),
+        floor: SwatchSchema.nullable(),
+      })
+      .strict()
+      .nullable()
+      .describe(
+        "True-scale, tileable material swatches cut from the stored paint: a game tiles them in world space for close range and keeps the atlas for macro variation. Null for a prompt test; a class no accepted view could give a patch for is null and named in warnings.",
+      ),
   })
   .strict();
 
@@ -428,6 +458,7 @@ export function createTextureProjectPaintHandler() {
         atlas: result.atlas,
         estimatedUsd: result.estimatedUsd,
         cookConfigHint: cookConfigHint(result.atlas),
+        swatches: result.swatches,
       });
       return { content: [{ type: "text" as const, text: JSON.stringify(output) }], structuredContent: output };
     } catch (error) {
