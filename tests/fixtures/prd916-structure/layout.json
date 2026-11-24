@@ -1,0 +1,30 @@
+{
+ "tile": 128,
+ "real": {
+  "columns": 10,
+  "rows": 6,
+  "views": 60
+ },
+ "inventions": [
+  {
+   "index": 0,
+   "kind": "door",
+   "sourceView": 11
+  },
+  {
+   "index": 1,
+   "kind": "window",
+   "sourceView": 33
+  },
+  {
+   "index": 2,
+   "kind": "passage",
+   "sourceView": 20
+  },
+  {
+   "index": 3,
+   "kind": "box",
+   "sourceView": 0
+  }
+ ]
+}
