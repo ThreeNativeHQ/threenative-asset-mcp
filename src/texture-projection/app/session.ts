@@ -23,6 +23,8 @@ import { Viewer } from "./core/viewer.js";
 
 export const LIGHTING: Record<string, Lighting> = { outdoor: OUTDOOR, overcast: OVERCAST, indoor: INDOOR };
 
+import { postHeaders } from "./token.js";
+
 /** One loaded level with its engine and viewer: the object both the UI and the headless API drive. */
 export class Session {
   readonly gpu: Gpu;
@@ -196,7 +198,11 @@ export class Session {
   async saveView(runId: string, view: ViewRecord) {
     const S = this.engine!.size;
     const put = async (file: string, body: Blob) => {
-      const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/${file}`, { method: "POST", body });
+      const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/${file}`, {
+        method: "POST",
+        headers: postHeaders("application/octet-stream"),
+        body,
+      });
       if (!res.ok) throw new Error(`saving ${file} failed: ${res.status}`);
     };
     await put(`view_${view.index}_clay.png`, await toBlob(view.clay, S, S, "image/png"));

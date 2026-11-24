@@ -1,13 +1,28 @@
+import { randomBytes } from "node:crypto";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { basename, extname, join, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { OPENROUTER_IMAGES_PATH, forwardImageRequest } from "./openrouter-proxy.js";
 import { defaultRunRoot, isSafeRunFile, isSafeRunId, listRuns, runDirectory } from "./runs.js";
 
-const DEFAULT_APP_DIR = resolve(process.cwd(), "dist", "texture-projection", "app");
+/**
+ * The app ships beside this module (`dist/texture-projection/app/`), so it is found from the module,
+ * never from the working directory: installed from npm the cwd is the game project. A source
+ * checkout keeps the built page in `dist/` instead.
+ */
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_APP_DIR = existsSync(join(MODULE_DIR, "app", "app.js"))
+  ? join(MODULE_DIR, "app")
+  : resolve(MODULE_DIR, "..", "..", "dist", "texture-projection", "app");
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+/** Header the page sends with every POST; injected into the served index.html, never guessable. */
+export const TOKEN_HEADER = "x-texture-projection-token";
+/** 128 random bits: a web page the user has open cannot read the token, so it cannot post here. */
+const TOKEN_BYTES = 16;
 
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -63,6 +78,13 @@ function sendText(response: ServerResponse, status: number, message: string): vo
   send(response, status, "text/plain; charset=utf-8", message);
 }
 
+/** The page learns its own server's token here; the token is per process and never on disk. */
+function withToken(html: Uint8Array, token: string): Uint8Array {
+  const text = Buffer.from(html).toString("utf8");
+  const meta = `<meta name="texture-projection-token" content="${token}" />`;
+  return new Uint8Array(Buffer.from(text.replace("</head>", `${meta}\n  </head>`), "utf8"));
+}
+
 /** A file under `root`, or undefined when the request escapes it. */
 function containedPath(root: string, relative: string): string | undefined {
   const rootPath = resolve(root);
@@ -90,13 +112,53 @@ export async function startUiServer(options: UiServerOptions = {}): Promise<UiSe
     options.styleImagePath === undefined ? undefined : new Uint8Array(await readFile(options.styleImagePath));
   const styleType = options.styleImagePath === undefined ? undefined : CONTENT_TYPES[extname(options.styleImagePath)] ?? "image/png";
 
+  const token = randomBytes(TOKEN_BYTES).toString("base64url");
+  /** The host names this server answers to; anything else is a DNS-rebinding or proxy request. */
+  function allowedHosts(port: number): string[] {
+    return [`127.0.0.1:${port}`, `localhost:${port}`];
+  }
+  function allowedOrigins(port: number): string[] {
+    return allowedHosts(port).map((host) => `http://${host}`);
+  }
+
   const server = createServer((request, response) => {
     void handle(request, response).catch((error: unknown) => {
       sendText(response, 500, error instanceof Error ? error.message : "internal error");
     });
   });
 
+  /**
+   * Every request must name this server by its own host: a page on any site can point a name at
+   * 127.0.0.1, but a JSON POST that spends the user's key or writes into a run also has to carry the
+   * per-server token (never readable cross-origin) and, when a browser sends one, this origin.
+   */
+  function authorize(request: IncomingMessage, response: ServerResponse): boolean {
+    const port = (server.address() as AddressInfo).port;
+    if (!allowedHosts(port).includes((request.headers.host ?? "").toLowerCase())) {
+      sendText(response, 403, "forbidden: unexpected Host header");
+      return false;
+    }
+    if (request.method !== "POST") return true;
+    const origin = request.headers.origin;
+    if (origin !== undefined && !allowedOrigins(port).includes(origin.toLowerCase())) {
+      sendText(response, 403, "forbidden: cross-origin request");
+      return false;
+    }
+    // A CORS "simple request" (text/plain) needs no preflight, so the type is checked, not assumed.
+    const contentType = (request.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
+    if (contentType !== "application/json" && contentType !== "application/octet-stream") {
+      sendText(response, 403, "forbidden: POST needs application/json or application/octet-stream");
+      return false;
+    }
+    if (request.headers[TOKEN_HEADER] !== token) {
+      sendText(response, 403, "forbidden: missing or wrong server token");
+      return false;
+    }
+    return true;
+  }
+
   async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!authorize(request, response)) return;
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     const path = url.pathname;
 
@@ -157,6 +219,7 @@ export async function startUiServer(options: UiServerOptions = {}): Promise<UiSe
     if (!file) return sendText(response, 400, "bad path");
     try {
       const bytes = new Uint8Array(await readFile(file));
+      if (extname(file) === ".html") return send(response, 200, CONTENT_TYPES[".html"]!, withToken(bytes, token));
       return send(response, 200, CONTENT_TYPES[extname(file)] ?? "application/octet-stream", bytes);
     } catch {
       return sendText(response, 404, "not found");

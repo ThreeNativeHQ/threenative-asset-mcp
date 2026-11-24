@@ -3,6 +3,7 @@
  * which adds the key from OPENROUTER_API_KEY. The key never reaches this page.
  */
 import type { EditInput, EditModel, ImageRequest } from "../models.js";
+import { postHeaders } from "./token.js";
 
 export interface EditResult {
   image: ImageBitmap;
@@ -29,7 +30,7 @@ export async function runEdit(model: EditModel, input: EditInput, signal?: Abort
   const res = await fetch("/api/openrouter/images", {
     method: "POST",
     signal,
-    headers: { "content-type": "application/json" },
+    headers: postHeaders("application/json"),
     body: JSON.stringify(body),
   });
   const data = (await res.json()) as {
