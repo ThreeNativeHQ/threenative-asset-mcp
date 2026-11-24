@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -17,6 +17,7 @@ import {
   quoteTextureProjection,
 } from "../src/texture-projection/runner.js";
 import type { StoredRun } from "../src/texture-projection/runs.js";
+import { startOpenRouterStub as startStub, type OpenRouterStub } from "./helpers/openrouter-stub.js";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LEVEL = join(REPO, "tests", "fixtures", "texture-projection", "courtyard.glb");
@@ -24,11 +25,17 @@ const FAKE_KEY = "sk-or-v1-this-is-a-fake-key-that-must-never-leak";
 const PLAN = { maxViews: 3, aerial: 0, roofs: 0, holes: 0, spacing: 6 };
 
 const temporaryDirectories: string[] = [];
-const servers: Server[] = [];
+const stubs: OpenRouterStub[] = [];
+
+async function startOpenRouterStub(png: string, options: { holdAt?: number } = {}) {
+  const stub = await startStub(png, options);
+  stubs.push(stub);
+  return stub;
+}
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  await Promise.all(servers.splice(0).map((server) => new Promise<void>((done) => server.close(() => done()))));
+  await Promise.all(stubs.splice(0).map((stub) => stub.close()));
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -36,65 +43,6 @@ async function scratchDir(name: string): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), `threenative-asset-mcp-${name}-`));
   temporaryDirectories.push(directory);
   return directory;
-}
-
-/** What the image stub received, so a test can assert what never was sent. */
-interface StubRequest {
-  readonly method: string;
-  readonly authorization: string | undefined;
-  readonly body: Record<string, unknown>;
-}
-
-interface Stub {
-  readonly url: string;
-  readonly requests: StubRequest[];
-  /** Opens the gate that holds request `holdAt` (no timers: the test decides when it may answer). */
-  release(): void;
-}
-
-async function startOpenRouterStub(pngBase64: string, options: { holdAt?: number } = {}): Promise<Stub> {
-  const requests: StubRequest[] = [];
-  let open = (): void => {};
-  const gate = new Promise<void>((resolveGate) => {
-    open = resolveGate;
-  });
-  let held = false;
-  const server = createServer((request: IncomingMessage, response) => {
-    const chunks: Buffer[] = [];
-    request.on("data", (chunk: Buffer) => chunks.push(chunk));
-    request.on("end", () => {
-      let body: Record<string, unknown> = {};
-      try {
-        body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
-      } catch {
-        body = {};
-      }
-      requests.push({
-        method: request.method ?? "",
-        authorization: request.headers.authorization,
-        body,
-      });
-      const answer = () => {
-        try {
-          response.writeHead(200, { "content-type": "application/json" });
-          response.end(
-            JSON.stringify({ id: "stub-image-1", created: 1, data: [{ b64_json: pngBase64, media_type: "image/png" }] }),
-          );
-        } catch {
-          // the browser was closed while this request was held; nothing to answer
-        }
-      };
-      if (options.holdAt !== undefined && !held && requests.length === options.holdAt) {
-        held = true;
-        void gate.then(answer);
-        return;
-      }
-      answer();
-    });
-  });
-  servers.push(server);
-  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
-  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests, release: open };
 }
 
 let pngBase64 = "";
@@ -343,6 +291,42 @@ describe("texture-projection runner", () => {
 
       const everything = [runText, JSON.stringify(result), logged.join("\n"), stdout.mock.calls.flat().join("\n"), stderr.mock.calls.flat().join("\n")].join("\n");
       expect(everything).not.toContain(FAKE_KEY);
+    },
+    240_000,
+  );
+
+  it(
+    "paints exactly one view for a prompt test, persists it and leaves the run incomplete",
+    async () => {
+      const cwd = await scratchDir("prompt-test");
+      const stub = await startOpenRouterStub(pngBase64);
+      const outputPath = join(cwd, "assets", "courtyard_textured.glb");
+      const result = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan: PLAN,
+        atlas: 256,
+        viewSize: 128,
+        runId: "prompt-test-run",
+        outputPath,
+        promptTestView: 0,
+      });
+
+      // One image bought, for one view only; the level's run is not complete.
+      expect(stub.requests).toHaveLength(1);
+      expect(result.complete).toBe(false);
+      expect(result.viewsPainted).toBe(1);
+      expect(existsSync(outputPath)).toBe(true);
+
+      const directory = join(cwd, ".threenative", "texture-projection", "prompt-test-run");
+      const run = JSON.parse(await readFile(join(directory, "run.json"), "utf8")) as StoredRun;
+      expect(run.complete).toBe(false);
+      expect(run.views).toHaveLength(1);
+      expect(run.views[0]?.index).toBe(0);
+      for (const file of ["clay", "gen", "comp"]) {
+        expect(existsSync(join(directory, `view_0_${file}.png`))).toBe(true);
+      }
     },
     240_000,
   );
