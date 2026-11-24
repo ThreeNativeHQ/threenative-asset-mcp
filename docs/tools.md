@@ -236,6 +236,23 @@ Mesh optimization:
   `.after.png`. When no candidate passes, the call succeeds with `kept: "original"`, no output file and the
   metrics of every attempt. `scripts/probe-mesh-optimize.ts` runs the real-scan path on Smithsonian GLBs.
 
+Texture projection (gray blockout levels and environments):
+
+- `texture_project_quote` — plans the camera views that would paint a gray blockout level or environment,
+  reports planned views, model and price, the atlas the bake would choose, the level's UV stretch and how
+  much of that atlas the views would leave blurred. No network call, no key.
+- `texture_project_paint` — buys the views from an OpenRouter image model (FLUX 3 Klein by default) with the
+  user's `OPENROUTER_API_KEY`, projects them into the level's UV atlas, and writes the baked GLB atomically
+  under the project's `assets/`. Every prompt keeps the clay image's edges, openings and silhouette; a view
+  that invents a door, window, arch, passage or volume is logged as `rejected: "structure"` and left to the
+  fill pass, and a view whose surface is almost all grazing is rejected before its image is bought.
+  `resumeRunId` never pays for a view twice; `promptTestView` buys exactly one image. `cookConfigHint` is the
+  `threenative.config.ts` `assets.models.textures` snippet that keeps the atlas' size and UASTC encoding.
+- `texture_project_inspect` — returns a contact sheet (clay render, model image and projected composite per
+  view, rejected views labelled) with coverage, atlas size, measured blurred-texel share, rejected views and an
+  audit of `threenative.config.ts`: a `maxSize` below the atlas or an ETC1S (or missing UASTC) base-colour codec
+  would blur the bake.
+
 Recommended agent flow:
 
 1. Call `asset_search_sources` with the requested category/query. Its default
