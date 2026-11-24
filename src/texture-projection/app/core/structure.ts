@@ -437,3 +437,84 @@ export function structureDeviation(
 export function rejectsStructure(deviation: number, limit = STRUCTURE_DEVIATION_LIMIT): boolean {
   return deviation > limit;
 }
+
+/** A cell counts as sky when this share of its pixels is outside the geometry mask. */
+const SKY_CELL_SHARE = 0.98;
+/** Luminance departure (0..1) of a sky cell's mean from what the clay's own sky showed there. */
+const SKY_DEPARTURE = 0.1;
+/** Within-cell luminance deviation above which a cell is textured (brick, stone, coping), not sky. */
+const SKY_TEXTURE = 0.03;
+/** Fewer sky cells than this is no evidence either way: the view (almost) does not see the sky. */
+const MIN_SKY_CELLS = 8;
+
+/**
+ * A view is rejected when the generation paints solid surface over at least this share of the cells the
+ * clay left as sky: a wall raised over the backdrop, a new coping, cobbles where the level has no
+ * ground. That is the same invention `structureDeviation` catches inside a surface, seen outside the
+ * level's silhouette, where no texel is projected and the defect only shows when the camera moves.
+ *
+ * - accepts 27 of the 40 views of `courtyard-mwuijnnl` (FLUX 3 Klein, 2048 px): the strongest is view 32
+ *   at 0.135, and 11 of the 27 score 0.000;
+ * - rejects the 13 that paint the sky: views 13 at 0.908 and 11, 14, 17, 18, 20, 22, 24, 30, 31, 36, 37
+ *   at 0.702-1.000, view 33 at 0.439 (a wall across part of the sky);
+ * - the same 13/27 split at 2048, 512, 256 and 128 px, and at every departure/texture pair in
+ *   {0.10, 0.15, 0.20, 0.25} x {0.03, 0.04, 0.05, 0.06}.
+ *
+ * 0.20 is 1.48x above the strongest accepted view and 2.2x below the weakest rejected one; the margin
+ * (min rejected / max accepted) is 0.439 / 0.135 = 3.3x.
+ */
+export const SILHOUETTE_MISMATCH_LIMIT = 0.2;
+
+/**
+ * Share (0..1) of the cells the clay left as sky that `generated` painted solid surface into. A cell is
+ * clay sky when at least `SKY_CELL_SHARE` of its pixels is outside `geometryMask` (1 = level geometry);
+ * it is solid when the generation's mean luminance there departs from what the clay's own sky showed, or
+ * when the cell is textured instead of the near-flat backdrop (a flat region of another colour would
+ * pass the departure test on a light sky, clouds would pass a bare texture test). 0 = every cell the
+ * clay left as sky is still sky, and 0 when the clay shows almost no sky (no evidence either way).
+ *
+ * Pure, on the same grid as the structure check: no DOM, no GL, unit-tested in node.
+ */
+export function silhouetteMismatch(
+  generated: Uint8ClampedArray | Uint8Array,
+  clay: Uint8ClampedArray | Uint8Array,
+  geometryMask: Uint8Array,
+  width: number,
+  height: number,
+  grid = STRUCTURE_GRID,
+): number {
+  const cells = grid * grid;
+  const sky = new Float64Array(cells);
+  const genSum = new Float64Array(cells);
+  const genSumSq = new Float64Array(cells);
+  const claySum = new Float64Array(cells);
+  for (let y = 0; y < height; y++) {
+    const gy = Math.min(grid - 1, Math.floor(((y + 0.5) * grid) / height));
+    for (let x = 0; x < width; x++) {
+      const pixel = y * width + x;
+      const gx = Math.min(grid - 1, Math.floor(((x + 0.5) * grid) / width));
+      const cell = gy * grid + gx;
+      const p = 4 * pixel;
+      const gl = (0.2126 * generated[p]! + 0.7152 * generated[p + 1]! + 0.0722 * generated[p + 2]!) / 255;
+      const cl = (0.2126 * clay[p]! + 0.7152 * clay[p + 1]! + 0.0722 * clay[p + 2]!) / 255;
+      if (!geometryMask[pixel]) sky[cell] = (sky[cell] ?? 0) + 1;
+      genSum[cell] = (genSum[cell] ?? 0) + gl;
+      genSumSq[cell] = (genSumSq[cell] ?? 0) + gl * gl;
+      claySum[cell] = (claySum[cell] ?? 0) + cl;
+    }
+  }
+  const pixelsPerCell = (width * height) / cells;
+  let skyCells = 0;
+  let solid = 0;
+  for (let i = 0; i < cells; i++) {
+    const count = sky[i]!;
+    if (count < SKY_CELL_SHARE * pixelsPerCell) continue;
+    skyCells += 1;
+    const mean = genSum[i]! / count;
+    const variance = Math.max(0, genSumSq[i]! / count - mean * mean);
+    const departure = Math.abs(mean - claySum[i]! / count);
+    if (departure > SKY_DEPARTURE || Math.sqrt(variance) > SKY_TEXTURE) solid += 1;
+  }
+  if (skyCells < MIN_SKY_CELLS) return 0;
+  return solid / skyCells;
+}

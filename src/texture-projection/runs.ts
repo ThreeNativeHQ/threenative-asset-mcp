@@ -37,6 +37,8 @@ const StoredViewSchema = z.object({
   /** Why nothing was projected: grazing surfaces only, an image that invented geometry, the vision check, or the caller's own verdict. */
   rejected: z.enum(["grazing", "structure", "verify", "caller"]).optional(),
   structureDeviation: z.number().optional(),
+  /** Share of the view's clay-sky cells the model painted solid surface into (structure.ts, B.2). */
+  silhouetteMismatch: z.number().optional(),
   grazingFraction: z.number().optional(),
   /** Share of the view's pixels the strip along the clay's own edges left out of the projection. */
   edgeBandShare: z.number().optional(),

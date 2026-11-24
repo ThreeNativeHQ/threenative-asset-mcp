@@ -21,7 +21,7 @@ import { bitmapToRGBA, toDataUrl } from "./image.js";
 import { DEFAULT_PLAN, holeViews, plan as makePlan, type Plan, type PlanOptions } from "./planner.js";
 import { classifyView, describeView } from "./semantics.js";
 import { edgeBandMask } from "./silhouette.js";
-import { rejectsStructure, structureDeviation } from "./structure.js";
+import { SILHOUETTE_MISMATCH_LIMIT, rejectsStructure, silhouetteMismatch, structureDeviation } from "./structure.js";
 import { type ViewSpec } from "./views.js";
 import { measureScaleAnchor, type ScaleAnchor } from "./scale.js";
 
@@ -77,6 +77,8 @@ export interface ViewRecord {
   rejected?: ViewRejection;
   /** Compact closed blob the model added over the image it was given; rejected above 0.20 (structure.ts). */
   structureDeviation?: number;
+  /** Share of the view's clay-sky cells the model painted solid surface into; rejected above 0.20 (structure.ts). */
+  silhouetteMismatch?: number;
   /** What the vision check said about the image that was kept for projection (phase 2c). */
   verify?: ViewVerify;
   /** The check rejected the first attempt, so the view was painted once more with a new seed. */
@@ -257,6 +259,7 @@ export interface JudgedView {
   readonly comp: Uint8ClampedArray;
   readonly rejected: boolean;
   readonly structureDeviation: number;
+  readonly silhouetteMismatch: number;
   /** Share of the area to paint the model handed back unpainted. */
   readonly left: number;
 }
@@ -292,12 +295,17 @@ export function judgeView(p: PreparedView, gen: Uint8ClampedArray, size: number,
   // background nothing projects, and already-painted texels are the previous views' work.
   const paintable = p.masks.geometry.map((geometry, i) => geometry & (1 - p.masks.known[i]!));
   const deviation = structureDeviation(corrected, p.state, size, size, undefined, paintable);
-  const rejected = rejectsStructure(deviation);
+  // The same invention outside the level's silhouette: a wall, a coping or cobbles painted where the clay
+  // shows sky. Judged on the whole frame, since that is where the sky is; nothing over the sky is ever
+  // projected, so the view would otherwise be kept and the wall would vanish as the camera moves.
+  const silhouette = silhouetteMismatch(corrected, p.state, p.masks.geometry, size, size);
+  const rejected = rejectsStructure(deviation) || silhouette > SILHOUETTE_MISMATCH_LIMIT;
   return {
     // A rejected view paints nothing: its composite stays the state the model was handed.
     comp: rejected ? p.state : comp,
     rejected,
     structureDeviation: deviation,
+    silhouetteMismatch: silhouette,
     left: nUnknown ? nLeft / nUnknown : 0,
   };
 }
@@ -308,6 +316,7 @@ export interface PaintedAttempt {
   readonly comp: Uint8ClampedArray;
   readonly left: number;
   readonly structureDeviation: number;
+  readonly silhouetteMismatch: number;
   readonly rejected?: ViewRejection;
   readonly verify?: ViewVerify;
   readonly seconds: number;
@@ -417,6 +426,7 @@ async function attemptView(
     comp: judged.comp,
     left: judged.left,
     structureDeviation: judged.structureDeviation,
+    silhouetteMismatch: judged.silhouetteMismatch,
     ...(judged.rejected ? { rejected: "structure" as const } : {}),
     ...(verify === undefined ? {} : { verify }),
     seconds: r.seconds,
@@ -584,6 +594,7 @@ export async function runPipeline(
         coverage: engine.atlas.coverage(),
         predicted: plan.predicted[vi] ?? 0,
         structureDeviation: r.structureDeviation,
+        silhouetteMismatch: r.silhouetteMismatch,
         grazingFraction: p.grazingFraction,
         ...(r.rejected === undefined ? {} : { rejected: r.rejected }),
         ...(r.verify === undefined ? {} : { verify: r.verify }),

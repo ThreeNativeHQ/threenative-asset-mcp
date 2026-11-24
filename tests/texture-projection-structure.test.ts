@@ -7,8 +7,10 @@ import { describe, expect, it } from "vitest";
 
 import { edgeBandMask } from "../src/texture-projection/app/core/silhouette.js";
 import {
+  SILHOUETTE_MISMATCH_LIMIT,
   STRUCTURE_DEVIATION_LIMIT,
   rejectsStructure,
+  silhouetteMismatch,
   structureDeviation,
 } from "../src/texture-projection/app/core/structure.js";
 
@@ -26,6 +28,7 @@ import {
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURES = join(REPO, "tests", "fixtures", "prd916-structure");
+const SILHOUETTE_FIXTURES = join(REPO, "tests", "fixtures", "prd916-silhouette");
 
 interface Sheet {
   readonly data: Buffer;
@@ -38,8 +41,8 @@ interface Layout {
   readonly inventions: readonly { readonly index: number; readonly kind: string; readonly sourceView: number }[];
 }
 
-async function readSheet(name: string): Promise<Sheet> {
-  const { data, info } = await sharp(join(FIXTURES, name)).greyscale().raw().toBuffer({ resolveWithObject: true });
+async function readSheet(name: string, directory = FIXTURES): Promise<Sheet> {
+  const { data, info } = await sharp(join(directory, name)).greyscale().raw().toBuffer({ resolveWithObject: true });
   return { data, width: info.width };
 }
 
@@ -131,6 +134,58 @@ describe("texture-projection structure check on the paid courtyard run (B.2)", (
     },
     60_000,
   );
+});
+
+/**
+ * Phase 2g on the paid run `courtyard-mwuijnnl` (40 views: 34 ground, 6 aerial). The labels were
+ * settled on the pixels: 13 of them paint brick, stone or cobbles over the background the clay left
+ * empty — a wall top raised over it, a coping, a floor where the level has no ground — and 27 keep it.
+ * Views 22, 30 and 36 are the reason a quick look at the generation reads them as clean: they keep
+ * part of the sky in frame.
+ */
+describe("texture-projection silhouette check: solid surface painted over the clay's sky (phase 2g)", () => {
+  const PAINTS_OVER_SKY = [11, 13, 14, 17, 18, 20, 22, 24, 30, 31, 33, 36, 37];
+
+  it("rejects the 13 views that paint over the sky and accepts the other 27", async () => {
+    const layout = JSON.parse(await readFile(join(SILHOUETTE_FIXTURES, "layout.json"), "utf8")) as {
+      readonly tile: number;
+      readonly columns: number;
+      readonly views: number;
+      readonly cells: number;
+    };
+    const { tile, cells } = layout;
+    const generations = await readSheet("gen.png", SILHOUETTE_FIXTURES);
+    const clays = await readSheet("clay.png", SILHOUETTE_FIXTURES);
+    const masks = await readSheet("geometry-cells.png", SILHOUETTE_FIXTURES);
+
+    const scores: number[] = [];
+    for (let index = 0; index < layout.views; index++) {
+      scores.push(
+        silhouetteMismatch(
+          tileOf(generations, tile, layout.columns, index),
+          tileOf(clays, tile, layout.columns, index),
+          maskOf(masks, tile, layout.columns, index, cells),
+          tile,
+          tile,
+          cells,
+        ),
+      );
+    }
+
+    const rejected = scores
+      .map((score, index) => (score > SILHOUETTE_MISMATCH_LIMIT ? index : -1))
+      .filter((index) => index >= 0);
+    expect(rejected).toEqual(PAINTS_OVER_SKY);
+    // And the 27 that keep the sky are accepted with room to spare, not merely under the limit.
+    const accepted = scores.filter((_score, index) => !PAINTS_OVER_SKY.includes(index));
+    const maxAccepted = Math.max(...accepted);
+    const minRejected = Math.min(...PAINTS_OVER_SKY.map((index) => scores[index]!));
+    expect(maxAccepted).toBeLessThan(SILHOUETTE_MISMATCH_LIMIT * 0.75);
+    // The margin the limit sits in: 3.3x between the strongest clean view and the weakest rejected one.
+    expect(minRejected / maxAccepted).toBeGreaterThan(3);
+    expect(SILHOUETTE_MISMATCH_LIMIT / maxAccepted).toBeGreaterThan(1.4);
+    expect(minRejected / SILHOUETTE_MISMATCH_LIMIT).toBeGreaterThan(2);
+  });
 });
 
 describe("the strip along a view's clay edges is left out of the projection (phase 2e)", () => {

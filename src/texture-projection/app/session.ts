@@ -232,7 +232,13 @@ export class Session {
         try {
           const p = prepareView(this.engine, spec, o, false, roofsByPass);
           const judged = judgeView(p, generation, S, o.feather);
-          view = { ...view, left: judged.left, comp: judged.comp, structureDeviation: judged.structureDeviation };
+          view = {
+            ...view,
+            left: judged.left,
+            comp: judged.comp,
+            structureDeviation: judged.structureDeviation,
+            silhouetteMismatch: judged.silhouetteMismatch,
+          };
           if (judged.rejected) view.rejected = "structure";
           // A stored vision rejection is a paid image the check found invented structure in: re-judging
           // the pixels cannot clear it, so it stays rejected and stays out of the bake.
@@ -318,6 +324,7 @@ export class Session {
       comp: r.comp,
       coverage: this.engine.atlas.coverage(),
       structureDeviation: r.structureDeviation,
+      silhouetteMismatch: r.silhouetteMismatch,
       ...(r.rejected === undefined ? {} : { rejected: r.rejected }),
       ...(r.verify === undefined ? {} : { verify: r.verify }),
       ...(r.attempts > 1 ? { repainted: true } : {}),

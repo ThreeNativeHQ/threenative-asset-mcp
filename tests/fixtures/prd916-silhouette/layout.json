@@ -1,0 +1,12 @@
+{
+ "tile": 128,
+ "columns": 8,
+ "rows": 5,
+ "views": 40,
+ "cells": 64,
+ "skyColour": [
+  200,
+  209,
+  223
+ ]
+}

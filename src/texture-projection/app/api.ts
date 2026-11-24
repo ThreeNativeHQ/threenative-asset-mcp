@@ -217,6 +217,7 @@ export function makeApi(session: Session) {
         coverage: view.coverage,
         rejected: view.rejected,
         structureDeviation: view.structureDeviation,
+        silhouetteMismatch: view.silhouetteMismatch,
       };
     },
     /** Base64 GLB of the level with the painted texture. */
@@ -251,6 +252,7 @@ function viewDone(view: ViewRecord, cost: number, elapsed: number) {
     spec: view.spec,
     rejected: view.rejected,
     structureDeviation: view.structureDeviation === undefined ? undefined : +view.structureDeviation.toFixed(3),
+    silhouetteMismatch: view.silhouetteMismatch === undefined ? undefined : +view.silhouetteMismatch.toFixed(3),
     grazingFraction: view.grazingFraction === undefined ? undefined : +view.grazingFraction.toFixed(3),
     edgeBandShare: view.edgeBandShare === undefined ? undefined : +view.edgeBandShare.toFixed(3),
     verify: view.verify,
