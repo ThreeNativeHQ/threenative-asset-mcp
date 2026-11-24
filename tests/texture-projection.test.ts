@@ -517,7 +517,7 @@ describe("texture-projection atlas choice (C.1)", () => {
     expect(autoAtlasSize(1024, 0.25)).toBe(2048);
     expect(autoAtlasSize(1024, 0.0625)).toBe(4096);
     // Never above 8K, never below 512.
-    expect(autoAtlasSize(1024, 1e-9)).toBe(8192);
+    expect(autoAtlasSize(1024, 1e-9)).toBe(4096);
     expect(autoAtlasSize(1024, 1e9)).toBe(512);
     // A 4.2K match must not become an 8K atlas: the nearest power of two, not the next one up.
     expect(autoAtlasSize(1024, 0.0573)).toBe(4096);

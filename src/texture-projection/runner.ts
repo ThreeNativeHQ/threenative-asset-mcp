@@ -108,7 +108,8 @@ export interface TextureProjectionResult {
 export const MEASUREMENT_ATLAS = 1024;
 /** No atlas below this can hold a level's islands without wasting the views' resolution. */
 export const MIN_AUTO_ATLAS = 512;
-export const MAX_AUTO_ATLAS = 8192;
+/** The engine cook's KTX2 ceiling (4096x4096): a larger auto atlas only pays for texels the cook resamples away. */
+export const MAX_AUTO_ATLAS = 4096;
 
 /**
  * C.1: the smallest power of two whose texel size matches the best view's pixel footprint on the
