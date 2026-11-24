@@ -335,7 +335,7 @@ export function mountUi(session: Session, panel: HTMLElement, api: ReturnType<ty
     resumeBtn.disabled = runBtn.disabled = planBtn.disabled = true;
     try {
       if (!session.engine) await load("/api/level", session.level?.name ?? "level", "overcast");
-      const summary = await api.resume(runId, track);
+      const summary = await api.resume(runId, undefined, track);
       vCost.textContent = `$${summary.cost.toFixed(2)}`;
       setMode("textured");
       await refreshRuns(session.level?.name);

@@ -186,13 +186,16 @@ export class Session {
    * is read back from the run directory and put through the *current* checks (judgeView): the images a
    * resume projects are the ones on disk, so a metric fix salvages a paid run without buying a single
    * image again. A view whose generation is missing (a grazing rejection, which never bought one) is
-   * kept as it was and never re-requested.
+   * kept as it was and never re-requested. `rejectViews` adds the calling agent's own verdicts: those
+   * views are re-judged as rejected by the caller and left out of the bake, and a rejection run.json
+   * already stores stays (a later resume never re-judges it back in).
    */
   async restore(
     runId: string,
     meta: StoredRun,
     opts: Partial<PipelineOptions> = {},
     onEvent?: (event: PipelineEvent) => void,
+    rejectViews: readonly number[] = [],
   ): Promise<{ plan: Plan; skip: Set<number>; prior: RunPrior }> {
     if (!this.engine || !this.viewer) throw new Error("load the level first");
     const S = this.engine.size;
@@ -203,6 +206,7 @@ export class Session {
     const o: PipelineOptions = { ...DEFAULT_PIPELINE, ...opts, plan: { ...DEFAULT_PIPELINE.plan, ...opts.plan } };
     const roofsByPass = (o.plan.roofs ?? 0) > 0 || plan.views.some((view) => view.kind === "roof");
     const saved = [...meta.views].sort((a, b) => a.index - b.index);
+    const rejectedByCaller = new Set(rejectViews);
     const prior: ViewRecord[] = [];
     for (const v of saved) {
       const spec: ViewSpec = plan.views[v.index] ?? { ...v.spec, id: v.index };
@@ -212,8 +216,18 @@ export class Session {
         edit: new Uint8Array(0),
         gen: new Uint8ClampedArray(0),
       };
-      const generation = await this.readRunImage(runId, `view_${v.index}_gen.png`, S);
-      let view: ViewRecord = { ...v, spec, ...empty, comp: new Uint8ClampedArray(0) };
+      // The caller's verdict is final: its image was already bought, so nothing is re-requested and no
+      // cheaper check argues with it. The texels it would have painted are filled from the images around
+      // them, as for any other rejected view.
+      const callerRejected = rejectedByCaller.has(v.index) || v.rejected === "caller";
+      const generation = callerRejected ? undefined : await this.readRunImage(runId, `view_${v.index}_gen.png`, S);
+      let view: ViewRecord = {
+        ...v,
+        spec,
+        ...empty,
+        comp: new Uint8ClampedArray(0),
+        ...(callerRejected ? { rejected: "caller" as const } : {}),
+      };
       if (generation !== undefined) {
         try {
           const p = prepareView(this.engine, spec, o, false, roofsByPass);

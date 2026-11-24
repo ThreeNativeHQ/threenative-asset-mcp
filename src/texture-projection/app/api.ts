@@ -182,16 +182,23 @@ export function makeApi(session: Session) {
     },
     /**
      * Continue a stored run: re-judge and project every stored generation, then paint only the views
-     * that have none. Nothing a stored run already paid for is requested again.
+     * that have none. Nothing a stored run already paid for is requested again. `rejectViews` carries
+     * the calling agent's own verdicts (view indices, from inspect's contact sheet).
      */
-    async resume(runId: string, onEvent?: (e: PipelineEvent) => void): Promise<RunSummary> {
+    async resume(runId: string, rejectViews?: number[], onEvent?: (e: PipelineEvent) => void): Promise<RunSummary> {
       const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/run.json`);
       if (!res.ok) throw new Error(`no stored run ${runId}: ${res.status}`);
       const meta = (await res.json()) as StoredRun;
-      const { plan, skip, prior } = await session.restore(runId, meta, meta.options, (event) => {
-        forward(event);
-        onEvent?.(event);
-      });
+      const { plan, skip, prior } = await session.restore(
+        runId,
+        meta,
+        meta.options,
+        (event) => {
+          forward(event);
+          onEvent?.(event);
+        },
+        rejectViews ?? [],
+      );
       if (prior.views.some((view) => view.rejected === undefined)) {
         // The stored bakes are back in the atlas: come back in textured mode before painting anything else.
         session.viewer?.setMode("textured");

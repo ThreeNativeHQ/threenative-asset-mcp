@@ -11,7 +11,6 @@ import { Document, NodeIO } from "@gltf-transform/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { readProjectedAtlasMarker } from "../src/texture-projection/glb-marker.js";
-import { DEFAULT_VERIFY_MODEL } from "../src/texture-projection/verify.js";
 import { paintTextureProjection } from "../src/texture-projection/runner.js";
 import {
   startOpenRouterStub,
@@ -243,13 +242,13 @@ describe("texture projection MCP tools", () => {
       expect(run["coveragePercent"]).toBeGreaterThan(0);
       expect(run["blurredTexelPercent"]).toBeTypeOf("number");
       expect(run["magnificationSkippedPercent"]).toBeTypeOf("number");
-      // The vision check is on by default: one chat completion per painted image.
-      expect(run["verifyModel"]).toBe(DEFAULT_VERIFY_MODEL.id);
-      expect(run["viewsRejected"]).toMatchObject({ verify: 0, verifyUnparsed: 0 });
+      // No embedded vision check by default (the calling agent reviews inspect's contact sheet itself).
+      expect(run["verifyModel"]).toBeNull();
+      expect(run["viewsRejected"]).toMatchObject({ verify: 0, verifyUnparsed: 0, caller: 0 });
       expect(run["cookConfigHint"]).toContain("maxSize: { baseColorTexture: 256 }");
       expect(run["cookConfigHint"]).toContain('codec: "uastc"');
-      // One image and one vision check per painted view.
-      expect(stub.requests).toHaveLength((run["viewsPainted"] as number) * 2);
+      // One image per painted view, and not a single chat completion.
+      expect(stub.requests).toHaveLength(run["viewsPainted"] as number);
 
       // C.3: the painted GLB marks its atlas image with the atlas size and run id.
       const glb = new Uint8Array(await readFile(join(project, "assets", "painted", "courtyard.glb")));
@@ -264,7 +263,7 @@ describe("texture projection MCP tools", () => {
         promptTestView: 0,
       });
       expect(promptTest.result.isError).toBeFalsy();
-      expect(stub.requests.length).toBe(requestsBeforePromptTest + 2);
+      expect(stub.requests.length).toBe(requestsBeforePromptTest + 1);
       const promptRun = structured(promptTest);
       expect(promptRun["runId"]).not.toBe(run["runId"]);
       const promptRunState = JSON.parse(
@@ -310,7 +309,7 @@ describe("texture projection MCP tools", () => {
       expect(finished.complete).toBe(true);
       expect(finished.views.length).toBeGreaterThan(1);
       // Only the views without a stored image were bought; the stored one was reused (and projected).
-      expect(stub.requests.length - requestsBeforeResume).toBe((finished.views.length - 1) * 2);
+      expect(stub.requests.length - requestsBeforeResume).toBe(finished.views.length - 1);
       expect(structured(resumed)["viewsPainted"]).toBe(finished.views.length);
 
       // inspect returns the contact sheet as an image block and flags the project's cook settings.

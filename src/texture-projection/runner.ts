@@ -73,10 +73,16 @@ export interface TextureProjectionRequest {
   readonly atlas?: number | "auto";
   readonly viewSize?: number;
   readonly styleImagePath?: string;
-  /** Check every painted view with a vision model (default true); `false` is a named override. */
+  /** Check every painted view with a vision model; off unless the caller asks for it (one chat call a view). */
   readonly verify?: boolean;
   /** OpenRouter chat model id for the vision check (image input, strict JSON out). */
   readonly verifyModel?: string;
+  /**
+   * Stored view indices the calling agent judged wrong in inspect's contact sheet. Only a resume, and
+   * only views run.json stores: each is recorded as rejected by the caller, projected nowhere, and
+   * nothing is bought for it.
+   */
+  readonly rejectViews?: readonly number[];
   readonly plan?: TextureProjectionPlanInput;
   readonly hooks?: TextureProjectionHooks;
   readonly env?: NodeJS.ProcessEnv;
@@ -102,7 +108,7 @@ export interface TextureProjectionQuote {
   readonly atlas: number;
   readonly estimatedBlurredTexelPercent: number;
   readonly uvStretch: UvStretchReport;
-  /** The vision check the run would pay for; null when the caller turned it off. */
+  /** The vision check the run would pay for; null unless the caller asked for one. */
   readonly verifyModel: string | null;
   /** Whole-run cost of the vision checks at the quoted view size, USD. */
   readonly estimatedVerifyUsd: number;
@@ -133,12 +139,14 @@ export interface TextureProjectionResult {
     readonly structure: number;
     readonly verify: number;
     readonly verifyUnparsed: number;
+    /** Views the calling agent rejected through `rejectViews`, from the same stored images. */
+    readonly caller: number;
   };
   /** Views the vision check rejected once and that were painted again with a new seed. */
   readonly viewsRepainted: number;
   /** Views whose check listed an edge band (a coping, a plinth): projected, and recorded in run.json. */
   readonly viewsBanded: number;
-  /** The vision model that judged the views, or null when the run was painted with `verify: false`. */
+  /** The vision model that judged the views, or null when the run was painted without `verify: true`. */
   readonly verifyModel: string | null;
 }
 
@@ -283,9 +291,10 @@ function planInput(request: TextureProjectionRequest): Record<string, number> {
 function pipelineOptions(request: TextureProjectionRequest): Record<string, unknown> {
   const options: Record<string, unknown> = {
     plan: planInput(request),
-    // Recorded even when defaulted: run.json has to say which check judged its views, so inspect and a
-    // resume report the model that ran instead of guessing the default of the day.
-    verify: request.verify !== false,
+    // Recorded even when defaulted: run.json has to say whether a check judged its views, so inspect
+    // and a resume report what ran instead of guessing the default of the day (off since PRD-916 2f:
+    // the agent that calls this tool judges the views itself).
+    verify: request.verify === true,
     verifyModel: request.verifyModel?.trim() || DEFAULT_VERIFY_MODEL.id,
   };
   // Only an explicit size: "auto" is the default and is re-measured (and capped) on a resume.
@@ -294,14 +303,13 @@ function pipelineOptions(request: TextureProjectionRequest): Record<string, unkn
   if (request.roofStyle !== undefined) options.roofStyle = request.roofStyle;
   if (request.firstModel !== undefined) options.firstModel = request.firstModel;
   if (request.fillModel !== undefined) options.fillModel = request.fillModel;
-  if (request.verify !== undefined) options.verify = request.verify;
   if (request.verifyModel !== undefined) options.verifyModel = request.verifyModel;
   return options;
 }
 
-/** The vision check a request asks for, priced: off is a named override and is reported. */
+/** The vision check a request asks for, priced: off by default, and `verify: true` is what buys one. */
 function verifyChoice(request: TextureProjectionRequest): { readonly model: string | null; readonly perView: number } {
-  if (request.verify === false) return { model: null, perView: 0 };
+  if (request.verify !== true) return { model: null, perView: 0 };
   const model = request.verifyModel?.trim() || DEFAULT_VERIFY_MODEL.id;
   return { model, perView: verifyCostUsd(verifyModelFor(model), request.viewSize ?? 1024) };
 }
@@ -500,6 +508,25 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
           }
           return run;
         });
+  // The caller's own verdicts are about images this run already paid for: refuse them anywhere else,
+  // and refuse an index run.json does not store (a rejection must never land on a view nobody saw).
+  const rejectViews = [...new Set(request.rejectViews ?? [])];
+  if (rejectViews.length > 0) {
+    if (stored === undefined) {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_INVALID_INPUT",
+        "rejectViews judges the views of a stored run: pass resumeRunId as well",
+      );
+    }
+    const storedIndices = new Set(stored.views.map((view) => view.index));
+    const unknown = rejectViews.filter((index) => !storedIndices.has(index));
+    if (unknown.length > 0) {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_INVALID_INPUT",
+        `rejectViews names view ${unknown.join(", ")}, which run ${stored.runId} does not store (it has ${[...storedIndices].sort((a, b) => a - b).join(", ") || "none"})`,
+      );
+    }
+  }
   const levelPath = request.levelPath ?? stored?.levelPath;
   if (levelPath === undefined) {
     throw new TextureProjectionError("TEXTURE_PROJECT_LEVEL_NOT_FOUND", "levelPath is required unless resuming a run");
@@ -617,7 +644,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       price: number;
       coverage: number;
       predicted: number;
-      rejected?: "grazing" | "structure" | "verify";
+      rejected?: "grazing" | "structure" | "verify" | "caller";
       structureDeviation?: number;
       grazingFraction?: number;
       edgeBandShare?: number;
@@ -697,7 +724,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
         visibleCoverage: await app.call<number>("visibleCoverage"),
       };
     } else if (stored !== undefined) {
-      summary = await Promise.race([app.call<BrowserRun>("resume", runId), interrupted]);
+      summary = await Promise.race([app.call<BrowserRun>("resume", runId, rejectViews), interrupted]);
     } else {
       summary = await Promise.race([app.call<BrowserRun>("run", { runId, options: run.options }), interrupted]);
     }
@@ -754,10 +781,12 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
         verifyUnparsed: run.views.filter(
           (view) => view.rejected === "verify" && view.verify?.verdict === "unparsed",
         ).length,
+        caller: run.views.filter((view) => view.rejected === "caller").length,
       },
       viewsRepainted: run.views.filter((view) => view.repainted === true).length,
       viewsBanded: run.views.filter((view) => (view.verify?.bands?.length ?? 0) > 0).length,
-      verifyModel: run.options.verify === false ? null : ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id),
+      verifyModel:
+        run.options.verify === true ? ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id) : null,
     };
   } catch (error) {
     // Let the events already in flight finish writing run.json: a stopped or interrupted run must

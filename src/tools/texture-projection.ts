@@ -75,14 +75,14 @@ export const TextureProjectQuoteInputSchema = z
       .boolean()
       .optional()
       .describe(
-        "Check every painted view with a vision model before projecting it (default true); a rejected view is repainted once, then left to the fill pass. false turns the check off by name.",
+        "Opt-in vision check: one OpenRouter chat call per painted view, priced separately here (default false, so the quote prices images only).",
       ),
     verifyModel: z
       .string()
       .min(1)
       .max(200)
       .optional()
-      .describe("OpenRouter chat model id with image input for the vision check (default google/gemini-2.5-flash-lite)."),
+      .describe("OpenRouter chat model id with image input for the opt-in vision check (default google/gemini-2.5-flash-lite)."),
   })
   .strict();
 
@@ -137,14 +137,14 @@ export const TextureProjectPaintInputSchema = z
       .boolean()
       .optional()
       .describe(
-        "Check every painted view with a vision model before projecting it (default true); a rejected view is repainted once, then left to the fill pass. false turns the check off by name.",
+        "Opt-in vision check: one OpenRouter chat call per painted view, priced separately in the quote (default false). A rejected view is repainted once, then left to the fill pass. You review inspect's contact sheet instead.",
       ),
     verifyModel: z
       .string()
       .min(1)
       .max(200)
       .optional()
-      .describe("OpenRouter chat model id with image input for the vision check (default google/gemini-2.5-flash-lite)."),
+      .describe("OpenRouter chat model id with image input for the opt-in vision check (default google/gemini-2.5-flash-lite)."),
     promptTestView: z
       .number()
       .int()
@@ -158,6 +158,12 @@ export const TextureProjectPaintInputSchema = z
       .max(128)
       .optional()
       .describe("Continue a stored run: its paid views are replayed and only the missing ones are requested."),
+    rejectViews: z
+      .array(z.number().int().min(0).max(95))
+      .optional()
+      .describe(
+        "Views you judged wrong in inspect's contact sheet: each is stored as rejected by the caller, projected nowhere, and buys no image. Requires resumeRunId and indices the run stores.",
+      ),
   })
   .strict();
 
@@ -182,6 +188,11 @@ export const TextureProjectPaintOutputSchema = z
         structure: z.number().int().nonnegative(),
         verify: z.number().int().nonnegative(),
         verifyUnparsed: z.number().int().nonnegative(),
+        caller: z
+          .number()
+          .int()
+          .nonnegative()
+          .describe("Views you rejected through rejectViews; they were not projected and bought nothing."),
       })
       .strict(),
     viewsRepainted: z.number().int().nonnegative(),
@@ -396,6 +407,7 @@ export function createTextureProjectPaintHandler() {
         ...(input.style === undefined ? {} : { style: input.style }),
         ...(input.promptTestView === undefined ? {} : { promptTestView: input.promptTestView }),
         ...(input.resumeRunId === undefined ? {} : { resumeRunId: input.resumeRunId }),
+        ...(input.rejectViews === undefined ? {} : { rejectViews: input.rejectViews }),
         ...(input.verify === undefined ? {} : { verify: input.verify }),
         ...(input.verifyModel === undefined ? {} : { verifyModel: input.verifyModel }),
         plan: planRequest(input),
@@ -508,9 +520,9 @@ export function createTextureProjectInspectHandler() {
           views: run.views.length,
           rejectedViews,
           verifyModel:
-            run.options.verify === false
-              ? null
-              : ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id),
+            run.options.verify === true
+              ? ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id)
+              : null,
           verifyRejected: run.views
             .filter((view) => view.rejected === "verify" && view.verify !== undefined)
             .map((view) => ({

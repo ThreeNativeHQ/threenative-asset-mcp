@@ -334,15 +334,11 @@ describe("texture-projection runner", () => {
       expect(quote.model).toBe("or-klein");
       expect(quote.views).toBeGreaterThan(0);
       expect(quote.estimatedUsd).toBeGreaterThan(0);
-      // The vision check is on by default, priced in the estimate and cheap enough to be a rounding error
-      // next to the images (< $0.002 per view).
-      expect(quote.verifyModel).toBe(DEFAULT_VERIFY_MODEL.id);
-      expect(quote.estimatedVerifyUsd).toBeGreaterThan(0);
-      expect(quote.estimatedVerifyUsd / (quote.views + quote.holes)).toBeLessThan(0.002);
-      // The estimate is the painted views at the image model plus the check, rounded to cents.
-      expect(quote.estimatedUsd).toBe(
-        Math.round(((quote.views + quote.holes) * quote.pricePerView + quote.estimatedVerifyUsd) * 100) / 100,
-      );
+      // No embedded vision check by default (the calling agent judges inspect's contact sheet), so the
+      // quote prices the images that would be bought and nothing else.
+      expect(quote.verifyModel).toBeNull();
+      expect(quote.estimatedVerifyUsd).toBe(0);
+      expect(quote.estimatedUsd).toBe(Math.round((quote.views + quote.holes) * quote.pricePerView * 100) / 100);
       expect(stub.requests).toHaveLength(0);
     },
     180_000,
@@ -362,21 +358,23 @@ describe("texture-projection runner", () => {
       expect(quote.views).toBeLessThanOrEqual(12);
       expect(quote.aerial).toBeLessThanOrEqual(3);
       expect(quote.aerial).toBeGreaterThan(0);
-      // One price per image actually painted plus its check, rounded to cents.
-      expect(quote.estimatedUsd).toBe(
-        Math.round(((quote.views + quote.holes) * quote.pricePerView + quote.estimatedVerifyUsd) * 100) / 100,
-      );
-      // `verify: false` is the named override: no check, no check cost, and the run reports it.
-      const unchecked = await quoteTextureProjection({
+      // One price per image actually painted, rounded to cents: the check is off by default.
+      expect(quote.estimatedUsd).toBe(Math.round((quote.views + quote.holes) * quote.pricePerView * 100) / 100);
+      // `verify: true` is the opt-in: the check is priced per view on top of the images.
+      const checked = await quoteTextureProjection({
         levelPath: LEVEL,
         cwd,
         env: {},
-        verify: false,
+        verify: true,
         plan: { maxViews: 12, aerial: 3, roofs: 0, holes: 4, spacing: 6 },
       });
-      expect(unchecked.verifyModel).toBeNull();
-      expect(unchecked.estimatedVerifyUsd).toBe(0);
-      expect(unchecked.estimatedUsd).toBeLessThan(quote.estimatedUsd);
+      expect(checked.verifyModel).toBe(DEFAULT_VERIFY_MODEL.id);
+      expect(checked.estimatedVerifyUsd).toBeGreaterThan(0);
+      // The opt-in estimate is the images at the image model plus the checks, rounded to cents.
+      expect(checked.estimatedUsd).toBe(
+        Math.round(((checked.views + checked.holes) * checked.pricePerView + checked.estimatedVerifyUsd) * 100) / 100,
+      );
+      expect(checked.estimatedUsd).toBeGreaterThan(quote.estimatedUsd);
     },
     180_000,
   );
@@ -422,7 +420,6 @@ describe("texture-projection runner", () => {
         plan: PLAN,
         atlas: 256,
         viewSize: 128,
-        verify: false,
         runId: "paint-run",
         outputPath,
         onLog: (line) => logged.push(line),
@@ -433,7 +430,7 @@ describe("texture-projection runner", () => {
       expect(result.coveragePercent).toBeGreaterThan(0);
       expect(result.verifyModel).toBeNull();
       expect(stub.requests.length).toBe(result.viewsPainted);
-      // No chat request either: verify:false buys images and nothing else.
+      // No chat request: the default run buys images and nothing else (the calling agent judges the views).
       expect(stub.requests.every((sent) => Array.isArray(sent.body["input_references"]))).toBe(true);
       // Later views get the accepted paint of the same surface as a material reference (C, phase 2d):
       // one extra image reference plus the instruction to keep its materials and coursing. The very
@@ -475,6 +472,9 @@ describe("texture-projection runner", () => {
       const runText = await readFile(join(cwd, ".threenative", "texture-projection", result.runId, "run.json"), "utf8");
       const run = JSON.parse(runText) as StoredRun;
       expect(run.complete).toBe(true);
+      // The default is recorded, not guessed: run.json says no vision check judged these views.
+      expect(run.options.verify).toBe(false);
+      expect(result.viewsRejected).toMatchObject({ verify: 0, verifyUnparsed: 0, caller: 0 });
       expect(run.views).toHaveLength(result.viewsPainted);
       for (const view of run.views) {
         for (const file of ["clay", "gen", "comp"]) {
@@ -762,6 +762,105 @@ describe("texture-projection runner", () => {
   );
 });
 
+describe("texture-projection caller verdicts (phase 2f)", () => {
+  const runPath = (cwd: string) => join(cwd, ".threenative", "texture-projection", "reject-run", "run.json");
+
+  it(
+    "fails closed on rejectViews with no stored run to judge, and before buying anything",
+    async () => {
+      const cwd = await scratchDir("reject-guard");
+      const stub = await startOpenRouterStub(pngBase64);
+      // A rejection is a verdict on an image that was already paid for: without resumeRunId there is
+      // nothing to judge, and nothing may be bought while looking for it.
+      expectTextureProjectionError(
+        await rejection(
+          paintTextureProjection({
+            levelPath: LEVEL,
+            cwd,
+            env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+            plan: PLAN,
+            rejectViews: [0],
+          }),
+        ),
+        "TEXTURE_PROJECT_INVALID_INPUT",
+      );
+      expect(stub.requests).toHaveLength(0);
+    },
+    180_000,
+  );
+
+  it(
+    "stores a caller-rejected view as rejected, projects nothing of it, and buys no image",
+    async () => {
+      const cwd = await scratchDir("reject-views");
+      const stub = await startOpenRouterStub(pngBase64);
+      const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+      // No verify flag: the default run buys images only, and the caller is the judge.
+      const first = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env,
+        plan: { ...PLAN, maxViews: 2 },
+        atlas: 256,
+        viewSize: 128,
+        runId: "reject-run",
+        outputPath: join(cwd, "assets", "first.glb"),
+      });
+      const bought = stub.requests.length;
+      expect(bought).toBe(first.viewsPainted);
+      expect(bought).toBeGreaterThan(1);
+
+      // An index this run does not store is refused too, before any browser or request.
+      expectTextureProjectionError(
+        await rejection(paintTextureProjection({ resumeRunId: "reject-run", cwd, env, rejectViews: [7] })),
+        "TEXTURE_PROJECT_INVALID_INPUT",
+      );
+      expect(stub.requests).toHaveLength(bought);
+
+      // A plain resume re-projects every stored image: the baseline the caller's verdict removes one from.
+      const plain = await paintTextureProjection({
+        resumeRunId: "reject-run",
+        cwd,
+        env,
+        outputPath: join(cwd, "assets", "plain.glb"),
+      });
+      expect(plain.viewsPainted).toBe(bought);
+      expect(stub.requests).toHaveLength(bought);
+
+      const rejected = await paintTextureProjection({
+        resumeRunId: "reject-run",
+        cwd,
+        env,
+        rejectViews: [0],
+        outputPath: join(cwd, "assets", "rejected.glb"),
+      });
+      // Nothing was bought, view 0 reached the atlas nowhere, and the rest re-baked from its stored image.
+      expect(stub.requests).toHaveLength(bought);
+      expect(rejected.viewsRejected.caller).toBe(1);
+      expect(rejected.viewsPainted).toBe(bought - 1);
+      expect(rejected.coveragePercent).toBeGreaterThan(0);
+      expect(rejected.coveragePercent).toBeLessThanOrEqual(plain.coveragePercent);
+      expect(existsSync(join(cwd, "assets", "rejected.glb"))).toBe(true);
+      const stored = JSON.parse(await readFile(runPath(cwd), "utf8")) as StoredRun;
+      expect(stored.views[0]?.rejected).toBe("caller");
+      expect(stored.views.filter((view) => view.rejected === undefined)).toHaveLength(bought - 1);
+
+      // A later resume keeps the caller's rejection instead of re-judging the image back in.
+      const again = await paintTextureProjection({
+        resumeRunId: "reject-run",
+        cwd,
+        env,
+        outputPath: join(cwd, "assets", "again.glb"),
+      });
+      expect(stub.requests).toHaveLength(bought);
+      expect(again.viewsRejected.caller).toBe(1);
+      expect(again.viewsPainted).toBe(bought - 1);
+      expect((JSON.parse(await readFile(runPath(cwd), "utf8")) as StoredRun).views[0]?.rejected).toBe("caller");
+    },
+    420_000,
+  );
+});
+
 describe("texture-projection UV stretch (A.3)", () => {
   it("measures a uniformly mapped level at 1x and reports it uniform", async () => {
     const report = await measureUvStretch(LEVEL);
@@ -1035,6 +1134,7 @@ describe("texture-projection vision check (2c)", () => {
           plan: PLAN,
           atlas: 256,
           viewSize: 128,
+          verify: true,
           runId: "verify-run",
           outputPath: join(cwd, "assets", "verify.glb"),
         }),
@@ -1073,6 +1173,7 @@ describe("texture-projection vision check (2c)", () => {
         plan: PLAN,
         atlas: 256,
         viewSize: 128,
+        verify: true,
         runId: "verify-once-run",
         outputPath: join(cwd, "assets", "verify-once.glb"),
       });
@@ -1103,6 +1204,7 @@ describe("texture-projection vision check (2c)", () => {
           plan: { ...PLAN, maxViews: 1 },
           atlas: 256,
           viewSize: 128,
+          verify: true,
           runId: "verify-garbage-run",
           outputPath: join(cwd, "assets", "verify-garbage.glb"),
         }),

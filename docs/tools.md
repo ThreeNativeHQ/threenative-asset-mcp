@@ -240,8 +240,8 @@ Texture projection (gray blockout levels and environments):
 
 - `texture_project_quote` — plans the camera views that would paint a gray blockout level or environment,
   reports planned views, model and price, the atlas the bake would choose, the level's UV stretch and how
-  much of that atlas the views would leave blurred. The price includes the vision check of every view
-  (`verifyModel`, `estimatedVerifyUsd`). No network call, no key.
+  much of that atlas the views would leave blurred. The price is images only by default; an opt-in vision
+  check adds its own line (`verifyModel`, `estimatedVerifyUsd`, 0 unless `verify: true`). No network call, no key.
 - `texture_project_paint` — buys the views from an OpenRouter image model (FLUX 3 Klein by default) with the
   user's `OPENROUTER_API_KEY`, projects them into the level's UV atlas, and writes the baked GLB atomically
   under the project's `assets/`. Every prompt keeps the clay image's edges, openings and silhouette, names the
@@ -251,21 +251,26 @@ Texture projection (gray blockout levels and environments):
   turned a blank floor plan into a decorative leaf mosaic), and a pass that looks down on the level — the aerial ring,
   the roof passes — may only paint texels no player-height view sees, so a wall top or an outer face is textured and
   the ground a player walks on never is (`aerialPassOnlyHidden`).
-  Each painted view is then checked by a vision model (`verify`, default true; `verifyModel`, default
+  Each painted view can be checked by a vision model (`verify: true`, off by default; `verifyModel`, default
   `google/gemini-2.5-flash`) that compares the clay with the painting and returns strict JSON: the structures it
   adds ("ruined stone pillar on the wall", "red roof-tile coping along the wall top") and whether the detail's
   real-world size is plausible. It is the reliable check — the cheap pixel check in front of it only catches
   compact dark shapes, while a real invention is often the same tone as the wall. A rejected view
   (`rejected: "verify"`) is repainted once with a new seed and the invented structures named as forbidden; a
   second rejection leaves its texels to the fill pass. An unreadable answer counts as a rejection
-  (`verifyUnparsed`). `verify: false` turns the check off by name and is reported. A view whose surface is almost
-  all grazing is rejected before its image is bought, and a view that invents dark geometry (a compact, closed,
-  much darker shape inside one clay surface) is rejected as `structure`. It fails closed and stops spending:
+  (`verifyUnparsed`). `verify: true` turns the check on by name, for one chat request per view. A view whose
+  surface is almost all grazing is rejected before its image is bought, and a view that invents dark geometry
+  (a compact, closed, much darker shape inside one clay surface) is rejected as `structure`. It fails closed and
+  stops spending:
   `TEXTURE_PROJECT_STRUCTURE_REJECTED` once the first three painted views all invent geometry, and
   `TEXTURE_PROJECT_NO_COVERAGE` when nothing reaches the atlas. `resumeRunId` re-judges every stored generation
   with the current checks, projects the accepted ones and requests only views that have none, so a view is never
   paid for twice (and a resume that reuses stored images needs no key); `viewsPainted` counts what reached the
-  atlas, bought or reused. `promptTestView` buys exactly one image. A view pixel that would cover more than
+  atlas, bought or reused. The agent that calls this tool judges the views itself: `texture_project_inspect` returns
+  the contact sheet, and any view that invents an arch, doorway, passage, opening, slab, coping or decorative floor
+  is rejected with `{"resumeRunId": ..., "rejectViews": [..]}`. A rejected view is stored as `rejected: "caller"`,
+  buys no image, is projected nowhere (the fill pass covers its texels from the images around them), and a later
+  resume keeps the rejection. `promptTestView` buys exactly one image. A view pixel that would cover more than
   2x2 atlas texels is never projected (it would only blur the atlas): those texels wait for a closer view or the
   hole pass, and `magnificationSkippedPercent` reports how many. The strip along a view's own clay edges is left out of
   the projection for the same reason: both image models give a wall top a grey coping and an inner corner a lit face
@@ -277,9 +282,11 @@ Texture projection (gray blockout levels and environments):
   cook's KTX2 ceiling) and UASTC encoding; the engine cook of the release that ships PRD-916 honours the GLB's
   marker on its own.
 - `texture_project_inspect` — returns a contact sheet (clay render, model image and projected composite per
-  view, rejected views labelled) with coverage, atlas size, measured blurred-texel share, rejected views, the
-  vision check's own verdicts (`verifyRejected`, `viewsRepainted`) and an audit of `threenative.config.ts`: a
-  `maxSize` below the atlas or an ETC1S (or missing UASTC) base-colour codec would blur the bake.
+  view, rejected views labelled) with coverage, atlas size, measured blurred-texel share, rejected views by reason
+  (the caller's own `rejected: "caller"` verdicts included), the opt-in vision check's verdicts when one ran
+  (`verifyRejected`, `viewsRepainted`) and an audit of `threenative.config.ts`: a `maxSize` below the atlas or an
+  ETC1S (or missing UASTC) base-colour codec would blur the bake. Read the sheet yourself: the agent that calls the
+  tool is the judge; no vision model is called to do it.
 
 `scripts/verify-calibration.ts` replays the vision check over a finished run's stored clay/painted pairs with the
 production prompt (`--run <run dir> --out <dir> [--model <id>] [--views 0,1,2]`), so the prompt can be tuned

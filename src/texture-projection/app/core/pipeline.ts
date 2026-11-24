@@ -37,7 +37,8 @@ export interface PipelineOptions {
   feather: number;
   seed: number;
   plan: Partial<PlanOptions>;
-  /** Check every painted view with a vision model (phase 2c); a rejected view is repainted once. */
+  /** Check every painted view with a vision model (phase 2c); off unless the caller opts in. A rejected
+   * view is repainted once. */
   verify: boolean;
   /** OpenRouter chat model id the vision check calls (`verify.ts` picks the default). */
   verifyModel: string;
@@ -54,12 +55,15 @@ export const DEFAULT_PIPELINE: PipelineOptions = {
   feather: 10,
   seed: 7,
   plan: {},
-  verify: true,
+  verify: false,
   verifyModel: DEFAULT_VERIFY_MODEL.id,
 };
 
-/** Why a view's image was not projected: it shows almost only grazing surfaces, invents geometry, or fails the vision check. */
-export type ViewRejection = "grazing" | "structure" | "verify";
+/**
+ * Why a view's image was not projected: it shows almost only grazing surfaces, invents geometry, fails
+ * the vision check, or the calling agent judged it wrong (`rejected: "caller"`).
+ */
+export type ViewRejection = "grazing" | "structure" | "verify" | "caller";
 
 export interface ViewRecord {
   index: number;
@@ -68,7 +72,8 @@ export interface ViewRecord {
   model: string;
   first: boolean;
   unknownFraction: number;
-  /** Set when nothing was projected: the image was not bought (grazing) or not trusted (structure). */
+  /** Set when nothing was projected: the image was not bought (grazing), not trusted (structure), or
+   * the caller rejected it (`caller`). */
   rejected?: ViewRejection;
   /** Compact closed blob the model added over the image it was given; rejected above 0.20 (structure.ts). */
   structureDeviation?: number;
@@ -359,11 +364,12 @@ export function firstViewReference(comp: Uint8ClampedArray, size: number, cropSi
 }
 
 /**
- * Buy one view's image, judge it with the free pixel check, then have a vision model compare it with the
- * clay (phase 2c). The pixel check stays as the cheap pre-filter; the vision check is the reliable one,
- * because a real invention (a stone buttress, roof tiles along a wall top) is the same tone as the
- * surface it stands on. A rejected view is repainted once with a new seed and the invented structure
- * named as forbidden; a second rejection leaves its texels to the fill and hole passes.
+ * Buy one view's image and judge it with the free pixel check; when the caller opted in (`verify: true`),
+ * a vision model then compares it with the clay (phase 2c). The pixel check is the cheap pre-filter; a
+ * vision check is the reliable one, because a real invention (a stone buttress, roof tiles along a wall
+ * top) is the same tone as the surface it stands on. A rejected view is repainted once with a new seed
+ * and the invented structure named as forbidden; a second rejection leaves its texels to the fill and
+ * hole passes.
  */
 async function attemptView(
   p: PreparedView,
