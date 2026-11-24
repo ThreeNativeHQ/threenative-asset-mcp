@@ -39,6 +39,8 @@ const StoredViewSchema = z.object({
   structureDeviation: z.number().optional(),
   /** Share of the view's clay-sky cells the model painted solid surface into (structure.ts, B.2). */
   silhouetteMismatch: z.number().optional(),
+  /** Share of the view's painted strong edges that lie on no clay edge (structure.ts, phase 2q). */
+  edgeMisalignment: z.number().optional(),
   grazingFraction: z.number().optional(),
   /** Share of the view's pixels the strip along the clay's own edges left out of the projection. */
   edgeBandShare: z.number().optional(),

@@ -219,6 +219,7 @@ export function makeApi(session: Session) {
         rejected: view.rejected,
         structureDeviation: view.structureDeviation,
         silhouetteMismatch: view.silhouetteMismatch,
+        edgeMisalignment: view.edgeMisalignment,
       };
     },
     /**
@@ -261,6 +262,7 @@ function viewDone(view: ViewRecord, cost: number, elapsed: number) {
     rejected: view.rejected,
     structureDeviation: view.structureDeviation === undefined ? undefined : +view.structureDeviation.toFixed(3),
     silhouetteMismatch: view.silhouetteMismatch === undefined ? undefined : +view.silhouetteMismatch.toFixed(3),
+    edgeMisalignment: view.edgeMisalignment === undefined ? undefined : +view.edgeMisalignment.toFixed(3),
     grazingFraction: view.grazingFraction === undefined ? undefined : +view.grazingFraction.toFixed(3),
     edgeBandShare: view.edgeBandShare === undefined ? undefined : +view.edgeBandShare.toFixed(3),
     verify: view.verify,

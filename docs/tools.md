@@ -260,7 +260,11 @@ Texture projection (gray blockout levels and environments):
   second rejection leaves its texels to the fill pass. An unreadable answer counts as a rejection
   (`verifyUnparsed`). `verify: true` turns the check on by name, for one chat request per view. A view whose
   surface is almost all grazing is rejected before its image is bought, and a view that invents dark geometry
-  (a compact, closed, much darker shape inside one clay surface) is rejected as `structure`. It fails closed and
+  (a compact, closed, much darker shape inside one clay surface), paints solid surface over the clay's sky, or
+  draws a long painted edge the clay has no edge for (a pillar shifted onto the flat wall behind it — the pixels
+  would project as a ghost slab) is rejected as `structure`; the last one leaves its edge strip out of the
+  projection instead of refusing the view when the strip is a small part of it (`edgeMisalignment` in run.json
+  records the share, and `structure.ts` has the calibration). It fails closed and
   stops spending:
   `TEXTURE_PROJECT_STRUCTURE_REJECTED` once the first three painted views all invent geometry, and
   `TEXTURE_PROJECT_NO_COVERAGE` when nothing reaches the atlas. `resumeRunId` re-judges every stored generation

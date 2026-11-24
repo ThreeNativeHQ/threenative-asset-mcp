@@ -518,3 +518,283 @@ export function silhouetteMismatch(
   if (skyCells < MIN_SKY_CELLS) return 0;
   return solid / skyCells;
 }
+
+/**
+ * Cells across the edge-alignment grid (64: one cell is 1.56 % of the view width). The grid is fixed in
+ * *relative* terms, so a cell is the same share of the frame at 128 px and at 2048 px.
+ */
+const EDGE_GRID = 64;
+/**
+ * Luminance step between two neighbouring cells above which the generation has drawn an *edge*, not
+ * worn a material: behind the blur, the courtyard's brick fields, stains, base plinths and painted
+ * shadows come to 0.02-0.07 of a cell step, and a drawn object boundary (a pillar, a coping, a niche)
+ * to 0.12-0.6.
+ */
+const PAINTED_EDGE_STEP = 0.08;
+/** Clay pixel gradient (luminance per pixel) above which the clay has a face boundary there. */
+const CLAY_FACE_STEP = 0.01;
+/**
+ * Blur radius, as a share of the view width, before the generation is averaged per cell. Without it the
+ * materials' own stones and joints reach the step (measured on the courtyard run: view 0 scores 0.15
+ * unblurred against 0.000 blurred, and 20 of the 40 views rise to 0.13-0.28); a drawn object's boundary
+ * survives it. Below 1 % the finest brick joints come back at 128-256 px, above 2 % a drawn coping
+ * blurs into its wall and views 12, 23 and 32 stop scoring.
+ */
+const PAINTED_EDGE_SMOOTH = 0.014;
+/** Share of the view width a painted edge must run to be an object's silhouette and not a joint. */
+const MIN_PAINTED_RUN = 0.04;
+/** How far (share of the view width) a painted edge may sit from a clay edge and still be that edge. */
+const CLAY_EDGE_TOLERANCE = 0.015;
+
+/**
+ * A view is rejected when at least this share of its painted strong edges lies on no clay edge: a pillar
+ * drawn where the clay is a flat wall, a coping or a ridge the level does not have. Those pixels are
+ * projected onto the flat wall behind them, so the ghost shows up as the camera moves.
+ *
+ * Calibrated on the 40 views of `courtyard-mwuijnnl` (FLUX 3 Klein), fixtures under
+ * `tests/fixtures/prd916-edges` at 256 px, and the same views re-judged at 2048 px by a resume of the
+ * run:
+ *
+ * - the 16 views the pipeline projects score 0.000 on the fixtures and at most 0.128 at 2048 (view 0),
+ *   0.070 (39), 0.053 (15), 0 everywhere else: none is rejected, and the strip they lose is under 0.1
+ *   points of the bake's visible coverage (68.3 -> 68.2 %);
+ * - the views that invent or shift an object score 0.386-1.000 on the fixtures: 32 (a coping along a
+ *   shifted wall top) 0.386, 12 (a foreground ridge) 0.394, 23 (a niche with a tiled canopy) 0.583,
+ *   24 (a wall raised over the sky) 0.920, 37 (a stele) 1.000. At 2048 only 24 (0.907) and 37 (0.913)
+ *   have a figure, since 12, 23 and 32 were rejected by the caller and never re-judged; views 11 and 17,
+ *   rejected by the structure check, score 0.815 and 0.754 there;
+ * - 12 is the one that moves with the scale (0.000 at 128 px, 0.195 at 192, 0.394 at 256, 0.532 at
+ *   2048): its invented ridge is a soft curved edge, and the cell grid has to be wide enough to see it.
+ *
+ * 0.25 is 1.95x above the strongest accepted view at 2048 and 1.54x below the weakest of those named
+ * views on the fixtures.
+ */
+export const EDGE_MISALIGNMENT_LIMIT = 0.25;
+
+/** A view's painted edges that the clay has no edge for: the mask to leave out of the projection. */
+export interface EdgeMisalignment {
+  /** Painted strong-edge cells in kept runs that lie on no clay edge, over all painted strong edges. */
+  readonly score: number;
+  /** 1 where this view must not project: the misaligned runs and the strip around them, on geometry. */
+  readonly band: Uint8Array;
+  /** Painted strong-edge cells (a cell step over `PAINTED_EDGE_STEP`), the score's denominator. */
+  readonly strong: number;
+  /** Misaligned cells inside a kept run, the score's numerator. */
+  readonly misaligned: number;
+}
+
+/**
+ * Painted edges the clay does not have, and the strip around them (PRD-916 phase 2q).
+ *
+ * A painter draws a body for everything it sees: the courtyard's corner pillar came back as a *shifted*
+ * pillar, and the projection put its pixels on the flat wall behind it as a ghost slab. Neither the
+ * structure check (a compact closed blob) nor the silhouette check (paint over sky) sees that: the
+ * painted edge is neither closed nor over the sky. So:
+ *
+ * 1. the clay's edges are its *pixel* gradients — the clay is flat-shaded per face, so any step at
+ *    pixel scale is a face boundary, even the pillar-against-wall one whose cell-to-cell step is below
+ *    the structure check's 0.03 — dilated by `CLAY_EDGE_TOLERANCE`, which is the body a painter gives
+ *    an edge (a coping, a plinth, a shadow line);
+ * 2. the painted edges are cell-to-cell luminance steps of the *blurred* generation over
+ *    `PAINTED_EDGE_STEP`: a step that survives a 1.4 % blur over 1.56 % cells is a drawn line, not
+ *    mortar or cobbles;
+ * 3. a strong painted edge outside the clay's tolerance, on geometry, is misaligned. Runs shorter than
+ *    `MIN_PAINTED_RUN` of the view are dropped (an object's silhouette runs; a stain's lip does not).
+ *
+ * Pure: no DOM, no GL, unit-tested in node.
+ */
+export function edgeMisalignment(
+  generated: Uint8ClampedArray | Uint8Array,
+  clay: Uint8ClampedArray | Uint8Array,
+  geometryMask: Uint8Array,
+  width: number,
+  height: number,
+): EdgeMisalignment {
+  const cells = EDGE_GRID * EDGE_GRID;
+  const geometry = maskCoverage(geometryMask, width, height, EDGE_GRID);
+  const clayLuminance = luminanceMap(clay, width, height);
+  // The clay's own edges: a face boundary is a 1-pixel step in a flat-shaded render.
+  const clayEdgeCell = new Uint8Array(cells);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const l = clayLuminance[i]!;
+      const right = x + 1 < width ? clayLuminance[i + 1]! : l;
+      const down = y + 1 < height ? clayLuminance[i + width]! : l;
+      const left = x > 0 ? clayLuminance[i - 1]! : l;
+      const up = y > 0 ? clayLuminance[i - width]! : l;
+      const gradient = Math.max(Math.abs(l - right), Math.abs(l - left), Math.abs(l - down), Math.abs(l - up));
+      if (gradient <= CLAY_FACE_STEP) continue;
+      clayEdgeCell[cellOf(x, y, width, height, EDGE_GRID)] = 1;
+    }
+  }
+  // The generation's cell means after the texture is blurred away, and the step between neighbours.
+  const blurred = boxBlur(boxBlur(luminanceMap(generated, width, height), width, height, blurRadius(width)), width, height, blurRadius(width));
+  const painted = cellMeans(blurred, width, height, EDGE_GRID);
+  const strong = new Uint8Array(cells);
+  let strongCells = 0;
+  for (let y = 0; y < EDGE_GRID; y++) {
+    for (let x = 0; x < EDGE_GRID; x++) {
+      const i = y * EDGE_GRID + x;
+      if (geometry[i]! <= 0.5) continue;
+      const right = x + 1 < EDGE_GRID ? painted[i + 1]! : painted[i]!;
+      const down = y + 1 < EDGE_GRID ? painted[i + EDGE_GRID]! : painted[i]!;
+      if (Math.max(Math.abs(painted[i]! - right), Math.abs(painted[i]! - down)) <= PAINTED_EDGE_STEP) continue;
+      strong[i] = 1;
+      strongCells += 1;
+    }
+  }
+  // How far each cell is from a clay edge, in cells: the painted edge has to sit outside that.
+  const tolerance = Math.max(1, Math.round(CLAY_EDGE_TOLERANCE * EDGE_GRID));
+  const nearClay = withinCells(clayEdgeCell, EDGE_GRID, tolerance);
+  const misalignedCells: number[] = [];
+  for (let i = 0; i < cells; i++) if (strong[i] && !nearClay[i]) misalignedCells.push(i);
+  const kept = longRuns(misalignedCells, EDGE_GRID, Math.max(2, Math.round(MIN_PAINTED_RUN * EDGE_GRID)));
+  const band = new Uint8Array(width * height);
+  if (kept.length > 0) {
+    const keep = new Uint8Array(cells);
+    for (const i of kept) keep[i] = 1;
+    const region = withinCells(keep, EDGE_GRID, tolerance);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const cell = cellOf(x, y, width, height, EDGE_GRID);
+        if (region[cell] && geometryMask[y * width + x]) band[y * width + x] = 1;
+      }
+    }
+  }
+  return {
+    score: strongCells === 0 ? 0 : kept.length / strongCells,
+    band,
+    strong: strongCells,
+    misaligned: kept.length,
+  };
+}
+
+/** The cell a pixel belongs to, on a `grid` x `grid` layout (the same rounding the checks sample with). */
+function cellOf(x: number, y: number, width: number, height: number, grid: number): number {
+  const gx = Math.min(grid - 1, Math.floor(((x + 0.5) * grid) / width));
+  const gy = Math.min(grid - 1, Math.floor(((y + 0.5) * grid) / height));
+  return gy * grid + gx;
+}
+
+/** Rec. 709 luminance of a top-down RGBA image, 0..1 per pixel. */
+function luminanceMap(rgba: Uint8ClampedArray | Uint8Array, width: number, height: number): Float32Array {
+  const out = new Float32Array(width * height);
+  for (let i = 0; i < out.length; i++) {
+    const p = 4 * i;
+    out[i] = (0.2126 * rgba[p]! + 0.7152 * rgba[p + 1]! + 0.0722 * rgba[p + 2]!) / 255;
+  }
+  return out;
+}
+
+/** Box blur radius in pixels for a view `width` wide (`PAINTED_EDGE_SMOOTH` of it). */
+function blurRadius(width: number): number {
+  return Math.max(1, Math.round(PAINTED_EDGE_SMOOTH * width));
+}
+
+/** Separable box blur, edge pixels clamped: two passes approximate the Gaussian the check was tuned on. */
+function boxBlur(source: Float32Array, width: number, height: number, radius: number): Float32Array {
+  const window = 2 * radius + 1;
+  const clamp = (v: number, limit: number) => (v < 0 ? 0 : v >= limit ? limit - 1 : v);
+  const horizontal = new Float32Array(source.length);
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    let sum = 0;
+    for (let x = -radius; x <= radius; x++) sum += source[row + clamp(x, width)]!;
+    for (let x = 0; x < width; x++) {
+      horizontal[row + x] = sum / window;
+      sum += source[row + clamp(x + radius + 1, width)]! - source[row + clamp(x - radius, width)]!;
+    }
+  }
+  const out = new Float32Array(source.length);
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    for (let y = -radius; y <= radius; y++) sum += horizontal[clamp(y, height) * width + x]!;
+    for (let y = 0; y < height; y++) {
+      out[y * width + x] = sum / window;
+      sum += horizontal[clamp(y + radius + 1, height) * width + x]! - horizontal[clamp(y - radius, height) * width + x]!;
+    }
+  }
+  return out;
+}
+
+/** Mean luminance of each `grid` x `grid` cell. */
+function cellMeans(luminance: Float32Array, width: number, height: number, grid: number): Float64Array {
+  const sums = new Float64Array(grid * grid);
+  const counts = new Float64Array(grid * grid);
+  for (let y = 0; y < height; y++) {
+    const gy = Math.min(grid - 1, Math.floor(((y + 0.5) * grid) / height));
+    for (let x = 0; x < width; x++) {
+      const gx = Math.min(grid - 1, Math.floor(((x + 0.5) * grid) / width));
+      const cell = gy * grid + gx;
+      sums[cell] = (sums[cell] ?? 0) + luminance[y * width + x]!;
+      counts[cell] = (counts[cell] ?? 0) + 1;
+    }
+  }
+  const out = new Float64Array(grid * grid);
+  for (let i = 0; i < out.length; i++) out[i] = counts[i]! > 0 ? sums[i]! / counts[i]! : 0;
+  return out;
+}
+
+/** 1 in every cell within `reach` cells (4-neighbour) of a cell of `cells`, in place order. */
+function withinCells(cells: Uint8Array, grid: number, reach: number): Uint8Array {
+  const out = new Uint8Array(cells.length);
+  let frontier: number[] = [];
+  for (let i = 0; i < cells.length; i++) {
+    if (!cells[i]) continue;
+    out[i] = 1;
+    frontier.push(i);
+  }
+  for (let step = 0; step < reach && frontier.length > 0; step++) {
+    const next: number[] = [];
+    for (const i of frontier) {
+      const x = i % grid;
+      const y = (i - x) / grid;
+      const neighbours = [x > 0 ? i - 1 : -1, x + 1 < grid ? i + 1 : -1, y > 0 ? i - grid : -1, y + 1 < grid ? i + grid : -1];
+      for (const j of neighbours) {
+        if (j < 0 || out[j]) continue;
+        out[j] = 1;
+        next.push(j);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+/** The cells of `cells` that belong to a connected run at least `minExtent` cells long (4-neighbour). */
+function longRuns(cells: readonly number[], grid: number, minExtent: number): number[] {
+  const inRun = new Uint8Array(grid * grid);
+  for (const i of cells) inRun[i] = 1;
+  const seen = new Uint8Array(grid * grid);
+  const kept: number[] = [];
+  for (const start of cells) {
+    if (seen[start]) continue;
+    const run: number[] = [];
+    let minX = grid;
+    let maxX = -1;
+    let minY = grid;
+    let maxY = -1;
+    const stack = [start];
+    seen[start] = 1;
+    while (stack.length > 0) {
+      const i = stack.pop()!;
+      run.push(i);
+      const x = i % grid;
+      const y = (i - x) / grid;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      const neighbours = [x > 0 ? i - 1 : -1, x + 1 < grid ? i + 1 : -1, y > 0 ? i - grid : -1, y + 1 < grid ? i + grid : -1];
+      for (const j of neighbours) {
+        if (j < 0 || !inRun[j] || seen[j]) continue;
+        seen[j] = 1;
+        stack.push(j);
+      }
+    }
+    if (Math.max(maxX - minX + 1, maxY - minY + 1) < minExtent) continue;
+    for (const i of run) kept.push(i);
+  }
+  return kept;
+}

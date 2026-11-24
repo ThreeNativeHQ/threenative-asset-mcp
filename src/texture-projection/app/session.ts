@@ -282,6 +282,7 @@ export class Session {
             comp: judged.comp,
             structureDeviation: judged.structureDeviation,
             silhouetteMismatch: judged.silhouetteMismatch,
+            edgeMisalignment: judged.edgeMisalignment,
           };
           if (judged.rejected) view.rejected = "structure";
           // A stored vision rejection is a paid image the check found invented structure in: re-judging
@@ -369,6 +370,7 @@ export class Session {
       coverage: this.engine.atlas.coverage(),
       structureDeviation: r.structureDeviation,
       silhouetteMismatch: r.silhouetteMismatch,
+      edgeMisalignment: r.edgeMisalignment,
       ...(r.rejected === undefined ? {} : { rejected: r.rejected }),
       ...(r.verify === undefined ? {} : { verify: r.verify }),
       ...(r.attempts > 1 ? { repainted: true } : {}),
