@@ -1564,6 +1564,90 @@ describe("texture-projection atlas infill (A, phase 2d)", () => {
     expect(labels[8 * size + 9]).toBe(1);
   });
 
+  it("fills a hole between a dark lower border and a light upper border as one smooth gradient (phase 2u)", () => {
+    // The judge's blobs, as a fixture: the painted rows below a full-width hole are dark moss, the ones
+    // above it light stone. Phase 2d flooded the nearest colour inwards, so the two met along a line that
+    // traced the hole and the fill showed its shape; the pyramid interpolates between both borders instead.
+    const size = 64;
+    const dark: [number, number, number] = [60, 50, 40];
+    const light: [number, number, number] = [200, 190, 170];
+    const { data, islands } = atlasOf(size, (x, y) => (y < 16 ? dark : y >= 48 ? light : undefined));
+    const before = Uint8ClampedArray.from(data);
+    inpaintUnpainted(data, islands, size);
+    const lum = (x: number, y: number) => {
+      const p = 4 * (y * size + x);
+      return (data[p]! + data[p + 1]! + data[p + 2]!) / 3;
+    };
+    const rows: number[] = [];
+    for (let y = 16; y < 48; y++) rows.push(lum(32, y));
+    // Monotone from the dark border to the light one, and no step in between: a nearest-colour fill puts
+    // the whole 140 levels of difference in one texel at the middle of the hole.
+    let worstStep = 0;
+    for (let i = 1; i < rows.length; i++) {
+      expect(rows[i]!, `row ${16 + i}`).toBeGreaterThanOrEqual(rows[i - 1]! - 0.5);
+      worstStep = Math.max(worstStep, rows[i]! - rows[i - 1]!);
+    }
+    expect(worstStep).toBeLessThanOrEqual(8);
+    // And it really does span the borders' difference rather than flattening to the island's mean.
+    expect(rows[rows.length - 1]! - rows[0]!).toBeGreaterThan(0.6 * (lum(0, 48) - lum(0, 15)));
+    // No shape: every column is the same, so nothing of the hole's outline is in the fill.
+    for (let y = 16; y < 48; y++) {
+      for (let x = 0; x < size; x++) expect(Math.abs(lum(x, y) - rows[y - 16]!), `texel ${x},${y}`).toBeLessThanOrEqual(1);
+    }
+    // The paint is untouched, bytes and all.
+    for (let y = 0; y < size; y++) {
+      if (y >= 16 && y < 48) continue;
+      for (let x = 0; x < size; x++) expect(Array.from(data.subarray(4 * (y * size + x), 4 * (y * size + x) + 4))).toEqual(
+        Array.from(before.subarray(4 * (y * size + x), 4 * (y * size + x) + 4)),
+      );
+    }
+  });
+
+  it("fills an island's gap from its own paint, never from an island inside its bounds (phase 2u)", () => {
+    // A cobble band with a 16x16 gap no view reached, and a plaster island standing in the notch beside it,
+    // so the cobble island's bounding box holds every plaster texel and the pyramid averages over it. A
+    // fill that took the box's paint instead of the island's comes back the mean of both materials (measured:
+    // 127 where the cobble is 60), which is what the label check in the fill is for.
+    const size = 48;
+    const cobble: [number, number, number] = [60, 45, 30];
+    const plaster: [number, number, number] = [240, 235, 220];
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size);
+    const paint = (x: number, y: number, rgb: [number, number, number]) => {
+      const p = 4 * (y * size + x);
+      data[p] = rgb[0];
+      data[p + 1] = rgb[1];
+      data[p + 2] = rgb[2];
+      data[p + 3] = 255;
+    };
+    const cobbleIsland = (x: number, y: number) => x >= 8 && x <= 39 && y >= 8 && y <= 39 && !(x >= 24 && y <= 23);
+    const cobbleGap = (x: number, y: number) => x >= 24 && y >= 24;
+    const plasterIsland = (x: number, y: number) => x >= 26 && x <= 31 && y >= 10 && y <= 15;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (cobbleIsland(x, y)) {
+          islands[y * size + x] = 1;
+          if (!cobbleGap(x, y)) paint(x, y, cobble);
+        } else if (plasterIsland(x, y)) {
+          islands[y * size + x] = 1;
+          if (!(x === 28 && y === 12)) paint(x, y, plaster);
+        }
+      }
+    }
+    const labels = islandLabels(islands, size);
+    const cobbleLabel = labels[10 * size + 10]!;
+    expect(labels[30 * size + 30]!).toBe(cobbleLabel); // the gap is part of the cobble island
+    expect(labels[11 * size + 26]!).not.toBe(cobbleLabel); // the plaster block is its own island
+    inpaintUnpainted(data, islands, size);
+    const filled = (x: number, y: number) => Array.from(data.subarray(4 * (y * size + x), 4 * (y * size + x) + 4));
+    // The gap the cobble island fills is cobble, opaque, throughout: not a texel of it is plaster.
+    for (let y = 24; y <= 39; y++) {
+      for (let x = 24; x <= 39; x++) expect(filled(x, y), `gap ${x},${y}`).toEqual([...cobble, 255]);
+    }
+    // And the plaster island's own hole is its own plaster.
+    expect(filled(28, 12)).toEqual([...plaster, 255]);
+  });
+
   /** Mean over a crop of each texel's 3x3 luminance variance: 0 for a smear, high for real grain. */
   function localVariance(data: Uint8ClampedArray, size: number, x0: number, x1: number, y0: number, y1: number) {
     const lum = (x: number, y: number) => {

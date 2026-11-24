@@ -30,9 +30,10 @@ const DEBUG_FILL_RGB = [255, 105, 180] as const;
 
 /**
  * Fill the texels no view painted (alpha < 128) from the painted texels of the same UV island: a
- * breadth-first fill inwards, each texel taking the average of the filled texels around it, so a gap
- * continues the material that surrounds it inside its own UV island. The alpha those texels leave with
- * is 255, as every texel's is: the painted-coverage mask ships separately (phase 2t).
+ * push-pull pyramid over the island's own bounding box, so each texel the fill made up takes the value
+ * of the level above it and the gap becomes a smooth membrane between the borders a view did paint (phase
+ * 2u) — never a line where one border's colour meets another's. The alpha those texels leave with is 255,
+ * as every texel's is: the painted-coverage mask ships separately (phase 2t).
  *
  * `fill: "debug"` (phase 2r) writes such a texel as hot pink (#FF69B4) instead, and skips the fill and
  * its grain: a capture then counts the bake's gaps as pink pixels, which is a number, where reading a
@@ -43,7 +44,9 @@ const DEBUG_FILL_RGB = [255, 105, 180] as const;
  * A single global mean colour was the 2c fill, and it is what made the courtyard floor look painted
  * (PRD-916 phase 2d): every texel the magnification guard or a rejected view left empty became the
  * atlas' average tone, so gaps between cobbles read as smooth white plaster patches with a tan seam.
- * The fill replaces that with the nearest painted material: a hole in the paving fills with paving.
+ * The fill replaces that with the material of the island around the hole. Phase 2d took the nearest
+ * painted colour for that; phase 2u takes the pyramid's interpolation between all the painted borders,
+ * because nearest-colour left the hole's own outline visible in the wall.
  *
  * The island is the boundary, not the atlas (phase 2e): a texel is only ever filled from painted
  * texels of its own island, so a gap in a floor island cannot take the white plaster of a wall island
@@ -324,10 +327,20 @@ export function islandLabels(islands: Uint8Array, size: number): Int32Array {
 }
 
 /**
- * Breadth-first fill of each island's unpainted texels from its own painted ones: a texel takes the
- * mean of the filled texels 8-connected to it, nearest paint first, so the gap continues the material
- * around it and never reaches into another island. `distance` records how many texels from paint each
- * filled texel is (0 where a view painted), which the detail pass fades its grain in over.
+ * Fill of each island's unpainted texels from its own painted ones, as a smooth membrane (PRD-916 phase
+ * 2u): a push-pull pyramid per island, so a gap interpolates between all of the painted borders around it
+ * rather than flowing in from the nearest one.
+ *
+ * Phase 2d filled a gap breadth-first, nearest painted texel first, which continues the material around it
+ * but leaves the *shape* of the gap in the result: where dark moss sits below a hole and light stone above
+ * it, the two meet along a line that traces the hole's outline, and the judge saw exactly those outlines as
+ * shrub-shadow blobs on the courtyard's back wall. A pyramid has no such meeting line: every level averages
+ * the island's paint, and the pull back down interpolates one continuous field between all its borders.
+ *
+ * Everything else is unchanged: the island is still the boundary (each island's pyramid is built in its own
+ * bounding box and only its own texels carry weight), `transferDetail` still adds the grain of a real
+ * painted patch on top, and `distance` still says how far from paint each filled texel sits, which is the
+ * grain's fade-in.
  */
 function fillWithinIslands(
   data: Uint8ClampedArray,
@@ -336,58 +349,128 @@ function fillWithinIslands(
   distance: Uint8Array,
   size: number,
 ): void {
-  const queue = new Int32Array(labels.length);
-  let head = 0;
-  let tail = 0;
-  const enqueueNeighboursOf = (i: number) => {
-    const x = i % size;
-    const y = (i - x) / size;
-    const id = labels[i]!;
-    for (let dy = -1; dy <= 1; dy++) {
-      const ny = y + dy;
-      if (ny < 0 || ny >= size) continue;
-      for (let dx = -1; dx <= 1; dx++) {
-        const nx = x + dx;
-        if ((dx === 0 && dy === 0) || nx < 0 || nx >= size) continue;
-        const j = ny * size + nx;
-        if (filled[j] || labels[j] !== id) continue;
-        // Nearest paint first, so the first enqueue is the shortest one; a later one keeps the shorter.
-        if (distance[j] === 0) distance[j] = Math.min(255, distance[i]! + 1);
-        queue[tail++] = j;
+  let islandCount = 0;
+  for (let i = 0; i < labels.length; i++) if (labels[i]! >= islandCount) islandCount = labels[i]! + 1;
+  if (islandCount === 0) return;
+  // One pass for each island's bounds and how much of it a view painted: an island with no paint has
+  // nothing to continue, and one with no gap has nothing to fill.
+  const x0 = new Int32Array(islandCount).fill(-1);
+  const y0 = new Int32Array(islandCount);
+  const x1 = new Int32Array(islandCount);
+  const y1 = new Int32Array(islandCount);
+  const texels = new Int32Array(islandCount);
+  const painted = new Int32Array(islandCount);
+  for (let y = 0, i = 0; y < size; y++) {
+    for (let x = 0; x < size; x++, i++) {
+      const id = labels[i]!;
+      if (id < 0) continue;
+      if (x0[id]! < 0) {
+        x0[id] = x;
+        y0[id] = y;
+        x1[id] = x;
+        y1[id] = y;
+      } else {
+        if (x < x0[id]!) x0[id] = x;
+        if (x > x1[id]!) x1[id] = x;
+        if (y > y1[id]!) y1[id] = y;
       }
+      texels[id]! += 1;
+      if (data[4 * i + 3]! >= 128) painted[id]! += 1;
     }
+  }
+  for (let id = 0; id < islandCount; id++) {
+    if (painted[id]! === 0 || painted[id]! === texels[id]!) continue;
+    fillIsland(data, labels, filled, distance, size, id, x0[id]!, y0[id]!, x1[id]!, y1[id]!);
+  }
+}
+
+/**
+ * One island's membrane fill, inside its own bounding box: the texels a view painted are the pyramid's
+ * weights (1 each), every other texel is 0, and the pull back down gives each of those a value.
+ *
+ * A second island can share these bounds (a hole in one island holding another in the packing) and it
+ * contributes nothing: its weight is 0, so the pyramid never averages its colour. The bounding box only
+ * decides how much work the island costs, never what it is filled from.
+ */
+function fillIsland(
+  data: Uint8ClampedArray,
+  labels: Int32Array,
+  filled: Uint8Array,
+  distance: Uint8Array,
+  size: number,
+  id: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+): void {
+  const w = x1 - x0 + 1;
+  const h = y1 - y0 + 1;
+  const val = new Float32Array(w * h * 3);
+  const weight = new Float32Array(w * h);
+  const dist = new Uint8Array(w * h).fill(DETAIL_RAMP_TEXELS);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y0 + y) * size + x0 + x;
+      if (labels[i] !== id || data[4 * i + 3]! < 128) continue;
+      const k = y * w + x;
+      val[3 * k] = data[4 * i]!;
+      val[3 * k + 1] = data[4 * i + 1]!;
+      val[3 * k + 2] = data[4 * i + 2]!;
+      weight[k] = 1;
+      dist[k] = 0;
+    }
+  }
+  const tone = pushPull(val, weight, w, h);
+  chamferFromPaint(dist, w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y0 + y) * size + x0 + x;
+      if (labels[i] !== id || data[4 * i + 3]! >= 128) continue;
+      const k = y * w + x;
+      data[4 * i] = tone[3 * k]!;
+      data[4 * i + 1] = tone[3 * k + 1]!;
+      data[4 * i + 2] = tone[3 * k + 2]!;
+      data[4 * i + 3] = 255;
+      filled[i] = 1;
+      distance[i] = dist[k]!;
+    }
+  }
+}
+
+/**
+ * Texels from paint, capped at `DETAIL_RAMP_TEXELS` (0 on a painted texel): two sweeps of a chessboard
+ * distance transform, which the breadth-first fill used to give for free. The grain's fade-in is the only
+ * reader, and it stops counting at that cap, so texels of another island inside these bounds may carry the
+ * field across without any colour following them.
+ */
+function chamferFromPaint(dist: Uint8Array, w: number, h: number): void {
+  const cap = DETAIL_RAMP_TEXELS;
+  const relax = (k: number, n: number) => {
+    const step = dist[n]! + 1;
+    if (step < dist[k]!) dist[k] = Math.min(cap, step);
   };
-  for (let i = 0; i < labels.length && tail < queue.length; i++) if (filled[i]) enqueueNeighboursOf(i);
-  while (head < tail) {
-    const i = queue[head++]!;
-    if (filled[i]) continue;
-    const x = i % size;
-    const y = (i - x) / size;
-    let r = 0;
-    let g = 0;
-    let b = 0;
-    let count = 0;
-    for (let dy = -1; dy <= 1; dy++) {
-      const ny = y + dy;
-      if (ny < 0 || ny >= size) continue;
-      for (let dx = -1; dx <= 1; dx++) {
-        const nx = x + dx;
-        if ((dx === 0 && dy === 0) || nx < 0 || nx >= size) continue;
-        const j = ny * size + nx;
-        if (!filled[j]) continue;
-        r += data[4 * j]!;
-        g += data[4 * j + 1]!;
-        b += data[4 * j + 2]!;
-        count += 1;
-      }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const k = y * w + x;
+      if (dist[k] === 0) continue;
+      if (x > 0) relax(k, k - 1);
+      if (y === 0) continue;
+      relax(k, k - w);
+      if (x > 0) relax(k, k - w - 1);
+      if (x + 1 < w) relax(k, k - w + 1);
     }
-    if (count === 0) continue; // its paint is further away: a later owner of the queue will fill it
-    data[4 * i] = r / count;
-    data[4 * i + 1] = g / count;
-    data[4 * i + 2] = b / count;
-    data[4 * i + 3] = 255;
-    filled[i] = 1;
-    enqueueNeighboursOf(i);
+  }
+  for (let y = h - 1; y >= 0; y--) {
+    for (let x = w - 1; x >= 0; x--) {
+      const k = y * w + x;
+      if (dist[k] === 0) continue;
+      if (x + 1 < w) relax(k, k + 1);
+      if (y + 1 === h) continue;
+      relax(k, k + w);
+      if (x + 1 < w) relax(k, k + w + 1);
+      if (x > 0) relax(k, k + w - 1);
+    }
   }
 }
 
