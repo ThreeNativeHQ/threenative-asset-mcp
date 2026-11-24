@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { ATLAS_GAP_CELLS, MAX_TEXELS_PER_PIXEL } from "./core/atlas.js";
 import { INDOOR, OUTDOOR, OVERCAST, type Lighting } from "./core/clay.js";
 import { Engine } from "./core/engine.js";
 import { exportGlb } from "./core/export.js";
@@ -7,6 +8,7 @@ import { toBlob, urlToRGBA } from "./core/image.js";
 import {
   DEFAULT_PIPELINE,
   GRAZING_VIEW_LIMIT,
+  consistencyReference,
   judgeView,
   paintPreparedView,
   prepareView,
@@ -17,19 +19,20 @@ import {
   type RunPrior,
   type RunRecord,
   type ViewRecord,
+  type VisibleCoverage,
 } from "./core/pipeline.js";
 import { plan as makePlan, type Plan, type PlanOptions } from "./core/planner.js";
 import { loadLevel, type Level } from "./core/scene.js";
-import { makeCamera, type ViewSpec } from "./core/views.js";
+import { makeCamera, ViewRenderer, type ViewSpec } from "./core/views.js";
 import { Viewer } from "./core/viewer.js";
 
 export const LIGHTING: Record<string, Lighting> = { outdoor: OUTDOOR, overcast: OVERCAST, indoor: INDOOR };
 
 /**
- * An image pixel that covers more than ~2x2 atlas texels is magnification blur (A.2): the atlas is
- * oversampled where the views cannot resolve more detail. Four texels per pixel is that 2x2.
+ * One image pixel may cover at most 2x2 atlas texels along its worse axis (A.2, PRD-916 phase 2d):
+ * the footprint the projection measures is that worse axis, so the guard's threshold is 2, not 4.
  */
-export const BLUR_TEXELS_PER_PIXEL = 4;
+export const BLUR_TEXELS_PER_PIXEL = MAX_TEXELS_PER_PIXEL;
 
 /** What a plan resolves at one atlas size: the footprint of the winning view per painted texel. */
 export interface ProjectionMeasurement {
@@ -40,7 +43,7 @@ export interface ProjectionMeasurement {
   readonly paintedTexels: number;
   /** Median texels per image pixel over painted island texels; 1 = one texel per pixel. */
   readonly medianFoot: number;
-  /** Share of painted texels whose best view has one pixel covering more than 2x2 texels, in percent. */
+  /** Share of painted texels whose best view has one pixel covering more than 2x2 texels along its worse axis, in percent. */
   readonly blurredTexelPercent: number;
   /** Share of island texels the projection's magnification guard refuses (unpainted, no detail to give). */
   readonly magnificationSkippedPercent: number;
@@ -58,6 +61,8 @@ export class Session {
   record?: RunRecord;
   private abort?: AbortController;
   private measurement?: { atlas: number; foot: Float32Array; painted: Uint8Array; islandTexels: number; paintedTexels: number };
+  /** 128 px renderer the hole pass ranks candidate cameras with (B, phase 2d). */
+  private holeProbe?: ViewRenderer;
 
   constructor(readonly canvas: HTMLCanvasElement) {
     this.gpu = new Gpu(canvas);
@@ -122,6 +127,7 @@ export class Session {
       plan,
       skip,
       prior,
+      this,
     );
     this.record = record;
     return record;
@@ -240,7 +246,8 @@ export class Session {
       return view;
     }
     onEvent({ type: "view-start", index: viewIndex, wave: 0, model: p.model.key, state: p.state });
-    const r = await paintPreparedView(p, this.engine.size, o, o.seed + viewIndex, o.feather, this.abort?.signal);
+    const consistency = consistencyReference(p, this.engine.size);
+    const r = await paintPreparedView(p, this.engine.size, o, o.seed + viewIndex, o.feather, this.abort?.signal, consistency);
     if (r.rejected === undefined) {
       this.engine.paint(p.spec, r.comp);
       this.viewer.setMode("textured");
@@ -317,14 +324,14 @@ export class Session {
   }
 
   /**
-   * The same footprint at another atlas size: an atlas twice as large puts four times as many texels
-   * under one image pixel, so the blur threshold scales with the square of the size ratio. This is
-   * what a quote reports for the atlas it just chose.
+   * The same footprint at another atlas size: a texel footprint is a length in texels, so it scales
+   * with the atlas' side, not with its area (the metric is the worse screen axis, not UV area).
+   * This is what a quote reports for the atlas it just chose.
    */
   blurredPercentAt(atlasSize: number): number {
     const measurement = this.measurement;
     if (!measurement) throw new Error("measure before reading a blur percent");
-    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize) ** 2;
+    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
     if (measurement.paintedTexels === 0) return 0;
     let blurred = 0;
     const foot = measurement.foot;
@@ -344,7 +351,7 @@ export class Session {
   guardedPercentAt(atlasSize: number): { blurred: number; skipped: number } {
     const measurement = this.measurement;
     if (!measurement) throw new Error("measure before reading the guard's share");
-    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize) ** 2;
+    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
     let skipped = 0;
     const foot = measurement.foot;
     for (let i = 0; i < foot.length; i++) if (foot[i]! > threshold) skipped += 1;
@@ -362,7 +369,7 @@ export class Session {
   magnificationSkippedPercentAt(atlasSize: number): number {
     const measurement = this.measurement;
     if (!measurement) throw new Error("measure before reading the magnification share");
-    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize) ** 2;
+    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
     if (measurement.islandTexels === 0) return 0;
     let skipped = 0;
     const foot = measurement.foot;
@@ -374,6 +381,57 @@ export class Session {
 
   stop() {
     this.abort?.abort();
+  }
+
+  /**
+   * How much of what players actually see the bake has painted, and where the rest is (B, phase 2d).
+   *
+   * The denominator is not the whole atlas: texels only an aerial camera or the back of a wall ever
+   * shows are not what a player walks past, and a run that paints 44% of the atlas but 100% of the
+   * player-visible surface is done. So the mask is built from the plan's player-height views (ground
+   * kind) with the projection's own grazing and occlusion gates, and counted against the atlas' paint.
+   */
+  visibleCoverage(plan: Plan): VisibleCoverage {
+    if (!this.engine) throw new Error("load a level first");
+    const engine = this.engine;
+    const player = plan.views.filter((view) => view.kind === undefined || view.kind === "ground");
+    if (player.length === 0) return { percent: 100, gapPercent: 0, gapCells: new Float32Array(ATLAS_GAP_CELLS ** 2) };
+    const mask = engine.atlas.projectionMask(player.length, (index) => {
+      const camera = makeCamera(player[index]!);
+      engine.views.renderGeometry(camera);
+      return { camera, gPos: engine.views.geometryTarget.textures[0]! };
+    });
+    try {
+      const stats = engine.atlas.visibleStats(mask.texture, ATLAS_GAP_CELLS);
+      return { percent: 100 - stats.gapPercent, gapPercent: stats.gapPercent, gapCells: stats.gapCells };
+    } finally {
+      mask.dispose();
+    }
+  }
+
+  /**
+   * Score one hole-pass candidate by the unpainted texels players can see that its camera would paint,
+   * each weighted by its cluster's size, so the budget goes to the largest holes first (B, phase 2d).
+   * The probe renders at 128 px: enough to rank cameras, far cheaper than a real view.
+   */
+  gapScore(spec: ViewSpec, gapCells: Float32Array): { score: number; pixels: number } {
+    if (!this.engine || !this.level) throw new Error("load a level first");
+    this.holeProbe ??= new ViewRenderer(this.gpu, this.level, 128);
+    const probe = this.holeProbe;
+    probe.renderGeometry(makeCamera(spec));
+    const uvq = this.gpu.readF32(probe.geometryTarget, 2, false);
+    const { mask } = probe.renderState(this.engine.atlas.texture, this.engine.atlas.texture, this.engine.options.qualityRatio);
+    let score = 0;
+    let pixels = 0;
+    for (let i = 0; i < mask.length / 4; i++) {
+      if (mask[4 * i]! < 128 || mask[4 * i + 2]! > 127) continue; // sky, or already painted
+      pixels += 1;
+      const cx = Math.min(ATLAS_GAP_CELLS - 1, Math.max(0, Math.floor(uvq[4 * i]! * ATLAS_GAP_CELLS)));
+      const cy = Math.min(ATLAS_GAP_CELLS - 1, Math.max(0, Math.floor(uvq[4 * i + 1]! * ATLAS_GAP_CELLS)));
+      // One point for the pixel, plus the size of the hole it falls in: the biggest cluster wins.
+      score += 1 + (gapCells[cy * ATLAS_GAP_CELLS + cx] ?? 0);
+    }
+    return { score, pixels };
   }
 
   private addSky(v: Pick<ViewRecord, "spec" | "model" | "comp">) {

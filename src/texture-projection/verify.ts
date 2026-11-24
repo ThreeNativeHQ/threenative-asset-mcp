@@ -75,11 +75,38 @@ export function verifyUsageUsd(
 /** What the check says: nothing invented and plausible detail, an invention, or an answer it cannot read. */
 export type VerifyVerdict = "ok" | "rejected" | "unparsed";
 
+/**
+ * Names of the structures that lie *along an edge* instead of standing out of a surface: a coping slab
+ * on a wall top, a plinth or base course at its foot, a cornice, a moulding, a ledge, quoins at a corner.
+ *
+ * Phase 2d measures why this split exists. On the live courtyard every wall top in the clay is a plain
+ * thin edge, and both image models (FLUX 3 Klein and Muse) paint a coping slab along it in nearly every
+ * view, even when the prompt names the wall top as the wall's own top face and the repaint forbids the
+ * exact band the check found (measured: still there, only thinner). Rejecting those views loses the
+ * whole view — the calibrated effect is 44 of 48 views refused, i.e. a bake with almost no paint, the
+ * patchy regression the judge named first. So the pipeline refuses a view for structure that stands out
+ * of a surface (a pilaster, buttress, quoin strip, arch, window, tiles, chimney, prop) and *records* an
+ * edge band instead: `run.json` keeps it under `bands`, and paint reports how many views carried one.
+ */
+const EDGE_BAND = /(coping|capstone|cornice|moulding|molding|plinth|base\s*course|base\s*band|ledge|quoin|sill|cill|kerb|curb)/iu;
+
+/** The candidates that stand out of a surface: the ones the pipeline refuses a view for. */
+export function structuresOutOfSurface(added: readonly string[]): string[] {
+  return added.filter((name) => !EDGE_BAND.test(name));
+}
+
+/** The candidates that are bands along an edge: recorded per view, never a rejection on their own. */
+export function edgeBands(added: readonly string[]): string[] {
+  return added.filter((name) => EDGE_BAND.test(name));
+}
+
 export interface ViewVerify {
   /** OpenRouter model id that judged the view. */
   readonly model: string;
   /** Structures the painted image shows and the clay does not ("ruined stone pillar on the wall"). */
   readonly added: readonly string[];
+  /** Of those, the bands along an edge (a coping, a plinth): recorded, not a rejection (see `EDGE_BAND`). */
+  readonly bands: readonly string[];
   /** Surface detail is at a plausible real-world size for the stated camera distance. */
   readonly scaleOk: boolean;
   readonly verdict: VerifyVerdict;
@@ -88,6 +115,8 @@ export interface ViewVerify {
 /** What one check reports besides its verdict. */
 export interface VerifyAnswer {
   readonly added: readonly string[];
+  /** Of `added`, the bands along an edge: listed, recorded, and not a rejection on their own. */
+  readonly bands: readonly string[];
   readonly scaleOk: boolean;
   readonly verdict: VerifyVerdict;
   /** The model's own words when the answer could not be parsed (never the request). */
@@ -112,6 +141,14 @@ const metres = (value: number): string => (value >= 10 ? value.toFixed(0) : valu
  * The wording is calibrated on the live courtyard run: a first version asked "what is added?" and the
  * model answered with materials ("stone blocks on the wall", "cobblestone paving"), rejecting every
  * good view. It now decides *shape* first and names the evidence it saw.
+ *
+ * Phase 2d widened it (and the 2c run showed why): a stone pilaster standing proud on a flat wall and
+ * a grey coping strip laid along every wall top passed as "material", and reached the bake. Both give a
+ * flat clay surface an edge, a top face or its own coursing, so this version names them (pilaster,
+ * buttress, pier, quoin, raised or recessed band, cornice, coping, capstone, ledge, plinth, relief) and
+ * tells the model to compare each wall's silhouette and top edge between the two images before it
+ * answers. "A course of the same stone is material" is narrowed to a course that continues the wall's
+ * own coursing and tone, because that sentence is what the coping hid behind.
  */
 export function verifyPrompt(c: VerifyPromptContext): string {
   const camera =
@@ -127,30 +164,38 @@ export function verifyPrompt(c: VerifyPromptContext): string {
     "The question is about SHAPE, never about paint. Painted material on a shape the clay already has is never " +
     '"added": stone blocks, cobbles, paving, plaster, brickwork, mortar, tiles used as flat material, moss, ' +
     "lichen, stains, cracks, weathering, shadows, colour.\n\n" +
+    "Before you answer, compare the two images edge by edge: every wall's TOP EDGE and SILHOUETTE, and every edge " +
+    "where two surfaces meet. In the clay a wall top is one thin flat edge and a wall is one flat face. A painting " +
+    "that gives either of them a new edge, a strip of its own, a top face, a side face or a shadow line along it " +
+    "has added structure, whatever stone it uses.\n\n" +
     '"added": three-dimensional structures or objects in the painted image that the clay does not show. An item ' +
-    "belongs here only if it stands out of a surface or breaks a flat surface in the clay: it has an outline or an " +
-    "edge across the flat clay, its own side face, or a shadow side. Ask of each candidate: could this be flat " +
-    "material painted on the flat clay shape? Then leave it out. When unsure, leave it out.\n" +
-    "Examples of added structure: a ruined stone pillar standing against a wall; a buttress on a wall; a doorway, " +
-    "window or arch painted into a flat wall; a passage or hole; an awning, balcony, railing, bench, cart, crate, " +
-    "lamp, person or plant.\n" +
-    "Wall tops: the clay shows each wall top as one thin flat edge. A row, band or slab of roof tiles or red " +
-    "terracotta laid along or above it is added, and so is a whole pitched roof or a chimney. A course of the same " +
-    "stone as the wall, against that edge, is material and is not added.\n" +
+    "belongs here if it stands out of a surface or breaks a flat surface in the clay: it has an outline or an edge " +
+    "across the flat clay, its own side or top face, its own shadow line, or its own coursing. Ask of each " +
+    'candidate: could this be flat material painted on the flat clay shape, with the same coursing and tone as ' +
+    "the surface it lies on? Then leave it out. When unsure, leave it out.\n" +
+    "Examples of added structure: a pilaster, buttress, pier or column standing against, on or beside a wall; a " +
+    "vertical strip on a flat wall with its own coursing, its own block size or its own base; quoin stones making " +
+    "a corner stand out; a raised or recessed band, ledge, cornice, moulding, plinth or base course that reads as a " +
+    "separate slab, with its own shadow line or a tone of its own; a coping, capstone or parapet laid along a wall " +
+    "top, and a row of roof tiles or terracotta along it; carved relief; a doorway, window or arch painted into a " +
+    "flat wall; a passage or hole; an awning, balcony, railing, bench, cart, crate, lamp, person or plant.\n" +
+    "Wall tops: a strip, band or slab of a different tone laid along or above the clay's thin edge is added, and so " +
+    "is a whole pitched roof or a chimney. A course of the same stone, in the wall's own coursing, continuing the " +
+    "wall to that edge and reading as the same wall, is material and is not added.\n" +
     "The clay already contains objects (blocks, cylinders, steps): an object at the same place with the same " +
     "silhouette as in the clay is not added.\n" +
     'For each candidate give its name in three to eight words with where it is, and answer outOfSurface: true ' +
-    "only if you can point at where it leaves the clay's surface (an outline across the flat clay, a side face, a " +
-    "shadow side). If it is paint lying on a shape the clay has, outOfSurface is false and you leave the " +
-    "candidate out. List each distinct structure once, at most six, and list nothing when the painting " +
-    "changes materials only, which is the normal, correct result.\n\n" +
+    "only if you can point at where it leaves the clay's surface (an outline across the flat clay, a side or top " +
+    "face of its own, a shadow line along it, or a change of coursing or block size). If it is paint lying on a " +
+    "shape the clay has, outOfSurface is false and you leave the candidate out. List each distinct structure once, " +
+    "at most six, and list nothing when the painting changes materials only, which is the normal, correct result.\n\n" +
     '"scaleOk": true when the material detail (stones, bricks, tiles, planks, mortar joints) is a plausible real ' +
     "size for that camera distance, false when it is far too large or far too small: cobbles the size of a car, " +
     "bricks a metre long, one paving stone filling the bottom of the frame, joints wider than a brick, stones " +
     "finer than sand. Judge the size like a person standing where the camera is, not by the pixels.\n\n" +
     "Answer with one JSON object and nothing else, for example:\n" +
-    '{"added": [{"what": "a ruined stone pillar standing against the wall, right of centre", "outOfSurface": ' +
-    'true}], "scaleOk": true, "reason": "compared the outlines in both images"}\n' +
+    '{"added": [{"what": "a coping strip along the top of the wall, right of centre", "outOfSurface": ' +
+    'true}], "scaleOk": true, "reason": "compared the wall tops and outlines in both images"}\n' +
     "With nothing added the answer is {\"added\": [], \"scaleOk\": true, \"reason\": \"...\"}.\n" +
     '"reason": one short sentence: what you compared, not a summary of the materials.'
   );
@@ -193,20 +238,20 @@ const MAX_ADDED = 12;
  */
 export function parseVerifyAnswer(content: string): VerifyAnswer {
   const json = firstObject(content);
-  if (json === undefined) return { added: [], scaleOk: false, verdict: "unparsed", reason: "no JSON object" };
+  if (json === undefined) return { added: [], bands: [], scaleOk: false, verdict: "unparsed", reason: "no JSON object" };
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
   } catch {
-    return { added: [], scaleOk: false, verdict: "unparsed", reason: "unreadable JSON" };
+    return { added: [], bands: [], scaleOk: false, verdict: "unparsed", reason: "unreadable JSON" };
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return { added: [], scaleOk: false, verdict: "unparsed", reason: "answer is not an object" };
+    return { added: [], bands: [], scaleOk: false, verdict: "unparsed", reason: "answer is not an object" };
   }
   const record = parsed as Record<string, unknown>;
   const rawAdded = record["added"];
   if (typeof record["scaleOk"] !== "boolean" || !Array.isArray(rawAdded)) {
-    return { added: [], scaleOk: false, verdict: "unparsed", reason: "answer misses added or scaleOk" };
+    return { added: [], bands: [], scaleOk: false, verdict: "unparsed", reason: "answer misses added or scaleOk" };
   }
   const added: string[] = [];
   for (const item of rawAdded) {
@@ -214,11 +259,11 @@ export function parseVerifyAnswer(content: string): VerifyAnswer {
     // candidate it calls flat paint is dropped, so a painted material never rejects a good view. An
     // entry in any other shape is not a verdict this check trusts (fail closed).
     if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      return { added: [], scaleOk: false, verdict: "unparsed", reason: "added entry is not an object" };
+      return { added: [], bands: [], scaleOk: false, verdict: "unparsed", reason: "added entry is not an object" };
     }
     const entry = item as Record<string, unknown>;
     if (typeof entry["what"] !== "string" || typeof entry["outOfSurface"] !== "boolean") {
-      return { added: [], scaleOk: false, verdict: "unparsed", reason: "added entry misses what or outOfSurface" };
+      return { added: [], bands: [], scaleOk: false, verdict: "unparsed", reason: "added entry misses what or outOfSurface" };
     }
     if (!entry["outOfSurface"]) continue;
     const name = entry["what"].trim().replace(/\s+/gu, " ").slice(0, 120);
@@ -227,6 +272,9 @@ export function parseVerifyAnswer(content: string): VerifyAnswer {
   }
   const scaleOk = record["scaleOk"];
   const reason = typeof record["reason"] === "string" ? record["reason"].slice(0, 300) : undefined;
-  const verdict: VerifyVerdict = added.length === 0 && scaleOk ? "ok" : "rejected";
-  return { added, scaleOk, verdict, ...(reason === undefined ? {} : { reason }) };
+  // An edge band is listed for the log (and for a repaint's avoid list) but does not refuse the view:
+  // `run.json` keeps it, and a view is only rejected for structure that stands out of a surface.
+  const bands = edgeBands(added);
+  const verdict: VerifyVerdict = structuresOutOfSurface(added).length === 0 && scaleOk ? "ok" : "rejected";
+  return { added, bands, scaleOk, verdict, ...(reason === undefined ? {} : { reason }) };
 }

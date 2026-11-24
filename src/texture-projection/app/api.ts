@@ -31,6 +31,8 @@ export interface RunSummary {
   cost: number;
   seconds: number;
   coverage: number;
+  /** Share of the texels player-height cameras see that the bake painted, in percent (B, phase 2d). */
+  visibleCoverage: number;
   /** "structure" when the run stopped buying because its first views invented geometry. */
   stopped?: "structure";
 }
@@ -99,6 +101,7 @@ export function makeApi(session: Session) {
       cost: record.cost,
       seconds: record.seconds,
       coverage: session.engine!.atlas.coverage(),
+      visibleCoverage: record.visibleCoverage,
       ...(record.stopped === undefined ? {} : { stopped: record.stopped }),
     };
   }
@@ -150,6 +153,11 @@ export function makeApi(session: Session) {
     /** The bake's blur pair under the projection's own guard rule (blur 0 by construction). */
     guardedPercentAt(atlasSize: number) {
       return session.guardedPercentAt(atlasSize);
+    },
+    /** Share of the texels player-height cameras see that the bake has painted, in percent (B, phase 2d). */
+    visibleCoverage(): number {
+      if (!session.engine || !session.plan) return 0;
+      return session.visibleCoverage(session.plan).percent;
     },
     /** Camera planning only: no model calls, so no key and no cost. */
     plan(opts: Partial<PlanOptions> = {}): PlanSummary {

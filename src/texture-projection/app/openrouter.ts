@@ -84,7 +84,7 @@ export async function runVerify(
     });
   } catch (error) {
     if (signal?.aborted) throw error;
-    return { added: [], scaleOk: false, verdict: "unparsed", reason: "request failed", cost: 0, seconds: seconds() };
+    return { added: [], bands: [], scaleOk: false, verdict: "unparsed", reason: "request failed", cost: 0, seconds: seconds() };
   }
   const data = (await res.json().catch(() => ({}))) as {
     choices?: { message?: { content?: unknown } }[];
@@ -95,6 +95,7 @@ export async function runVerify(
     const reason = typeof data.error === "string" ? data.error : data.error?.message;
     return {
       added: [],
+      bands: [],
       scaleOk: false,
       verdict: "unparsed",
       reason: reason ?? `status ${res.status}`,
@@ -105,7 +106,7 @@ export async function runVerify(
   const cost = verifyUsageUsd(verifyModelFor(model), data.usage, viewSize);
   const content = data.choices?.[0]?.message?.content;
   if (typeof content !== "string") {
-    return { added: [], scaleOk: false, verdict: "unparsed", reason: "no text answer", cost, seconds: seconds() };
+    return { added: [], bands: [], scaleOk: false, verdict: "unparsed", reason: "no text answer", cost, seconds: seconds() };
   }
   return { ...parseVerifyAnswer(content), cost, seconds: seconds() };
 }

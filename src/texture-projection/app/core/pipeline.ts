@@ -1,4 +1,5 @@
 import { DEFAULT_MODEL, prompts, resolveModel, type EditModel, type PromptContext } from "../../models.js";
+import { VISIBLE_COVERAGE_TARGET, cropRgba, paintedWindow } from "../../atlas-pixels.js";
 import { DEFAULT_VERIFY_MODEL, verifyPrompt, type ViewVerify } from "../../verify.js";
 import { runEdit, runVerify } from "../openrouter.js";
 import {
@@ -19,7 +20,7 @@ import { bitmapToRGBA, toDataUrl } from "./image.js";
 import { DEFAULT_PLAN, holeViews, plan as makePlan, type Plan, type PlanOptions } from "./planner.js";
 import { classifyView, describeView } from "./semantics.js";
 import { rejectsStructure, structureDeviation } from "./structure.js";
-import { makeCamera, ViewRenderer, type ViewSpec } from "./views.js";
+import { type ViewSpec } from "./views.js";
 import { measureScaleAnchor, type ScaleAnchor } from "./scale.js";
 
 export interface PipelineOptions {
@@ -98,6 +99,8 @@ export interface RunRecord {
   views: ViewRecord[];
   cost: number;
   seconds: number;
+  /** Share of the texels players can see that the bake painted, in percent (B, phase 2d). */
+  visibleCoverage: number;
   /** Set when the run stopped itself instead of painting on: the B.2 check rejected its first views. */
   stopped?: "structure";
 }
@@ -297,6 +300,47 @@ export interface PaintedView extends PaintedAttempt {
 }
 
 /**
+ * A view's request gets a material reference (C, phase 2d): a crop of accepted paint on the same surface,
+ * so two views of one wall cannot choose an ashlar and a stucco for it and meet at a seam.
+ *
+ * The crop comes from the state image this very view was handed — its known pixels are the accepted
+ * paint of this surface, by construction — from the densest block of it. A view with no accepted paint
+ * (the first one) falls back to the first accepted view of the run, when there is one.
+ */
+export function consistencyReference(
+  p: PreparedView,
+  size: number,
+  first?: string,
+  cropSize = CONSISTENCY_CROP_PX,
+): string | undefined {
+  const known = new Uint8Array(p.masks.known.length);
+  let painted = 0;
+  for (let i = 0; i < known.length; i++) {
+    if (p.masks.geometry[i] && p.masks.known[i]) {
+      known[i] = 1;
+      painted += 1;
+    }
+  }
+  if (painted < size * size * CONSISTENCY_MIN_SHARE) return first;
+  const side = Math.min(cropSize, size);
+  const { x, y } = paintedWindow(known, size, size, side);
+  // The densest window still has to be mostly accepted paint, or the model is handed a crop of clay.
+  let inWindow = 0;
+  for (let row = 0; row < side; row++) {
+    for (let col = 0; col < side; col++) inWindow += known[(y + row) * size + x + col] ? 1 : 0;
+  }
+  if (inWindow < side * side * CONSISTENCY_MIN_SHARE) return first;
+  return toDataUrl(cropRgba(p.state, size, size, x, y, side), side, side, "image/jpeg", 0.9);
+}
+
+/** A view's request gets a material reference from `consistencyReference`; this is the first-view fallback. */
+export function firstViewReference(comp: Uint8ClampedArray, size: number, cropSize = CONSISTENCY_CROP_PX): string {
+  const side = Math.min(cropSize, size);
+  const corner = Math.max(0, Math.floor((size - side) / 2));
+  return toDataUrl(cropRgba(comp, size, size, corner, corner, side), side, side, "image/jpeg", 0.9);
+}
+
+/**
  * Buy one view's image, judge it with the free pixel check, then have a vision model compare it with the
  * clay (phase 2c). The pixel check stays as the cheap pre-filter; the vision check is the reliable one,
  * because a real invention (a stone buttress, roof tiles along a wall top) is the same tone as the
@@ -310,10 +354,15 @@ async function attemptView(
   seed: number,
   feather: number,
   signal?: AbortSignal,
+  consistency?: string,
 ): Promise<PaintedAttempt> {
   const image = toDataUrl(p.state, size, size, "image/jpeg", 0.95);
   const prompt = promptText(p);
-  const r = await runEdit(p.model, { imageUrl: image, prompt: p.prompt, seed }, signal);
+  const r = await runEdit(
+    p.model,
+    { imageUrl: image, prompt: p.prompt, seed, ...(consistency === undefined ? {} : { consistency }) },
+    signal,
+  );
   const gen = bitmapToRGBA(r.image, size, size);
   const judged = judgeView(p, gen, size, feather);
   let price = p.model.price;
@@ -331,7 +380,13 @@ async function attemptView(
       signal,
     );
     price += answer.cost;
-    verify = { model: o.verifyModel, added: answer.added, scaleOk: answer.scaleOk, verdict: answer.verdict };
+    verify = {
+      model: o.verifyModel,
+      added: answer.added,
+      bands: answer.bands,
+      scaleOk: answer.scaleOk,
+      verdict: answer.verdict,
+    };
   }
   return {
     gen,
@@ -353,8 +408,9 @@ export async function paintPreparedView(
   seed: number,
   feather: number,
   signal?: AbortSignal,
+  consistency?: string,
 ): Promise<PaintedView> {
-  const first = await attemptView(p, size, o, seed, feather, signal);
+  const first = await attemptView(p, size, o, seed, feather, signal, consistency);
   const failed = first.rejected !== undefined || (first.verify !== undefined && first.verify.verdict !== "ok");
   if (!failed) return { ...first, attempts: 1 };
   // A pixel-check rejection bought nothing usable and is left to the fill pass: only the vision check
@@ -364,7 +420,7 @@ export async function paintPreparedView(
     ...p,
     prompt: { ...p.prompt, repaint: true, avoid: first.verify?.added ?? [] },
   };
-  const second = await attemptView(retry, size, o, seed + 5000, feather, signal);
+  const second = await attemptView(retry, size, o, seed + 5000, feather, signal, consistency);
   const rejected: ViewRejection | undefined =
     second.rejected ??
     (second.verify !== undefined && second.verify.verdict !== "ok" ? "verify" : undefined);
@@ -386,6 +442,36 @@ export interface RunPrior {
 }
 
 /**
+ * What players can still see unpainted (B, phase 2d): the share of the texels the plan's player-height
+ * views see that the bake painted, and the same gaps on a coarse grid, biggest holes ready to aim at.
+ */
+export interface VisibleCoverage {
+  /** Share of the player-visible atlas texels the bake painted, in percent. */
+  readonly percent: number;
+  /** Share of them it has not painted, in percent. */
+  readonly gapPercent: number;
+  /** Gap counts per cell of an `ATLAS_GAP_CELLS`² atlas grid (uv order, first row = v 0). */
+  readonly gapCells: Float32Array;
+}
+
+/**
+ * What the hole pass needs from the session that owns the GPU and the plan: how much of the player-visible
+ * surface is still unpainted, and how much of it a candidate camera would fill (B, phase 2d).
+ */
+export interface RunCoverage {
+  visibleCoverage(plan: Plan): VisibleCoverage;
+  gapScore(spec: ViewSpec, gapCells: Float32Array): { score: number; pixels: number };
+}
+
+/** How many texels of a 128 px probe a hole camera must leave unpainted to be worth a paid view. */
+const MIN_HOLE_PROBE_PIXELS = 65;
+
+/** Side of the material crop a request is told to match, in view pixels (C, phase 2d). */
+export const CONSISTENCY_CROP_PX = 1024;
+/** Below this share of accepted paint the crop is clay, and the first accepted view is used instead. */
+const CONSISTENCY_MIN_SHARE = 0.25;
+
+/**
  * Paint every planned view, in waves. `skip` holds plan indices a resumed run already has images for;
  * `prior` carries their records (re-judged and re-projected by the caller) so the returned run counts
  * them without re-requesting them.
@@ -398,6 +484,7 @@ export async function runPipeline(
   existingPlan?: Plan,
   skip?: ReadonlySet<number>,
   prior?: RunPrior,
+  coverage?: RunCoverage,
 ): Promise<RunRecord> {
   const o: PipelineOptions = { ...DEFAULT_PIPELINE, ...opts, plan: { ...DEFAULT_PIPELINE.plan, ...opts.plan } };
   const t0 = performance.now();
@@ -409,6 +496,8 @@ export async function runPipeline(
   const done = new Set<number>(skip ?? []);
   const roofsByPass = (o.plan.roofs ?? 0) > 0 || plan.views.some((v) => v.kind === "roof");
   const startOfRun = (prior?.views.length ?? 0) === 0;
+  // The first view whose paint was accepted: the material reference every later request falls back to (C).
+  let firstReference: string | undefined;
 
   const empty = (): { clay: Uint8ClampedArray; state: Uint8ClampedArray; edit: Uint8Array; gen: Uint8ClampedArray; comp: Uint8ClampedArray } => ({
     clay: new Uint8ClampedArray(0),
@@ -436,10 +525,12 @@ export async function runPipeline(
     }
     onEvent({ type: "view-start", index: vi, wave, model: p.model.key, state: p.state });
     try {
+      const consistency = consistencyReference(p, S, firstReference);
       const r = await withRetry((attempt) =>
-        paintPreparedView(p, S, o, o.seed + 1000 * attempt + vi, o.feather, signal),
+        paintPreparedView(p, S, o, o.seed + 1000 * attempt + vi, o.feather, signal, consistency),
       );
       if (r.rejected === undefined) engine.paint(p.spec, r.comp);
+      if (r.rejected === undefined && firstReference === undefined) firstReference = firstViewReference(r.comp, S);
       cost += r.price;
       const view: ViewRecord = {
         index: vi,
@@ -506,29 +597,33 @@ export async function runPipeline(
     }
   }
 
-  // Hole pass: texels nothing painted (ground behind props, tops of props) from views that actually see them.
-  // A resume never runs it: the stored plan's hole views (bought, rejected or not) were already
-  // decided, and a resume must not buy a camera the caller never approved.
+  // Hole pass (B, phase 2d): keep planning views over the largest unpainted clusters of texels a
+  // player actually sees, paint them, and re-measure, until visible coverage reaches the target or
+  // the `holes` budget is spent. A resume never runs it: the stored plan's hole views (bought,
+  // rejected or not) were already decided, and a resume must not buy a camera the caller never approved.
   const holeBudget = o.plan.holes ?? DEFAULT_PLAN.holes;
-  if (holeBudget > 0 && !signal?.aborted && !stopped && prior === undefined) {
+  // Measured once here, refreshed after every hole view, and reported: one mask render per measure, so
+  // the end of the run reuses the last one instead of asking the GPU again.
+  let visible = coverage?.visibleCoverage(plan);
+  if (holeBudget > 0 && !signal?.aborted && !stopped && prior === undefined && coverage !== undefined) {
     const cands = holeViews(engine.level, { ...DEFAULT_PLAN, ...o.plan }, plan.points);
-    const probe = new ViewRenderer(engine.gpu, engine.level, 128);
     const used = new Set<number>();
-    for (let n = 0; n < holeBudget && !signal?.aborted; n++) {
+    let state = visible!;
+    for (let n = 0; n < holeBudget && !signal?.aborted && state.percent < VISIBLE_COVERAGE_TARGET; n++) {
       let best = -1;
-      let bestPx = 0;
+      let bestScore = 0;
+      let bestPixels = 0;
       cands.forEach((c, k) => {
         if (used.has(k)) return;
-        probe.renderGeometry(makeCamera(c));
-        const { mask } = probe.renderState(engine.atlas.texture, engine.atlas.texture, engine.options.qualityRatio);
-        let px = 0;
-        for (let i = 0; i < mask.length; i += 4) if (mask[i]! > 127 && mask[i + 2]! < 128) px++;
-        if (px > bestPx) {
-          bestPx = px;
+        const { score, pixels } = coverage.gapScore(c, state.gapCells);
+        if (score > bestScore) {
+          bestScore = score;
+          bestPixels = pixels;
           best = k;
         }
       });
-      if (best < 0 || bestPx < 0.004 * 128 * 128) break; // under ~65 of 16k probe pixels: not worth a call
+      // No camera fills enough of what is left (65 of a 128 px probe): another image would not pay.
+      if (best < 0 || bestPixels < MIN_HOLE_PROBE_PIXELS) break;
       used.add(best);
       const vi = plan.views.length;
       const spec = { ...cands[best]!, id: vi };
@@ -537,12 +632,16 @@ export async function runPipeline(
       plan.predicted.push(plan.predicted[plan.predicted.length - 1] ?? 0);
       if (done.has(vi)) continue;
       await runView(spec, vi, plan.waves.length - 1);
+      // This view changed what is still missing: measure again before spending the next one.
+      state = coverage.visibleCoverage(plan);
+      visible = state;
     }
-    probe.geometryTarget.dispose();
-    probe.stateTarget.dispose();
   }
 
   const seconds = (prior?.seconds ?? 0) + (performance.now() - t0) / 1000;
+  // The run's own answer to "is the level textured for a player?": a share of what ground-level cameras
+  // see, not of the whole atlas (an atlas can be 44% painted and 96% of what a player looks at).
+  const visibleCoveragePercent = visible?.percent ?? 0;
   const record: RunRecord = {
     level: engine.level.name,
     options: o,
@@ -550,6 +649,7 @@ export async function runPipeline(
     views,
     cost,
     seconds,
+    visibleCoverage: visibleCoveragePercent,
     ...(stopped ? { stopped: "structure" as const } : {}),
   };
   onEvent({ type: "done", record });

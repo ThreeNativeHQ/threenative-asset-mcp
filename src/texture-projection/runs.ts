@@ -7,6 +7,8 @@ import { z } from "zod";
 const ViewVerifySchema = z.object({
   model: z.string().min(1),
   added: z.array(z.string()),
+  /** Of `added`, the bands along an edge (coping, plinth): recorded, never a rejection on their own. */
+  bands: z.array(z.string()).optional(),
   scaleOk: z.boolean(),
   verdict: z.enum(["ok", "rejected", "unparsed"]),
 });

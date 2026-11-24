@@ -4,6 +4,7 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 import { NodeIO, Primitive } from "@gltf-transform/core";
 
 import { markProjectedAtlas } from "./glb-marker.js";
+import { VISIBLE_COVERAGE_WARN } from "./atlas-pixels.js";
 import { DEFAULT_VERIFY_MODEL, verifyCostUsd, verifyModelFor } from "./verify.js";
 import { DEFAULT_MODEL, resolveModel } from "./models.js";
 import {
@@ -114,6 +115,10 @@ export interface TextureProjectionResult {
   readonly views: number;
   readonly viewsPainted: number;
   readonly coveragePercent: number;
+  /** Share of the texels player-height cameras see that the bake painted (B, phase 2d). */
+  readonly visibleCoveragePercent: number;
+  /** What the run wants a reader to know about its own result (a visible-coverage shortfall, a fill gap). */
+  readonly warnings: readonly string[];
   readonly estimatedUsd: number;
   readonly seconds: number;
   readonly complete: boolean;
@@ -131,6 +136,8 @@ export interface TextureProjectionResult {
   };
   /** Views the vision check rejected once and that were painted again with a new seed. */
   readonly viewsRepainted: number;
+  /** Views whose check listed an edge band (a coping, a plinth): projected, and recorded in run.json. */
+  readonly viewsBanded: number;
   /** The vision model that judged the views, or null when the run was painted with `verify: false`. */
   readonly verifyModel: string | null;
 }
@@ -147,16 +154,16 @@ export const MAX_AUTO_ATLAS = 4096;
 
 /**
  * C.1: the smallest power of two whose texel size matches the best view's pixel footprint on the
- * median surface. Footprints are texels per image pixel, so an atlas `k` times larger has `k^2`
- * times as many texels under one pixel: the size that puts one texel under a pixel is the
- * measurement atlas divided by the square root of the measured median footprint.
+ * median surface. The footprint is a length in texels per image pixel (the worse screen axis, A.2),
+ * so a texel matches a pixel when the atlas side is the measurement atlas divided by that footprint:
+ * an atlas `k` times larger has `k` times as many texels along each axis under one pixel.
  *
  * The nearest power of two, not the next one up: rounding up can pick an atlas four times finer than
  * the views resolve (a 4.2K match became 8K on the sample courtyard), which is the wasted texels
  * C.1 forbids. The nearest is within sqrt(2) of the match, so a texel still matches a pixel.
  */
 export function autoAtlasSize(measurementAtlas: number, medianFoot: number): number {
-  const candidate = medianFoot > 0 ? measurementAtlas / Math.sqrt(medianFoot) : measurementAtlas;
+  const candidate = medianFoot > 0 ? measurementAtlas / medianFoot : measurementAtlas;
   const power = 2 ** Math.round(Math.log2(Math.max(candidate, MIN_AUTO_ATLAS)));
   return Math.min(MAX_AUTO_ATLAS, Math.max(MIN_AUTO_ATLAS, power));
 }
@@ -180,6 +187,8 @@ interface BrowserRun {
   readonly cost: number;
   readonly seconds: number;
   readonly coverage: number;
+  /** Share of the texels players can see that the bake painted (B, phase 2d). */
+  readonly visibleCoverage: number;
   readonly stopped?: "structure";
 }
 
@@ -295,6 +304,25 @@ function verifyChoice(request: TextureProjectionRequest): { readonly model: stri
   if (request.verify === false) return { model: null, perView: 0 };
   const model = request.verifyModel?.trim() || DEFAULT_VERIFY_MODEL.id;
   return { model, perView: verifyCostUsd(verifyModelFor(model), request.viewSize ?? 1024) };
+}
+
+/**
+ * What a finished bake wants read before it is used (B, PRD-916 phase 2d): a floor a player still sees
+ * unpainted is the defect the judge saw as white plaster patches, and the number alone does not say so.
+ */
+function bakeWarnings(visibleCoveragePercent: number, run: StoredRun): string[] {
+  const warnings: string[] = [];
+  if (visibleCoveragePercent < VISIBLE_COVERAGE_WARN) {
+    const rejected = run.views.filter((view) => view.rejected !== undefined).length;
+    const bought = run.views.filter((view) => view.price > 0).length;
+    warnings.push(
+      `visible coverage ${visibleCoveragePercent.toFixed(1)}% is under ${VISIBLE_COVERAGE_WARN}%: of the ${bought} views bought, ` +
+        `${rejected} were rejected and the hole pass could not fill what players still see. Those texels continue the` +
+        " material around them (a gap is never a foreign colour), so the level reads as patchy there; a resume with" +
+        " more holes, or a plan whose views see them closer, fills them.",
+    );
+  }
+  return warnings;
 }
 
 async function atomicWrite(path: string, bytes: Uint8Array): Promise<void> {
@@ -664,6 +692,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
         cost: run.cost,
         seconds: run.seconds,
         coverage: painted.coverage,
+        visibleCoverage: await app.call<number>("visibleCoverage"),
       };
     } else if (stored !== undefined) {
       summary = await Promise.race([app.call<BrowserRun>("resume", runId), interrupted]);
@@ -698,6 +727,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     run.updatedAt = new Date().toISOString();
     await writeRun(runRoot, run);
     const measured = await measureBlurredPercent(app, run, measurementAtlas);
+    const visibleCoveragePercent = Math.round(summary.visibleCoverage * 10) / 10;
     return {
       runId,
       level: level.name,
@@ -705,6 +735,8 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       views: summary.views,
       viewsPainted: summary.painted,
       coveragePercent: Math.round(summary.coverage * 100),
+      visibleCoveragePercent,
+      warnings: bakeWarnings(visibleCoveragePercent, run),
       // What this call spent (not rounded: it is money already spent): a resume that only reused
       // stored images reports 0.
       estimatedUsd: summary.cost - priorCost,
@@ -722,6 +754,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
         ).length,
       },
       viewsRepainted: run.views.filter((view) => view.repainted === true).length,
+      viewsBanded: run.views.filter((view) => (view.verify?.bands?.length ?? 0) > 0).length,
       verifyModel: run.options.verify === false ? null : ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id),
     };
   } catch (error) {

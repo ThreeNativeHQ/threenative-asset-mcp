@@ -27,13 +27,13 @@ export interface PlanOptions {
   aerial: number;         // cameras per ring around the level (outer walls, tops of props); up to 2x this are used; 0 = none
   roofs: number;          // max close cameras over the roofs, painted with a roof prompt (0 = none)
   roofDistance: number;   // m from a roof camera to the roof it looks at
-  holes: number;          // max views in the final pass over texels nothing painted (behind props, tops of props)
+  holes: number;          // max extra views the final pass may buy to fill what players can see unpainted (B)
   seed: number;
 }
 
 export const DEFAULT_PLAN: PlanOptions = {
   eyeHeight: 1.65, spacing: 4, fov: 90, yaws: 8, pitchDeg: 6, downYaws: 0, downPitchDeg: -40, maxViews: 36, targetCoverage: 0.97,
-  probeSize: 96, grid: 256, goodRatio: 0.5, goodAbs: 0.12, maxParallel: 1, aerial: 0, roofs: 0, roofDistance: 15, holes: 0, seed: 7,
+  probeSize: 96, grid: 256, goodRatio: 0.5, goodAbs: 0.12, maxParallel: 1, aerial: 0, roofs: 0, roofDistance: 15, holes: 12, seed: 7,
 };
 
 export interface Plan {

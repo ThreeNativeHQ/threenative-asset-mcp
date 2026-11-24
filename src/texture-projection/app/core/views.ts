@@ -29,9 +29,14 @@ export function makeCamera(v: ViewSpec, aspect = 1, near = 0.05, far = 2000): TH
 
 /**
  * Writes per-pixel world position + distance, normal + geometry flag, UV + capture quality, and the
- * view's own footprint: how many atlas texels one image pixel covers here (UV area per pixel times
- * the atlas' texels per unit UV area). That number, not the distance, says whether the atlas can be
- * sharp from this view (see A.2: over ~2x2 texels per pixel is magnification blur).
+ * view's own footprint: how many atlas texels one image pixel covers here, along the worse of the
+ * screen axes (UV length per pixel times the atlas' texels per unit UV). That number, not the
+ * distance, says whether the atlas can be sharp from this view (see A.2: over ~2x2 texels per pixel
+ * is magnification blur).
+ *
+ * The worse axis, not the UV area: a floor at a grazing angle has a huge footprint along one axis and
+ * a normal one along the other, so its area passes a 2x2 guard while its image pixels are smeared into
+ * long streaks (the courtyard's streaked strip beside the steps, PRD-916 phase 2d).
  */
 const GEOMETRY_VERT = /* glsl */ `
 in float label;
@@ -65,11 +70,16 @@ void main() {
   float cosv = dot(n, toCam / dist);
   vec2 uvDx = dFdx(vUv);
   vec2 uvDy = dFdy(vUv);
-  float texelsPerPixel = abs(uvDx.x * uvDy.y - uvDx.y * uvDy.x) * atlasTexels;
+  // Texels per image pixel along each screen axis, and the worse of the two (see this shader's note).
+  float side = sqrt(atlasTexels);
+  vec2 dxTexels = uvDx * side;
+  vec2 dyTexels = uvDy * side;
+  float axisFootprint = max(length(dxTexels), length(dyTexels));
+  float areaFootprint = abs(uvDx.x * uvDy.y - uvDx.y * uvDy.x) * atlasTexels;
   gPos = vec4(vWorld, dist);
   gNrm = vec4(n, vLabel + 1.0);   // a > 0.5 means geometry; a - 1 is the part label
   gUvq = vec4(vUv, cosv / max(dist, 0.5), cosv);
-  gFoot = vec4(texelsPerPixel, sqrt(max(texelsPerPixel, 0.0)), 0.0, 1.0);
+  gFoot = vec4(axisFootprint, areaFootprint, 0.0, 1.0);
 }`;
 
 /** Composites what a view's image model sees: known texels in colour, the rest as lit clay. */

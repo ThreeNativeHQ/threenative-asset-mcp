@@ -42,7 +42,15 @@ const PlanShape = {
   views: z.number().int().min(1).max(96).optional().describe("Maximum number of camera views to plan (default 36)."),
   aerial: z.number().int().min(0).max(24).optional().describe("Aerial ring cameras around the level (default 0)."),
   roofs: z.number().int().min(0).max(24).optional().describe("Close roof passes painted with the roof prompt (default 0)."),
-  holes: z.number().int().min(0).max(24).optional().describe("Extra views over texels nothing painted (default 0)."),
+  holes: z
+    .number()
+    .int()
+    .min(0)
+    .max(24)
+    .optional()
+    .describe(
+      "Extra views over the largest unpainted texels players can see, painted until visible coverage reaches 95% (default 12).",
+    ),
 } as const;
 
 const UvStretchSchema = z
@@ -158,6 +166,12 @@ export const TextureProjectPaintOutputSchema = z
     runId: z.string(),
     outputPath: z.string(),
     coveragePercent: z.number().min(0).max(100),
+    visibleCoveragePercent: z
+      .number()
+      .min(0)
+      .max(100)
+      .describe("Share of the texels player-height cameras see that the bake painted (B)."),
+    warnings: z.array(z.string()).describe("What the run wants read before the bake is used (a visible-coverage shortfall)."),
     viewsPainted: z
       .number()
       .int()
@@ -171,6 +185,11 @@ export const TextureProjectPaintOutputSchema = z
       })
       .strict(),
     viewsRepainted: z.number().int().nonnegative(),
+    viewsBanded: z
+      .number()
+      .int()
+      .nonnegative()
+      .describe("Views whose vision check listed an edge band (a coping, a plinth): projected, and recorded in run.json."),
     verifyModel: z.string().nullable(),
     blurredTexelPercent: z.number().min(0).max(100),
     magnificationSkippedPercent: z.number().min(0).max(100),
@@ -207,7 +226,13 @@ export const TextureProjectInspectOutputSchema = z
     verifyRejected: z
       .array(
         z
-          .object({ index: z.number().int(), added: z.array(z.string()), scaleOk: z.boolean(), verdict: z.string() })
+          .object({
+            index: z.number().int(),
+            added: z.array(z.string()),
+            bands: z.array(z.string()),
+            scaleOk: z.boolean(),
+            verdict: z.string(),
+          })
           .strict(),
       ),
     viewsRepainted: z.number().int().nonnegative(),
@@ -379,9 +404,12 @@ export function createTextureProjectPaintHandler() {
         runId: result.runId,
         outputPath: relative(root, result.outputPath) || basename(result.outputPath),
         coveragePercent: result.coveragePercent,
+        visibleCoveragePercent: result.visibleCoveragePercent,
+        warnings: result.warnings,
         viewsPainted: result.viewsPainted,
         viewsRejected: result.viewsRejected,
         viewsRepainted: result.viewsRepainted,
+        viewsBanded: result.viewsBanded,
         verifyModel: result.verifyModel,
         blurredTexelPercent: result.blurredTexelPercent,
         magnificationSkippedPercent: result.magnificationSkippedPercent,
@@ -488,6 +516,7 @@ export function createTextureProjectInspectHandler() {
             .map((view) => ({
               index: view.index,
               added: [...(view.verify?.added ?? [])],
+              bands: [...(view.verify?.bands ?? [])],
               scaleOk: view.verify?.scaleOk ?? false,
               verdict: view.verify?.verdict ?? "unparsed",
             })),

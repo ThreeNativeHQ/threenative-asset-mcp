@@ -9,7 +9,13 @@ import { Document, NodeIO } from "@gltf-transform/core";
 import sharp from "sharp";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { ATLAS_GUTTER_TEXELS, infillUnpainted } from "../src/texture-projection/atlas-pixels.js";
+import {
+  ATLAS_GUTTER_TEXELS,
+  cropRgba,
+  inpaintUnpainted,
+  paintedWindow,
+  pushPull,
+} from "../src/texture-projection/atlas-pixels.js";
 import {
   STRUCTURE_DEVIATION_LIMIT,
   lowFrequencyLuminance,
@@ -27,7 +33,12 @@ import {
   forwardChatRequest,
   forwardImageRequest,
 } from "../src/texture-projection/openrouter-proxy.js";
-import { DEFAULT_VERIFY_MODEL, parseVerifyAnswer, verifyPrompt } from "../src/texture-projection/verify.js";
+import {
+  DEFAULT_VERIFY_MODEL,
+  parseVerifyAnswer,
+  structuresOutOfSurface,
+  verifyPrompt,
+} from "../src/texture-projection/verify.js";
 import {
   MAX_AUTO_ATLAS,
   TextureProjectionError,
@@ -231,6 +242,36 @@ describe("texture-projection OpenRouter proxy", () => {
     expect(sent.body).not.toHaveProperty("style_image");
   });
 
+  it("adds an accepted-paint crop as a reference with a keep-these-materials instruction (C, phase 2d)", async () => {
+    const stub = await startOpenRouterStub(pngBase64);
+    const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+    const crop = "data:image/jpeg;base64,QUNGRVBUQUc=";
+    const response = await forwardImageRequest(
+      {
+        model: "black-forest-labs/flux-3-image-klein",
+        prompt: "A photo of stone walls",
+        input_references: sampleReference(),
+        consistency_image: crop,
+      },
+      { env },
+    );
+    expect(response.status).toBe(200);
+    const sent = stub.requests[0]!;
+    const references = sent.body["input_references"] as { image_url: { url: string } }[];
+    expect(references).toHaveLength(2);
+    expect(references[1]?.image_url.url).toBe(crop);
+    // The instruction names the three things that broke the seam: material, block size, coursing.
+    expect(sent.body["prompt"]).toContain("keep exactly its materials");
+    expect(sent.body["prompt"]).toContain("coursing");
+    expect(sent.body).not.toHaveProperty("consistency_image");
+    // A crop that is not a data URL is refused, like the style image.
+    const bad = await forwardImageRequest(
+      { model: "m", prompt: "p", input_references: sampleReference(), consistency_image: "https://example.com/x.png" },
+      { env },
+    );
+    expect(bad.status).toBe(400);
+  });
+
   it("fails closed with TEXTURE_PROJECT_MISSING_API_KEY when no key is set", async () => {
     const stub = await startOpenRouterStub(pngBase64);
     const response = await forwardImageRequest(
@@ -355,9 +396,10 @@ describe("texture-projection runner", () => {
       const large = await quoteAt(512);
       expect(small.atlas).toBe(4096);
       expect(large.atlas).toBe(4096);
-      // At half the view size one image pixel covers four times the atlas area, so many more texels
-      // are magnification-blurred: the measurement has to follow the view size it was given.
-      expect(small.estimatedBlurredTexelPercent).toBeGreaterThan(large.estimatedBlurredTexelPercent * 2 + 5);
+      // At half the view size one image pixel covers twice as many texels along each axis (the guard's
+      // footprint is a length, A.2), so many more texels are magnification-blurred: the measurement has
+      // to follow the view size it was given.
+      expect(small.estimatedBlurredTexelPercent).toBeGreaterThan(large.estimatedBlurredTexelPercent + 10);
     },
     180_000,
   );
@@ -391,6 +433,25 @@ describe("texture-projection runner", () => {
       expect(stub.requests.length).toBe(result.viewsPainted);
       // No chat request either: verify:false buys images and nothing else.
       expect(stub.requests.every((sent) => Array.isArray(sent.body["input_references"]))).toBe(true);
+      // Later views get the accepted paint of the same surface as a material reference (C, phase 2d):
+      // one extra image reference plus the instruction to keep its materials and coursing. The very
+      // first view has none to copy yet.
+      const referencesOf = (sent: { body: Record<string, unknown> }) =>
+        sent.body["input_references"] as { image_url: { url: string } }[];
+      expect(referencesOf(stub.requests[0]!)).toHaveLength(1);
+      expect(stub.requests[0]?.body["prompt"]).not.toContain("keep exactly its materials");
+      const consistent = stub.requests.slice(1).find((sent) => referencesOf(sent).length === 2);
+      expect(consistent).toBeDefined();
+      expect(consistent?.body["prompt"]).toContain("keep exactly its materials");
+      expect(referencesOf(consistent!)[1]?.image_url.url.startsWith("data:image/jpeg;base64,")).toBe(true);
+      // B: how much of what a player sees the bake actually painted, and the warning rule that goes with it.
+      expect(result.visibleCoveragePercent).toBeGreaterThan(0);
+      expect(result.visibleCoveragePercent).toBeLessThanOrEqual(100);
+      if (result.visibleCoveragePercent < 90) {
+        expect(result.warnings.join(" ")).toContain("visible coverage");
+      } else {
+        expect(result.warnings).toEqual([]);
+      }
       const references = stub.requests[0]?.body["input_references"] as
         | { type: string; image_url: { url: string } }[]
         | undefined;
@@ -791,7 +852,24 @@ describe("texture-projection vision check (2c)", () => {
     const prompt = verifyPrompt({ cameraHeightM: 1.65, centreDistanceM: 9.34, kind: "ground" });
     expect(prompt).toContain("1.6 m above the ground");
     expect(prompt).toContain("9.3 m away");
-    for (const word of ["pillar", "buttress", "roof tiles", "terracotta", "arch", "doorway", "chimney"]) {
+    // Phase 2d: the species the 2c check let through are named, and the wall top is compared.
+    for (const word of [
+      "buttress",
+      "pilaster",
+      "quoin",
+      "coping",
+      "capstone",
+      "cornice",
+      "plinth",
+      "relief",
+      "roof tiles",
+      "terracotta",
+      "arch",
+      "doorway",
+      "chimney",
+      "TOP EDGE",
+      "SILHOUETTE",
+    ]) {
       expect(prompt).toContain(word);
     }
     expect(prompt).toContain('"added"');
@@ -868,6 +946,29 @@ describe("texture-projection vision check (2c)", () => {
         '{"added": [{"what": "a ruined stone pillar", "outOfSurface": true}], "scaleOk": true}\nimage"}',
       ).added,
     ).toEqual(["a ruined stone pillar"]);
+    // An edge band alone is recorded, not a rejection (phase 2d): every wall top in the courtyard's clay
+    // is a plain edge and both image models paint a coping along it in nearly every view, so refusing
+    // those views empties the bake. Structure that stands out of a surface still rejects.
+    const band = parseVerifyAnswer(
+      '{"added": [{"what": "a coping strip along the top of the left wall", "outOfSurface": true}, ' +
+        '{"what": "a base course along the bottom of the wall", "outOfSurface": true}], "scaleOk": true}',
+    );
+    expect(band.verdict).toBe("ok");
+    expect(band.bands).toEqual([
+      "a coping strip along the top of the left wall",
+      "a base course along the bottom of the wall",
+    ]);
+    expect(structuresOutOfSurface(band.added)).toEqual([]);
+    // A vertical strip with its own coursing (the pilaster the judge saw) is not a band: it rejects.
+    const pilaster = parseVerifyAnswer(
+      '{"added": [{"what": "a coping strip along the top of the wall", "outOfSurface": true}, ' +
+        '{"what": "a vertical strip with its own coursing on the flat wall, right of centre", "outOfSurface": true}], ' +
+        '"scaleOk": true}',
+    );
+    expect(pilaster.verdict).toBe("rejected");
+    expect(structuresOutOfSurface(pilaster.added)).toEqual([
+      "a vertical strip with its own coursing on the flat wall, right of centre",
+    ]);
     // Impossible detail sizes are a rejection on their own.
     expect(parseVerifyAnswer('{"added": [], "scaleOk": false}')).toMatchObject({ verdict: "rejected", scaleOk: false });
     for (const bad of [
@@ -1020,18 +1121,19 @@ describe("texture-projection vision check (2c)", () => {
 
 describe("texture-projection atlas choice (C.1)", () => {
   it("picks the power of two that matches the measured footprint, without wasting texels", () => {
-    // One texel per image pixel already: keep the measurement atlas.
+    // The footprint is texels per image pixel along the worse screen axis (A.2), a length: one texel
+    // per pixel already keeps the measurement atlas.
     expect(autoAtlasSize(1024, 1)).toBe(1024);
-    // Four texels per pixel (the views resolve half the linear size): a 512 atlas matches.
-    expect(autoAtlasSize(1024, 4)).toBe(512);
-    // A pixel covers a quarter texel: the views resolve twice the linear size, so 2048 matches.
-    expect(autoAtlasSize(1024, 0.25)).toBe(2048);
-    expect(autoAtlasSize(1024, 0.0625)).toBe(4096);
-    // Never above 8K, never below 512.
+    // Two texels per pixel (the views resolve half the linear size): a 512 atlas matches.
+    expect(autoAtlasSize(1024, 2)).toBe(512);
+    // A pixel covers half a texel: the views resolve twice the linear size, so 2048 matches.
+    expect(autoAtlasSize(1024, 0.5)).toBe(2048);
+    expect(autoAtlasSize(1024, 0.25)).toBe(4096);
+    // Never above 4K, never below 512.
     expect(autoAtlasSize(1024, 1e-9)).toBe(4096);
     expect(autoAtlasSize(1024, 1e9)).toBe(512);
     // A 4.2K match must not become an 8K atlas: the nearest power of two, not the next one up.
-    expect(autoAtlasSize(1024, 0.0573)).toBe(4096);
+    expect(autoAtlasSize(1024, 0.239)).toBe(4096);
   });
 });
 
@@ -1131,18 +1233,83 @@ async function writeStretchedGlb(path: string): Promise<void> {
   await new NodeIO().write(path, document);
 }
 
-describe("texture-projection atlas infill (C.2)", () => {
-  it("fills never-painted texels with the atlas mean colour and keeps at least an 8 px gutter", () => {
-    // Two painted texels, two unpainted ones that would otherwise export as clay gray or black.
-    const data = new Uint8ClampedArray([
-      100, 50, 10, 255,
-      200, 150, 110, 255,
-      0, 0, 0, 0,
-      0, 0, 0, 0,
-    ]);
-    infillUnpainted(data);
-    expect(Array.from(data.subarray(8))).toEqual([150, 100, 60, 255, 150, 100, 60, 255]);
+describe("texture-projection atlas infill (A, phase 2d)", () => {
+  /** RGBA atlas with `rgb` painted into every texel where `mask` is 1, and nothing (alpha 0) elsewhere. */
+  function atlasOf(size: number, mask: (x: number, y: number) => [number, number, number] | undefined) {
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size).fill(1);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const colour = mask(x, y);
+        if (colour === undefined) continue;
+        const p = 4 * (y * size + x);
+        data[p] = colour[0];
+        data[p + 1] = colour[1];
+        data[p + 2] = colour[2];
+        data[p + 3] = 255;
+      }
+    }
+    return { data, islands };
+  }
+
+  it("continues the material in a gap between two cobble patches instead of the atlas mean", () => {
+    const size = 32;
+    // Cobbles all around a 6 px gap in the middle, and a bright plaster block in one corner: the atlas
+    // mean is a pale plaster-ish tone, so a global-mean fill is exactly the white patch the judge saw
+    // between cobbles.
+    const cobble: [number, number, number] = [92, 70, 48];
+    const plaster: [number, number, number] = [240, 236, 220];
+    const gap = (x: number, y: number) => x >= 13 && x < 19 && y >= 13 && y < 19;
+    const corner = (x: number, y: number) => x >= 24 && y >= 24;
+    const { data, islands } = atlasOf(size, (x, y) => (gap(x, y) ? undefined : corner(x, y) ? plaster : cobble));
+    const mean = [(cobble[0] + plaster[0]) / 2, (cobble[1] + plaster[1]) / 2, (cobble[2] + plaster[2]) / 2];
+    const report = inpaintUnpainted(data, islands, size);
+    for (const [x, y] of [[15, 15], [16, 16], [17, 14], [14, 17]] as const) {
+      const p = 4 * (y * size + x);
+      const filled = [data[p]!, data[p + 1]!, data[p + 2]!];
+      const toCobble = Math.hypot(...filled.map((v, c) => v - cobble[c]!));
+      const toMean = Math.hypot(...filled.map((v, c) => v - mean[c]!));
+      // The gap continues the cobbles around it, and is nothing like the atlas' mean colour.
+      expect(data[p + 3]).toBe(255);
+      expect(toCobble).toBeLessThan(28);
+      expect(toMean).toBeGreaterThan(toCobble);
+    }
+    expect(report.unpaintedPercent).toBeGreaterThan(0);
     expect(ATLAS_GUTTER_TEXELS).toBeGreaterThanOrEqual(8);
+  });
+
+  it("fills a whole unpainted island from the islands around it and keeps every texel opaque", () => {
+    const size = 8;
+    const { data, islands } = atlasOf(size, (x, y) => (x < 4 ? [40, 80, 40] : undefined));
+    const report = inpaintUnpainted(data, islands, size);
+    for (let i = 0; i < size * size; i++) expect(data[4 * i + 3]).toBe(255);
+    expect(report.unpaintedPercent).toBe(50);
+  });
+
+  it("pushes known values into everything unknown, from the neighbours outward", () => {
+    // One known pixel in a 4x4 grid: every value is that pixel's, whatever the pyramid level reads it at.
+    const w = 4;
+    const val = new Float32Array(w * w * 3);
+    const wt = new Float32Array(w * w);
+    val.set([10, 20, 30], 0);
+    wt[0] = 1;
+    const field = pushPull(val, wt, w, w);
+    expect(Array.from(field.subarray(3, 6))).toEqual([10, 20, 30]);
+    expect(Array.from(field.subarray(3 * 15, 3 * 15 + 3))).toEqual([10, 20, 30]);
+  });
+});
+
+describe("texture-projection consistency reference (C, phase 2d)", () => {
+  it("takes the crop of a view that is most of already-accepted texture", () => {
+    // 8x8 view, accepted paint only in the bottom-right 4x4: the window must land there, not on the clay.
+    const known = new Uint8Array(64);
+    for (let y = 4; y < 8; y++) for (let x = 4; x < 8; x++) known[y * 8 + x] = 1;
+    expect(paintedWindow(known, 8, 8, 4)).toEqual({ x: 4, y: 4 });
+    const image = new Uint8ClampedArray(64 * 4);
+    for (let i = 0; i < 64; i++) image[4 * i] = i;
+    const crop = cropRgba(image, 8, 8, 4, 4, 4);
+    expect(crop).toHaveLength(64);
+    expect(crop[0]).toBe(4 * 8 + 4);
   });
 });
 

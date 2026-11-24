@@ -39,6 +39,8 @@ export interface EditInput {
   imageUrl: string;
   prompt: PromptContext;
   seed: number;
+  /** Data URL of already-accepted texture of the same surface: its materials must be kept (C, phase 2d). */
+  consistency?: string;
 }
 
 export interface ImageReference {
@@ -55,6 +57,8 @@ export interface ImageRequest {
   input_references: ImageReference[];
   /** Optional style image (data URL); the proxy appends it as a second reference. Never sent as-is. */
   style_image?: string;
+  /** Optional consistency crop (data URL); the proxy appends it with a keep-these-materials instruction. */
+  consistency_image?: string;
 }
 
 export interface EditModel {
@@ -120,7 +124,15 @@ function avoid(c: PromptContext): string {
 export const SURFACE_ONLY_CONSTRAINT =
   " Paint surface materials only. Keep every edge, opening and silhouette of the clay image exactly;" +
   " add no doors, windows, arches, passages, openings, stairs, people, plants or objects that are not in the clay image," +
-  " and no roof, roof tiles, tile band, coping or chimney above a wall top: every wall top stays the flat edge it is in the clay.";
+  " and no roof, roof tiles, tile band, coping or chimney above a wall top: every wall top stays the flat edge it is in the clay." +
+  // Phase 2d: the 2c run's paintings gave almost every wall a grey coping slab along its top (and many a
+  // plinth at the base), which the vision check then had to reject. A negative list alone did not stop it
+  // (a repaint that said "do not paint a coping strip along the top of the wall" painted one anyway), so
+  // the wall top is named as the shape it is: the wall's own top face, painted with the wall's own stone.
+  " The thin strip along the top of a wall is that wall's own top face: paint it with the same stone, the" +
+  " same coursing and the same tone as the wall below it, so the wall continues to its edge. Do not add a" +
+  " capstone, coping, cornice, moulding, ledge, plinth, base course, quoin or pilaster on, along or beside" +
+  " any edge, and no band of a different tone along a wall top or a wall base.";
 
 /** A roof pass is the one prompt that may paint a roof: it gets the constraint without the roof clause. */
 export const ROOF_PASS_CONSTRAINT =
@@ -161,6 +173,20 @@ export const prompts = {
 export const STYLE_INSTRUCTION =
   " Take the materials, colours and wear from the second image only; the camera, shapes and layout come from the first image.";
 
+/**
+ * Added to the prompt when already-accepted texture of the same surface rides along (C, PRD-916 phase 2d).
+ *
+ * Different views of one flat wall used to pick different materials (an ashlar wall became smooth stucco
+ * at a vertical seam, and block courses missed each other across it), because each request saw only the
+ * clay plus whatever a previous view had painted in *its* pixels. A crop of the accepted paint makes the
+ * surface's material explicit. The wording never indexes the reference (a style image may ride along
+ * too), and it names the three things that visibly broke the seam: material, block size, coursing.
+ */
+export const CONSISTENCY_INSTRUCTION =
+  " The already-accepted texture of this same surface rides along as a material reference: keep exactly its materials," +
+  " its block and stone sizes and its coursing, continuing the same courses across this view; do not change the material" +
+  " or the scale of the blocks anywhere this surface appears.";
+
 function openRouterModel(key: string, label: string, id: string, price: number): EditModel {
   return {
     key,
@@ -173,6 +199,7 @@ function openRouterModel(key: string, label: string, id: string, price: number):
       aspect_ratio: "1:1",
       seed: i.seed,
       input_references: [{ type: "image_url", image_url: { url: i.imageUrl } }],
+      ...(i.consistency === undefined ? {} : { consistency_image: i.consistency }),
     }),
   };
 }

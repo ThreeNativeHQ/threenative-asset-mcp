@@ -1,6 +1,10 @@
 /**
  * CPU image utilities for one view (top-down RGBA8, square or not). Pure functions, unit-tested.
+ *
+ * Push-pull and the crop helpers live in ../../atlas-pixels.ts with the rest of the shared pixel rules:
+ * this module is browser-only code (the node build compiles its shared imports with stricter flags).
  */
+import { pushPull } from "../../atlas-pixels.js";
 
 export interface ViewMasks {
   /** 1 where the pixel shows level geometry (0 = sky/background). */
@@ -209,57 +213,6 @@ export function maskedBlur(src: Uint8ClampedArray, mask: Uint8Array, w: number, 
     for (let c = 0; c < 3; c++) n2[3 * i + c] = d ? n2[3 * i + c] / d : 0;
   }
   return n2;
-}
-
-/**
- * Push-pull interpolation: values known where `wt` > 0 spread smoothly into everything else (a cheap stand-in for
- * a membrane / Poisson fill). RGB float in, RGB float out.
- */
-export function pushPull(val: Float32Array, wt: Float32Array, w: number, h: number): Float32Array {
-  type L = { v: Float32Array; a: Float32Array; w: number; h: number };
-  const levels: L[] = [{ v: val.slice(), a: wt.slice(), w, h }];
-  while (levels[levels.length - 1].w > 1 || levels[levels.length - 1].h > 1) {
-    const F = levels[levels.length - 1];
-    const cw = Math.max(1, Math.ceil(F.w / 2)), ch = Math.max(1, Math.ceil(F.h / 2));
-    const v = new Float32Array(cw * ch * 3), a = new Float32Array(cw * ch);
-    for (let y = 0; y < ch; y++) {
-      for (let x = 0; x < cw; x++) {
-        let s0 = 0, s1 = 0, s2 = 0, sa = 0;
-        for (let dy = 0; dy < 2; dy++) {
-          for (let dx = 0; dx < 2; dx++) {
-            const fx = 2 * x + dx, fy = 2 * y + dy;
-            if (fx >= F.w || fy >= F.h) continue;
-            const j = fy * F.w + fx, wj = F.a[j];
-            s0 += F.v[3 * j] * wj; s1 += F.v[3 * j + 1] * wj; s2 += F.v[3 * j + 2] * wj; sa += wj;
-          }
-        }
-        const k = y * cw + x;
-        if (sa > 0) { v[3 * k] = s0 / sa; v[3 * k + 1] = s1 / sa; v[3 * k + 2] = s2 / sa; }
-        a[k] = Math.min(1, sa);
-      }
-    }
-    levels.push({ v, a, w: cw, h: ch });
-  }
-  for (let li = levels.length - 2; li >= 0; li--) {
-    const F = levels[li], C = levels[li + 1];
-    for (let y = 0; y < F.h; y++) {
-      const cy = Math.min(C.h - 1, Math.max(0, (y + 0.5) / 2 - 0.5));
-      const y0 = Math.floor(cy), y1 = Math.min(C.h - 1, y0 + 1), fy = cy - y0;
-      for (let x = 0; x < F.w; x++) {
-        const cx = Math.min(C.w - 1, Math.max(0, (x + 0.5) / 2 - 0.5));
-        const x0 = Math.floor(cx), x1 = Math.min(C.w - 1, x0 + 1), fx = cx - x0;
-        const j = y * F.w + x, a = F.a[j];
-        if (a >= 1) continue;
-        for (let c = 0; c < 3; c++) {
-          const top = C.v[3 * (y0 * C.w + x0) + c] * (1 - fx) + C.v[3 * (y0 * C.w + x1) + c] * fx;
-          const bot = C.v[3 * (y1 * C.w + x0) + c] * (1 - fx) + C.v[3 * (y1 * C.w + x1) + c] * fx;
-          F.v[3 * j + c] = a * F.v[3 * j + c] + (1 - a) * (top * (1 - fy) + bot * fy);
-        }
-        F.a[j] = 1;
-      }
-    }
-  }
-  return levels[0].v;
 }
 
 /**

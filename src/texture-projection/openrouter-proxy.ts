@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { STYLE_INSTRUCTION } from "./models.js";
+import { CONSISTENCY_INSTRUCTION, STYLE_INSTRUCTION } from "./models.js";
 
 /** The proxy the app posts to; the key is read here, server-side, and never handed to the browser. */
 export const OPENROUTER_IMAGES_PATH = "/api/openrouter/images";
@@ -22,6 +22,7 @@ const ImageRequestSchema = z.object({
   seed: z.number().int().optional(),
   input_references: z.array(ReferenceSchema).min(1),
   style_image: z.string().min(1).optional(),
+  consistency_image: z.string().min(1).optional(),
 });
 
 export type ImageRequestBody = z.infer<typeof ImageRequestSchema>;
@@ -84,6 +85,13 @@ export async function forwardImageRequest(body: unknown, options: ProxyOptions =
     references.push({ type: "image_url", image_url: { url: request.style_image } });
     prompt += STYLE_INSTRUCTION;
   }
+  if (request.consistency_image !== undefined) {
+    if (!DATA_URL.test(request.consistency_image)) {
+      return jsonResponse(400, BAD_REQUEST_CODE, "consistency_image must be a base64 data URL of a PNG or JPEG");
+    }
+    references.push({ type: "image_url", image_url: { url: request.consistency_image } });
+    prompt += CONSISTENCY_INSTRUCTION;
+  }
   const payload = {
     model: request.model,
     prompt,
@@ -118,7 +126,10 @@ export async function forwardChatRequest(body: unknown, options: ProxyOptions = 
     model: request.model,
     temperature: 0,
     // Up to six named structures with a where-clause each: a longer answer is a summary, not a verdict.
-    max_tokens: 800,
+    // Room for a reasoning model's own tokens as well: at 800 a reasoning check (gemini-2.5-pro measured
+    // on the 2d calibration) spent the whole budget thinking and returned an empty answer, which the
+    // parser reads as unparsed and the pipeline as a rejection.
+    max_tokens: 2_000,
     response_format: { type: "json_object" },
     messages: [
       {
