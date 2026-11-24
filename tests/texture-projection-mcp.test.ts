@@ -298,12 +298,14 @@ describe("texture projection MCP tools", () => {
         resumeRunId: interruptedRunId,
       });
       expect(resumed.result.isError).toBeFalsy();
-      expect(stub.requests.length - requestsBeforeResume).toBe(structured(resumed)["viewsPainted"]);
       const finished = JSON.parse(
         await readFile(join(project, ".threenative", "texture-projection", interruptedRunId, "run.json"), "utf8"),
       ) as { complete: boolean; views: unknown[] };
       expect(finished.complete).toBe(true);
       expect(finished.views.length).toBeGreaterThan(1);
+      // Only the views without a stored image were bought; the stored one was reused (and projected).
+      expect(stub.requests.length - requestsBeforeResume).toBe(finished.views.length - 1);
+      expect(structured(resumed)["viewsPainted"]).toBe(finished.views.length);
 
       // inspect returns the contact sheet as an image block and flags the project's cook settings.
       const inspected = await callTool(server, "texture_project_inspect", { runId: run["runId"] });

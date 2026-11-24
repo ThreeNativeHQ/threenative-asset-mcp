@@ -10,12 +10,19 @@ import sharp from "sharp";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { ATLAS_GUTTER_TEXELS, infillUnpainted } from "../src/texture-projection/atlas-pixels.js";
-import { lowFrequencyLuminance, rejectsStructure, structureDeviation } from "../src/texture-projection/app/core/structure.js";
+import {
+  STRUCTURE_DEVIATION_LIMIT,
+  lowFrequencyLuminance,
+  rejectsStructure,
+  structureDeviation,
+} from "../src/texture-projection/app/core/structure.js";
 import { auditCookConfig } from "../src/texture-projection/config-audit.js";
+import { cookConfigHint } from "../src/tools/texture-projection.js";
 import { markProjectedAtlas, readProjectedAtlasMarker } from "../src/texture-projection/glb-marker.js";
 import { MODEL_ALIASES, DEFAULT_MODEL, resolveModel } from "../src/texture-projection/models.js";
 import { MISSING_API_KEY_CODE, forwardImageRequest } from "../src/texture-projection/openrouter-proxy.js";
 import {
+  MAX_AUTO_ATLAS,
   TextureProjectionError,
   autoAtlasSize,
   paintTextureProjection,
@@ -93,6 +100,47 @@ async function rejection(promise: Promise<unknown>): Promise<unknown> {
 function expectTextureProjectionError(error: unknown, code: string): void {
   expect(error).toBeInstanceOf(TextureProjectionError);
   expect((error as TextureProjectionError).code).toBe(code);
+}
+
+/** A closed room: floor plus four walls, one flat clay surface per face (a deterministic wall to paint). */
+async function writeRoomGlb(path: string, half = 10, height = 8): Promise<void> {
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const quad = (name: string, corners: [number, number, number][]) => {
+    const position = document
+      .createAccessor()
+      .setType("VEC3")
+      .setArray(new Float32Array(corners.flat()))
+      .setBuffer(buffer);
+    const uv = document
+      .createAccessor()
+      .setType("VEC2")
+      .setArray(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]))
+      .setBuffer(buffer);
+    const indices = document
+      .createAccessor()
+      .setType("SCALAR")
+      .setArray(new Uint16Array([0, 1, 2, 0, 2, 3]))
+      .setBuffer(buffer);
+    const primitive = document
+      .createPrimitive()
+      .setAttribute("POSITION", position)
+      .setAttribute("TEXCOORD_0", uv)
+      .setIndices(indices)
+      .setMaterial(document.createMaterial(name));
+    return document.createMesh(name).addPrimitive(primitive);
+  };
+  const h = half;
+  const meshes = [
+    quad("floor", [[-h, 0, -h], [-h, 0, h], [h, 0, h], [h, 0, -h]]),
+    quad("north", [[-h, 0, -h], [h, 0, -h], [h, height, -h], [-h, height, -h]]),
+    quad("south", [[h, 0, h], [-h, 0, h], [-h, height, h], [h, height, h]]),
+    quad("west", [[-h, 0, h], [-h, 0, -h], [-h, height, -h], [-h, height, h]]),
+    quad("east", [[h, 0, -h], [h, 0, h], [h, height, h], [h, height, -h]]),
+  ];
+  const scene = document.createScene("room");
+  for (const mesh of meshes) scene.addChild(document.createNode(mesh.getName()).setMesh(mesh));
+  await new NodeIO().write(path, document);
 }
 
 describe("texture-projection model aliases", () => {
@@ -233,8 +281,53 @@ describe("texture-projection runner", () => {
       expect(quote.model).toBe("or-klein");
       expect(quote.views).toBeGreaterThan(0);
       expect(quote.estimatedUsd).toBeGreaterThan(0);
-      expect(quote.estimatedUsd).toBeCloseTo((quote.views + quote.holes) * 0.009, 6);
+      // The estimate is the painted views at the model's price, rounded to cents.
+      expect(quote.estimatedUsd).toBeCloseTo(Math.round((quote.views + quote.holes) * 0.009 * 100) / 100, 6);
       expect(stub.requests).toHaveLength(0);
+    },
+    180_000,
+  );
+
+  it(
+    "plans no more views than the caller asked for, aerial ring included, and prices them in cents",
+    async () => {
+      const cwd = await scratchDir("quote-budget");
+      const quote = await quoteTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: {},
+        plan: { maxViews: 12, aerial: 3, roofs: 0, holes: 4, spacing: 6 },
+      });
+      // The caller's view budget is the total: 3 aerial views leave at most 9 player views.
+      expect(quote.views).toBeLessThanOrEqual(12);
+      expect(quote.aerial).toBeLessThanOrEqual(3);
+      expect(quote.aerial).toBeGreaterThan(0);
+      // One price per image actually painted, rounded to cents.
+      expect(quote.estimatedUsd).toBe(Math.round((quote.views + quote.holes) * 0.009 * 100) / 100);
+    },
+    180_000,
+  );
+
+  it(
+    "measures blur against the view image size, not only the atlas",
+    async () => {
+      const cwd = await scratchDir("quote-viewsize");
+      const quoteAt = (viewSize: number) =>
+        quoteTextureProjection({
+          levelPath: LEVEL,
+          cwd,
+          env: {},
+          atlas: 4096,
+          viewSize,
+          plan: { maxViews: 4, aerial: 0, roofs: 0, holes: 0, spacing: 6 },
+        });
+      const small = await quoteAt(256);
+      const large = await quoteAt(512);
+      expect(small.atlas).toBe(4096);
+      expect(large.atlas).toBe(4096);
+      // At half the view size one image pixel covers four times the atlas area, so many more texels
+      // are magnification-blurred: the measurement has to follow the view size it was given.
+      expect(small.estimatedBlurredTexelPercent).toBeGreaterThan(large.estimatedBlurredTexelPercent * 2 + 5);
     },
     180_000,
   );
@@ -302,39 +395,122 @@ describe("texture-projection runner", () => {
   );
 
   it(
-    "rejects a view that paints an arch the level does not have and projects nothing",
+    "stops buying after three invented-geometry views and keeps their images for a resume",
     async () => {
       const cwd = await scratchDir("structure");
+      // A closed room where the arch the stub paints lands on a wall in every view.
+      const room = join(cwd, "room.glb");
+      await writeRoomGlb(room);
       const stub = await startOpenRouterStub(pngBase64, { paint: "arch" });
-      const outputPath = join(cwd, "assets", "courtyard_textured.glb");
-      const result = await paintTextureProjection({
-        levelPath: LEVEL,
-        cwd,
-        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
-        plan: PLAN,
-        atlas: 256,
-        viewSize: 128,
-        runId: "arch-run",
-        outputPath,
-      });
-
-      // Every bought view invented a dark arch, so none of them reached the atlas.
-      expect(stub.requests.length).toBeGreaterThan(0);
-      expect(result.viewsPainted).toBe(0);
-      expect(result.viewsRejected.structure).toBe(stub.requests.length);
-      expect(result.coveragePercent).toBe(0);
+      const outputPath = join(cwd, "assets", "room_textured.glb");
+      const error = await rejection(
+        paintTextureProjection({
+          levelPath: room,
+          cwd,
+          env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+          plan: { maxViews: 6, aerial: 0, roofs: 0, holes: 0, spacing: 4 },
+          atlas: 256,
+          viewSize: 128,
+          runId: "arch-run",
+          outputPath,
+        }),
+      );
+      // The check fails closed: three rejected first views stop the run instead of buying six.
+      expectTextureProjectionError(error, "TEXTURE_PROJECT_STRUCTURE_REJECTED");
+      expect((error as Error).message).toContain("arch-run");
+      expect((error as Error).message).toContain("resumeRunId");
+      expect(stub.requests).toHaveLength(3);
       const run = JSON.parse(
         await readFile(join(cwd, ".threenative", "texture-projection", "arch-run", "run.json"), "utf8"),
       ) as StoredRun;
-      expect(run.views.filter((view) => view.rejected === "structure")).toHaveLength(stub.requests.length);
+      expect(run.complete).toBe(false);
+      expect(run.views.filter((view) => view.rejected === "structure")).toHaveLength(3);
       for (const view of run.views) {
-        expect(view.structureDeviation).toBeGreaterThan(0.05);
-        // Rejected views keep their images for the contact sheet, so the reason stays checkable.
+        expect(view.structureDeviation).toBeGreaterThan(0.2);
+        // Rejected views keep their images for the contact sheet and for a resume, so the reason stays checkable.
         expect(existsSync(join(cwd, ".threenative", "texture-projection", "arch-run", `view_${view.index}_gen.png`))).toBe(true);
       }
-      expect(existsSync(outputPath)).toBe(true);
+      // Nothing was baked, so no GLB was written over the caller's path.
+      expect(existsSync(outputPath)).toBe(false);
     },
     240_000,
+  );
+
+  it(
+    "fails closed with TEXTURE_PROJECT_NO_COVERAGE when no view reaches the atlas",
+    async () => {
+      const cwd = await scratchDir("no-coverage");
+      const room = join(cwd, "room.glb");
+      await writeRoomGlb(room);
+      const stub = await startOpenRouterStub(pngBase64, { paint: "arch" });
+      // One view only: the three-view structure stop cannot fire, so the run ends with nothing projected.
+      const error = await rejection(
+        paintTextureProjection({
+          levelPath: room,
+          cwd,
+          env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+          plan: { maxViews: 1, aerial: 0, roofs: 0, holes: 0, spacing: 4 },
+          atlas: 256,
+          viewSize: 128,
+          runId: "no-coverage-run",
+          outputPath: join(cwd, "assets", "room_textured.glb"),
+        }),
+      );
+      expectTextureProjectionError(error, "TEXTURE_PROJECT_NO_COVERAGE");
+      expect((error as Error).message).toContain("no-coverage-run");
+      expect(stub.requests.length).toBe(1);
+      // The paid view is on disk and run.json names it, so a resume can reuse it.
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "no-coverage-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views).toHaveLength(1);
+      expect(existsSync(join(cwd, ".threenative", "texture-projection", "no-coverage-run", "view_0_gen.png"))).toBe(true);
+    },
+    240_000,
+  );
+
+  it(
+    "resumes from stored generations alone: no image on disk is ever bought twice",
+    async () => {
+      const cwd = await scratchDir("resume-reuse");
+      const stub = await startOpenRouterStub(pngBase64);
+      const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+      const first = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env,
+        plan: { ...PLAN, maxViews: 2 },
+        atlas: 256,
+        viewSize: 128,
+        runId: "reuse-run",
+        outputPath: join(cwd, "assets", "first.glb"),
+      });
+      expect(first.viewsPainted).toBeGreaterThan(0);
+      const bought = stub.requests.length;
+      expect(bought).toBe(first.viewsPainted);
+
+      // The provider is gone: a resume that would request anything fails here, and the run is bought out.
+      await stub.close();
+      const resumed = await paintTextureProjection({
+        resumeRunId: "reuse-run",
+        cwd,
+        env,
+        outputPath: join(cwd, "assets", "resumed.glb"),
+      });
+      expect(resumed.viewsPainted).toBe(bought);
+      expect(resumed.coveragePercent).toBeGreaterThan(0);
+      expect(resumed.viewsRejected.structure).toBe(0);
+      // Nothing was bought on the resume, so it reports no spend (the run's own cost is in run.json).
+      expect(resumed.estimatedUsd).toBe(0);
+      expect(stub.requests).toHaveLength(bought);
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "reuse-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.complete).toBe(true);
+      expect(run.views.filter((view) => view.rejected !== undefined)).toHaveLength(0);
+      expect(existsSync(join(cwd, "assets", "resumed.glb"))).toBe(true);
+    },
+    300_000,
   );
 
   it(
@@ -416,11 +592,14 @@ describe("texture-projection runner", () => {
       expect(resumed.complete).toBe(true);
       const finished = JSON.parse(await readFile(runPath, "utf8")) as StoredRun;
       expect(finished.complete).toBe(true);
-      // Exactly one paid request per view the resumed run painted: view 0 was kept, not bought again.
-      expect(stub.requests.length - beforeResume).toBe(resumed.viewsPainted);
-      expect(finished.views.length).toBe(1 + resumed.viewsPainted);
+      // Exactly one paid request per view still missing: view 0 was kept and reused, not bought again.
+      const boughtOnResume = stub.requests.length - beforeResume;
+      expect(boughtOnResume).toBe(finished.views.length - 1);
+      // "Views painted" counts what reached the atlas: the reused view plus the newly bought ones.
+      expect(resumed.viewsPainted).toBe(finished.views.length);
+      expect(resumed.estimatedUsd).toBeCloseTo(boughtOnResume * 0.009, 6);
       expect(finished.views[0]?.index).toBe(0);
-      expect(resumed.viewsPainted).toBeGreaterThan(0);
+      expect(boughtOnResume).toBeGreaterThan(0);
     },
     300_000,
   );
@@ -469,7 +648,7 @@ describe("texture-projection structure check (B.2)", () => {
       }
     }
     const materialDeviation = structureDeviation(material, clay, SIZE, SIZE);
-    expect(materialDeviation).toBeLessThan(0.05);
+    expect(materialDeviation).toBeLessThan(STRUCTURE_DEVIATION_LIMIT);
     expect(rejectsStructure(materialDeviation)).toBe(false);
 
     // A darker style or a lighting gradient is a smooth trend, not a shape.
@@ -481,17 +660,23 @@ describe("texture-projection structure check (B.2)", () => {
         for (let channel = 0; channel < 3; channel++) ramp[p + channel] = Math.min(255, ramp[p + channel]! * factor);
       }
     }
-    expect(structureDeviation(ramp, clay, SIZE, SIZE)).toBeLessThan(0.05);
+    expect(structureDeviation(ramp, clay, SIZE, SIZE)).toBeLessThan(STRUCTURE_DEVIATION_LIMIT);
 
-    // A big dark arch painted on the flat wall: low-frequency luminance the clay does not have.
+    // A big dark arch painted on the flat wall, clear of the floor line: a compact, closed, much
+    // darker shape inside one clay surface.
     const arch = new Uint8ClampedArray(clay);
     const cx = SIZE * 0.5;
-    const half = SIZE * 0.14;
-    const top = SIZE * 0.2;
+    const half = SIZE * 0.13;
+    const top = SIZE * 0.22;
+    const bottom = SIZE * 0.58;
     for (let y = 0; y < SIZE; y++) {
       for (let x = 0; x < SIZE; x++) {
         const inside =
-          x > cx - half && x < cx + half && y > top && (y > top + half || (x - cx) ** 2 + (y - (top + half)) ** 2 < half ** 2);
+          x > cx - half &&
+          x < cx + half &&
+          y > top &&
+          y < bottom &&
+          (y > top + half || (x - cx) ** 2 + (y - (top + half)) ** 2 < half ** 2);
         if (!inside) continue;
         const p = 4 * (y * SIZE + x);
         arch[p] = 34;
@@ -500,7 +685,7 @@ describe("texture-projection structure check (B.2)", () => {
       }
     }
     const archDeviation = structureDeviation(arch, clay, SIZE, SIZE);
-    expect(archDeviation).toBeGreaterThan(0.15); // the limit is 0.05, the arch is 4x over it
+    expect(archDeviation).toBeGreaterThan(0.2); // the limit is 0.2, the arch is nearly 3x over it
     expect(rejectsStructure(archDeviation)).toBe(true);
     // The grid it compares on is the documented 64 cells.
     expect(lowFrequencyLuminance(clay, SIZE, SIZE)).toHaveLength(64 * 64);
@@ -632,6 +817,21 @@ describe("texture-projection atlas infill (C.2)", () => {
     infillUnpainted(data);
     expect(Array.from(data.subarray(8))).toEqual([150, 100, 60, 255, 150, 100, 60, 255]);
     expect(ATLAS_GUTTER_TEXELS).toBeGreaterThanOrEqual(8);
+  });
+});
+
+describe("texture-projection cook config hint (C.3)", () => {
+  it("documents the override for the atlas the bake actually holds, never above the 4096 cook ceiling", () => {
+    const hint = cookConfigHint(MAX_AUTO_ATLAS);
+    expect(hint).toContain(`maxSize: { baseColorTexture: ${MAX_AUTO_ATLAS} }`);
+    expect(hint).toContain('codec: "uastc"');
+    // The engine cook of the release that ships PRD-916 honours the marker; the hint says so.
+    expect(hint).toContain("extras.threenative.textureProjection");
+    expect(hint).toContain("PRD-916");
+    // Nothing the auto atlas can choose asks for a bigger base colour than the cook's KTX2 ceiling.
+    expect(MAX_AUTO_ATLAS).toBe(4096);
+    expect(autoAtlasSize(1024, 1e-9)).toBeLessThanOrEqual(MAX_AUTO_ATLAS);
+    expect(cookConfigHint(autoAtlasSize(1024, 1e-9))).toContain("baseColorTexture: 4096");
   });
 });
 

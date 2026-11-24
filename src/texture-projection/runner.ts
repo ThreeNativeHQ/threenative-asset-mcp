@@ -5,7 +5,15 @@ import { NodeIO, Primitive } from "@gltf-transform/core";
 
 import { markProjectedAtlas } from "./glb-marker.js";
 import { DEFAULT_MODEL, resolveModel } from "./models.js";
-import { defaultRunRoot, readRun, writeRun, type StoredPlan, type StoredRun, type StoredView } from "./runs.js";
+import {
+  defaultRunRoot,
+  readRun,
+  runDirectory,
+  writeRun,
+  type StoredPlan,
+  type StoredRun,
+  type StoredView,
+} from "./runs.js";
 import { openAppSession, type AppEvent } from "./session.js";
 import { startUiServer } from "./ui-server.js";
 import { measureUvStretch, type UvStretchReport } from "./uv-stretch.js";
@@ -18,6 +26,8 @@ export type TextureProjectionErrorCode =
   | "TEXTURE_PROJECT_RUN_NOT_FOUND"
   | "TEXTURE_PROJECT_UNSAFE_PATH"
   | "TEXTURE_PROJECT_INVALID_INPUT"
+  | "TEXTURE_PROJECT_STRUCTURE_REJECTED"
+  | "TEXTURE_PROJECT_NO_COVERAGE"
   | "TEXTURE_PROJECT_FAILED";
 
 export class TextureProjectionError extends Error {
@@ -104,6 +114,9 @@ export interface TextureProjectionResult {
   readonly viewsRejected: { readonly grazing: number; readonly structure: number };
 }
 
+/** How many painted views must all invent geometry before the run stops buying (B.2, fail closed). */
+export const STRUCTURE_STOP_VIEWS = 3;
+
 /** Atlas size a plan is measured at: small enough to read back, exact after scaling by area. */
 export const MEASUREMENT_ATLAS = 1024;
 /** No atlas below this can hold a level's islands without wasting the views' resolution. */
@@ -146,6 +159,7 @@ interface BrowserRun {
   readonly cost: number;
   readonly seconds: number;
   readonly coverage: number;
+  readonly stopped?: "structure";
 }
 
 interface BrowserPromptTest {
@@ -238,6 +252,8 @@ function planInput(request: TextureProjectionRequest): Record<string, number> {
 /** Only what the caller chose; the pipeline's own defaults fill the rest, on resume too. */
 function pipelineOptions(request: TextureProjectionRequest): Record<string, unknown> {
   const options: Record<string, unknown> = { plan: planInput(request) };
+  // Only an explicit size: "auto" is the default and is re-measured (and capped) on a resume.
+  if (typeof request.atlas === "number") options.atlas = request.atlas;
   if (request.style !== undefined) options.style = request.style;
   if (request.roofStyle !== undefined) options.roofStyle = request.roofStyle;
   if (request.firstModel !== undefined) options.firstModel = request.firstModel;
@@ -310,7 +326,8 @@ export async function quoteTextureProjection(
       holes: plan.holes,
       points: plan.points,
       predicted: plan.predicted,
-      estimatedUsd: (plan.views + plan.holes) * price,
+      // Cents: the caller asked for a price, not for floating-point dust.
+      estimatedUsd: Math.round((plan.views + plan.holes) * price * 100) / 100,
       atlas,
       estimatedBlurredTexelPercent,
       uvStretch,
@@ -411,10 +428,19 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
   }
   const lighting = stored?.lighting ?? request.lighting ?? "overcast";
   // "auto" (C.1) is decided from a measurement below, once the browser has planned the cameras.
-  const requested = stored?.atlas ?? request.atlas ?? "auto";
+  // A stored atlas the caller never named was an auto choice: resume it under the engine cook's
+  // ceiling, so a run planned at 8K by an older build bakes (and reports) at 4K, not above it.
+  const requested =
+    stored === undefined
+      ? (request.atlas ?? "auto")
+      : typeof stored.options.atlas === "number"
+        ? stored.atlas
+        : Math.min(stored.atlas, MAX_AUTO_ATLAS);
   const measurementAtlas = requested === "auto" ? MEASUREMENT_ATLAS : Math.min(requested, MEASUREMENT_ATLAS);
   const viewSize = stored?.viewSize ?? request.viewSize ?? 1024;
   const runId = request.runId ?? stored?.runId ?? `${level.name}-${Date.now().toString(36)}`;
+  // `run` aliases `stored` on a resume, so remember what it had already spent before it is updated.
+  const priorCost = stored?.cost ?? 0;
   const now = new Date().toISOString();
   const run: StoredRun = stored ?? {
     version: 1,
@@ -467,13 +493,20 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     },
   });
 
+  /** The run directory of a stopped or failed paint: every image it paid for is in there. */
+  function runNote(): string {
+    return `run ${runId} keeps every image it paid for in ${runDirectory(runRoot, runId)}`;
+  }
+
   async function handleEvent(event: AppEvent): Promise<void> {
     if (event.type === "planned") {
       const plan = (event as { plan?: StoredPlan }).plan;
       if (plan) run.plan = plan;
       return;
     }
-    if (event.type !== "view-done") return;
+    // The painter stopped itself; the summary it returns says so (the event is only progress).
+    if (event.type === "structure-stop") return;
+    if (event.type !== "view-done" && event.type !== "view-reused") return;
     const view = event as unknown as {
       index: number;
       wave: number;
@@ -513,8 +546,11 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     run.views = [...run.views.filter((v) => v.index !== storedView.index), storedView].sort(
       (a, b) => a.index - b.index,
     );
-    run.cost = view.cost;
-    run.seconds = (stored?.seconds ?? 0) + view.elapsed;
+    // A reused view was paid for by an earlier run: its cost and seconds are already in the run's.
+    if (event.type === "view-done") {
+      run.cost = view.cost;
+      run.seconds = (stored?.seconds ?? 0) + view.elapsed;
+    }
     run.updatedAt = new Date().toISOString();
     await writeRun(runRoot, run);
     await request.hooks?.onViewDone?.(storedView, run);
@@ -551,7 +587,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       summary = {
         runId,
         views: run.views.length,
-        painted: 1,
+        painted: painted.rejected === undefined ? 1 : 0,
         cost: run.cost,
         seconds: run.seconds,
         coverage: painted.coverage,
@@ -563,6 +599,21 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     }
     await pending;
     if (failure !== undefined) throw failure;
+    if (summary.stopped === "structure") {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_STRUCTURE_REJECTED",
+        `the first ${STRUCTURE_STOP_VIEWS} painted views of ${runNote()} invented geometry (doors, windows, arches, passages or volumes the clay has not) and were not projected; stopped before buying the rest. A resume re-judges and reuses those paid images: call this tool again with {"resumeRunId": "${runId}"}`,
+      );
+    }
+
+    // The painter only needs the key when it is about to ask for an image; a resume that reuses stored
+    // views must not be refused for a missing one, and a request that fails for it must say so.
+    if (summary.painted === 0 || summary.coverage === 0) {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_NO_COVERAGE",
+        `no view of ${runNote()} reached the atlas: ${summary.painted} of ${summary.views} views projected, coverage ${Math.round(summary.coverage * 100)}%. Nothing was baked. The paid images are kept for a resume: call this tool again with {"resumeRunId": "${runId}"}`,
+      );
+    }
 
     const base64 = await app.call<string>("glb");
     const outputPath = request.outputPath ?? join(runRoot, runId, "level_textured.glb");
@@ -580,7 +631,9 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       views: summary.views,
       viewsPainted: summary.painted,
       coveragePercent: Math.round(summary.coverage * 100),
-      estimatedUsd: summary.cost,
+      // What this call spent (not rounded: it is money already spent): a resume that only reused
+      // stored images reports 0.
+      estimatedUsd: summary.cost - priorCost,
       seconds: summary.seconds,
       complete: run.complete,
       atlas: run.atlas,
@@ -590,6 +643,18 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
         structure: run.views.filter((view) => view.rejected === "structure").length,
       },
     };
+  } catch (error) {
+    // Let the events already in flight finish writing run.json: a stopped or interrupted run must
+    // keep the record (and the images) of every view it paid for, or a resume would buy them again.
+    await pending.catch(() => undefined);
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("TEXTURE_PROJECT_MISSING_API_KEY")) {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_MISSING_API_KEY",
+        `OPENROUTER_API_KEY is not set and ${runNote()} still needs an image; resume with it set, or let every view come from the stored images`,
+      );
+    }
+    throw error;
   } finally {
     // Closing the browser is what interrupts a run whose hook threw: its page stops mid-view.
     await app.close();

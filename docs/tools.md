@@ -244,10 +244,17 @@ Texture projection (gray blockout levels and environments):
 - `texture_project_paint` — buys the views from an OpenRouter image model (FLUX 3 Klein by default) with the
   user's `OPENROUTER_API_KEY`, projects them into the level's UV atlas, and writes the baked GLB atomically
   under the project's `assets/`. Every prompt keeps the clay image's edges, openings and silhouette; a view
-  that invents a door, window, arch, passage or volume is logged as `rejected: "structure"` and left to the
-  fill pass, and a view whose surface is almost all grazing is rejected before its image is bought.
-  `resumeRunId` never pays for a view twice; `promptTestView` buys exactly one image. `cookConfigHint` is the
-  `threenative.config.ts` `assets.models.textures` snippet that keeps the atlas' size and UASTC encoding.
+  that invents a door, window, arch, passage or volume (a compact, closed, much darker shape inside one clay
+  surface) is logged as `rejected: "structure"` and left to the fill pass, and a view whose surface is almost all
+  grazing is rejected before its image is bought. It fails closed and stops spending:
+  `TEXTURE_PROJECT_STRUCTURE_REJECTED` once the first three painted views all invent geometry, and
+  `TEXTURE_PROJECT_NO_COVERAGE` when nothing reaches the atlas. `resumeRunId` re-judges every stored generation
+  with the current checks, projects the accepted ones and requests only views that have none, so a view is never
+  paid for twice (and a resume that reuses stored images needs no key); `viewsPainted` counts what reached the
+  atlas, bought or reused. `promptTestView` buys exactly one image. `cookConfigHint` is the
+  `threenative.config.ts` `assets.models.textures` snippet that keeps the atlas' size (at most 4096, the engine
+  cook's KTX2 ceiling) and UASTC encoding; the engine cook of the release that ships PRD-916 honours the GLB's
+  marker on its own.
 - `texture_project_inspect` — returns a contact sheet (clay render, model image and projected composite per
   view, rejected views labelled) with coverage, atlas size, measured blurred-texel share, rejected views and an
   audit of `threenative.config.ts`: a `maxSize` below the atlas or an ETC1S (or missing UASTC) base-colour codec

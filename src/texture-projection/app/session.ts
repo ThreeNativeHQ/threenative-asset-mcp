@@ -8,6 +8,7 @@ import {
   DEFAULT_PIPELINE,
   GRAZING_VIEW_LIMIT,
   generateView,
+  judgeView,
   prepareView,
   promptText,
   runPipeline,
@@ -131,34 +132,64 @@ export class Session {
     if (this.viewer) this.viewer.dirty = true;
   }
 
-  /** Load a stored run's plan and composites into the engine; returns what still has to be painted. */
-  async restore(runId: string, meta: StoredRun): Promise<{ plan: Plan; skip: Set<number>; prior: RunPrior }> {
+  /**
+   * Load a stored run into the engine and re-judge what it already paid for. Every stored generation
+   * is read back from the run directory and put through the *current* checks (judgeView): the images a
+   * resume projects are the ones on disk, so a metric fix salvages a paid run without buying a single
+   * image again. A view whose generation is missing (a grazing rejection, which never bought one) is
+   * kept as it was and never re-requested.
+   */
+  async restore(
+    runId: string,
+    meta: StoredRun,
+    opts: Partial<PipelineOptions> = {},
+    onEvent?: (event: PipelineEvent) => void,
+  ): Promise<{ plan: Plan; skip: Set<number>; prior: RunPrior }> {
     if (!this.engine || !this.viewer) throw new Error("load the level first");
     const S = this.engine.size;
     const plan = decodePlan(meta.plan);
     this.engine.atlas.reset();
     this.viewer.sky.reset();
     this.viewer.setMode("textured");
+    const o: PipelineOptions = { ...DEFAULT_PIPELINE, ...opts, plan: { ...DEFAULT_PIPELINE.plan, ...opts.plan } };
+    const roofsByPass = (o.plan.roofs ?? 0) > 0 || plan.views.some((view) => view.kind === "roof");
     const saved = [...meta.views].sort((a, b) => a.index - b.index);
     const prior: ViewRecord[] = [];
-    // A rejected view was never projected and has no images on disk; it is skipped, not re-bought.
-    for (const v of saved.filter((view) => view.rejected === undefined)) {
-      const comp = await urlToRGBA(`/api/runs/${encodeURIComponent(runId)}/view_${v.index}_comp.png`, S, S);
+    for (const v of saved) {
       const spec: ViewSpec = plan.views[v.index] ?? { ...v.spec, id: v.index };
-      this.engine.paint(spec, comp);
-      const view: ViewRecord = {
-        ...v,
-        spec,
+      const empty = {
         clay: new Uint8ClampedArray(0),
         state: new Uint8ClampedArray(0),
         edit: new Uint8Array(0),
         gen: new Uint8ClampedArray(0),
-        comp,
-        coverage: v.coverage,
-        predicted: v.predicted,
       };
-      prior.push(view);
-      this.addSky(view);
+      const generation = await this.readRunImage(runId, `view_${v.index}_gen.png`, S);
+      let view: ViewRecord = { ...v, spec, ...empty, comp: new Uint8ClampedArray(0) };
+      if (generation !== undefined) {
+        try {
+          const p = prepareView(this.engine, spec, o, false, roofsByPass);
+          const judged = judgeView(p, generation, S, o.feather);
+          view = { ...view, left: judged.left, comp: judged.comp, structureDeviation: judged.structureDeviation };
+          if (judged.rejected) view.rejected = "structure";
+          else delete view.rejected;
+        } catch {
+          // Unreadable state for this view (a changed level): keep it as stored rather than lose the run.
+        }
+      }
+      // Project what this view now contributes. A stored composite is the fallback for a view that was
+      // accepted before generations were re-judged (its image is gone but the bake still exists).
+      let comp = view.rejected === undefined ? view.comp : new Uint8ClampedArray(0);
+      if (view.rejected === undefined && comp.length === 0 && v.rejected === undefined) {
+        comp = (await this.readRunImage(runId, `view_${v.index}_comp.png`, S)) ?? new Uint8ClampedArray(0);
+      }
+      if (view.rejected === undefined && comp.length > 0) {
+        this.engine.paint(spec, comp);
+        await this.writeRunImage(runId, `view_${v.index}_comp.png`, comp, S);
+        view = { ...view, comp };
+        this.addSky(view);
+      }
+      prior.push({ ...view, coverage: this.engine.atlas.coverage() });
+      onEvent?.({ type: "view-reused", view: { ...view, coverage: this.engine.atlas.coverage() } });
     }
     this.viewer.sky.finish();
     this.plan = plan;
@@ -307,20 +338,31 @@ export class Session {
     return exportGlb(this.engine);
   }
 
+  /** One PNG of a run file, or undefined when the run directory does not hold it. */
+  private async readRunImage(runId: string, file: string, size: number): Promise<Uint8ClampedArray | undefined> {
+    try {
+      return await urlToRGBA(`/api/runs/${encodeURIComponent(runId)}/${file}`, size, size);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Write one RGBA image as a run file through the local server. */
+  private async writeRunImage(runId: string, file: string, pixels: Uint8ClampedArray, size: number) {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/${file}`, {
+      method: "POST",
+      headers: postHeaders("application/octet-stream"),
+      body: await toBlob(pixels, size, size, "image/png"),
+    });
+    if (!res.ok) throw new Error(`saving ${file} failed: ${res.status}`);
+  }
+
   /** Write one finished view's images to the run directory through the local server, then drop them. */
   async saveView(runId: string, view: ViewRecord) {
     const S = this.engine!.size;
-    const put = async (file: string, body: Blob) => {
-      const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/${file}`, {
-        method: "POST",
-        headers: postHeaders("application/octet-stream"),
-        body,
-      });
-      if (!res.ok) throw new Error(`saving ${file} failed: ${res.status}`);
-    };
-    await put(`view_${view.index}_clay.png`, await toBlob(view.clay, S, S, "image/png"));
-    await put(`view_${view.index}_gen.png`, await toBlob(view.gen, S, S, "image/png"));
-    await put(`view_${view.index}_comp.png`, await toBlob(view.comp, S, S, "image/png"));
+    await this.writeRunImage(runId, `view_${view.index}_clay.png`, view.clay, S);
+    await this.writeRunImage(runId, `view_${view.index}_gen.png`, view.gen, S);
+    await this.writeRunImage(runId, `view_${view.index}_comp.png`, view.comp, S);
     view.clay = new Uint8ClampedArray(0);
     view.state = new Uint8ClampedArray(0);
     view.edit = new Uint8Array(0);

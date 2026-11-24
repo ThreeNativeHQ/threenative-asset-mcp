@@ -59,7 +59,7 @@ export interface ViewRecord {
   unknownFraction: number;
   /** Set when nothing was projected: the image was not bought (grazing) or not trusted (structure). */
   rejected?: ViewRejection;
-  /** Low-frequency luminance the model added over the image it was given; rejected above 0.13. */
+  /** Compact closed blob the model added over the image it was given; rejected above 0.20 (structure.ts). */
   structureDeviation?: number;
   /** Share of this view's geometry the 0.35 grazing gate rejects. */
   grazingFraction?: number;
@@ -86,12 +86,18 @@ export interface RunRecord {
   views: ViewRecord[];
   cost: number;
   seconds: number;
+  /** Set when the run stopped itself instead of painting on: the B.2 check rejected its first views. */
+  stopped?: "structure";
 }
 
 export type PipelineEvent =
   | { type: "planned"; plan: Plan }
   | { type: "view-start"; index: number; wave: number; model: string; state: Uint8ClampedArray }
   | { type: "view-done"; view: ViewRecord; cost: number; elapsed: number }
+  /** A stored view re-judged on resume: run.json takes the new record, nothing was bought. */
+  | { type: "view-reused"; view: ViewRecord }
+  /** The run's first painted views were all rejected as invented geometry; no more money is spent. */
+  | { type: "structure-stop"; views: number; runViews: number }
   | { type: "error"; index: number; message: string }
   | { type: "done"; record: RunRecord };
 
@@ -201,14 +207,21 @@ export const GRAZING_VIEW_LIMIT = 0.85;
 
 export const promptText = (p: Pick<PreparedView, "prompt">) => prompts.view(p.prompt);
 
-/** Ask the model for one prepared view and composite its answer next to the known texture. */
-export async function generateView(p: PreparedView, size: number, seed: number, feather: number, signal?: AbortSignal) {
-  const r = await runEdit(
-    p.model,
-    { imageUrl: toDataUrl(p.state, size, size, "image/jpeg", 0.95), prompt: p.prompt, seed },
-    signal,
-  );
-  const gen = bitmapToRGBA(r.image, size, size);
+/** One generated view, judged: what to project, and whether it invented geometry. */
+export interface JudgedView {
+  /** The composite to project, or the untouched state when the view was rejected. */
+  readonly comp: Uint8ClampedArray;
+  readonly rejected: boolean;
+  readonly structureDeviation: number;
+  /** Share of the area to paint the model handed back unpainted. */
+  readonly left: number;
+}
+
+/**
+ * Composite one image onto the state it was generated from and run the B.2 structure check. No model
+ * call: a resume re-judges the images it already paid for through this same function.
+ */
+export function judgeView(p: PreparedView, gen: Uint8ClampedArray, size: number, feather: number): JudgedView {
   const k = size / 1024; // pixel radii below are tuned at 1024 px views
   const corrected = colorCorrect(p.state, gen, p.masks, size, size, {
     band: 6 * k,
@@ -227,22 +240,32 @@ export async function generateView(p: PreparedView, size: number, seed: number, 
   }
   const keep = nLeft ? (p.keep ?? p.geometry).map((v, i) => v & (1 - leftOver[i])) : p.keep;
   if (keep) comp = keepOnly(comp, keep, p.geometry);
-  // B.2: the model must keep the image it was given. A painted arch, doorway or new volume moves the
-  // low-frequency luminance far more than any material does, so that view is logged and not projected.
+  // B.2: the model must keep the image it was given. A painted arch, doorway or new volume is a
+  // compact, closed, much darker region inside one clay surface, so that view is logged and not
+  // projected (structure.ts has the method and its calibration).
   // Judge only what the model was asked to paint: level geometry it has not painted yet. The sky is
   // background nothing projects, and already-painted texels are the previous views' work.
   const paintable = p.masks.geometry.map((geometry, i) => geometry & (1 - p.masks.known[i]!));
   const deviation = structureDeviation(corrected, p.state, size, size, undefined, paintable);
   const rejected = rejectsStructure(deviation);
   return {
-    gen,
     // A rejected view paints nothing: its composite stays the state the model was handed.
     comp: rejected ? p.state : comp,
-    seconds: r.seconds,
-    left: nUnknown ? nLeft / nUnknown : 0,
-    structureDeviation: deviation,
     rejected,
+    structureDeviation: deviation,
+    left: nUnknown ? nLeft / nUnknown : 0,
   };
+}
+
+/** Ask the model for one prepared view and composite its answer next to the known texture. */
+export async function generateView(p: PreparedView, size: number, seed: number, feather: number, signal?: AbortSignal) {
+  const r = await runEdit(
+    p.model,
+    { imageUrl: toDataUrl(p.state, size, size, "image/jpeg", 0.95), prompt: p.prompt, seed },
+    signal,
+  );
+  const gen = bitmapToRGBA(r.image, size, size);
+  return { gen, seconds: r.seconds, ...judgeView(p, gen, size, feather) };
 }
 
 /** Views a resumed run already has on disk: their pixels are replayed from the saved composites. */
@@ -253,8 +276,9 @@ export interface RunPrior {
 }
 
 /**
- * Paint every planned view, in waves. `skip` holds plan indices a resumed run has already painted;
- * `prior` carries their metadata so the returned record counts them without re-requesting them.
+ * Paint every planned view, in waves. `skip` holds plan indices a resumed run already has images for;
+ * `prior` carries their records (re-judged and re-projected by the caller) so the returned run counts
+ * them without re-requesting them.
  */
 export async function runPipeline(
   engine: Engine,
@@ -284,9 +308,9 @@ export async function runPipeline(
     comp: new Uint8ClampedArray(0),
   });
 
-  const runView = async (spec: ViewSpec, vi: number, wave: number) => {
+  const runView = async (spec: ViewSpec, vi: number, wave: number): Promise<ViewRecord | undefined> => {
     const p = prepareView(engine, { ...spec, id: vi }, o, startOfRun && vi === 0, roofsByPass);
-    if (p.skip) return;
+    if (p.skip) return undefined;
     if (p.grazingFraction > GRAZING_VIEW_LIMIT) {
       // Almost everything in view is below the grazing gate: no image is bought for it.
       const view: ViewRecord = {
@@ -298,7 +322,7 @@ export async function runPipeline(
       views.push(view);
       done.add(vi);
       onEvent({ type: "view-done", view, cost, elapsed: (performance.now() - t0) / 1000 });
-      return;
+      return view;
     }
     onEvent({ type: "view-start", index: vi, wave, model: p.model.key, state: p.state });
     try {
@@ -332,25 +356,49 @@ export async function runPipeline(
       views.push(view);
       done.add(vi);
       onEvent({ type: "view-done", view, cost, elapsed: (performance.now() - t0) / 1000 });
+      return view;
     } catch (e) {
       onEvent({ type: "error", index: vi, message: String((e as Error)?.message ?? e) });
+      return undefined;
     }
   };
 
+  /**
+   * B.2 is only worth believing while the money is still unspent: when the first three *painted*
+   * views of the run all invented geometry, the check is either right (the level's paintings are
+   * unusable, stop paying) or wrong (stop paying and look at the pairs). Either way the run stops
+   * with the cause in run.json; every bought image is kept for a resume.
+   */
+  const rejectedFirstViews: ViewRecord[] = [];
+  const stopOnStructureFailure = (view: ViewRecord | undefined): boolean => {
+    if (!view || view.price <= 0) return false; // not bought (a grazing view or a skip): says nothing
+    rejectedFirstViews.push(view);
+    if (rejectedFirstViews.length < 3) return false;
+    if (rejectedFirstViews.some((seen) => seen.rejected !== "structure")) return false;
+    onEvent({ type: "structure-stop", views: 3, runViews: views.length });
+    return true;
+  };
+
   // Views are painted one at a time, so each one renders against everything painted before it.
-  for (let w = 0; w < plan.waves.length; w++) {
+  let stopped = false;
+  for (let w = 0; w < plan.waves.length && !stopped; w++) {
     if (signal?.aborted) break;
     for (const vi of plan.waves[w] ?? []) {
       if (signal?.aborted) break;
       const spec = plan.views[vi];
       if (!spec || done.has(vi)) continue;
-      await runView(spec, vi, w);
+      if (stopOnStructureFailure(await runView(spec, vi, w))) {
+        stopped = true;
+        break;
+      }
     }
   }
 
   // Hole pass: texels nothing painted (ground behind props, tops of props) from views that actually see them.
+  // A resume never runs it: the stored plan's hole views (bought, rejected or not) were already
+  // decided, and a resume must not buy a camera the caller never approved.
   const holeBudget = o.plan.holes ?? DEFAULT_PLAN.holes;
-  if (holeBudget > 0 && !signal?.aborted) {
+  if (holeBudget > 0 && !signal?.aborted && !stopped && prior === undefined) {
     const cands = holeViews(engine.level, { ...DEFAULT_PLAN, ...o.plan }, plan.points);
     const probe = new ViewRenderer(engine.gpu, engine.level, 128);
     const used = new Set<number>();
@@ -383,7 +431,15 @@ export async function runPipeline(
   }
 
   const seconds = (prior?.seconds ?? 0) + (performance.now() - t0) / 1000;
-  const record: RunRecord = { level: engine.level.name, options: o, plan, views, cost, seconds };
+  const record: RunRecord = {
+    level: engine.level.name,
+    options: o,
+    plan,
+    views,
+    cost,
+    seconds,
+    ...(stopped ? { stopped: "structure" as const } : {}),
+  };
   onEvent({ type: "done", record });
   return record;
 }

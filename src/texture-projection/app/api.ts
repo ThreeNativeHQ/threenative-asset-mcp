@@ -31,6 +31,8 @@ export interface RunSummary {
   cost: number;
   seconds: number;
   coverage: number;
+  /** "structure" when the run stopped buying because its first views invented geometry. */
+  stopped?: "structure";
 }
 
 /**
@@ -43,6 +45,8 @@ export function makeApi(session: Session) {
     if (e.type === "planned") emit({ type: e.type, plan: encodePlan(e.plan) });
     else if (e.type === "view-start") emit({ type: e.type, index: e.index, wave: e.wave, model: e.model });
     else if (e.type === "view-done") emit(viewDone(e.view, e.cost, e.elapsed));
+    else if (e.type === "view-reused") emit({ ...viewDone(e.view, 0, 0), reused: true });
+    else if (e.type === "structure-stop") emit({ type: e.type, views: e.views, runViews: e.runViews });
     else if (e.type === "error") emit({ type: e.type, index: e.index, message: e.message });
     else if (e.type === "done")
       emit({ type: e.type, views: e.record.views.length, cost: e.record.cost, seconds: e.record.seconds });
@@ -58,11 +62,18 @@ export function makeApi(session: Session) {
     onEvent?: (e: PipelineEvent) => void,
   ): Promise<RunSummary> {
     let saving = Promise.resolve();
-    let painted = 0;
+    // Views a resume already had on disk reached the atlas too: they count as projected, not as bought.
+    let projected = (prior?.views ?? []).filter((view) => view.rejected === undefined).length;
     const record = await session.run(
       options,
       (e) => {
         onEvent?.(e);
+        if (e.type === "view-reused") {
+          // A resume re-judged and re-projected a stored view: it reached the atlas, but nothing was bought.
+          if (e.view.rejected === undefined) projected += 1;
+          forward(e);
+          return;
+        }
         if (e.type !== "view-done") {
           forward(e);
           return;
@@ -71,8 +82,8 @@ export function makeApi(session: Session) {
         saving = saving.then(async () => {
           // A view rejected for grazing never called the model, so it has no images to store.
           if (view.rejected !== "grazing") await session.saveView(runId, view);
-          // "Painted" counts bought images; a rejected view painted nothing.
-          if (view.rejected === undefined) painted += 1;
+          // "Views painted" counts what reached the atlas: a bought image, or a stored one reused on resume.
+          if (view.rejected === undefined) projected += 1;
           emit(viewDone(view, cost, elapsed));
         });
       },
@@ -84,10 +95,11 @@ export function makeApi(session: Session) {
     return {
       runId,
       views: record.views.length,
-      painted,
+      painted: projected,
       cost: record.cost,
       seconds: record.seconds,
       coverage: session.engine!.atlas.coverage(),
+      ...(record.stopped === undefined ? {} : { stopped: record.stopped }),
     };
   }
 
@@ -152,12 +164,22 @@ export function makeApi(session: Session) {
     ) {
       return paint(input.runId, input.options, input.plan, input.skip, undefined, onEvent);
     },
-    /** Continue a stored run: replay its saved views, then paint the ones it is missing. */
+    /**
+     * Continue a stored run: re-judge and project every stored generation, then paint only the views
+     * that have none. Nothing a stored run already paid for is requested again.
+     */
     async resume(runId: string, onEvent?: (e: PipelineEvent) => void): Promise<RunSummary> {
       const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/run.json`);
       if (!res.ok) throw new Error(`no stored run ${runId}: ${res.status}`);
       const meta = (await res.json()) as StoredRun;
-      const { plan, skip, prior } = await session.restore(runId, meta);
+      const { plan, skip, prior } = await session.restore(runId, meta, meta.options, (event) => {
+        forward(event);
+        onEvent?.(event);
+      });
+      if (prior.views.some((view) => view.rejected === undefined)) {
+        // The stored bakes are back in the atlas: come back in textured mode before painting anything else.
+        session.viewer?.setMode("textured");
+      }
       return paint(runId, meta.options, encodePlan(plan), [...skip], prior, onEvent);
     },
     /** Paint a single planned view: a prompt test for the price of one image. */

@@ -131,7 +131,10 @@ export const TextureProjectPaintOutputSchema = z
     runId: z.string(),
     outputPath: z.string(),
     coveragePercent: z.number().min(0).max(100),
-    viewsPainted: z.number().int().nonnegative(),
+    viewsPainted: z
+      .number()
+      .int()
+      .nonnegative(),
     viewsRejected: z.object({ grazing: z.number().int().nonnegative(), structure: z.number().int().nonnegative() }).strict(),
     blurredTexelPercent: z.number().min(0).max(100),
     atlas: z.number().int().positive(),
@@ -207,11 +210,19 @@ function planRequest(input: {
   };
 }
 
-/** The explicit threenative.config.ts override for one painted atlas (C.3): size kept, UASTC encoded. */
+/**
+ * The cook settings for one painted atlas (C.3, A.4). The atlas is at most 4096 px (the engine cook's
+ * KTX2 ceiling), so no override can ask for more than the bake holds. The engine cook of the release
+ * that ships PRD-916 reads the GLB's extras.threenative.textureProjection marker and keeps this size
+ * with UASTC on its own; the explicit override below only says it out loud, and wins if the project
+ * ever needs a different choice for this file.
+ */
 export function cookConfigHint(atlas: number): string {
   return [
-    "// threenative.config.ts — explicit override for the painted atlas. The engine cook also honours the",
-    "// GLB's extras.threenative.textureProjection marker (this MCP writes it; the cook side ships separately).",
+    "// threenative.config.ts — the painted atlas at the size the bake actually holds (<= 4096, the KTX2",
+    "// ceiling). The engine cook of the release that ships PRD-916 honours the GLB's",
+    "// extras.threenative.textureProjection marker: it keeps this size and encodes UASTC with full mips.",
+    "// The override below is the same choice stated explicitly, for a project that pins it per slot.",
     "// The game sets anisotropy 8 on the level's base colour map so the atlas stays sharp at a graze.",
     "assets: {",
     "  models: {",

@@ -48,10 +48,45 @@ async function repainted(dataUrl: string | undefined, paint: "material" | "arch"
       .png()
       .toBuffer();
     if (paint === "material") return grained.toString("base64");
-    const left = width * 0.36;
-    const right = width * 0.64;
-    const spring = height * 0.4;
-    const bottom = height * 0.66;
+    // Put the arch inside one flat run of level geometry, not across the sky or a silhouette: the
+    // failure mode is an opening painted on a wall, and a shape hanging over the sky is not inside
+    // any clay surface (nothing over the sky is ever projected). The flattest window with the fewest
+    // sky pixels wins, nearest the middle of the frame.
+    const probe = await sharp(source)
+      .greyscale()
+      .resize(Math.max(1, Math.round(width / 8)), Math.max(1, Math.round(height / 8)), { fit: "fill" })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const cols = probe.info.width;
+    const rows = probe.info.height;
+    const levels = probe.data;
+    const windowCols = Math.max(3, Math.round((0.28 * width * cols) / width));
+    const windowRows = Math.max(3, Math.round((0.26 * height * rows) / height));
+    let best = { x: 0, y: 0, score: -Infinity };
+    for (let y = 0; y + windowRows <= rows; y++) {
+      for (let x = 0; x + windowCols <= cols; x++) {
+        const values: number[] = [];
+        for (let dy = 0; dy < windowRows; dy++) {
+          for (let dx = 0; dx < windowCols; dx++) values.push(levels[(y + dy) * cols + x + dx]!);
+        }
+        values.sort((a, b) => a - b);
+        const median = values[values.length >> 1]!;
+        // On the clay, a flat surface is one constant gray; the sky is brighter than 179.
+        const flat = values.filter((value) => Math.abs(value - median) <= 8).length / values.length;
+        const lit = median < 179 ? 1 : 0;
+        const offCentre = Math.abs(x + windowCols / 2 - cols / 2) + Math.abs(y + windowRows / 2 - rows / 2);
+        const score = lit * 10 + flat - offCentre * 0.01;
+        if (score > best.score) best = { x, y, score };
+      }
+    }
+    const archWidth = windowCols * (width / cols);
+    const archHeight = windowRows * (height / rows);
+    const left = best.x * (width / cols);
+    const top = best.y * (height / rows);
+    const half = archWidth / 2;
+    const right = left + archWidth;
+    const spring = top + half;
+    const bottom = top + archHeight;
     const radius = (right - left) / 2;
     const svg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><path d="M ${left} ${bottom} L ${left} ${spring} A ${radius} ${radius} 0 0 1 ${right} ${spring} L ${right} ${bottom} Z" fill="#221c1a"/></svg>`;
     const arch = await sharp(grained)

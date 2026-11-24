@@ -476,24 +476,29 @@ export function plan(gpu: Gpu, level: Level, views: ViewRenderer, opts: Partial<
   if (!points.length) throw new Error('found nowhere to stand: is the level Y-up with walkable floors?');
   // Three passes, each with its own budget: the players' views, close views over the roofs, and the aerial ring
   // for what's left (outer walls, tops of props). Players' and aerial views leave roofs to the roof pass.
+  // The three budgets add up to `maxViews`: asking for 40 views and 6 aerial ones buys at most 40 images
+  // (34 player views and 6 aerial), never 40 plus 12.
+  const aerialBudget = Math.min(o.aerial, o.maxViews);
+  const roofBudget = Math.min(o.roofs, Math.max(0, o.maxViews - aerialBudget));
+  const groundBudget = Math.max(1, o.maxViews - aerialBudget - roofBudget);
   const ground = candidateViews(points, o);
   const groundLists = probeCells(gpu, views, ground, o);
-  const roofCands = o.roofs > 0 ? roofViews(level, o, 0) : [];
+  const roofCands = roofBudget > 0 ? roofViews(level, o, 0) : [];
   const roofLists = probeCells(gpu, views, roofCands, o, roofTest(level));
-  const air = o.aerial > 0 ? aerialViews(level, o, 0) : [];
+  const air = aerialBudget > 0 ? aerialViews(level, o, 0) : [];
   const airLists = probeCells(gpu, views, air, o);
   let roofCells: Uint8Array | undefined;
   if (roofCands.length) {
     roofCells = new Uint8Array(G2);
     for (const l of roofLists) for (const c of l.cells) roofCells[c] = 1;
   }
-  const sel = selectViews(groundLists, o, [], existing, roofCells);
+  const sel = selectViews(groundLists, { ...o, maxViews: groundBudget }, [], existing, roofCells);
   const roofSel = roofCands.length
-    ? selectViews(roofLists, { ...o, maxViews: o.roofs, targetCoverage: 0.98 }, roofCands.map(() => true), existing) : null;
+    ? selectViews(roofLists, { ...o, maxViews: roofBudget, targetCoverage: 0.98 }, roofCands.map(() => true), existing) : null;
   // the aerial ring only fills in after the players' views
   const have = existing ? existing.slice() : new Float32Array(G2);
   for (const k of sel.order) { const l = groundLists[k]; for (let i = 0; i < l.cells.length; i++) have[l.cells[i]] = Math.max(have[l.cells[i]], l.q[i]); }
-  const airSel = air.length ? selectViews(airLists, { ...o, maxViews: 2 * o.aerial }, air.map(() => true), have, roofCells) : null;
+  const airSel = air.length ? selectViews(airLists, { ...o, maxViews: aerialBudget }, air.map(() => true), have, roofCells) : null;
   const picked = [
     ...sel.order.map((k) => ({ spec: ground[k], cells: groundLists[k] })),
     ...(roofSel?.order.map((k) => ({ spec: roofCands[k], cells: roofLists[k] })) ?? []),
