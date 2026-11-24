@@ -11,9 +11,13 @@
  *
  * A swatch is a planar world-space square on one surface of one material class that an accepted view
  * sees fully: its pixels are the inverse projection of that stored image onto the plane (no
- * stretching, no resampling of a resampled image), and it is made tileable by cross-fading it with a
- * copy offset by half a tile, the way `transferDetail` tiles an island's fill. Plain math over arrays
- * (no DOM, no GPU) so the node tests run the same rules the browser applies.
+ * stretching, no resampling of a resampled image). It is made tileable in two ways (phase 2n): an axis
+ * whose paint repeats on a clear period — brick courses, setts, a floor's paving — is cropped to whole
+ * periods with the seam inside a joint, so it wraps with no blend at all; an axis without one keeps a
+ * narrow cross-fade against a copy offset by half a tile, the way `transferDetail` tiles an island's
+ * fill. A blend band mixes two layouts, so on a coursed wall the misaligned joints inside it read as
+ * doubled mortar at arm's length: the band is the fallback, not the rule. Plain math over arrays (no
+ * DOM, no GPU) so the node tests run the same rules the browser applies.
  */
 import * as THREE from 'three';
 import { makeCamera, type ViewSpec } from './views.js';
@@ -29,13 +33,45 @@ export const SWATCH_SIDE_METRES: Readonly<Record<SwatchClass, number>> = { wall:
 export const SWATCH_SIZE = 1024;
 
 /**
- * A patch is only cut from a view that sees it at less than this angle to its normal: at 50 degrees
- * one view pixel covers 1.56x as much surface along one axis, and the swatch would stretch that.
+ * Per class, the angle between a patch's normal and the direction to its view above which no patch is
+ * cut, in degrees. A wall is only cut near head-on: at 50 degrees one view pixel covers 1.56x as much
+ * surface along one axis, and the swatch would stretch that. A floor is allowed further (phase 2n):
+ * rectification is an inverse projection, so a floor cut at 60 degrees is still true scale — one view
+ * pixel covers 1/cos(60) = 2x as much surface along depth as across, so it is only softer there.
  */
-export const SWATCH_MAX_INCIDENCE_DEG = 50;
+export const SWATCH_MAX_INCIDENCE_DEG: Readonly<Record<SwatchClass, number>> = { wall: 50, floor: 65 };
 
-/** Share of the swatch's side the seam band covers (a quarter of the tile, as `transferDetail` uses). */
-export const SWATCH_SEAM_SHARE = 0.25;
+/**
+ * Share of a side the cross-fade band covers, on an axis with no mortar snap (phase 2n): narrow, not
+ * `transferDetail`'s quarter. The band is where two layouts are mixed, and a coursed surface shows it.
+ */
+export const SWATCH_SEAM_SHARE = 0.08;
+
+/**
+ * The period of a course profile is taken only when its normalised autocorrelation peaks above this:
+ * below it the profile has structure without a repeat, and cropping to it would cut the paint apart.
+ */
+export const SWATCH_PERIOD_MIN_CORRELATION = 0.3;
+
+/** Shortest lag a period is looked for at, px: anything shorter is grain, not a course or a sett. */
+const SWATCH_PERIOD_MIN_LAG = 8;
+
+/** How far a peak has to climb out of its trough to count as a repeat rather than a flat stretch. */
+const SWATCH_PERIOD_MIN_RISE = 0.15;
+
+/**
+ * Repeats a snap has to cover: one would repeat at its own pitch and read as a stripe, and two or three
+ * are thin evidence of a repeat. It also keeps a patch's own lighting gradient — which nearly equals
+ * itself half an image later — from ever being taken for a period.
+ */
+const SWATCH_MIN_PERIODS = 4;
+
+/**
+ * Share of a period a joint may cover, after folding the profile onto one period. A mortar joint is a
+ * narrow band of a course (a tenth of it); a dip wider than this is a tonal patch — moss on a sett floor,
+ * a stain — and cutting there would butt two unrelated patches together, so that axis keeps its fade.
+ */
+const SWATCH_JOINT_MAX_SHARE = 0.25;
 
 /** A vertical face, by |normal.y|: the walls a wall swatch can come from (semantics.ts finds floors). */
 export const WALL_MAX_NY = 0.35;
@@ -76,6 +112,20 @@ export interface ViewGeometry {
   readonly position: Float32Array;
   /** RGBA per pixel: world normal xyz + (label + 1); a < 0.5 is sky. */
   readonly normal: Float32Array;
+}
+
+/** A cut, tileable swatch: its pixels, and the extent each of its axes covers in metres. */
+export interface SwatchTile {
+  readonly pixels: Uint8ClampedArray;
+  readonly width: number;
+  readonly height: number;
+  /** Extent along the patch's u axis, metres: the tile's width when a game repeats it. */
+  readonly metresX: number;
+  /** Extent along the patch's v axis, metres: its height. */
+  readonly metresY: number;
+  /** Period the axis was cut on, px, and its own; 0 where the axis has no clear one and was cross-faded. */
+  readonly periodX: number;
+  readonly periodY: number;
 }
 
 /** A planar, world-space square on one surface of the level. */
@@ -209,7 +259,7 @@ export function pickSwatch(g: ViewGeometry, search: SwatchSearch): SwatchCandida
   const tanHalf = Math.tan((g.spec.fov * Math.PI) / 360);
   const pixelAngle = (2 * tanHalf) / size;
   const viewAngle = (2 * tanHalf) / search.viewSize;
-  const cosLimit = Math.cos((SWATCH_MAX_INCIDENCE_DEG * Math.PI) / 180);
+  const cosLimit = Math.cos((SWATCH_MAX_INCIDENCE_DEG[search.klass] * Math.PI) / 180);
   const metresPerPixel = search.side / SWATCH_SIZE;
   // Best resolution first: a view pixel covers less surface the closer and more head-on it is.
   const buckets: number[][] = Array.from({ length: SWATCH_BUCKETS }, () => []);
@@ -262,7 +312,7 @@ function candidateAt(
   const cosInc = ((eye[0] - centre[0]) * normal[0] + (eye[1] - centre[1]) * normal[1] + (eye[2] - centre[2]) * normal[2]) / d;
   if (!(cosInc > 0)) return undefined;
   const incidence = (Math.acos(Math.min(1, cosInc)) * 180) / Math.PI;
-  if (incidence >= SWATCH_MAX_INCIDENCE_DEG) return undefined;
+  if (incidence >= SWATCH_MAX_INCIDENCE_DEG[search.klass]) return undefined;
   const patch = makePatch(centre, normal, search.side);
   // One view pixel on the patch, plus room for the gap between a sample and the pixel it projects
   // into: a nearer surface (an occluder) or a surface behind a hole is metres off, not centimetres.
@@ -348,39 +398,208 @@ export function rectifySwatch(
 }
 
 /**
- * Make a rectified patch tile in world space: cross-fade it with a copy offset by half a tile, over a
- * `seamShare` band along its own edges (the 2-sample overlap blend `transferDetail` uses). Only the
- * deviation from the patch's mean is cross-faded and renormalised by `1 / sqrt(w1^2 + w2^2)`, so the
- * band keeps the grain's amplitude and the patch's colour instead of washing out or brightening; on
- * the border one sample has weight 1 and the other 0, which is what lets the edges wrap.
+ * Make the rectified patch a tile in world space (phase 2n). An axis whose paint repeats on a clear
+ * period is cropped to whole periods, starting on the darkest row (column) of the period, so the tile's
+ * two ends are the two halves of one joint and it wraps with no blend there. An axis without one is
+ * cross-faded with a copy offset by half a tile over a narrow band along its own edges (the 2-sample
+ * overlap blend `transferDetail` uses). Only the deviation from the patch's mean is cross-faded and
+ * renormalised by `1 / sqrt(w1^2 + w2^2)`, so the band keeps the grain's amplitude and the patch's
+ * colour instead of washing out or brightening; on the border one sample has weight 1 and the other 0,
+ * which is what lets the edges wrap.
+ *
+ * The crop is what the swatch's own extent has to follow: a cropped axis covers less than `side`, so
+ * the tile reports `metresX` and `metresY` and a game repeats it with both. The pixel grid itself is
+ * untouched (whole rows and columns are dropped, never resampled), so the metres per pixel stay the
+ * patch's own on both axes.
  */
-export function makeSwatchTileable(src: Uint8ClampedArray, size = SWATCH_SIZE, seamShare = SWATCH_SEAM_SHARE): Uint8ClampedArray {
-  const half = size >> 1;
-  const band = Math.max(1, Math.round(size * seamShare));
+export function tileSwatch(rectified: Uint8ClampedArray, side: number, size = SWATCH_SIZE): SwatchTile {
+  // One profile per axis: the mean over a row says what a course does down y, the mean over a column
+  // says what a joint does across x.
+  const rows = smoothed(axisProfile(rectified, size, true));
+  const columns = smoothed(axisProfile(rectified, size, false));
+  const periodY = axisPeriod(rows);
+  const periodX = axisPeriod(columns);
+  const croppedY = periodY > 0 ? periodCrop(rows, periodY) : undefined;
+  const croppedX = periodX > 0 ? periodCrop(columns, periodX) : undefined;
+  const left = croppedX?.start ?? 0;
+  const top = croppedY?.start ?? 0;
+  const width = croppedX?.length ?? size;
+  const height = croppedY?.length ?? size;
   const mean = [0, 0, 0];
-  for (let i = 0; i < size * size; i++) for (let c = 0; c < 3; c++) mean[c] = mean[c]! + src[4 * i + c]!;
-  for (let c = 0; c < 3; c++) mean[c] = mean[c]! / (size * size);
-  const out = new Uint8ClampedArray(src.length);
-  for (let y = 0; y < size; y++) {
-    const y2 = (y + half) % size;
-    for (let x = 0; x < size; x++) {
-      const x2 = (x + half) % size;
-      // 0 on the patch's border, 1 the band's width in: the same weight on all four sides, so the
-      // four edges wrap into each other.
-      const near = Math.min(1, Math.min(x, size - 1 - x, y, size - 1 - y) / band);
-      const w1 = near;
-      const w2 = 1 - near;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const at = 4 * ((top + y) * size + left + x);
+      for (let c = 0; c < 3; c++) mean[c] = mean[c]! + rectified[at + c]!;
+    }
+  }
+  for (let c = 0; c < 3; c++) mean[c] = mean[c]! / (width * height);
+  const bandX = Math.max(1, Math.round(width * SWATCH_SEAM_SHARE));
+  const bandY = Math.max(1, Math.round(height * SWATCH_SEAM_SHARE));
+  const out = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    // A cropped axis is not blended and not rolled: its two ends already continue each other.
+    const nearY = croppedY ? 1 : edgeWeight(y, height, bandY);
+    const y2 = croppedY ? y : (y + (height >> 1)) % height;
+    for (let x = 0; x < width; x++) {
+      const nearX = croppedX ? 1 : edgeWeight(x, width, bandX);
+      const x2 = croppedX ? x : (x + (width >> 1)) % width;
+      const w1 = Math.min(nearX, nearY);
+      const w2 = 1 - w1;
       const scale = 1 / Math.sqrt(w1 * w1 + w2 * w2);
-      const a = 4 * (y * size + x);
-      const b = 4 * (y2 * size + x2);
+      const a = 4 * (y * width + x);
+      const b = 4 * ((top + y2) * size + left + x2);
+      const c0 = 4 * ((top + y) * size + left + x);
       for (let c = 0; c < 3; c++) {
         const m = mean[c]!;
-        out[a + c] = m + scale * (w1 * (src[a + c]! - m) + w2 * (src[b + c]! - m));
+        out[a + c] = m + scale * (w1 * (rectified[c0 + c]! - m) + w2 * (rectified[b + c]! - m));
       }
       out[a + 3] = 255;
     }
   }
+  return {
+    pixels: out,
+    width,
+    height,
+    metresX: (side * width) / size,
+    metresY: (side * height) / size,
+    periodX: croppedX ? periodX : 0,
+    periodY: croppedY ? periodY : 0,
+  };
+}
+
+/** 0 on the border of the band, 1 the band's width in: the same weight on both of an axis' edges. */
+function edgeWeight(at: number, span: number, band: number): number {
+  return Math.min(1, Math.min(at, span - 1 - at) / band);
+}
+
+/** Mean luminance per row of a square image (courses down y) or per column (setts across x). */
+function axisProfile(image: Uint8ClampedArray, size: number, perRow: boolean): Float64Array {
+  const out = new Float64Array(size);
+  for (let a = 0; a < size; a++) {
+    let sum = 0;
+    for (let b = 0; b < size; b++) {
+      const at = 4 * (perRow ? a * size + b : b * size + a);
+      sum += 0.299 * image[at]! + 0.587 * image[at + 1]! + 0.114 * image[at + 2]!;
+    }
+    out[a] = sum / size;
+  }
   return out;
+}
+
+/** A 3-tap box over the profile: the paint's own grain is not a course, and would fake two peaks. */
+function smoothed(profile: Float64Array): Float64Array {
+  const count = profile.length;
+  const out = new Float64Array(count);
+  for (let i = 0; i < count; i++) {
+    const before = profile[Math.max(0, i - 1)]!;
+    const after = profile[Math.min(count - 1, i + 1)]!;
+    out[i] = (before + profile[i]! + after) / 3;
+  }
+  return out;
+}
+
+/**
+ * The repeat this profile shows, in px, or 0 when it shows none. The normalised autocorrelation's first
+ * peak after its first trough: a coursed wall's row profile is a square wave whose correlation is back
+ * to ~1 at one course height, while a profile without a repeat never peaks.
+ */
+function axisPeriod(values: Float64Array): number {
+  const count = values.length;
+  const longest = Math.floor(count / 2);
+  if (longest <= SWATCH_PERIOD_MIN_LAG) return 0;
+  const mean = values.reduce((sum, value) => sum + value, 0) / count;
+  let energy = 0;
+  for (let i = 0; i < count; i++) energy += (values[i]! - mean) ** 2;
+  // A constant profile — a checkerboard's rows are all the same — has no period at all.
+  if (!(energy / count > 1e-6)) return 0;
+  const r = new Float64Array(longest + 1);
+  for (let lag = 1; lag <= longest; lag++) {
+    let dot = 0;
+    let before = 0;
+    let after = 0;
+    for (let i = 0; i + lag < count; i++) {
+      const a = values[i]! - mean;
+      const b = values[i + lag]! - mean;
+      dot += a * b;
+      before += a * a;
+      after += b * b;
+    }
+    r[lag] = before > 0 && after > 0 ? dot / Math.sqrt(before * after) : 0;
+  }
+  let trough = -1;
+  for (let lag = SWATCH_PERIOD_MIN_LAG; lag < longest; lag++) {
+    if (r[lag]! < r[lag - 1]! && r[lag]! <= r[lag + 1]!) {
+      trough = lag;
+      break;
+    }
+  }
+  if (trough < 0) return 0;
+  // The shortest repeat that is clearly one: a later, stronger peak is a multiple of it, and taking that
+  // would cost the swatch the paint of the periods it skips. A peak also has to climb out of the trough —
+  // one that sits on a plateau's noise is no repeat — and be a peak at all, so a period longer than the
+  // window, which only rises to its edge, is not read as one.
+  let best = 0;
+  for (let lag = trough + 1; lag < longest; lag++) {
+    if (!(r[lag]! >= r[lag - 1]! && r[lag]! >= r[lag + 1]!)) continue;
+    if (r[lag]! < SWATCH_PERIOD_MIN_CORRELATION || r[lag]! - r[trough]! < SWATCH_PERIOD_MIN_RISE) continue;
+    best = lag;
+    break;
+  }
+  if (best === 0) return 0;
+  // The peak has to be one the window can hold: a crop needs whole periods, and enough of them to be a repeat.
+  return Math.floor(count / best) >= SWATCH_MIN_PERIODS ? best : 0;
+}
+
+/**
+ * Where to cut a rectified swatch on an axis with a period: the longest whole number of periods that
+ * opens on a mortar joint, so the paint carries on across the wrap and the wrap needs no blend. A start
+ * that leaves no whole period is given up for one period less, so the clearest joint in the image is
+ * the one the seam lands in.
+ */
+function periodCrop(values: Float64Array, period: number): { start: number; length: number } | undefined {
+  const count = values.length;
+  // Fold the profile onto one period: the mean over every occurrence of each phase. Folding averages
+  // the patch's own lighting gradient out, so the joint this finds is the paint's, not its shading.
+  const folded = new Float64Array(period);
+  for (let phase = 0; phase < period; phase++) {
+    let sum = 0;
+    let seen = 0;
+    for (let at = phase; at < count; at += period) {
+      sum += values[at]!;
+      seen++;
+    }
+    folded[phase] = sum / seen;
+  }
+  let darkest = 0;
+  for (let phase = 1; phase < period; phase++) if (folded[phase]! < folded[darkest]!) darkest = phase;
+  const mid = (Math.min(...folded) + Math.max(...folded)) / 2;
+  // A joint is a narrow band of a course, not a broad tonal patch (see SWATCH_JOINT_MAX_SHARE).
+  let below = 0;
+  for (let phase = 0; phase < period; phase++) if (folded[phase]! < mid) below++;
+  if (below > period * SWATCH_JOINT_MAX_SHARE) return undefined;
+  // The joint's first row, not its darkest: then the whole joint opens the tile and the tile's last row
+  // is the brick just before the next one, so the wrap reads as one ordinary joint. Starting on the
+  // darkest row instead would split the joint across the seam and leave half of it there.
+  let joint = darkest;
+  for (let up = 1; up < period >> 2; up++) {
+    const phase = (darkest - up + period) % period;
+    if (folded[phase]! >= mid) break;
+    joint = phase;
+  }
+  for (let periods = Math.floor(count / period); periods >= SWATCH_MIN_PERIODS; periods--) {
+    const length = periods * period;
+    // The clearest joint of that phase: the darkest of its occurrences that still leaves whole periods.
+    let start = -1;
+    let lowest = Infinity;
+    for (let row = joint; row + length <= count; row += period) {
+      if (values[row]! < lowest) {
+        lowest = values[row]!;
+        start = row;
+      }
+    }
+    if (start >= 0) return { start, length };
+  }
+  return undefined;
 }
 
 /** Bilinear RGBA sample of a square image at a continuous pixel coordinate, edges clamped. */

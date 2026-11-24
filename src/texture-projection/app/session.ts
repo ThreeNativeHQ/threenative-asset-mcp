@@ -30,12 +30,11 @@ import {
   SWATCH_CLASSES,
   SWATCH_PROBE_PX,
   SWATCH_SIDE_METRES,
-  SWATCH_SIZE,
   WALL_MAX_NY,
-  makeSwatchTileable,
   patchPainted,
   pickSwatch,
   rectifySwatch,
+  tileSwatch,
   type SwatchCandidate,
   type ViewGeometry,
 } from "./core/swatch.js";
@@ -57,11 +56,15 @@ const SWATCH_ATTEMPTS = 4;
 export interface SwatchReportEntry {
   /** Run file: `swatch_wall.png` or `swatch_floor.png`. */
   readonly file: string;
-  /** Patch side in metres. */
+  /** Patch side in metres, before the wrap crop: the largest square the view gave (see `metresX`). */
   readonly metres: number;
+  /** Extent of the cut swatch along the patch's u axis, metres: the width a game repeats it at. */
+  readonly metresX: number;
+  /** Extent along the patch's v axis, metres: its height. A cropped axis is shorter than `metres`. */
+  readonly metresY: number;
   /** Index of the accepted view it was cut from. */
   readonly view: number;
-  /** Metres of surface per swatch pixel: the scale a game tiles it at. */
+  /** Metres of surface per swatch pixel: the scale a game tiles it at. The same on both axes. */
   readonly metresPerPixel: number;
   /** Metres of surface per pixel of that view (below the above means the swatch is an upsample). */
   readonly sourceMetresPerPixel: number;
@@ -573,9 +576,9 @@ export class Session {
     if (!res.ok) throw new Error(`saving ${file} failed: ${res.status}`);
   }
 
-  /** Write one RGBA image as a run file through the local server. */
-  private async writeRunImage(runId: string, file: string, pixels: Uint8ClampedArray, size: number) {
-    await this.writeRunFile(runId, file, await toBlob(pixels, size, size, "image/png"), "application/octet-stream");
+  /** Write one RGBA image as a run file through the local server (a view's image, a swatch). */
+  private async writeRunImage(runId: string, file: string, pixels: Uint8ClampedArray, width: number, height = width) {
+    await this.writeRunFile(runId, file, await toBlob(pixels, width, height, "image/png"), "application/octet-stream");
   }
 
   /** Write one finished view's images to the run directory through the local server, then drop them. */
@@ -646,6 +649,8 @@ export class Session {
       }
     }
     for (const klass of SWATCH_CLASSES) {
+      // The view's own pixels, worst axis first (a floor at 60 degrees covers 2x as much surface along
+      // depth as across): the swatch can be no finer than the paint it is cut from.
       const ranked = candidates
         .filter((candidate) => candidate.klass === klass)
         .sort((a, b) => a.sourceMetresPerPixel - b.sourceMetresPerPixel);
@@ -660,12 +665,16 @@ export class Session {
         const painted = new Uint8Array(composite.length / 4);
         for (let i = 0; i < painted.length; i++) painted[i] = composite[4 * i + 3]! > 127 ? 1 : 0;
         if (!patchPainted(candidate.patch, view.spec, painted, engine.size)) continue;
-        const swatch = makeSwatchTileable(rectifySwatch(candidate.patch, view.spec, generation, engine.size));
+        // The rectified patch is cut to whole courses where the paint repeats (phase 2n), so it wraps
+        // on a joint instead of in a blend band: that is what sets the swatch's own extent per axis.
+        const tile = tileSwatch(rectifySwatch(candidate.patch, view.spec, generation, engine.size), candidate.patch.side);
         const file = `swatch_${klass}.png`;
-        await this.writeRunImage(runId, file, swatch, SWATCH_SIZE);
+        await this.writeRunImage(runId, file, tile.pixels, tile.width, tile.height);
         report[klass] = {
           file,
-          metres: candidate.patch.side,
+          metres: tile.metresX,
+          metresX: tile.metresX,
+          metresY: tile.metresY,
           view: candidate.view,
           metresPerPixel: candidate.metresPerPixel,
           sourceMetresPerPixel: candidate.sourceMetresPerPixel,

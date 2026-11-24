@@ -497,9 +497,15 @@ describe("texture-projection runner", () => {
       for (const klass of cut) {
         const swatch = swatches[klass]!;
         expect(swatch.file).toBe(`${basename(outputPath).replace(/\.\w+$/, "")}.swatch_${klass}.png`);
-        expect(swatch.metres).toBe(klass === "wall" ? 1.5 : 2);
-        expect(swatch.metresPerPixel).toBeCloseTo(swatch.metres / 1024, 9);
-        expect(swatch.incidence).toBeLessThan(50);
+        // A swatch is cut to whole courses where the paint repeats (phase 2n), so it is no wider than the
+        // patch it came from: `metres` follows the width, and the scale stays the patch's own on both axes.
+        const side = klass === "wall" ? 1.5 : 2;
+        expect(swatch.metres).toBe(swatch.metresX);
+        expect(swatch.metresX).toBeLessThanOrEqual(side);
+        expect(swatch.metresY).toBeGreaterThan(0);
+        expect(swatch.metresY).toBeLessThanOrEqual(side);
+        expect(swatch.metresPerPixel).toBeCloseTo(side / 1024, 9);
+        expect(swatch.incidence).toBeLessThan(klass === "wall" ? 50 : 65);
         expect(swatch.corners).toHaveLength(4);
         expect((await readFile(swatch.path)).subarray(1, 4).toString("utf8")).toBe("PNG");
         const inRun = await readFile(join(cwd, ".threenative", "texture-projection", result.runId, `swatch_${klass}.png`));
@@ -507,9 +513,15 @@ describe("texture-projection runner", () => {
         expect(swatch.sourceMetresPerPixel).toBeGreaterThan(0);
         expect(swatch.view).toBeGreaterThanOrEqual(0);
       }
-      const swatchFile = JSON.parse(await readFile(swatches.jsonPath, "utf8")) as Record<string, { file: string }>;
+      const swatchFile = JSON.parse(await readFile(swatches.jsonPath, "utf8")) as Record<
+        string,
+        { file: string; metresY: number }
+      >;
       expect(Object.keys(swatchFile).sort()).toEqual([...cut].sort());
-      for (const klass of cut) expect(swatchFile[klass]?.file).toBe(swatches[klass]!.file);
+      for (const klass of cut) {
+        expect(swatchFile[klass]?.file).toBe(swatches[klass]!.file);
+        expect(swatchFile[klass]?.metresY).toBe(swatches[klass]!.metresY);
+      }
 
       const everything = [runText, JSON.stringify(result), logged.join("\n"), stdout.mock.calls.flat().join("\n"), stderr.mock.calls.flat().join("\n")].join("\n");
       expect(everything).not.toContain(FAKE_KEY);

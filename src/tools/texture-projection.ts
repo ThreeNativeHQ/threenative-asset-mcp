@@ -171,7 +171,15 @@ const SwatchSchema = z
   .object({
     file: z.string().describe("File name beside the GLB, e.g. courtyard.swatch_wall.png."),
     path: z.string().describe("Absolute path of that file."),
-    metres: z.number().positive().describe("Patch side in metres: the tile a game repeats."),
+    metres: z.number().positive().describe("Patch side in metres, before the wrap crop: the largest square the view gave."),
+    metresX: z
+      .number()
+      .positive()
+      .describe("Extent of the cut swatch across, metres: the width a game repeats it at."),
+    metresY: z
+      .number()
+      .positive()
+      .describe("Extent of the cut swatch up, metres: its height (a cropped axis is shorter than metres)."),
     view: z.number().int().nonnegative().describe("Accepted view the swatch was cut from."),
     metresPerPixel: z.number().positive().describe("Metres of surface per swatch pixel (its true scale)."),
     sourceMetresPerPixel: z

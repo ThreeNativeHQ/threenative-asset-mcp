@@ -4,19 +4,21 @@ import { describe, expect, it } from "vitest";
 import {
   SWATCH_MAX_INCIDENCE_DEG,
   SWATCH_SIZE,
-  makeSwatchTileable,
   pickSwatch,
   rectifySwatch,
+  tileSwatch,
   type SwatchCandidate,
+  type SwatchTile,
   type ViewGeometry,
 } from "../src/texture-projection/app/core/swatch.js";
 import { makeCamera, type ViewSpec } from "../src/texture-projection/app/core/views.js";
 
 /**
- * The swatch math on a synthetic world (PRD-916 phase 2m): a camera, one infinite plane, and an image
- * painted on that plane at a known metric scale. The swatch must read the pattern back at its own
- * true scale — the same period along both of its axes, within 2% of the real one — and its edges must
- * wrap, which a plain rectified patch does not.
+ * The swatch math on a synthetic world (PRD-916 phases 2m and 2n): a camera, one infinite plane, and
+ * an image painted on that plane at a known metric scale. The swatch must read the pattern back at its
+ * own true scale — the same period along both of its axes, within 2% of the real one — and it must
+ * tile: an axis with a clear repeat is cropped to whole repeats so it wraps on a joint, an axis
+ * without one is cross-faded, and a floor may be cut from a view that sees it obliquely.
  */
 
 /** Synthetic view and generation size, px. */
@@ -127,23 +129,56 @@ const waves = (x: number, y: number): Triple => [
   128,
 ];
 
-/** One channel of a swatch, along a row (`horizontal`) or down a column, at `line`. */
-function sample(image: Uint8ClampedArray, line: number, step: number, channel: number, horizontal: boolean): number {
-  const at = horizontal ? line * SWATCH_SIZE + step : step * SWATCH_SIZE + line;
-  return image[4 * at + channel]!;
+/**
+ * Broad 0.25 m bands of dark and light: a repeat the autocorrelation sees clearly (six of them fit the
+ * patch) but which is a tonal patch, half the period dark, not a joint. Moss on a sett floor looks like
+ * this, and cutting a swatch there would butt two unrelated patches together.
+ */
+const blotches = (x: number): Triple => (((x % PERIOD) + PERIOD) % PERIOD) < PERIOD / 2 ? [40, 40, 40] : [220, 220, 220];
+
+/** A running bond: 0.3 m bricks, 0.125 m courses, a 12 mm mortar joint, every other course offset. */
+const BRICK_LONG = 0.3;
+const BRICK_HIGH = 0.125;
+const MORTAR = 0.012;
+const brick = (x: number, y: number): Triple => {
+  const course = Math.floor(y / BRICK_HIGH);
+  const offset = (((course % 2) + 2) % 2) * (BRICK_LONG / 2);
+  const along = (((x - offset) % BRICK_LONG) + BRICK_LONG) % BRICK_LONG;
+  const up = ((y % BRICK_HIGH) + BRICK_HIGH) % BRICK_HIGH;
+  return along < MORTAR || up < MORTAR ? [70, 70, 70] : [180, 140, 120];
+};
+
+/** A painted image with its own dimensions: a swatch is only square while nothing was cropped. */
+interface Frame {
+  readonly pixels: Uint8ClampedArray;
+  readonly width: number;
+  readonly height: number;
+}
+
+const frameOf = (tile: SwatchTile): Frame => ({ pixels: tile.pixels, width: tile.width, height: tile.height });
+/** A rectified patch as it comes off `rectifySwatch`: the whole square, before any crop. */
+const rectifiedFrame = (pixels: Uint8ClampedArray): Frame => ({ pixels, width: SWATCH_SIZE, height: SWATCH_SIZE });
+
+/** One channel of a frame, along a row (`horizontal`) or down a column, at `line`. */
+function sample(frame: Frame, line: number, step: number, channel: number, horizontal: boolean): number {
+  const at = horizontal ? line * frame.width + step : step * frame.width + line;
+  return frame.pixels[4 * at + channel]!;
 }
 
 /**
- * The pattern's metric period along one line, in swatch pixels: a checker alternates from cell to
- * cell, so its crossings are one cell apart, and their positions against their index give the cell
- * size by least squares (each crossing has its own sub-pixel error; a fit does not add them up).
+ * The pattern's metric period along one line, in pixels: a checker alternates from cell to cell, so
+ * its crossings are one cell apart, and their positions against their index give the cell size by
+ * least squares (each crossing has its own sub-pixel error; a fit does not add them up). With
+ * `entering` only the light-to-dark crossings count, which is one per mortar joint: a joint is a
+ * stripe, so counting both of its edges would fit half its spacing.
  */
-function periodAlong(image: Uint8ClampedArray, line: number, channel: number, horizontal: boolean): number {
+function periodAlong(frame: Frame, line: number, channel: number, horizontal: boolean, entering: boolean): number {
+  const length = horizontal ? frame.width : frame.height;
   const crossings: number[] = [];
-  let previous = sample(image, line, 0, channel, horizontal) > 128;
-  for (let step = 1; step < SWATCH_SIZE; step++) {
-    const value = sample(image, line, step, channel, horizontal) > 128;
-    if (value !== previous) crossings.push(step - 0.5);
+  let previous = sample(frame, line, 0, channel, horizontal) > 128;
+  for (let step = 1; step < length; step++) {
+    const value = sample(frame, line, step, channel, horizontal) > 128;
+    if (value !== previous && (!entering || value)) crossings.push(step - 0.5);
     previous = value;
   }
   if (crossings.length < 4) return Number.NaN;
@@ -159,12 +194,76 @@ function periodAlong(image: Uint8ClampedArray, line: number, channel: number, ho
 }
 
 /** The median period over a few lines, so one line that happens to sit on a cell edge cannot decide it. */
-function medianPeriod(image: Uint8ClampedArray, channel: number, horizontal: boolean): number {
+function medianPeriod(frame: Frame, channel: number, horizontal: boolean, entering = false): number {
+  const span = horizontal ? frame.height : frame.width;
   const periods = [0.33, 0.37, 0.41, 0.55, 0.59]
-    .map((share) => periodAlong(image, Math.round(share * SWATCH_SIZE), channel, horizontal))
+    .map((share) => periodAlong(frame, Math.round(share * span), channel, horizontal, entering))
     .filter((period) => Number.isFinite(period))
     .sort((a, b) => a - b);
   return periods[Math.floor(periods.length / 2)]!;
+}
+
+/** Luminance of every row of a frame, the profile a course shows in. */
+function rowLuminance(frame: Frame): Float64Array {
+  const out = new Float64Array(frame.height);
+  for (let y = 0; y < frame.height; y++) {
+    let sum = 0;
+    for (let x = 0; x < frame.width; x++) {
+      const at = 4 * (y * frame.width + x);
+      sum += 0.299 * frame.pixels[at]! + 0.587 * frame.pixels[at + 1]! + 0.114 * frame.pixels[at + 2]!;
+    }
+    out[y] = sum / frame.width;
+  }
+  return out;
+}
+
+/** The row profile of `frame` read across the wrap: `span` rows before the seam, then `span` after. */
+function acrossSeam(frame: Frame, span: number): number[] {
+  const rows = rowLuminance(frame);
+  return Array.from({ length: 2 * span + 1 }, (_, i) => rows[(((i - span) % frame.height) + frame.height) % frame.height]!);
+}
+
+/** The runs of rows darker than `mid`, in image order: one run per mortar joint. */
+function joints(rows: Float64Array, mid: number): number[] {
+  const runs: number[] = [];
+  let run = 0;
+  for (const value of rows) {
+    if (value < mid) run++;
+    else if (run > 0) {
+      runs.push(run);
+      run = 0;
+    }
+  }
+  if (run > 0) runs.push(run);
+  return runs;
+}
+
+/** The rows below `mid` that straddle the wrap: the two ends of the tile are one joint across it. */
+function seamJoint(rows: Float64Array, mid: number): number {
+  let before = 0;
+  for (let at = rows.length - 1; at >= 0 && rows[at]! < mid; at--) before++;
+  let after = 0;
+  for (let at = 0; at < rows.length && rows[at]! < mid; at++) after++;
+  return before + after;
+}
+
+/** 1 where the plane is seen inside `low`..`high` degrees of its normal: a class' sampling window. */
+function incidenceBand(view: SyntheticView, low: number, high: number): Uint8Array {
+  const eye = makeCamera(view.geometry.spec).position;
+  const { position, normal, size } = view.geometry;
+  const band = new Uint8Array(size * size);
+  for (let i = 0; i < band.length; i++) {
+    if (normal[4 * i + 3]! < 0.5) continue;
+    const at = 4 * i;
+    const cosine =
+      ((eye.x - position[at]!) * normal[at]! +
+        (eye.y - position[at + 1]!) * normal[at + 1]! +
+        (eye.z - position[at + 2]!) * normal[at + 2]!) /
+      position[at + 3]!;
+    const incidence = (Math.acos(Math.min(1, cosine)) * 180) / Math.PI;
+    if (incidence >= low && incidence <= high) band[i] = 1;
+  }
+  return band;
 }
 
 function patchOf(view: SyntheticView, klass: "wall" | "floor", side: number): SwatchCandidate {
@@ -189,11 +288,11 @@ describe("material swatch rectification", () => {
   it("reproduces the paint at its true metric period, on both axes", () => {
     const candidate = patchOf(wall, "wall", SIDE);
     expect(candidate.incidence).toBeGreaterThan(5);
-    expect(candidate.incidence).toBeLessThan(SWATCH_MAX_INCIDENCE_DEG);
+    expect(candidate.incidence).toBeLessThan(SWATCH_MAX_INCIDENCE_DEG.wall);
     expect(candidate.patch.side).toBe(SIDE);
     // The swatch is 1.5 m over 1024 px; a 0.25 m tile is 1024 / 6 px.
     const expected = SWATCH_SIZE * (PERIOD / SIDE);
-    const swatch = makeSwatchTileable(rectifySwatch(candidate.patch, spec, wall.generation, VIEW));
+    const swatch = frameOf(tileSwatch(rectifySwatch(candidate.patch, spec, wall.generation, VIEW), candidate.patch.side));
     const horizontal = medianPeriod(swatch, 0, true);
     const vertical = medianPeriod(swatch, 0, false);
     expect(Math.abs(horizontal - expected) / expected).toBeLessThan(0.02);
@@ -235,15 +334,15 @@ describe("material swatch tiling", () => {
 
   it("wraps its edges into each other, where a plain rectified patch does not", () => {
     const candidate = patchOf(wall, "wall", SIDE);
-    const rectified = rectifySwatch(candidate.patch, spec, wall.generation, VIEW);
-    const tiled = makeSwatchTileable(rectified);
-    const edgeStep = (image: Uint8ClampedArray) => {
+    const rectified = rectifiedFrame(rectifySwatch(candidate.patch, spec, wall.generation, VIEW));
+    const tiled = frameOf(tileSwatch(rectified.pixels, candidate.patch.side));
+    const edgeStep = (frame: Frame) => {
       let worst = 0;
       for (const share of [0.2, 0.3, 0.5, 0.7, 0.8]) {
-        const line = Math.round(share * SWATCH_SIZE);
+        const line = Math.round(share * frame.height);
         for (const channel of [0, 1]) {
-          worst = Math.max(worst, Math.abs(sample(image, line, 0, channel, true) - sample(image, line, SWATCH_SIZE - 1, channel, true)));
-          worst = Math.max(worst, Math.abs(sample(image, line, 0, channel, false) - sample(image, line, SWATCH_SIZE - 1, channel, false)));
+          worst = Math.max(worst, Math.abs(sample(frame, line, 0, channel, true) - sample(frame, line, frame.width - 1, channel, true)));
+          worst = Math.max(worst, Math.abs(sample(frame, line, 0, channel, false) - sample(frame, line, frame.height - 1, channel, false)));
         }
       }
       return worst;
@@ -251,26 +350,26 @@ describe("material swatch tiling", () => {
     // The patch's paint is 1.5 m of a wave that repeats every 0.6 m: laid end to end it would not
     // meet, so the plain rectified patch has a hard cut on both axes.
     expect(edgeStep(rectified)).toBeGreaterThan(40);
-    // The tile's border pixels come from one source pixel apart, so the join is a continuous one: the
-    // paint's own step over a single view pixel (a few levels of 255), nothing more.
+    // The tile wraps instead: an axis with a clear repeat is cut on one (no blend at all), and an axis
+    // without one is cross-faded from a sample one pixel apart — either way the join is continuous.
     expect(edgeStep(tiled)).toBeLessThan(12);
   });
 
   it("keeps the paint's grain and colour through the seam band", () => {
     const candidate = patchOf(wall, "wall", SIDE);
-    const rectified = rectifySwatch(candidate.patch, spec, wall.generation, VIEW);
-    const tiled = makeSwatchTileable(rectified);
-    const stats = (image: Uint8ClampedArray) => {
+    const rectified = rectifiedFrame(rectifySwatch(candidate.patch, spec, wall.generation, VIEW));
+    const tiled = frameOf(tileSwatch(rectified.pixels, candidate.patch.side));
+    const stats = (frame: Frame) => {
       let mean = 0;
       let min = 255;
       let max = 0;
-      for (let i = 0; i < SWATCH_SIZE * SWATCH_SIZE; i++) {
-        const value = image[4 * i]!;
+      for (let i = 0; i < frame.width * frame.height; i++) {
+        const value = frame.pixels[4 * i]!;
         mean += value;
         min = Math.min(min, value);
         max = Math.max(max, value);
       }
-      return { mean: mean / SWATCH_SIZE / SWATCH_SIZE, min, max };
+      return { mean: mean / frame.width / frame.height, min, max };
     };
     const before = stats(rectified);
     const after = stats(tiled);
@@ -279,6 +378,79 @@ describe("material swatch tiling", () => {
     // The band's two samples are the same paint half a tile apart, so the patch's own tone survives
     // it to within a couple of levels (the amplitude rescale cannot shift a wider pattern's mean).
     expect(Math.abs(after.mean - before.mean)).toBeLessThan(8);
+  });
+});
+
+describe("material swatch courses", () => {
+  const spec = lookAt(5, [1.8, 2.2, 3.4], [0.2, 1.4, 0]);
+  const wall = renderPlane(spec, [0, 0, 0], [0, 0, 1], brick);
+  const COURSE = SWATCH_SIZE * (BRICK_HIGH / SIDE);
+  const cut = () => {
+    const candidate = patchOf(wall, "wall", SIDE);
+    return tileSwatch(rectifySwatch(candidate.patch, spec, wall.generation, VIEW), candidate.patch.side);
+  };
+
+  it("wraps a running bond on a mortar joint, with no blend band to double it", () => {
+    const tile = cut();
+    // The courses were found and the height cut to whole ones, so a course sits on the seam.
+    expect(tile.periodY).toBe(Math.round(COURSE));
+    expect(tile.height % tile.periodY).toBe(0);
+    expect(tile.height).toBeLessThan(SWATCH_SIZE);
+    const rows = rowLuminance(frameOf(tile));
+    const mid = (Math.min(...rows) + Math.max(...rows)) / 2;
+    // Exactly one joint in the quarter period either side of the wrap, and it is a joint: a patch cut
+    // through brick or a half-tile blend (which mixes two layouts) misses it or shows more than one.
+    const profile = acrossSeam(frameOf(tile), Math.round(COURSE / 4));
+    const minima: number[] = [];
+    for (let i = 1; i < profile.length - 1; i++) {
+      if (profile[i]! < mid && profile[i]! <= profile[i - 1]! && profile[i]! <= profile[i + 1]!) minima.push(i);
+    }
+    expect(minima).toHaveLength(1);
+    // And the joint across the seam is one joint wide, not two: it matches the joints inside the tile.
+    const inside = joints(rows, mid).sort((a, b) => a - b);
+    const joint = inside[Math.floor(inside.length / 2)]!;
+    // One whole joint opens the tile (a half one would leave a thin mortar line at the wrap, two would
+    // read as doubled mortar): the same width as the joints inside the tile, give or take a row.
+    expect(seamJoint(rows, mid)).toBeGreaterThanOrEqual(Math.round(joint * 0.75));
+    expect(seamJoint(rows, mid)).toBeLessThanOrEqual(Math.round(joint * 1.25));
+  });
+
+  it("does not cut an axis whose repeat is a tonal patch rather than a joint", () => {
+    const spec = lookAt(6, [1.8, 2.2, 3.4], [0.2, 1.4, 0]);
+    const wall = renderPlane(spec, [0, 0, 0], [0, 0, 1], blotches);
+    const candidate = patchOf(wall, "wall", SIDE);
+    const tile = tileSwatch(rectifySwatch(candidate.patch, spec, wall.generation, VIEW), candidate.patch.side);
+    // The bands repeat every 0.25 m, so the period is there; the dip they make is half the period wide,
+    // so it is not a mortar joint and the axis keeps its narrow cross-fade instead of a hard cut.
+    expect(tile.periodX).toBe(0);
+    expect(tile.width).toBe(SWATCH_SIZE);
+    expect(tile.metresX).toBeCloseTo(SIDE, 9);
+    // The bands are still in the swatch, dark and light: it blended the axis, it did not lose the paint.
+    let dark = 255;
+    let light = 0;
+    for (let i = 0; i < tile.width * tile.height; i++) {
+      dark = Math.min(dark, tile.pixels[4 * i]!);
+      light = Math.max(light, tile.pixels[4 * i]!);
+    }
+    expect(dark).toBeLessThan(60);
+    expect(light).toBeGreaterThan(200);
+  });
+
+  it("keeps the paint's metric scale on both axes through the crop", () => {
+    const tile = cut();
+    // Whole rows and columns are dropped, never resampled: the pixel grid keeps the patch's scale, and
+    // the tile only covers less of it.
+    expect(tile.metresX).toBeCloseTo((SIDE * tile.width) / SWATCH_SIZE, 9);
+    expect(tile.metresY).toBeCloseTo((SIDE * tile.height) / SWATCH_SIZE, 9);
+    const frame = frameOf(tile);
+    // One mortar joint per crossing, so the metric measure is the joint pitch — 0.3 m of brick along a
+    // course, 0.125 m of course down the wall — read back off the cut tile.
+    const horizontal = medianPeriod(frame, 0, true, true);
+    const vertical = medianPeriod(frame, 0, false, true);
+    const expectedX = SWATCH_SIZE * (BRICK_LONG / SIDE);
+    const expectedY = COURSE;
+    expect(Math.abs(horizontal - expectedX) / expectedX).toBeLessThan(0.02);
+    expect(Math.abs(vertical - expectedY) / expectedY).toBeLessThan(0.02);
   });
 });
 
@@ -294,7 +466,38 @@ describe("material swatch search", () => {
     const toEye = [spec.position[0] - centreX, spec.position[1] - centreY, spec.position[2] - centreZ];
     const incidence = (Math.acos(toEye[1]! / Math.hypot(...toEye)) * 180) / Math.PI;
     expect(candidate.incidence).toBeCloseTo(incidence, 3);
-    expect(candidate.incidence).toBeLessThan(SWATCH_MAX_INCIDENCE_DEG);
+    expect(candidate.incidence).toBeLessThan(SWATCH_MAX_INCIDENCE_DEG.floor);
+  });
+
+  it("cuts a 2 m floor patch from a ground view that only sees it at 60 degrees", () => {
+    // The real run's shape (phase 2n): a player-height camera pitched 2 degrees up sees no floor nearer
+    // than 2 m away, so the flattest patch it can give is past 50 degrees of the floor's normal. That is
+    // still true scale after rectification, only softer along depth, so the floor class takes it.
+    const spec: ViewSpec = { id: 10, position: [0, 1.7, 0], yaw: 0, pitch: (2 * Math.PI) / 180, fov: FOV };
+    const floor = renderPlane(spec, [0, 0, 0], [0, 1, 0], checker);
+    const candidate = patchOf(floor, "floor", 2);
+    expect(candidate.incidence).toBeGreaterThan(SWATCH_MAX_INCIDENCE_DEG.wall);
+    expect(candidate.incidence).toBeGreaterThan(55);
+    expect(candidate.incidence).toBeLessThan(SWATCH_MAX_INCIDENCE_DEG.floor);
+  });
+
+  it("takes the floor at 60 degrees of its normal and refuses it at 70", () => {
+    const spec: ViewSpec = { id: 11, position: [0, 1.7, 0], yaw: 0, pitch: (2 * Math.PI) / 180, fov: FOV };
+    const floor = renderPlane(spec, [0, 0, 0], [0, 1, 0], checker);
+    const search = (low: number, high: number) =>
+      pickSwatch(floor.geometry, {
+        klass: "floor",
+        side: 2,
+        view: 11,
+        viewSize: VIEW,
+        area: incidenceBand(floor, low, high),
+      });
+    // Only the floor class' ceiling lets a patch this oblique through: the wall's 50 would refuse it.
+    const accepted = search(56, 62);
+    expect(accepted).toBeDefined();
+    expect(accepted!.incidence).toBeGreaterThan(SWATCH_MAX_INCIDENCE_DEG.wall);
+    expect(accepted!.incidence).toBeLessThan(SWATCH_MAX_INCIDENCE_DEG.floor);
+    expect(search(66, 74)).toBeUndefined();
   });
 
   it("refuses a floor patch a standing view only sees at a graze", () => {

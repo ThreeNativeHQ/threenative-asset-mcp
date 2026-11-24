@@ -120,8 +120,12 @@ export interface TextureProjectionSwatch {
   readonly file: string;
   /** Absolute path of that file. */
   readonly path: string;
-  /** Patch side in metres. */
+  /** Patch side in metres, before the wrap crop: the largest square the view gave (see `metresX`). */
   readonly metres: number;
+  /** Extent of the cut swatch along the patch's u axis, metres: the width a game repeats it at. */
+  readonly metresX: number;
+  /** Extent along the patch's v axis, metres: its height. A cropped axis is shorter than `metres`. */
+  readonly metresY: number;
   /** Index of the accepted view it was cut from. */
   readonly view: number;
   /** Metres of surface per swatch pixel: the scale a game tiles it at in world space. */
@@ -245,6 +249,8 @@ interface BrowserPromptTest {
 interface BrowserSwatch {
   readonly file: string;
   readonly metres: number;
+  readonly metresX: number;
+  readonly metresY: number;
   readonly view: number;
   readonly metresPerPixel: number;
   readonly sourceMetresPerPixel: number;
@@ -420,6 +426,8 @@ async function copySwatches(
       file,
       path,
       metres: swatch.metres,
+      metresX: swatch.metresX,
+      metresY: swatch.metresY,
       view: swatch.view,
       metresPerPixel: swatch.metresPerPixel,
       sourceMetresPerPixel: swatch.sourceMetresPerPixel,
@@ -444,6 +452,8 @@ function swatchEntry(swatch: TextureProjectionSwatch) {
   return {
     file: swatch.file,
     metres: swatch.metres,
+    metresX: swatch.metresX,
+    metresY: swatch.metresY,
     view: swatch.view,
     metresPerPixel: swatch.metresPerPixel,
     sourceMetresPerPixel: swatch.sourceMetresPerPixel,
@@ -462,7 +472,7 @@ function swatchWarnings(swatches: TextureProjectionSwatches | null): string[] {
   for (const klass of ["wall", "floor"] as const) {
     if (swatches[klass] !== null) continue;
     warnings.push(
-      `no accepted view sees a ${klass === "wall" ? "1.5" : "2"} m ${klass} patch at under 50° of its normal, so the bake has no` +
+      `no accepted view sees a ${klass === "wall" ? "1.5" : "2"} m ${klass} patch head-on enough to cut one, so the bake has no` +
         ` ${klass} swatch: close-range ${klass} detail stays at the atlas' own resolution.` +
         (klass === "floor"
           ? " The ground is only seen this head-on by a view that looks down at it (a lower camera pitch, or an aerial pass)."
