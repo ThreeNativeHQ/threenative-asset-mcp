@@ -4,6 +4,7 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 import { NodeIO, Primitive } from "@gltf-transform/core";
 
 import { markProjectedAtlas } from "./glb-marker.js";
+import { DEFAULT_VERIFY_MODEL, verifyCostUsd, verifyModelFor } from "./verify.js";
 import { DEFAULT_MODEL, resolveModel } from "./models.js";
 import {
   defaultRunRoot,
@@ -71,6 +72,10 @@ export interface TextureProjectionRequest {
   readonly atlas?: number | "auto";
   readonly viewSize?: number;
   readonly styleImagePath?: string;
+  /** Check every painted view with a vision model (default true); `false` is a named override. */
+  readonly verify?: boolean;
+  /** OpenRouter chat model id for the vision check (image input, strict JSON out). */
+  readonly verifyModel?: string;
   readonly plan?: TextureProjectionPlanInput;
   readonly hooks?: TextureProjectionHooks;
   readonly env?: NodeJS.ProcessEnv;
@@ -96,6 +101,10 @@ export interface TextureProjectionQuote {
   readonly atlas: number;
   readonly estimatedBlurredTexelPercent: number;
   readonly uvStretch: UvStretchReport;
+  /** The vision check the run would pay for; null when the caller turned it off. */
+  readonly verifyModel: string | null;
+  /** Whole-run cost of the vision checks at the quoted view size, USD. */
+  readonly estimatedVerifyUsd: number;
 }
 
 export interface TextureProjectionResult {
@@ -111,7 +120,19 @@ export interface TextureProjectionResult {
   readonly atlas: number;
   /** Painted texels whose best view resolves more than ~2x2 atlas texels per image pixel (A.2). */
   readonly blurredTexelPercent: number;
-  readonly viewsRejected: { readonly grazing: number; readonly structure: number };
+  /** Island texels left unpainted by the 2x2 magnification guard, waiting for a closer view or a hole pass. */
+  readonly magnificationSkippedPercent: number;
+  /** Rejected views by reason; `verifyUnparsed` counts the unreadable answers inside `verify`. */
+  readonly viewsRejected: {
+    readonly grazing: number;
+    readonly structure: number;
+    readonly verify: number;
+    readonly verifyUnparsed: number;
+  };
+  /** Views the vision check rejected once and that were painted again with a new seed. */
+  readonly viewsRepainted: number;
+  /** The vision model that judged the views, or null when the run was painted with `verify: false`. */
+  readonly verifyModel: string | null;
 }
 
 /** How many painted views must all invent geometry before the run stops buying (B.2, fail closed). */
@@ -258,7 +279,16 @@ function pipelineOptions(request: TextureProjectionRequest): Record<string, unkn
   if (request.roofStyle !== undefined) options.roofStyle = request.roofStyle;
   if (request.firstModel !== undefined) options.firstModel = request.firstModel;
   if (request.fillModel !== undefined) options.fillModel = request.fillModel;
+  if (request.verify !== undefined) options.verify = request.verify;
+  if (request.verifyModel !== undefined) options.verifyModel = request.verifyModel;
   return options;
+}
+
+/** The vision check a request asks for, priced: off is a named override and is reported. */
+function verifyChoice(request: TextureProjectionRequest): { readonly model: string | null; readonly perView: number } {
+  if (request.verify === false) return { model: null, perView: 0 };
+  const model = request.verifyModel?.trim() || DEFAULT_VERIFY_MODEL.id;
+  return { model, perView: verifyCostUsd(verifyModelFor(model), request.viewSize ?? 1024) };
 }
 
 async function atomicWrite(path: string, bytes: Uint8Array): Promise<void> {
@@ -314,7 +344,10 @@ export async function quoteTextureProjection(
     const measurement = await app.call<BrowserMeasurement>("measure", planInput(request), false);
     const atlas = requestedAtlas === "auto" ? autoAtlasSize(measurementAtlas, measurement.medianFoot) : requestedAtlas;
     const estimatedBlurredTexelPercent = await app.call<number>("blurredPercentAt", atlas);
-    // Every planned view is one image, and the hole pass may add up to its budget on top.
+    const verify = verifyChoice(request);
+    // Every planned view is one image plus one vision check (and a rejected view may be repainted once),
+    // and the hole pass may add up to its budget on top.
+    const perView = price + verify.perView;
     return {
       level: level.name,
       model: alias,
@@ -327,10 +360,13 @@ export async function quoteTextureProjection(
       points: plan.points,
       predicted: plan.predicted,
       // Cents: the caller asked for a price, not for floating-point dust.
-      estimatedUsd: Math.round((plan.views + plan.holes) * price * 100) / 100,
+      estimatedUsd: Math.round((plan.views + plan.holes) * perView * 100) / 100,
       atlas,
       estimatedBlurredTexelPercent,
       uvStretch,
+      verifyModel: verify.model,
+      // Not cents: a whole run of checks costs a few cents, and a rounded-down 0 would read as free.
+      estimatedVerifyUsd: Math.round((plan.views + plan.holes) * verify.perView * 10_000) / 10_000,
     };
   } finally {
     await app.close();
@@ -343,7 +379,11 @@ export async function quoteTextureProjection(
  * painting session already holds the real texture, so the painted texels are the run's own; a larger
  * atlas is measured at the cap and scaled (A.2's count is a share, so scaling is exact per texel).
  */
-async function measureBlurredPercent(app: Awaited<ReturnType<typeof openAppSession>>, run: StoredRun, measurementAtlas: number): Promise<number> {
+async function measureBlurredPercent(
+  app: Awaited<ReturnType<typeof openAppSession>>,
+  run: StoredRun,
+  measurementAtlas: number,
+): Promise<{ blurred: number; magnificationSkipped: number }> {
   if (run.atlas > measurementAtlas) {
     await app.call("load", "/api/level", {
       lighting: run.lighting,
@@ -356,7 +396,10 @@ async function measureBlurredPercent(app: Awaited<ReturnType<typeof openAppSessi
   } else {
     await app.call<BrowserMeasurement>("measure", {}, true);
   }
-  return app.call<number>("blurredPercentAt", run.atlas);
+  return {
+    blurred: await app.call<number>("blurredPercentAt", run.atlas),
+    magnificationSkipped: await app.call<number>("magnificationSkippedPercentAt", run.atlas),
+  };
 }
 
 /**
@@ -460,6 +503,16 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     updatedAt: now,
   };
 
+  // A resume may ask for a different vision check: it applies to the views this call paints, never to
+  // the stored ones (they keep the verdicts run.json recorded, so nothing is re-verified for money).
+  if (stored !== undefined && (request.verify !== undefined || request.verifyModel !== undefined)) {
+    run.options = {
+      ...run.options,
+      ...(request.verify === undefined ? {} : { verify: request.verify }),
+      ...(request.verifyModel === undefined ? {} : { verifyModel: request.verifyModel }),
+    };
+  }
+
   let failure: unknown;
   let interrupt: (error: unknown) => void = () => {};
   const interrupted = new Promise<never>((_, reject) => {
@@ -520,9 +573,11 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       price: number;
       coverage: number;
       predicted: number;
-      rejected?: "grazing" | "structure";
+      rejected?: "grazing" | "structure" | "verify";
       structureDeviation?: number;
       grazingFraction?: number;
+      verify?: StoredView["verify"];
+      repainted?: boolean;
       cost: number;
       elapsed: number;
     };
@@ -542,6 +597,8 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       ...(view.rejected === undefined ? {} : { rejected: view.rejected }),
       ...(view.structureDeviation === undefined ? {} : { structureDeviation: view.structureDeviation }),
       ...(view.grazingFraction === undefined ? {} : { grazingFraction: view.grazingFraction }),
+      ...(view.verify === undefined ? {} : { verify: view.verify }),
+      ...(view.repainted === undefined ? {} : { repainted: view.repainted }),
     };
     run.views = [...run.views.filter((v) => v.index !== storedView.index), storedView].sort(
       (a, b) => a.index - b.index,
@@ -624,6 +681,7 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
     run.seconds = summary.seconds;
     run.updatedAt = new Date().toISOString();
     await writeRun(runRoot, run);
+    const measured = await measureBlurredPercent(app, run, measurementAtlas);
     return {
       runId,
       level: level.name,
@@ -637,11 +695,18 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       seconds: summary.seconds,
       complete: run.complete,
       atlas: run.atlas,
-      blurredTexelPercent: await measureBlurredPercent(app, run, measurementAtlas),
+      blurredTexelPercent: measured.blurred,
+      magnificationSkippedPercent: measured.magnificationSkipped,
       viewsRejected: {
         grazing: run.views.filter((view) => view.rejected === "grazing").length,
         structure: run.views.filter((view) => view.rejected === "structure").length,
+        verify: run.views.filter((view) => view.rejected === "verify").length,
+        verifyUnparsed: run.views.filter(
+          (view) => view.rejected === "verify" && view.verify?.verdict === "unparsed",
+        ).length,
       },
+      viewsRepainted: run.views.filter((view) => view.repainted === true).length,
+      verifyModel: run.options.verify === false ? null : ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id),
     };
   } catch (error) {
     // Let the events already in flight finish writing run.json: a stopped or interrupted run must

@@ -19,8 +19,15 @@ import {
 import { auditCookConfig } from "../src/texture-projection/config-audit.js";
 import { cookConfigHint } from "../src/tools/texture-projection.js";
 import { markProjectedAtlas, readProjectedAtlasMarker } from "../src/texture-projection/glb-marker.js";
-import { MODEL_ALIASES, DEFAULT_MODEL, resolveModel } from "../src/texture-projection/models.js";
-import { MISSING_API_KEY_CODE, forwardImageRequest } from "../src/texture-projection/openrouter-proxy.js";
+import { MODEL_ALIASES, DEFAULT_MODEL, prompts, resolveModel } from "../src/texture-projection/models.js";
+import { loadLevel } from "../src/texture-projection/app/core/scene.js";
+import { measureScaleAnchor } from "../src/texture-projection/app/core/scale.js";
+import {
+  MISSING_API_KEY_CODE,
+  forwardChatRequest,
+  forwardImageRequest,
+} from "../src/texture-projection/openrouter-proxy.js";
+import { DEFAULT_VERIFY_MODEL, parseVerifyAnswer, verifyPrompt } from "../src/texture-projection/verify.js";
 import {
   MAX_AUTO_ATLAS,
   TextureProjectionError,
@@ -40,7 +47,10 @@ const PLAN = { maxViews: 3, aerial: 0, roofs: 0, holes: 0, spacing: 6 };
 const temporaryDirectories: string[] = [];
 const stubs: OpenRouterStub[] = [];
 
-async function startOpenRouterStub(png: string, options: { holdAt?: number; paint?: "material" | "arch" } = {}) {
+async function startOpenRouterStub(
+  png: string,
+  options: { holdAt?: number; paint?: "material" | "arch"; verify?: "ok" | "invented" | "garbage" | "once" } = {},
+) {
   const stub = await startStub(png, options);
   stubs.push(stub);
   return stub;
@@ -281,8 +291,15 @@ describe("texture-projection runner", () => {
       expect(quote.model).toBe("or-klein");
       expect(quote.views).toBeGreaterThan(0);
       expect(quote.estimatedUsd).toBeGreaterThan(0);
-      // The estimate is the painted views at the model's price, rounded to cents.
-      expect(quote.estimatedUsd).toBeCloseTo(Math.round((quote.views + quote.holes) * 0.009 * 100) / 100, 6);
+      // The vision check is on by default, priced in the estimate and cheap enough to be a rounding error
+      // next to the images (< $0.002 per view).
+      expect(quote.verifyModel).toBe(DEFAULT_VERIFY_MODEL.id);
+      expect(quote.estimatedVerifyUsd).toBeGreaterThan(0);
+      expect(quote.estimatedVerifyUsd / (quote.views + quote.holes)).toBeLessThan(0.002);
+      // The estimate is the painted views at the image model plus the check, rounded to cents.
+      expect(quote.estimatedUsd).toBe(
+        Math.round(((quote.views + quote.holes) * quote.pricePerView + quote.estimatedVerifyUsd) * 100) / 100,
+      );
       expect(stub.requests).toHaveLength(0);
     },
     180_000,
@@ -302,8 +319,21 @@ describe("texture-projection runner", () => {
       expect(quote.views).toBeLessThanOrEqual(12);
       expect(quote.aerial).toBeLessThanOrEqual(3);
       expect(quote.aerial).toBeGreaterThan(0);
-      // One price per image actually painted, rounded to cents.
-      expect(quote.estimatedUsd).toBe(Math.round((quote.views + quote.holes) * 0.009 * 100) / 100);
+      // One price per image actually painted plus its check, rounded to cents.
+      expect(quote.estimatedUsd).toBe(
+        Math.round(((quote.views + quote.holes) * quote.pricePerView + quote.estimatedVerifyUsd) * 100) / 100,
+      );
+      // `verify: false` is the named override: no check, no check cost, and the run reports it.
+      const unchecked = await quoteTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: {},
+        verify: false,
+        plan: { maxViews: 12, aerial: 3, roofs: 0, holes: 4, spacing: 6 },
+      });
+      expect(unchecked.verifyModel).toBeNull();
+      expect(unchecked.estimatedVerifyUsd).toBe(0);
+      expect(unchecked.estimatedUsd).toBeLessThan(quote.estimatedUsd);
     },
     180_000,
   );
@@ -348,6 +378,7 @@ describe("texture-projection runner", () => {
         plan: PLAN,
         atlas: 256,
         viewSize: 128,
+        verify: false,
         runId: "paint-run",
         outputPath,
         onLog: (line) => logged.push(line),
@@ -356,7 +387,10 @@ describe("texture-projection runner", () => {
       expect(result.complete).toBe(true);
       expect(result.viewsPainted).toBeGreaterThan(0);
       expect(result.coveragePercent).toBeGreaterThan(0);
+      expect(result.verifyModel).toBeNull();
       expect(stub.requests.length).toBe(result.viewsPainted);
+      // No chat request either: verify:false buys images and nothing else.
+      expect(stub.requests.every((sent) => Array.isArray(sent.body["input_references"]))).toBe(true);
       const references = stub.requests[0]?.body["input_references"] as
         | { type: string; image_url: { url: string } }[]
         | undefined;
@@ -392,6 +426,43 @@ describe("texture-projection runner", () => {
       expect(everything).not.toContain(FAKE_KEY);
     },
     240_000,
+  );
+
+  it(
+    "refuses to paint a view pixel that would cover more than 2x2 atlas texels",
+    async () => {
+      const cwd = await scratchDir("magnification");
+      const stub = await startOpenRouterStub(pngBase64);
+      const plan = { maxViews: 3, aerial: 0, roofs: 0, holes: 0, spacing: 6 };
+      // An atlas four times finer than the views resolve: without the guard most texels would be painted
+      // from one stretched image pixel each.
+      const quote = await quoteTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: {},
+        atlas: 1024,
+        viewSize: 128,
+        verify: false,
+        plan,
+      });
+      expect(quote.estimatedBlurredTexelPercent).toBeGreaterThan(10);
+      const result = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan,
+        atlas: 1024,
+        viewSize: 128,
+        verify: false,
+        runId: "magnification-run",
+        outputPath: join(cwd, "assets", "magnification.glb"),
+      });
+      // The guard is why the painted atlas has no magnified texel left: they wait for a closer view.
+      expect(result.blurredTexelPercent).toBe(0);
+      expect(result.magnificationSkippedPercent).toBeGreaterThan(1);
+      expect(result.coveragePercent).toBeGreaterThan(0);
+    },
+    300_000,
   );
 
   it(
@@ -482,6 +553,7 @@ describe("texture-projection runner", () => {
         plan: { ...PLAN, maxViews: 2 },
         atlas: 256,
         viewSize: 128,
+        verify: false,
         runId: "reuse-run",
         outputPath: join(cwd, "assets", "first.glb"),
       });
@@ -526,6 +598,7 @@ describe("texture-projection runner", () => {
         plan: PLAN,
         atlas: 256,
         viewSize: 128,
+        verify: false,
         runId: "prompt-test-run",
         outputPath,
         promptTestView: 0,
@@ -564,6 +637,8 @@ describe("texture-projection runner", () => {
         plan: PLAN,
         atlas: 256,
         viewSize: 128,
+        // One request per view, so `holdAt: 2` is the second view's image.
+        verify: false,
         runId: "resume-run",
         hooks: {
           onViewDone: () => {
@@ -690,6 +765,238 @@ describe("texture-projection structure check (B.2)", () => {
     // The grid it compares on is the documented 64 cells.
     expect(lowFrequencyLuminance(clay, SIZE, SIZE)).toHaveLength(64 * 64);
   });
+});
+
+describe("texture-projection vision check (2c)", () => {
+  it("asks for the structures the clay lacks and the real-world size of the detail", () => {
+    const prompt = verifyPrompt({ cameraHeightM: 1.65, centreDistanceM: 9.34, kind: "ground" });
+    expect(prompt).toContain("1.6 m above the ground");
+    expect(prompt).toContain("9.3 m away");
+    for (const word of ["pillar", "buttress", "roof tiles", "terracotta", "arch", "doorway", "chimney"]) {
+      expect(prompt).toContain(word);
+    }
+    expect(prompt).toContain('"added"');
+    expect(prompt).toContain('"scaleOk"');
+  });
+
+  it("anchors every paint prompt to the camera's height and the depth in the middle of the frame", () => {
+    const scale = { cameraHeight: 1.65, centreDistance: 9.34 };
+    for (const mode of ["first", "fill", "roof"] as const) {
+      const text = prompts.view({ look: "ochre plaster", roofLook: "roof tiles", parts: "", mode, floor: false, scale });
+      expect(text).toContain("1.6 m above the ground");
+      expect(text).toContain("9.3 m away");
+      expect(text).toContain("paving stones are 15-25 cm across");
+      expect(text).toContain("bricks 20-25 cm long");
+    }
+    // A caller with no anchor (no level geometry to measure) gets the prompt it had before.
+    const unanchored = prompts.view({ look: "ochre plaster", roofLook: "roof tiles", parts: "", mode: "first", floor: false });
+    expect(unanchored).not.toContain("true real-world size");
+  });
+
+  it("forbids roofs above a flat wall top, except in the roof pass that paints roofs", () => {
+    const base = { look: "ochre plaster", roofLook: "roof tiles", parts: "", floor: false };
+    const first = prompts.view({ ...base, mode: "first" });
+    expect(first).toContain("no roof, roof tiles, tile band, coping or chimney above a wall top");
+    expect(first).toContain("every wall top stays the flat edge it is in the clay");
+    // The roof pass exists to paint roofs, so it must not be told that a roof is forbidden.
+    const roof = prompts.view({ ...base, mode: "roof" });
+    expect(roof).not.toContain("no roof, roof tiles");
+    expect(roof).toContain("nothing is added on the roofs");
+  });
+
+  it("measures the anchor from the level's own geometry, not from the frame", async () => {
+    const cwd = await scratchDir("scale-anchor");
+    const room = join(cwd, "room.glb");
+    await writeRoomGlb(room);
+    const bytes = await readFile(room);
+    const level = await loadLevel(
+      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+      "room",
+    );
+    // The room is 20 m across with 8 m walls: standing in the middle at 1.65 m, the wall ahead is 10 m away.
+    const anchor = measureScaleAnchor(level, { position: [0, 1.65, 0], yaw: 0, pitch: 0, fov: 90 });
+    expect(anchor.cameraHeight).toBeCloseTo(1.65, 2);
+    expect(anchor.centreDistance).toBeCloseTo(10, 1);
+    // Looking up over a wall top: no centre hit, so the nearest surface in the fan stands in.
+    const sky = measureScaleAnchor(level, { position: [0, 1.65, 0], yaw: 0, pitch: 1.3, fov: 90 });
+    expect(sky.centreDistance).toBeGreaterThan(0);
+    expect(sky.centreDistance).toBeLessThan(100);
+  });
+
+  it("fails closed: only a well-formed verdict passes, everything else is unparsed", () => {
+    expect(parseVerifyAnswer('{"added": [], "scaleOk": true, "reason": "materials only"}')).toMatchObject({
+      added: [],
+      scaleOk: true,
+      verdict: "ok",
+    });
+    // A fenced answer with an invented pillar and roof tile coping is a rejection naming them.
+    const invented = parseVerifyAnswer(
+      'Here it is:\n```json\n{"added": [{"what": "a stone pillar on the back wall", "outOfSurface": true}, ' +
+        '{"what": "red roof-tile coping along the wall top", "outOfSurface": true}], "scaleOk": true}\n```',
+    );
+    expect(invented.verdict).toBe("rejected");
+    expect(invented.added).toEqual(["a stone pillar on the back wall", "red roof-tile coping along the wall top"]);
+    // The model's own "this is flat paint" answer drops the item: a painted material is not added geometry.
+    expect(
+      parseVerifyAnswer(
+        '{"added": [{"what": "cobblestone paving on the ground", "outOfSurface": false}, ' +
+          '{"what": "moss on the wall base", "outOfSurface": false}], "scaleOk": true}',
+      ),
+    ).toMatchObject({ added: [], verdict: "ok" });
+    // A chat model sometimes repeats a fragment after the object: the object is still read, strictly.
+    expect(
+      parseVerifyAnswer(
+        '{"added": [{"what": "a ruined stone pillar", "outOfSurface": true}], "scaleOk": true}\nimage"}',
+      ).added,
+    ).toEqual(["a ruined stone pillar"]);
+    // Impossible detail sizes are a rejection on their own.
+    expect(parseVerifyAnswer('{"added": [], "scaleOk": false}')).toMatchObject({ verdict: "rejected", scaleOk: false });
+    for (const bad of [
+      "no json at all",
+      '{"scaleOk": true}',
+      '{"added": "a pillar", "scaleOk": true}',
+      '{"added": [{"what": "a pillar"}], "scaleOk": true}',
+      '{"added": ["a pillar"], "scaleOk": true}',
+      '{"added": [], "scaleOk": "yes"}',
+      "[1, 2, 3]",
+      '{"added": []',
+    ]) {
+      expect(parseVerifyAnswer(bad).verdict).toBe("unparsed");
+    }
+  });
+
+  it("forwards a chat completion with both images through the server-side key", async () => {
+    const stub = await startOpenRouterStub(pngBase64);
+    const forwarded = await forwardChatRequest(
+      {
+        model: DEFAULT_VERIFY_MODEL.id,
+        prompt: verifyPrompt({ cameraHeightM: 1.65, centreDistanceM: 4 }),
+        images: ["data:image/jpeg;base64,AAAA", "data:image/jpeg;base64,BBBB"],
+      },
+      { env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url } },
+    );
+    expect(forwarded.status).toBe(200);
+    expect(stub.requests).toHaveLength(1);
+    const sent = stub.requests[0]!;
+    expect(sent.authorization).toBe(`Bearer ${FAKE_KEY}`);
+    expect(sent.body["response_format"]).toEqual({ type: "json_object" });
+    const content = (sent.body["messages"] as { content: { type: string; image_url?: { url: string } }[] }[])[0]!
+      .content;
+    expect(content.filter((part) => part.type === "image_url").map((part) => part.image_url?.url)).toEqual([
+      "data:image/jpeg;base64,AAAA",
+      "data:image/jpeg;base64,BBBB",
+    ]);
+    expect(content[0]?.type).toBe("text");
+
+    // The key stays server-side: without it nothing is forwarded, and a non-image body is refused.
+    const keyless = await forwardChatRequest({ model: "m", prompt: "p", images: ["data:image/png;base64,AA", "data:image/png;base64,AA"] }, { env: {} });
+    expect(keyless.status).toBe(500);
+    expect(new TextDecoder().decode(keyless.bytes)).toContain(MISSING_API_KEY_CODE);
+    const notAnImage = await forwardChatRequest(
+      { model: "m", prompt: "p", images: ["data:text/html;base64,AA", "data:image/png;base64,AA"] },
+      { env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url } },
+    );
+    expect(notAnImage.status).toBe(400);
+    expect(stub.requests).toHaveLength(1);
+  });
+
+  it(
+    "rejects an invented pillar or roof tiles, repaints once and leaves the view for the fill pass",
+    async () => {
+      const cwd = await scratchDir("verify-invented");
+      const stub = await startOpenRouterStub(pngBase64, { verify: "invented" });
+      const error = await rejection(
+        paintTextureProjection({
+          levelPath: LEVEL,
+          cwd,
+          env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+          plan: PLAN,
+          atlas: 256,
+          viewSize: 128,
+          runId: "verify-run",
+          outputPath: join(cwd, "assets", "verify.glb"),
+        }),
+      );
+      // Every painted view was rejected by the check, so nothing reaches the atlas.
+      expectTextureProjectionError(error, "TEXTURE_PROJECT_NO_COVERAGE");
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "verify-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views.length).toBeGreaterThan(0);
+      for (const view of run.views) {
+        expect(view.rejected).toBe("verify");
+        expect(view.repainted).toBe(true);
+        expect(view.verify?.model).toBe(DEFAULT_VERIFY_MODEL.id);
+        expect(view.verify?.added.join(" ")).toContain("pillar");
+        // The kept generation is the repaint's, and its prompt named the invention as forbidden.
+        expect(view.prompt).toContain("do not paint:");
+        expect(view.prompt).toContain("pillar");
+        expect(view.prompt).toContain("This is a repaint");
+      }
+      // Two images and two checks per view: the one repaint a rejected view is allowed.
+      expect(stub.requests.filter((sent) => Array.isArray(sent.body["input_references"]))).toHaveLength(run.views.length * 2);
+    },
+    300_000,
+  );
+
+  it(
+    "accepts a view whose repaint passes the check and counts the repaint",
+    async () => {
+      const cwd = await scratchDir("verify-once");
+      const stub = await startOpenRouterStub(pngBase64, { verify: "once" });
+      const result = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan: PLAN,
+        atlas: 256,
+        viewSize: 128,
+        runId: "verify-once-run",
+        outputPath: join(cwd, "assets", "verify-once.glb"),
+      });
+      expect(result.verifyModel).toBe(DEFAULT_VERIFY_MODEL.id);
+      expect(result.viewsRejected.verify).toBe(0);
+      expect(result.viewsRepainted).toBe(result.viewsPainted);
+      expect(result.coveragePercent).toBeGreaterThan(0);
+      expect(result.estimatedUsd).toBeGreaterThan(result.viewsPainted * 0.009 * 2 * 0.99);
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "verify-once-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views.filter((view) => view.rejected !== undefined)).toHaveLength(0);
+      expect(run.views.every((view) => view.verify?.verdict === "ok")).toBe(true);
+    },
+    300_000,
+  );
+
+  it(
+    "counts an unreadable answer as its own rejection and buys only the one repaint",
+    async () => {
+      const cwd = await scratchDir("verify-garbage");
+      const stub = await startOpenRouterStub(pngBase64, { verify: "garbage" });
+      const error = await rejection(
+        paintTextureProjection({
+          levelPath: LEVEL,
+          cwd,
+          env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+          plan: { ...PLAN, maxViews: 1 },
+          atlas: 256,
+          viewSize: 128,
+          runId: "verify-garbage-run",
+          outputPath: join(cwd, "assets", "verify-garbage.glb"),
+        }),
+      );
+      expectTextureProjectionError(error, "TEXTURE_PROJECT_NO_COVERAGE");
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "verify-garbage-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views).toHaveLength(1);
+      expect(run.views[0]?.rejected).toBe("verify");
+      expect(run.views[0]?.verify?.verdict).toBe("unparsed");
+      // Fail closed: the unreadable answer never lets an image into the atlas.
+      expect(stub.requests.filter((sent) => Array.isArray(sent.body["input_references"]))).toHaveLength(2);
+    },
+    300_000,
+  );
 });
 
 describe("texture-projection atlas choice (C.1)", () => {

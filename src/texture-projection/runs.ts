@@ -3,6 +3,14 @@ import { join } from "node:path";
 
 import { z } from "zod";
 
+/** What the vision check said about a stored view (phase 2c). */
+const ViewVerifySchema = z.object({
+  model: z.string().min(1),
+  added: z.array(z.string()),
+  scaleOk: z.boolean(),
+  verdict: z.enum(["ok", "rejected", "unparsed"]),
+});
+
 /** One view of a run, as stored in run.json: everything a resume needs, and no image pixels. */
 const StoredViewSchema = z.object({
   index: z.number().int().nonnegative(),
@@ -24,10 +32,14 @@ const StoredViewSchema = z.object({
   price: z.number(),
   coverage: z.number(),
   predicted: z.number(),
-  /** Why nothing was projected: grazing surfaces only, or an image that invented geometry. */
-  rejected: z.enum(["grazing", "structure"]).optional(),
+  /** Why nothing was projected: grazing surfaces only, an image that invented geometry, or the vision check. */
+  rejected: z.enum(["grazing", "structure", "verify"]).optional(),
   structureDeviation: z.number().optional(),
   grazingFraction: z.number().optional(),
+  /** The vision check's verdict on the image this view kept (a repaint's verdict when it was repainted). */
+  verify: ViewVerifySchema.optional(),
+  /** The vision check rejected the first attempt, so the view was painted once more. */
+  repainted: z.boolean().optional(),
 });
 
 const PlanSchema = z.object({

@@ -143,6 +143,10 @@ export function makeApi(session: Session) {
     blurredPercentAt(atlasSize: number) {
       return session.blurredPercentAt(atlasSize);
     },
+    /** Texels the magnification guard left unpainted at another atlas size, as a share of the island. */
+    magnificationSkippedPercentAt(atlasSize: number) {
+      return session.magnificationSkippedPercentAt(atlasSize);
+    },
     /** Camera planning only: no model calls, so no key and no cost. */
     plan(opts: Partial<PlanOptions> = {}): PlanSummary {
       const p = session.makePlan(opts);
@@ -229,6 +233,8 @@ function viewDone(view: ViewRecord, cost: number, elapsed: number) {
     rejected: view.rejected,
     structureDeviation: view.structureDeviation === undefined ? undefined : +view.structureDeviation.toFixed(3),
     grazingFraction: view.grazingFraction === undefined ? undefined : +view.grazingFraction.toFixed(3),
+    verify: view.verify,
+    repainted: view.repainted,
     cost: +cost.toFixed(4),
     elapsed: +elapsed.toFixed(1),
   };

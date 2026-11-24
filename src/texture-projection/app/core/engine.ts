@@ -62,7 +62,8 @@ export class Engine {
     this.views.renderGeometry(camera);
     (this.compTexture.image.data as Uint8Array).set(comp);
     this.compTexture.needsUpdate = true;
-    this.atlas.project(camera, this.views.geometryTarget.textures[0], this.compTexture, this.options.qualityRatio);
+    const g = this.views.geometryTarget.textures;
+    this.atlas.project(camera, g[0]!, g[3]!, this.compTexture, this.options.qualityRatio);
   }
 
   /** 1 where a view's pixels show level geometry (0 = sky), top-down. */

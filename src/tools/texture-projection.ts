@@ -62,6 +62,18 @@ export const TextureProjectQuoteInputSchema = z
     ...PlanShape,
     model: ModelSchema,
     atlas: AtlasSchema,
+    verify: z
+      .boolean()
+      .optional()
+      .describe(
+        "Check every painted view with a vision model before projecting it (default true); a rejected view is repainted once, then left to the fill pass. false turns the check off by name.",
+      ),
+    verifyModel: z
+      .string()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe("OpenRouter chat model id with image input for the vision check (default google/gemini-2.5-flash-lite)."),
   })
   .strict();
 
@@ -77,6 +89,8 @@ export const TextureProjectQuoteOutputSchema = z
     atlas: z.number().int().positive(),
     estimatedBlurredTexelPercent: z.number().min(0).max(100),
     uvStretch: UvStretchSchema,
+    verifyModel: z.string().nullable(),
+    estimatedVerifyUsd: z.number().nonnegative(),
   })
   .strict();
 
@@ -110,6 +124,18 @@ export const TextureProjectPaintInputSchema = z
     style: z.string().min(1).max(2_000).optional().describe("Material style for the level, e.g. its architecture and wear."),
     styleImagePath: PathSchema.optional().describe("Reference image whose materials and palette ride along, project-relative."),
     ...PlanShape,
+    verify: z
+      .boolean()
+      .optional()
+      .describe(
+        "Check every painted view with a vision model before projecting it (default true); a rejected view is repainted once, then left to the fill pass. false turns the check off by name.",
+      ),
+    verifyModel: z
+      .string()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe("OpenRouter chat model id with image input for the vision check (default google/gemini-2.5-flash-lite)."),
     promptTestView: z
       .number()
       .int()
@@ -135,8 +161,18 @@ export const TextureProjectPaintOutputSchema = z
       .number()
       .int()
       .nonnegative(),
-    viewsRejected: z.object({ grazing: z.number().int().nonnegative(), structure: z.number().int().nonnegative() }).strict(),
+    viewsRejected: z
+      .object({
+        grazing: z.number().int().nonnegative(),
+        structure: z.number().int().nonnegative(),
+        verify: z.number().int().nonnegative(),
+        verifyUnparsed: z.number().int().nonnegative(),
+      })
+      .strict(),
+    viewsRepainted: z.number().int().nonnegative(),
+    verifyModel: z.string().nullable(),
     blurredTexelPercent: z.number().min(0).max(100),
+    magnificationSkippedPercent: z.number().min(0).max(100),
     atlas: z.number().int().positive(),
     estimatedUsd: z.number().nonnegative(),
     cookConfigHint: z.string(),
@@ -164,6 +200,15 @@ export const TextureProjectInspectOutputSchema = z
     blurredTexelPercent: z.number().min(0).max(100).nullable(),
     views: z.number().int().nonnegative(),
     rejectedViews: z.array(z.object({ index: z.number().int(), reason: z.string() }).strict()),
+    /** The vision check's own verdicts, so a bake's invented structure is visible without the run.json. */
+    verifyModel: z.string().nullable(),
+    verifyRejected: z
+      .array(
+        z
+          .object({ index: z.number().int(), added: z.array(z.string()), scaleOk: z.boolean(), verdict: z.string() })
+          .strict(),
+      ),
+    viewsRepainted: z.number().int().nonnegative(),
     cookConfig: z
       .object({
         path: z.string().nullable(),
@@ -270,6 +315,8 @@ export function createTextureProjectQuoteHandler() {
         atlas: input.atlas,
         plan: planRequest(input),
         firstModel: input.model,
+        ...(input.verify === undefined ? {} : { verify: input.verify }),
+        ...(input.verifyModel === undefined ? {} : { verifyModel: input.verifyModel }),
       });
       const output = TextureProjectQuoteOutputSchema.parse({
         views: quote.views,
@@ -282,6 +329,8 @@ export function createTextureProjectQuoteHandler() {
         atlas: quote.atlas,
         estimatedBlurredTexelPercent: quote.estimatedBlurredTexelPercent,
         uvStretch: quote.uvStretch,
+        verifyModel: quote.verifyModel,
+        estimatedVerifyUsd: quote.estimatedVerifyUsd,
       });
       return { content: [{ type: "text" as const, text: JSON.stringify(output) }], structuredContent: output };
     } catch (error) {
@@ -320,6 +369,8 @@ export function createTextureProjectPaintHandler() {
         ...(input.style === undefined ? {} : { style: input.style }),
         ...(input.promptTestView === undefined ? {} : { promptTestView: input.promptTestView }),
         ...(input.resumeRunId === undefined ? {} : { resumeRunId: input.resumeRunId }),
+        ...(input.verify === undefined ? {} : { verify: input.verify }),
+        ...(input.verifyModel === undefined ? {} : { verifyModel: input.verifyModel }),
         plan: planRequest(input),
       });
       const output = TextureProjectPaintOutputSchema.parse({
@@ -328,7 +379,10 @@ export function createTextureProjectPaintHandler() {
         coveragePercent: result.coveragePercent,
         viewsPainted: result.viewsPainted,
         viewsRejected: result.viewsRejected,
+        viewsRepainted: result.viewsRepainted,
+        verifyModel: result.verifyModel,
         blurredTexelPercent: result.blurredTexelPercent,
+        magnificationSkippedPercent: result.magnificationSkippedPercent,
         atlas: result.atlas,
         estimatedUsd: result.estimatedUsd,
         cookConfigHint: cookConfigHint(result.atlas),
@@ -421,6 +475,16 @@ export function createTextureProjectInspectHandler() {
           blurredTexelPercent,
           views: run.views.length,
           rejectedViews,
+          verifyModel: run.options.verify === false ? null : ((run.options.verifyModel as string | undefined) ?? null),
+          verifyRejected: run.views
+            .filter((view) => view.rejected === "verify" && view.verify !== undefined)
+            .map((view) => ({
+              index: view.index,
+              added: [...(view.verify?.added ?? [])],
+              scaleOk: view.verify?.scaleOk ?? false,
+              verdict: view.verify?.verdict ?? "unparsed",
+            })),
+          viewsRepainted: run.views.filter((view) => view.repainted === true).length,
           cookConfig: await readConfigAudit(root, run.atlas),
           contactSheetPath: relative(root, sheet.path),
           contactSheetViews: [...sheet.views],

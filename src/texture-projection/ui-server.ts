@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { OPENROUTER_IMAGES_PATH, forwardImageRequest } from "./openrouter-proxy.js";
+import { OPENROUTER_CHAT_PATH, OPENROUTER_IMAGES_PATH, forwardChatRequest, forwardImageRequest } from "./openrouter-proxy.js";
 import { defaultRunRoot, isSafeRunFile, isSafeRunId, listRuns, runDirectory } from "./runs.js";
 
 /**
@@ -162,7 +162,7 @@ export async function startUiServer(options: UiServerOptions = {}): Promise<UiSe
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     const path = url.pathname;
 
-    if (path === OPENROUTER_IMAGES_PATH) {
+    if (path === OPENROUTER_IMAGES_PATH || path === OPENROUTER_CHAT_PATH) {
       if (request.method !== "POST") return sendText(response, 405, "POST only");
       let body: unknown;
       try {
@@ -170,7 +170,10 @@ export async function startUiServer(options: UiServerOptions = {}): Promise<UiSe
       } catch {
         return sendText(response, 400, "body must be JSON");
       }
-      const forwarded = await forwardImageRequest(body, options.env === undefined ? {} : { env: options.env });
+      const forwarded =
+        path === OPENROUTER_CHAT_PATH
+          ? await forwardChatRequest(body, options.env === undefined ? {} : { env: options.env })
+          : await forwardImageRequest(body, options.env === undefined ? {} : { env: options.env });
       return send(response, forwarded.status, forwarded.contentType, forwarded.bytes);
     }
 

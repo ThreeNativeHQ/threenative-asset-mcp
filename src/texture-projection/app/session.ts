@@ -7,8 +7,8 @@ import { toBlob, urlToRGBA } from "./core/image.js";
 import {
   DEFAULT_PIPELINE,
   GRAZING_VIEW_LIMIT,
-  generateView,
   judgeView,
+  paintPreparedView,
   prepareView,
   promptText,
   runPipeline,
@@ -42,6 +42,8 @@ export interface ProjectionMeasurement {
   readonly medianFoot: number;
   /** Share of painted texels whose best view has one pixel covering more than 2x2 texels, in percent. */
   readonly blurredTexelPercent: number;
+  /** Share of island texels the projection's magnification guard refuses (unpainted, no detail to give). */
+  readonly magnificationSkippedPercent: number;
 }
 
 import { postHeaders } from "./token.js";
@@ -171,7 +173,9 @@ export class Session {
           const judged = judgeView(p, generation, S, o.feather);
           view = { ...view, left: judged.left, comp: judged.comp, structureDeviation: judged.structureDeviation };
           if (judged.rejected) view.rejected = "structure";
-          else delete view.rejected;
+          // A stored vision rejection is a paid image the check found invented structure in: re-judging
+          // the pixels cannot clear it, so it stays rejected and stays out of the bake.
+          else if (v.rejected !== "verify") delete view.rejected;
         } catch {
           // Unreadable state for this view (a changed level): keep it as stored rather than lose the run.
         }
@@ -236,8 +240,8 @@ export class Session {
       return view;
     }
     onEvent({ type: "view-start", index: viewIndex, wave: 0, model: p.model.key, state: p.state });
-    const r = await generateView(p, this.engine.size, o.seed + viewIndex, o.feather, this.abort?.signal);
-    if (!r.rejected) {
+    const r = await paintPreparedView(p, this.engine.size, o, o.seed + viewIndex, o.feather, this.abort?.signal);
+    if (r.rejected === undefined) {
       this.engine.paint(p.spec, r.comp);
       this.viewer.setMode("textured");
       this.viewer.dirty = true;
@@ -246,14 +250,17 @@ export class Session {
       ...base,
       left: r.left,
       seconds: r.seconds,
-      price: p.model.price,
+      price: r.price,
+      prompt: r.prompt,
       gen: r.gen,
       comp: r.comp,
       coverage: this.engine.atlas.coverage(),
       structureDeviation: r.structureDeviation,
-      ...(r.rejected ? { rejected: "structure" as const } : {}),
+      ...(r.rejected === undefined ? {} : { rejected: r.rejected }),
+      ...(r.verify === undefined ? {} : { verify: r.verify }),
+      ...(r.attempts > 1 ? { repainted: true } : {}),
     };
-    onEvent({ type: "view-done", view, cost: p.model.price, elapsed: r.seconds });
+    onEvent({ type: "view-done", view, cost: r.price, elapsed: r.seconds });
     return view;
   }
 
@@ -290,10 +297,12 @@ export class Session {
     for (let i = 0; i < foot.length; i++) {
       const island = islands[4 * i]! > 127;
       if (island) islandTexels += 1;
-      painted[i] = paintedMask ? paintedMask[i]! : pixels[4 * i]! > 0 ? 1 : 0;
-      if (!island || !painted[i] || !(pixels[4 * i]! > 0)) continue;
-      paintedTexels += 1;
+      painted[i] = paintedMask ? (paintedMask[i]! > 0 ? 1 : 0) : pixels[4 * i]! > 0 ? 1 : 0;
+      // The footprint is kept for every texel a view sees, painted or not: what the magnification
+      // guard left empty is exactly the unpainted texels whose best view resolves too coarsely.
+      if (!island || !(pixels[4 * i]! > 0)) continue;
       foot[i] = pixels[4 * i + 1]!;
+      if (painted[i]) paintedTexels += 1;
     }
     this.measurement = { atlas: size, foot, painted, islandTexels, paintedTexels };
     return {
@@ -303,6 +312,7 @@ export class Session {
       paintedTexels,
       medianFoot: medianOfPainted(this.measurement),
       blurredTexelPercent: this.blurredPercentAt(size),
+      magnificationSkippedPercent: this.magnificationSkippedPercentAt(size),
     };
   }
 
@@ -318,8 +328,28 @@ export class Session {
     if (measurement.paintedTexels === 0) return 0;
     let blurred = 0;
     const foot = measurement.foot;
-    for (let i = 0; i < foot.length; i++) if (foot[i]! > 0 && foot[i]! > threshold) blurred += 1;
+    for (let i = 0; i < foot.length; i++) {
+      if (measurement.painted[i] && foot[i]! > threshold) blurred += 1;
+    }
     return (100 * blurred) / measurement.paintedTexels;
+  }
+
+  /**
+   * Texels the magnification guard leaves unpainted, as a share of the island: a view sees them but
+   * one of its pixels would cover more than 2x2 atlas texels there, so projecting it would only
+   * stretch one pixel over many texels. They wait for a closer view or the hole pass.
+   */
+  magnificationSkippedPercentAt(atlasSize: number): number {
+    const measurement = this.measurement;
+    if (!measurement) throw new Error("measure before reading the magnification share");
+    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize) ** 2;
+    if (measurement.islandTexels === 0) return 0;
+    let skipped = 0;
+    const foot = measurement.foot;
+    for (let i = 0; i < foot.length; i++) {
+      if (!measurement.painted[i] && foot[i]! > threshold) skipped += 1;
+    }
+    return (100 * skipped) / measurement.islandTexels;
   }
 
   stop() {
@@ -376,7 +406,7 @@ function medianOfPainted(measurement: { foot: Float32Array; painted: Uint8Array;
   const buckets = new Float64Array(128);
   for (let i = 0; i < measurement.foot.length; i++) {
     const value = measurement.foot[i]!;
-    if (!(value > 0)) continue;
+    if (!(value > 0) || !measurement.painted[i]) continue;
     const bucket = Math.min(127, Math.max(0, Math.floor((Math.log2(value) + 24) * 4)));
     buckets[bucket] = buckets[bucket]! + 1;
   }

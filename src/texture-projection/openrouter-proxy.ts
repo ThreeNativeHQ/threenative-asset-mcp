@@ -4,6 +4,8 @@ import { STYLE_INSTRUCTION } from "./models.js";
 
 /** The proxy the app posts to; the key is read here, server-side, and never handed to the browser. */
 export const OPENROUTER_IMAGES_PATH = "/api/openrouter/images";
+/** The vision check's proxy: one chat completion, two view images, no browsing side effects. */
+export const OPENROUTER_CHAT_PATH = "/api/openrouter/chat";
 export const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai";
 export const MISSING_API_KEY_CODE = "TEXTURE_PROJECT_MISSING_API_KEY";
 export const BAD_REQUEST_CODE = "TEXTURE_PROJECT_BAD_REQUEST";
@@ -23,6 +25,17 @@ const ImageRequestSchema = z.object({
 });
 
 export type ImageRequestBody = z.infer<typeof ImageRequestSchema>;
+
+const DATA_URL = /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/;
+
+const ChatRequestSchema = z.object({
+  model: z.string().min(1).max(200),
+  prompt: z.string().min(1).max(8_000),
+  /** The clay (what the model was given) and the painted image, in that order. */
+  images: z.array(z.string().regex(DATA_URL)).length(2),
+});
+
+export type ChatRequestBody = z.infer<typeof ChatRequestSchema>;
 
 export interface ProxyResponse {
   readonly status: number;
@@ -78,10 +91,60 @@ export async function forwardImageRequest(body: unknown, options: ProxyOptions =
     ...(request.aspect_ratio === undefined ? {} : { aspect_ratio: request.aspect_ratio }),
     ...(request.seed === undefined ? {} : { seed: request.seed }),
   };
+  return send(key, "/api/v1/images", payload, options);
+}
+
+/**
+ * Forwards the vision check: one chat completion with the clay and the painted image, strict JSON
+ * out. It goes through the same server-side key as the painting proxy — the page never holds the key.
+ */
+export async function forwardChatRequest(body: unknown, options: ProxyOptions = {}): Promise<ProxyResponse> {
+  const env = options.env ?? process.env;
+  const key = env.OPENROUTER_API_KEY?.trim();
+  if (!key) {
+    return jsonResponse(
+      500,
+      MISSING_API_KEY_CODE,
+      "OPENROUTER_API_KEY is not set; the vision check calls an OpenRouter chat model with your own key.",
+    );
+  }
+  const parsed = ChatRequestSchema.safeParse(body);
+  if (!parsed.success) {
+    const detail = parsed.error.issues.map((issue) => `${issue.path.join(".") || "body"}: ${issue.message}`).join("; ");
+    return jsonResponse(400, BAD_REQUEST_CODE, `invalid chat request (${detail})`);
+  }
+  const request = parsed.data;
+  const payload = {
+    model: request.model,
+    temperature: 0,
+    // Up to six named structures with a where-clause each: a longer answer is a summary, not a verdict.
+    max_tokens: 800,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: request.prompt },
+          ...request.images.map((url) => ({ type: "image_url", image_url: { url } })),
+        ],
+      },
+    ],
+  };
+  return send(key, "/api/v1/chat/completions", payload, options);
+}
+
+/** One authenticated POST to OpenRouter; the key stays in this function's caller process. */
+async function send(
+  key: string,
+  path: string,
+  payload: unknown,
+  options: ProxyOptions,
+): Promise<ProxyResponse> {
+  const env = options.env ?? process.env;
   const base = (env.OPENROUTER_BASE_URL?.trim() || DEFAULT_OPENROUTER_BASE_URL).replace(/\/+$/, "");
   const doFetch = options.fetch ?? fetch;
   try {
-    const response = await doFetch(`${base}/api/v1/images`, {
+    const response = await doFetch(`${base}${path}`, {
       method: "POST",
       headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
       body: JSON.stringify(payload),

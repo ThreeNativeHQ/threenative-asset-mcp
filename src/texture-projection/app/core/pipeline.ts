@@ -1,5 +1,6 @@
 import { DEFAULT_MODEL, prompts, resolveModel, type EditModel, type PromptContext } from "../../models.js";
-import { runEdit } from "../openrouter.js";
+import { DEFAULT_VERIFY_MODEL, verifyPrompt, type ViewVerify } from "../../verify.js";
+import { runEdit, runVerify } from "../openrouter.js";
 import {
   colorCorrect,
   dilate,
@@ -19,6 +20,7 @@ import { DEFAULT_PLAN, holeViews, plan as makePlan, type Plan, type PlanOptions 
 import { classifyView, describeView } from "./semantics.js";
 import { rejectsStructure, structureDeviation } from "./structure.js";
 import { makeCamera, ViewRenderer, type ViewSpec } from "./views.js";
+import { measureScaleAnchor, type ScaleAnchor } from "./scale.js";
 
 export interface PipelineOptions {
   /** The look, as materials only: anything named here (a fountain, a stall) gets painted onto walls. */
@@ -32,6 +34,10 @@ export interface PipelineOptions {
   feather: number;
   seed: number;
   plan: Partial<PlanOptions>;
+  /** Check every painted view with a vision model (phase 2c); a rejected view is repainted once. */
+  verify: boolean;
+  /** OpenRouter chat model id the vision check calls (`verify.ts` picks the default). */
+  verifyModel: string;
 }
 
 export const DEFAULT_PIPELINE: PipelineOptions = {
@@ -45,10 +51,12 @@ export const DEFAULT_PIPELINE: PipelineOptions = {
   feather: 10,
   seed: 7,
   plan: {},
+  verify: true,
+  verifyModel: DEFAULT_VERIFY_MODEL.id,
 };
 
-/** Why a view's image was not projected: it shows almost only grazing surfaces, or it invents geometry. */
-export type ViewRejection = "grazing" | "structure";
+/** Why a view's image was not projected: it shows almost only grazing surfaces, invents geometry, or fails the vision check. */
+export type ViewRejection = "grazing" | "structure" | "verify";
 
 export interface ViewRecord {
   index: number;
@@ -61,6 +69,10 @@ export interface ViewRecord {
   rejected?: ViewRejection;
   /** Compact closed blob the model added over the image it was given; rejected above 0.20 (structure.ts). */
   structureDeviation?: number;
+  /** What the vision check said about the image that was kept for projection (phase 2c). */
+  verify?: ViewVerify;
+  /** The check rejected the first attempt, so the view was painted once more with a new seed. */
+  repainted?: boolean;
   /** Share of this view's geometry the 0.35 grazing gate rejects. */
   grazingFraction?: number;
   /** The prompt text sent with this view. */
@@ -130,6 +142,8 @@ export interface PreparedView {
   skip: boolean;
   model: EditModel;
   prompt: PromptContext;
+  /** Camera height and centre depth the prompt's material sizes and the vision check are stated against. */
+  scale: ScaleAnchor;
   /** Share of the view's geometry below the shader's 0.35 grazing gate. */
   grazingFraction: number;
 }
@@ -187,6 +201,7 @@ export function prepareView(
   const model = roofPass || fillPass ? fill : isFirst || unknownFraction > o.mostlyNew ? first : fill;
   const edit = editMask(masks, S, S, Math.round((3 * S) / 1024));
   const desc = describeView(cls, labels, S, isFirst ? undefined : edit);
+  const scale = measureScaleAnchor(engine.level, spec);
   const prompt: PromptContext = {
     look: o.style,
     roofLook: o.roofStyle,
@@ -194,8 +209,12 @@ export function prepareView(
     mode: roofPass ? "roof" : isFirst ? "first" : "fill",
     floor: desc.floorShare > 0.5,
     overcast: !!engine.clay.lighting.overcast,
+    scale: { cameraHeight: scale.cameraHeight, centreDistance: scale.centreDistance },
   };
-  return { spec, clay, state, masks, geometry, edit, keep, unknownFraction, isFirst, skip, model, prompt, grazingFraction };
+  return {
+    spec, clay, state, masks, geometry, edit, keep, unknownFraction, isFirst, skip, model, prompt, scale,
+    grazingFraction,
+  };
 }
 
 /**
@@ -257,15 +276,106 @@ export function judgeView(p: PreparedView, gen: Uint8ClampedArray, size: number,
   };
 }
 
-/** Ask the model for one prepared view and composite its answer next to the known texture. */
-export async function generateView(p: PreparedView, size: number, seed: number, feather: number, signal?: AbortSignal) {
-  const r = await runEdit(
-    p.model,
-    { imageUrl: toDataUrl(p.state, size, size, "image/jpeg", 0.95), prompt: p.prompt, seed },
-    signal,
-  );
+/** One paid image, judged by the pixel check and then by the vision check, with what it cost. */
+export interface PaintedAttempt {
+  readonly gen: Uint8ClampedArray;
+  readonly comp: Uint8ClampedArray;
+  readonly left: number;
+  readonly structureDeviation: number;
+  readonly rejected?: ViewRejection;
+  readonly verify?: ViewVerify;
+  readonly seconds: number;
+  /** Image plus vision check, USD. */
+  readonly price: number;
+  /** The prompt of the request that produced this image (a repaint says what to leave out). */
+  readonly prompt: string;
+}
+
+/** A view's final image after the pixel check and the one repaint a vision rejection is allowed. */
+export interface PaintedView extends PaintedAttempt {
+  readonly attempts: number;
+}
+
+/**
+ * Buy one view's image, judge it with the free pixel check, then have a vision model compare it with the
+ * clay (phase 2c). The pixel check stays as the cheap pre-filter; the vision check is the reliable one,
+ * because a real invention (a stone buttress, roof tiles along a wall top) is the same tone as the
+ * surface it stands on. A rejected view is repainted once with a new seed and the invented structure
+ * named as forbidden; a second rejection leaves its texels to the fill and hole passes.
+ */
+async function attemptView(
+  p: PreparedView,
+  size: number,
+  o: PipelineOptions,
+  seed: number,
+  feather: number,
+  signal?: AbortSignal,
+): Promise<PaintedAttempt> {
+  const image = toDataUrl(p.state, size, size, "image/jpeg", 0.95);
+  const prompt = promptText(p);
+  const r = await runEdit(p.model, { imageUrl: image, prompt: p.prompt, seed }, signal);
   const gen = bitmapToRGBA(r.image, size, size);
-  return { gen, seconds: r.seconds, ...judgeView(p, gen, size, feather) };
+  const judged = judgeView(p, gen, size, feather);
+  let price = p.model.price;
+  let verify: ViewVerify | undefined;
+  if (o.verify && !judged.rejected) {
+    const answer = await runVerify(
+      o.verifyModel,
+      verifyPrompt({
+        cameraHeightM: p.scale.cameraHeight,
+        centreDistanceM: p.scale.centreDistance,
+        ...(p.spec.kind === undefined ? {} : { kind: p.spec.kind }),
+      }),
+      [image, toDataUrl(gen, size, size, "image/jpeg", 0.9)],
+      size,
+      signal,
+    );
+    price += answer.cost;
+    verify = { model: o.verifyModel, added: answer.added, scaleOk: answer.scaleOk, verdict: answer.verdict };
+  }
+  return {
+    gen,
+    comp: judged.comp,
+    left: judged.left,
+    structureDeviation: judged.structureDeviation,
+    ...(judged.rejected ? { rejected: "structure" as const } : {}),
+    ...(verify === undefined ? {} : { verify }),
+    seconds: r.seconds,
+    price,
+    prompt,
+  };
+}
+
+export async function paintPreparedView(
+  p: PreparedView,
+  size: number,
+  o: PipelineOptions,
+  seed: number,
+  feather: number,
+  signal?: AbortSignal,
+): Promise<PaintedView> {
+  const first = await attemptView(p, size, o, seed, feather, signal);
+  const failed = first.rejected !== undefined || (first.verify !== undefined && first.verify.verdict !== "ok");
+  if (!failed) return { ...first, attempts: 1 };
+  // A pixel-check rejection bought nothing usable and is left to the fill pass: only the vision check
+  // earns a repaint (one, with a new seed), because it is the one that can be argued with by a prompt.
+  if (first.rejected !== undefined) return { ...first, attempts: 1 };
+  const retry: PreparedView = {
+    ...p,
+    prompt: { ...p.prompt, repaint: true, avoid: first.verify?.added ?? [] },
+  };
+  const second = await attemptView(retry, size, o, seed + 5000, feather, signal);
+  const rejected: ViewRejection | undefined =
+    second.rejected ??
+    (second.verify !== undefined && second.verify.verdict !== "ok" ? "verify" : undefined);
+  return {
+    ...second,
+    ...(rejected === undefined ? {} : { rejected }),
+    verify: second.verify ?? first.verify,
+    attempts: 2,
+    seconds: first.seconds + second.seconds,
+    price: first.price + second.price,
+  };
 }
 
 /** Views a resumed run already has on disk: their pixels are replayed from the saved composites. */
@@ -327,10 +437,10 @@ export async function runPipeline(
     onEvent({ type: "view-start", index: vi, wave, model: p.model.key, state: p.state });
     try {
       const r = await withRetry((attempt) =>
-        generateView(p, S, o.seed + 1000 * attempt + vi, o.feather, signal),
+        paintPreparedView(p, S, o, o.seed + 1000 * attempt + vi, o.feather, signal),
       );
-      if (!r.rejected) engine.paint(p.spec, r.comp);
-      cost += p.model.price;
+      if (r.rejected === undefined) engine.paint(p.spec, r.comp);
+      cost += r.price;
       const view: ViewRecord = {
         index: vi,
         wave,
@@ -338,10 +448,10 @@ export async function runPipeline(
         model: p.model.key,
         first: p.isFirst,
         unknownFraction: p.unknownFraction,
-        prompt: promptText(p),
+        prompt: r.prompt,
         left: r.left,
         seconds: r.seconds,
-        price: p.model.price,
+        price: r.price,
         clay: p.clay,
         state: p.state,
         edit: p.edit,
@@ -351,7 +461,9 @@ export async function runPipeline(
         predicted: plan.predicted[vi] ?? 0,
         structureDeviation: r.structureDeviation,
         grazingFraction: p.grazingFraction,
-        ...(r.rejected ? { rejected: "structure" as const } : {}),
+        ...(r.rejected === undefined ? {} : { rejected: r.rejected }),
+        ...(r.verify === undefined ? {} : { verify: r.verify }),
+        ...(r.attempts > 1 ? { repainted: true } : {}),
       };
       views.push(view);
       done.add(vi);

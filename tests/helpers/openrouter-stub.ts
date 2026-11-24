@@ -100,13 +100,35 @@ async function repainted(dataUrl: string | undefined, paint: "material" | "arch"
 }
 
 /**
- * A local stand-in for OpenRouter's `/api/v1/images`: answers every request with the view it was
- * given, repainted (or a flat PNG when the request carries no usable image), records what arrived,
- * and can hold one request open so a test can interrupt a run inside its window.
+ * What the vision check stub answers. "ok" passes every view; "invented" names a pillar and roof
+ * tiles on every check (every view rejected); "garbage" answers prose (an unparsed verdict);
+ * "once" rejects the first check of a view and passes its repaint, so a run can recover.
+ */
+export type StubVerify = "ok" | "invented" | "garbage" | "once";
+
+const INVENTED = ["a ruined stone pillar on the back wall", "red roof-tile coping along the wall top"];
+
+function chatAnswer(verify: StubVerify, checks: number): string {
+  if (verify === "garbage") return "The painting looks like a courtyard wall, with no inventions that I can see.";
+  const reject =
+    verify === "invented" ||
+    (verify === "once" && checks % 2 === 1);
+  return JSON.stringify({
+    added: reject ? INVENTED.map((what) => ({ what, outOfSurface: true })) : [],
+    scaleOk: !(verify === "invented" && checks % 3 === 0),
+    reason: reject ? "the painting adds structure the clay does not have" : "materials only, plausible size",
+  });
+}
+
+/**
+ * A local stand-in for OpenRouter's `/api/v1/images` and `/api/v1/chat/completions`: answers an image
+ * request with the view it was given, repainted (or a flat PNG when the request carries no usable
+ * image), and a chat request with the vision check's strict JSON answer; records what arrived, and
+ * can hold one request open so a test can interrupt a run inside its window.
  */
 export async function startOpenRouterStub(
   pngBase64: string,
-  options: { holdAt?: number; paint?: "material" | "arch" } = {},
+  options: { holdAt?: number; paint?: "material" | "arch"; verify?: StubVerify } = {},
 ): Promise<OpenRouterStub> {
   const requests: StubRequest[] = [];
   let open = (): void => {};
@@ -114,6 +136,7 @@ export async function startOpenRouterStub(
     open = resolveGate;
   });
   let held = false;
+  let checks = 0;
   const server: Server = createServer((request: IncomingMessage, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -130,6 +153,22 @@ export async function startOpenRouterStub(
         body,
       });
       const answer = async () => {
+        if ((request.url ?? "").startsWith("/api/v1/chat/completions")) {
+          checks += 1;
+          try {
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(
+              JSON.stringify({
+                id: `stub-chat-${checks}`,
+                choices: [{ message: { role: "assistant", content: chatAnswer(options.verify ?? "ok", checks) } }],
+                usage: { prompt_tokens: 2_600, completion_tokens: 90 },
+              }),
+            );
+          } catch {
+            // the browser was closed while this request was held; nothing to answer
+          }
+          return;
+        }
         const reference = (body["input_references"] as { image_url?: { url?: string } }[] | undefined)?.[0]?.image_url?.url;
         const image = (await repainted(reference, options.paint ?? "material")) ?? pngBase64;
         try {

@@ -3,6 +3,9 @@ import { ATLAS_GUTTER_TEXELS, infillUnpainted } from '../../atlas-pixels.js';
 import { byteTarget, floatTarget, passMaterial, type Gpu } from './gpu.js';
 import type { Level } from './scene.js';
 
+/** One image pixel may cover at most 2x2 atlas texels before the projection refuses it (A.2). */
+export const MAX_TEXELS_PER_PIXEL = 4;
+
 /**
  * The texture being painted, in UV space. Each texel stores sRGB colour and the quality it was captured at
  * (cos(view angle) / distance; 0 = not painted). Projection passes rasterise the level in UV space and pull
@@ -22,17 +25,20 @@ const PROJECT_FRAG = /* glsl */ `
 precision highp float;
 uniform sampler2D prev;
 uniform sampler2D gPos;
+uniform sampler2D gFoot;
 uniform sampler2D comp;
 uniform mat4 viewProj;
 uniform vec3 camPos;
 uniform float ratio;
 uniform vec2 texel;
 uniform float edgeRadius;
+uniform float maxTexelsPerPixel;
 in vec3 vWorld;
 in vec3 vNormal;
 layout(location = 0) out vec4 outColor;
 void main() {
-  vec4 old = texelFetch(prev, ivec2(gl_FragCoord.xy), 0);
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 old = texelFetch(prev, p, 0);
   outColor = old;
   vec4 clip = viewProj * vec4(vWorld, 1.0);
   if (clip.w <= 0.0) return;
@@ -46,6 +52,10 @@ void main() {
   vec4 g = texture(gPos, suv);
   bool sky = g.w <= 0.0;
   if (!sky && dist > g.w + 0.02 + 0.01 * dist) return;
+  // Magnification guard (A.2): a view pixel that would cover more than 2x2 atlas texels has no
+  // detail of its own to give — projected, it stretches one image pixel over many texels. Leave
+  // those texels for a closer view or the hole pass instead of painting blur into the atlas.
+  if (texture(gFoot, suv).r > maxTexelsPerPixel) return;
   float q = cosv / max(dist, 0.5);
   // Near a silhouette the model's image is least trustworthy (slight misalignment paints the wrong side onto
   // the edge), so capture it at reduced quality: a view that sees it away from an edge will replace it.
@@ -205,9 +215,10 @@ export class Atlas {
     this.projectMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: UV_VERT, fragmentShader: PROJECT_FRAG, side: THREE.DoubleSide,
       depthTest: false, depthWrite: false,
-      uniforms: { prev: { value: null }, gPos: { value: null }, comp: { value: null }, viewProj: { value: new THREE.Matrix4() },
+      uniforms: { prev: { value: null }, gPos: { value: null }, gFoot: { value: null }, comp: { value: null },
+        viewProj: { value: new THREE.Matrix4() },
         camPos: { value: new THREE.Vector3() }, ratio: { value: 0.4 }, texel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
-        edgeRadius: { value: 6 } },
+        edgeRadius: { value: 6 }, maxTexelsPerPixel: { value: MAX_TEXELS_PER_PIXEL } },
     });
     this.islandMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: UV_VERT, fragmentShader: ISLAND_FRAG, side: THREE.DoubleSide,
@@ -236,13 +247,14 @@ export class Atlas {
     for (const t of [this.a, this.b, this.display, this.temp]) this.gpu.draw(new THREE.Scene(), this.uvCam, t, 0x000000, 0);
   }
 
-  /** Paint from one view: `gPos` is that view's position/distance buffer, `comp` its composited image. */
-  project(camera: THREE.Camera, gPos: THREE.Texture, comp: THREE.Texture, ratio: number) {
+  /** Paint from one view: `gPos` is that view's position/distance buffer, `gFoot` its texels-per-pixel buffer, `comp` its composited image. */
+  project(camera: THREE.Camera, gPos: THREE.Texture, gFoot: THREE.Texture, comp: THREE.Texture, ratio: number) {
     this.copyMat.uniforms.src.value = this.a.texture;
     this.gpu.pass(this.copyMat, this.b);
     const u = this.projectMat.uniforms;
     u.prev.value = this.a.texture;
     u.gPos.value = gPos;
+    u.gFoot.value = gFoot;
     u.comp.value = comp;
     u.viewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     u.camPos.value.setFromMatrixPosition(camera.matrixWorld);

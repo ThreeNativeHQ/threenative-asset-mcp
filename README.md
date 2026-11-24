@@ -145,9 +145,11 @@ changing its configuration.
 input and keeps the original when the gate fails. See [docs/tools.md](docs/tools.md#mesh-optimization).
 
 `texture_project_paint` textures a gray blockout level or environment: an image model paints planned camera
-views, the views are projected into the level's UV atlas, and the baked GLB comes back ready to cook.
-`texture_project_quote` is free and keyless, and `texture_project_inspect` reviews the bake with a contact
-sheet and a cook-settings audit. See [docs/tools.md](docs/tools.md).
+views, a cheap vision model verifies each painting against the clay (it may not add geometry, and its material
+detail must be at a real-world size), and the accepted views are projected into the level's UV atlas before the
+baked GLB comes back ready to cook. `texture_project_quote` is free and keyless, and `texture_project_inspect`
+reviews the bake with a contact sheet, the vision check's verdicts and a cook-settings audit. See
+[docs/tools.md](docs/tools.md).
 
 Recommended flow: `asset_search_sources` → the returned search tool → the returned files tool → the returned
 download tool with `acceptLicense: true`. All discovery tools are read-only. Download tools write only inside

@@ -20,6 +20,18 @@ export interface PromptContext {
   floor: boolean;
   /** Painting under overcast light (no cast shadows wanted) rather than keeping the render's sun and shadows. */
   overcast?: boolean;
+  /** Real-world distance anchors, from the level's geometry (`app/core/scale.ts`). */
+  scale?: PromptScale;
+  /** Structures the vision check found the last attempt invented: this repaint must not paint them. */
+  avoid?: readonly string[];
+  /** This request is the one repaint a rejected view gets: say so and keep the named structure out. */
+  repaint?: boolean;
+}
+
+/** Camera height and centre-of-frame depth, in metres, that the prompt's material sizes are stated against. */
+export interface PromptScale {
+  readonly cameraHeight: number;
+  readonly centreDistance: number;
 }
 
 export interface EditInput {
@@ -67,13 +79,52 @@ function forbidden(parts: string) {
 
 const shapes = (c: PromptContext) => (c.parts ? `: ${c.parts}` : "");
 
+const metres = (value: number) => (value >= 10 ? value.toFixed(0) : value.toFixed(1));
+
+/**
+ * The real-world size anchor (phase 2c): the model paints material detail at whatever scale fits the
+ * frame unless it is told how far away the camera is. Naming true sizes for the common materials is
+ * what keeps paving stones the same size across views, so their seams do not show.
+ */
+function trueSize(c: PromptContext): string {
+  if (c.scale === undefined) return "";
+  return (
+    ` Paint every material at its true real-world size as seen from this camera: the camera is ${metres(c.scale.cameraHeight)} m` +
+    ` above the ground and the surface in the middle of the frame is about ${metres(c.scale.centreDistance)} m away, so` +
+    " paving stones are 15-25 cm across, bricks 20-25 cm long, roof tiles 20 cm wide, mortar joints 1-2 cm and wooden" +
+    ` planks 12-15 cm wide, in perspective for that distance.`
+  );
+}
+
+/** A repaint after the vision check named structure the clay does not have: keep it out of the image. */
+function avoid(c: PromptContext): string {
+  if (c.repaint !== true) return "";
+  const named = c.avoid === undefined || c.avoid.length === 0 ? [] : c.avoid.slice(0, 8);
+  const forbidden = named.length === 0 ? "" : `, and do not paint: ${named.join("; ")}`;
+  return (
+    ` This is a repaint of the same view: paint only the flat surfaces of the clay image with material${forbidden}.` +
+    " The clay has no such structure anywhere, and every material stays at its true real-world size for the distance above."
+  );
+}
+
 /**
  * Every prompt ends with this, after the caller's style text, so no style can talk the model into
  * inventing architecture (B.1): a painted arch, doorway, passage, staircase or extra building is
  * geometry the level does not have, and it will not line up with the blockout from any other angle.
+ *
+ * The roof clause is the live courtyard's lesson (PRD-916 phase 2c): a style that names "terracotta
+ * roof tiles" makes the model lay tiles along every wall top, so the level grew roofs it has not. A
+ * flat clay wall top is the shape; naming the defect in the fixed constraint (and again in a
+ * repaint) removes it, where the general "add no ... objects" clause did not.
  */
 export const SURFACE_ONLY_CONSTRAINT =
   " Paint surface materials only. Keep every edge, opening and silhouette of the clay image exactly;" +
+  " add no doors, windows, arches, passages, openings, stairs, people, plants or objects that are not in the clay image," +
+  " and no roof, roof tiles, tile band, coping or chimney above a wall top: every wall top stays the flat edge it is in the clay.";
+
+/** A roof pass is the one prompt that may paint a roof: it gets the constraint without the roof clause. */
+export const ROOF_PASS_CONSTRAINT =
+  " Paint surface materials only. Keep every edge and silhouette of the clay image exactly;" +
   " add no doors, windows, arches, passages, openings, stairs, people, plants or objects that are not in the clay image.";
 /** How the light should look: the render's own sun and shadows, or soft overcast light with no cast shadows. */
 const light = (c: PromptContext) => (c.overcast
@@ -91,16 +142,18 @@ export const prompts = {
   view(c: PromptContext): string {
     if (c.mode === "roof") {
       return `A photo identical to the first image, except that its plain gray roofs are now ${c.roofLook}, following each ` +
-        `roof's exact outline and slope, with ${light(c)}; nothing is added on the roofs.` + SURFACE_ONLY_CONSTRAINT;
+        `roof's exact outline and slope, with ${light(c)}; nothing is added on the roofs.` + trueSize(c) +
+        ROOF_PASS_CONSTRAINT + avoid(c);
     }
     if (c.mode === "first") {
       return `A photorealistic photo of ${c.look}, with exactly the camera, perspective and composition of the first ` +
         `image and ${light(c)}. Every gray shape of the first image keeps its exact outline and is now the real ` +
-        `surface it is${shapes(c)}. ${surfaces(c)}` + SURFACE_ONLY_CONSTRAINT;
+        `surface it is${shapes(c)}. ${surfaces(c)}` + trueSize(c) + SURFACE_ONLY_CONSTRAINT + avoid(c);
     }
     return `A photorealistic photo of ${c.look}, with ${light(c)}, identical to the first image in camera, perspective, ` +
       "composition and in every area that already has texture; the plain gray untextured surfaces of the first image now " +
-      `continue those textures seamlessly and keep their exact outlines${shapes(c)}. ${surfaces(c)}` + SURFACE_ONLY_CONSTRAINT;
+      `continue those textures seamlessly and keep their exact outlines${shapes(c)}. ${surfaces(c)}` + trueSize(c) +
+      SURFACE_ONLY_CONSTRAINT + avoid(c);
   },
 };
 
