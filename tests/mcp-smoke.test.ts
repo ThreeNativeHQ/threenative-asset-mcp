@@ -504,6 +504,9 @@ describe("built stdio package", () => {
       "asset_list_sources",
       "asset_search_sources",
       "asset_download_file",
+      "texture_project_quote",
+      "texture_project_paint",
+      "texture_project_inspect",
     ]);
 
     const called = jsonResponse(child, 3);
