@@ -19,9 +19,10 @@ export interface OpenRouterStub {
 }
 
 /**
- * What an image model plausibly returns for the view it was given: the same picture, repainted in
- * other materials (a global colour shift and a slight blur, so no pixel is the untouched clay, while
- * the low-frequency structure — the thing the B.2 check protects — is kept).
+ * What an image model plausibly returns for the view it was given: the same picture, repainted with
+ * a fine colour grain (so no pixel is untouched clay) while its low-frequency luminance — the thing
+ * the B.2 check protects — stays within a few levels. With `arch` it also paints the failure mode
+ * that check exists for: a dark arch on a flat wall.
  */
 async function repainted(dataUrl: string | undefined, paint: "material" | "arch"): Promise<string | undefined> {
   const encoded = /^data:image\/[a-z]+;base64,(.+)$/u.exec(dataUrl ?? "")?.[1];
@@ -31,16 +32,29 @@ async function repainted(dataUrl: string | undefined, paint: "material" | "arch"
     const metadata = await sharp(source).metadata();
     const width = metadata.width ?? 0;
     const height = metadata.height ?? 0;
-    const repainted = await sharp(source).blur(3).modulate({ brightness: 0.85, saturation: 1.35 }).png().toBuffer();
-    if (paint === "material" || width === 0 || height === 0) return repainted.toString("base64");
-    // B.2's failure mode: a dark arch painted where the clay image has a flat wall.
+    if (width === 0 || height === 0) return undefined;
+    // Grain in red and blue only: max-channel difference well over the "untouched clay" tolerance,
+    // luminance nearly unchanged, and nothing low-frequency.
+    const grain = Buffer.alloc(width * height * 3);
+    let seed = 1234567;
+    const random = (): number => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    for (let i = 0; i < width * height; i++) {
+      grain[i * 3] = 10 + Math.floor(random() * 20);
+      grain[i * 3 + 1] = 0;
+      grain[i * 3 + 2] = 10 + Math.floor(random() * 20);
+    }
+    const grained = await sharp(source)
+      .composite([{ input: grain, raw: { width, height, channels: 3 }, blend: "add" }])
+      .png()
+      .toBuffer();
+    if (paint === "material") return grained.toString("base64");
     const left = width * 0.36;
     const right = width * 0.64;
     const spring = height * 0.4;
     const bottom = height * 0.66;
     const radius = (right - left) / 2;
     const svg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><path d="M ${left} ${bottom} L ${left} ${spring} A ${radius} ${radius} 0 0 1 ${right} ${spring} L ${right} ${bottom} Z" fill="#221c1a"/></svg>`;
-    const arch = await sharp(repainted)
+    const arch = await sharp(grained)
       .composite([{ input: Buffer.from(svg), left: 0, top: 0 }])
       .png()
       .toBuffer();

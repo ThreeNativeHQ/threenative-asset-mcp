@@ -229,7 +229,10 @@ export async function generateView(p: PreparedView, size: number, seed: number, 
   if (keep) comp = keepOnly(comp, keep, p.geometry);
   // B.2: the model must keep the image it was given. A painted arch, doorway or new volume moves the
   // low-frequency luminance far more than any material does, so that view is logged and not projected.
-  const deviation = structureDeviation(corrected, p.state, size, size);
+  // Judge only what the model was asked to paint: level geometry it has not painted yet. The sky is
+  // background nothing projects, and already-painted texels are the previous views' work.
+  const paintable = p.masks.geometry.map((geometry, i) => geometry & (1 - p.masks.known[i]!));
+  const deviation = structureDeviation(corrected, p.state, size, size, undefined, paintable);
   const rejected = rejectsStructure(deviation);
   return {
     gen,

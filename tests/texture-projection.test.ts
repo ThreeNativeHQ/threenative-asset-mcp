@@ -328,7 +328,7 @@ describe("texture-projection runner", () => {
       ) as StoredRun;
       expect(run.views.filter((view) => view.rejected === "structure")).toHaveLength(stub.requests.length);
       for (const view of run.views) {
-        expect(view.structureDeviation).toBeGreaterThan(0.13);
+        expect(view.structureDeviation).toBeGreaterThan(0.05);
         // Rejected views keep their images for the contact sheet, so the reason stays checkable.
         expect(existsSync(join(cwd, ".threenative", "texture-projection", "arch-run", `view_${view.index}_gen.png`))).toBe(true);
       }
@@ -469,8 +469,19 @@ describe("texture-projection structure check (B.2)", () => {
       }
     }
     const materialDeviation = structureDeviation(material, clay, SIZE, SIZE);
-    expect(materialDeviation).toBeLessThan(0.13);
+    expect(materialDeviation).toBeLessThan(0.05);
     expect(rejectsStructure(materialDeviation)).toBe(false);
+
+    // A darker style or a lighting gradient is a smooth trend, not a shape.
+    const ramp = new Uint8ClampedArray(clay);
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        const p = 4 * (y * SIZE + x);
+        const factor = 1 + 0.2 * (x / SIZE - 0.5) + 0.15 * (y / SIZE - 0.5);
+        for (let channel = 0; channel < 3; channel++) ramp[p + channel] = Math.min(255, ramp[p + channel]! * factor);
+      }
+    }
+    expect(structureDeviation(ramp, clay, SIZE, SIZE)).toBeLessThan(0.05);
 
     // A big dark arch painted on the flat wall: low-frequency luminance the clay does not have.
     const arch = new Uint8ClampedArray(clay);
@@ -489,7 +500,7 @@ describe("texture-projection structure check (B.2)", () => {
       }
     }
     const archDeviation = structureDeviation(arch, clay, SIZE, SIZE);
-    expect(archDeviation).toBeGreaterThan(0.3);
+    expect(archDeviation).toBeGreaterThan(0.15); // the limit is 0.05, the arch is 4x over it
     expect(rejectsStructure(archDeviation)).toBe(true);
     // The grid it compares on is the documented 64 cells.
     expect(lowFrequencyLuminance(clay, SIZE, SIZE)).toHaveLength(64 * 64);
