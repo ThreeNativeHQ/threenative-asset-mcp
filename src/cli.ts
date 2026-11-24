@@ -1,5 +1,6 @@
 import { relative, resolve } from "node:path";
 
+import { startUiServer, type UiServer } from "./texture-projection/ui-server.js";
 import {
   createAssetImportUnrealHandler,
   createFabImportAssetHandler,
@@ -17,6 +18,11 @@ const USAGE = `threenative-asset-mcp import <fab-listing-url-or-uid | local-unre
   --only <a,b,c>           Import only these package names instead of every static mesh.
   --max-texture-size <n>   Longest edge for embedded textures. Omitted keeps Unreal's resolution.
   --json                   Print the machine-readable summary instead of a human one.
+
+threenative-asset-mcp texture-project-ui [--level <glb>] [--port <n>]
+
+  --level <glb>            Level loaded when the page opens; otherwise drop one in.
+  --port <n>               Fixed port on 127.0.0.1. Omitted picks a free one.
 
 With no arguments the process starts the stdio MCP server instead.
 Authentication is never performed here: run \`fabcli auth login\` yourself first.`;
@@ -130,4 +136,39 @@ export async function runImportCli(
     ...summary.warnings.map((warning) => `warning: ${warning}`),
   ];
   return { exitCode: 0, stdout: `${lines.join("\n")}\n`, stderr: "" };
+}
+
+/**
+ * `texture-project-ui`: the local Web UI for texture projection, on 127.0.0.1 only. It shares the
+ * bundled app and the OpenRouter proxy with the headless runner; the API key stays in this process.
+ */
+export async function runTextureProjectUiCli(
+  argv: readonly string[],
+  log: (message: string) => void = () => {},
+): Promise<UiServer> {
+  let level: string | undefined;
+  let port: number | undefined;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === undefined) continue;
+    if (argument === "--level") {
+      level = argv[(index += 1)];
+      continue;
+    }
+    if (argument === "--port") {
+      const raw = argv[(index += 1)];
+      port = raw === undefined ? undefined : Number(raw);
+      if (port === undefined || !Number.isInteger(port) || port < 0 || port > 65_535) {
+        throw new Error(`--port needs a number between 0 and 65535, got ${raw ?? "nothing"}`);
+      }
+      continue;
+    }
+    throw new Error(`unknown flag for texture-project-ui: ${argument}`);
+  }
+  const server = await startUiServer({
+    ...(level === undefined ? {} : { levelPath: resolve(process.cwd(), level) }),
+    ...(port === undefined ? {} : { port }),
+  });
+  log(`Texture projection UI on 127.0.0.1: ${server.url}${level === undefined ? "" : ` (level: ${relative(process.cwd(), resolve(level)) || level})`}`);
+  return server;
 }
