@@ -1,0 +1,1025 @@
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+
+import { NodeIO, Primitive } from "@gltf-transform/core";
+import sharp from "sharp";
+
+import { markProjectedAtlas } from "./glb-marker.js";
+import { VISIBLE_COVERAGE_WARN, type PaintFill } from "./atlas-pixels.js";
+import { DEFAULT_VERIFY_MODEL, verifyCostUsd, verifyModelFor } from "./verify.js";
+import { DEFAULT_MODEL, resolveModel } from "./models.js";
+import {
+  defaultRunRoot,
+  readRun,
+  runDirectory,
+  writeRun,
+  type StoredPlan,
+  type StoredRun,
+  type StoredView,
+} from "./runs.js";
+import { openAppSession, type AppEvent } from "./session.js";
+import { startUiServer } from "./ui-server.js";
+import { measureUvStretch, type UvStretchReport } from "./uv-stretch.js";
+
+export type TextureProjectionErrorCode =
+  | "TEXTURE_PROJECT_MISSING_UV"
+  | "TEXTURE_PROJECT_MISSING_API_KEY"
+  | "TEXTURE_PROJECT_LEVEL_NOT_FOUND"
+  | "TEXTURE_PROJECT_LEVEL_UNREADABLE"
+  | "TEXTURE_PROJECT_RUN_NOT_FOUND"
+  | "TEXTURE_PROJECT_UNSAFE_PATH"
+  | "TEXTURE_PROJECT_INVALID_INPUT"
+  | "TEXTURE_PROJECT_STRUCTURE_REJECTED"
+  | "TEXTURE_PROJECT_NO_COVERAGE"
+  | "TEXTURE_PROJECT_FAILED";
+
+export class TextureProjectionError extends Error {
+  constructor(
+    readonly code: TextureProjectionErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TextureProjectionError";
+  }
+}
+
+export interface TextureProjectionPlanInput {
+  /** Ground cameras to paint, capped by the planner's budget. */
+  readonly maxViews?: number;
+  readonly aerial?: number;
+  readonly roofs?: number;
+  readonly holes?: number;
+  readonly spacing?: number;
+}
+
+export interface TextureProjectionHooks {
+  /** Called once a view is on disk. Throwing interrupts the run; its paid views stay resumable. */
+  readonly onViewDone?: (view: StoredView, run: StoredRun) => void | Promise<void>;
+}
+
+export interface TextureProjectionRequest {
+  /** Level GLB to texture. Required unless resuming, where the stored run names it. */
+  readonly levelPath?: string;
+  readonly resumeRunId?: string;
+  /** Paint a single planned view (a prompt test) instead of the whole run. */
+  readonly promptTestView?: number;
+  readonly runId?: string;
+  readonly outputPath?: string;
+  /**
+   * What the exported atlas writes where no accepted view painted: `"detail"` (the default, and today's
+   * output) fills the gap from its island, `"debug"` writes hot pink so a capture can count the gaps
+   * (phase 2r). Debug never changes what the run stores or buys: it only changes this call's GLB.
+   */
+  readonly fill?: PaintFill;
+  readonly firstModel?: string;
+  readonly fillModel?: string;
+  readonly style?: string;
+  readonly roofStyle?: string;
+  readonly lighting?: "outdoor" | "overcast" | "indoor";
+  /** "auto" (the default) measures the plan and picks the smallest atlas that matches it (C.1). */
+  readonly atlas?: number | "auto";
+  readonly viewSize?: number;
+  readonly styleImagePath?: string;
+  /** Check every painted view with a vision model; off unless the caller asks for it (one chat call a view). */
+  readonly verify?: boolean;
+  /** OpenRouter chat model id for the vision check (image input, strict JSON out). */
+  readonly verifyModel?: string;
+  /**
+   * Stored view indices the calling agent judged wrong in inspect's contact sheet. Only a resume, and
+   * only views run.json stores: each is recorded as rejected by the caller, projected nowhere, and
+   * nothing is bought for it.
+   */
+  readonly rejectViews?: readonly number[];
+  readonly plan?: TextureProjectionPlanInput;
+  readonly hooks?: TextureProjectionHooks;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly cwd?: string;
+  readonly onEvent?: (event: AppEvent) => void;
+  readonly onLog?: (line: string) => void;
+  readonly timeoutMs?: number;
+}
+
+export interface TextureProjectionQuote {
+  readonly level: string;
+  readonly model: string;
+  readonly modelId: string;
+  readonly pricePerView: number;
+  readonly views: number;
+  readonly aerial: number;
+  readonly roofs: number;
+  readonly holes: number;
+  readonly points: number;
+  readonly predicted: number;
+  readonly estimatedUsd: number;
+  /** The atlas size the run would bake (C.1), and what it would resolve there (A.2). */
+  readonly atlas: number;
+  readonly estimatedBlurredTexelPercent: number;
+  readonly uvStretch: UvStretchReport;
+  /** The vision check the run would pay for; null unless the caller asked for one. */
+  readonly verifyModel: string | null;
+  /** Whole-run cost of the vision checks at the quoted view size, USD. */
+  readonly estimatedVerifyUsd: number;
+}
+
+/** A material swatch beside the baked GLB: the run directory's copy, cut and made tileable (phase 2m). */
+export interface TextureProjectionSwatch {
+  /** File name beside the GLB, e.g. `courtyard.swatch_wall.png`. */
+  readonly file: string;
+  /** Absolute path of that file. */
+  readonly path: string;
+  /** Patch side in metres, before the wrap crop: the largest square the view gave (see `metresX`). */
+  readonly metres: number;
+  /** Extent of the cut swatch along the patch's u axis, metres: the width a game repeats it at. */
+  readonly metresX: number;
+  /** Extent along the patch's v axis, metres: its height. A cropped axis is shorter than `metres`. */
+  readonly metresY: number;
+  /** Index of the accepted view it was cut from. */
+  readonly view: number;
+  /** Metres of surface per swatch pixel: the scale a game tiles it at in world space. */
+  readonly metresPerPixel: number;
+  /** Metres of surface per pixel of that view (below the above means the swatch is an upsample). */
+  readonly sourceMetresPerPixel: number;
+  /** Angle between the patch's normal and the direction to its view, in degrees. */
+  readonly incidence: number;
+  /** The patch's four world corners, in order: -u-v, +u-v, +u+v, -u+v (from its centre). */
+  readonly corners: [number, number, number][];
+}
+
+/** The swatches a bake wrote: `swatches.json`'s content, with absolute paths, and null for an absent class. */
+export interface TextureProjectionSwatches {
+  readonly jsonPath: string;
+  readonly wall: TextureProjectionSwatch | null;
+  readonly floor: TextureProjectionSwatch | null;
+}
+
+export interface TextureProjectionResult {
+  readonly runId: string;
+  readonly level: string;
+  readonly outputPath: string;
+  readonly views: number;
+  readonly viewsPainted: number;
+  readonly coveragePercent: number;
+  /** Share of the texels player-height cameras see that the bake painted (B, phase 2d). */
+  readonly visibleCoveragePercent: number;
+  /** What the run wants a reader to know about its own result (a visible-coverage shortfall, a fill gap). */
+  readonly warnings: readonly string[];
+  readonly estimatedUsd: number;
+  readonly seconds: number;
+  readonly complete: boolean;
+  readonly atlas: number;
+  /** Painted texels whose best view resolves more than ~2x2 atlas texels per image pixel (A.2). */
+  readonly blurredTexelPercent: number;
+  /** Island texels left unpainted by the 2x2 magnification guard, waiting for a closer view or a hole pass. */
+  readonly magnificationSkippedPercent: number;
+  /** Rejected views by reason; `verifyUnparsed` counts the unreadable answers inside `verify`. */
+  readonly viewsRejected: {
+    readonly grazing: number;
+    readonly structure: number;
+    readonly verify: number;
+    readonly verifyUnparsed: number;
+    /** Views the calling agent rejected through `rejectViews`, from the same stored images. */
+    readonly caller: number;
+  };
+  /** Views the vision check rejected once and that were painted again with a new seed. */
+  readonly viewsRepainted: number;
+  /** Views whose check listed an edge band (a coping, a plinth): projected, and recorded in run.json. */
+  readonly viewsBanded: number;
+  /** The vision model that judged the views, or null when the run was painted without `verify: true`. */
+  readonly verifyModel: string | null;
+  /**
+   * True-scale material swatches cut from the stored paint and written beside the GLB (phase 2m): a game
+   * tiles them in world space for close range and keeps the atlas for macro variation. Null for a prompt
+   * test, which bakes nothing; a class with no qualifying patch is null and reported in `warnings`.
+   */
+  readonly swatches: TextureProjectionSwatches | null;
+  /**
+   * The painted-coverage mask written beside the GLB (phase 2t): where an accepted view painted the atlas
+   * (255) and where the fill made the colour up (0), at a quarter of the atlas' side. The atlas itself is
+   * opaque RGB with the fill's own colour. Null for the debug fill, which writes no mask.
+   */
+  readonly paintedMask: TextureProjectionPaintedMask | null;
+}
+
+/** The baked mask beside the GLB: an 8-bit grayscale PNG, atlas side / 4 square (phase 2t). */
+export interface TextureProjectionPaintedMask {
+  /** File name beside the GLB, e.g. `courtyard.painted.png`. */
+  readonly file: string;
+  /** Absolute path of that file. */
+  readonly path: string;
+}
+
+/** How many painted views must all invent geometry before the run stops buying (B.2, fail closed). */
+export const STRUCTURE_STOP_VIEWS = 3;
+
+/** Atlas size a plan is measured at: small enough to read back, exact after scaling by area. */
+export const MEASUREMENT_ATLAS = 1024;
+/** No atlas below this can hold a level's islands without wasting the views' resolution. */
+export const MIN_AUTO_ATLAS = 512;
+/** The engine cook's KTX2 ceiling (4096x4096): a larger auto atlas only pays for texels the cook resamples away. */
+export const MAX_AUTO_ATLAS = 4096;
+
+/**
+ * C.1: the smallest power of two whose texel size matches the best view's pixel footprint on the
+ * median surface. The footprint is a length in texels per image pixel (the worse screen axis, A.2),
+ * so a texel matches a pixel when the atlas side is the measurement atlas divided by that footprint:
+ * an atlas `k` times larger has `k` times as many texels along each axis under one pixel.
+ *
+ * The nearest power of two, not the next one up: rounding up can pick an atlas four times finer than
+ * the views resolve (a 4.2K match became 8K on the sample courtyard), which is the wasted texels
+ * C.1 forbids. The nearest is within sqrt(2) of the match, so a texel still matches a pixel.
+ */
+export function autoAtlasSize(measurementAtlas: number, medianFoot: number): number {
+  const candidate = medianFoot > 0 ? measurementAtlas / medianFoot : measurementAtlas;
+  const power = 2 ** Math.round(Math.log2(Math.max(candidate, MIN_AUTO_ATLAS)));
+  return Math.min(MAX_AUTO_ATLAS, Math.max(MIN_AUTO_ATLAS, power));
+}
+
+/** Plan summary the browser app returns (see app/api.ts). */
+interface BrowserPlan {
+  readonly views: number;
+  readonly points: number;
+  readonly waves: number;
+  readonly aerial: number;
+  readonly roofs: number;
+  readonly holes: number;
+  readonly predicted: number;
+  readonly plan: StoredPlan;
+}
+
+interface BrowserRun {
+  readonly runId: string;
+  readonly views: number;
+  readonly painted: number;
+  readonly cost: number;
+  readonly seconds: number;
+  readonly coverage: number;
+  /** Share of the texels players can see that the bake painted (B, phase 2d). */
+  readonly visibleCoverage: number;
+  readonly stopped?: "structure";
+}
+
+interface BrowserPromptTest {
+  readonly index: number;
+  readonly price: number;
+  readonly seconds: number;
+  readonly coverage: number;
+  readonly rejected?: "grazing" | "structure";
+}
+
+/** One swatch the app cut, as `Session.swatches` reports it. */
+interface BrowserSwatch {
+  readonly file: string;
+  readonly metres: number;
+  readonly metresX: number;
+  readonly metresY: number;
+  readonly view: number;
+  readonly metresPerPixel: number;
+  readonly sourceMetresPerPixel: number;
+  readonly incidence: number;
+  readonly corners: [number, number, number][];
+}
+
+/** What the app's swatch step returns: a class it could not cut a patch for is absent. */
+interface BrowserSwatches {
+  readonly wall?: BrowserSwatch;
+  readonly floor?: BrowserSwatch;
+}
+
+/** What the app's `glb` call returns: the baked GLB, and the base64 coverage mask that ships beside it (phase 2t). */
+interface BrowserGlb {
+  readonly glb: string;
+  readonly paintedMask?: string;
+}
+
+/** What the app's measurement returns (see app/session.ts, `Session.measure`). */
+interface BrowserMeasurement {
+  readonly atlas: number;
+  readonly views: number;
+  readonly islandTexels: number;
+  readonly paintedTexels: number;
+  readonly medianFoot: number;
+  readonly blurredTexelPercent: number;
+}
+
+interface PreparedLevel {
+  readonly absolute: string;
+  readonly name: string;
+}
+
+async function prepareLevel(levelPath: string, cwd: string): Promise<PreparedLevel> {
+  const absolute = isAbsolute(levelPath) ? levelPath : resolve(cwd, levelPath);
+  const extension = extname(absolute).toLowerCase();
+  try {
+    if (!(await stat(absolute)).isFile()) throw new Error("not a file");
+  } catch {
+    throw new TextureProjectionError("TEXTURE_PROJECT_LEVEL_NOT_FOUND", `level not found: ${levelPath}`);
+  }
+  if (extension !== ".glb" && extension !== ".gltf") {
+    throw new TextureProjectionError("TEXTURE_PROJECT_LEVEL_UNREADABLE", `not a glTF file: ${levelPath}`);
+  }
+  await assertUvMapped(absolute);
+  return { absolute, name: basename(absolute).replace(/\.\w+$/, "") };
+}
+
+/**
+ * Fails closed before a browser is launched: the projection bakes into UV space, so a primitive with
+ * no TEXCOORD_0 cannot be textured at all.
+ */
+async function assertUvMapped(path: string): Promise<void> {
+  let root;
+  try {
+    root = (await new NodeIO().read(path)).getRoot();
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new TextureProjectionError("TEXTURE_PROJECT_LEVEL_UNREADABLE", `could not read ${path}: ${reason}`);
+  }
+  const meshes = root.listMeshes();
+  if (meshes.length === 0) {
+    throw new TextureProjectionError("TEXTURE_PROJECT_LEVEL_UNREADABLE", `${path} has no meshes`);
+  }
+  for (const mesh of meshes) {
+    for (const primitive of mesh.listPrimitives()) {
+      if (primitive.getMode() !== Primitive.Mode.TRIANGLES) continue;
+      if (!primitive.listSemantics().includes("TEXCOORD_0")) {
+        const name = mesh.getName() || "unnamed mesh";
+        throw new TextureProjectionError(
+          "TEXTURE_PROJECT_MISSING_UV",
+          `mesh "${name}" in ${path} has no TEXCOORD_0; unwrap the level before projecting a texture onto it`,
+        );
+      }
+    }
+  }
+}
+
+function requireApiKey(env: NodeJS.ProcessEnv): void {
+  if (!env.OPENROUTER_API_KEY?.trim()) {
+    throw new TextureProjectionError(
+      "TEXTURE_PROJECT_MISSING_API_KEY",
+      "OPENROUTER_API_KEY is not set; painting calls OpenRouter image models with your own key",
+    );
+  }
+}
+
+function planInput(request: TextureProjectionRequest): Record<string, number> {
+  const plan = request.plan ?? {};
+  const out: Record<string, number> = {};
+  for (const key of ["maxViews", "aerial", "roofs", "holes", "spacing"] as const) {
+    const value = plan[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+/** Only what the caller chose; the pipeline's own defaults fill the rest, on resume too. */
+function pipelineOptions(request: TextureProjectionRequest): Record<string, unknown> {
+  const options: Record<string, unknown> = {
+    plan: planInput(request),
+    // Recorded even when defaulted: run.json has to say whether a check judged its views, so inspect
+    // and a resume report what ran instead of guessing the default of the day (off since PRD-916 2f:
+    // the agent that calls this tool judges the views itself).
+    verify: request.verify === true,
+    verifyModel: request.verifyModel?.trim() || DEFAULT_VERIFY_MODEL.id,
+  };
+  // Only an explicit size: "auto" is the default and is re-measured (and capped) on a resume.
+  if (typeof request.atlas === "number") options.atlas = request.atlas;
+  if (request.style !== undefined) options.style = request.style;
+  if (request.roofStyle !== undefined) options.roofStyle = request.roofStyle;
+  if (request.firstModel !== undefined) options.firstModel = request.firstModel;
+  if (request.fillModel !== undefined) options.fillModel = request.fillModel;
+  if (request.fill !== undefined) options.fill = request.fill;
+  if (request.verifyModel !== undefined) options.verifyModel = request.verifyModel;
+  return options;
+}
+
+/** The vision check a request asks for, priced: off by default, and `verify: true` is what buys one. */
+function verifyChoice(request: TextureProjectionRequest): { readonly model: string | null; readonly perView: number } {
+  if (request.verify !== true) return { model: null, perView: 0 };
+  const model = request.verifyModel?.trim() || DEFAULT_VERIFY_MODEL.id;
+  return { model, perView: verifyCostUsd(verifyModelFor(model), request.viewSize ?? 1024) };
+}
+
+/**
+ * What a finished bake wants read before it is used (B, PRD-916 phase 2d): a floor a player still sees
+ * unpainted is the defect the judge saw as white plaster patches, and the number alone does not say so.
+ */
+function bakeWarnings(visibleCoveragePercent: number, run: StoredRun): string[] {
+  const warnings: string[] = [];
+  if (visibleCoveragePercent < VISIBLE_COVERAGE_WARN) {
+    const rejected = run.views.filter((view) => view.rejected !== undefined).length;
+    const bought = run.views.filter((view) => view.price > 0).length;
+    warnings.push(
+      `visible coverage ${visibleCoveragePercent.toFixed(1)}% is under ${VISIBLE_COVERAGE_WARN}%: of the ${bought} views bought, ` +
+        `${rejected} were rejected and the hole pass could not fill what players still see. Those texels continue the` +
+        " material around them (a gap is never a foreign colour), so the level reads as patchy there; a resume with" +
+        " more holes, or a plan whose views see them closer, fills them.",
+    );
+  }
+  return warnings;
+}
+
+async function atomicWrite(path: string, bytes: Uint8Array): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
+  await writeFile(temporary, bytes);
+  try {
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+/**
+ * Copy the swatches a run cut from its run directory to beside the baked GLB, under the GLB's own
+ * name, and rewrite `swatches.json` so its `file` fields point at those copies (they are what a game
+ * loads next to the GLB). `path` is absolute, for a caller that has to find the files it was told about.
+ */
+async function copySwatches(
+  runRoot: string,
+  runId: string,
+  outputPath: string,
+  report: BrowserSwatches,
+): Promise<TextureProjectionSwatches> {
+  const base = basename(outputPath).replace(/\.\w+$/, "");
+  const directory = dirname(outputPath);
+  const copy = async (
+    klass: "wall" | "floor",
+    swatch: BrowserSwatch | undefined,
+  ): Promise<TextureProjectionSwatch | null> => {
+    if (!swatch) return null;
+    const file = `${base}.swatch_${klass}.png`;
+    const path = join(directory, file);
+    await atomicWrite(path, new Uint8Array(await readFile(join(runDirectory(runRoot, runId), swatch.file))));
+    return {
+      file,
+      path,
+      metres: swatch.metres,
+      metresX: swatch.metresX,
+      metresY: swatch.metresY,
+      view: swatch.view,
+      metresPerPixel: swatch.metresPerPixel,
+      sourceMetresPerPixel: swatch.sourceMetresPerPixel,
+      incidence: swatch.incidence,
+      corners: swatch.corners,
+    };
+  };
+  const wall = await copy("wall", report.wall);
+  const floor = await copy("floor", report.floor);
+  // JSON.stringify drops the undefined entries: a class that could not be cut is absent, not null.
+  const content = {
+    wall: wall === null ? undefined : swatchEntry(wall),
+    floor: floor === null ? undefined : swatchEntry(floor),
+  };
+  const jsonPath = join(directory, `${base}.swatches.json`);
+  await atomicWrite(jsonPath, Buffer.from(`${JSON.stringify(content, null, 1)}\n`));
+  return { jsonPath, wall, floor };
+}
+
+/**
+ * Write the bake's painted-coverage mask (phase 2t) beside the GLB as `<name>.painted.png`: an 8-bit
+ * grayscale PNG at a quarter of the atlas' side, exactly the bytes the app measured, so a game reads
+ * "did a view paint this texel" without asking the atlas' alpha (which stays opaque, so it keeps its
+ * UASTC cook). `undefined` for a bake with no mask (the debug fill): nothing is written and no marker
+ * names a file.
+ */
+async function writePaintedMask(
+  outputPath: string,
+  base64: string | undefined,
+): Promise<TextureProjectionPaintedMask | null> {
+  if (base64 === undefined) return null;
+  const bytes = Buffer.from(base64, "base64");
+  const side = Math.round(Math.sqrt(bytes.byteLength));
+  if (side * side !== bytes.byteLength) {
+    throw new TextureProjectionError(
+      "TEXTURE_PROJECT_FAILED",
+      `the baked coverage mask is ${bytes.byteLength} bytes, not a square of one-byte texels`,
+    );
+  }
+  const file = `${basename(outputPath).replace(/\.\w+$/, "")}.painted.png`;
+  const path = join(dirname(outputPath), file);
+  const png = await sharp(bytes, { raw: { width: side, height: side, channels: 1 } })
+    .toColourspace("b-w") // one 8-bit channel, not a greyscale-looking sRGB PNG
+    .png()
+    .toBuffer();
+  await atomicWrite(path, png);
+  return { file, path };
+}
+
+/** One swatch without its absolute path: what `swatches.json` records. */
+function swatchEntry(swatch: TextureProjectionSwatch) {
+  return {
+    file: swatch.file,
+    metres: swatch.metres,
+    metresX: swatch.metresX,
+    metresY: swatch.metresY,
+    view: swatch.view,
+    metresPerPixel: swatch.metresPerPixel,
+    sourceMetresPerPixel: swatch.sourceMetresPerPixel,
+    incidence: swatch.incidence,
+    corners: swatch.corners,
+  };
+}
+
+/**
+ * What a reader has to know about the swatches (phase 2m): a class the run could not cut one for is
+ * left out of `swatches.json` rather than faked, and this is where that shortfall is said out loud.
+ */
+function swatchWarnings(swatches: TextureProjectionSwatches | null): string[] {
+  if (swatches === null) return [];
+  const warnings: string[] = [];
+  for (const klass of ["wall", "floor"] as const) {
+    if (swatches[klass] !== null) continue;
+    warnings.push(
+      `no accepted view sees a ${klass === "wall" ? "1.5" : "2"} m ${klass} patch head-on enough to cut one, so the bake has no` +
+        ` ${klass} swatch: close-range ${klass} detail stays at the atlas' own resolution.` +
+        (klass === "floor"
+          ? " The ground is only seen this head-on by a view that looks down at it (a lower camera pitch, or an aerial pass)."
+          : " A closer, more head-on view of that surface would give one."),
+    );
+  }
+  return warnings;
+}
+
+/**
+ * Plans cameras in the browser and reports what a run would buy: view counts, the atlas it would
+ * bake, the UV stretch of the mesh and what that atlas would blur. No model calls, so no key.
+ */
+export async function quoteTextureProjection(
+  request: TextureProjectionRequest & { readonly levelPath: string },
+): Promise<TextureProjectionQuote> {
+  const cwd = request.cwd ?? process.cwd();
+  const level = await prepareLevel(request.levelPath, cwd);
+  const uvStretch = await measureUvStretch(level.absolute);
+  const alias = request.firstModel ?? DEFAULT_MODEL;
+  const model = resolveModel(alias);
+  if (model === undefined) {
+    throw new TextureProjectionError("TEXTURE_PROJECT_INVALID_INPUT", `unknown model alias: ${alias}`);
+  }
+  const price = model.price;
+  const requestedAtlas = request.atlas ?? "auto";
+  const measurementAtlas =
+    requestedAtlas === "auto" ? MEASUREMENT_ATLAS : Math.min(requestedAtlas, MEASUREMENT_ATLAS);
+  const server = await startUiServer({
+    levelPath: level.absolute,
+    runRoot: defaultRunRoot(cwd),
+    ...(request.env === undefined ? {} : { env: request.env }),
+    ...(request.styleImagePath === undefined ? {} : { styleImagePath: request.styleImagePath }),
+  });
+  const app = await openAppSession({
+    url: server.url,
+    ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+    ...(request.onLog === undefined ? {} : { onLog: request.onLog }),
+  });
+  try {
+    await app.call("load", "/api/level", {
+      lighting: request.lighting ?? "overcast",
+      atlasSize: measurementAtlas,
+      viewSize: request.viewSize ?? 1024,
+      name: level.name,
+    });
+    const plan = await app.call<BrowserPlan>("plan", planInput(request));
+    const measurement = await app.call<BrowserMeasurement>("measure", planInput(request), false);
+    const atlas = requestedAtlas === "auto" ? autoAtlasSize(measurementAtlas, measurement.medianFoot) : requestedAtlas;
+    const estimatedBlurredTexelPercent = await app.call<number>("blurredPercentAt", atlas);
+    const verify = verifyChoice(request);
+    // Every planned view is one image plus one vision check (and a rejected view may be repainted once),
+    // and the hole pass may add up to its budget on top.
+    const perView = price + verify.perView;
+    return {
+      level: level.name,
+      model: alias,
+      modelId: model.id,
+      pricePerView: price,
+      views: plan.views,
+      aerial: plan.aerial,
+      roofs: plan.roofs,
+      holes: plan.holes,
+      points: plan.points,
+      predicted: plan.predicted,
+      // Cents: the caller asked for a price, not for floating-point dust.
+      estimatedUsd: Math.round((plan.views + plan.holes) * perView * 100) / 100,
+      atlas,
+      estimatedBlurredTexelPercent,
+      uvStretch,
+      verifyModel: verify.model,
+      // Not cents: a whole run of checks costs a few cents, and a rounded-down 0 would read as free.
+      estimatedVerifyUsd: Math.round((plan.views + plan.holes) * verify.perView * 10_000) / 10_000,
+    };
+  } finally {
+    await app.close();
+    await server.close();
+  }
+}
+
+/**
+ * Measure the finished run's footprint at its own atlas size. At or below the measurement atlas the
+ * painting session already holds the real texture, so the painted texels are the run's own; a larger
+ * atlas is measured at the cap and scaled (A.2's count is a share, so scaling is exact per texel).
+ */
+async function measureBlurredPercent(
+  app: Awaited<ReturnType<typeof openAppSession>>,
+  run: StoredRun,
+  measurementAtlas: number,
+): Promise<{ blurred: number; magnificationSkipped: number }> {
+  if (run.atlas > measurementAtlas) {
+    // Measured at the cap and scaled: the bake itself is too large to measure 1:1 here, so the pair
+    // is the guard's own rule — no texel a view resolves at more than 2x2 is painted (blur 0), and
+    // the texels it refuses are reported separately.
+    await app.call("load", "/api/level", {
+      lighting: run.lighting,
+      atlasSize: measurementAtlas,
+      viewSize: run.viewSize,
+      name: run.level,
+    });
+    await app.call("usePlan", run.plan);
+    await app.call<BrowserMeasurement>("measure", {}, false);
+    const guarded = await app.call<{ blurred: number; skipped: number }>("guardedPercentAt", run.atlas);
+    return { blurred: guarded.blurred, magnificationSkipped: guarded.skipped };
+  }
+  await app.call<BrowserMeasurement>("measure", {}, true);
+  return {
+    blurred: await app.call<number>("blurredPercentAt", run.atlas),
+    magnificationSkipped: await app.call<number>("magnificationSkippedPercentAt", run.atlas),
+  };
+}
+
+/**
+ * Measure a stored run's blur at its own atlas size, from its stored plan: inspect's number. No model
+ * calls, no key, and the run directory is only read.
+ */
+export async function measureStoredRunBlurredPercent(
+  runRoot: string,
+  run: StoredRun,
+): Promise<{ blurred: number; magnificationSkipped: number }> {
+  const measurementAtlas = Math.min(run.atlas, MEASUREMENT_ATLAS);
+  const server = await startUiServer({ levelPath: run.levelPath, runRoot });
+  try {
+    const app = await openAppSession({ url: server.url });
+    try {
+      // Inspect reads a stored run and never repaints it, so there is no atlas content to measure
+      // against: the pair is the projection's own guard rule (see `Session.guardedPercentAt`).
+      await app.call("load", "/api/level", {
+        lighting: run.lighting,
+        atlasSize: measurementAtlas,
+        viewSize: run.viewSize,
+        name: run.level,
+      });
+      await app.call("usePlan", run.plan);
+      await app.call<BrowserMeasurement>("measure", {}, false);
+      const guarded = await app.call<{ blurred: number; skipped: number }>("guardedPercentAt", run.atlas);
+      return { blurred: guarded.blurred, magnificationSkipped: guarded.skipped };
+    } finally {
+      await app.close();
+    }
+  } finally {
+    await server.close();
+  }
+}
+
+/**
+ * Paints a level, or resumes a stored run, and writes the baked GLB atomically. Each finished view is
+ * persisted with run.json before the next one starts, so an interrupted run keeps every paid view and
+ * a resume requests only the views still missing.
+ */
+export async function paintTextureProjection(request: TextureProjectionRequest): Promise<TextureProjectionResult> {
+  const cwd = request.cwd ?? process.cwd();
+  const env = request.env ?? process.env;
+  const runRoot = defaultRunRoot(cwd);
+  if (request.resumeRunId !== undefined && request.promptTestView !== undefined) {
+    throw new TextureProjectionError(
+      "TEXTURE_PROJECT_FAILED",
+      "promptTestView paints a freshly planned view, so it cannot be combined with resumeRunId",
+    );
+  }
+  const stored =
+    request.resumeRunId === undefined
+      ? undefined
+      : await readRun(runRoot, request.resumeRunId).then((run) => {
+          if (!run) {
+            throw new TextureProjectionError(
+              "TEXTURE_PROJECT_RUN_NOT_FOUND",
+              `no stored run ${request.resumeRunId} in ${runRoot}`,
+            );
+          }
+          return run;
+        });
+  // The caller's own verdicts are about images this run already paid for: refuse them anywhere else,
+  // and refuse an index run.json does not store (a rejection must never land on a view nobody saw).
+  const rejectViews = [...new Set(request.rejectViews ?? [])];
+  if (rejectViews.length > 0) {
+    if (stored === undefined) {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_INVALID_INPUT",
+        "rejectViews judges the views of a stored run: pass resumeRunId as well",
+      );
+    }
+    const storedIndices = new Set(stored.views.map((view) => view.index));
+    const unknown = rejectViews.filter((index) => !storedIndices.has(index));
+    if (unknown.length > 0) {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_INVALID_INPUT",
+        `rejectViews names view ${unknown.join(", ")}, which run ${stored.runId} does not store (it has ${[...storedIndices].sort((a, b) => a - b).join(", ") || "none"})`,
+      );
+    }
+  }
+  const levelPath = request.levelPath ?? stored?.levelPath;
+  if (levelPath === undefined) {
+    throw new TextureProjectionError("TEXTURE_PROJECT_LEVEL_NOT_FOUND", "levelPath is required unless resuming a run");
+  }
+  const level = await prepareLevel(levelPath, cwd);
+  if (stored === undefined) requireApiKey(env);
+  const firstModel = request.firstModel ?? DEFAULT_MODEL;
+  if (resolveModel(firstModel) === undefined) {
+    throw new TextureProjectionError("TEXTURE_PROJECT_FAILED", `unknown model alias: ${firstModel}`);
+  }
+  if (request.fillModel !== undefined && resolveModel(request.fillModel) === undefined) {
+    throw new TextureProjectionError("TEXTURE_PROJECT_FAILED", `unknown model alias: ${request.fillModel}`);
+  }
+  const lighting = stored?.lighting ?? request.lighting ?? "overcast";
+  // "auto" (C.1) is decided from a measurement below, once the browser has planned the cameras.
+  // A stored atlas the caller never named was an auto choice: resume it under the engine cook's
+  // ceiling, so a run planned at 8K by an older build bakes (and reports) at 4K, not above it.
+  const requested =
+    stored === undefined
+      ? (request.atlas ?? "auto")
+      : typeof stored.options.atlas === "number"
+        ? stored.atlas
+        : Math.min(stored.atlas, MAX_AUTO_ATLAS);
+  const measurementAtlas = requested === "auto" ? MEASUREMENT_ATLAS : Math.min(requested, MEASUREMENT_ATLAS);
+  const viewSize = stored?.viewSize ?? request.viewSize ?? 1024;
+  const runId = request.runId ?? stored?.runId ?? `${level.name}-${Date.now().toString(36)}`;
+  // `run` aliases `stored` on a resume, so remember what it had already spent before it is updated.
+  const priorCost = stored?.cost ?? 0;
+  const now = new Date().toISOString();
+  const run: StoredRun = stored ?? {
+    version: 1,
+    runId,
+    level: level.name,
+    levelPath: level.absolute,
+    lighting,
+    atlas: measurementAtlas,
+    viewSize,
+    options: pipelineOptions(request),
+    plan: { points: [], views: [], waves: [], predicted: [], grid: 1, reachableCells: 0 },
+    views: [],
+    cost: 0,
+    seconds: 0,
+    complete: false,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  // A resume may ask for a different vision check: it applies to the views this call paints, never to
+  // the stored ones (they keep the verdicts run.json recorded, so nothing is re-verified for money).
+  if (stored !== undefined && (request.verify !== undefined || request.verifyModel !== undefined)) {
+    run.options = {
+      ...run.options,
+      ...(request.verify === undefined ? {} : { verify: request.verify }),
+      ...(request.verifyModel === undefined ? {} : { verifyModel: request.verifyModel }),
+    };
+  }
+
+  let failure: unknown;
+  let interrupt: (error: unknown) => void = () => {};
+  const interrupted = new Promise<never>((_, reject) => {
+    interrupt = reject;
+  });
+  interrupted.catch(() => undefined); // awaited through Promise.race below
+
+  let pending: Promise<void> = Promise.resolve();
+  const server = await startUiServer({
+    runRoot,
+    levelPath: level.absolute,
+    ...(request.env === undefined ? {} : { env: request.env }),
+    ...(request.styleImagePath === undefined ? {} : { styleImagePath: request.styleImagePath }),
+  });
+  const app = await openAppSession({
+    url: server.url,
+    ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+    ...(request.onLog === undefined ? {} : { onLog: request.onLog }),
+    onEvent: (event) => {
+      request.onEvent?.(event);
+      pending = pending.then(async () => {
+        try {
+          await handleEvent(event);
+        } catch (error) {
+          if (failure === undefined) {
+            failure = error;
+            interrupt(error);
+          }
+        }
+      });
+    },
+  });
+
+  /** The run directory of a stopped or failed paint: every image it paid for is in there. */
+  function runNote(): string {
+    return `run ${runId} keeps every image it paid for in ${runDirectory(runRoot, runId)}`;
+  }
+
+  async function handleEvent(event: AppEvent): Promise<void> {
+    if (event.type === "planned") {
+      const plan = (event as { plan?: StoredPlan }).plan;
+      if (plan) run.plan = plan;
+      return;
+    }
+    // The painter stopped itself; the summary it returns says so (the event is only progress).
+    if (event.type === "structure-stop") return;
+    if (event.type !== "view-done" && event.type !== "view-reused") return;
+    const view = event as unknown as {
+      index: number;
+      wave: number;
+      spec: StoredView["spec"];
+      model: string;
+      first: boolean;
+      unknown: number;
+      left?: number;
+      prompt?: string;
+      seconds: number;
+      price: number;
+      coverage: number;
+      predicted: number;
+      rejected?: "grazing" | "structure" | "verify" | "caller";
+      structureDeviation?: number;
+      silhouetteMismatch?: number;
+      edgeMisalignment?: number;
+      grazingFraction?: number;
+      edgeBandShare?: number;
+      verify?: StoredView["verify"];
+      repainted?: boolean;
+      cost: number;
+      elapsed: number;
+    };
+    const storedView: StoredView = {
+      index: view.index,
+      wave: view.wave,
+      spec: view.spec,
+      model: view.model,
+      first: view.first,
+      unknownFraction: view.unknown,
+      seconds: view.seconds,
+      price: view.price,
+      coverage: view.coverage,
+      predicted: view.predicted,
+      ...(view.prompt === undefined ? {} : { prompt: view.prompt }),
+      ...(view.left === undefined ? {} : { left: view.left }),
+      ...(view.rejected === undefined ? {} : { rejected: view.rejected }),
+      ...(view.structureDeviation === undefined ? {} : { structureDeviation: view.structureDeviation }),
+      ...(view.silhouetteMismatch === undefined ? {} : { silhouetteMismatch: view.silhouetteMismatch }),
+      ...(view.edgeMisalignment === undefined ? {} : { edgeMisalignment: view.edgeMisalignment }),
+      ...(view.grazingFraction === undefined ? {} : { grazingFraction: view.grazingFraction }),
+      ...(view.edgeBandShare === undefined ? {} : { edgeBandShare: view.edgeBandShare }),
+      ...(view.verify === undefined ? {} : { verify: view.verify }),
+      ...(view.repainted === undefined ? {} : { repainted: view.repainted }),
+    };
+    run.views = [...run.views.filter((v) => v.index !== storedView.index), storedView].sort(
+      (a, b) => a.index - b.index,
+    );
+    // A reused view was paid for by an earlier run: its cost and seconds are already in the run's.
+    if (event.type === "view-done") {
+      run.cost = view.cost;
+      run.seconds = (stored?.seconds ?? 0) + view.elapsed;
+    }
+    run.updatedAt = new Date().toISOString();
+    await writeRun(runRoot, run);
+    await request.hooks?.onViewDone?.(storedView, run);
+  }
+
+  try {
+    let atlas = requested === "auto" ? 0 : requested;
+    await app.call("load", "/api/level", { lighting, atlasSize: measurementAtlas, viewSize, name: level.name });
+    if (atlas === 0) {
+      await app.call<BrowserPlan>("plan", planInput(request));
+      const measured = await app.call<BrowserMeasurement>("measure", planInput(request), false);
+      atlas = autoAtlasSize(measurementAtlas, measured.medianFoot);
+    }
+    // Paint at the chosen size: the plan only depends on the cameras, so it is planned again as is.
+    if (atlas !== measurementAtlas) {
+      await app.call("load", "/api/level", { lighting, atlasSize: atlas, viewSize, name: level.name });
+    }
+    run.atlas = atlas;
+
+    let summary: BrowserRun;
+    if (request.promptTestView !== undefined) {
+      const plan = await app.call<BrowserPlan>("plan", planInput(request));
+      run.plan = plan.plan;
+      run.updatedAt = new Date().toISOString();
+      await writeRun(runRoot, run);
+      const painted = await Promise.race([
+        app.call<BrowserPromptTest>("promptTest", {
+          runId,
+          viewIndex: request.promptTestView,
+          options: run.options,
+        }),
+        interrupted,
+      ]);
+      summary = {
+        runId,
+        views: run.views.length,
+        painted: painted.rejected === undefined ? 1 : 0,
+        cost: run.cost,
+        seconds: run.seconds,
+        coverage: painted.coverage,
+        visibleCoverage: await app.call<number>("visibleCoverage"),
+      };
+    } else if (stored !== undefined) {
+      summary = await Promise.race([app.call<BrowserRun>("resume", runId, rejectViews), interrupted]);
+    } else {
+      summary = await Promise.race([app.call<BrowserRun>("run", { runId, options: run.options }), interrupted]);
+    }
+    await pending;
+    if (failure !== undefined) throw failure;
+    if (summary.stopped === "structure") {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_STRUCTURE_REJECTED",
+        `the first ${STRUCTURE_STOP_VIEWS} painted views of ${runNote()} invented geometry (doors, windows, arches, passages or volumes the clay has not) and were not projected; stopped before buying the rest. A resume re-judges and reuses those paid images: call this tool again with {"resumeRunId": "${runId}"}`,
+      );
+    }
+
+    // The painter only needs the key when it is about to ask for an image; a resume that reuses stored
+    // views must not be refused for a missing one, and a request that fails for it must say so.
+    if (summary.painted === 0 || summary.coverage === 0) {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_NO_COVERAGE",
+        `no view of ${runNote()} reached the atlas: ${summary.painted} of ${summary.views} views projected, coverage ${Math.round(summary.coverage * 100)}%. Nothing was baked. The paid images are kept for a resume: call this tool again with {"resumeRunId": "${runId}"}`,
+      );
+    }
+
+    // The debug fill only changes this export: nothing bought, nothing stored a second time (phase 2r).
+    // A debug bake writes no coverage mask, so nothing beside the GLB says it did (phase 2t).
+    const exported = await app.call<BrowserGlb>("glb", request.fill ?? "detail");
+    const outputPath = request.outputPath ?? join(runRoot, runId, "level_textured.glb");
+    const paintedMask = await writePaintedMask(outputPath, exported.paintedMask);
+    await atomicWrite(
+      outputPath,
+      markProjectedAtlas(Buffer.from(exported.glb, "base64"), {
+        atlas: run.atlas,
+        runId,
+        ...(paintedMask === null ? {} : { paintedMask: paintedMask.file }),
+      }),
+    );
+    // A prompt test buys one view; it does not make the level's run complete.
+    run.complete = request.promptTestView === undefined;
+    run.cost = summary.cost;
+    run.seconds = summary.seconds;
+    run.updatedAt = new Date().toISOString();
+    await writeRun(runRoot, run);
+    // True-scale material swatches (phase 2m) from the paint this run holds: cut and written into the
+    // run directory by the app, then copied beside the GLB. A prompt test bakes no swatch.
+    const swatches =
+      request.promptTestView === undefined
+        ? await copySwatches(runRoot, runId, outputPath, await app.call<BrowserSwatches>("swatches", runId))
+        : null;
+    const measured = await measureBlurredPercent(app, run, measurementAtlas);
+    const visibleCoveragePercent = Math.round(summary.visibleCoverage * 10) / 10;
+    return {
+      runId,
+      level: level.name,
+      outputPath,
+      views: summary.views,
+      viewsPainted: summary.painted,
+      coveragePercent: Math.round(summary.coverage * 100),
+      visibleCoveragePercent,
+      warnings: [...bakeWarnings(visibleCoveragePercent, run), ...swatchWarnings(swatches)],
+      // What this call spent (not rounded: it is money already spent): a resume that only reused
+      // stored images reports 0.
+      estimatedUsd: summary.cost - priorCost,
+      seconds: summary.seconds,
+      complete: run.complete,
+      atlas: run.atlas,
+      blurredTexelPercent: measured.blurred,
+      magnificationSkippedPercent: measured.magnificationSkipped,
+      viewsRejected: {
+        grazing: run.views.filter((view) => view.rejected === "grazing").length,
+        structure: run.views.filter((view) => view.rejected === "structure").length,
+        verify: run.views.filter((view) => view.rejected === "verify").length,
+        verifyUnparsed: run.views.filter(
+          (view) => view.rejected === "verify" && view.verify?.verdict === "unparsed",
+        ).length,
+        caller: run.views.filter((view) => view.rejected === "caller").length,
+      },
+      viewsRepainted: run.views.filter((view) => view.repainted === true).length,
+      viewsBanded: run.views.filter((view) => (view.verify?.bands?.length ?? 0) > 0).length,
+      verifyModel:
+        run.options.verify === true ? ((run.options.verifyModel as string | undefined) ?? DEFAULT_VERIFY_MODEL.id) : null,
+      swatches,
+      paintedMask,
+    };
+  } catch (error) {
+    // Let the events already in flight finish writing run.json: a stopped or interrupted run must
+    // keep the record (and the images) of every view it paid for, or a resume would buy them again.
+    await pending.catch(() => undefined);
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("TEXTURE_PROJECT_MISSING_API_KEY")) {
+      throw new TextureProjectionError(
+        "TEXTURE_PROJECT_MISSING_API_KEY",
+        `OPENROUTER_API_KEY is not set and ${runNote()} still needs an image; resume with it set, or let every view come from the stored images`,
+      );
+    }
+    throw error;
+  } finally {
+    // Closing the browser is what interrupts a run whose hook threw: its page stops mid-view.
+    await app.close();
+    await server.close();
+  }
+}

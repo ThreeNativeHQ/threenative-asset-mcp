@@ -1,0 +1,2131 @@
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { Document, NodeIO } from "@gltf-transform/core";
+import sharp from "sharp";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+import {
+  ATLAS_GUTTER_TEXELS,
+  PAINTED_MASK_DOWNSCALE,
+  PAINTED_MASK_FEATHER,
+  aerialPassOnlyHidden,
+  cropRgba,
+  downsampleCoverage,
+  inpaintUnpainted,
+  islandLabels,
+  paintedWindow,
+  pushPull,
+} from "../src/texture-projection/atlas-pixels.js";
+import {
+  STRUCTURE_DEVIATION_LIMIT,
+  lowFrequencyLuminance,
+  rejectsStructure,
+  structureDeviation,
+} from "../src/texture-projection/app/core/structure.js";
+import { auditCookConfig } from "../src/texture-projection/config-audit.js";
+import { countDebugPink } from "../src/texture-projection/debug-pink.js";
+import { cookConfigHint } from "../src/tools/texture-projection.js";
+import { markProjectedAtlas, readProjectedAtlasMarker } from "../src/texture-projection/glb-marker.js";
+import { MODEL_ALIASES, DEFAULT_MODEL, prompts, resolveModel } from "../src/texture-projection/models.js";
+import { loadLevel } from "../src/texture-projection/app/core/scene.js";
+import { measureScaleAnchor } from "../src/texture-projection/app/core/scale.js";
+import {
+  MISSING_API_KEY_CODE,
+  forwardChatRequest,
+  forwardImageRequest,
+} from "../src/texture-projection/openrouter-proxy.js";
+import {
+  DEFAULT_VERIFY_MODEL,
+  parseVerifyAnswer,
+  structuresOutOfSurface,
+  verifyPrompt,
+} from "../src/texture-projection/verify.js";
+import {
+  MAX_AUTO_ATLAS,
+  TextureProjectionError,
+  autoAtlasSize,
+  paintTextureProjection,
+  quoteTextureProjection,
+} from "../src/texture-projection/runner.js";
+import { UV_STRETCH_LIMIT, measureUvStretch } from "../src/texture-projection/uv-stretch.js";
+import type { StoredRun } from "../src/texture-projection/runs.js";
+import { startOpenRouterStub as startStub, type OpenRouterStub } from "./helpers/openrouter-stub.js";
+
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const LEVEL = join(REPO, "tests", "fixtures", "texture-projection", "courtyard.glb");
+const FAKE_KEY = "sk-or-v1-this-is-a-fake-key-that-must-never-leak";
+const PLAN = { maxViews: 3, aerial: 0, roofs: 0, holes: 0, spacing: 6 };
+
+const temporaryDirectories: string[] = [];
+const stubs: OpenRouterStub[] = [];
+
+async function startOpenRouterStub(
+  png: string,
+  options: { holdAt?: number; paint?: "material" | "arch"; verify?: "ok" | "invented" | "garbage" | "once" } = {},
+) {
+  const stub = await startStub(png, options);
+  stubs.push(stub);
+  return stub;
+}
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await Promise.all(stubs.splice(0).map((stub) => stub.close()));
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+async function scratchDir(name: string): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), `threenative-asset-mcp-${name}-`));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+let pngBase64 = "";
+
+beforeAll(async () => {
+  const png = await sharp({
+    create: { width: 16, height: 16, channels: 3, background: { r: 196, g: 120, b: 72 } },
+  })
+    .png()
+    .toBuffer();
+  pngBase64 = png.toString("base64");
+});
+
+const sampleReference = () => [
+  { type: "image_url" as const, image_url: { url: "data:image/png;base64,AAAA" } },
+];
+
+/** A GLB with one triangle and no TEXCOORD_0: valid geometry the projection cannot bake into. */
+async function writeUvlessGlb(path: string): Promise<void> {
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const position = document
+    .createAccessor()
+    .setType("VEC3")
+    .setArray(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]))
+    .setBuffer(buffer);
+  const primitive = document.createPrimitive().setAttribute("POSITION", position);
+  const mesh = document.createMesh().setName("plate").addPrimitive(primitive);
+  const node = document.createNode().setMesh(mesh);
+  document.createScene().addChild(node);
+  await new NodeIO().write(path, document);
+}
+
+/** The rejection (or undefined when the promise resolved), so a test can assert the error code. */
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  return promise.then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+}
+
+function expectTextureProjectionError(error: unknown, code: string): void {
+  expect(error).toBeInstanceOf(TextureProjectionError);
+  expect((error as TextureProjectionError).code).toBe(code);
+}
+
+/** A closed room: floor plus four walls, one flat clay surface per face (a deterministic wall to paint). */
+async function writeRoomGlb(path: string, half = 10, height = 8): Promise<void> {
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const quad = (name: string, corners: [number, number, number][]) => {
+    const position = document
+      .createAccessor()
+      .setType("VEC3")
+      .setArray(new Float32Array(corners.flat()))
+      .setBuffer(buffer);
+    const uv = document
+      .createAccessor()
+      .setType("VEC2")
+      .setArray(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]))
+      .setBuffer(buffer);
+    const indices = document
+      .createAccessor()
+      .setType("SCALAR")
+      .setArray(new Uint16Array([0, 1, 2, 0, 2, 3]))
+      .setBuffer(buffer);
+    const primitive = document
+      .createPrimitive()
+      .setAttribute("POSITION", position)
+      .setAttribute("TEXCOORD_0", uv)
+      .setIndices(indices)
+      .setMaterial(document.createMaterial(name));
+    return document.createMesh(name).addPrimitive(primitive);
+  };
+  const h = half;
+  const meshes = [
+    quad("floor", [[-h, 0, -h], [-h, 0, h], [h, 0, h], [h, 0, -h]]),
+    quad("north", [[-h, 0, -h], [h, 0, -h], [h, height, -h], [-h, height, -h]]),
+    quad("south", [[h, 0, h], [-h, 0, h], [-h, height, h], [h, height, h]]),
+    quad("west", [[-h, 0, h], [-h, 0, -h], [-h, height, -h], [-h, height, h]]),
+    quad("east", [[h, 0, -h], [h, 0, h], [h, height, h], [h, height, -h]]),
+  ];
+  const scene = document.createScene("room");
+  for (const mesh of meshes) scene.addChild(document.createNode(mesh.getName()).setMesh(mesh));
+  await new NodeIO().write(path, document);
+}
+
+describe("texture-projection model aliases", () => {
+  it("defaults to or-klein and lists the documented aliases with their OpenRouter ids and prices", () => {
+    expect(DEFAULT_MODEL).toBe("or-klein");
+    expect(MODEL_ALIASES.map((model) => model.key)).toEqual(["or-klein", "muse-image", "or-seedream-lite"]);
+    expect(resolveModel("or-klein")).toMatchObject({
+      id: "black-forest-labs/flux-3-image-klein",
+      price: 0.009,
+    });
+    expect(resolveModel("muse-image")).toMatchObject({ id: "meta/muse-image", price: 0.01 });
+    expect(resolveModel("or-seedream-lite")).toMatchObject({
+      id: "bytedance-seed/seedream-5-0-lite",
+      price: 0.035,
+    });
+    expect(resolveModel("flux3-klein")).toBeUndefined();
+  });
+
+  it("passes any or:<model-id> through, with the image in input_references and never in images", () => {
+    const model = resolveModel("or:acme/any-image")!;
+    expect(model.id).toBe("acme/any-image");
+    const request = model.input({
+      imageUrl: "data:image/png;base64,AAAA",
+      prompt: { look: "stone walls", roofLook: "tiles", parts: "", mode: "first", floor: false },
+      seed: 7,
+    });
+    expect(request.input_references).toEqual(sampleReference());
+    expect(Object.keys(request)).not.toContain("images");
+    expect(request.seed).toBe(7);
+    expect(request.prompt).toContain("stone walls");
+  });
+});
+
+describe("texture-projection OpenRouter proxy", () => {
+  it("sends input_references with the key in the Authorization header, never an images field", async () => {
+    const stub = await startOpenRouterStub(pngBase64);
+    const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+    const response = await forwardImageRequest(
+      {
+        model: "black-forest-labs/flux-3-image-klein",
+        prompt: "A photo of stone walls",
+        seed: 7,
+        aspect_ratio: "1:1",
+        input_references: sampleReference(),
+      },
+      { env },
+    );
+    expect(response.status).toBe(200);
+    expect(Buffer.from(response.bytes).toString("utf8")).toContain(pngBase64);
+    expect(stub.requests).toHaveLength(1);
+    const sent = stub.requests[0]!;
+    expect(sent.method).toBe("POST");
+    expect(sent.authorization).toBe(`Bearer ${FAKE_KEY}`);
+    expect(sent.body["input_references"]).toEqual(sampleReference());
+    expect(sent.body).not.toHaveProperty("images");
+    expect(sent.body["model"]).toBe("black-forest-labs/flux-3-image-klein");
+  });
+
+  it("adds a style image as a second reference with a materials-only instruction", async () => {
+    const stub = await startOpenRouterStub(pngBase64);
+    const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+    const styleImage = "data:image/png;base64,STYLE";
+    const response = await forwardImageRequest(
+      {
+        model: "black-forest-labs/flux-3-image-klein",
+        prompt: "A photo of stone walls",
+        input_references: sampleReference(),
+        style_image: styleImage,
+      },
+      { env },
+    );
+    expect(response.status).toBe(200);
+    const sent = stub.requests[0]!;
+    const references = sent.body["input_references"] as { image_url: { url: string } }[];
+    expect(references).toHaveLength(2);
+    expect(references[1]?.image_url.url).toBe(styleImage);
+    expect(sent.body["prompt"]).toContain("materials");
+    expect(sent.body).not.toHaveProperty("style_image");
+  });
+
+  it("adds an accepted-paint crop as a reference with a keep-these-materials instruction (C, phase 2d)", async () => {
+    const stub = await startOpenRouterStub(pngBase64);
+    const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+    const crop = "data:image/jpeg;base64,QUNGRVBUQUc=";
+    const response = await forwardImageRequest(
+      {
+        model: "black-forest-labs/flux-3-image-klein",
+        prompt: "A photo of stone walls",
+        input_references: sampleReference(),
+        consistency_image: crop,
+      },
+      { env },
+    );
+    expect(response.status).toBe(200);
+    const sent = stub.requests[0]!;
+    const references = sent.body["input_references"] as { image_url: { url: string } }[];
+    expect(references).toHaveLength(2);
+    expect(references[1]?.image_url.url).toBe(crop);
+    // The instruction names the three things that broke the seam: material, block size, coursing.
+    expect(sent.body["prompt"]).toContain("keep exactly its materials");
+    expect(sent.body["prompt"]).toContain("coursing");
+    expect(sent.body).not.toHaveProperty("consistency_image");
+    // A crop that is not a data URL is refused, like the style image.
+    const bad = await forwardImageRequest(
+      { model: "m", prompt: "p", input_references: sampleReference(), consistency_image: "https://example.com/x.png" },
+      { env },
+    );
+    expect(bad.status).toBe(400);
+  });
+
+  it("fails closed with TEXTURE_PROJECT_MISSING_API_KEY when no key is set", async () => {
+    const stub = await startOpenRouterStub(pngBase64);
+    const response = await forwardImageRequest(
+      { model: "black-forest-labs/flux-3-image-klein", prompt: "p", input_references: sampleReference() },
+      { env: { OPENROUTER_BASE_URL: stub.url } },
+    );
+    expect(response.status).toBe(500);
+    const body = JSON.parse(Buffer.from(response.bytes).toString("utf8")) as { error: { code: string } };
+    expect(body.error.code).toBe(MISSING_API_KEY_CODE);
+    expect(stub.requests).toHaveLength(0);
+  });
+
+  it("rejects a body that would smuggle images or has no reference", async () => {
+    const stub = await startOpenRouterStub(pngBase64);
+    const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+    const response = await forwardImageRequest({ model: "m", prompt: "p", images: ["x"], input_references: [] }, { env });
+    expect(response.status).toBe(400);
+    expect(stub.requests).toHaveLength(0);
+  });
+});
+
+describe("texture-projection runner", () => {
+  it("fails closed on a level with no TEXCOORD_0", async () => {
+    const cwd = await scratchDir("uvless");
+    const level = join(cwd, "plate.glb");
+    await writeUvlessGlb(level);
+    const env = { OPENROUTER_API_KEY: FAKE_KEY };
+    expectTextureProjectionError(
+      await rejection(paintTextureProjection({ levelPath: level, cwd, env })),
+      "TEXTURE_PROJECT_MISSING_UV",
+    );
+    expectTextureProjectionError(
+      await rejection(quoteTextureProjection({ levelPath: level, cwd, env })),
+      "TEXTURE_PROJECT_MISSING_UV",
+    );
+  });
+
+  it("fails closed with TEXTURE_PROJECT_MISSING_API_KEY before painting", async () => {
+    const cwd = await scratchDir("nokey");
+    expectTextureProjectionError(
+      await rejection(paintTextureProjection({ levelPath: LEVEL, cwd, env: {} })),
+      "TEXTURE_PROJECT_MISSING_API_KEY",
+    );
+  });
+
+  it(
+    "quotes planned views and a positive estimate with zero API calls",
+    async () => {
+      const cwd = await scratchDir("quote");
+      const stub = await startOpenRouterStub(pngBase64);
+      // No OPENROUTER_API_KEY on purpose: planning cameras costs nothing and needs no key.
+      const quote = await quoteTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_BASE_URL: stub.url },
+        plan: PLAN,
+      });
+      expect(quote.model).toBe("or-klein");
+      expect(quote.views).toBeGreaterThan(0);
+      expect(quote.estimatedUsd).toBeGreaterThan(0);
+      // No embedded vision check by default (the calling agent judges inspect's contact sheet), so the
+      // quote prices the images that would be bought and nothing else.
+      expect(quote.verifyModel).toBeNull();
+      expect(quote.estimatedVerifyUsd).toBe(0);
+      expect(quote.estimatedUsd).toBe(Math.round((quote.views + quote.holes) * quote.pricePerView * 100) / 100);
+      expect(stub.requests).toHaveLength(0);
+    },
+    180_000,
+  );
+
+  it(
+    "plans no more views than the caller asked for, aerial ring included, and prices them in cents",
+    async () => {
+      const cwd = await scratchDir("quote-budget");
+      const quote = await quoteTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: {},
+        plan: { maxViews: 12, aerial: 3, roofs: 0, holes: 4, spacing: 6 },
+      });
+      // The caller's view budget is the total: 3 aerial views leave at most 9 player views.
+      expect(quote.views).toBeLessThanOrEqual(12);
+      expect(quote.aerial).toBeLessThanOrEqual(3);
+      expect(quote.aerial).toBeGreaterThan(0);
+      // One price per image actually painted, rounded to cents: the check is off by default.
+      expect(quote.estimatedUsd).toBe(Math.round((quote.views + quote.holes) * quote.pricePerView * 100) / 100);
+      // `verify: true` is the opt-in: the check is priced per view on top of the images.
+      const checked = await quoteTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: {},
+        verify: true,
+        plan: { maxViews: 12, aerial: 3, roofs: 0, holes: 4, spacing: 6 },
+      });
+      expect(checked.verifyModel).toBe(DEFAULT_VERIFY_MODEL.id);
+      expect(checked.estimatedVerifyUsd).toBeGreaterThan(0);
+      // The opt-in estimate is the images at the image model plus the checks, rounded to cents.
+      expect(checked.estimatedUsd).toBe(
+        Math.round(((checked.views + checked.holes) * checked.pricePerView + checked.estimatedVerifyUsd) * 100) / 100,
+      );
+      expect(checked.estimatedUsd).toBeGreaterThan(quote.estimatedUsd);
+    },
+    180_000,
+  );
+
+  it(
+    "measures blur against the view image size, not only the atlas",
+    async () => {
+      const cwd = await scratchDir("quote-viewsize");
+      const quoteAt = (viewSize: number) =>
+        quoteTextureProjection({
+          levelPath: LEVEL,
+          cwd,
+          env: {},
+          atlas: 4096,
+          viewSize,
+          plan: { maxViews: 4, aerial: 0, roofs: 0, holes: 0, spacing: 6 },
+        });
+      const small = await quoteAt(256);
+      const large = await quoteAt(512);
+      expect(small.atlas).toBe(4096);
+      expect(large.atlas).toBe(4096);
+      // At half the view size one image pixel covers twice as many texels along each axis (the guard's
+      // footprint is a length, A.2), so many more texels are magnification-blurred: the measurement has
+      // to follow the view size it was given.
+      expect(small.estimatedBlurredTexelPercent).toBeGreaterThan(large.estimatedBlurredTexelPercent + 10);
+    },
+    180_000,
+  );
+
+  it(
+    "paints a small run, writes a GLB atomically and keeps the key out of run.json and the logs",
+    async () => {
+      const cwd = await scratchDir("paint");
+      const stub = await startOpenRouterStub(pngBase64);
+      const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const logged: string[] = [];
+      const outputPath = join(cwd, "assets", "courtyard_textured.glb");
+      const result = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan: PLAN,
+        atlas: 256,
+        viewSize: 128,
+        runId: "paint-run",
+        outputPath,
+        onLog: (line) => logged.push(line),
+      });
+
+      expect(result.complete).toBe(true);
+      expect(result.viewsPainted).toBeGreaterThan(0);
+      expect(result.coveragePercent).toBeGreaterThan(0);
+      expect(result.verifyModel).toBeNull();
+      expect(stub.requests.length).toBe(result.viewsPainted);
+      // No chat request: the default run buys images and nothing else (the calling agent judges the views).
+      expect(stub.requests.every((sent) => Array.isArray(sent.body["input_references"]))).toBe(true);
+      // Later views get the accepted paint of the same surface as a material reference (C, phase 2d):
+      // one extra image reference plus the instruction to keep its materials and coursing. The very
+      // first view has none to copy yet.
+      const referencesOf = (sent: { body: Record<string, unknown> }) =>
+        sent.body["input_references"] as { image_url: { url: string } }[];
+      expect(referencesOf(stub.requests[0]!)).toHaveLength(1);
+      expect(stub.requests[0]?.body["prompt"]).not.toContain("keep exactly its materials");
+      const consistent = stub.requests.slice(1).find((sent) => referencesOf(sent).length === 2);
+      expect(consistent).toBeDefined();
+      expect(consistent?.body["prompt"]).toContain("keep exactly its materials");
+      expect(referencesOf(consistent!)[1]?.image_url.url.startsWith("data:image/jpeg;base64,")).toBe(true);
+      // B: how much of what a player sees the bake actually painted, and the warning rule that goes with it.
+      expect(result.visibleCoveragePercent).toBeGreaterThan(0);
+      expect(result.visibleCoveragePercent).toBeLessThanOrEqual(100);
+      // The swatch step's own shortfall is a warning of its own (phase 2m), so the coverage rule is
+      // read on the warnings that are not about swatches.
+      const bakeOnly = result.warnings.filter((warning) => !warning.includes("swatch"));
+      if (result.visibleCoveragePercent < 90) {
+        expect(bakeOnly.join(" ")).toContain("visible coverage");
+      } else {
+        expect(bakeOnly).toEqual([]);
+      }
+      const references = stub.requests[0]?.body["input_references"] as
+        | { type: string; image_url: { url: string } }[]
+        | undefined;
+      expect(references).toHaveLength(1);
+      expect(references?.[0]?.type).toBe("image_url");
+      expect(references?.[0]?.image_url.url.startsWith("data:image/jpeg;base64,")).toBe(true);
+      expect(stub.requests[0]?.body).not.toHaveProperty("images");
+      expect(stub.requests[0]?.authorization).toBe(`Bearer ${FAKE_KEY}`);
+
+      const glb = await readFile(outputPath);
+      expect(glb.subarray(0, 4).toString("utf8")).toBe("glTF");
+      expect(glb.byteLength).toBeGreaterThan(1024);
+      // The bake, not just the geometry: the level material carries the projected atlas as its base colour.
+      const baked = await new NodeIO().read(outputPath);
+      const material = baked.getRoot().listMaterials()[0];
+      expect(material?.getBaseColorTexture()).not.toBeNull();
+      expect(material?.getBaseColorTexture()?.getSize()).toEqual([256, 256]);
+
+      const runText = await readFile(join(cwd, ".threenative", "texture-projection", result.runId, "run.json"), "utf8");
+      const run = JSON.parse(runText) as StoredRun;
+      expect(run.complete).toBe(true);
+      // The default is recorded, not guessed: run.json says no vision check judged these views.
+      expect(run.options.verify).toBe(false);
+      expect(result.viewsRejected).toMatchObject({ verify: 0, verifyUnparsed: 0, caller: 0 });
+      expect(run.views).toHaveLength(result.viewsPainted);
+      for (const view of run.views) {
+        for (const file of ["clay", "gen", "comp"]) {
+          const image = await readFile(
+            join(cwd, ".threenative", "texture-projection", result.runId, `view_${view.index}_${file}.png`),
+          );
+          expect(image.subarray(1, 4).toString("utf8")).toBe("PNG");
+        }
+      }
+
+      // The swatches (phase 2m): true-scale patches cut from the stored paint, written both into the run
+      // directory and beside the GLB, with swatches.json saying which view and scale they came from.
+      expect(result.swatches).not.toBeNull();
+      const swatches = result.swatches!;
+      const cut = (["wall", "floor"] as const).filter((klass) => swatches[klass] !== null);
+      expect(cut.length).toBeGreaterThan(0);
+      for (const klass of cut) {
+        const swatch = swatches[klass]!;
+        expect(swatch.file).toBe(`${basename(outputPath).replace(/\.\w+$/, "")}.swatch_${klass}.png`);
+        // A swatch is cut to whole courses where the paint repeats (phase 2n), so it is no wider than the
+        // patch it came from: `metres` follows the width, and the scale stays the patch's own on both axes.
+        const side = klass === "wall" ? 1.5 : 2;
+        expect(swatch.metres).toBe(swatch.metresX);
+        expect(swatch.metresX).toBeLessThanOrEqual(side);
+        expect(swatch.metresY).toBeGreaterThan(0);
+        expect(swatch.metresY).toBeLessThanOrEqual(side);
+        expect(swatch.metresPerPixel).toBeCloseTo(side / 1024, 9);
+        expect(swatch.incidence).toBeLessThan(klass === "wall" ? 50 : 65);
+        expect(swatch.corners).toHaveLength(4);
+        expect((await readFile(swatch.path)).subarray(1, 4).toString("utf8")).toBe("PNG");
+        const inRun = await readFile(join(cwd, ".threenative", "texture-projection", result.runId, `swatch_${klass}.png`));
+        expect(inRun.subarray(1, 4).toString("utf8")).toBe("PNG");
+        expect(swatch.sourceMetresPerPixel).toBeGreaterThan(0);
+        expect(swatch.view).toBeGreaterThanOrEqual(0);
+      }
+      const swatchFile = JSON.parse(await readFile(swatches.jsonPath, "utf8")) as Record<
+        string,
+        { file: string; metresY: number }
+      >;
+      expect(Object.keys(swatchFile).sort()).toEqual([...cut].sort());
+      for (const klass of cut) {
+        expect(swatchFile[klass]?.file).toBe(swatches[klass]!.file);
+        expect(swatchFile[klass]?.metresY).toBe(swatches[klass]!.metresY);
+      }
+
+      const everything = [runText, JSON.stringify(result), logged.join("\n"), stdout.mock.calls.flat().join("\n"), stderr.mock.calls.flat().join("\n")].join("\n");
+      expect(everything).not.toContain(FAKE_KEY);
+    },
+    240_000,
+  );
+
+  it(
+    "refuses to paint a view pixel that would cover more than 2x2 atlas texels",
+    async () => {
+      const cwd = await scratchDir("magnification");
+      const stub = await startOpenRouterStub(pngBase64);
+      const plan = { maxViews: 3, aerial: 0, roofs: 0, holes: 0, spacing: 6 };
+      // An atlas four times finer than the views resolve: without the guard most texels would be painted
+      // from one stretched image pixel each.
+      const quote = await quoteTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: {},
+        atlas: 1024,
+        viewSize: 128,
+        verify: false,
+        plan,
+      });
+      expect(quote.estimatedBlurredTexelPercent).toBeGreaterThan(10);
+      const result = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan,
+        atlas: 1024,
+        viewSize: 128,
+        verify: false,
+        runId: "magnification-run",
+        outputPath: join(cwd, "assets", "magnification.glb"),
+      });
+      // The guard is why the painted atlas has no magnified texel left: they wait for a closer view.
+      expect(result.blurredTexelPercent).toBe(0);
+      expect(result.magnificationSkippedPercent).toBeGreaterThan(1);
+      expect(result.coveragePercent).toBeGreaterThan(0);
+
+      // A bake at an atlas above the measurement cap reports the guard's own rule: blur 0 by
+      // construction, the refused texels counted instead.
+      const big = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan,
+        atlas: 4096,
+        viewSize: 128,
+        verify: false,
+        runId: "magnification-4k-run",
+        outputPath: join(cwd, "assets", "magnification-4k.glb"),
+      });
+      expect(big.atlas).toBe(4096);
+      expect(big.blurredTexelPercent).toBe(0);
+      // At 4096 px from 128 px views almost every texel is refused: that is the guard doing its job.
+      expect(big.magnificationSkippedPercent).toBeGreaterThan(5);
+      expect(existsSync(big.outputPath)).toBe(true);
+    },
+    300_000,
+  );
+
+  it(
+    "stops buying after three invented-geometry views and keeps their images for a resume",
+    async () => {
+      const cwd = await scratchDir("structure");
+      // A closed room where the arch the stub paints lands on a wall in every view.
+      const room = join(cwd, "room.glb");
+      await writeRoomGlb(room);
+      const stub = await startOpenRouterStub(pngBase64, { paint: "arch" });
+      const outputPath = join(cwd, "assets", "room_textured.glb");
+      const error = await rejection(
+        paintTextureProjection({
+          levelPath: room,
+          cwd,
+          env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+          plan: { maxViews: 6, aerial: 0, roofs: 0, holes: 0, spacing: 4 },
+          atlas: 256,
+          viewSize: 128,
+          runId: "arch-run",
+          outputPath,
+        }),
+      );
+      // The check fails closed: three rejected first views stop the run instead of buying six.
+      expectTextureProjectionError(error, "TEXTURE_PROJECT_STRUCTURE_REJECTED");
+      expect((error as Error).message).toContain("arch-run");
+      expect((error as Error).message).toContain("resumeRunId");
+      expect(stub.requests).toHaveLength(3);
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "arch-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.complete).toBe(false);
+      expect(run.views.filter((view) => view.rejected === "structure")).toHaveLength(3);
+      for (const view of run.views) {
+        expect(view.structureDeviation).toBeGreaterThan(0.2);
+        // Rejected views keep their images for the contact sheet and for a resume, so the reason stays checkable.
+        expect(existsSync(join(cwd, ".threenative", "texture-projection", "arch-run", `view_${view.index}_gen.png`))).toBe(true);
+      }
+      // Nothing was baked, so no GLB was written over the caller's path.
+      expect(existsSync(outputPath)).toBe(false);
+    },
+    240_000,
+  );
+
+  it(
+    "fails closed with TEXTURE_PROJECT_NO_COVERAGE when no view reaches the atlas",
+    async () => {
+      const cwd = await scratchDir("no-coverage");
+      const room = join(cwd, "room.glb");
+      await writeRoomGlb(room);
+      const stub = await startOpenRouterStub(pngBase64, { paint: "arch" });
+      // One view only: the three-view structure stop cannot fire, so the run ends with nothing projected.
+      const error = await rejection(
+        paintTextureProjection({
+          levelPath: room,
+          cwd,
+          env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+          plan: { maxViews: 1, aerial: 0, roofs: 0, holes: 0, spacing: 4 },
+          atlas: 256,
+          viewSize: 128,
+          runId: "no-coverage-run",
+          outputPath: join(cwd, "assets", "room_textured.glb"),
+        }),
+      );
+      expectTextureProjectionError(error, "TEXTURE_PROJECT_NO_COVERAGE");
+      expect((error as Error).message).toContain("no-coverage-run");
+      expect(stub.requests.length).toBe(1);
+      // The paid view is on disk and run.json names it, so a resume can reuse it.
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "no-coverage-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views).toHaveLength(1);
+      expect(existsSync(join(cwd, ".threenative", "texture-projection", "no-coverage-run", "view_0_gen.png"))).toBe(true);
+    },
+    240_000,
+  );
+
+  it(
+    "resumes from stored generations alone: no image on disk is ever bought twice",
+    async () => {
+      const cwd = await scratchDir("resume-reuse");
+      const stub = await startOpenRouterStub(pngBase64);
+      const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+      const first = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env,
+        plan: { ...PLAN, maxViews: 2 },
+        atlas: 256,
+        viewSize: 128,
+        verify: false,
+        runId: "reuse-run",
+        outputPath: join(cwd, "assets", "first.glb"),
+      });
+      expect(first.viewsPainted).toBeGreaterThan(0);
+      const bought = stub.requests.length;
+      expect(bought).toBe(first.viewsPainted);
+
+      // The provider is gone: a resume that would request anything fails here, and the run is bought out.
+      await stub.close();
+      const resumed = await paintTextureProjection({
+        resumeRunId: "reuse-run",
+        cwd,
+        env,
+        outputPath: join(cwd, "assets", "resumed.glb"),
+      });
+      expect(resumed.viewsPainted).toBe(bought);
+      expect(resumed.coveragePercent).toBeGreaterThan(0);
+      expect(resumed.viewsRejected.structure).toBe(0);
+      // Nothing was bought on the resume, so it reports no spend (the run's own cost is in run.json).
+      expect(resumed.estimatedUsd).toBe(0);
+      expect(stub.requests).toHaveLength(bought);
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "reuse-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.complete).toBe(true);
+      expect(run.views.filter((view) => view.rejected !== undefined)).toHaveLength(0);
+      expect(existsSync(join(cwd, "assets", "resumed.glb"))).toBe(true);
+
+      // A debug resume bakes the same stored images with every texel no view painted as hot pink (phase
+      // 2r): the provider is still gone, so the fill buys nothing, and the default bake has no pink at
+      // all — the debug fill only changes the GLB this call writes.
+      const debugPath = join(cwd, "assets", "debug.glb");
+      const debug = await paintTextureProjection({
+        resumeRunId: "reuse-run",
+        cwd,
+        env,
+        fill: "debug",
+        outputPath: debugPath,
+      });
+      expect(debug.estimatedUsd).toBe(0);
+      expect(debug.viewsPainted).toBe(bought);
+      expect(stub.requests).toHaveLength(bought);
+      const pinkOf = async (path: string) => {
+        const root = (await new NodeIO().read(path)).getRoot();
+        const image = root.listMaterials()[0]!.getBaseColorTexture()!.getImage()!;
+        return countDebugPink(await sharp(image).ensureAlpha().raw().toBuffer());
+      };
+      expect((await pinkOf(join(cwd, "assets", "resumed.glb"))).pink).toBe(0);
+      const pink = await pinkOf(debugPath);
+      expect(pink.pink).toBeGreaterThan(0);
+      expect(pink.share).toBeGreaterThan(0);
+      // A debug bake is a verification export: it writes no coverage mask, and no marker names one.
+      expect(debug.paintedMask).toBeNull();
+      expect(existsSync(join(cwd, "assets", "debug.painted.png"))).toBe(false);
+      expect(readProjectedAtlasMarker(new Uint8Array(await readFile(debugPath)))).toEqual({
+        atlas: resumed.atlas,
+        runId: "reuse-run",
+      });
+
+      // The default bake's atlas is opaque RGB and "a view painted this" ships as its own file (phase
+      // 2t): the material stays OPAQUE, the marker names the mask PNG beside the GLB, and the atlas
+      // carries the fill's colour instead of black where that mask says the fill made it up.
+      const resumedRoot = (await new NodeIO().read(join(cwd, "assets", "resumed.glb"))).getRoot();
+      expect(resumedRoot.listMaterials()[0]!.getAlphaMode()).toBe("OPAQUE");
+      const marker = readProjectedAtlasMarker(new Uint8Array(await readFile(join(cwd, "assets", "resumed.glb"))));
+      expect(marker?.paintedMask).toBe("resumed.painted.png");
+      expect(resumed.paintedMask).toEqual({
+        file: "resumed.painted.png",
+        path: join(cwd, "assets", "resumed.painted.png"),
+      });
+      const maskPath = join(cwd, "assets", "resumed.painted.png");
+      const maskMeta = await sharp(maskPath).metadata();
+      // A quarter of the 256 atlas, one 8-bit channel: a mask a game loads as linear data, not colour.
+      expect(maskMeta).toMatchObject({ width: 64, height: 64, channels: 1, depth: "uchar" });
+      const mask = await sharp(maskPath).raw().toBuffer();
+      const raw = await sharp(resumedRoot.listMaterials()[0]!.getBaseColorTexture()!.getImage()!)
+        .ensureAlpha()
+        .raw()
+        .toBuffer();
+      let paintTexels = 0;
+      let fillTexels = 0;
+      let opaqueTexels = 0;
+      for (let i = 3; i < raw.length; i += 4) if (raw[i] === 255) opaqueTexels += 1;
+      expect(opaqueTexels).toBe((raw.length / 4)); // every texel, exactly
+      let colouredFill = 0;
+      for (let i = 0; i < mask.length; i++) {
+        if (mask[i]! > 0) {
+          paintTexels += 1;
+          continue;
+        }
+        fillTexels += 1;
+        // The 4x4 atlas block under this mask texel: a filled texel is the fill's own colour now, never
+        // the black a premultiplied canvas left there (phase 2s finding 4).
+        const x = (i % 64) * 4;
+        const y = Math.floor(i / 64) * 4;
+        const p = 4 * (y * 256 + x);
+        if (raw[p] !== 0 || raw[p + 1] !== 0 || raw[p + 2] !== 0) colouredFill += 1;
+      }
+      expect(paintTexels).toBeGreaterThan(0);
+      expect(fillTexels).toBeGreaterThan(0);
+      expect(colouredFill / fillTexels).toBeGreaterThan(0.9);
+    },
+    300_000,
+  );
+
+  it(
+    "paints exactly one view for a prompt test, persists it and leaves the run incomplete",
+    async () => {
+      const cwd = await scratchDir("prompt-test");
+      const stub = await startOpenRouterStub(pngBase64);
+      const outputPath = join(cwd, "assets", "courtyard_textured.glb");
+      const result = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan: PLAN,
+        atlas: 256,
+        viewSize: 128,
+        verify: false,
+        runId: "prompt-test-run",
+        outputPath,
+        promptTestView: 0,
+      });
+
+      // One image bought, for one view only; the level's run is not complete.
+      expect(stub.requests).toHaveLength(1);
+      expect(result.complete).toBe(false);
+      expect(result.viewsPainted).toBe(1);
+      expect(existsSync(outputPath)).toBe(true);
+
+      const directory = join(cwd, ".threenative", "texture-projection", "prompt-test-run");
+      const run = JSON.parse(await readFile(join(directory, "run.json"), "utf8")) as StoredRun;
+      expect(run.complete).toBe(false);
+      expect(run.views).toHaveLength(1);
+      expect(run.views[0]?.index).toBe(0);
+      for (const file of ["clay", "gen", "comp"]) {
+        expect(existsSync(join(directory, `view_0_${file}.png`))).toBe(true);
+      }
+    },
+    240_000,
+  );
+
+  it(
+    "resumes an interrupted run and requests only the views still missing",
+    async () => {
+      const cwd = await scratchDir("resume");
+      // The second view's request is held open, so the first view's completion reaches the runner while
+      // the browser is still waiting on the model: closing the browser there interrupts a real run.
+      const stub = await startOpenRouterStub(pngBase64, { holdAt: 2 });
+      const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+      const interrupted = paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env,
+        plan: PLAN,
+        atlas: 256,
+        viewSize: 128,
+        // One request per view, so `holdAt: 2` is the second view's image.
+        verify: false,
+        runId: "resume-run",
+        hooks: {
+          onViewDone: () => {
+            throw new Error("interrupted after the first paid view");
+          },
+        },
+      });
+      await expect(interrupted).rejects.toThrow("interrupted after the first paid view");
+      stub.release();
+
+      const runPath = join(cwd, ".threenative", "texture-projection", "resume-run", "run.json");
+      const partial = JSON.parse(await readFile(runPath, "utf8")) as StoredRun;
+      expect(partial.complete).toBe(false);
+      expect(partial.views).toHaveLength(1);
+      const planned = partial.plan.views.length;
+      expect(planned).toBeGreaterThan(1);
+      // View 0's image and the view the browser was waiting on when it was closed.
+      const beforeResume = stub.requests.length;
+
+      const resumed = await paintTextureProjection({
+        resumeRunId: "resume-run",
+        cwd,
+        env,
+        outputPath: join(cwd, "courtyard_textured.glb"),
+      });
+      expect(resumed.complete).toBe(true);
+      const finished = JSON.parse(await readFile(runPath, "utf8")) as StoredRun;
+      expect(finished.complete).toBe(true);
+      // Exactly one paid request per view still missing: view 0 was kept and reused, not bought again.
+      const boughtOnResume = stub.requests.length - beforeResume;
+      expect(boughtOnResume).toBe(finished.views.length - 1);
+      // "Views painted" counts what reached the atlas: the reused view plus the newly bought ones.
+      expect(resumed.viewsPainted).toBe(finished.views.length);
+      expect(resumed.estimatedUsd).toBeCloseTo(boughtOnResume * 0.009, 6);
+      expect(finished.views[0]?.index).toBe(0);
+      expect(boughtOnResume).toBeGreaterThan(0);
+    },
+    300_000,
+  );
+});
+
+describe("texture-projection caller verdicts (phase 2f)", () => {
+  const runPath = (cwd: string) => join(cwd, ".threenative", "texture-projection", "reject-run", "run.json");
+
+  it(
+    "fails closed on rejectViews with no stored run to judge, and before buying anything",
+    async () => {
+      const cwd = await scratchDir("reject-guard");
+      const stub = await startOpenRouterStub(pngBase64);
+      // A rejection is a verdict on an image that was already paid for: without resumeRunId there is
+      // nothing to judge, and nothing may be bought while looking for it.
+      expectTextureProjectionError(
+        await rejection(
+          paintTextureProjection({
+            levelPath: LEVEL,
+            cwd,
+            env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+            plan: PLAN,
+            rejectViews: [0],
+          }),
+        ),
+        "TEXTURE_PROJECT_INVALID_INPUT",
+      );
+      expect(stub.requests).toHaveLength(0);
+    },
+    180_000,
+  );
+
+  it(
+    "stores a caller-rejected view as rejected, projects nothing of it, and buys no image",
+    async () => {
+      const cwd = await scratchDir("reject-views");
+      const stub = await startOpenRouterStub(pngBase64);
+      const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
+      // No verify flag: the default run buys images only, and the caller is the judge.
+      const first = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env,
+        plan: { ...PLAN, maxViews: 2 },
+        atlas: 256,
+        viewSize: 128,
+        runId: "reject-run",
+        outputPath: join(cwd, "assets", "first.glb"),
+      });
+      const bought = stub.requests.length;
+      expect(bought).toBe(first.viewsPainted);
+      expect(bought).toBeGreaterThan(1);
+
+      // An index this run does not store is refused too, before any browser or request.
+      expectTextureProjectionError(
+        await rejection(paintTextureProjection({ resumeRunId: "reject-run", cwd, env, rejectViews: [7] })),
+        "TEXTURE_PROJECT_INVALID_INPUT",
+      );
+      expect(stub.requests).toHaveLength(bought);
+
+      // A plain resume re-projects every stored image: the baseline the caller's verdict removes one from.
+      const plain = await paintTextureProjection({
+        resumeRunId: "reject-run",
+        cwd,
+        env,
+        outputPath: join(cwd, "assets", "plain.glb"),
+      });
+      expect(plain.viewsPainted).toBe(bought);
+      expect(stub.requests).toHaveLength(bought);
+
+      const rejected = await paintTextureProjection({
+        resumeRunId: "reject-run",
+        cwd,
+        env,
+        rejectViews: [0],
+        outputPath: join(cwd, "assets", "rejected.glb"),
+      });
+      // Nothing was bought, view 0 reached the atlas nowhere, and the rest re-baked from its stored image.
+      expect(stub.requests).toHaveLength(bought);
+      expect(rejected.viewsRejected.caller).toBe(1);
+      expect(rejected.viewsPainted).toBe(bought - 1);
+      expect(rejected.coveragePercent).toBeGreaterThan(0);
+      expect(rejected.coveragePercent).toBeLessThanOrEqual(plain.coveragePercent);
+      expect(existsSync(join(cwd, "assets", "rejected.glb"))).toBe(true);
+      const stored = JSON.parse(await readFile(runPath(cwd), "utf8")) as StoredRun;
+      expect(stored.views[0]?.rejected).toBe("caller");
+      expect(stored.views.filter((view) => view.rejected === undefined)).toHaveLength(bought - 1);
+
+      // A later resume keeps the caller's rejection instead of re-judging the image back in.
+      const again = await paintTextureProjection({
+        resumeRunId: "reject-run",
+        cwd,
+        env,
+        outputPath: join(cwd, "assets", "again.glb"),
+      });
+      expect(stub.requests).toHaveLength(bought);
+      expect(again.viewsRejected.caller).toBe(1);
+      expect(again.viewsPainted).toBe(bought - 1);
+      expect((JSON.parse(await readFile(runPath(cwd), "utf8")) as StoredRun).views[0]?.rejected).toBe("caller");
+    },
+    420_000,
+  );
+});
+
+describe("texture-projection UV stretch (A.3)", () => {
+  it("measures a uniformly mapped level at 1x and reports it uniform", async () => {
+    const report = await measureUvStretch(LEVEL);
+    expect(report.triangles).toBeGreaterThan(0);
+    expect(report.p95).toBeGreaterThan(0.9);
+    expect(report.p95).toBeLessThanOrEqual(UV_STRETCH_LIMIT);
+    expect(report.uniform).toBe(true);
+  });
+
+  it("reports the material whose texels are coarsest and warns past 4x", async () => {
+    const cwd = await scratchDir("uvstretch");
+    const path = join(cwd, "stretched.glb");
+    await writeStretchedGlb(path);
+    const report = await measureUvStretch(path);
+    expect(report.worstMaterial).toBe("stretched");
+    expect(report.p95).toBeGreaterThan(UV_STRETCH_LIMIT);
+    expect(report.uniform).toBe(false);
+  });
+});
+
+describe("texture-projection structure check (B.2)", () => {
+  const SIZE = 256;
+
+  it("accepts the image the model was given", () => {
+    const clay = syntheticClay(SIZE);
+    expect(structureDeviation(clay, clay, SIZE, SIZE)).toBe(0);
+    expect(rejectsStructure(structureDeviation(clay, clay, SIZE, SIZE))).toBe(false);
+  });
+
+  it("accepts a painted material and a global lighting change, rejects an invented dark arch", () => {
+    const clay = syntheticClay(SIZE);
+    // A painted material: bricks and grain over the same shading.
+    const material = new Uint8ClampedArray(clay);
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        const p = 4 * (y * SIZE + x);
+        const brick = ((x >> 3) + (y >> 2)) % 2 ? 16 : -14;
+        for (let channel = 0; channel < 3; channel++) {
+          material[p + channel] = brick > 0 ? material[p + channel]! * 0.9 + 30 : material[p + channel]! * 0.9 + 4;
+        }
+      }
+    }
+    const materialDeviation = structureDeviation(material, clay, SIZE, SIZE);
+    expect(materialDeviation).toBeLessThan(STRUCTURE_DEVIATION_LIMIT);
+    expect(rejectsStructure(materialDeviation)).toBe(false);
+
+    // A darker style or a lighting gradient is a smooth trend, not a shape.
+    const ramp = new Uint8ClampedArray(clay);
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        const p = 4 * (y * SIZE + x);
+        const factor = 1 + 0.2 * (x / SIZE - 0.5) + 0.15 * (y / SIZE - 0.5);
+        for (let channel = 0; channel < 3; channel++) ramp[p + channel] = Math.min(255, ramp[p + channel]! * factor);
+      }
+    }
+    expect(structureDeviation(ramp, clay, SIZE, SIZE)).toBeLessThan(STRUCTURE_DEVIATION_LIMIT);
+
+    // A big dark arch painted on the flat wall, clear of the floor line: a compact, closed, much
+    // darker shape inside one clay surface.
+    const arch = new Uint8ClampedArray(clay);
+    const cx = SIZE * 0.5;
+    const half = SIZE * 0.13;
+    const top = SIZE * 0.22;
+    const bottom = SIZE * 0.58;
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        const inside =
+          x > cx - half &&
+          x < cx + half &&
+          y > top &&
+          y < bottom &&
+          (y > top + half || (x - cx) ** 2 + (y - (top + half)) ** 2 < half ** 2);
+        if (!inside) continue;
+        const p = 4 * (y * SIZE + x);
+        arch[p] = 34;
+        arch[p + 1] = 28;
+        arch[p + 2] = 26;
+      }
+    }
+    const archDeviation = structureDeviation(arch, clay, SIZE, SIZE);
+    expect(archDeviation).toBeGreaterThan(0.2); // the limit is 0.2, the arch is nearly 3x over it
+    expect(rejectsStructure(archDeviation)).toBe(true);
+    // The grid it compares on is the documented 64 cells.
+    expect(lowFrequencyLuminance(clay, SIZE, SIZE)).toHaveLength(64 * 64);
+  });
+});
+
+describe("texture-projection vision check (2c)", () => {
+  it("asks for the structures the clay lacks and the real-world size of the detail", () => {
+    const prompt = verifyPrompt({ cameraHeightM: 1.65, centreDistanceM: 9.34, kind: "ground" });
+    expect(prompt).toContain("1.6 m above the ground");
+    expect(prompt).toContain("9.3 m away");
+    // Phase 2d: the species the 2c check let through are named, and the wall top is compared.
+    for (const word of [
+      "buttress",
+      "pilaster",
+      "quoin",
+      "coping",
+      "capstone",
+      "cornice",
+      "plinth",
+      "relief",
+      "roof tiles",
+      "terracotta",
+      "arch",
+      "doorway",
+      "chimney",
+      "TOP EDGE",
+      "SILHOUETTE",
+    ]) {
+      expect(prompt).toContain(word);
+    }
+    expect(prompt).toContain('"added"');
+    expect(prompt).toContain('"scaleOk"');
+  });
+
+  it("anchors every paint prompt to the camera's height and the depth in the middle of the frame", () => {
+    const scale = { cameraHeight: 1.65, centreDistance: 9.34 };
+    for (const mode of ["first", "fill", "roof"] as const) {
+      const text = prompts.view({ look: "ochre plaster", roofLook: "roof tiles", parts: "", mode, floor: false, scale });
+      expect(text).toContain("1.6 m above the ground");
+      expect(text).toContain("9.3 m away");
+      expect(text).toContain("paving stones are 15-25 cm across");
+      expect(text).toContain("bricks 20-25 cm long");
+    }
+    // A caller with no anchor (no level geometry to measure) gets the prompt it had before.
+    const unanchored = prompts.view({ look: "ochre plaster", roofLook: "roof tiles", parts: "", mode: "first", floor: false });
+    expect(unanchored).not.toContain("true real-world size");
+  });
+
+  it("forbids roofs above a flat wall top, except in the roof pass that paints roofs", () => {
+    const base = { look: "ochre plaster", roofLook: "roof tiles", parts: "", floor: false };
+    const first = prompts.view({ ...base, mode: "first" });
+    expect(first).toContain("no roof, roof tiles, tile band, coping or chimney above a wall top");
+    expect(first).toContain("every wall top stays the flat edge it is in the clay");
+    // The roof pass exists to paint roofs, so it must not be told that a roof is forbidden.
+    const roof = prompts.view({ ...base, mode: "roof" });
+    expect(roof).not.toContain("no roof, roof tiles");
+    expect(roof).toContain("nothing is added on the roofs");
+  });
+
+  it("measures the anchor from the level's own geometry, not from the frame", async () => {
+    const cwd = await scratchDir("scale-anchor");
+    const room = join(cwd, "room.glb");
+    await writeRoomGlb(room);
+    const bytes = await readFile(room);
+    const level = await loadLevel(
+      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+      "room",
+    );
+    // The room is 20 m across with 8 m walls: standing in the middle at 1.65 m, the wall ahead is 10 m away.
+    const anchor = measureScaleAnchor(level, { position: [0, 1.65, 0], yaw: 0, pitch: 0, fov: 90 });
+    expect(anchor.cameraHeight).toBeCloseTo(1.65, 2);
+    expect(anchor.centreDistance).toBeCloseTo(10, 1);
+    // Looking up over a wall top: no centre hit, so the nearest surface in the fan stands in.
+    const sky = measureScaleAnchor(level, { position: [0, 1.65, 0], yaw: 0, pitch: 1.3, fov: 90 });
+    expect(sky.centreDistance).toBeGreaterThan(0);
+    expect(sky.centreDistance).toBeLessThan(100);
+  });
+
+  it("fails closed: only a well-formed verdict passes, everything else is unparsed", () => {
+    expect(parseVerifyAnswer('{"added": [], "scaleOk": true, "reason": "materials only"}')).toMatchObject({
+      added: [],
+      scaleOk: true,
+      verdict: "ok",
+    });
+    // A fenced answer with an invented pillar and roof tile coping is a rejection naming them.
+    const invented = parseVerifyAnswer(
+      'Here it is:\n```json\n{"added": [{"what": "a stone pillar on the back wall", "outOfSurface": true}, ' +
+        '{"what": "red roof-tile coping along the wall top", "outOfSurface": true}], "scaleOk": true}\n```',
+    );
+    expect(invented.verdict).toBe("rejected");
+    expect(invented.added).toEqual(["a stone pillar on the back wall", "red roof-tile coping along the wall top"]);
+    // The model's own "this is flat paint" answer drops the item: a painted material is not added geometry.
+    expect(
+      parseVerifyAnswer(
+        '{"added": [{"what": "cobblestone paving on the ground", "outOfSurface": false}, ' +
+          '{"what": "moss on the wall base", "outOfSurface": false}], "scaleOk": true}',
+      ),
+    ).toMatchObject({ added: [], verdict: "ok" });
+    // A chat model sometimes repeats a fragment after the object: the object is still read, strictly.
+    expect(
+      parseVerifyAnswer(
+        '{"added": [{"what": "a ruined stone pillar", "outOfSurface": true}], "scaleOk": true}\nimage"}',
+      ).added,
+    ).toEqual(["a ruined stone pillar"]);
+    // An edge band alone is recorded, not a rejection (phase 2d): every wall top in the courtyard's clay
+    // is a plain edge and both image models paint a coping along it in nearly every view, so refusing
+    // those views empties the bake. Structure that stands out of a surface still rejects.
+    const band = parseVerifyAnswer(
+      '{"added": [{"what": "a coping strip along the top of the left wall", "outOfSurface": true}, ' +
+        '{"what": "a base course along the bottom of the wall", "outOfSurface": true}], "scaleOk": true}',
+    );
+    expect(band.verdict).toBe("ok");
+    expect(band.bands).toEqual([
+      "a coping strip along the top of the left wall",
+      "a base course along the bottom of the wall",
+    ]);
+    expect(structuresOutOfSurface(band.added)).toEqual([]);
+    // A vertical strip with its own coursing (the pilaster the judge saw) is not a band: it rejects.
+    const pilaster = parseVerifyAnswer(
+      '{"added": [{"what": "a coping strip along the top of the wall", "outOfSurface": true}, ' +
+        '{"what": "a vertical strip with its own coursing on the flat wall, right of centre", "outOfSurface": true}], ' +
+        '"scaleOk": true}',
+    );
+    expect(pilaster.verdict).toBe("rejected");
+    expect(structuresOutOfSurface(pilaster.added)).toEqual([
+      "a vertical strip with its own coursing on the flat wall, right of centre",
+    ]);
+    // Impossible detail sizes are a rejection on their own.
+    expect(parseVerifyAnswer('{"added": [], "scaleOk": false}')).toMatchObject({ verdict: "rejected", scaleOk: false });
+    for (const bad of [
+      "no json at all",
+      '{"scaleOk": true}',
+      '{"added": "a pillar", "scaleOk": true}',
+      '{"added": [{"what": "a pillar"}], "scaleOk": true}',
+      '{"added": ["a pillar"], "scaleOk": true}',
+      '{"added": [], "scaleOk": "yes"}',
+      "[1, 2, 3]",
+      '{"added": []',
+    ]) {
+      expect(parseVerifyAnswer(bad).verdict).toBe("unparsed");
+    }
+  });
+
+  it("forwards a chat completion with both images through the server-side key", async () => {
+    const stub = await startOpenRouterStub(pngBase64);
+    const forwarded = await forwardChatRequest(
+      {
+        model: DEFAULT_VERIFY_MODEL.id,
+        prompt: verifyPrompt({ cameraHeightM: 1.65, centreDistanceM: 4 }),
+        images: ["data:image/jpeg;base64,AAAA", "data:image/jpeg;base64,BBBB"],
+      },
+      { env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url } },
+    );
+    expect(forwarded.status).toBe(200);
+    expect(stub.requests).toHaveLength(1);
+    const sent = stub.requests[0]!;
+    expect(sent.authorization).toBe(`Bearer ${FAKE_KEY}`);
+    expect(sent.body["response_format"]).toEqual({ type: "json_object" });
+    const content = (sent.body["messages"] as { content: { type: string; image_url?: { url: string } }[] }[])[0]!
+      .content;
+    expect(content.filter((part) => part.type === "image_url").map((part) => part.image_url?.url)).toEqual([
+      "data:image/jpeg;base64,AAAA",
+      "data:image/jpeg;base64,BBBB",
+    ]);
+    expect(content[0]?.type).toBe("text");
+
+    // The key stays server-side: without it nothing is forwarded, and a non-image body is refused.
+    const keyless = await forwardChatRequest({ model: "m", prompt: "p", images: ["data:image/png;base64,AA", "data:image/png;base64,AA"] }, { env: {} });
+    expect(keyless.status).toBe(500);
+    expect(new TextDecoder().decode(keyless.bytes)).toContain(MISSING_API_KEY_CODE);
+    const notAnImage = await forwardChatRequest(
+      { model: "m", prompt: "p", images: ["data:text/html;base64,AA", "data:image/png;base64,AA"] },
+      { env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url } },
+    );
+    expect(notAnImage.status).toBe(400);
+    expect(stub.requests).toHaveLength(1);
+  });
+
+  it(
+    "rejects an invented pillar or roof tiles, repaints once and leaves the view for the fill pass",
+    async () => {
+      const cwd = await scratchDir("verify-invented");
+      const stub = await startOpenRouterStub(pngBase64, { verify: "invented" });
+      const error = await rejection(
+        paintTextureProjection({
+          levelPath: LEVEL,
+          cwd,
+          env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+          plan: PLAN,
+          atlas: 256,
+          viewSize: 128,
+          verify: true,
+          runId: "verify-run",
+          outputPath: join(cwd, "assets", "verify.glb"),
+        }),
+      );
+      // Every painted view was rejected by the check, so nothing reaches the atlas.
+      expectTextureProjectionError(error, "TEXTURE_PROJECT_NO_COVERAGE");
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "verify-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views.length).toBeGreaterThan(0);
+      for (const view of run.views) {
+        expect(view.rejected).toBe("verify");
+        expect(view.repainted).toBe(true);
+        expect(view.verify?.model).toBe(DEFAULT_VERIFY_MODEL.id);
+        expect(view.verify?.added.join(" ")).toContain("pillar");
+        // The kept generation is the repaint's, and its prompt named the invention as forbidden.
+        expect(view.prompt).toContain("do not paint:");
+        expect(view.prompt).toContain("pillar");
+        expect(view.prompt).toContain("This is a repaint");
+      }
+      // Two images and two checks per view: the one repaint a rejected view is allowed.
+      expect(stub.requests.filter((sent) => Array.isArray(sent.body["input_references"]))).toHaveLength(run.views.length * 2);
+    },
+    300_000,
+  );
+
+  it(
+    "accepts a view whose repaint passes the check and counts the repaint",
+    async () => {
+      const cwd = await scratchDir("verify-once");
+      const stub = await startOpenRouterStub(pngBase64, { verify: "once" });
+      const result = await paintTextureProjection({
+        levelPath: LEVEL,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        plan: PLAN,
+        atlas: 256,
+        viewSize: 128,
+        verify: true,
+        runId: "verify-once-run",
+        outputPath: join(cwd, "assets", "verify-once.glb"),
+      });
+      expect(result.verifyModel).toBe(DEFAULT_VERIFY_MODEL.id);
+      expect(result.viewsRejected.verify).toBe(0);
+      expect(result.viewsRepainted).toBe(result.viewsPainted);
+      expect(result.coveragePercent).toBeGreaterThan(0);
+      expect(result.estimatedUsd).toBeGreaterThan(result.viewsPainted * 0.009 * 2 * 0.99);
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "verify-once-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views.filter((view) => view.rejected !== undefined)).toHaveLength(0);
+      expect(run.views.every((view) => view.verify?.verdict === "ok")).toBe(true);
+    },
+    300_000,
+  );
+
+  it(
+    "counts an unreadable answer as its own rejection and buys only the one repaint",
+    async () => {
+      const cwd = await scratchDir("verify-garbage");
+      const stub = await startOpenRouterStub(pngBase64, { verify: "garbage" });
+      const error = await rejection(
+        paintTextureProjection({
+          levelPath: LEVEL,
+          cwd,
+          env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+          plan: { ...PLAN, maxViews: 1 },
+          atlas: 256,
+          viewSize: 128,
+          verify: true,
+          runId: "verify-garbage-run",
+          outputPath: join(cwd, "assets", "verify-garbage.glb"),
+        }),
+      );
+      expectTextureProjectionError(error, "TEXTURE_PROJECT_NO_COVERAGE");
+      const run = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", "verify-garbage-run", "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(run.views).toHaveLength(1);
+      expect(run.views[0]?.rejected).toBe("verify");
+      expect(run.views[0]?.verify?.verdict).toBe("unparsed");
+      // Fail closed: the unreadable answer never lets an image into the atlas.
+      expect(stub.requests.filter((sent) => Array.isArray(sent.body["input_references"]))).toHaveLength(2);
+    },
+    300_000,
+  );
+});
+
+describe("texture-projection atlas choice (C.1)", () => {
+  it("picks the power of two that matches the measured footprint, without wasting texels", () => {
+    // The footprint is texels per image pixel along the worse screen axis (A.2), a length: one texel
+    // per pixel already keeps the measurement atlas.
+    expect(autoAtlasSize(1024, 1)).toBe(1024);
+    // Two texels per pixel (the views resolve half the linear size): a 512 atlas matches.
+    expect(autoAtlasSize(1024, 2)).toBe(512);
+    // A pixel covers half a texel: the views resolve twice the linear size, so 2048 matches.
+    expect(autoAtlasSize(1024, 0.5)).toBe(2048);
+    expect(autoAtlasSize(1024, 0.25)).toBe(4096);
+    // Never above 4K, never below 512.
+    expect(autoAtlasSize(1024, 1e-9)).toBe(4096);
+    expect(autoAtlasSize(1024, 1e9)).toBe(512);
+    // A 4.2K match must not become an 8K atlas: the nearest power of two, not the next one up.
+    expect(autoAtlasSize(1024, 0.239)).toBe(4096);
+  });
+});
+
+describe("texture-projection atlas marker (C.3)", () => {
+  it("writes extras.threenative.textureProjection on the base-colour image and texture", async () => {
+    const cwd = await scratchDir("marker");
+    const path = join(cwd, "painted.glb");
+    const png = await sharp({ create: { width: 4, height: 4, channels: 4, background: { r: 9, g: 8, b: 7, alpha: 1 } } })
+      .png()
+      .toBuffer();
+    const document = new Document();
+    const buffer = document.createBuffer();
+    const texture = document.createTexture("atlas").setImage(new Uint8Array(png)).setMimeType("image/png");
+    const material = document.createMaterial("painted").setBaseColorTexture(texture);
+    const position = document
+      .createAccessor()
+      .setType("VEC3")
+      .setArray(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]))
+      .setBuffer(buffer);
+    const uv = document
+      .createAccessor()
+      .setType("VEC2")
+      .setArray(new Float32Array([0, 0, 1, 0, 0, 1]))
+      .setBuffer(buffer);
+    document
+      .createMesh("level")
+      .addPrimitive(document.createPrimitive().setAttribute("POSITION", position).setAttribute("TEXCOORD_0", uv).setMaterial(material));
+    document.createScene().addChild(document.createNode("level").setMesh(document.getRoot().listMeshes()[0]!));
+    await new NodeIO().write(path, document);
+
+    expect(readProjectedAtlasMarker(new Uint8Array(await readFile(path)))).toBeUndefined();
+    const marked = markProjectedAtlas(new Uint8Array(await readFile(path)), {
+      atlas: 4096,
+      runId: "courtyard-abc",
+      paintedMask: "courtyard.painted.png",
+    });
+    expect(readProjectedAtlasMarker(marked)).toEqual({
+      atlas: 4096,
+      runId: "courtyard-abc",
+      paintedMask: "courtyard.painted.png",
+    });
+    // Phase 2s put the mask in the atlas' alpha and marked it with a flag: that GLB's marker names no
+    // file, so it reads back as a bake whose mask is absent (phase 2t).
+    const legacy = markProjectedAtlas(new Uint8Array(await readFile(path)), { atlas: 4096, runId: "courtyard-abc" });
+    expect(readProjectedAtlasMarker(legacy)).toEqual({ atlas: 4096, runId: "courtyard-abc" });
+    // The bytes are still a readable GLB with its texture intact.
+    const reread = await new NodeIO().readBinary(marked);
+    expect(reread.getRoot().listTextures()).toHaveLength(1);
+  });
+});
+
+/** A flat gray wall over a floor with soft shading: what the clay render looks like to the check. */
+function syntheticClay(size: number): Uint8ClampedArray {
+  const pixels = new Uint8ClampedArray(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const p = 4 * (y * size + x);
+      const floor = y > size * 0.62;
+      const value = (floor ? 148 : 186) + (floor ? (y / size - 0.62) * -40 : (x / size - 0.5) * 18 - (y / size) * 24);
+      pixels[p] = value;
+      pixels[p + 1] = value;
+      pixels[p + 2] = value;
+      pixels[p + 3] = 255;
+    }
+  }
+  return pixels;
+}
+
+/** Two quads: the "flat" one maps its 1x1 m to 0.5x0.5 UV, the "stretched" one to 0.05x0.05. */
+async function writeStretchedGlb(path: string): Promise<void> {
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const quad = (name: string, uvScale: number, offset: number) => {
+    const position = document
+      .createAccessor()
+      .setType("VEC3")
+      .setArray(new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]))
+      .setBuffer(buffer);
+    const uv = document
+      .createAccessor()
+      .setType("VEC2")
+      .setArray(
+        new Float32Array([
+          offset,
+          0,
+          offset + uvScale,
+          0,
+          offset + uvScale,
+          uvScale,
+          offset,
+          uvScale,
+        ]),
+      )
+      .setBuffer(buffer);
+    const indices = document.createAccessor().setType("SCALAR").setArray(new Uint16Array([0, 1, 2, 0, 2, 3])).setBuffer(buffer);
+    const primitive = document
+      .createPrimitive()
+      .setAttribute("POSITION", position)
+      .setAttribute("TEXCOORD_0", uv)
+      .setIndices(indices)
+      .setMaterial(document.createMaterial(name));
+    return document.createMesh(name).addPrimitive(primitive);
+  };
+  const flat = quad("flat", 0.5, 0);
+  const stretched = quad("stretched", 0.05, 0.5);
+  const scene = document.createScene("Scene");
+  scene.addChild(document.createNode("flat").setMesh(flat));
+  scene.addChild(document.createNode("stretched").setMesh(stretched));
+  await new NodeIO().write(path, document);
+}
+
+describe("texture-projection atlas infill (A, phase 2d)", () => {
+  /** RGBA atlas with `rgb` painted into every texel where `mask` is 1, and nothing (alpha 0) elsewhere. */
+  function atlasOf(size: number, mask: (x: number, y: number) => [number, number, number] | undefined) {
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size).fill(1);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const colour = mask(x, y);
+        if (colour === undefined) continue;
+        const p = 4 * (y * size + x);
+        data[p] = colour[0];
+        data[p + 1] = colour[1];
+        data[p + 2] = colour[2];
+        data[p + 3] = 255;
+      }
+    }
+    return { data, islands };
+  }
+
+  it("continues the material in a gap between two cobble patches instead of the atlas mean", () => {
+    const size = 32;
+    // Cobbles all around a 6 px gap in the middle, and a bright plaster block in one corner: the atlas
+    // mean is a pale plaster-ish tone, so a global-mean fill is exactly the white patch the judge saw
+    // between cobbles.
+    const cobble: [number, number, number] = [92, 70, 48];
+    const plaster: [number, number, number] = [240, 236, 220];
+    const gap = (x: number, y: number) => x >= 13 && x < 19 && y >= 13 && y < 19;
+    const corner = (x: number, y: number) => x >= 24 && y >= 24;
+    const { data, islands } = atlasOf(size, (x, y) => (gap(x, y) ? undefined : corner(x, y) ? plaster : cobble));
+    const mean = [(cobble[0] + plaster[0]) / 2, (cobble[1] + plaster[1]) / 2, (cobble[2] + plaster[2]) / 2];
+    const report = inpaintUnpainted(data, islands, size);
+    for (const [x, y] of [[15, 15], [16, 16], [17, 14], [14, 17]] as const) {
+      const p = 4 * (y * size + x);
+      const filled = [data[p]!, data[p + 1]!, data[p + 2]!];
+      const toCobble = Math.hypot(...filled.map((v, c) => v - cobble[c]!));
+      const toMean = Math.hypot(...filled.map((v, c) => v - mean[c]!));
+      // The gap continues the cobbles around it, and is nothing like the atlas' mean colour. Its bytes
+      // stay opaque with that colour (phase 2t), and the mask — not the alpha — says no accepted view
+      // painted it (phase 2s).
+      expect(data[p + 3]).toBe(255);
+      expect(report.mask?.[y * size + x]).toBe(0);
+      expect(toCobble).toBeLessThan(28);
+      expect(toMean).toBeGreaterThan(toCobble);
+    }
+    expect(report.unpaintedPercent).toBeGreaterThan(0);
+    expect(ATLAS_GUTTER_TEXELS).toBeGreaterThanOrEqual(8);
+  });
+
+  it("fills a whole unpainted half from the painted half, opaque, and marks the fill 0 in the mask", () => {
+    const size = 8;
+    const { data, islands } = atlasOf(size, (x, y) => (x < 4 ? [40, 80, 40] : undefined));
+    const report = inpaintUnpainted(data, islands, size);
+    for (let i = 0; i < size * size; i++) {
+      const texel = `texel ${i % size},${Math.floor(i / size)}`;
+      // Opaque everywhere: the atlas is a base colour, and its alpha is not a carry channel any more.
+      expect(data[4 * i + 3], texel).toBe(255);
+      // Four columns are painted and four are made up, so the whole paint side is inside the feather.
+      if (i % size >= 4) {
+        // The fill's own RGB, exactly what the atlas carried at 4f31afc: not black, not the atlas' mean.
+        expect(Array.from(data.subarray(4 * i, 4 * i + 4)), texel).toEqual([40, 80, 40, 255]);
+        expect(report.mask?.[i], texel).toBe(0);
+      } else {
+        expect(report.mask?.[i], texel).toBeGreaterThan(0);
+      }
+    }
+    expect(report.unpaintedPercent).toBe(50);
+  });
+
+  it("never fills a gap with another island's material (phase 2e)", () => {
+    // Two islands side by side in the packing: cobbles on the left, white plaster on the right with a
+    // hole in it. The hole must continue the plaster, not the cobbles next to it in the atlas.
+    const size = 16;
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size);
+    const paint = (x: number, y: number, rgb: [number, number, number]) => {
+      const p = 4 * (y * size + x);
+      data[p] = rgb[0];
+      data[p + 1] = rgb[1];
+      data[p + 2] = rgb[2];
+      data[p + 3] = 255;
+    };
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        islands[y * size + x] = x < 6 || x > 7 ? 1 : 0; // the gutter between the islands
+        const hole = x === 9 && y === 8;
+        if (x < 6) paint(x, y, [80, 60, 40]); // cobbles
+        else if (x > 7 && !hole) paint(x, y, [240, 235, 220]); // plaster with one hole near the gutter
+      }
+    }
+    const labels = islandLabels(islands, size);
+    expect(labels[0]).toBe(0);
+    expect(labels[15]).toBe(1);
+    inpaintUnpainted(data, islands, size);
+    const p = 4 * (8 * size + 9);
+    // The plaster island's hole is filled from the plaster, not from the cobbles across the gutter.
+    expect(data[p]).toBeGreaterThan(200);
+    expect(labels[8 * size + 9]).toBe(1);
+  });
+
+  it("fills a hole between a dark lower border and a light upper border as one smooth gradient (phase 2u)", () => {
+    // The judge's blobs, as a fixture: the painted rows below a full-width hole are dark moss, the ones
+    // above it light stone. Phase 2d flooded the nearest colour inwards, so the two met along a line that
+    // traced the hole and the fill showed its shape; the pyramid interpolates between both borders instead.
+    const size = 64;
+    const dark: [number, number, number] = [60, 50, 40];
+    const light: [number, number, number] = [200, 190, 170];
+    const { data, islands } = atlasOf(size, (x, y) => (y < 16 ? dark : y >= 48 ? light : undefined));
+    const before = Uint8ClampedArray.from(data);
+    inpaintUnpainted(data, islands, size);
+    const lum = (x: number, y: number) => {
+      const p = 4 * (y * size + x);
+      return (data[p]! + data[p + 1]! + data[p + 2]!) / 3;
+    };
+    const rows: number[] = [];
+    for (let y = 16; y < 48; y++) rows.push(lum(32, y));
+    // Monotone from the dark border to the light one, and no step in between: a nearest-colour fill puts
+    // the whole 140 levels of difference in one texel at the middle of the hole.
+    let worstStep = 0;
+    for (let i = 1; i < rows.length; i++) {
+      expect(rows[i]!, `row ${16 + i}`).toBeGreaterThanOrEqual(rows[i - 1]! - 0.5);
+      worstStep = Math.max(worstStep, rows[i]! - rows[i - 1]!);
+    }
+    expect(worstStep).toBeLessThanOrEqual(8);
+    // And it really does span the borders' difference rather than flattening to the island's mean.
+    expect(rows[rows.length - 1]! - rows[0]!).toBeGreaterThan(0.6 * (lum(0, 48) - lum(0, 15)));
+    // No shape: every column is the same, so nothing of the hole's outline is in the fill.
+    for (let y = 16; y < 48; y++) {
+      for (let x = 0; x < size; x++) expect(Math.abs(lum(x, y) - rows[y - 16]!), `texel ${x},${y}`).toBeLessThanOrEqual(1);
+    }
+    // The paint is untouched, bytes and all.
+    for (let y = 0; y < size; y++) {
+      if (y >= 16 && y < 48) continue;
+      for (let x = 0; x < size; x++) expect(Array.from(data.subarray(4 * (y * size + x), 4 * (y * size + x) + 4))).toEqual(
+        Array.from(before.subarray(4 * (y * size + x), 4 * (y * size + x) + 4)),
+      );
+    }
+  });
+
+  it("fills an island's gap from its own paint, never from an island inside its bounds (phase 2u)", () => {
+    // A cobble band with a 16x16 gap no view reached, and a plaster island standing in the notch beside it,
+    // so the cobble island's bounding box holds every plaster texel and the pyramid averages over it. A
+    // fill that took the box's paint instead of the island's comes back the mean of both materials (measured:
+    // 127 where the cobble is 60), which is what the label check in the fill is for.
+    const size = 48;
+    const cobble: [number, number, number] = [60, 45, 30];
+    const plaster: [number, number, number] = [240, 235, 220];
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size);
+    const paint = (x: number, y: number, rgb: [number, number, number]) => {
+      const p = 4 * (y * size + x);
+      data[p] = rgb[0];
+      data[p + 1] = rgb[1];
+      data[p + 2] = rgb[2];
+      data[p + 3] = 255;
+    };
+    const cobbleIsland = (x: number, y: number) => x >= 8 && x <= 39 && y >= 8 && y <= 39 && !(x >= 24 && y <= 23);
+    const cobbleGap = (x: number, y: number) => x >= 24 && y >= 24;
+    const plasterIsland = (x: number, y: number) => x >= 26 && x <= 31 && y >= 10 && y <= 15;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (cobbleIsland(x, y)) {
+          islands[y * size + x] = 1;
+          if (!cobbleGap(x, y)) paint(x, y, cobble);
+        } else if (plasterIsland(x, y)) {
+          islands[y * size + x] = 1;
+          if (!(x === 28 && y === 12)) paint(x, y, plaster);
+        }
+      }
+    }
+    const labels = islandLabels(islands, size);
+    const cobbleLabel = labels[10 * size + 10]!;
+    expect(labels[30 * size + 30]!).toBe(cobbleLabel); // the gap is part of the cobble island
+    expect(labels[11 * size + 26]!).not.toBe(cobbleLabel); // the plaster block is its own island
+    inpaintUnpainted(data, islands, size);
+    const filled = (x: number, y: number) => Array.from(data.subarray(4 * (y * size + x), 4 * (y * size + x) + 4));
+    // The gap the cobble island fills is cobble, opaque, throughout: not a texel of it is plaster.
+    for (let y = 24; y <= 39; y++) {
+      for (let x = 24; x <= 39; x++) expect(filled(x, y), `gap ${x},${y}`).toEqual([...cobble, 255]);
+    }
+    // And the plaster island's own hole is its own plaster.
+    expect(filled(28, 12)).toEqual([...plaster, 255]);
+  });
+
+  /** Mean over a crop of each texel's 3x3 luminance variance: 0 for a smear, high for real grain. */
+  function localVariance(data: Uint8ClampedArray, size: number, x0: number, x1: number, y0: number, y1: number) {
+    const lum = (x: number, y: number) => {
+      const p = 4 * (Math.min(size - 1, Math.max(0, y)) * size + Math.min(size - 1, Math.max(0, x)));
+      return (data[p]! + data[p + 1]! + data[p + 2]!) / 3;
+    };
+    let total = 0;
+    let texels = 0;
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const window: number[] = [];
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) window.push(lum(x + dx, y + dy));
+        const mean = window.reduce((a, b) => a + b, 0) / window.length;
+        total += window.reduce((a, v) => a + (v - mean) ** 2, 0) / window.length;
+        texels += 1;
+      }
+    }
+    return total / texels;
+  }
+
+  /** Deterministic value noise: a pattern a mirrored copy matches exactly and a wrapped tile does not. */
+  function noise(x: number, y: number) {
+    const h = Math.imul(x + 1, 0x27d4eb2d) ^ Math.imul(y + 1, 0x165667b1);
+    const mixed = Math.imul(h ^ (h >>> 15), 0x2545f491);
+    return (mixed ^ (mixed >>> 13)) & 255;
+  }
+
+  /** Mean RGB over a crop. */
+  function cropMean(data: Uint8ClampedArray, size: number, x0: number, x1: number, y0: number, y1: number) {
+    const sum: [number, number, number] = [0, 0, 0];
+    let texels = 0;
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const p = 4 * (y * size + x);
+        sum[0] += data[p]!;
+        sum[1] += data[p + 1]!;
+        sum[2] += data[p + 2]!;
+        texels += 1;
+      }
+    }
+    return [sum[0]! / texels, sum[1]! / texels, sum[2]! / texels];
+  }
+
+  it("gives the unpainted half of an island its painted half's grain, not the fill's smear (phase 2i)", () => {
+    // A 64^2 island: the left half is an 8-texel checker (so it holds a fully painted 32x32 square),
+    // the right half no view painted. The BFS fill alone leaves the right half flat: the smeared
+    // streaks and flat beige the owner saw in game.
+    const size = 64;
+    const dark: [number, number, number] = [70, 62, 52];
+    const light: [number, number, number] = [190, 178, 158];
+    const { data, islands } = atlasOf(size, (x, y) =>
+      x < 32 ? ((Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light) : undefined,
+    );
+    const paintedVariance = localVariance(data, size, 1, 30, 1, size - 2);
+    expect(paintedVariance).toBeGreaterThan(100);
+    const report = inpaintUnpainted(data, islands, size);
+    const filledVariance = localVariance(data, size, 35, 62, 1, size - 2);
+    expect(filledVariance).toBeGreaterThanOrEqual(0.5 * paintedVariance);
+    // Subtracting the patch's mean keeps the fill's tone: the hole continues its neighbours' colour.
+    const paintedMean = cropMean(data, size, 0, 31, 0, size - 1);
+    const filledMean = cropMean(data, size, 32, size - 1, 0, size - 1);
+    for (let c = 0; c < 3; c++) expect(Math.abs(filledMean[c]! - paintedMean[c]!)).toBeLessThanOrEqual(5);
+    expect(report.unpaintedPercent).toBe(50);
+  });
+
+  it("leaves every texel a view painted byte-identical (phase 2i, phase 2t)", () => {
+    const size = 64;
+    const dark: [number, number, number] = [70, 62, 52];
+    const light: [number, number, number] = [190, 178, 158];
+    const { data, islands } = atlasOf(size, (x, y) =>
+      x < 32 ? ((Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light) : undefined,
+    );
+    const before = Uint8ClampedArray.from(data);
+    inpaintUnpainted(data, islands, size);
+    for (let i = 0; i < size * size; i++) {
+      if (before[4 * i + 3]! < 128) continue;
+      // All four bytes: the atlas carries no mask, so a painted texel is untouched, alpha included.
+      const texel = Array.from(data.subarray(4 * i, 4 * i + 4));
+      expect(texel, `painted texel ${i % size},${Math.floor(i / size)}`).toEqual(
+        Array.from(before.subarray(4 * i, 4 * i + 4)),
+      );
+    }
+  });
+
+  it("marks painted texels 255 in the mask and the fill 0, feathering inwards from the paint edge (phase 2s, phase 2t)", () => {
+    // A 64^2 island: a 32-texel-wide checker painted by views on the left, no view on the right. The
+    // mask is the game's answer to "did a view paint this texel": 255 deep inside the paint, 0
+    // everywhere the fill made the colour up, and a six-texel ramp on the painted side of the edge. It
+    // ships as its own file (phase 2t), so the atlas keeps its opaque colour.
+    const size = 64;
+    const dark: [number, number, number] = [70, 62, 52];
+    const light: [number, number, number] = [190, 178, 158];
+    const { data, islands } = atlasOf(size, (x, y) =>
+      x < 32 ? ((Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light) : undefined,
+    );
+    const mask = inpaintUnpainted(data, islands, size).mask!;
+    const value = (x: number, y: number) => mask[y * size + x]!;
+    expect(value(2, 30)).toBe(255);
+    expect(value(25, 30)).toBe(255);
+    expect(value(32, 30)).toBe(0);
+    expect(value(63, 63)).toBe(0);
+    // The atlas is opaque where the mask is 0, and the filled texel keeps a colour, not black.
+    expect(data[4 * (30 * size + 63) + 3]).toBe(255);
+    expect(data[4 * (30 * size + 63)]).toBeGreaterThan(0);
+    // Monotone from the fill into the paint, with the feather strictly between 0 and 255 for a while.
+    let previous = -1;
+    const ramp: number[] = [];
+    for (let x = 32; x >= 20; x--) {
+      const step = value(x, 47);
+      expect(step, `mask at x ${x}`).toBeGreaterThanOrEqual(previous);
+      previous = step;
+      if (step > 0 && step < 255) ramp.push(step);
+    }
+    // Six texels of feather: five partial steps and the sixth texel already at full paint.
+    expect(ramp.length).toBe(PAINTED_MASK_FEATHER - 1);
+    expect(new Set(ramp).size).toBe(PAINTED_MASK_FEATHER - 1);
+    expect(value(32 - PAINTED_MASK_FEATHER, 47)).toBe(255);
+  });
+
+  it("copies the island edge's coverage into the UV gutters, and nothing else (phase 2s, phase 2t)", () => {
+    // One 32x32 island at (16,16); its rightmost three columns are a fill, everything else is painted.
+    // The gutter is where `Atlas.pad` dilated the colour out of an island, so a bilinear or mipped
+    // sample there must read the same coverage as the edge it came from, not the empty atlas.
+    const size = 64;
+    const islands = new Uint8Array(size * size);
+    const data = new Uint8ClampedArray(size * size * 4);
+    for (let y = 16; y < 48; y++) {
+      for (let x = 16; x < 48; x++) {
+        islands[y * size + x] = 1;
+        if (x >= 44) continue; // the fill: no view painted these three columns
+        const p = 4 * (y * size + x);
+        data[p] = 120;
+        data[p + 1] = 100;
+        data[p + 2] = 80;
+        data[p + 3] = 255;
+      }
+    }
+    const mask = inpaintUnpainted(data, islands, size).mask!;
+    const value = (x: number, y: number) => mask[y * size + x]!;
+    expect(value(20, 20)).toBe(255); // painted, well inside
+    expect(value(45, 30)).toBe(0); // filled
+    // The gutter beside the painted edge carries its coverage; the one beside the fill carries 0.
+    expect(value(15, 20)).toBe(255);
+    expect(value(48, 30)).toBe(0);
+    expect(value(12, 20)).toBe(255); // still inside the pad's eight texels
+    expect(value(6, 20)).toBe(0); // past the gutter: never painted, never bled
+    // The atlas stays opaque in the gutter too: the mask is the only place coverage lives.
+    expect(data[4 * (20 * size + 6) + 3]).toBe(255);
+  });
+
+  it("ships the mask at a quarter of the atlas' side, box-averaged and still monotone across the edge (phase 2t)", () => {
+    // The same 64^2 island, so the file a game loads is a 16x16 PNG: 255 deep in the paint, 0 deep in
+    // the fill, and the six-texel feather arrives as one or two texels of ramp between them.
+    const size = 64;
+    const { data, islands } = atlasOf(size, (x) => (x < 32 ? [70, 62, 52] : undefined));
+    const mask = inpaintUnpainted(data, islands, size).mask!;
+    const small = downsampleCoverage(mask, size);
+    const side = size / PAINTED_MASK_DOWNSCALE;
+    expect(small.length).toBe(side * side);
+    const value = (x: number, y: number) => small[y * side + x]!;
+    expect(value(0, 8)).toBe(255);
+    expect(value(side - 1, 8)).toBe(0);
+    let previous = -1;
+    const ramp: number[] = [];
+    for (let x = side - 1; x >= 0; x--) {
+      const step = value(x, 8);
+      expect(step, `mask at x ${x}`).toBeGreaterThanOrEqual(previous);
+      previous = step;
+      if (step > 0 && step < 255) ramp.push(step);
+    }
+    expect(ramp.length).toBeGreaterThan(0);
+    expect(ramp.length).toBeLessThanOrEqual(Math.ceil(PAINTED_MASK_FEATHER / PAINTED_MASK_DOWNSCALE) + 1);
+  });
+
+  it("writes no mask for the debug fill, and none for an atlas no view painted (phase 2t)", () => {
+    const size = 8;
+    const { data, islands } = atlasOf(size, (x) => (x < 4 ? [40, 80, 40] : undefined));
+    expect(inpaintUnpainted(data, islands, size, undefined, "debug").mask).toBeUndefined();
+    const blank = atlasOf(size, () => undefined);
+    expect(inpaintUnpainted(blank.data, blank.islands, size).mask).toBeUndefined();
+  });
+
+  /** Pearson correlation of a crop's luminance with its own mirror about the line `line2 / 2` (a whole or half texel). */
+  function mirrorCorrelation(
+    data: Uint8ClampedArray,
+    size: number,
+    box: { x0: number; x1: number; y0: number; y1: number },
+    axis: "x" | "y",
+    line2: number,
+  ) {
+    const lum = (x: number, y: number) => {
+      const p = 4 * (y * size + x);
+      return (data[p]! + data[p + 1]! + data[p + 2]!) / 3;
+    };
+    let n = 0;
+    let sa = 0;
+    let sb = 0;
+    let saa = 0;
+    let sbb = 0;
+    let sab = 0;
+    for (let y = box.y0; y <= box.y1; y++) {
+      for (let x = box.x0; x <= box.x1; x++) {
+        const mx = axis === "x" ? line2 - x : x;
+        const my = axis === "y" ? line2 - y : y;
+        if (mx < box.x0 || mx > box.x1 || my < box.y0 || my > box.y1) continue;
+        const a = lum(x, y);
+        const b = lum(mx, my);
+        n += 1;
+        sa += a;
+        sb += b;
+        saa += a * a;
+        sbb += b * b;
+        sab += a * b;
+      }
+    }
+    if (n < 16) return 0;
+    const meanA = sa / n;
+    const meanB = sb / n;
+    const spread = Math.sqrt((saa / n - meanA * meanA) * (sbb / n - meanB * meanB));
+    return spread > 0 ? (sab / n - meanA * meanB) / spread : 0;
+  }
+
+  it("tiles the fill with plain wrap, never a mirror: no symmetry about any tile border (phase 2k)", () => {
+    // The judge saw a wall end face come back a mirror-symmetric kaleidoscope and the floor a rosette at
+    // every tile corner: mirrored repeat folds the patch back on itself, so the fill is exactly its own
+    // mirror about every fold line — the patch's border and its own middle, half a patch apart. A 32x32
+    // noise patch in the corner of a 128^2 island tiles four times over the fill, so both kinds of fold
+    // line sit well inside the filled area; noise is what a mirrored copy matches perfectly and a plainly
+    // wrapped one does not.
+    const size = 128;
+    const { data, islands } = atlasOf(size, (x, y) => {
+      if (x >= 32 || y >= 32) return undefined;
+      const value = noise(x, y);
+      return [value, value, value];
+    });
+    inpaintUnpainted(data, islands, size);
+    // The filled area past the grain's fade-in (8 texels from the patch's corner is texel 40).
+    const box = { x0: 40, x1: 126, y0: 40, y1: 126 };
+    let worst = 0;
+    // Whole and half texel lines, and lines too near the crop edge skipped: their mirrored copy would be
+    // mostly the cropped window itself.
+    for (let line2 = 2 * (box.x0 + 16); line2 <= 2 * (box.x1 - 16); line2++) {
+      worst = Math.max(worst, Math.abs(mirrorCorrelation(data, size, box, "x", line2)));
+    }
+    for (let line2 = 2 * (box.y0 + 16); line2 <= 2 * (box.y1 - 16); line2++) {
+      worst = Math.max(worst, Math.abs(mirrorCorrelation(data, size, box, "y", line2)));
+    }
+    expect(worst).toBeLessThan(0.5);
+  });
+
+  it("fades the grain in over the first 8 texels of fill, so paint and fill meet in grain (phase 2k)", () => {
+    // A 128x64 island: a 64x64 noise patch on the left (its own largest square, so the source of the
+    // grain) and flat stone on the right with a 40x40 hole in it, so the hole's plain fill is exactly the
+    // stone's own value and every bit of variance in it is the grain. A hard switch would make the rim
+    // as grainy as the middle; phase 2i did exactly that, which is the abrupt pattern change the judge
+    // saw where the filled floor met the painted one.
+    const size = 128;
+    const stone = 150;
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size);
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < size; x++) {
+        islands[y * size + x] = 1;
+        if (x >= 80 && x < 120 && y >= 12 && y < 52) continue; // the hole
+        const p = 4 * (y * size + x);
+        const value = x < 64 ? noise(x, y) : stone;
+        data[p] = value;
+        data[p + 1] = value;
+        data[p + 2] = value;
+        data[p + 3] = 255;
+      }
+    }
+    const painted = localVariance(data, size, 2, 60, 2, 60);
+    expect(painted).toBeGreaterThan(100);
+    inpaintUnpainted(data, islands, size);
+    // 1 to 3 texels in, 4 to 6 in, and 9 or more in (past the fade).
+    const rim = localVariance(data, size, 80, 82, 14, 50);
+    const step = localVariance(data, size, 83, 85, 14, 50);
+    const core = localVariance(data, size, 89, 111, 21, 43);
+    expect(core).toBeGreaterThanOrEqual(0.5 * painted);
+    expect(rim).toBeLessThan(0.2 * core);
+    expect(step).toBeGreaterThan(2 * rim);
+    expect(step).toBeLessThan(0.8 * core);
+  });
+
+  it("leaves an island with no painted square of its own as the plain fill, borrowing nothing (phase 2k)", () => {
+    // Two islands: A carries a loud 8-texel checker with a hole in it, B is a thin box whose only paint
+    // is a two-texel rim around a hole, so B can hold no 32x32 square. Phase 2i lent B A's checkers —
+    // grain at another island's scale, which is what the judge saw on the narrow wall ends. A flat rim's
+    // hole fills flat, texel for texel, so that is exactly what "the plain fill" means here; that the
+    // grain arrives at all where an island does own a square is the phase 2i test above.
+    const size = 96;
+    const data = new Uint8ClampedArray(size * size * 4);
+    const islands = new Uint8Array(size * size);
+    const paint = (x: number, y: number, rgb: [number, number, number]) => {
+      const p = 4 * (y * size + x);
+      data[p] = rgb[0];
+      data[p + 1] = rgb[1];
+      data[p + 2] = rgb[2];
+      data[p + 3] = 255;
+    };
+    const dark: [number, number, number] = [170, 150, 130];
+    const light: [number, number, number] = [230, 210, 190];
+    const stone: [number, number, number] = [200, 180, 160];
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 64; x++) {
+        islands[y * size + x] = 1;
+        if (x >= 2 && x < 22 && y >= 2 && y < 22) continue; // A's own hole: the grain has somewhere to go
+        paint(x, y, (Math.floor(x / 8) + Math.floor(y / 8)) % 2 === 0 ? dark : light);
+      }
+    }
+    // B: 16x40 at x 72, flat stone rim two texels thick around a hole; its longest painted run is 2.
+    for (let y = 0; y < 40; y++) {
+      for (let x = 72; x < 88; x++) {
+        islands[y * size + x] = 1;
+        const rim = x < 74 || x > 85 || y < 2 || y > 37;
+        if (rim) paint(x, y, stone);
+      }
+    }
+    inpaintUnpainted(data, islands, size);
+    for (let y = 2; y < 38; y++) {
+      for (let x = 74; x < 86; x++) {
+        const p = 4 * (y * size + x);
+        // The plain fill's own stone, opaque (phase 2t): the mask, not the alpha, says no view painted it.
+        expect(Array.from(data.subarray(p, p + 4)), `B ${x},${y}`).toEqual([...stone, 255]);
+      }
+    }
+  });
+
+  it("writes the debug fill's hot pink in every texel no view painted, and leaves paint alone (phase 2r)", () => {
+    const size = 32;
+    const cobble: [number, number, number] = [92, 70, 48];
+    // One cobbled island over the whole atlas (as atlasOf packs it): a 6x6 gap inside it and a 6-row
+    // band no view reached at all.
+    const hole = (x: number, y: number) => (x >= 13 && x < 19 && y >= 13 && y < 19) || y >= 26;
+    const { data, islands } = atlasOf(size, (x, y) => (hole(x, y) ? undefined : cobble));
+    const painted = Array.from(data);
+    const report = inpaintUnpainted(data, islands, size, undefined, "debug");
+    let holes = 0;
+    for (let i = 0; i < size * size; i++) {
+      const p = 4 * i;
+      if (painted[p + 3]! >= 128) {
+        // A texel a view painted keeps its colour: no pink, no grain, no tone of the fill.
+        expect(Array.from(data.subarray(p, p + 4)), `painted ${i}`).toEqual(painted.slice(p, p + 4));
+        continue;
+      }
+      holes += 1;
+      // Exactly #FF69B4 and opaque: not the cobbles around it, not the detail fill.
+      expect(Array.from(data.subarray(p, p + 4)), `hole ${i}`).toEqual([255, 105, 180, 255]);
+    }
+    expect(holes).toBe(6 * 6 + 6 * size);
+    expect(report.unpaintedPercent).toBeCloseTo((100 * holes) / (size * size), 6);
+    // The default fill is unchanged: the same atlas in detail mode continues the cobbles there.
+    const detail = new Uint8ClampedArray(painted);
+    inpaintUnpainted(detail, islands, size);
+    const middle = 4 * (16 * size + 16);
+    expect(Array.from(detail.subarray(middle, middle + 3))).not.toEqual([255, 105, 180]);
+  });
+
+  it("counts a capture's hot pink, letting the light move it and ignoring sky and pale walls (phase 2r)", () => {
+    // A synthetic capture: the debug pink as baked, lit and in shadow, beside a blue sky, a pale plaster
+    // wall and grey stone. Exactly 30% of the pixels are the fill, which is the share to recover.
+    const width = 100;
+    const height = 100;
+    const data = new Uint8ClampedArray(width * height * 4);
+    const swatches: [number, [number, number, number]][] = [
+      [20, [255, 105, 180]], // #FF69B4 as baked
+      [5, [255, 130, 195]], // lit: the same hue, a brighter key light
+      [5, [150, 40, 96]], // in shadow: the same hue, darker
+      [40, [140, 190, 235]], // sky
+      [20, [242, 238, 228]], // pale plaster
+      [10, [120, 118, 112]], // grey stone
+    ];
+    let index = 0;
+    for (const [count, rgb] of swatches) {
+      for (let n = 0; n < count * height; n++, index++) {
+        const p = 4 * index;
+        data[p] = rgb[0];
+        data[p + 1] = rgb[1];
+        data[p + 2] = rgb[2];
+        data[p + 3] = 255;
+      }
+    }
+    const count = countDebugPink(data);
+    expect(count.pixels).toBe(width * height);
+    expect(count.pink).toBe(30 * height);
+    expect(Math.abs(count.share - 0.3)).toBeLessThan(0.01);
+    // A transparent pixel is not a bake gap: it leaves both counts.
+    expect(countDebugPink(new Uint8ClampedArray([255, 105, 180, 0]))).toEqual({ pixels: 0, pink: 0, share: 0 });
+  });
+
+  it("leaves only passes that look down on the level to the texels no player camera sees", () => {
+    // The aerial-mask rule (phase 2e): the courtyard's floor mosaic came from an aerial view that was
+    // allowed to paint ground a player walks on. Only aerials and roof passes get restricted.
+    expect(aerialPassOnlyHidden("aerial")).toBe(true);
+    expect(aerialPassOnlyHidden("roof")).toBe(true);
+    expect(aerialPassOnlyHidden("ground")).toBe(false);
+    expect(aerialPassOnlyHidden("fill")).toBe(false);
+    expect(aerialPassOnlyHidden(undefined)).toBe(false);
+  });
+
+  it("pushes known values into everything unknown, from the neighbours outward", () => {
+    // One known pixel in a 4x4 grid: every value is that pixel's, whatever the pyramid level reads it at.
+    const w = 4;
+    const val = new Float32Array(w * w * 3);
+    const wt = new Float32Array(w * w);
+    val.set([10, 20, 30], 0);
+    wt[0] = 1;
+    const field = pushPull(val, wt, w, w);
+    expect(Array.from(field.subarray(3, 6))).toEqual([10, 20, 30]);
+    expect(Array.from(field.subarray(3 * 15, 3 * 15 + 3))).toEqual([10, 20, 30]);
+  });
+});
+
+describe("texture-projection consistency reference (C, phase 2d)", () => {
+  it("takes the crop of a view that is most of already-accepted texture", () => {
+    // 8x8 view, accepted paint only in the bottom-right 4x4: the window must land there, not on the clay.
+    const known = new Uint8Array(64);
+    for (let y = 4; y < 8; y++) for (let x = 4; x < 8; x++) known[y * 8 + x] = 1;
+    expect(paintedWindow(known, 8, 8, 4)).toEqual({ x: 4, y: 4 });
+    const image = new Uint8ClampedArray(64 * 4);
+    for (let i = 0; i < 64; i++) image[4 * i] = i;
+    const crop = cropRgba(image, 8, 8, 4, 4, 4);
+    expect(crop).toHaveLength(64);
+    expect(crop[0]).toBe(4 * 8 + 4);
+  });
+});
+
+describe("texture-projection cook config hint (C.3)", () => {
+  it("documents the override for the atlas the bake actually holds, never above the 4096 cook ceiling", () => {
+    const hint = cookConfigHint(MAX_AUTO_ATLAS);
+    expect(hint).toContain(`maxSize: { baseColorTexture: ${MAX_AUTO_ATLAS} }`);
+    expect(hint).toContain('codec: "uastc"');
+    // The engine cook of the release that ships PRD-916 honours the marker; the hint says so.
+    expect(hint).toContain("extras.threenative.textureProjection");
+    expect(hint).toContain("PRD-916");
+    // Nothing the auto atlas can choose asks for a bigger base colour than the cook's KTX2 ceiling.
+    expect(MAX_AUTO_ATLAS).toBe(4096);
+    expect(autoAtlasSize(1024, 1e-9)).toBeLessThanOrEqual(MAX_AUTO_ATLAS);
+    expect(cookConfigHint(autoAtlasSize(1024, 1e-9))).toContain("baseColorTexture: 4096");
+  });
+});
+
+describe("texture-projection cook config audit (C.3)", () => {
+  it("flags a missing config as the 2048 ETC1S-eligible default", () => {
+    const audit = auditCookConfig(undefined, 4096, null);
+    expect(audit).toMatchObject({ path: null, baseColorMaxSize: 2048, flagged: true });
+    expect(audit.findings.join(" ")).toMatch(/maxSize 2048/u);
+  });
+
+  it("reads maxSize and the base-colour codec out of TypeScript, comments and all", () => {
+    const good = auditCookConfig(
+      [
+        "export default {",
+        "  // the painted courtyard atlas is 4096",
+        "  assets: {",
+        "    models: {",
+        "      textures: {",
+        "        maxSize: { baseColorTexture: 4096, normalTexture: 1024 },",
+        '        overrides: [{ slot: "normalTexture", codec: "uastc" }, { slot: "baseColorTexture", codec: "uastc" }],',
+        "      },",
+        "    },",
+        "  },",
+        "} as const;",
+      ].join("\n"),
+      4096,
+      "threenative.config.ts",
+    );
+    expect(good).toMatchObject({ baseColorMaxSize: 4096, baseColorCodec: "uastc", flagged: false });
+    expect(good.findings).toEqual([]);
+
+    const downscaled = auditCookConfig(
+      "export default { assets: { models: { textures: { maxSize: { baseColorTexture: 1024 }, overrides: [{ slot: \"baseColorTexture\", codec: \"etc1s\" }] } } } };",
+      8192,
+      "threenative.config.ts",
+    );
+    expect(downscaled.flagged).toBe(true);
+    expect(downscaled.findings.join(" ")).toMatch(/1024 < the 8192 atlas/u);
+    expect(downscaled.findings.join(" ")).toMatch(/ETC1S/u);
+  });
+});

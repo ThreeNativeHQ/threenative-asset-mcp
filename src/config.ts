@@ -105,12 +105,14 @@ export interface FabConfig {
   downloadTimeoutMs: number;
 }
 
-function isInside(path: string, parent: string): boolean {
+/** True when `path` is `parent` or lives below it (after resolving both). */
+export function isInside(path: string, parent: string): boolean {
   const child = relative(parent, path);
   return child === "" || (!child.startsWith("..") && !isAbsolute(child));
 }
 
-function canonicalPath(input: string): string {
+/** Real path of `input`, resolving the longest existing prefix so a missing tail still compares. */
+export function canonicalPath(input: string): string {
   let candidate = resolve(input);
   const missingSegments: string[] = [];
   while (true) {

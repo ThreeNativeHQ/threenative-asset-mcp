@@ -139,9 +139,17 @@ changing its configuration.
 | Unreal | `asset_import_unreal` |
 | Unity | `unity_list_packages`, `asset_import_unity` |
 | Mesh optimization | `mesh_optimize` |
+| Texture projection | `texture_project_quote`, `texture_project_paint`, `texture_project_inspect` |
 
 `mesh_optimize` shrinks a heavy static GLB behind a rendered before/after gate; it never overwrites its
 input and keeps the original when the gate fails. See [docs/tools.md](docs/tools.md#mesh-optimization).
+
+`texture_project_paint` textures a gray blockout level or environment: an image model paints planned camera
+views, the agent that called the tool reviews the contact sheet and rejects any view that invented geometry,
+and the accepted views are projected into the level's UV atlas before the baked GLB comes back ready to cook
+(an embedded vision check is an opt-in). `texture_project_quote` is free and keyless, and
+`texture_project_inspect` reviews the bake with a contact sheet, the rejected views and a cook-settings audit.
+See [docs/tools.md](docs/tools.md).
 
 Recommended flow: `asset_search_sources` → the returned search tool → the returned files tool → the returned
 download tool with `acceptLicense: true`. All discovery tools are read-only. Download tools write only inside

@@ -5,8 +5,32 @@ import { join } from "node:path";
 
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
-// `import` is the only argument form this bin accepts. No arguments still starts the stdio MCP
-// server, which is the contract every generated project's .mcp.json depends on.
+// `import` and `texture-project-ui` are the only argument forms this bin accepts. No arguments still
+// starts the stdio MCP server, which is the contract every generated project's .mcp.json depends on.
+if (process.argv[2] === "texture-project-ui") {
+  const { runTextureProjectUiCli } = await import("./cli.js");
+  let server: Awaited<ReturnType<typeof runTextureProjectUiCli>>;
+  try {
+    server = await runTextureProjectUiCli(process.argv.slice(3), (message) => {
+      process.stderr.write(`${message}\n`);
+    });
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`${server.url}\n`);
+  let closing = false;
+  const shutdown = (): void => {
+    if (closing) return;
+    closing = true;
+    void server.close().finally(() => process.exit(0));
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  // The UI is served until the operator stops it; the stdio MCP server must not start here.
+  await new Promise<never>(() => {});
+}
+
 if (process.argv[2] === "import") {
   const { runImportCli } = await import("./cli.js");
   const result = await runImportCli(process.argv.slice(3), (message) => {
