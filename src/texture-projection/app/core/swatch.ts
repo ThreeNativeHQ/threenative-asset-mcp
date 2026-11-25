@@ -48,6 +48,20 @@ export const SWATCH_MAX_INCIDENCE_DEG: Readonly<Record<SwatchClass, number>> = {
 export const SWATCH_SEAM_SHARE = 0.08;
 
 /**
+ * Unsharp mask applied where the swatch is cut (phase 2x). The paint's mortar joints come out soft: the
+ * swatch is a 1.7x upscale of soft source pixels, so at 0.35 m a joint is a 20 px ramp, and 2w measured
+ * that a shader unsharp at the atlas' own mip bias cannot narrow it (the atlas the shader samples carries
+ * no energy at that scale). The cut is the one place with the paint at its own texels, so the joint is
+ * steepened here and the game samples a swatch that already reads as an edge.
+ *
+ * Sigma is about one joint edge in swatch texels — a 12 mm mortar joint is 8 texels at 1.46 mm — so the
+ * mask acts on the joint and leaves the paint's grain alone; the amount is the smallest that halves a
+ * joint's 10-90 % edge width (tests/texture-projection-swatch.test.ts pins both).
+ */
+export const SWATCH_SHARPEN_SIGMA = 3;
+export const SWATCH_SHARPEN_AMOUNT = 2.5;
+
+/**
  * The period of a course profile is taken only when its normalised autocorrelation peaks above this:
  * below it the profile has structure without a repeat, and cropping to it would cut the paint apart.
  */
@@ -457,7 +471,8 @@ export function tileSwatch(rectified: Uint8ClampedArray, side: number, size = SW
     }
   }
   return {
-    pixels: out,
+    // The cut is the last place the joint can be made crisp: sharpened at the tile's own texels (2x).
+    pixels: sharpenSwatch(out, width, height),
     width,
     height,
     metresX: (side * width) / size,
@@ -465,6 +480,72 @@ export function tileSwatch(rectified: Uint8ClampedArray, side: number, size = SW
     periodX: croppedX ? periodX : 0,
     periodY: croppedY ? periodY : 0,
   };
+}
+
+/**
+ * The tile's own unsharp mask (phase 2x): `pixel + amount * (pixel - blur(pixel))`, clamped to the byte
+ * range. The blur samples the tile with wrap, so a tiled swatch sees its own edges as the game will and
+ * the mean is kept exactly where the paint is not clipped.
+ */
+export function sharpenSwatch(
+  pixels: Uint8ClampedArray,
+  width: number,
+  height: number,
+  sigma = SWATCH_SHARPEN_SIGMA,
+  amount = SWATCH_SHARPEN_AMOUNT,
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(pixels);
+  const kernel = gaussianKernel(sigma);
+  const rgb = new Float32Array(width * height * 3);
+  for (let i = 0; i < width * height; i++) {
+    for (let c = 0; c < 3; c++) rgb[3 * i + c] = pixels[4 * i + c]!;
+  }
+  const blurred = blurAxis(blurAxis(rgb, width, height, kernel, true), width, height, kernel, false);
+  for (let i = 0; i < width * height; i++) {
+    for (let c = 0; c < 3; c++) {
+      // Uint8ClampedArray rounds and clamps: the overshoot at a joint's dark core stops at the byte floor.
+      out[4 * i + c] = pixels[4 * i + c]! + amount * (pixels[4 * i + c]! - blurred[3 * i + c]!);
+    }
+  }
+  return out;
+}
+
+/** A normalised Gaussian of `sigma`, truncated at three sigma. */
+function gaussianKernel(sigma: number): Float64Array {
+  const radius = Math.max(1, Math.ceil(3 * sigma));
+  const kernel = new Float64Array(2 * radius + 1);
+  let sum = 0;
+  for (let i = -radius; i <= radius; i++) {
+    kernel[i + radius] = Math.exp(-(i * i) / (2 * sigma * sigma));
+    sum += kernel[i + radius]!;
+  }
+  for (let i = 0; i < kernel.length; i++) kernel[i] = kernel[i]! / sum;
+  return kernel;
+}
+
+/** One separable pass of a Gaussian over an RGB plane, wrapping at both edges like the tile it is. */
+function blurAxis(
+  src: Float32Array,
+  width: number,
+  height: number,
+  kernel: Float64Array,
+  horizontal: boolean,
+): Float32Array {
+  const radius = (kernel.length - 1) / 2;
+  const out = new Float32Array(src.length);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const to = 3 * (y * width + x);
+      for (let t = -radius; t <= radius; t++) {
+        const k = kernel[t + radius]!;
+        const at = horizontal
+          ? 3 * (y * width + (((x + t) % width) + width) % width)
+          : 3 * (((((y + t) % height) + height) % height) * width + x);
+        for (let c = 0; c < 3; c++) out[to + c] = out[to + c]! + k * src[at + c]!;
+      }
+    }
+  }
+  return out;
 }
 
 /** 0 on the border of the band, 1 the band's width in: the same weight on both of an axis' edges. */

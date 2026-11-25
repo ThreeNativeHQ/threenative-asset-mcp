@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 
-import { edgeBandMask } from "../src/texture-projection/app/core/silhouette.js";
+import { edgeBandMask, occlusionBandMask } from "../src/texture-projection/app/core/silhouette.js";
 import {
   SILHOUETTE_MISMATCH_LIMIT,
   STRUCTURE_DEVIATION_LIMIT,
@@ -251,5 +251,68 @@ describe("the strip along a view's clay edges is left out of the projection (pha
       expect(mask[y * W + 7]).toBe(0); // the farther wall keeps its stone
       expect(mask[y * W + 15]).toBe(0);
     }
+  });
+});
+
+describe("the far side of an occlusion edge is left out of the projection (phase 2x)", () => {
+  const W = 64;
+  const H = 64;
+  /** Wall at 10 m everywhere, a box at 3 m over its middle: a foreground silhouette on a background. */
+  const boxOnWall = () => {
+    const pos = new Float32Array(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        pos[4 * i] = x * 0.1;
+        pos[4 * i + 1] = y * 0.1;
+        pos[4 * i + 2] = -10;
+        pos[4 * i + 3] = x >= 24 && x < 40 && y >= 24 && y < 40 ? 3 : 10;
+      }
+    }
+    return pos;
+  };
+
+  it("masks the wall within the band beside the box, and neither the box nor the wall away from it", () => {
+    const pos = boxOnWall();
+    const mask = occlusionBandMask(pos, W, H, 4);
+    // The four sides of the background: the band is the wall's pixels right beside the box.
+    for (let at = 26; at < 38; at += 3) {
+      expect(mask[at * W + 20]).toBe(1); // 4 px left of the box
+      expect(mask[at * W + 43]).toBe(1); // 4 px right of it
+      expect(mask[20 * W + at]).toBe(1); // 4 px above it
+      expect(mask[43 * W + at]).toBe(1); // 4 px below it
+      expect(mask[at * W + 19]).toBe(0); // 5 px away: the wall's own stone
+      expect(mask[at * W + 44]).toBe(0);
+      expect(mask[19 * W + at]).toBe(0);
+      expect(mask[44 * W + at]).toBe(0);
+    }
+    // The box keeps every one of its own pixels: the painter drew it where the clay has it.
+    for (let y = 24; y < 40; y++) {
+      for (let x = 24; x < 40; x++) expect(mask[y * W + x]).toBe(0);
+    }
+    // And the wall away from the silhouette is untouched.
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) expect(mask[y * W + x]).toBe(0);
+  });
+
+  it("leaves a surface whose distance only climbs with the frame — a wall at a grazing angle — alone", () => {
+    // 3 % per pixel, under the 4 % jump that makes a discontinuity: no seed anywhere, no band.
+    const pos = new Float32Array(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) pos[4 * (y * W + x) + 3] = 10 + 0.3 * x;
+    }
+    const mask = occlusionBandMask(pos, W, H, 4);
+    expect(mask.some((value) => value)).toBe(false);
+  });
+
+  it("seeds no band from the sky: only the wall beside a foreground surface is masked", () => {
+    // Sky (distance 0) above row 20: a wall running out of frame into the sky is not an occlusion edge,
+    // because nothing is painted over the sky in the first place.
+    const pos = boxOnWall();
+    for (let y = 0; y < 20; y++) for (let x = 0; x < W; x++) pos[4 * (y * W + x) + 3] = 0;
+    const mask = occlusionBandMask(pos, W, H, 4);
+    // Columns left and right of the box: the wall right under the sky keeps its stone.
+    for (let x = 0; x < 20; x++) expect(mask[20 * W + x]).toBe(0), expect(mask[23 * W + x]).toBe(0);
+    for (let x = 45; x < W; x++) expect(mask[20 * W + x]).toBe(0), expect(mask[23 * W + x]).toBe(0);
+    expect(mask[19 * W + 8]).toBe(0);
   });
 });

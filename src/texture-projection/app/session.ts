@@ -25,7 +25,7 @@ import {
 import { plan as makePlan, type Plan, type PlanOptions } from "./core/planner.js";
 import { loadLevel, type Level } from "./core/scene.js";
 import { classifyView } from "./core/semantics.js";
-import { edgeBandMask } from "./core/silhouette.js";
+import { edgeBandMask, occlusionBandMask } from "./core/silhouette.js";
 import {
   SWATCH_CLASSES,
   SWATCH_PROBE_PX,
@@ -641,6 +641,9 @@ export class Session {
       // The strip along the clay's own edges is projected nowhere (a coping, a plinth is invented there),
       // so no swatch may straddle it: its paint only exists in the image, not in the atlas.
       const avoid = edgeBandMask(geometry.position, geometry.normal, size, size);
+      // The far side of an occlusion edge is where the painter put the foreground's colour (phase 2x).
+      const occluded = occlusionBandMask(geometry.position, size, size);
+      for (let i = 0; i < avoid.length; i++) avoid[i] |= occluded[i]!;
       for (const klass of SWATCH_CLASSES) {
         const candidate = pickSwatch(geometry, {
           klass,

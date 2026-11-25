@@ -20,7 +20,7 @@ import type { Engine } from "./engine.js";
 import { bitmapToRGBA, toDataUrl } from "./image.js";
 import { DEFAULT_PLAN, holeViews, plan as makePlan, type Plan, type PlanOptions } from "./planner.js";
 import { classifyView, describeView } from "./semantics.js";
-import { edgeBandMask } from "./silhouette.js";
+import { edgeBandMask, occlusionBandMask } from "./silhouette.js";
 import {
   EDGE_MISALIGNMENT_LIMIT,
   SILHOUETTE_MISMATCH_LIMIT,
@@ -174,9 +174,10 @@ export interface PreparedView {
   scale: ScaleAnchor;
   /** Share of the view's geometry below the shader's 0.35 grazing gate. */
   grazingFraction: number;
-  /** 1 where this view's paint is not projected: the strip along its clay edges (phase 2e). */
+  /** 1 where this view's paint is not projected: the strip along its clay edges (phase 2e) and the far
+   *  side of its occlusion edges (phase 2x). */
   edgeBand: Uint8Array;
-  /** Share of the view's geometry the edge strip leaves out of the projection. */
+  /** Share of the view's geometry the two strips above leave out of the projection. */
   edgeBandShare: number;
 }
 
@@ -203,6 +204,10 @@ export function prepareView(
   // painters do: the strip along the clay's own edges stays out of the projection and the fill
   // continues the wall's own stone to the edge (phase 2e).
   const edgeBand = edgeBandMask(pos, nrm, S, S);
+  // The far side of every occlusion edge goes too (phase 2x): the painter moves a silhouette by a few
+  // pixels and leaves the object's colour on the background beside it.
+  const occluded = occlusionBandMask(pos, S, S);
+  for (let i = 0; i < edgeBand.length; i++) edgeBand[i] |= occluded[i]!;
   let edgeBandPixels = 0;
   for (let i = 0; i < edgeBand.length; i++) edgeBandPixels += edgeBand[i]!;
   const edgeBandShare = edgeBandPixels / Math.max(1, S * S);

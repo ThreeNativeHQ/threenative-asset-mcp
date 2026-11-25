@@ -6,6 +6,7 @@ import {
   SWATCH_SIZE,
   pickSwatch,
   rectifySwatch,
+  sharpenSwatch,
   tileSwatch,
   type SwatchCandidate,
   type SwatchTile,
@@ -451,6 +452,90 @@ describe("material swatch courses", () => {
     const expectedY = COURSE;
     expect(Math.abs(horizontal - expectedX) / expectedX).toBeLessThan(0.02);
     expect(Math.abs(vertical - expectedY) / expectedY).toBeLessThan(0.02);
+  });
+});
+
+describe("the swatch's joints are sharpened where it is cut (phase 2x)", () => {
+  /**
+   * A coursed wall as the paint leaves it: a 12 mm mortar joint is 8 texels at the swatch's 1.46 mm, and
+   * its edges are soft — the swatch is an upscale of soft source pixels — a Gaussian of 2 texels each.
+   */
+  const SIZE = 256;
+  const PER = 64;
+  const JOINT = 8;
+  const SOFT = 2;
+  const DARK = 60;
+  const LIGHT = 200;
+  /** One joint per course, centred on the course break, so both of its edges are soft and it wraps. */
+  const coursed = () => {
+    const pixels = new Uint8ClampedArray(SIZE * SIZE * 4);
+    for (let y = 0; y < SIZE; y++) {
+      const phase = y % PER;
+      // Dark for the rows around the break (0), light in the middle of the course.
+      const distance = Math.min(phase, PER - phase);
+      const joint = 1 / (1 + Math.exp((distance - JOINT) / SOFT));
+      const value = Math.round(LIGHT - (LIGHT - DARK) * joint);
+      for (let x = 0; x < SIZE; x++) {
+        const at = 4 * (y * SIZE + x);
+        pixels[at] = pixels[at + 1] = pixels[at + 2] = value;
+        pixels[at + 3] = 255;
+      }
+    }
+    return pixels;
+  };
+  /** 10-90 % width of one joint edge, in rows, at the paint's own levels (down the middle column). */
+  const jointRamp = (pixels: Uint8ClampedArray, width: number, from: number, to: number) => {
+    const low = DARK + 0.1 * (LIGHT - DARK);
+    const high = DARK + 0.9 * (LIGHT - DARK);
+    const at = (row: number) => pixels[4 * (row * width + (width >> 1))]!;
+    // The joint's leading edge, scanning down: light above, dark below.
+    const crossing = (level: number, startAt: number) => {
+      for (let row = Math.floor(startAt) + 1; row < to; row++) {
+        const before = at(row - 1);
+        const after = at(row);
+        if (before >= level && after < level) return row - 1 + Math.abs((level - before) / (after - before));
+      }
+      return Number.NaN;
+    };
+    const top = crossing(high, from);
+    return crossing(low, Number.isNaN(top) ? from : top) - top;
+  };
+
+  it("halves a soft joint's edge and keeps the paint's mean colour", () => {
+    const pixels = coursed();
+    const before = jointRamp(pixels, SIZE, 40, 84);
+    const sharpened = sharpenSwatch(pixels, SIZE, SIZE);
+    const after = jointRamp(sharpened, SIZE, 40, 84);
+    expect(Number.isFinite(before)).toBe(true);
+    expect(before).toBeGreaterThan(4);
+    expect(after).toBeLessThanOrEqual(before * 0.5);
+    const mean = (frame: Uint8ClampedArray) => {
+      let sum = 0;
+      for (let i = 0; i < frame.length; i += 4) sum += frame[i]!;
+      return sum / (frame.length / 4);
+    };
+    expect(Math.abs(mean(sharpened) - mean(pixels)) / mean(pixels)).toBeLessThan(0.02);
+  });
+
+  it("leaves flat paint flat, and sharpens the joint of the cut the game is handed", () => {
+    // No edge, no overshoot: the mask adds nothing where the paint is one value.
+    const flat = new Uint8ClampedArray(SIZE * SIZE * 4).fill(120);
+    for (const value of sharpenSwatch(flat, SIZE, SIZE)) expect(value).toBe(120);
+    // And the cut really is what carries the sharpening: the tile's joint falls further per row than the
+    // rectified patch it was cut from.
+    const pixels = coursed();
+    const tile = tileSwatch(pixels, SIDE, SIZE);
+    const steepest = (frame: { pixels: Uint8ClampedArray; width: number }) => {
+      const column = frame.width >> 1;
+      let worst = 0;
+      for (let row = 41; row < 84; row++) {
+        const before = frame.pixels[4 * ((row - 1) * frame.width + column)]!;
+        const after = frame.pixels[4 * (row * frame.width + column)]!;
+        worst = Math.max(worst, Math.abs(after - before));
+      }
+      return worst;
+    };
+    expect(steepest(tile)).toBeGreaterThan(steepest({ pixels, width: SIZE }) * 1.5);
   });
 });
 
