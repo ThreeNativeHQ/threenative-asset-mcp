@@ -1,5 +1,7 @@
 # AGENTS.md — threenative-asset-mcp
 
+**Release chain:** after changing this MCP, follow the `threenative-release-chain` skill (bump version, squash PR to `main`, wait for npm publish, then bump and PR `threenative-engine`).
+
 Rules and hard-won facts for any agent working here. `README.md` documents what the tools do;
 this file covers what you would otherwise relearn the expensive way. Plans live in `docs/PRDs/`
 (finished ones in `docs/PRDs/done/`; ones waiting only on an owner action in
