@@ -507,6 +507,7 @@ describe("built stdio package", () => {
       "texture_project_quote",
       "texture_project_paint",
       "texture_project_inspect",
+      "texture_project_match_materials",
     ]);
 
     const called = jsonResponse(child, 3);

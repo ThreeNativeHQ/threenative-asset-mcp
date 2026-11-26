@@ -9,10 +9,19 @@ export interface EngineOptions {
   viewSize: number;   // px, square views sent to the models
   atlasSize: number;  // px, the baked texture
   lighting: Lighting;
+  /** Render-state threshold: known pixels stay locked until a view is `> 1 / qualityRatio` sharper. */
   qualityRatio: number;
+  /** Projection overwrite threshold: closer/sharper views overwrite earlier paint when `q > old.a / projectRatio`. */
+  projectRatio: number;
 }
 
-export const DEFAULT_ENGINE: EngineOptions = { viewSize: 1024, atlasSize: 4096, lighting: OUTDOOR, qualityRatio: 0.4 };
+export const DEFAULT_ENGINE: EngineOptions = {
+  viewSize: 1024,
+  atlasSize: 4096,
+  lighting: OUTDOOR,
+  qualityRatio: 0.55,
+  projectRatio: 0.95,
+};
 
 /** Owns the GPU resources for one level: clay renders, view buffers and the texture being painted. */
 export class Engine {
@@ -67,7 +76,7 @@ export class Engine {
     (this.compTexture.image.data as Uint8Array).set(comp);
     this.compTexture.needsUpdate = true;
     const g = this.views.geometryTarget.textures;
-    this.atlas.project(camera, g[0]!, g[3]!, this.compTexture, this.options.qualityRatio, playerVisible);
+    this.atlas.project(camera, g[0]!, g[3]!, this.compTexture, this.options.projectRatio, playerVisible);
   }
 
   /** 1 where a view's pixels show level geometry (0 = sky), top-down. */

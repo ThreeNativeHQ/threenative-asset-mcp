@@ -1,9 +1,10 @@
 import * as THREE from "three";
 import { aerialPassOnlyHidden, type PaintFill } from "../atlas-pixels.js";
 import { ATLAS_GAP_CELLS, MAX_TEXELS_PER_PIXEL } from "./core/atlas.js";
+import { autoAtlasPages, MAX_ATLAS_PAGES } from "../atlas-pages.js";
 import { INDOOR, OUTDOOR, OVERCAST, type Lighting } from "./core/clay.js";
 import { Engine } from "./core/engine.js";
-import { exportGlb, type ExportedGlb } from "./core/export.js";
+import { exportGlb, exportMultiPageGlb, type ExportedGlb } from "./core/export.js";
 import { Gpu } from "./core/gpu.js";
 import { toBlob, urlToRGBA } from "./core/image.js";
 import {
@@ -48,6 +49,8 @@ export const LIGHTING: Record<string, Lighting> = { outdoor: OUTDOOR, overcast: 
  * the footprint the projection measures is that worse axis, so the guard's threshold is 2, not 4.
  */
 export const BLUR_TEXELS_PER_PIXEL = MAX_TEXELS_PER_PIXEL;
+/** Coarse fallback ceiling beyond which magnification skips the texel cleanly. */
+export const FALLBACK_TEXELS_PER_PIXEL = 8;
 
 /** How many of a class' ranked patch candidates are tried against the stored paint before it is given up. */
 const SWATCH_ATTEMPTS = 4;
@@ -103,7 +106,14 @@ export class Session {
   plan?: Plan;
   record?: RunRecord;
   private abort?: AbortController;
-  private measurement?: { atlas: number; foot: Float32Array; painted: Uint8Array; islandTexels: number; paintedTexels: number };
+  private measurement?: {
+    atlas: number;
+    foot: Float32Array;
+    painted: Uint8Array;
+    paintedOnly: boolean;
+    islandTexels: number;
+    paintedTexels: number;
+  };
   /** 128 px renderer the hole pass ranks candidate cameras with (B, phase 2d). */
   private holeProbe?: ViewRenderer;
   /** Probe renderer the swatch search reads a view's geometry back with (phase 2m). */
@@ -401,7 +411,7 @@ export class Session {
           foot: engine.views.geometryTarget.textures[3]!,
         };
       },
-      engine.options.qualityRatio,
+      engine.options.projectRatio,
     );
     const islands = this.gpu.readU8(engine.atlas.islands, 0, false);
     const paintedMask = paintedOnly ? engine.atlas.paintedMask() : undefined;
@@ -414,12 +424,12 @@ export class Session {
       if (island) islandTexels += 1;
       painted[i] = paintedMask ? (paintedMask[i]! > 0 ? 1 : 0) : pixels[4 * i]! > 0 ? 1 : 0;
       // The footprint is kept for every texel a view sees, painted or not: what the magnification
-      // guard left empty is exactly the unpainted texels whose best view resolves too coarsely.
+      // guard left empty is the unpainted texels whose best view resolves coarser than the fallback ceiling.
       if (!island || !(pixels[4 * i]! > 0)) continue;
       foot[i] = pixels[4 * i + 1]!;
       if (painted[i]) paintedTexels += 1;
     }
-    this.measurement = { atlas: size, foot, painted, islandTexels, paintedTexels };
+    this.measurement = { atlas: size, foot, painted, paintedOnly, islandTexels, paintedTexels };
     return {
       atlas: size,
       views: plan.views.length,
@@ -439,50 +449,59 @@ export class Session {
   blurredPercentAt(atlasSize: number): number {
     const measurement = this.measurement;
     if (!measurement) throw new Error("measure before reading a blur percent");
-    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
+    const blurThreshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
     if (measurement.paintedTexels === 0) return 0;
     let blurred = 0;
     const foot = measurement.foot;
     for (let i = 0; i < foot.length; i++) {
-      if (measurement.painted[i] && foot[i]! > threshold) blurred += 1;
+      if (measurement.painted[i] && foot[i]! > blurThreshold) blurred += 1;
     }
     return (100 * blurred) / measurement.paintedTexels;
   }
 
   /**
-   * What a bake painted under the projection's own guard rule: a texel no view resolves within 2x2
-   * atlas texels is left unpainted, so the blur share is 0 by construction and the magnified texels
-   * show up as `skipped` instead. This is the honest pair for a finished run measured at a coarser
-   * atlas than the one it baked: the real atlas content says which texels were painted there, and
-   * that is exactly this rule.
+   * What a bake paints under the fallback + magnification rule at another atlas size: texels in
+   * `(2, 8]` paint with coarse fallback (`blurred`), and texels `> 8` are left unpainted (`skipped`).
    */
   guardedPercentAt(atlasSize: number): { blurred: number; skipped: number } {
     const measurement = this.measurement;
     if (!measurement) throw new Error("measure before reading the guard's share");
-    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
+    const blurThreshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
+    const fallbackThreshold = FALLBACK_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
+    let painted = 0;
+    let blurred = 0;
     let skipped = 0;
     const foot = measurement.foot;
-    for (let i = 0; i < foot.length; i++) if (foot[i]! > threshold) skipped += 1;
+    for (let i = 0; i < foot.length; i++) {
+      const f = foot[i]!;
+      if (f <= 0) continue;
+      if (f > fallbackThreshold) {
+        skipped += 1;
+      } else {
+        painted += 1;
+        if (f > blurThreshold) blurred += 1;
+      }
+    }
     return {
-      blurred: 0,
+      blurred: painted === 0 ? 0 : (100 * blurred) / painted,
       skipped: measurement.islandTexels === 0 ? 0 : (100 * skipped) / measurement.islandTexels,
     };
   }
 
   /**
    * Texels the magnification guard leaves unpainted, as a share of the island: a view sees them but
-   * one of its pixels would cover more than 2x2 atlas texels there, so projecting it would only
-   * stretch one pixel over many texels. They wait for a closer view or the hole pass.
+   * one of its pixels would cover more than the fallback ceiling (`8x8` atlas texels), so projecting
+   * it would smear across too many texels.
    */
   magnificationSkippedPercentAt(atlasSize: number): number {
     const measurement = this.measurement;
     if (!measurement) throw new Error("measure before reading the magnification share");
-    const threshold = BLUR_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
+    const threshold = FALLBACK_TEXELS_PER_PIXEL * (measurement.atlas / atlasSize);
     if (measurement.islandTexels === 0) return 0;
     let skipped = 0;
     const foot = measurement.foot;
     for (let i = 0; i < foot.length; i++) {
-      if (!measurement.painted[i] && foot[i]! > threshold) skipped += 1;
+      if ((measurement.paintedOnly ? !measurement.painted[i] : foot[i]! > 0) && foot[i]! > threshold) skipped += 1;
     }
     return (100 * skipped) / measurement.islandTexels;
   }
@@ -552,9 +571,18 @@ export class Session {
    * Textured GLB of the level (unlit or lit material, depending on the lighting it was painted in), and the
    * painted-coverage mask that ships beside it (phase 2t).
    */
-  async exportGlb(fill: PaintFill = "detail"): Promise<ExportedGlb> {
+  async exportGlb(fill: PaintFill = "detail", atlasPages: number | "auto" = "auto"): Promise<ExportedGlb> {
     if (!this.engine) throw new Error("nothing to export");
-    return exportGlb(this.engine, fill);
+    const accepted = (this.record?.views ?? []).filter((v) => v.rejected === undefined && v.comp.length > 0);
+    if (this.record === undefined || accepted.length === 0 || atlasPages === 1) {
+      return exportGlb(this.engine, fill);
+    }
+    const targetPages =
+      atlasPages === "auto"
+        ? autoAtlasPages(this.engine.level.surfaceArea, this.engine.options.atlasSize)
+        : Math.min(MAX_ATLAS_PAGES, Math.max(1, atlasPages));
+    if (targetPages <= 1) return exportGlb(this.engine, fill);
+    return exportMultiPageGlb(this.engine, this.plan, accepted, { fill, targetPages });
   }
 
   /** One PNG of a run file, or undefined when the run directory does not hold it. */
@@ -596,6 +624,7 @@ export class Session {
     view.state = new Uint8ClampedArray(0);
     view.edit = new Uint8Array(0);
     view.gen = new Uint8ClampedArray(0);
+    if (view.rejected !== undefined) view.comp = new Uint8ClampedArray(0);
   }
 
   /** One view's geometry at the probe size the swatch search reads back (not the view's own image). */

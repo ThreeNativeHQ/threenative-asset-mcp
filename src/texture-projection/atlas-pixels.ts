@@ -475,7 +475,7 @@ function chamferFromPaint(dist: Uint8Array, w: number, h: number): void {
 }
 
 /** Smallest square of painted texels a patch is cut from: smaller is a streak, not a texture. */
-const DETAIL_PATCH_MIN = 32;
+const DETAIL_PATCH_MIN = 16;
 /** Longest side a patch is cut at, so a patch's mean stays a fixed cost per island. */
 const DETAIL_PATCH_MAX = 128;
 /** Share of a patch's side a tile seam cross-fades over (a quarter: wide enough to hide the seam). */

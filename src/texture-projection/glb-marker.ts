@@ -58,15 +58,18 @@ interface JsonArray {
   }[];
 }
 
-/** The image behind the first material's base colour texture; undefined when no material has one. */
-function baseColorImageIndex(json: JsonArray): number | undefined {
+/** All image and texture indices used as base-colour maps across every material in the GLB. */
+function baseColorTargets(json: JsonArray): { imageIndices: Set<number>; textureIndices: Set<number> } {
+  const imageIndices = new Set<number>();
+  const textureIndices = new Set<number>();
   for (const material of json.materials ?? []) {
     const textureIndex = material.pbrMetallicRoughness?.baseColorTexture?.index;
     if (textureIndex === undefined) continue;
+    textureIndices.add(textureIndex);
     const source = json.textures?.[textureIndex]?.source;
-    if (source !== undefined) return source;
+    if (source !== undefined) imageIndices.add(source);
   }
-  return undefined;
+  return { imageIndices, textureIndices };
 }
 
 function writeChunks(json: Record<string, unknown>, binary: Uint8Array | undefined): Uint8Array {
@@ -97,7 +100,7 @@ const MARKER_KEY = "threenative";
 export function markProjectedAtlas(glb: Uint8Array, marker: ProjectedAtlasMarker): Uint8Array {
   const { json, binary } = readChunks(glb);
   const document = json as JsonArray;
-  const imageIndex = baseColorImageIndex(document);
+  const { imageIndices, textureIndices } = baseColorTargets(document);
   const projection = {
     atlas: marker.atlas,
     runId: marker.runId,
@@ -106,10 +109,15 @@ export function markProjectedAtlas(glb: Uint8Array, marker: ProjectedAtlasMarker
   const merge = (target: { extras?: Record<string, unknown> }): void => {
     target.extras = { ...(target.extras ?? {}), [MARKER_KEY]: { textureProjection: projection } };
   };
-  if (imageIndex !== undefined) merge(document.images![imageIndex]!);
-  for (const texture of document.textures ?? []) {
-    if (texture.source === imageIndex) merge(texture);
+  for (const imageIndex of imageIndices) {
+    const image = document.images?.[imageIndex];
+    if (image) merge(image);
   }
+  (document.textures ?? []).forEach((texture, index) => {
+    if (textureIndices.has(index) || (texture.source !== undefined && imageIndices.has(texture.source))) {
+      merge(texture);
+    }
+  });
   return writeChunks(json, binary);
 }
 

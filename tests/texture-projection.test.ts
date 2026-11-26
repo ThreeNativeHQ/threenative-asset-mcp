@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -31,7 +32,14 @@ import { auditCookConfig } from "../src/texture-projection/config-audit.js";
 import { countDebugPink } from "../src/texture-projection/debug-pink.js";
 import { cookConfigHint } from "../src/tools/texture-projection.js";
 import { markProjectedAtlas, readProjectedAtlasMarker } from "../src/texture-projection/glb-marker.js";
-import { MODEL_ALIASES, DEFAULT_MODEL, prompts, resolveModel } from "../src/texture-projection/models.js";
+import {
+  MODEL_ALIASES,
+  DEFAULT_MODEL,
+  modelPriceForViewSize,
+  prompts,
+  resolutionForViewSize,
+  resolveModel,
+} from "../src/texture-projection/models.js";
 import { loadLevel } from "../src/texture-projection/app/core/scene.js";
 import { measureScaleAnchor } from "../src/texture-projection/app/core/scale.js";
 import {
@@ -173,17 +181,73 @@ async function writeRoomGlb(path: string, half = 10, height = 8): Promise<void> 
 describe("texture-projection model aliases", () => {
   it("defaults to or-klein and lists the documented aliases with their OpenRouter ids and prices", () => {
     expect(DEFAULT_MODEL).toBe("or-klein");
-    expect(MODEL_ALIASES.map((model) => model.key)).toEqual(["or-klein", "muse-image", "or-seedream-lite"]);
+    expect(MODEL_ALIASES.map((model) => model.key)).toEqual([
+      "or-klein",
+      "flux-3",
+      "qwen-2.1-turbo",
+      "qwen-2.1-pro",
+      "muse-image",
+      "or-seedream-lite",
+    ]);
     expect(resolveModel("or-klein")).toMatchObject({
       id: "black-forest-labs/flux-3-image-klein",
       price: 0.009,
     });
+    expect(resolveModel("flux-3")).toMatchObject({ id: "black-forest-labs/flux-3-image", price: 0.048 });
+    expect(resolveModel("qwen-2.1-turbo")).toMatchObject({ id: "qwen/qwen-image-2.1-turbo", price: 0.0184 });
+    expect(resolveModel("qwen-2.1-pro")).toMatchObject({ id: "qwen/qwen-image-2.1-pro", price: 0.046 });
     expect(resolveModel("muse-image")).toMatchObject({ id: "meta/muse-image", price: 0.01 });
     expect(resolveModel("or-seedream-lite")).toMatchObject({
       id: "bytedance-seed/seedream-5-0-lite",
       price: 0.035,
     });
     expect(resolveModel("flux3-klein")).toBeUndefined();
+
+    const kleinReq = resolveModel("or-klein")!.input({
+      imageUrl: "data:image/png;base64,AAAA",
+      prompt: { look: "stone walls", roofLook: "tiles", parts: "", mode: "first", floor: false },
+      seed: 7,
+      viewSize: 2048,
+    });
+    expect(kleinReq.resolution).toBe("2K");
+    expect(kleinReq.output_format).toBe("png");
+    expect(kleinReq.seed).toBe(7);
+
+    // FLUX 3 Image rejects `seed` on OpenRouter; omit it while sending supported resolution tiers.
+    const flux3Req = resolveModel("flux-3")!.input({
+      imageUrl: "data:image/png;base64,AAAA",
+      prompt: { look: "stone walls", roofLook: "tiles", parts: "", mode: "first", floor: false },
+      seed: 7,
+      viewSize: 2048,
+    });
+    expect(flux3Req.resolution).toBe("2K");
+    expect(flux3Req).not.toHaveProperty("seed");
+
+    // Muse Image does not accept OpenRouter `resolution`; Seedream 5 Lite minimum resolution is `2K`.
+    const museReq = resolveModel("muse-image")!.input({
+      imageUrl: "data:image/png;base64,AAAA",
+      prompt: { look: "stone walls", roofLook: "tiles", parts: "", mode: "first", floor: false },
+      seed: 7,
+      viewSize: 2048,
+    });
+    expect(museReq.resolution).toBeUndefined();
+    expect(museReq.output_format).toBe("png");
+
+    const seedreamReq = resolveModel("or-seedream-lite")!.input({
+      imageUrl: "data:image/png;base64,AAAA",
+      prompt: { look: "stone walls", roofLook: "tiles", parts: "", mode: "first", floor: false },
+      seed: 7,
+      viewSize: 1024,
+    });
+    expect(seedreamReq.resolution).toBe("2K");
+
+    expect(resolutionForViewSize(1024)).toBe("1K");
+    expect(resolutionForViewSize(1536)).toBe("1.5K");
+    expect(resolutionForViewSize(2048)).toBe("2K");
+    expect(resolutionForViewSize(4096)).toBe("4K");
+    expect(modelPriceForViewSize(resolveModel("or-klein")!, 1024)).toBe(0.009);
+    expect(modelPriceForViewSize(resolveModel("or-klein")!, 2048)).toBe(0.014);
+    expect(modelPriceForViewSize(resolveModel("or-klein")!, 4096)).toBe(0.036);
   });
 
   it("passes any or:<model-id> through, with the image in input_references and never in images", () => {
@@ -211,6 +275,8 @@ describe("texture-projection OpenRouter proxy", () => {
         prompt: "A photo of stone walls",
         seed: 7,
         aspect_ratio: "1:1",
+        resolution: "2K",
+        output_format: "png",
         input_references: sampleReference(),
       },
       { env },
@@ -224,9 +290,11 @@ describe("texture-projection OpenRouter proxy", () => {
     expect(sent.body["input_references"]).toEqual(sampleReference());
     expect(sent.body).not.toHaveProperty("images");
     expect(sent.body["model"]).toBe("black-forest-labs/flux-3-image-klein");
+    expect(sent.body["resolution"]).toBe("2K");
+    expect(sent.body["output_format"]).toBe("png");
   });
 
-  it("adds a style image as a second reference with a materials-only instruction", async () => {
+  it("adds a style image as a second reference with a materials-only instruction appended after the view prompt", async () => {
     const stub = await startOpenRouterStub(pngBase64);
     const env = { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url };
     const styleImage = "data:image/png;base64,STYLE";
@@ -244,7 +312,10 @@ describe("texture-projection OpenRouter proxy", () => {
     const references = sent.body["input_references"] as { image_url: { url: string } }[];
     expect(references).toHaveLength(2);
     expect(references[1]?.image_url.url).toBe(styleImage);
-    expect(sent.body["prompt"]).toContain("materials");
+    const sentPrompt = sent.body["prompt"] as string;
+    expect(sentPrompt.startsWith("A photo of stone walls")).toBe(true);
+    expect(sentPrompt).toContain("material palette");
+    expect(sentPrompt).toContain("second image only");
     expect(sent.body).not.toHaveProperty("style_image");
   });
 
@@ -534,13 +605,91 @@ describe("texture-projection runner", () => {
   );
 
   it(
-    "refuses to paint a view pixel that would cover more than 2x2 atlas texels",
+    "defaults fillModel to firstModel on fill and hole views and omits seed for flux-3",
+    async () => {
+      const cwd = await scratchDir("flux3-fill-default");
+      const room = join(cwd, "room.glb");
+      await writeRoomGlb(room);
+      const stub = await startOpenRouterStub(pngBase64);
+      const result = await paintTextureProjection({
+        levelPath: room,
+        cwd,
+        env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: stub.url },
+        firstModel: "flux-3",
+        plan: { maxViews: 4, aerial: 0, roofs: 0, holes: 2, spacing: 6 },
+        atlas: 256,
+        viewSize: 128,
+        runId: "flux3-default-fill",
+        outputPath: join(cwd, "assets", "room_flux3.glb"),
+      });
+      expect(result.viewsPainted).toBeGreaterThan(1);
+      expect(stub.requests.length).toBe(result.viewsPainted);
+      for (const sent of stub.requests) {
+        expect(sent.body["model"]).toBe("black-forest-labs/flux-3-image");
+        expect(sent.body).not.toHaveProperty("seed");
+      }
+      const storedRun = JSON.parse(
+        await readFile(join(cwd, ".threenative", "texture-projection", result.runId, "run.json"), "utf8"),
+      ) as StoredRun;
+      expect(storedRun.options["fillModel"]).toBe("flux-3");
+      expect(storedRun.views.every((view) => view.model === "flux-3")).toBe(true);
+    },
+    240_000,
+  );
+
+  it(
+    "fails closed after 3 consecutive provider HTTP 400 errors instead of silently continuing",
+    async () => {
+      const cwd = await scratchDir("fail-closed-400");
+      const room = join(cwd, "room.glb");
+      await writeRoomGlb(room);
+      let imageHits = 0;
+      const errorServer = createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+          imageHits += 1;
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: { message: "Black Forest Labs FLUX 3 Image does not support: seed.", code: 400 },
+            }),
+          );
+        });
+      });
+      await new Promise<void>((ok) => errorServer.listen(0, "127.0.0.1", ok));
+      const baseUrl = `http://127.0.0.1:${(errorServer.address() as AddressInfo).port}`;
+      try {
+        const error = await rejection(
+          paintTextureProjection({
+            levelPath: room,
+            cwd,
+            env: { OPENROUTER_API_KEY: FAKE_KEY, OPENROUTER_BASE_URL: baseUrl },
+            plan: { maxViews: 6, aerial: 0, roofs: 0, holes: 4, spacing: 6 },
+            atlas: 256,
+            viewSize: 128,
+            runId: "fail-closed-run",
+            outputPath: join(cwd, "assets", "room_fail.glb"),
+          }),
+        );
+        expect(error).toBeInstanceOf(Error);
+        const message = (error as Error).message;
+        expect(message).toContain("3 consecutive image requests failed");
+        expect(message).toContain("does not support: seed");
+        // 3 consecutive failed views x 2 retry attempts each, never continuing to views 4-6 or holes.
+        expect(imageHits).toBe(6);
+      } finally {
+        await new Promise<void>((ok) => errorServer.close(() => ok()));
+      }
+    },
+    240_000,
+  );
+
+  it(
+    "uses coarse fallback only for unpainted texels (<= 8 px/texel) and reports blur vs magnification skips honestly",
     async () => {
       const cwd = await scratchDir("magnification");
       const stub = await startOpenRouterStub(pngBase64);
       const plan = { maxViews: 3, aerial: 0, roofs: 0, holes: 0, spacing: 6 };
-      // An atlas four times finer than the views resolve: without the guard most texels would be painted
-      // from one stretched image pixel each.
       const quote = await quoteTextureProjection({
         levelPath: LEVEL,
         cwd,
@@ -562,13 +711,11 @@ describe("texture-projection runner", () => {
         runId: "magnification-run",
         outputPath: join(cwd, "assets", "magnification.glb"),
       });
-      // The guard is why the painted atlas has no magnified texel left: they wait for a closer view.
-      expect(result.blurredTexelPercent).toBe(0);
-      expect(result.magnificationSkippedPercent).toBeGreaterThan(1);
+      // Coarse fallback paints `(2, 8]` texels/px instead of leaving gaps, reporting `blurredTexelPercent > 0`.
+      expect(result.blurredTexelPercent).toBeGreaterThan(0);
       expect(result.coveragePercent).toBeGreaterThan(0);
 
-      // A bake at an atlas above the measurement cap reports the guard's own rule: blur 0 by
-      // construction, the refused texels counted instead.
+      // Above the 8x8 fallback ceiling at 4096 from 128 px views, texels are skipped cleanly.
       const big = await paintTextureProjection({
         levelPath: LEVEL,
         cwd,
@@ -581,9 +728,7 @@ describe("texture-projection runner", () => {
         outputPath: join(cwd, "assets", "magnification-4k.glb"),
       });
       expect(big.atlas).toBe(4096);
-      expect(big.blurredTexelPercent).toBe(0);
-      // At 4096 px from 128 px views almost every texel is refused: that is the guard doing its job.
-      expect(big.magnificationSkippedPercent).toBeGreaterThan(5);
+      expect(big.blurredTexelPercent + big.magnificationSkippedPercent).toBeGreaterThan(5);
       expect(existsSync(big.outputPath)).toBe(true);
     },
     300_000,
@@ -1340,19 +1485,17 @@ describe("texture-projection vision check (2c)", () => {
 });
 
 describe("texture-projection atlas choice (C.1)", () => {
-  it("picks the power of two that matches the measured footprint, without wasting texels", () => {
-    // The footprint is texels per image pixel along the worse screen axis (A.2), a length: one texel
-    // per pixel already keeps the measurement atlas.
+  it("picks the ceiling power of two that keeps resolved detail without rounding down", () => {
     expect(autoAtlasSize(1024, 1)).toBe(1024);
-    // Two texels per pixel (the views resolve half the linear size): a 512 atlas matches.
     expect(autoAtlasSize(1024, 2)).toBe(512);
-    // A pixel covers half a texel: the views resolve twice the linear size, so 2048 matches.
     expect(autoAtlasSize(1024, 0.5)).toBe(2048);
     expect(autoAtlasSize(1024, 0.25)).toBe(4096);
+    // Non-power-of-two candidate between 2048 and 4096 rounds up to 4096 instead of discarding half the detail.
+    expect(autoAtlasSize(4096, 1.5)).toBe(4096);
+    expect(autoAtlasSize(1024, 0.4)).toBe(4096);
     // Never above 4K, never below 512.
     expect(autoAtlasSize(1024, 1e-9)).toBe(4096);
     expect(autoAtlasSize(1024, 1e9)).toBe(512);
-    // A 4.2K match must not become an 8K atlas: the nearest power of two, not the next one up.
     expect(autoAtlasSize(1024, 0.239)).toBe(4096);
   });
 });

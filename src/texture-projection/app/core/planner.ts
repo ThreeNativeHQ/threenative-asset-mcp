@@ -32,7 +32,7 @@ export interface PlanOptions {
 }
 
 export const DEFAULT_PLAN: PlanOptions = {
-  eyeHeight: 1.65, spacing: 4, fov: 90, yaws: 8, pitchDeg: 6, downYaws: 0, downPitchDeg: -40, maxViews: 36, targetCoverage: 0.97,
+  eyeHeight: 1.65, spacing: 4, fov: 90, yaws: 8, pitchDeg: 6, downYaws: 0, downPitchDeg: -35, maxViews: 36, targetCoverage: 0.97,
   probeSize: 96, grid: 256, goodRatio: 0.5, goodAbs: 0.12, maxParallel: 1, aerial: 0, roofs: 0, roofDistance: 15, holes: 12, seed: 7,
 };
 

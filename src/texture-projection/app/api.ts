@@ -235,11 +235,17 @@ export function makeApi(session: Session) {
      * beside it as `<name>.painted.png`; `fill: "debug"` bakes the holes hot pink and writes no mask
      * (phases 2r, 2t).
      */
-    async glb(fill?: PaintFill): Promise<{ glb: string; paintedMask?: string }> {
-      const { glb, mask } = await session.exportGlb(fill);
+    async glb(
+      fill?: PaintFill,
+      atlasPages?: number | "auto",
+    ): Promise<{ glb: string; paintedMask?: string; atlasPages?: number; pageAtlasSize?: number; texelsPerMetre?: number }> {
+      const { glb, mask, atlasPages: pages, pageAtlasSize, texelsPerMetre } = await session.exportGlb(fill, atlasPages);
       return {
         glb: toBase64(new Uint8Array(glb)),
         ...(mask === undefined ? {} : { paintedMask: toBase64(mask) }),
+        ...(pages === undefined ? {} : { atlasPages: pages }),
+        ...(pageAtlasSize === undefined ? {} : { pageAtlasSize }),
+        ...(texelsPerMetre === undefined ? {} : { texelsPerMetre }),
       };
     },
     models() {

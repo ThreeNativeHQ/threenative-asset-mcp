@@ -26,7 +26,7 @@
  * points of player-visible texels to the fill (98.2% -> 88.6% visible coverage), where 0.25 m keeps a
  * measured 93%+ (`tests/texture-projection-structure.test.ts` pins the rule itself).
  */
-export const EDGE_BAND_METRES = 0.25;
+export const EDGE_BAND_METRES = 0.10;
 
 /** |normal.y| above this is a horizontal surface (a floor, a tread), never a masked edge. */
 const HORIZONTAL = 0.5;
@@ -37,7 +37,7 @@ const HORIZONTAL = 0.5;
  * the foreground object's colour: on the courtyard a moss strip along the top of the slab, a dark blob of
  * the slab's shadow on the wall behind it. 1.5 % of 1024 px is 15 px, more than any shift seen.
  */
-export const OCCLUSION_BAND_SHARE = 0.015;
+export const OCCLUSION_BAND_SHARE = 0.005;
 
 /**
  * Two pixels are on different surfaces when their distances differ by more than this share of the nearer

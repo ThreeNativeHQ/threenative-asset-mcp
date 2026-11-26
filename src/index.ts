@@ -5,8 +5,8 @@ import { join } from "node:path";
 
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
-// `import` and `texture-project-ui` are the only argument forms this bin accepts. No arguments still
-// starts the stdio MCP server, which is the contract every generated project's .mcp.json depends on.
+// `import`, `texture-project-ui`, and stdio `--mode <detailed|lean>` are the argument forms this bin accepts.
+// No arguments still starts the stdio MCP server (`detailed` default), which every generated project's .mcp.json depends on.
 if (process.argv[2] === "texture-project-ui") {
   const { runTextureProjectUiCli } = await import("./cli.js");
   let server: Awaited<ReturnType<typeof runTextureProjectUiCli>>;
@@ -44,7 +44,7 @@ if (process.argv[2] === "import") {
 import { AmbientCgClient } from "./ambientcg/client.js";
 import { AudioCatalogClient } from "./audio/client.js";
 import { BundleAssetClient } from "./bundle/client.js";
-import { loadCreatureConfig } from "./config.js";
+import { loadCreatureConfig, loadTextureProjectionMode, type TextureProjectionMode } from "./config.js";
 import type { CreatureRunner } from "./creature/runner.js";
 import { DirectAssetDownloader } from "./download/direct-asset-downloader.js";
 import { FabClient } from "./fab/client.js";
@@ -57,6 +57,14 @@ import {
   activateCreatureCompilation,
   registerCreatureCompileTool,
 } from "./tools/creature.js";
+
+let textureMode: TextureProjectionMode;
+try {
+  textureMode = loadTextureProjectionMode(process.env, process.argv.slice(2));
+} catch (error) {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+}
 
 const fab = new FabClient();
 const polyhaven = new PolyHavenClient();
@@ -97,6 +105,7 @@ const handle = serveStdio(
       directDownloader,
       itch,
       bundle,
+      textureMode,
     });
     if (creatureRunner) registerCreatureCompileTool(server, creatureRunner);
     return server;

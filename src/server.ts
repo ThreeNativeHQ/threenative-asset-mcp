@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 
 import { McpServer } from "@modelcontextprotocol/server";
 
+import type { TextureProjectionMode } from "./config.js";
+
 import { AssetFederation } from "./discovery/federation.js";
 import { createAssetAdapters } from "./discovery/adapters.js";
 import { ThreeNativeCatalogClient } from "./threenative/client.js";
@@ -182,11 +184,14 @@ import {
 import {
   TextureProjectInspectInputSchema,
   TextureProjectInspectOutputSchema,
+  TextureProjectMatchMaterialsInputSchema,
+  TextureProjectMatchMaterialsOutputSchema,
   TextureProjectPaintInputSchema,
   TextureProjectPaintOutputSchema,
   TextureProjectQuoteInputSchema,
   TextureProjectQuoteOutputSchema,
   createTextureProjectInspectHandler,
+  createTextureProjectMatchMaterialsHandler,
   createTextureProjectPaintHandler,
   createTextureProjectQuoteHandler,
 } from "./tools/texture-projection.js";
@@ -267,6 +272,8 @@ export interface AssetServerClients {
   /** Constructed on demand; overridden only by tests that supply a stub inspector or fetch. */
   audioInspector?: AudioInspector;
   audioGenerator?: AudioGenerator;
+  /** Workflow mode for texture projection tools; defaults to "detailed". */
+  textureMode?: TextureProjectionMode;
 }
 
 export function createAssetServer(
@@ -282,6 +289,7 @@ export function createAssetServer(
     bundle: new BundleAssetClient({ itch: new ItchAssetClient() }),
   },
 ): McpServer {
+  const textureMode: TextureProjectionMode = clients.textureMode ?? "detailed";
   const kenneySetting = process.env.ASSET_ENABLE_KENNEY ?? "1";
   if (kenneySetting !== "0" && kenneySetting !== "1") {
     throw new Error("ASSET_ENABLE_KENNEY must be 0 or 1.");
@@ -1282,60 +1290,79 @@ export function createAssetServer(
   );
 
   // Texture projection: gray blockout levels and environments, painted by an image model and baked
-  // into the level's own UV atlas. Quote is free and read-only; paint spends the user's key; inspect
-  // reviews a bake and writes only a contact sheet under the run directory.
+  // into the level's own UV atlas in "detailed" mode. In "lean" mode, only keyless Poly Haven
+  // matching (`texture_project_match_materials`) is exposed so agents never spend OpenRouter credits.
+  if (textureMode === "detailed") {
+    server.registerTool(
+      "texture_project_quote",
+      {
+        title: "Quote texturing a gray blockout level or environment",
+        description:
+          "Plan the camera views that would paint a gray blockout level or environment (greybox/untextured scene), and report what texturing it costs before anything is bought: planned views, model and price, the atlas size the bake would choose by measuring the plan, the UV stretch of the level's mapping and how much of that atlas the views would leave blurred. Uses OpenRouter image models with the user's own key at paint time; this quote makes no network call and needs no key. Fails closed with TEXTURE_PROJECT_MISSING_UV when the GLB has no UVs.",
+        inputSchema: TextureProjectQuoteInputSchema,
+        outputSchema: TextureProjectQuoteOutputSchema,
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      createTextureProjectQuoteHandler(),
+    );
+    server.registerTool(
+      "texture_project_paint",
+      {
+        title: "Paint a gray blockout level or environment (spends the user's OpenRouter key)",
+        description:
+          "SPENDS PROVIDER CREDITS. Texture a gray blockout level or environment: plan camera views, ask an OpenRouter image model (FLUX 3 Klein by default) to paint each view from the clay render, project the images into the level's UV atlas, and write the baked GLB atomically under the project's assets/. Every prompt keeps the clay image's edges, openings and silhouette and forbids invented doors, windows, arches and volumes; a view that invents geometry, or whose surface is almost all grazing, is rejected and left to the fill pass. You judge the views yourself: inspect returns the contact sheet, and any view that invents an arch, doorway, passage, opening, slab, coping or decorative floor is rejected with {\"resumeRunId\": ..., \"rejectViews\": [..]}, which buys no image and re-bakes from the stored ones. An embedded vision check is an opt-in (verify: true) that costs one chat request per view; it is off by default. Fails closed and stops spending: TEXTURE_PROJECT_STRUCTURE_REJECTED once the first three painted views all invent geometry, TEXTURE_PROJECT_NO_COVERAGE when no view reaches the atlas. Requires OPENROUTER_API_KEY when an image actually has to be bought; a resume that only reuses stored images needs none. Reusing resumeRunId re-judges every stored generation and requests only views that have none, so a view is never paid for twice; viewsPainted counts what reached the atlas, bought or reused. promptTestView buys exactly one image. fill: \"debug\" paints never-painted texels hot pink (#FF69B4) so a capture can count bake gaps; use it for verification, never ship it. The atlas stays opaque RGB with the fill's own colour, so it keeps its UASTC cook; \"a view painted this texel\" ships as its own file, <name>.painted.png beside the GLB: an 8-bit grayscale PNG at a quarter of the atlas' side, 255 where an accepted view painted, 0 where the fill made the colour up, feathered and bled into the UV gutters, named by the GLB's extras.threenative.textureProjection.paintedMask and returned as paintedMask. A game samples it as a linear data texture at the atlas' uv and swaps the atlas for the paint's swatch exactly where no view painted. It also cuts true-scale, tileable material swatches from the stored paint — one wall and one floor patch, rectified onto their own planes and written beside the GLB as <name>.swatch_wall.png, <name>.swatch_floor.png and <name>.swatches.json — because the atlas is macro variation and at arm's length its texels read as blotches: a game tiles these in world space for close-range detail.",
+        inputSchema: TextureProjectPaintInputSchema,
+        outputSchema: TextureProjectPaintOutputSchema,
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      createTextureProjectPaintHandler(),
+    );
+    server.registerTool(
+      "texture_project_inspect",
+      {
+        title: "Inspect a painted level texture projection",
+        description:
+          "Review the texturing of a gray blockout level or environment: return a contact sheet image (clay render, model image and projected composite per view, rejected views labelled) plus coverage, atlas size, measured blurred-texel share and rejected views by reason, and audit threenative.config.ts cook settings: flags a maxSize below the atlas or an ETC1S (or missing UASTC) base-colour codec that would blur the bake. Read this sheet yourself: no image model is called by default, so a view that invents an arch, doorway, passage, opening, slab, coping or decorative floor is yours to catch with texture_project_paint {\"resumeRunId\": ..., \"rejectViews\": [..]}, which buys no image and re-bakes from the stored ones. Read-only review of the run's own data; it buys no images and writes only the contact sheet beside the run.",
+        inputSchema: TextureProjectInspectInputSchema,
+        outputSchema: TextureProjectInspectOutputSchema,
+        annotations: {
+          // The contact sheet PNG is written into the run directory, so this is not read-only by the
+          // letter; it neither buys an image nor changes the bake or the project's assets.
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      createTextureProjectInspectHandler(),
+    );
+  }
   server.registerTool(
-    "texture_project_quote",
+    "texture_project_match_materials",
     {
-      title: "Quote texturing a gray blockout level or environment",
+      title: "Match gray blockout level surfaces and props to CC0 Poly Haven assets",
       description:
-        "Plan the camera views that would paint a gray blockout level or environment (greybox/untextured scene), and report what texturing it costs before anything is bought: planned views, model and price, the atlas size the bake would choose by measuring the plan, the UV stretch of the level's mapping and how much of that atlas the views would leave blurred. Uses OpenRouter image models with the user's own key at paint time; this quote makes no network call and needs no key. Fails closed with TEXTURE_PROJECT_MISSING_UV when the GLB has no UVs.",
-      inputSchema: TextureProjectQuoteInputSchema,
-      outputSchema: TextureProjectQuoteOutputSchema,
+        'Evaluates named level surfaces and 3D prop/object queries against Poly Haven CC0 PBR textures and 3D models using one or more reference images, CIELAB chroma/contrast invariance, and multi-scale gradient energy, extracting referenceHex per query. Default to mode: "lean" (keyless Poly Haven CC0 PBR textures & 3D models + referenceHex fallbacks) unless the user explicitly asks for detailed OpenRouter AI projection.',
+      inputSchema: TextureProjectMatchMaterialsInputSchema,
+      outputSchema: TextureProjectMatchMaterialsOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: false,
-      },
-    },
-    createTextureProjectQuoteHandler(),
-  );
-  server.registerTool(
-    "texture_project_paint",
-    {
-      title: "Paint a gray blockout level or environment (spends the user's OpenRouter key)",
-      description:
-        "SPENDS PROVIDER CREDITS. Texture a gray blockout level or environment: plan camera views, ask an OpenRouter image model (FLUX 3 Klein by default) to paint each view from the clay render, project the images into the level's UV atlas, and write the baked GLB atomically under the project's assets/. Every prompt keeps the clay image's edges, openings and silhouette and forbids invented doors, windows, arches and volumes; a view that invents geometry, or whose surface is almost all grazing, is rejected and left to the fill pass. You judge the views yourself: inspect returns the contact sheet, and any view that invents an arch, doorway, passage, opening, slab, coping or decorative floor is rejected with {\"resumeRunId\": ..., \"rejectViews\": [..]}, which buys no image and re-bakes from the stored ones. An embedded vision check is an opt-in (verify: true) that costs one chat request per view; it is off by default. Fails closed and stops spending: TEXTURE_PROJECT_STRUCTURE_REJECTED once the first three painted views all invent geometry, TEXTURE_PROJECT_NO_COVERAGE when no view reaches the atlas. Requires OPENROUTER_API_KEY when an image actually has to be bought; a resume that only reuses stored images needs none. Reusing resumeRunId re-judges every stored generation and requests only views that have none, so a view is never paid for twice; viewsPainted counts what reached the atlas, bought or reused. promptTestView buys exactly one image. fill: \"debug\" paints never-painted texels hot pink (#FF69B4) so a capture can count bake gaps; use it for verification, never ship it. The atlas stays opaque RGB with the fill's own colour, so it keeps its UASTC cook; \"a view painted this texel\" ships as its own file, <name>.painted.png beside the GLB: an 8-bit grayscale PNG at a quarter of the atlas' side, 255 where an accepted view painted, 0 where the fill made the colour up, feathered and bled into the UV gutters, named by the GLB's extras.threenative.textureProjection.paintedMask and returned as paintedMask. A game samples it as a linear data texture at the atlas' uv and swaps the atlas for the paint's swatch exactly where no view painted. It also cuts true-scale, tileable material swatches from the stored paint — one wall and one floor patch, rectified onto their own planes and written beside the GLB as <name>.swatch_wall.png, <name>.swatch_floor.png and <name>.swatches.json — because the atlas is macro variation and at arm's length its texels read as blotches: a game tiles these in world space for close-range detail.",
-      inputSchema: TextureProjectPaintInputSchema,
-      outputSchema: TextureProjectPaintOutputSchema,
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: false,
-        idempotentHint: false,
         openWorldHint: true,
       },
     },
-    createTextureProjectPaintHandler(),
-  );
-  server.registerTool(
-    "texture_project_inspect",
-    {
-      title: "Inspect a painted level texture projection",
-      description:
-        "Review the texturing of a gray blockout level or environment: return a contact sheet image (clay render, model image and projected composite per view, rejected views labelled) plus coverage, atlas size, measured blurred-texel share and rejected views by reason, and audit threenative.config.ts cook settings: flags a maxSize below the atlas or an ETC1S (or missing UASTC) base-colour codec that would blur the bake. Read this sheet yourself: no image model is called by default, so a view that invents an arch, doorway, passage, opening, slab, coping or decorative floor is yours to catch with texture_project_paint {\"resumeRunId\": ..., \"rejectViews\": [..]}, which buys no image and re-bakes from the stored ones. Read-only review of the run's own data; it buys no images and writes only the contact sheet beside the run.",
-      inputSchema: TextureProjectInspectInputSchema,
-      outputSchema: TextureProjectInspectOutputSchema,
-      annotations: {
-        // The contact sheet PNG is written into the run directory, so this is not read-only by the
-        // letter; it neither buys an image nor changes the bake or the project's assets.
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: false,
-      },
-    },
-    createTextureProjectInspectHandler(),
+    createTextureProjectMatchMaterialsHandler(polyhaven, textureMode),
   );
 
   const closeServer = server.close.bind(server);

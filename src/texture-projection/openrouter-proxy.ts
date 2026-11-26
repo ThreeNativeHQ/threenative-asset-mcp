@@ -20,6 +20,8 @@ const ImageRequestSchema = z.object({
   prompt: z.string().min(1),
   aspect_ratio: z.string().min(1).optional(),
   seed: z.number().int().optional(),
+  resolution: z.string().min(1).optional(),
+  output_format: z.enum(["png", "jpeg", "webp"]).optional(),
   input_references: z.array(ReferenceSchema).min(1),
   style_image: z.string().min(1).optional(),
   consistency_image: z.string().min(1).optional(),
@@ -98,6 +100,8 @@ export async function forwardImageRequest(body: unknown, options: ProxyOptions =
     input_references: references,
     ...(request.aspect_ratio === undefined ? {} : { aspect_ratio: request.aspect_ratio }),
     ...(request.seed === undefined ? {} : { seed: request.seed }),
+    ...(request.resolution === undefined ? {} : { resolution: request.resolution }),
+    ...(request.output_format === undefined ? {} : { output_format: request.output_format }),
   };
   return send(key, "/api/v1/images", payload, options);
 }

@@ -11,13 +11,21 @@ import type { Level } from './scene.js';
  */
 export const MAX_TEXELS_PER_PIXEL = 2;
 
+/**
+ * Fallback magnification ceiling for otherwise-unpainted texels: a coarse view (`<= 8` texels/px,
+ * `cosv >= 0.20`) fills a surface instead of leaving it to flat smooth push-pull, at a heavy
+ * quality penalty so any crisp view (`<= 2` texels/px, `cosv >= 0.35`) always overwrites it.
+ */
+export const MAX_FALLBACK_TEXELS_PER_PIXEL = 8;
+
 /** Cells per side of the coarse atlas grid the hole pass scores unpainted clusters on (B, phase 2d). */
 export const ATLAS_GAP_CELLS = 128;
 
 /**
  * The texture being painted, in UV space. Each texel stores sRGB colour and the quality it was captured at
- * (cos(view angle) / distance; 0 = not painted). Projection passes rasterise the level in UV space and pull
- * colour from a view's composited image wherever that view sees the texel better than what is stored.
+ * (cos(view angle) / distance scaled by sharpness; 0 = not painted). Projection passes rasterise the level
+ * in UV space and pull colour from a view's composited image wherever that view sees the texel better than
+ * what is stored.
  */
 const UV_VERT = /* glsl */ `
 out vec3 vWorld;
@@ -41,6 +49,9 @@ uniform float ratio;
 uniform vec2 texel;
 uniform float edgeRadius;
 uniform float maxTexelsPerPixel;
+uniform float maxFallbackTexelsPerPixel;
+uniform float useDeriv;
+uniform float viewSize;
 uniform sampler2D playerVisible;
 in vec3 vWorld;
 in vec3 vNormal;
@@ -49,10 +60,14 @@ void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 old = texelFetch(prev, p, 0);
   outColor = old;
+  vec4 clip = viewProj * vec4(vWorld, 1.0);
+  // Compute UV->screen Jacobian in uniform control flow before any early return (repacked multi-page atlases).
+  vec2 suvRaw = (clip.xy / max(clip.w, 1e-4)) * 0.5 + 0.5;
+  vec2 jx = dFdx(suvRaw) * viewSize;
+  vec2 jy = dFdy(suvRaw) * viewSize;
   // Aerial and roof passes get the mask of the texels a player-height view sees (phase 2e): a pass that
   // looks down on the level paints wall tops and outer faces, never the ground a player walks on.
   if (texelFetch(playerVisible, p, 0).r > 0.5) return;
-  vec4 clip = viewProj * vec4(vWorld, 1.0);
   if (clip.w <= 0.0) return;
   vec3 ndc = clip.xyz / clip.w;
   if (abs(ndc.x) > 0.999 || abs(ndc.y) > 0.999) return;
@@ -60,15 +75,29 @@ void main() {
   vec3 toCam = camPos - vWorld;
   float dist = length(toCam);
   float cosv = dot(normalize(vNormal), toCam / dist);
-  if (cosv < 0.35) return;   // was 0.08: steeper views smear one pixel over a wall strip
+  if (cosv < 0.20) return;
   vec4 g = texture(gPos, suv);
   bool sky = g.w <= 0.0;
   if (!sky && dist > g.w + 0.02 + 0.01 * dist) return;
-  // Magnification guard (A.2): a view pixel that would cover more than 2x2 atlas texels has no
-  // detail of its own to give — projected, it stretches one image pixel over many texels. Leave
-  // those texels for a closer view or the hole pass instead of painting blur into the atlas.
-  if (texture(gFoot, suv).r > maxTexelsPerPixel) return;
-  float q = cosv / max(dist, 0.5);
+  float foot;
+  if (useDeriv > 0.5) {
+    float det = jx.x * jy.y - jx.y * jy.x;
+    if (abs(det) < 1e-6) {
+      foot = 100.0;
+    } else {
+      float col0 = length(vec2(jy.y, -jx.y)) / abs(det);
+      float col1 = length(vec2(-jy.x, jx.x)) / abs(det);
+      foot = max(col0, col1);
+    }
+  } else {
+    foot = texture(gFoot, suv).r;
+  }
+  // Crisp samples satisfy cosv >= 0.35 and foot <= maxTexelsPerPixel; coarser samples only fill unpainted texels.
+  bool crisp = cosv >= 0.35 && foot <= maxTexelsPerPixel;
+  if (old.a > 0.0 && !crisp) return;
+  if (!crisp && foot > maxFallbackTexelsPerPixel) return;
+  float sharpness = 1.0 / max(0.5, foot * 0.5);
+  float q = (cosv / max(dist, 0.5)) * sharpness * (crisp ? 1.0 : 0.15);
   // Near a silhouette the model's image is least trustworthy (slight misalignment paints the wrong side onto
   // the edge), so capture it at reduced quality: a view that sees it away from an edge will replace it.
   float edge = 0.0;
@@ -104,6 +133,7 @@ uniform vec3 camPos;
 uniform float ratio;
 uniform vec2 texel;
 uniform float edgeRadius;
+uniform float maxTexelsPerPixel;
 in vec3 vWorld;
 in vec3 vNormal;
 layout(location = 0) out vec4 outColor;
@@ -119,10 +149,13 @@ void main() {
   vec3 toCam = camPos - vWorld;
   float dist = length(toCam);
   float cosv = dot(normalize(vNormal), toCam / dist);
-  if (cosv < 0.35) return;
+  if (cosv < 0.20) return;
   vec4 g = texture(gPos, suv);
   if (g.w > 0.0 && dist > g.w + 0.02 + 0.01 * dist) return;
-  float q = cosv / max(dist, 0.5);
+  float foot = texture(gFoot, suv).r;
+  bool crisp = cosv >= 0.35 && foot <= maxTexelsPerPixel;
+  float sharpness = 1.0 / max(0.5, foot * 0.5);
+  float q = (cosv / max(dist, 0.5)) * sharpness * (crisp ? 1.0 : 0.15);
   float edge = 0.0;
   for (int k = 0; k < 8; k++) {
     float a = 0.7853982 * float(k);
@@ -131,7 +164,7 @@ void main() {
   }
   q *= mix(1.0, 0.3, edge);
   if (old.r > 0.0 && old.r >= ratio * q) return;
-  outColor = vec4(q, texture(gFoot, suv).r, 0.0, 1.0);
+  outColor = vec4(q, foot, 0.0, 1.0);
 }`;
 
 const COPY_FRAG = /* glsl */ `
@@ -280,7 +313,12 @@ export class Atlas {
     visible: { value: null }, src: { value: null }, cell: { value: 32 }, stride: { value: 8 },
   });
 
-  constructor(private readonly gpu: Gpu, level: Level, readonly size = 4096) {
+  constructor(
+    private readonly gpu: Gpu,
+    level: Level,
+    readonly size = 4096,
+    private readonly opts: { useDeriv?: boolean; maxFallbackTexelsPerPixel?: number } = {},
+  ) {
     this.noPlayerVisible.needsUpdate = true;
     this.a = floatTarget(size, size, { half: true, linear: true });
     this.b = floatTarget(size, size, { half: true, linear: true });
@@ -292,8 +330,10 @@ export class Atlas {
       depthTest: false, depthWrite: false,
       uniforms: { prev: { value: null }, gPos: { value: null }, gFoot: { value: null }, comp: { value: null },
         viewProj: { value: new THREE.Matrix4() },
-        camPos: { value: new THREE.Vector3() }, ratio: { value: 0.4 }, texel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
-        edgeRadius: { value: 6 }, maxTexelsPerPixel: { value: MAX_TEXELS_PER_PIXEL }, playerVisible: { value: null } },
+        camPos: { value: new THREE.Vector3() }, ratio: { value: 0.95 }, texel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+        edgeRadius: { value: 6 }, maxTexelsPerPixel: { value: MAX_TEXELS_PER_PIXEL },
+        maxFallbackTexelsPerPixel: { value: opts.maxFallbackTexelsPerPixel ?? MAX_FALLBACK_TEXELS_PER_PIXEL },
+        useDeriv: { value: opts.useDeriv ? 1 : 0 }, viewSize: { value: 1024 }, playerVisible: { value: null } },
     });
     this.islandMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: UV_VERT, fragmentShader: ISLAND_FRAG, side: THREE.DoubleSide,
@@ -303,8 +343,8 @@ export class Atlas {
       glslVersion: THREE.GLSL3, vertexShader: UV_VERT, fragmentShader: QUALITY_FRAG, side: THREE.DoubleSide,
       depthTest: false, depthWrite: false,
       uniforms: { prev: { value: null }, gPos: { value: null }, gFoot: { value: null }, viewProj: { value: new THREE.Matrix4() },
-        camPos: { value: new THREE.Vector3() }, ratio: { value: 0.4 }, texel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
-        edgeRadius: { value: 6 } },
+        camPos: { value: new THREE.Vector3() }, ratio: { value: 0.95 }, texel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+        edgeRadius: { value: 6 }, maxTexelsPerPixel: { value: MAX_TEXELS_PER_PIXEL } },
     });
     this.visibleMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: UV_VERT, fragmentShader: VISIBLE_FRAG, side: THREE.DoubleSide,
@@ -336,7 +376,7 @@ export class Atlas {
    * `comp` its composited image. `playerVisible` (1 per texel a player-height view sees) restricts an aerial or
    * roof pass to the texels no player camera can see; undefined lets the projection's own gates decide.
    */
-  project(camera: THREE.Camera, gPos: THREE.Texture, gFoot: THREE.Texture, comp: THREE.Texture, ratio: number, playerVisible?: THREE.Texture) {
+  project(camera: THREE.Camera, gPos: THREE.Texture, gFoot: THREE.Texture, comp: THREE.Texture, ratio: number, playerVisible?: THREE.Texture, skipPad = false) {
     this.copyMat.uniforms.src.value = this.a.texture;
     this.gpu.pass(this.copyMat, this.b);
     const u = this.projectMat.uniforms;
@@ -350,12 +390,15 @@ export class Atlas {
     const img = gPos.image as { width: number; height: number };
     u.texel.value.set(1 / img.width, 1 / img.height);
     u.edgeRadius.value = (6 * img.width) / 1024;   // same angular band at any view size
+    u.maxFallbackTexelsPerPixel.value = this.opts.maxFallbackTexelsPerPixel ?? MAX_FALLBACK_TEXELS_PER_PIXEL;
+    u.useDeriv.value = this.opts.useDeriv ? 1 : 0;
+    u.viewSize.value = img.width;
     u.playerVisible.value = playerVisible ?? this.noPlayerVisible;
     this.uvMesh.material = this.projectMat;
     this.gpu.draw(this.uvScene, this.uvCam, this.b, null);
     this.uvMesh.material = this.islandMat;
     [this.a, this.b] = [this.b, this.a];
-    this.pad();
+    if (!skipPad) this.pad();
   }
 
   /**

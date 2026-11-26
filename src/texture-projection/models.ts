@@ -39,6 +39,8 @@ export interface EditInput {
   imageUrl: string;
   prompt: PromptContext;
   seed: number;
+  /** Target square view pixel size (`1024`, `1536`, `2048`, `4096`) used to select OpenRouter `resolution`. */
+  viewSize?: number;
   /** Data URL of already-accepted texture of the same surface: its materials must be kept (C, phase 2d). */
   consistency?: string;
 }
@@ -53,7 +55,9 @@ export interface ImageRequest {
   model: string;
   prompt: string;
   aspect_ratio: string;
-  seed: number;
+  seed?: number;
+  resolution?: string;
+  output_format?: "png" | "jpeg";
   input_references: ImageReference[];
   /** Optional style image (data URL); the proxy appends it as a second reference. Never sent as-is. */
   style_image?: string;
@@ -140,7 +144,7 @@ export const ROOF_PASS_CONSTRAINT =
   " add no doors, windows, arches, passages, openings, stairs, people, plants or objects that are not in the clay image.";
 /** How the light should look: the render's own sun and shadows, or soft overcast light with no cast shadows. */
 const light = (c: PromptContext) => (c.overcast
-  ? "soft, even overcast daylight with no cast shadows and no sunlit patches"
+  ? "completely flat, diffuse, neutral PBR albedo lighting with zero cast shadows, zero directional sunlight, zero ambient-occlusion darkening, zero specular highlights, and zero baked global illumination or color bounce"
   : "the same light direction and shadows");
 /**
  * The ground clause (PRD-916 phase 2e). The courtyard's aerial views see the floor as one big blank
@@ -179,9 +183,9 @@ export const prompts = {
   },
 };
 
-/** Added to the prompt when a style image rides along; it is a material reference, never a composition. */
+/** Appended when a style image rides along: materials from the second image, framing from the first. */
 export const STYLE_INSTRUCTION =
-  " Take the materials, colours and wear from the second image only; the camera, shapes and layout come from the first image.";
+  " Use the second image only for its material palette, base colours and surface wear; ignore all sunlight direction, cast shadows, bright highlights and global illumination in the second image, and keep the exact camera, perspective, outlines and layout of the first image.";
 
 /**
  * Added to the prompt when already-accepted texture of the same surface rides along (C, PRD-916 phase 2d).
@@ -197,20 +201,87 @@ export const CONSISTENCY_INSTRUCTION =
   " its block and stone sizes and its coursing, continuing the same courses across this view; do not change the material" +
   " or the scale of the blocks anywhere this surface appears.";
 
-function openRouterModel(key: string, label: string, id: string, price: number): EditModel {
+export type OpenRouterResolution = "768" | "1K" | "1.5K" | "2K" | "4K";
+
+const RESOLUTION_TIERS: readonly { minPx: number; tier: OpenRouterResolution }[] = [
+  { minPx: 4096, tier: "4K" },
+  { minPx: 2048, tier: "2K" },
+  { minPx: 1536, tier: "1.5K" },
+  { minPx: 0, tier: "1K" },
+];
+
+const RESOLUTION_ORDER: readonly OpenRouterResolution[] = ["768", "1K", "1.5K", "2K", "4K"];
+
+/** Map view render width (`1024`, `1536`, `2048`, `4096`) to the OpenRouter `resolution` tier. */
+export function resolutionForViewSize(viewSize = 1024): OpenRouterResolution {
+  for (const entry of RESOLUTION_TIERS) {
+    if (viewSize >= entry.minPx) return entry.tier;
+  }
+  return "1K";
+}
+
+function selectSupportedResolution(
+  supported: readonly OpenRouterResolution[] | undefined,
+  viewSize: number | undefined,
+): OpenRouterResolution | undefined {
+  if (supported !== undefined && supported.length === 0) return undefined;
+  const target = resolutionForViewSize(viewSize);
+  if (supported === undefined) {
+    // Unknown `or:<model id>` passthrough: only ask for resolution explicitly above the 1K baseline.
+    return viewSize !== undefined && viewSize > 1024 ? target : undefined;
+  }
+  if (supported.includes(target)) return target;
+  const targetRank = RESOLUTION_ORDER.indexOf(target);
+  const higher = supported.find((tier) => RESOLUTION_ORDER.indexOf(tier) >= targetRank);
+  return higher ?? supported[supported.length - 1];
+}
+
+const MODEL_PRICES_BY_RES: Readonly<Record<string, Partial<Record<OpenRouterResolution, number>>>> = {
+  "black-forest-labs/flux-3-image-klein": { "1K": 0.009, "1.5K": 0.011, "2K": 0.014, "4K": 0.036 },
+  "black-forest-labs/flux-3-image": { "1K": 0.048, "1.5K": 0.07, "2K": 0.1, "4K": 0.607 },
+  "qwen/qwen-image-2.1-turbo": { "1K": 0.0184, "2K": 0.0184 },
+  "qwen/qwen-image-2.1-pro": { "1K": 0.046, "2K": 0.046 },
+};
+
+/** USD per generated image for `model` at `viewSize`, falling back to the 1K catalog price. */
+export function modelPriceForViewSize(model: EditModel, viewSize = 1024): number {
+  const byRes = MODEL_PRICES_BY_RES[model.id];
+  if (!byRes) return model.price;
+  const tier = resolutionForViewSize(viewSize);
+  return byRes[tier] ?? model.price;
+}
+
+interface OpenRouterModelCapabilities {
+  readonly resolutions?: readonly OpenRouterResolution[];
+  readonly outputFormat?: "png" | "jpeg";
+  readonly supportsSeed?: boolean;
+}
+
+function openRouterModel(
+  key: string,
+  label: string,
+  id: string,
+  price: number,
+  caps: OpenRouterModelCapabilities = {},
+): EditModel {
   return {
     key,
     label,
     id,
     price,
-    input: (i) => ({
-      model: id,
-      prompt: prompts.view(i.prompt),
-      aspect_ratio: "1:1",
-      seed: i.seed,
-      input_references: [{ type: "image_url", image_url: { url: i.imageUrl } }],
-      ...(i.consistency === undefined ? {} : { consistency_image: i.consistency }),
-    }),
+    input: (i) => {
+      const resolution = selectSupportedResolution(caps.resolutions, i.viewSize);
+      return {
+        model: id,
+        prompt: prompts.view(i.prompt),
+        aspect_ratio: "1:1",
+        ...(caps.supportsSeed === false ? {} : { seed: i.seed }),
+        ...(resolution === undefined ? {} : { resolution }),
+        ...(caps.outputFormat === undefined ? {} : { output_format: caps.outputFormat }),
+        input_references: [{ type: "image_url", image_url: { url: i.imageUrl } }],
+        ...(i.consistency === undefined ? {} : { consistency_image: i.consistency }),
+      };
+    },
   };
 }
 
@@ -218,9 +289,28 @@ export const DEFAULT_MODEL = "or-klein";
 
 /** Selectable aliases, in the order the UI lists them. */
 export const MODEL_ALIASES: readonly EditModel[] = [
-  openRouterModel("or-klein", "FLUX 3 Klein", "black-forest-labs/flux-3-image-klein", 0.009),
-  openRouterModel("muse-image", "Muse Image", "meta/muse-image", 0.01),
-  openRouterModel("or-seedream-lite", "Seedream 5 Lite", "bytedance-seed/seedream-5-0-lite", 0.035),
+  openRouterModel("or-klein", "FLUX 3 Klein", "black-forest-labs/flux-3-image-klein", 0.009, {
+    resolutions: ["1K", "1.5K", "2K", "4K"],
+    outputFormat: "png",
+  }),
+  openRouterModel("flux-3", "FLUX 3 Image", "black-forest-labs/flux-3-image", 0.048, {
+    resolutions: ["1K", "1.5K", "2K", "4K"],
+    supportsSeed: false,
+  }),
+  openRouterModel("qwen-2.1-turbo", "Qwen Image 2.1 Turbo", "qwen/qwen-image-2.1-turbo", 0.0184, {
+    resolutions: ["1K", "2K"],
+  }),
+  openRouterModel("qwen-2.1-pro", "Qwen Image 2.1 Pro", "qwen/qwen-image-2.1-pro", 0.046, {
+    resolutions: ["1K", "2K"],
+  }),
+  openRouterModel("muse-image", "Muse Image", "meta/muse-image", 0.01, {
+    resolutions: [],
+    outputFormat: "png",
+  }),
+  openRouterModel("or-seedream-lite", "Seedream 5 Lite", "bytedance-seed/seedream-5-0-lite", 0.035, {
+    resolutions: ["2K", "4K"],
+    outputFormat: "png",
+  }),
 ];
 
 /**

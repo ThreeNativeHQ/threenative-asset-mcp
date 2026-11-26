@@ -237,6 +237,54 @@ export function loadCreatureConfig(
   };
 }
 
+export type TextureProjectionMode = "detailed" | "lean";
+
+function parseTextureProjectionModeValue(raw: string, source: string): TextureProjectionMode {
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "detailed" || normalized === "lean") {
+    return normalized;
+  }
+  throw new Error(
+    `Invalid texture projection mode "${raw}" from ${source}. Expected "detailed" or "lean".`,
+  );
+}
+
+/**
+ * Resolve the MCP server texture projection workflow mode.
+ * Precedence: CLI `--mode <detailed|lean>` (or `--mode=<value>`) > `THREENATIVE_TEXTURE_MODE` > `"detailed"`.
+ */
+export function loadTextureProjectionMode(
+  environment: NodeJS.ProcessEnv = process.env,
+  argv: readonly string[] = [],
+): TextureProjectionMode {
+  let cliValue: string | undefined;
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === undefined) continue;
+    if (arg === "--") break;
+    if (arg === "--mode") {
+      const next = argv[index + 1];
+      if (next === undefined || next.startsWith("--")) {
+        throw new Error('Missing value for "--mode". Expected "detailed" or "lean".');
+      }
+      cliValue = next;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--mode=")) {
+      cliValue = arg.slice("--mode=".length);
+    }
+  }
+  if (cliValue !== undefined) {
+    return parseTextureProjectionModeValue(cliValue, "--mode");
+  }
+  const envValue = environment.THREENATIVE_TEXTURE_MODE;
+  if (envValue !== undefined && envValue.trim().length > 0) {
+    return parseTextureProjectionModeValue(envValue, "THREENATIVE_TEXTURE_MODE");
+  }
+  return "detailed";
+}
+
 export interface RigConfig {
   /** Development cache for explicitly acquired animation sources; never a project asset root. */
   cacheDir: string;

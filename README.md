@@ -140,16 +140,24 @@ changing its configuration.
 | Unreal | `asset_import_unreal` |
 | Unity | `unity_list_packages`, `asset_import_unity` |
 | Mesh optimization | `mesh_optimize` |
-| Texture projection | `texture_project_quote`, `texture_project_paint`, `texture_project_inspect` |
+| Texture projection | `texture_project_match_materials`, `texture_project_quote`, `texture_project_paint`, `texture_project_inspect` |
 
 `mesh_optimize` shrinks a heavy static GLB behind a rendered before/after gate; it never overwrites its
 input and keeps the original when the gate fails. See [docs/tools.md](docs/tools.md#mesh-optimization).
 
-`texture_project_paint` textures a gray blockout level or environment: an image model paints planned camera
-views, the agent that called the tool reviews the contact sheet and rejects any view that invented geometry,
-and the accepted views are projected into the level's UV atlas before the baked GLB comes back ready to cook
-(an embedded vision check is an opt-in). `texture_project_quote` is free and keyless, and
-`texture_project_inspect` reviews the bake with a contact sheet, the rejected views and a cook-settings audit.
+Texture projection runs in one of two server modes selected by `--mode <detailed|lean>` or
+`THREENATIVE_TEXTURE_MODE` (`detailed` by default):
+
+- **`detailed` mode (default, requires `OPENROUTER_API_KEY` at paint time):** `texture_project_match_materials`
+  first identifies repeating Poly Haven PBR textures/models that match the reference image(s), and
+  `texture_project_quote` / `texture_project_paint` / `texture_project_inspect` paint remaining views into the
+  level's UV atlas before returning the baked GLB ready to cook (an embedded vision check is opt-in;
+  `texture_project_quote` is free and keyless).
+- **`lean` mode (`--mode lean` or `THREENATIVE_TEXTURE_MODE=lean`, keyless):** `texture_project_quote`,
+  `texture_project_paint`, and `texture_project_inspect` are omitted from `tools/list`. Only
+  `texture_project_match_materials` and the CC0 catalog search/download tools are registered so agents resolve
+  surfaces and props solely from Poly Haven CC0 PBR textures, 3D models, and `referenceHex` tint fallbacks
+  with zero image-generation calls.
 See [docs/tools.md](docs/tools.md).
 
 Recommended flow: `asset_search_sources` → the returned search tool → the returned files tool → the returned
