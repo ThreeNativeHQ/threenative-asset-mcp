@@ -12,6 +12,8 @@ import {
 import { POLYFORK_TERMS, polyforkLicense } from "../polyfork/license.js";
 import { SketchfabClient, type SketchfabModel } from "../sketchfab/client.js";
 import { SmithsonianClient, type SmithsonianFile } from "../smithsonian/client.js";
+import { threenativeAdapter } from "../threenative/adapter.js";
+import type { ThreeNativeCatalogClient } from "../threenative/client.js";
 import { safeRelativePath } from "./acquisition.js";
 import {
   assetId,
@@ -546,6 +548,8 @@ export interface AssetAdapterClients {
   polyfork?: PolyforkClient;
   /** Optional injection; the server includes the qualified adapter unless explicitly disabled. */
   kenney?: KenneyClient;
+  /** PRD-120: ThreeNative's own catalog, public with no configuration. */
+  threenative?: ThreeNativeCatalogClient;
 }
 
 export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAdapter[] {
@@ -886,6 +890,7 @@ export function createAssetAdapters(clients: AssetAdapterClients = {}): AssetAda
       },
     },
   ];
+  adapters.push(threenativeAdapter(clients.threenative));
   adapters.push({
     id: "procedural",
     async search(query, types, limit, signal) {

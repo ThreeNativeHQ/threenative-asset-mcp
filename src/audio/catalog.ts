@@ -8,7 +8,9 @@ export type AudioSourceId =
   | "pixabay"
   | "freesound"
   | "opengameart"
-  | "abstraction";
+  | "abstraction"
+  /** PRD-120: ThreeNative's own sounds, public seeds and the Studio cache. */
+  | "threenative";
 
 export type AudioKind = "sfx" | "music" | "mixed";
 export type ProgrammaticDownload = "curated-direct" | "provider-page";

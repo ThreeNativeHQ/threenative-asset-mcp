@@ -5,6 +5,7 @@ import {
   AudioCatalogError,
 } from "../audio/client.js";
 import { AudioGenerateError, type AudioGenerator } from "../audio/generate.js";
+import type { ThreeNativeCatalogClient, ThreeNativeItem } from "../threenative/client.js";
 import { AudioInspectError, type AudioInspector } from "../audio/inspect.js";
 
 const AudioSourceIdSchema = z.enum([
@@ -18,6 +19,7 @@ const AudioSourceIdSchema = z.enum([
   "freesound",
   "opengameart",
   "abstraction",
+  "threenative",
 ]);
 const AudioKindSchema = z.enum(["sfx", "music", "mixed"]);
 
@@ -120,15 +122,54 @@ export const AudioSearchOutputSchema = z.object({
   total: z.number().int().nonnegative(),
 });
 
-export function createAudioSearchHandler(client: AudioCatalogClient) {
+const THREENATIVE_AUDIO = /^threenative-([0-9a-f-]{36})$/u;
+
+/** PRD-120. A ThreeNative sound as a catalog row: id `threenative-<uuid>`, fetched by audio_download_asset. */
+function threenativeAudio(threenative: ThreeNativeCatalogClient, item: ThreeNativeItem) {
+  const url = threenative.fileUrl(item);
+  return {
+    id: `threenative-${item.id}`,
+    sourceId: "threenative" as const,
+    name: item.prompt.slice(0, 500),
+    description: item.tier === "public" ? "ThreeNative seeded sound effect." : "A sound from your ThreeNative Studio cache, 0 credits.",
+    kind: "sfx" as const,
+    tags: item.tags.split(/\s+/u).filter(Boolean).slice(0, 50),
+    license: item.tier === "public" ? item.license : "ThreeNative Studio Terms",
+    commercialUse: true,
+    attributionRequired: false,
+    sourcePageUrl: url,
+    downloadUrl: url,
+    fileName: `${item.id}.wav`,
+    directDownload: true as const,
+    redistributionAllowed: false as const,
+  };
+}
+
+export function createAudioSearchHandler(
+  client: AudioCatalogClient,
+  threenative?: ThreeNativeCatalogClient,
+) {
   return async (rawInput: z.input<typeof AudioSearchInputSchema>) => {
     try {
       const input = AudioSearchInputSchema.parse(rawInput);
-      const items = client.searchAssets({
-        ...(input.query ? { query: input.query } : {}),
-        kind: input.kind,
-        source: input.source,
-      });
+      const wantsOwn =
+        threenative !== undefined &&
+        ["all", "threenative"].includes(input.source) &&
+        ["all", "sfx"].includes(input.kind);
+      const own = wantsOwn
+        ? (await threenative.search(input.query ?? "", "audio", 8, AbortSignal.timeout(10_000)).catch(() => [])).map(
+            (item) => threenativeAudio(threenative, item),
+          )
+        : [];
+      // ThreeNative's own sounds first: they cost nothing and need no unpacking.
+      const items = [
+        ...own,
+        ...client.searchAssets({
+          ...(input.query ? { query: input.query } : {}),
+          kind: input.kind,
+          source: input.source,
+        }),
+      ];
       const offset = Number(input.cursor ?? 0);
       const page = items.slice(offset, offset + input.limit);
       return successResult(
@@ -166,10 +207,39 @@ export const AudioDownloadOutputSchema = z.object({
   sourcePageUrl: z.url().max(2_048),
 });
 
-export function createAudioDownloadHandler(client: AudioCatalogClient) {
+export function createAudioDownloadHandler(
+  client: AudioCatalogClient,
+  threenative?: ThreeNativeCatalogClient,
+) {
   return async (rawInput: z.input<typeof AudioDownloadInputSchema>) => {
     try {
       const input = AudioDownloadInputSchema.parse(rawInput);
+      const own = THREENATIVE_AUDIO.exec(input.assetId);
+      if (own && threenative) {
+        const signal = AbortSignal.timeout(30_000);
+        const item = (await threenative.publicItem(own[1]!, signal)) ?? {
+          author: "ThreeNative Studio",
+          hasPreview: false,
+          id: own[1]!,
+          license: "ThreeNative Studio Terms",
+          origin: "custom" as const,
+          prompt: input.assetId,
+          tags: "",
+          tier: "studio" as const,
+          type: "audio" as const,
+        };
+        const saved = await threenative.downloadAudio(item, client.directory);
+        return successResult(
+          AudioDownloadOutputSchema.parse({
+            ...saved,
+            assetId: input.assetId,
+            sourceId: "threenative",
+            license: item.tier === "public" ? item.license : "ThreeNative Studio Terms",
+            attributionRequired: false,
+            sourcePageUrl: threenative.fileUrl(item),
+          }),
+        );
+      }
       return successResult(
         AudioDownloadOutputSchema.parse(await client.downloadAsset(input.assetId)),
       );

@@ -16,6 +16,7 @@ import {
   DirectAssetDownloader,
   type DirectAssetProvider,
 } from "../download/direct-asset-downloader.js";
+import { ThreeNativeCatalogClient } from "../threenative/client.js";
 import type { AssetDetail, AssetFile } from "./types.js";
 
 export class AcquisitionError extends Error {}
@@ -73,6 +74,7 @@ export function validateFiles(detail: AssetDetail): void {
       ambientcg: ["ambientcg.com"],
       polyfork: ["polyfork.dev"],
       kenney: ["kenney.nl"],
+      threenative: new ThreeNativeCatalogClient().hosts(),
     };
     if (!hosts[detail.asset.provider]?.includes(url.hostname))
       throw new AcquisitionError("Unsupported asset file URL.");

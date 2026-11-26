@@ -136,6 +136,10 @@ export class AudioCatalogClient {
       );
   }
 
+  get directory(): string {
+    return this.downloadDir;
+  }
+
   listSources(): AudioSource[] {
     return AUDIO_SOURCES.map((source) => ({ ...source, browseUrls: [...source.browseUrls], kinds: [...source.kinds] }));
   }

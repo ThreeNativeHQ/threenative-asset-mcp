@@ -166,6 +166,23 @@ export const ASSET_SOURCES: readonly AssetSource[] = [
       "HD editions are Polyfork Pro; the .mjs source is never fetched or executed. Thumbnails and renders are not CC BY. Fetch one model on use rather than the catalogue in bulk, and credit Polyfork where users pick models.",
   }),
   source({
+    id: "threenative",
+    name: "ThreeNative catalog (Cloudflare)",
+    categories: ["3d-model", "sfx"],
+    bestFor:
+      "Ready baked GLBs from ThreeNative's own procedural generators (animals, flora, floors) with no setup, plus, inside ThreeNative Studio, the account's shared and private models, sounds and sculpts at 0 credits",
+    browseUrls: ["https://gateway.threenative.com/api/assets/public/catalog.json"],
+    licenseSummary: "Public seeds CC0 1.0; Studio cache rows under the ThreeNative Studio Terms",
+    licenseTags: ["cc0", "per-asset"],
+    attribution: "None",
+    access: "mcp-api",
+    downloadSupport: "mcp-managed",
+    searchTool: "asset_search",
+    downloadTool: "asset_download",
+    caution:
+      "Public tier: read-only and rate-limited per address; the catalog is cached for 10 minutes. The Studio tier needs the GATEWAY_URL and GATEWAY_TOKEN a Studio container injects; nothing is configured by hand.",
+  }),
+  source({
     id: "procedural",
     name: "Procedural environment (bake-first)",
     categories: ["3d-model"],
