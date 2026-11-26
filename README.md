@@ -46,6 +46,7 @@ search, metadata and guarded downloads, and it converts owned Unreal/Fab packs a
 | [Sketchfab](https://sketchfab.com/) | Public models | Varies per model | `SKETCHFAB_API_TOKEN` for downloads only |
 | [Kenney](https://kenney.nl/) | 3D packs, audio | CC0 | Nothing |
 | [itch.io](https://itch.io/) (curated) | Quaternius animations, KayKit, Brackeys VFX, Tallbeard music | CC0 | Nothing |
+| [ThreeNative catalog](https://gateway.threenative.com/api/assets/public/catalog.json) | Ready baked GLBs from ThreeNative's procedural generators (animals, flora, floors), no setup; inside ThreeNative Studio also the account's cached models, sounds and sculpts | CC0 seeds; Studio Terms for the Studio cache | none (`asset_search`, `asset_download`, `audio_search_assets`) |
 | [Procedural environment](https://www.npmjs.com/package/@threenative/procedural-environment) | Trees, cover, logs, rocks, city modules baked offline; `asset_search` returns each `bakeCall` | MIT generators, CC0 scans | `npm i -D @threenative/procedural-environment` |
 | [Blendkit](docs/blendkit-integration.md) (optional) | Free models through your own Blendkit-Client | Private use only, never redistributed | Local Client plus `BLENDKIT_PROVIDER_PERMISSION` |
 | Game audio catalog | Sonniss, Kenney, Tallbeard, Scott Buckley, Mixkit, Pixabay, Freesound, OpenGameArt, Abstraction | Per source | `ELEVENLABS_API_KEY` for generation only |

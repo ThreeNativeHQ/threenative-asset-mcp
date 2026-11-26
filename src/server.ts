@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 
 import { AssetFederation } from "./discovery/federation.js";
 import { createAssetAdapters } from "./discovery/adapters.js";
+import { ThreeNativeCatalogClient } from "./threenative/client.js";
 import { KenneyClient } from "./kenney/client.js";
 import { BlendkitClient } from "./blendkit/client.js";
 import { blendkitConfig, BlendkitProvider } from "./blendkit/provider.js";
@@ -249,6 +250,7 @@ function packageVersion(): string {
 }
 
 export interface AssetServerClients {
+  threenative?: ThreeNativeCatalogClient;
   fab: FabClient;
   polyhaven: PolyHavenClient;
   ambientcg: AmbientCgClient;
@@ -300,6 +302,8 @@ export function createAssetServer(
   // Constructing this reads no credentials: a missing key fails at call time, not at startup, so
   // the catalog and inspection tools still work on a machine that has no ElevenLabs account.
   const audioGenerator = clients.audioGenerator ?? new AudioGenerator();
+  // PRD-120: ThreeNative's own catalog, public with no configuration, the Studio cache inside Studio.
+  const threenative = clients.threenative ?? new ThreeNativeCatalogClient();
   const server = new McpServer({
     name: "threenative-asset-mcp",
     version: packageVersion(),
@@ -321,6 +325,7 @@ export function createAssetServer(
         ambientcg,
         smithsonian,
         polyfork,
+        threenative,
         ...(kenneySetting === "1" ? { kenney: clients.kenney ?? new KenneyClient() } : {}),
       }).concat(
         // Live Blendkit search joins the federation only with documented provider permission.
@@ -1064,7 +1069,7 @@ export function createAssetServer(
         openWorldHint: false,
       },
     },
-    createAudioSearchHandler(audio),
+    createAudioSearchHandler(audio, threenative),
   );
   server.registerTool(
     "audio_download_asset",
@@ -1081,7 +1086,7 @@ export function createAssetServer(
         openWorldHint: true,
       },
     },
-    createAudioDownloadHandler(audio),
+    createAudioDownloadHandler(audio, threenative),
   );
   server.registerTool(
     "audio_inspect_asset",

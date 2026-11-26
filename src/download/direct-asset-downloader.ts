@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
 import { sizeMeters, type SizeMeters } from "../gltf-size.js";
+import { THREENATIVE_FILE_PATH, ThreeNativeCatalogClient } from "../threenative/client.js";
 
 export type DirectAssetProvider =
   | "polyhaven"
@@ -23,7 +24,8 @@ export type DirectAssetProvider =
   | "game-icons"
   | "polyfork"
   | "kenney"
-  | "itch";
+  | "itch"
+  | "threenative";
 
 export type DirectAssetDownloadErrorCode =
   | "ASSET_DOWNLOAD_URL_REJECTED"
@@ -70,9 +72,11 @@ const PROVIDER_HOSTS: Record<DirectAssetProvider, ReadonlySet<string>> = {
   polyfork: new Set(["polyfork.dev"]),
   kenney: new Set(["kenney.nl"]),
   itch: new Set(),
+  threenative: new Set(),
 };
 
 function isAllowedProviderHost(provider: DirectAssetProvider, hostname: string): boolean {
+  if (provider === "threenative") return new ThreeNativeCatalogClient().hosts().includes(hostname);
   if (provider === "itch") {
     return /^itchio-mirror\.[0-9a-f]+\.r2\.cloudflarestorage\.com$/i.test(hostname);
   }
@@ -114,6 +118,7 @@ function validateInitialUrl(provider: DirectAssetProvider, url: URL): boolean {
     );
   }
   if (provider === "kenney") return kenneySlug(url) !== undefined;
+  if (provider === "threenative") return url.search === "" && THREENATIVE_FILE_PATH.test(url.pathname);
   if (provider === "itch") {
     return (
       /^\/upload2\/game\/\d+\/\d+$/.test(url.pathname) && url.searchParams.has("X-Amz-Signature")
@@ -446,7 +451,11 @@ export class DirectAssetDownloader {
       const response = await this.fetch(current, {
         redirect: "manual",
         signal,
-        headers: { "user-agent": "threenative-asset-mcp/0.4.0" },
+        headers: {
+          "user-agent": "threenative-asset-mcp/0.4.0",
+          // PRD-120: the Studio cache's bearer token, only for its own file route on the gateway host.
+          ...(provider === "threenative" ? new ThreeNativeCatalogClient().authFor(current) : {}),
+        },
       });
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = response.headers.get("location");
