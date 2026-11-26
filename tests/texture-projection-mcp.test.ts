@@ -87,10 +87,14 @@ interface Server {
   readonly child: ChildProcessWithoutNullStreams;
 }
 
-async function startServer(project: string, environment: NodeJS.ProcessEnv): Promise<Server> {
+async function startServer(
+  project: string,
+  environment: NodeJS.ProcessEnv,
+  args: readonly string[] = [],
+): Promise<Server> {
   const profileDir = await mkdtemp(join(tmpdir(), "texture-projection-profile-"));
   temporaryDirectories.push(profileDir);
-  const child = spawn(process.execPath, [join(REPO, "dist", "index.js")], {
+  const child = spawn(process.execPath, [join(REPO, "dist", "index.js"), ...args], {
     cwd: project,
     env: {
       ...process.env,
@@ -174,11 +178,20 @@ describe("texture projection MCP tools", () => {
       const tools = ((await listed).result as { tools: { name: string; description: string; annotations: Record<string, unknown> }[] })
         .tools;
       const byName = new Map(tools.map((tool) => [tool.name, tool]));
-      for (const name of ["texture_project_quote", "texture_project_paint", "texture_project_inspect"]) {
+      for (const name of [
+        "texture_project_quote",
+        "texture_project_paint",
+        "texture_project_inspect",
+        "texture_project_match_materials",
+      ]) {
         expect(byName.has(name)).toBe(true);
       }
       expect(byName.get("texture_project_quote")?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
       expect(byName.get("texture_project_inspect")?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
+      expect(byName.get("texture_project_match_materials")?.annotations).toMatchObject({
+        readOnlyHint: true,
+        openWorldHint: true,
+      });
       expect(byName.get("texture_project_paint")?.annotations).toMatchObject({ readOnlyHint: false, openWorldHint: true });
       for (const name of ["texture_project_quote", "texture_project_paint", "texture_project_inspect"]) {
         expect(byName.get(name)?.description ?? "").toMatch(/gray blockout level or environment/u);
@@ -373,6 +386,66 @@ describe("texture projection MCP tools", () => {
       await stopServer(server);
     }
   }, 300_000);
+});
+
+describe("texture projection modes (lean vs detailed)", () => {
+  it("should omit OpenRouter projection tools under --mode lean and THREENATIVE_TEXTURE_MODE=lean", async () => {
+    const project = await mkdtemp(join(tmpdir(), "texture-projection-lean-"));
+    temporaryDirectories.push(project);
+    const serverCli = await startServer(project, {}, ["--mode", "lean"]);
+    try {
+      const id = (nextId += 1);
+      const listed = jsonResponse(serverCli.child, id);
+      send(serverCli.child, { jsonrpc: "2.0", id, method: "tools/list", params: {} });
+      const tools = ((await listed).result as { tools: { name: string }[] }).tools;
+      const names = new Set(tools.map((tool) => tool.name));
+      expect(names.has("texture_project_match_materials")).toBe(true);
+      expect(names.has("texture_project_quote")).toBe(false);
+      expect(names.has("texture_project_paint")).toBe(false);
+      expect(names.has("texture_project_inspect")).toBe(false);
+
+      const restricted = await callTool(serverCli, "texture_project_match_materials", {
+        mode: "detailed",
+        referenceImagePath: "ref.png",
+        surfaces: [{ name: "road", query: "cobblestone street" }],
+      });
+      expect(restricted.result.isError).toBe(true);
+      expect(contentText(restricted)).toContain("TEXTURE_PROJECT_MODE_RESTRICTED");
+    } finally {
+      await stopServer(serverCli);
+    }
+
+    const serverEnv = await startServer(project, { THREENATIVE_TEXTURE_MODE: "lean" });
+    try {
+      const id = (nextId += 1);
+      const listed = jsonResponse(serverEnv.child, id);
+      send(serverEnv.child, { jsonrpc: "2.0", id, method: "tools/list", params: {} });
+      const names = new Set(((await listed).result as { tools: { name: string }[] }).tools.map((tool) => tool.name));
+      expect(names.has("texture_project_match_materials")).toBe(true);
+      expect(names.has("texture_project_quote")).toBe(false);
+      expect(names.has("texture_project_paint")).toBe(false);
+      expect(names.has("texture_project_inspect")).toBe(false);
+    } finally {
+      await stopServer(serverEnv);
+    }
+  }, 120_000);
+
+  it("should exit non-zero on invalid --mode or THREENATIVE_TEXTURE_MODE", async () => {
+    const project = await mkdtemp(join(tmpdir(), "texture-projection-badmode-"));
+    temporaryDirectories.push(project);
+    const child = spawn(process.execPath, [join(REPO, "dist", "index.js"), "--mode", "bogus"], {
+      cwd: project,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    children.add(child);
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    const [code] = (await once(child, "exit")) as [number | null];
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/Invalid texture projection mode/u);
+  }, 60_000);
 });
 
 /** A GLB with one triangle and no TEXCOORD_0. */

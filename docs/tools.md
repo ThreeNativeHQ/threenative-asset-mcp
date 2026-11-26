@@ -311,7 +311,20 @@ Texture projection (gray blockout levels and environments):
   (the caller's own `rejected: "caller"` verdicts included), the opt-in vision check's verdicts when one ran
   (`verifyRejected`, `viewsRepainted`) and an audit of `threenative.config.ts`: a `maxSize` below the atlas or an
   ETC1S (or missing UASTC) base-colour codec would blur the bake. Read the sheet yourself: the agent that calls the
-  tool is the judge; no vision model is called to do it.
+  tool is the judge; no vision model is called to do it. Only registered in `detailed` mode.
+- `texture_project_match_materials` — matches named level surfaces and 3D prop/object queries against Poly Haven
+  CC0 PBR textures and 3D models using one or more project-relative reference images (`referenceImagePath`,
+  `referenceImagePaths`, or per-item `referenceImagePath` with optional `crop`), CIELAB chroma/contrast invariance,
+  and multi-scale gradient energy, plus extracts `referenceHex` (`#rrggbb`) for neutral tinting or procedural
+  fallback materials. Registered in both modes:
+  - In `detailed` mode (default, `--mode detailed` or `THREENATIVE_TEXTURE_MODE=detailed`): routes surfaces to
+    `use_polyhaven_pbr`, `polyhaven_detail_plus_project`, or `ai_project_only`, and prop queries to
+    `use_polyhaven_model` or `ai_project_only`, setting `requiresOpenRouterKey: true` whenever any item still
+    needs AI projection.
+  - In `lean` mode (`--mode lean` or `THREENATIVE_TEXTURE_MODE=lean`): omits `texture_project_quote`,
+    `texture_project_paint`, and `texture_project_inspect` from the MCP server completely, refuses explicit
+    `mode: "detailed"` calls with `TEXTURE_PROJECT_MODE_RESTRICTED`, and routes every surface and prop to
+    `use_polyhaven_pbr`, `use_polyhaven_model`, or `procedural_tint_fallback` (`requiresOpenRouterKey: false`).
 
 `scripts/verify-calibration.ts` replays the vision check over a finished run's stored clay/painted pairs with the
 production prompt (`--run <run dir> --out <dir> [--model <id>] [--views 0,1,2]`), so the prompt can be tuned

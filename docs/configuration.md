@@ -45,6 +45,7 @@ Environment variables read by the server.
 | `THREENATIVE_UMODEL_PATH`       | auto-detected/provisioned                           | Absolute path to a UE Viewer executable override.        |
 | `THREENATIVE_UNCOOKED_CONVERTER_PATH` | auto-detected/provisioned                     | Absolute path to `unreal-assets-to-glb`.                  |
 | `THREENATIVE_FABCLI_PATH`       | auto-detected/provisioned                           | Absolute path to FabCLI; login remains user-controlled.  |
+| `THREENATIVE_TEXTURE_MODE`      | `detailed`                                          | Texture workflow mode: `detailed` (Poly Haven PBR + OpenRouter `texture_project_*` tools) or `lean` (Poly Haven CC0 PBR/models + `referenceHex` procedural fallbacks only, omitting `texture_project_quote/paint/inspect`). Overridden by CLI `--mode <detailed|lean>`. |
 
 Direct requests are spaced at least `FAB_MIN_REQUEST_INTERVAL_MS` apart. Only
 HTTP 429, 502, 503, and 504 are retried, at most twice, with backoff and

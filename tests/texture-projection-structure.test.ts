@@ -7,10 +7,14 @@ import { describe, expect, it } from "vitest";
 
 import { edgeBandMask, occlusionBandMask } from "../src/texture-projection/app/core/silhouette.js";
 import {
+  EDGE_MISALIGNMENT_LIMIT,
   SILHOUETTE_MISMATCH_LIMIT,
   STRUCTURE_DEVIATION_LIMIT,
+  edgeMisalignment,
   rejectsStructure,
+  rejectsViewScores,
   silhouetteMismatch,
+  skySolidShare,
   structureDeviation,
 } from "../src/texture-projection/app/core/structure.js";
 
@@ -314,5 +318,105 @@ describe("the far side of an occlusion edge is left out of the projection (phase
     for (let x = 0; x < 20; x++) expect(mask[20 * W + x]).toBe(0), expect(mask[23 * W + x]).toBe(0);
     for (let x = 45; x < W; x++) expect(mask[20 * W + x]).toBe(0), expect(mask[23 * W + x]).toBe(0);
     expect(mask[19 * W + 8]).toBe(0);
+  });
+});
+
+describe("silhouette gate decision (rejectsViewScores)", () => {
+  const N = 128;
+
+  it("accepts sky-only silhouette shifts <= 0.85 when geometry stays aligned, and rejects hijack or paired misalignment", () => {
+    const geometry = new Uint8Array(N * N);
+    const state = new Uint8ClampedArray(N * N * 4);
+    for (let y = 0; y < N; y++) {
+      const isWall = y >= N / 2;
+      for (let x = 0; x < N; x++) {
+        const i = y * N + x;
+        geometry[i] = isWall ? 1 : 0;
+        const p = 4 * i;
+        state[p] = state[p + 1] = state[p + 2] = 180;
+        state[p + 3] = 255;
+      }
+    }
+
+    // Case 1: half of sky changes luminance (silhouette ~0.5 > 0.20), wall stays aligned -> accepted.
+    const genSkyOnly = new Uint8ClampedArray(state);
+    for (let y = 0; y < N / 4; y++) {
+      for (let x = 0; x < N; x++) {
+        const k = 4 * (y * N + x);
+        genSkyOnly[k] = genSkyOnly[k + 1] = genSkyOnly[k + 2] = 90;
+      }
+    }
+    const sil1 = silhouetteMismatch(genSkyOnly, state, geometry, N, N);
+    const dev1 = structureDeviation(genSkyOnly, state, N, N, undefined, geometry);
+    const edge1 = edgeMisalignment(genSkyOnly, state, geometry, N, N).score;
+    expect(sil1).toBeGreaterThan(SILHOUETTE_MISMATCH_LIMIT);
+    expect(sil1).toBeLessThanOrEqual(0.85);
+    expect(rejectsViewScores(dev1, sil1, edge1)).toBe(false);
+
+    // Case 2: full-sky hijack (> 0.85) -> rejected.
+    const genHijack = new Uint8ClampedArray(state);
+    for (let y = 0; y < N / 2; y++) {
+      for (let x = 0; x < N; x++) {
+        const k = 4 * (y * N + x);
+        genHijack[k] = genHijack[k + 1] = genHijack[k + 2] = 60;
+      }
+    }
+    const sil2 = silhouetteMismatch(genHijack, state, geometry, N, N);
+    expect(sil2).toBeGreaterThan(0.85);
+    expect(rejectsViewScores(0, sil2, 0)).toBe(true);
+
+    // Case 3: moderate sky shift paired with a sharp drawn edge step inside the wall -> rejected.
+    const genPaired = new Uint8ClampedArray(genSkyOnly);
+    for (let y = N / 2; y < N; y++) {
+      for (let x = N / 2; x < N; x++) {
+        const k = 4 * (y * N + x);
+        genPaired[k] = genPaired[k + 1] = genPaired[k + 2] = 70;
+      }
+    }
+    const edge3 = edgeMisalignment(genPaired, state, geometry, N, N).score;
+    expect(edge3).toBeGreaterThan(0.1);
+    expect(rejectsViewScores(0, sil1, edge3)).toBe(true);
+    expect(rejectsViewScores(0, 0.1, EDGE_MISALIGNMENT_LIMIT + 0.01)).toBe(true);
+  });
+
+  it("allows uniform bright overcast sky shifts via skySolidShare while rejecting dark or textured sky intrusions", () => {
+    const geometry = new Uint8Array(N * N);
+    const clay = new Uint8ClampedArray(N * N * 4);
+    for (let y = 0; y < N; y++) {
+      const isWall = y >= N / 2;
+      for (let x = 0; x < N; x++) {
+        const i = y * N + x;
+        geometry[i] = isWall ? 1 : 0;
+        const p = 4 * i;
+        clay[p] = clay[p + 1] = clay[p + 2] = 170;
+        clay[p + 3] = 255;
+      }
+    }
+
+    // Smooth overcast white/bright sky across all sky cells: silhouetteMismatch = 1.0, skySolid = 0.0 -> accepted.
+    const genSmoothBrightSky = new Uint8ClampedArray(clay);
+    for (let y = 0; y < N / 2; y++) {
+      for (let x = 0; x < N; x++) {
+        const p = 4 * (y * N + x);
+        genSmoothBrightSky[p] = genSmoothBrightSky[p + 1] = genSmoothBrightSky[p + 2] = 242;
+      }
+    }
+    const silSmooth = silhouetteMismatch(genSmoothBrightSky, clay, geometry, N, N);
+    const skySolidSmooth = skySolidShare(genSmoothBrightSky, geometry, N, N);
+    expect(silSmooth).toBeGreaterThan(0.85);
+    expect(skySolidSmooth).toBe(0);
+    expect(rejectsViewScores(0, silSmooth, 0, skySolidSmooth)).toBe(false);
+
+    // Dark solid wall over sky: skySolid > 0.50 -> rejected.
+    const genDarkWall = new Uint8ClampedArray(clay);
+    for (let y = 0; y < N / 2; y++) {
+      for (let x = 0; x < N; x++) {
+        const p = 4 * (y * N + x);
+        genDarkWall[p] = genDarkWall[p + 1] = genDarkWall[p + 2] = 60;
+      }
+    }
+    const skySolidDark = skySolidShare(genDarkWall, geometry, N, N);
+    expect(skySolidDark).toBeGreaterThan(0.5);
+    expect(rejectsViewScores(0, silSmooth, 0, skySolidDark)).toBe(true);
   });
 });

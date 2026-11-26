@@ -55,6 +55,7 @@ void main() {
 
 const GEOMETRY_FRAG = /* glsl */ `
 uniform float atlasTexels;   // N * N: atlas texels per unit UV area
+uniform int useSharpQuality;
 in vec3 vWorld;
 in vec3 vNormal;
 in vec2 vUv;
@@ -76,9 +77,14 @@ void main() {
   vec2 dyTexels = uvDy * side;
   float axisFootprint = max(length(dxTexels), length(dyTexels));
   float areaFootprint = abs(uvDx.x * uvDy.y - uvDx.y * uvDy.x) * atlasTexels;
+  float baseQ = cosv / max(dist, 0.5);
+  float sharpness = 1.0 / max(0.5, axisFootprint * 0.5);
+  float fallback = (cosv >= 0.35 && axisFootprint <= 2.0) ? 1.0 : 0.15;
+  float sharpQ = (cosv >= 0.20 && axisFootprint <= 8.0) ? baseQ * sharpness * fallback : 0.0;
+  float candidateQ = useSharpQuality == 1 ? sharpQ : baseQ;
   gPos = vec4(vWorld, dist);
   gNrm = vec4(n, vLabel + 1.0);   // a > 0.5 means geometry; a - 1 is the part label
-  gUvq = vec4(vUv, cosv / max(dist, 0.5), cosv);
+  gUvq = vec4(vUv, candidateQ, cosv);
   gFoot = vec4(axisFootprint, areaFootprint, 0.0, 1.0);
 }`;
 
@@ -107,14 +113,15 @@ export class ViewRenderer {
   readonly geometryScene = new THREE.Scene();
   readonly geometryTarget: THREE.WebGLRenderTarget;
   readonly stateTarget: THREE.WebGLRenderTarget;
+  private readonly geometryMaterial: THREE.ShaderMaterial;
   private readonly stateMaterial: THREE.ShaderMaterial;
 
   constructor(private readonly gpu: Gpu, level: Level, readonly size = 1024, atlasSize = 4096) {
-    const mat = new THREE.ShaderMaterial({
+    this.geometryMaterial = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: GEOMETRY_VERT, fragmentShader: GEOMETRY_FRAG, side: THREE.DoubleSide,
-      uniforms: { atlasTexels: { value: atlasSize * atlasSize } },
+      uniforms: { atlasTexels: { value: atlasSize * atlasSize }, useSharpQuality: { value: 1 } },
     });
-    const mesh = new THREE.Mesh(level.geometry, mat);
+    const mesh = new THREE.Mesh(level.geometry, this.geometryMaterial);
     mesh.frustumCulled = false;
     this.geometryScene.add(mesh);
     this.geometryTarget = floatTarget(size, size, { count: 4, depth: true });
@@ -129,6 +136,7 @@ export class ViewRenderer {
 
   /** Geometry buffers for a camera, into `target` (defaults to the view-sized MRT target). */
   renderGeometry(camera: THREE.Camera, target = this.geometryTarget) {
+    this.geometryMaterial.uniforms.useSharpQuality!.value = target === this.geometryTarget ? 1 : 0;
     this.gpu.draw(this.geometryScene, camera, target, 0x000000, 0);
   }
 

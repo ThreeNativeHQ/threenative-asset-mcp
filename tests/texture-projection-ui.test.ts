@@ -221,8 +221,22 @@ describe("texture-projection UI page", () => {
     });
     expect(selectors.first.value).toBe("or-klein");
     expect(selectors.fill.value).toBe("or-klein");
-    expect(selectors.first.options).toEqual(["or-klein", "muse-image", "or-seedream-lite"]);
-    expect(selectors.fill.options).toEqual(["or-klein", "muse-image", "or-seedream-lite"]);
+    expect(selectors.first.options).toEqual([
+      "or-klein",
+      "flux-3",
+      "qwen-2.1-turbo",
+      "qwen-2.1-pro",
+      "muse-image",
+      "or-seedream-lite",
+    ]);
+    expect(selectors.fill.options).toEqual([
+      "or-klein",
+      "flux-3",
+      "qwen-2.1-turbo",
+      "qwen-2.1-pro",
+      "muse-image",
+      "or-seedream-lite",
+    ]);
 
     const exposed = await page.evaluate(() => {
       const strings: string[] = [document.documentElement.outerHTML];

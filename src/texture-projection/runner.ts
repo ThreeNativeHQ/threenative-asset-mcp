@@ -5,9 +5,10 @@ import { NodeIO, Primitive } from "@gltf-transform/core";
 import sharp from "sharp";
 
 import { markProjectedAtlas } from "./glb-marker.js";
+import { autoAtlasPages, MAX_ATLAS_PAGES } from "./atlas-pages.js";
 import { VISIBLE_COVERAGE_WARN, type PaintFill } from "./atlas-pixels.js";
 import { DEFAULT_VERIFY_MODEL, verifyCostUsd, verifyModelFor } from "./verify.js";
-import { DEFAULT_MODEL, resolveModel } from "./models.js";
+import { DEFAULT_MODEL, modelPriceForViewSize, resolveModel } from "./models.js";
 import {
   defaultRunRoot,
   readRun,
@@ -24,6 +25,7 @@ import { measureUvStretch, type UvStretchReport } from "./uv-stretch.js";
 export type TextureProjectionErrorCode =
   | "TEXTURE_PROJECT_MISSING_UV"
   | "TEXTURE_PROJECT_MISSING_API_KEY"
+  | "TEXTURE_PROJECT_MODE_RESTRICTED"
   | "TEXTURE_PROJECT_LEVEL_NOT_FOUND"
   | "TEXTURE_PROJECT_LEVEL_UNREADABLE"
   | "TEXTURE_PROJECT_RUN_NOT_FOUND"
@@ -78,6 +80,8 @@ export interface TextureProjectionRequest {
   readonly lighting?: "outdoor" | "overcast" | "indoor";
   /** "auto" (the default) measures the plan and picks the smallest atlas that matches it (C.1). */
   readonly atlas?: number | "auto";
+  /** Multi-page UV atlas count (1-4), or "auto" (default) to split large levels for high texel density. */
+  readonly atlasPages?: number | "auto";
   readonly viewSize?: number;
   readonly styleImagePath?: string;
   /** Check every painted view with a vision model; off unless the caller asks for it (one chat call a view). */
@@ -113,6 +117,7 @@ export interface TextureProjectionQuote {
   readonly estimatedUsd: number;
   /** The atlas size the run would bake (C.1), and what it would resolve there (A.2). */
   readonly atlas: number;
+  readonly atlasPages: number;
   readonly estimatedBlurredTexelPercent: number;
   readonly uvStretch: UvStretchReport;
   /** The vision check the run would pay for; null unless the caller asked for one. */
@@ -167,6 +172,8 @@ export interface TextureProjectionResult {
   readonly seconds: number;
   readonly complete: boolean;
   readonly atlas: number;
+  readonly atlasPages: number;
+  readonly texelsPerMetre?: number;
   /** Painted texels whose best view resolves more than ~2x2 atlas texels per image pixel (A.2). */
   readonly blurredTexelPercent: number;
   /** Island texels left unpainted by the 2x2 magnification guard, waiting for a closer view or a hole pass. */
@@ -230,7 +237,7 @@ export const MAX_AUTO_ATLAS = 4096;
  */
 export function autoAtlasSize(measurementAtlas: number, medianFoot: number): number {
   const candidate = medianFoot > 0 ? measurementAtlas / medianFoot : measurementAtlas;
-  const power = 2 ** Math.round(Math.log2(Math.max(candidate, MIN_AUTO_ATLAS)));
+  const power = 2 ** Math.ceil(Math.log2(Math.max(candidate, MIN_AUTO_ATLAS)));
   return Math.min(MAX_AUTO_ATLAS, Math.max(MIN_AUTO_ATLAS, power));
 }
 
@@ -289,6 +296,9 @@ interface BrowserSwatches {
 interface BrowserGlb {
   readonly glb: string;
   readonly paintedMask?: string;
+  readonly atlasPages?: number;
+  readonly pageAtlasSize?: number;
+  readonly texelsPerMetre?: number;
 }
 
 /** What the app's measurement returns (see app/session.ts, `Session.measure`). */
@@ -385,7 +395,8 @@ function pipelineOptions(request: TextureProjectionRequest): Record<string, unkn
   if (request.style !== undefined) options.style = request.style;
   if (request.roofStyle !== undefined) options.roofStyle = request.roofStyle;
   if (request.firstModel !== undefined) options.firstModel = request.firstModel;
-  if (request.fillModel !== undefined) options.fillModel = request.fillModel;
+  const fillModel = request.fillModel ?? request.firstModel;
+  if (fillModel !== undefined) options.fillModel = fillModel;
   if (request.fill !== undefined) options.fill = request.fill;
   if (request.verifyModel !== undefined) options.verifyModel = request.verifyModel;
   return options;
@@ -555,7 +566,7 @@ export async function quoteTextureProjection(
   if (model === undefined) {
     throw new TextureProjectionError("TEXTURE_PROJECT_INVALID_INPUT", `unknown model alias: ${alias}`);
   }
-  const price = model.price;
+  const price = modelPriceForViewSize(model, request.viewSize ?? 1024);
   const requestedAtlas = request.atlas ?? "auto";
   const measurementAtlas =
     requestedAtlas === "auto" ? MEASUREMENT_ATLAS : Math.min(requestedAtlas, MEASUREMENT_ATLAS);
@@ -571,7 +582,7 @@ export async function quoteTextureProjection(
     ...(request.onLog === undefined ? {} : { onLog: request.onLog }),
   });
   try {
-    await app.call("load", "/api/level", {
+    const loaded = await app.call<{ triangles: number; area: number }>("load", "/api/level", {
       lighting: request.lighting ?? "overcast",
       atlasSize: measurementAtlas,
       viewSize: request.viewSize ?? 1024,
@@ -580,6 +591,11 @@ export async function quoteTextureProjection(
     const plan = await app.call<BrowserPlan>("plan", planInput(request));
     const measurement = await app.call<BrowserMeasurement>("measure", planInput(request), false);
     const atlas = requestedAtlas === "auto" ? autoAtlasSize(measurementAtlas, measurement.medianFoot) : requestedAtlas;
+    const requestedPages = request.atlasPages ?? "auto";
+    const atlasPages =
+      requestedPages === "auto"
+        ? autoAtlasPages(loaded.area, atlas)
+        : Math.min(MAX_ATLAS_PAGES, Math.max(1, requestedPages));
     const estimatedBlurredTexelPercent = await app.call<number>("blurredPercentAt", atlas);
     const verify = verifyChoice(request);
     // Every planned view is one image plus one vision check (and a rejected view may be repainted once),
@@ -599,6 +615,7 @@ export async function quoteTextureProjection(
       // Cents: the caller asked for a price, not for floating-point dust.
       estimatedUsd: Math.round((plan.views + plan.holes) * perView * 100) / 100,
       atlas,
+      atlasPages,
       estimatedBlurredTexelPercent,
       uvStretch,
       verifyModel: verify.model,
@@ -947,13 +964,15 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
 
     // The debug fill only changes this export: nothing bought, nothing stored a second time (phase 2r).
     // A debug bake writes no coverage mask, so nothing beside the GLB says it did (phase 2t).
-    const exported = await app.call<BrowserGlb>("glb", request.fill ?? "detail");
+    const requestedPages = request.promptTestView !== undefined ? 1 : (request.atlasPages ?? "auto");
+    const exported = await app.call<BrowserGlb>("glb", request.fill ?? "detail", requestedPages);
+    const atlasForMarker = exported.pageAtlasSize ?? run.atlas;
     const outputPath = request.outputPath ?? join(runRoot, runId, "level_textured.glb");
     const paintedMask = await writePaintedMask(outputPath, exported.paintedMask);
     await atomicWrite(
       outputPath,
       markProjectedAtlas(Buffer.from(exported.glb, "base64"), {
-        atlas: run.atlas,
+        atlas: atlasForMarker,
         runId,
         ...(paintedMask === null ? {} : { paintedMask: paintedMask.file }),
       }),
@@ -986,7 +1005,9 @@ export async function paintTextureProjection(request: TextureProjectionRequest):
       estimatedUsd: summary.cost - priorCost,
       seconds: summary.seconds,
       complete: run.complete,
-      atlas: run.atlas,
+      atlas: atlasForMarker,
+      atlasPages: exported.atlasPages ?? 1,
+      ...(exported.texelsPerMetre === undefined ? {} : { texelsPerMetre: exported.texelsPerMetre }),
       blurredTexelPercent: measured.blurred,
       magnificationSkippedPercent: measured.magnificationSkipped,
       viewsRejected: {

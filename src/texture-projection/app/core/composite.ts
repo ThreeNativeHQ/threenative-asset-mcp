@@ -172,10 +172,15 @@ export function featherComposite(state: Uint8ClampedArray, gen: Uint8ClampedArra
     else if (unknown[i]) t = 1;
     else if (dk && dk[i] <= feather) t = 1 - dk[i] / (feather + 1);
     else t = 0;
-    out[p] = state[p] + (gen[p] - state[p]) * t;
-    out[p + 1] = state[p + 1] + (gen[p + 1] - state[p + 1]) * t;
-    out[p + 2] = state[p + 2] + (gen[p + 2] - state[p + 2]) * t;
-    out[p + 3] = 255;
+    if (t === 0) {
+      // Leave strictly-known pixels transparent so later projection passes never re-sample state back into the atlas.
+      out[p] = out[p + 1] = out[p + 2] = out[p + 3] = 0;
+    } else {
+      out[p] = state[p] + (gen[p] - state[p]) * t;
+      out[p + 1] = state[p + 1] + (gen[p + 1] - state[p + 1]) * t;
+      out[p + 2] = state[p + 2] + (gen[p + 2] - state[p + 2]) * t;
+      out[p + 3] = 255;
+    }
   }
   return out;
 }

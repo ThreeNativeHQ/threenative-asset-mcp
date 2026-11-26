@@ -438,6 +438,24 @@ export function rejectsStructure(deviation: number, limit = STRUCTURE_DEVIATION_
   return deviation > limit;
 }
 
+/**
+ * Combined pixel rejection predicate for a view: sky-only silhouette shifts without
+ * structural or edge misalignment do not ruin geometry pixels, whereas solid intrusions
+ * over sky (`skySolid > 0.50`) or paired misalignment still reject cleanly.
+ */
+export function rejectsViewScores(
+  structure: number,
+  silhouette: number,
+  edge: number,
+  skySolid = silhouette,
+): boolean {
+  return (
+    rejectsStructure(structure) ||
+    (silhouette > SILHOUETTE_MISMATCH_LIMIT && (edge > 0.10 || structure > 0.10 || skySolid > 0.50)) ||
+    edge > EDGE_MISALIGNMENT_LIMIT
+  );
+}
+
 /** A cell counts as sky when this share of its pixels is outside the geometry mask. */
 const SKY_CELL_SHARE = 0.98;
 /** Luminance departure (0..1) of a sky cell's mean from what the clay's own sky showed there. */
@@ -514,6 +532,49 @@ export function silhouetteMismatch(
     const variance = Math.max(0, genSumSq[i]! / count - mean * mean);
     const departure = Math.abs(mean - claySum[i]! / count);
     if (departure > SKY_DEPARTURE || Math.sqrt(variance) > SKY_TEXTURE) solid += 1;
+  }
+  if (skyCells < MIN_SKY_CELLS) return 0;
+  return solid / skyCells;
+}
+
+/**
+ * Share (0..1) of clay sky cells that hold textured or dark solid geometry rather than smooth bright overcast sky.
+ */
+export function skySolidShare(
+  generated: Uint8ClampedArray | Uint8Array,
+  geometryMask: Uint8Array,
+  width: number,
+  height: number,
+  grid = STRUCTURE_GRID,
+): number {
+  const cells = grid * grid;
+  const sky = new Float64Array(cells);
+  const genSum = new Float64Array(cells);
+  const genSumSq = new Float64Array(cells);
+  for (let y = 0; y < height; y++) {
+    const gy = Math.min(grid - 1, Math.floor(((y + 0.5) * grid) / height));
+    for (let x = 0; x < width; x++) {
+      const pixel = y * width + x;
+      if (geometryMask[pixel]) continue;
+      const gx = Math.min(grid - 1, Math.floor(((x + 0.5) * grid) / width));
+      const cell = gy * grid + gx;
+      const p = 4 * pixel;
+      const gl = (0.2126 * generated[p]! + 0.7152 * generated[p + 1]! + 0.0722 * generated[p + 2]!) / 255;
+      sky[cell] = (sky[cell] ?? 0) + 1;
+      genSum[cell] = (genSum[cell] ?? 0) + gl;
+      genSumSq[cell] = (genSumSq[cell] ?? 0) + gl * gl;
+    }
+  }
+  const pixelsPerCell = (width * height) / cells;
+  let skyCells = 0;
+  let solid = 0;
+  for (let i = 0; i < cells; i++) {
+    const count = sky[i]!;
+    if (count < SKY_CELL_SHARE * pixelsPerCell) continue;
+    skyCells += 1;
+    const mean = genSum[i]! / count;
+    const variance = Math.max(0, genSumSq[i]! / count - mean * mean);
+    if (Math.sqrt(variance) > SKY_TEXTURE || mean < 0.45) solid += 1;
   }
   if (skyCells < MIN_SKY_CELLS) return 0;
   return solid / skyCells;

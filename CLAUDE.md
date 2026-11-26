@@ -18,4 +18,4 @@ engine version or decoder route:
 3. Bump the "Last audited" line. Keep the import table in `docs/unreal-import.md` consistent with the ledger.
 4. A PR that changes importer or converter output without touching the ledger is incomplete.
 
-**Release reminder:** after an importer or converter fix is published, bump the exact `threenative-asset-mcp` pin in `threenative-engine/packages/core/package.json` (PR to `develop`); ask before `npm publish`.
+**Release chain:** follow the `threenative-release-chain` skill — bump version, squash PR to `main`, wait for npm publish, then bump `threenative-engine` via PR to `develop`.

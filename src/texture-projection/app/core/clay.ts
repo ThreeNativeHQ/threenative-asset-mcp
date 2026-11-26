@@ -25,7 +25,7 @@ export interface Lighting {
 
 export const OUTDOOR: Lighting = { name: 'outdoor', sunAzimuth: 45, sunElevation: 50, sunIntensity: 2.7, skyIntensity: 2.1, bounce: 0.35,
   exposure: 1.0, sky: [0.36, 0.55, 0.86] };
-export const OVERCAST: Lighting = { name: 'overcast', sunAzimuth: 45, sunElevation: 65, sunIntensity: 0.9, skyIntensity: 3.1, bounce: 0.2,
+export const OVERCAST: Lighting = { name: 'overcast', sunAzimuth: 45, sunElevation: 75, sunIntensity: 0.25, skyIntensity: 3.4, bounce: 0.5,
   exposure: 1.0, sky: [0.62, 0.68, 0.78], overcast: true };
 export const INDOOR: Lighting = { name: 'indoor', sunAzimuth: 200, sunElevation: 35, sunIntensity: 4.5, skyIntensity: 1.6, bounce: 0.45,
   exposure: 1.2, sky: [0.5, 0.6, 0.75] };
@@ -176,6 +176,7 @@ export class ClayRenderer {
     this.sun.shadow.needsUpdate = true;
     this.hemi.intensity = l.skyIntensity;
     this.skyColor.setRGB(...l.sky);
+    this.output.uniforms.aoStrength!.value = l.overcast ? 0.15 : 0.85;
     this.output.uniforms.toneMappingExposure.value = l.exposure;
   }
 

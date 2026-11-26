@@ -1,4 +1,4 @@
-import { DEFAULT_MODEL, prompts, resolveModel, type EditModel, type PromptContext } from "../../models.js";
+import { DEFAULT_MODEL, modelPriceForViewSize, prompts, resolveModel, type EditModel, type PromptContext } from "../../models.js";
 import { VISIBLE_COVERAGE_TARGET, cropRgba, paintedWindow, type PaintFill } from "../../atlas-pixels.js";
 import { DEFAULT_VERIFY_MODEL, verifyPrompt, type ViewVerify } from "../../verify.js";
 import { runEdit, runVerify } from "../openrouter.js";
@@ -22,11 +22,10 @@ import { DEFAULT_PLAN, holeViews, plan as makePlan, type Plan, type PlanOptions 
 import { classifyView, describeView } from "./semantics.js";
 import { edgeBandMask, occlusionBandMask } from "./silhouette.js";
 import {
-  EDGE_MISALIGNMENT_LIMIT,
-  SILHOUETTE_MISMATCH_LIMIT,
   edgeMisalignment,
-  rejectsStructure,
+  rejectsViewScores,
   silhouetteMismatch,
+  skySolidShare,
   structureDeviation,
 } from "./structure.js";
 import { type ViewSpec } from "./views.js";
@@ -325,10 +324,8 @@ export function judgeView(p: PreparedView, gen: Uint8ClampedArray, size: number,
   // shows sky. Judged on the whole frame, since that is where the sky is; nothing over the sky is ever
   // projected, so the view would otherwise be kept and the wall would vanish as the camera moves.
   const silhouette = silhouetteMismatch(corrected, p.state, p.masks.geometry, size, size);
-  const rejected =
-    rejectsStructure(deviation) ||
-    silhouette > SILHOUETTE_MISMATCH_LIMIT ||
-    edges.score > EDGE_MISALIGNMENT_LIMIT;
+  const skySolid = skySolidShare(corrected, p.masks.geometry, size, size);
+  const rejected = rejectsViewScores(deviation, silhouette, edges.score, skySolid);
   return {
     // A rejected view paints nothing: its composite stays the state the model was handed.
     comp: rejected ? p.state : comp,
@@ -424,12 +421,12 @@ async function attemptView(
   const prompt = promptText(p);
   const r = await runEdit(
     p.model,
-    { imageUrl: image, prompt: p.prompt, seed, ...(consistency === undefined ? {} : { consistency }) },
+    { imageUrl: image, prompt: p.prompt, seed, viewSize: size, ...(consistency === undefined ? {} : { consistency }) },
     signal,
   );
   const gen = bitmapToRGBA(r.image, size, size);
   const judged = judgeView(p, gen, size, feather);
-  let price = p.model.price;
+  let price = modelPriceForViewSize(p.model, size);
   let verify: ViewVerify | undefined;
   if (o.verify && !judged.rejected) {
     const answer = await runVerify(
@@ -565,6 +562,8 @@ export async function runPipeline(
   const S = engine.size;
   const views: ViewRecord[] = [...(prior?.views ?? [])];
   let cost = prior?.cost ?? 0;
+  let consecutiveErrors = 0;
+  let lastErrorMessage = "";
   const done = new Set<number>(skip ?? []);
   const roofsByPass = (o.plan.roofs ?? 0) > 0 || plan.views.some((v) => v.kind === "roof");
   const startOfRun = (prior?.views.length ?? 0) === 0;
@@ -601,6 +600,7 @@ export async function runPipeline(
       const r = await withRetry((attempt) =>
         paintPreparedView(p, S, o, o.seed + 1000 * attempt + vi, o.feather, signal, consistency),
       );
+      consecutiveErrors = 0;
       if (r.rejected === undefined) {
         if (coverage?.paintView) coverage.paintView(plan, p.spec, r.comp);
         else engine.paint(p.spec, r.comp);
@@ -639,7 +639,13 @@ export async function runPipeline(
       onEvent({ type: "view-done", view, cost, elapsed: (performance.now() - t0) / 1000 });
       return view;
     } catch (e) {
-      onEvent({ type: "error", index: vi, message: String((e as Error)?.message ?? e) });
+      if (signal?.aborted) throw e;
+      consecutiveErrors += 1;
+      lastErrorMessage = String((e as Error)?.message ?? e);
+      onEvent({ type: "error", index: vi, message: lastErrorMessage });
+      if (consecutiveErrors >= 3) {
+        throw new Error(`3 consecutive image requests failed; last error: ${lastErrorMessage}`);
+      }
       return undefined;
     }
   };
