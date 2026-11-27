@@ -17,6 +17,9 @@ export const THREENATIVE_FILE_PATH = new RegExp(`^/api/assets/(?:public|cache)/$
 const MAX_AUDIO_BYTES = 64 * 1024 * 1024;
 
 export type ThreeNativeType = "model" | "texture" | "audio";
+/** What a Studio cache download answers. A procedural row is a baked GLB or a legacy builder entry, so the
+ * representation is the Worker's own word, never inferred from `origin`. */
+export type ThreeNativeFormat = "glb" | "procedural-json" | "wav" | "png";
 export interface ThreeNativeItem {
   id: string;
   prompt: string;
@@ -29,6 +32,9 @@ export interface ThreeNativeItem {
   /** `public`: a ThreeNative seed anyone may fetch; `studio`: the Studio cache, fetched with the token. */
   tier: "public" | "studio";
   slug?: string;
+  format?: ThreeNativeFormat;
+  /** SHA-256 of the stored main file, when the server names it. */
+  contentHash?: string;
 }
 
 interface CatalogItem {
@@ -50,6 +56,24 @@ interface StudioItem {
   hasPreview: boolean;
   type?: ThreeNativeType;
   origin?: "custom" | "procedural";
+  format?: ThreeNativeFormat;
+  license?: string;
+  author?: string;
+  contentHash?: string;
+}
+
+const FORMATS: readonly ThreeNativeFormat[] = ["glb", "procedural-json", "wav", "png"];
+const formatOf = (value: unknown): ThreeNativeFormat | undefined =>
+  FORMATS.find((format) => format === value);
+
+/** A URI-encoded header value from the Studio cache, or `undefined`. */
+function header(reply: Response, name: string): string | undefined {
+  try {
+    return decodeURIComponent(reply.headers.get(name) ?? "") || undefined;
+  } catch {
+    // A malformed escape is no value.
+    return undefined;
+  }
 }
 
 export class ThreeNativeError extends Error {}
@@ -148,21 +172,63 @@ export class ThreeNativeCatalogClient {
     }).catch(() => undefined);
     if (!reply?.ok) return undefined;
     const { items = [] } = (await reply.json()) as { items?: StudioItem[] };
-    return items.map((item) => {
+    // A seed's license and author are the server's facts: the Studio row's own, else the public catalog's.
+    // A Worker that names neither leaves them unknown rather than assumed CC0.
+    const catalog = items.some((item) => item.provider === "threenative" && item.license === undefined)
+      ? await this.catalog(signal)
+      : [];
+    return items.map((item): ThreeNativeItem => {
       const seeded = item.provider === "threenative";
+      const listed = seeded ? catalog.find((entry) => entry.id === item.id) : undefined;
+      const format = formatOf(item.format);
       return {
-        author: seeded ? "ThreeNative" : "ThreeNative Studio",
+        author: item.author ?? listed?.author ?? (seeded ? "unknown" : "ThreeNative Studio"),
         hasPreview: item.hasPreview,
         id: item.id,
-        license: seeded ? "CC0-1.0" : "ThreeNative Studio asset cache",
+        license: item.license ?? listed?.license ?? (seeded ? "unknown" : "ThreeNative Studio asset cache"),
         origin: item.origin ?? "custom",
         prompt: item.prompt,
         tags: item.tags,
         // A seed is fetched from the public tier: no token, and the edge cache answers.
         tier: seeded ? "public" : "studio",
         type: item.type ?? "model",
+        ...(format === undefined ? {} : { format }),
+        ...(item.contentHash === undefined ? {} : { contentHash: item.contentHash }),
+        ...(listed?.slug === undefined ? {} : { slug: listed.slug }),
       };
     });
+  }
+
+  /** One Studio cache row's facts from `HEAD /api/assets/cache/<id>`: its representation, prompt, license,
+   * author, hash and preview, with no body and no reuse counted. `undefined` when the row is not readable
+   * (absent, private to another account) or the Worker predates the HEAD answer. */
+  async studioItem(id: string, origin: "custom" | "procedural", signal: AbortSignal): Promise<ThreeNativeItem | undefined> {
+    const gateway = this.gateway;
+    if (!gateway || !new RegExp(`^${UUID}$`, "u").test(id)) return undefined;
+    const url = new URL(`/api/assets/cache/${id}`, gateway.origin);
+    const reply = await this.fetch(url, {
+      headers: { authorization: `Bearer ${gateway.token}` },
+      method: "HEAD",
+      redirect: "error",
+      signal,
+    }).catch(() => undefined);
+    const format = reply?.ok ? formatOf(reply.headers.get("x-tn-format")) : undefined;
+    if (!reply || format === undefined) return undefined;
+    const seeded = header(reply, "x-tn-provider") === "threenative";
+    const contentHash = reply.headers.get("x-tn-sha256") ?? undefined;
+    return {
+      author: header(reply, "x-tn-author") ?? (seeded ? "unknown" : "ThreeNative Studio"),
+      format,
+      hasPreview: reply.headers.get("x-tn-preview") === "1",
+      id,
+      license: header(reply, "x-tn-license") ?? (seeded ? "unknown" : "ThreeNative Studio asset cache"),
+      origin,
+      prompt: header(reply, "x-tn-prompt") ?? id,
+      tags: "",
+      tier: "studio",
+      type: format === "wav" ? "audio" : format === "png" ? "texture" : "model",
+      ...(contentHash === undefined ? {} : { contentHash }),
+    };
   }
 
   /** The public manifest: cached for ten minutes, revalidated by ETag, and kept (or empty) while the

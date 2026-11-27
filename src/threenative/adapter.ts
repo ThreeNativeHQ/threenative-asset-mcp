@@ -12,11 +12,15 @@ const TERMS_PUBLIC =
 const TERMS_STUDIO =
   "ThreeNative Studio asset cache: reusable in your ThreeNative games under the ThreeNative Studio Terms.";
 
+const STUDIO_LICENSE = "ThreeNative Studio asset cache";
+
 const nativeIdOf = (item: ThreeNativeItem): string =>
   item.tier === "public" ? item.id : `studio-${item.origin}-${item.id}`;
 
+/** The license the server recorded. A Studio row with none of its own falls under the Studio Terms. */
 function licenseOf(item: ThreeNativeItem): Asset["license"] {
-  if (item.tier === "public" && item.license.toUpperCase().startsWith("CC0"))
+  const recorded = item.tier === "public" || item.license !== STUDIO_LICENSE;
+  if (recorded && item.license.toUpperCase().startsWith("CC0"))
     return {
       name: "CC0 1.0",
       url: "https://creativecommons.org/publicdomain/zero/1.0/",
@@ -25,16 +29,24 @@ function licenseOf(item: ThreeNativeItem): Asset["license"] {
       attributionRequired: "no",
     };
   return {
-    name: item.tier === "public" ? item.license : "ThreeNative Studio Terms",
-    evidence: item.tier === "public" ? `ThreeNative's catalog records ${item.license}.` : TERMS_STUDIO,
-    commercialUse: item.tier === "public" ? "unknown" : "yes",
-    attributionRequired: "no",
+    name: recorded ? item.license : "ThreeNative Studio Terms",
+    evidence: recorded ? `ThreeNative's catalog records ${item.license}.` : TERMS_STUDIO,
+    commercialUse: recorded ? "unknown" : "yes",
+    // A CC-BY license requires credit; any other recorded license is not read here, so it stays unknown.
+    attributionRequired: !recorded ? "no" : /^CC[- ]?BY/iu.test(item.license) ? "yes" : "unknown",
   };
 }
 
+/** A legacy builder entry (JSON), only when the server says so. A Worker that predates `format` named no
+ * representation: there a Studio `procedural` row keeps the old reading. */
+const isBuilder = (item: ThreeNativeItem): boolean =>
+  item.format !== undefined
+    ? item.format === "procedural-json"
+    : item.tier === "studio" && item.origin === "procedural";
+
 function assetOf(client: ThreeNativeCatalogClient, item: ThreeNativeItem, rank: number): Asset {
   const nativeId = nativeIdOf(item);
-  const builder = item.tier === "studio" && item.origin === "procedural";
+  const builder = isBuilder(item);
   return AssetSchema.parse({
     assetId: assetId("threenative", nativeId),
     provider: "threenative",
@@ -70,24 +82,26 @@ export function threenativeAdapter(client = new ThreeNativeCatalogClient()): Ass
     },
     async get(nativeId, _selection, signal): Promise<AssetDetail> {
       const studio = STUDIO_ID.exec(nativeId);
+      if (studio && !client.gateway)
+        throw new ThreeNativeError("A Studio cache asset is reachable only inside a ThreeNative Studio game.");
+      const origin = studio?.[1] as "custom" | "procedural" | undefined;
+      // A Studio row's facts come from the Worker (HEAD); a Worker that predates them keeps the old placeholder.
       const item: ThreeNativeItem | undefined = studio
-        ? {
+        ? ((await client.studioItem(studio[2]!, origin ?? "custom", signal)) ?? {
             author: "ThreeNative Studio",
             hasPreview: false,
             id: studio[2]!,
-            license: "ThreeNative Studio asset cache",
-            origin: studio[1] as "custom" | "procedural",
+            license: STUDIO_LICENSE,
+            origin: origin ?? "custom",
             prompt: nativeId,
             tags: "",
             tier: "studio",
             type: "model",
-          }
+          })
         : await client.publicItem(nativeId, signal);
       if (!item) throw new ThreeNativeError("This ThreeNative asset is not in the public catalog.");
-      if (item.tier === "studio" && !client.gateway)
-        throw new ThreeNativeError("A Studio cache asset is reachable only inside a ThreeNative Studio game.");
       const asset = assetOf(client, item, 0);
-      const builder = item.tier === "studio" && item.origin === "procedural";
+      const builder = isBuilder(item);
       const name = item.slug ?? item.id;
       return {
         asset,
