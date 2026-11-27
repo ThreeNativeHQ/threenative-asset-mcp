@@ -243,7 +243,7 @@ describe("studio profile & meshopt acquisition", () => {
       buffers: [{ byteLength: 4 }],
     });
     await expect(runAcquireWithBytes(root, "threenative:unknown-ext", unknownGlb)).rejects.toThrow(
-      "Unsupported glTF required extension.",
+      "Unsupported glTF required extension: EXT_unknown_external.",
     );
   });
 });
