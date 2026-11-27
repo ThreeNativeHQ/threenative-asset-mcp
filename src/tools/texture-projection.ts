@@ -286,6 +286,10 @@ export const TextureProjectInspectInputSchema = z
     glbPath: PathSchema.optional().describe(
       "A projected GLB, project-relative; its extras marker names the run when one exists.",
     ),
+    atlasOnly: z
+      .boolean()
+      .optional()
+      .describe("With glbPath: show the GLB's own atlas and ignore the run its marker names."),
   })
   .strict()
   .refine((value) => value.runId !== undefined || value.glbPath !== undefined, {
@@ -556,7 +560,7 @@ export function createTextureProjectInspectHandler() {
       if (glbPath !== undefined) {
         const fromGlb = await atlasImageOf(glbPath);
         glbImage = fromGlb.image;
-        if (runId === undefined && fromGlb.runId !== undefined) runId = fromGlb.runId;
+        if (input.atlasOnly !== true && runId === undefined && fromGlb.runId !== undefined) runId = fromGlb.runId;
         const marker = readProjectedAtlasMarker(new Uint8Array(await readFile(glbPath)));
         atlasFromGlb = marker?.atlas;
       }
@@ -644,8 +648,12 @@ export function createTextureProjectInspectHandler() {
         atlas,
         coveragePercent: null,
         blurredTexelPercent: null,
+        magnificationSkippedPercent: null,
         views: 0,
         rejectedViews: [],
+        verifyModel: null,
+        verifyRejected: [],
+        viewsRepainted: 0,
         cookConfig: await readConfigAudit(root, atlas),
         contactSheetPath: relative(root, sheetPath),
         contactSheetViews: [],
