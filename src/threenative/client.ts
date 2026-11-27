@@ -13,7 +13,11 @@ import { join } from "node:path";
 export const PUBLIC_ASSETS_ORIGIN = "https://gateway.threenative.com";
 const CATALOG_TTL_MS = 10 * 60_000;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-export const THREENATIVE_FILE_PATH = new RegExp(`^/api/assets/(?:public|cache)/${UUID}$`, "u");
+/** A file, or its manifest or one companion member (0 to 15). */
+export const THREENATIVE_FILE_PATH = new RegExp(
+  `^/api/assets/(?:public|cache)/${UUID}(?:/manifest|/members/(?:[0-9]|1[0-5]))?$`,
+  "u",
+);
 const MAX_AUDIO_BYTES = 64 * 1024 * 1024;
 
 export type ThreeNativeType = "model" | "texture" | "audio";
@@ -35,7 +39,27 @@ export interface ThreeNativeItem {
   format?: ThreeNativeFormat;
   /** SHA-256 of the stored main file, when the server names it. */
   contentHash?: string;
+  /** `complete` when the Worker recorded the file self-contained with every companion stored; anything
+   * else (an older entry, an older Worker) is unknown, and a download checks the file itself. */
+  completeness?: "complete" | "unknown";
+  /** How many companion files (source textures, reports, license, receipts) travel with it. */
+  memberCount?: number;
 }
+
+/** One companion file the Worker's manifest lists, and the provenance it keeps. */
+export interface ThreeNativeManifest {
+  members: { index: number; path: string; role: string; bytes: number; sha256: string }[];
+  provenance?: { license?: { name?: string; url?: string } };
+}
+
+const completenessOf = (value: unknown): "complete" | "unknown" =>
+  value === "complete" ? "complete" : "unknown";
+const countOf = (value: unknown): number | undefined => {
+  const count = Number(value);
+  return value !== null && value !== undefined && Number.isInteger(count) && count >= 0 && count <= 16
+    ? count
+    : undefined;
+};
 
 interface CatalogItem {
   id: string;
@@ -47,6 +71,8 @@ interface CatalogItem {
   license: string;
   author: string;
   hasPreview: boolean;
+  completeness?: string;
+  memberCount?: number;
 }
 interface StudioItem {
   id: string;
@@ -60,6 +86,8 @@ interface StudioItem {
   license?: string;
   author?: string;
   contentHash?: string;
+  completeness?: string;
+  memberCount?: number;
 }
 
 const FORMATS: readonly ThreeNativeFormat[] = ["glb", "procedural-json", "wav", "png"];
@@ -144,13 +172,24 @@ export class ThreeNativeCatalogClient {
       })
       .filter((entry) => wanted.length === 0 || entry.score > 0)
       .sort((a, b) => b.score - a.score || a.item.slug.localeCompare(b.item.slug));
-    return scored.slice(0, limit).map(({ item }): ThreeNativeItem => ({ ...item, tier: "public" }));
+    return scored.slice(0, limit).map(({ item }) => this.publicOf(item));
+  }
+
+  private publicOf(item: CatalogItem): ThreeNativeItem {
+    const { completeness, memberCount, ...rest } = item;
+    const count = countOf(memberCount);
+    return {
+      ...rest,
+      completeness: completenessOf(completeness),
+      tier: "public",
+      ...(count === undefined ? {} : { memberCount: count }),
+    };
   }
 
   /** A public seed by id, from the cached manifest. */
   async publicItem(id: string, signal: AbortSignal): Promise<ThreeNativeItem | undefined> {
     const item = (await this.catalog(signal)).find((entry) => entry.id === id);
-    return item ? { ...item, tier: "public" } : undefined;
+    return item ? this.publicOf(item) : undefined;
   }
 
   /** The Studio cache search, or `undefined` when it refuses (a trial, an expired token): then the
@@ -181,7 +220,10 @@ export class ThreeNativeCatalogClient {
       const seeded = item.provider === "threenative";
       const listed = seeded ? catalog.find((entry) => entry.id === item.id) : undefined;
       const format = formatOf(item.format);
+      const count = countOf(item.memberCount);
       return {
+        completeness: completenessOf(item.completeness),
+        ...(count === undefined ? {} : { memberCount: count }),
         author: item.author ?? listed?.author ?? (seeded ? "unknown" : "ThreeNative Studio"),
         hasPreview: item.hasPreview,
         id: item.id,
@@ -216,7 +258,10 @@ export class ThreeNativeCatalogClient {
     if (!reply || format === undefined) return undefined;
     const seeded = header(reply, "x-tn-provider") === "threenative";
     const contentHash = reply.headers.get("x-tn-sha256") ?? undefined;
+    const count = countOf(reply.headers.get("x-tn-members"));
     return {
+      completeness: completenessOf(reply.headers.get("x-tn-completeness")),
+      ...(count === undefined ? {} : { memberCount: count }),
       author: header(reply, "x-tn-author") ?? (seeded ? "unknown" : "ThreeNative Studio"),
       format,
       hasPreview: reply.headers.get("x-tn-preview") === "1",
@@ -229,6 +274,43 @@ export class ThreeNativeCatalogClient {
       type: format === "wav" ? "audio" : format === "png" ? "texture" : "model",
       ...(contentHash === undefined ? {} : { contentHash }),
     };
+  }
+
+  /** The companion manifest of a file (`<file>/manifest`), with the bytes it was read as, or `undefined`
+   * when it cannot be read or is not one. */
+  async manifest(
+    item: ThreeNativeItem,
+    signal: AbortSignal,
+  ): Promise<{ manifest: ThreeNativeManifest; bytes: Uint8Array } | undefined> {
+    const url = new URL(`${this.fileUrl(item)}/manifest`);
+    const reply = await this.fetch(url, { headers: this.authFor(url), redirect: "error", signal }).catch(
+      () => undefined,
+    );
+    // A manifest lists at most 16 members: anything near a megabyte is not one.
+    if (!reply?.ok || Number(reply.headers.get("content-length") ?? 0) > 1024 * 1024) return undefined;
+    const bytes = new Uint8Array(await reply.arrayBuffer());
+    if (bytes.byteLength > 1024 * 1024) return undefined;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      // Not JSON: no manifest.
+      return undefined;
+    }
+    const members = (parsed as { members?: unknown })?.members;
+    const valid =
+      Array.isArray(members) &&
+      members.length <= 16 &&
+      members.every(
+        (member: Record<string, unknown>) =>
+          Number.isInteger(member?.index) &&
+          typeof member.path === "string" &&
+          typeof member.role === "string" &&
+          Number.isSafeInteger(member.bytes) &&
+          typeof member.sha256 === "string" &&
+          /^[0-9a-f]{64}$/u.test(member.sha256),
+      );
+    return valid ? { bytes, manifest: parsed as ThreeNativeManifest } : undefined;
   }
 
   /** The public manifest: cached for ten minutes, revalidated by ETag, and kept (or empty) while the

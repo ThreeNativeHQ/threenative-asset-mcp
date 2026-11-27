@@ -1,5 +1,18 @@
-import { assetId, AssetSchema, type Asset, type AssetAdapter, type AssetDetail } from "../discovery/types.js";
-import { ThreeNativeCatalogClient, ThreeNativeError, type ThreeNativeItem } from "./client.js";
+import { createHash } from "node:crypto";
+import {
+  assetId,
+  AssetSchema,
+  type Asset,
+  type AssetAdapter,
+  type AssetDetail,
+  type AssetFile,
+} from "../discovery/types.js";
+import {
+  ThreeNativeCatalogClient,
+  ThreeNativeError,
+  type ThreeNativeItem,
+  type ThreeNativeManifest,
+} from "./client.js";
 
 /** PRD-120. The `threenative` provider of `asset_search` / `asset_get` / `asset_download`: ThreeNative's
  * seeded assets with no configuration, plus the Studio cache inside a Studio container. A public seed's
@@ -44,9 +57,26 @@ const isBuilder = (item: ThreeNativeItem): boolean =>
     ? item.format === "procedural-json"
     : item.tier === "studio" && item.origin === "procedural";
 
+/** What `asset_download` saves. Only a row the Worker recorded complete is called a ready GLB; an older one
+ * is still checked texture by texture and buffer by buffer before anything is saved. */
+function reasonOf(item: ThreeNativeItem, builder: boolean): string {
+  const where = item.tier === "public" ? "public catalog" : "Studio cache";
+  if (builder)
+    return "A Studio procedural builder: asset_download saves its builder.ts and spec.json as one JSON entry, 0 credits.";
+  if (item.completeness !== "complete")
+    return `A GLB from ThreeNative's ${where} whose completeness ThreeNative has not recorded (an older entry): asset_download checks every texture and buffer it names before it saves it, 0 credits.`;
+  const members = item.memberCount ?? 0;
+  return `A complete, self-contained GLB from ThreeNative's ${where}${
+    members > 0
+      ? ` with ${members} companion files (source textures, reports, license and receipts) saved under companions/`
+      : ""
+  }, 0 credits.`;
+}
+
 function assetOf(client: ThreeNativeCatalogClient, item: ThreeNativeItem, rank: number): Asset {
   const nativeId = nativeIdOf(item);
   const builder = isBuilder(item);
+  const ready = !builder && item.completeness === "complete";
   return AssetSchema.parse({
     assetId: assetId("threenative", nativeId),
     provider: "threenative",
@@ -61,11 +91,9 @@ function assetOf(client: ThreeNativeCatalogClient, item: ThreeNativeItem, rank: 
     ...(item.hasPreview ? { thumbnailUrl: `${client.fileUrl(item)}/preview` } : {}),
     downloadStatus: "direct",
     canDownloadNow: true,
-    downloadReason: builder
-      ? "A Studio procedural builder: asset_download saves its builder.ts and spec.json as one JSON entry, 0 credits."
-      : `A ready GLB from ThreeNative's ${item.tier === "public" ? "public catalog" : "Studio cache"}, 0 credits.`,
+    downloadReason: reasonOf(item, builder),
     providerRank: rank,
-    rankingFactors: [item.tier === "public" ? "ThreeNative seed" : "Studio cache", ...(builder ? [] : ["ready GLB"])],
+    rankingFactors: [item.tier === "public" ? "ThreeNative seed" : "Studio cache", ...(ready ? ["ready GLB"] : [])],
   });
 }
 
@@ -100,9 +128,10 @@ export function threenativeAdapter(client = new ThreeNativeCatalogClient()): Ass
           })
         : await client.publicItem(nativeId, signal);
       if (!item) throw new ThreeNativeError("This ThreeNative asset is not in the public catalog.");
-      const asset = assetOf(client, item, 0);
       const builder = isBuilder(item);
       const name = item.slug ?? item.id;
+      const companions = builder ? { files: [] } : await companionFiles(client, item, signal);
+      const asset = withEvidence(assetOf(client, item, 0), companions);
       return {
         asset,
         files: [
@@ -112,6 +141,7 @@ export function threenativeAdapter(client = new ThreeNativeCatalogClient()): Ass
             url: client.fileUrl(item),
             role: builder ? "procedural-builder" : "main-model",
           },
+          ...companions.files,
         ],
         selectedVariant: builder ? "json/procedural-builder" : "glb/original",
         selectionExplanation: builder
@@ -122,4 +152,73 @@ export function threenativeAdapter(client = new ThreeNativeCatalogClient()): Ass
       };
     },
   };
+}
+
+/** The manifest and every companion member the Worker lists, each saved under `companions/` with its
+ * hash, so the download checks it byte for byte. A row that names members it cannot list is refused:
+ * a declared file never goes missing quietly. */
+async function companionFiles(
+  client: ThreeNativeCatalogClient,
+  item: ThreeNativeItem,
+  signal: AbortSignal,
+): Promise<{ files: AssetFile[]; manifest?: ThreeNativeManifest }> {
+  if ((item.memberCount ?? 0) === 0) return { files: [] };
+  const read = await client.manifest(item, signal);
+  if (!read || read.manifest.members.length !== item.memberCount)
+    throw new ThreeNativeError("This ThreeNative asset's companion files could not be listed.");
+  const base = client.fileUrl(item);
+  const sha256 = createHash("sha256").update(read.bytes).digest("hex");
+  return {
+    files: [
+      {
+        id: "companion-manifest",
+        path: "companions/manifest.json",
+        url: `${base}/manifest`,
+        role: "companion-manifest",
+        sizeBytes: read.bytes.byteLength,
+        dependencyOf: "main",
+        metadata: { sha256 },
+      },
+      ...read.manifest.members.map(
+        (member): AssetFile => ({
+          id: `companion-${member.index}`,
+          path: `companions/${member.path}`,
+          url: `${base}/members/${member.index}`,
+          role: `companion-${member.role}`,
+          sizeBytes: member.bytes,
+          dependencyOf: "main",
+          metadata: { sha256: member.sha256, companionRole: member.role },
+        }),
+      ),
+    ],
+    manifest: read.manifest,
+  };
+}
+
+/** The license as the preserved evidence states it: the original source's license name and URL when the
+ * provenance records them, and where its own document and original receipt are kept. */
+function withEvidence(
+  asset: Asset,
+  companions: { files: AssetFile[]; manifest?: ThreeNativeManifest },
+): Asset {
+  const at = (role: string) => companions.files.find((file) => file.metadata?.companionRole === role)?.path;
+  const document = at("license");
+  const receipt = at("source-receipt");
+  const source = companions.manifest?.provenance?.license;
+  if (!document && !receipt && !source?.name) return asset;
+  const kept = [
+    ...(document ? [`the license document at ${document}`] : []),
+    ...(receipt ? [`the original acquisition receipt at ${receipt}`] : []),
+  ];
+  const keeps = kept.length ? ` ThreeNative keeps ${kept.join(" and ")}.` : "";
+  const license: Asset["license"] = source?.name
+    ? {
+        name: source.name,
+        ...(source.url ? { url: source.url } : {}),
+        evidence: `The original source records ${source.name}.${keeps}`,
+        commercialUse: "unknown",
+        attributionRequired: /^CC[- ]?BY/iu.test(source.name) ? "yes" : "unknown",
+      }
+    : { ...asset.license, evidence: `${asset.license.evidence}${keeps}` };
+  return AssetSchema.parse({ ...asset, license: { ...license, evidence: license.evidence.slice(0, 2000) } });
 }
