@@ -438,6 +438,9 @@ export async function acquire(
         ...(file.sizeBytes !== undefined ? { expectedSize: file.sizeBytes } : {}),
         ...(file.md5 ? { expectedMd5: file.md5 } : {}),
       });
+      // A file the provider names by its SHA-256 (a ThreeNative companion) must be exactly those bytes.
+      if (file.metadata?.sha256 !== undefined && downloaded.sha256 !== file.metadata.sha256)
+        throw new AcquisitionError("Downloaded file hash mismatch: " + file.path);
       const destination = join(originals, file.path);
       await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
       await copyFile(downloaded.path, destination, 1);
