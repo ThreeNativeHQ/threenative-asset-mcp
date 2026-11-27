@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
 
 import { McpServer } from "@modelcontextprotocol/server";
+import {
+  applyStudioProfileFilter,
+  resolveAssetMcpProfile,
+  type AssetMcpProfile,
+} from "./studio-profile.js";
 
 import type { TextureProjectionMode } from "./config.js";
 
@@ -274,6 +279,8 @@ export interface AssetServerClients {
   audioGenerator?: AudioGenerator;
   /** Workflow mode for texture projection tools; defaults to "detailed". */
   textureMode?: TextureProjectionMode;
+  /** Tool profile filter; defaults to "detailed". */
+  profile?: AssetMcpProfile;
 }
 
 export function createAssetServer(
@@ -316,6 +323,10 @@ export function createAssetServer(
     name: "threenative-asset-mcp",
     version: packageVersion(),
   });
+  applyStudioProfileFilter(
+    server,
+    clients.profile ?? resolveAssetMcpProfile(process.argv, process.env),
+  );
 
   const blendkitSettings = blendkitConfig();
   const blendkit =

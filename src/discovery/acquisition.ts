@@ -203,6 +203,19 @@ async function validateGltf(directory: string, files: AssetFile[]): Promise<void
               "KHR_materials_pbrSpecularGlossiness",
               "KHR_draco_mesh_compression",
               "EXT_meshopt_compression",
+              "EXT_texture_webp",
+              "KHR_texture_basisu",
+              "KHR_materials_clearcoat",
+              "KHR_materials_emissive_strength",
+              "KHR_materials_ior",
+              "KHR_materials_specular",
+              "KHR_materials_transmission",
+              "KHR_materials_volume",
+              "KHR_materials_sheen",
+              "KHR_materials_anisotropy",
+              "KHR_materials_iridescence",
+              "KHR_lights_punctual",
+              "EXT_mesh_gpu_instancing",
             ].includes(String(name)),
         ))
     )
@@ -223,11 +236,22 @@ async function validateGltf(directory: string, files: AssetFile[]): Promise<void
           throw new AcquisitionError("Invalid glTF buffer length.");
         if (uri === undefined) {
           if (kind === 0) {
+            const extValue = (resource as { extensions?: unknown }).extensions;
+            const ext =
+              typeof extValue === "object" && extValue !== null && !Array.isArray(extValue)
+                ? (extValue as Record<string, unknown>)
+                : undefined;
+            const meshopt =
+              ext && typeof ext.EXT_meshopt_compression === "object" && ext.EXT_meshopt_compression !== null
+                ? (ext.EXT_meshopt_compression as Record<string, unknown>)
+                : undefined;
+            const isMeshoptFallback = index > 0 && meshopt?.fallback === true;
             if (
-              index !== 0 ||
-              binaryLength === undefined ||
-              binaryLength < (byteLength as number) ||
-              binaryLength > (byteLength as number) + 3
+              !isMeshoptFallback &&
+              (index !== 0 ||
+                binaryLength === undefined ||
+                binaryLength < (byteLength as number) ||
+                binaryLength > (byteLength as number) + 3)
             )
               throw new AcquisitionError("Missing or incomplete GLB embedded buffer.");
           } else if (

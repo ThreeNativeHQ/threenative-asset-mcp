@@ -23,7 +23,7 @@ import {
 
 const PathSchema = z.string().min(1).max(4_096);
 
-const Vec3Schema = z.tuple([z.number(), z.number(), z.number()]);
+const Vec3Schema = z.array(z.number()).length(3);
 
 const MeshSchema = z.object({
   name: z.string().max(300),
