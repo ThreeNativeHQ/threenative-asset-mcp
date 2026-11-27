@@ -356,8 +356,16 @@ describe("texture projection MCP tools", () => {
       expect((inspectedGlb.result.content as { type: string }[])[0]?.type).toBe("image");
       expect(structured(inspectedGlb)["runId"]).toBe(run["runId"]);
 
+      // atlasOnly reads the GLB's own atlas and ignores the run its marker names (Studio's level preview).
+      const atlasOnly = await callTool(server, "texture_project_inspect", {
+        glbPath: "assets/painted/courtyard.glb",
+        atlasOnly: true,
+      });
+      expect((atlasOnly.result.content as { type: string }[])[0]?.type).toBe("image");
+      expect(structured(atlasOnly)).toMatchObject({ runId: null, views: 0, viewsRepainted: 0, verifyRejected: [] });
+
       // The key never appears in any tool result.
-      const everything = [painted, promptTest, resumed, inspected, inspectedGlb]
+      const everything = [painted, promptTest, resumed, inspected, inspectedGlb, atlasOnly]
         .map((response) => JSON.stringify(response))
         .join("\n");
       expect(everything).not.toContain(FAKE_KEY);
