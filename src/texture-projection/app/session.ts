@@ -31,6 +31,7 @@ import {
   SWATCH_CLASSES,
   SWATCH_PROBE_PX,
   SWATCH_SIDE_METRES,
+  SWATCH_SIZE,
   WALL_MAX_NY,
   patchPainted,
   pickSwatch,
@@ -702,9 +703,15 @@ export class Session {
         const painted = new Uint8Array(composite.length / 4);
         for (let i = 0; i < painted.length; i++) painted[i] = composite[4 * i + 3]! > 127 ? 1 : 0;
         if (!patchPainted(candidate.patch, view.spec, painted, engine.size)) continue;
-        // The rectified patch is cut to whole courses where the paint repeats (phase 2n), so it wraps
-        // on a joint instead of in a blend band: that is what sets the swatch's own extent per axis.
-        const tile = tileSwatch(rectifySwatch(candidate.patch, view.spec, generation, engine.size), candidate.patch.side);
+        // The rectified patch is cut to whole courses where the paint repeats, and to bed joints where it
+        // is coursed without repeating (phase 2y), so it wraps on a joint instead of in a blend band: that
+        // is what sets the swatch's own extent per axis.
+        const tile = tileSwatch(
+          rectifySwatch(candidate.patch, view.spec, generation, engine.size),
+          candidate.patch.side,
+          SWATCH_SIZE,
+          candidate.klass,
+        );
         const file = `swatch_${klass}.png`;
         await this.writeRunImage(runId, file, tile.pixels, tile.width, tile.height);
         report[klass] = {

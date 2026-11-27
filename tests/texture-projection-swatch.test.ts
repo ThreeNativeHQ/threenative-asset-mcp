@@ -620,3 +620,283 @@ describe("material swatch search", () => {
     ).toBeUndefined();
   });
 });
+
+/**
+ * A coursed wall of ashlar as the paint leaves it (phase 2y): courses of unequal height, head joints
+ * staggered from course to course, mortar darker than the stone, grain over both — and no period at all,
+ * because the courses are not the same height. The sample courtyard's wall is this, at 1.5 m over 1024 px.
+ */
+const ASHLAR = 1024;
+/** Centres of the bed joints, px: courses of 138, 176, 152, 196 and 164 rows, and 198 across the wrap. */
+const BEDS = [23, 161, 337, 489, 685, 849];
+const BED_HALF = 5;
+const HEAD_HALF = 5;
+const MORTAR_LEVEL = 70;
+const STONE_LEVEL = 165;
+
+/**
+ * The head joints of course `course`, px: three per course, each course staggered from the last and each
+ * course's stones of a different width, so no column repeats: the x axis has no period either.
+ */
+function headsOf(course: number): number[] {
+  return [(97 + 383 * course) % ASHLAR, (411 + 271 * course) % ASHLAR, (877 + 149 * course) % ASHLAR];
+}
+
+/** A small deterministic grain, so the row profile has the paint's noise and no autocorrelation peak. */
+function grain(x: number, y: number): number {
+  let hash = (Math.imul(x + 1, 0x9e3779b1) ^ Math.imul(y + 1, 0x85ebca6b)) >>> 0;
+  hash ^= hash >>> 15;
+  return (hash % 13) - 6;
+}
+
+/** The level of one pixel of the ashlar wall. */
+function ashlarLevel(x: number, y: number): number {
+  for (let course = 0; course < BEDS.length; course++) {
+    const from = BEDS[course]!;
+    const to = BEDS[(course + 1) % BEDS.length]!;
+    const inside = from < to ? y >= from && y < to : y >= from || y < to;
+    if (!inside) continue;
+    let bed = Math.min(Math.abs(y - from), Math.abs(y - (from - ASHLAR)), Math.abs(y - (from + ASHLAR)));
+    bed = Math.min(bed, Math.abs(y - to), Math.abs(y - (to - ASHLAR)), Math.abs(y - (to + ASHLAR)));
+    if (bed <= BED_HALF) return MORTAR_LEVEL + grain(x, y);
+    const head = Math.min(...headsOf(course).map((at) => Math.min(Math.abs(x - at), ASHLAR - Math.abs(x - at))));
+    return (head <= HEAD_HALF ? MORTAR_LEVEL : STONE_LEVEL) + grain(x, y);
+  }
+  return STONE_LEVEL;
+}
+
+/** The ashlar wall as a rectified patch. */
+function ashlar(): Uint8ClampedArray {
+  const pixels = new Uint8ClampedArray(ASHLAR * ASHLAR * 4);
+  for (let y = 0; y < ASHLAR; y++) {
+    for (let x = 0; x < ASHLAR; x++) {
+      const value = ashlarLevel(x, y);
+      const at = 4 * (y * ASHLAR + x);
+      pixels[at] = value;
+      pixels[at + 1] = value;
+      pixels[at + 2] = value;
+      pixels[at + 3] = 255;
+    }
+  }
+  return pixels;
+}
+
+/**
+ * The same courses with no head joints at all: the paint of a coursed wall whose stones run on, so the only
+ * head joints the tile can show are the ones it draws itself. Nothing else can close a course's x wrap.
+ */
+function stripes(): Uint8ClampedArray {
+  const pixels = new Uint8ClampedArray(ASHLAR * ASHLAR * 4);
+  for (let y = 0; y < ASHLAR; y++) {
+    let bed = Infinity;
+    for (const at of BEDS) bed = Math.min(bed, Math.abs(y - at), ASHLAR - Math.abs(y - at));
+    const value = bed <= BED_HALF ? MORTAR_LEVEL : STONE_LEVEL;
+    for (let x = 0; x < ASHLAR; x++) {
+      const level = value + grain(x, y);
+      const offset = 4 * (y * ASHLAR + x);
+      pixels[offset] = level;
+      pixels[offset + 1] = level;
+      pixels[offset + 2] = level;
+      pixels[offset + 3] = 255;
+    }
+  }
+  return pixels;
+}
+
+/** A running bond on a clear period: courses of exactly 136 rows, head joints every 264, half-staggered. */
+function regular(): Uint8ClampedArray {
+  const pixels = new Uint8ClampedArray(ASHLAR * ASHLAR * 4);
+  for (let y = 0; y < ASHLAR; y++) {
+    for (let x = 0; x < ASHLAR; x++) {
+      const index = Math.floor(y / 136);
+      const offset = (index % 2) * 132;
+      const bed = y % 136 < 10;
+      const head = (x - offset + 4 * ASHLAR) % 264 < 10;
+      const value = bed || head ? MORTAR_LEVEL : STONE_LEVEL;
+      const at = 4 * (y * ASHLAR + x);
+      pixels[at] = value;
+      pixels[at + 1] = value;
+      pixels[at + 2] = value;
+      pixels[at + 3] = 255;
+    }
+  }
+  return pixels;
+}
+
+/** Something a wall could be painted with that has no courses in it: smooth, and no period either. */
+function smooth(): Uint8ClampedArray {
+  const pixels = new Uint8ClampedArray(ASHLAR * ASHLAR * 4);
+  for (let y = 0; y < ASHLAR; y++) {
+    for (let x = 0; x < ASHLAR; x++) {
+      const value = 128 + 40 * Math.sin(x / 210) + 30 * Math.sin(y / 165 + 1.3);
+      const at = 4 * (y * ASHLAR + x);
+      pixels[at] = value;
+      pixels[at + 1] = value;
+      pixels[at + 2] = value;
+      pixels[at + 3] = 255;
+    }
+  }
+  return pixels;
+}
+
+/** A 32-bit fingerprint of a tile, so a path that must not change can be pinned to it. */
+function fingerprint(tile: SwatchTile): string {
+  let hash = 0x811c9dc5;
+  const mix = (value: number) => {
+    hash = (hash ^ (value & 0xff)) >>> 0;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  };
+  for (const value of tile.pixels) mix(value);
+  for (const value of [tile.width, tile.height, tile.periodX, tile.periodY]) {
+    mix(value & 0xff);
+    mix((value >> 8) & 0xff);
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+/** Mean luminance of every column of a frame, over its rows `from`..`to`. */
+function columnLuminance(frame: Frame, from: number, to: number): Float64Array {
+  const out = new Float64Array(frame.width);
+  for (let x = 0; x < frame.width; x++) {
+    let sum = 0;
+    let count = 0;
+    for (let y = from; y < to; y++) {
+      const at = 4 * (y * frame.width + x);
+      sum += 0.299 * frame.pixels[at]! + 0.587 * frame.pixels[at + 1]! + 0.114 * frame.pixels[at + 2]!;
+      count++;
+    }
+    out[x] = count > 0 ? sum / count : 0;
+  }
+  return out;
+}
+
+/** The runs of rows darker than `mid`, read across the wrap: one entry per joint, centres in rows. */
+function circularRuns(rows: Float64Array, mid: number): number[][] {
+  const count = rows.length;
+  const dark = Array.from({ length: count }, (_, y) => rows[y]! < mid);
+  if (dark.every((value) => value)) return [[0, count]];
+  // Start at a row that is not dark, so the run across the wrap is one run and not two.
+  const start = dark.findIndex((value) => !value);
+  const runs: number[][] = [];
+  let run: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const y = (start + i) % count;
+    if (dark[y]) run.push(y);
+    else if (run.length > 0) {
+      runs.push(run);
+      run = [];
+    }
+  }
+  if (run.length > 0) runs.push(run);
+  return runs;
+}
+
+/** Fingerprints of the paths phase 2y must not touch, taken from the cut as it shipped in 0.19.0. */
+const FLOOR_FINGERPRINT = "1785890d";
+const PERIOD_FINGERPRINT = "bd68e731";
+const FADE_FINGERPRINT = "7212f4e6";
+
+/** Centre row of a run of rows, read on the circle the tile wraps on (a run may cross the wrap). */
+function runCentre(run: readonly number[], height: number): number {
+  const base = run[0]!;
+  let sum = 0;
+  for (const row of run) sum += row < base ? row + height : row;
+  const mean = sum / run.length;
+  return mean >= height ? mean - height : mean;
+}
+
+/** Distance between two rows of the tile, the short way round its wrap. */
+function circularGap(a: number, b: number, height: number): number {
+  const gap = Math.abs(a - b);
+  return Math.min(gap, height - gap);
+}
+
+describe("a coursed wall wraps inside its bed joints and head joints (phase 2y)", () => {
+  const tile = tileSwatch(ashlar(), SIDE, ASHLAR, "wall");
+  const frame = frameOf(tile);
+  const rows = rowLuminance(frame);
+  const mid = (Math.min(...rows) + Math.max(...rows)) / 2;
+
+  it("cuts the rows to two bed joints, so both ends of the tile are mortar", () => {
+    // No period: the courses are not the same height, so the cut is on the joints the profile shows.
+    expect(tile.periodY).toBe(0);
+    expect(tile.height).toBeLessThan(ASHLAR);
+    // Both ends sit inside a bed joint: the wrap needs no blend at all.
+    expect(rows[0]).toBeLessThan(mid);
+    expect(rows[1]).toBeLessThan(mid);
+    expect(rows[tile.height - 1]).toBeLessThan(mid);
+    expect(rows[tile.height - 2]).toBeLessThan(mid);
+    // The cut is whole rows off the patch, never a resample: the patch's own scale is what it reports.
+    expect(tile.metresY).toBeCloseTo((SIDE * tile.height) / ASHLAR, 9);
+    expect(tile.metresX).toBeCloseTo((SIDE * tile.width) / ASHLAR, 9);
+    // And both sides are whole 4x4 blocks: the cook transcodes the base colour map in them and refuses a
+    // swatch that is not (a 1024x871 tile failed the engine's ktx2 pass outright).
+    expect(tile.width % 4).toBe(0);
+    expect(tile.height % 4).toBe(0);
+  });
+
+  it("shows exactly one bed joint per course, never a doubled one", () => {
+    const runs = circularRuns(rows, mid);
+    // One joint per course of the pattern the tile covers, plus no second joint beside any of them.
+    expect(runs.length).toBeGreaterThanOrEqual(4);
+    for (const run of runs) {
+      // A joint: wide enough for the mortar and the grain on it, and no wider than the pattern's mortar.
+      expect(run.length).toBeGreaterThanOrEqual(6);
+      expect(run.length).toBeLessThanOrEqual(2 * BED_HALF + 14);
+    }
+    // A cross-fade band mixes two layouts half a tile apart, which puts a second minimum a short course
+    // away from the real joint. No two joints of this wall are that close.
+    const centres = runs.map((run) => runCentre(run, tile.height));
+    for (let i = 0; i < centres.length; i++) {
+      for (let j = i + 1; j < centres.length; j++) {
+        expect(circularGap(centres[i]!, centres[j]!, tile.height)).toBeGreaterThan(60);
+      }
+    }
+  });
+
+  it("draws one head joint per course to close its x wrap, staggered onto a running bond", () => {
+    // On a wall with no head joints of its own there is nothing but the drawn joint to close a course's x
+    // wrap: exactly one full-height mortar band per course, as wide as the bed joints are thick, and no
+    // two courses in a row with it in the same place.
+    const striped = tileSwatch(stripes(), SIDE, ASHLAR, "wall");
+    const frame = frameOf(striped);
+    const profile = rowLuminance(frame);
+    const mid = (Math.min(...profile) + Math.max(...profile)) / 2;
+    const borders = circularRuns(profile, mid).map((run) => runCentre(run, striped.height));
+    expect(borders.length).toBeGreaterThanOrEqual(4);
+    const sorted = [...borders].sort((a, b) => a - b);
+    const bounds = [0, ...sorted.filter((row) => row > 6 && row < striped.height - 6), striped.height];
+    const centres: number[] = [];
+    for (let i = 0; i + 1 < bounds.length; i++) {
+      const from = Math.round(bounds[i]! + BED_HALF + 2);
+      const to = Math.round(bounds[i + 1]! - BED_HALF - 2);
+      // The share of a column's rows that is stone: a drawn head joint runs the whole course, so it is
+      // stone for none of them, while everywhere else is stone but for the bed joints crossing it.
+      const stone = new Float64Array(striped.width);
+      for (let x = 0; x < striped.width; x++) {
+        let bright = 0;
+        for (let y = from; y < to; y++) if (sample(frame, y, x, 0, true) >= mid) bright++;
+        stone[x] = bright / Math.max(1, to - from);
+      }
+      const runs = circularRuns(stone, 0.15);
+      expect(runs.length, `one head joint in the course at row ${from}`).toBe(1);
+      const width = runs[0]!.length;
+      expect(width).toBeGreaterThanOrEqual(6);
+      expect(width).toBeLessThanOrEqual(2 * BED_HALF + 14);
+      centres.push(runCentre(runs[0]!, striped.width));
+    }
+    expect(centres.length).toBeGreaterThanOrEqual(4);
+    for (let i = 1; i < centres.length; i++) {
+      expect(circularGap(centres[i]!, centres[i - 1]!, striped.width)).toBeGreaterThan(60);
+    }
+  });
+
+  it("leaves the floor path, the periodic path and the cross-faded path byte-identical", () => {
+    // A floor is not cut to bed joints even when it shows them: the class decides, as before.
+    expect(fingerprint(tileSwatch(ashlar(), 2, ASHLAR, "floor"))).toBe(FLOOR_FINGERPRINT);
+    // A wall whose courses do repeat is still cut on the period, exactly as it was.
+    expect(fingerprint(tileSwatch(regular(), SIDE, ASHLAR))).toBe(PERIOD_FINGERPRINT);
+    // And a wall with no joints to find keeps its cross-fade.
+    expect(fingerprint(tileSwatch(smooth(), SIDE, ASHLAR))).toBe(FADE_FINGERPRINT);
+  });
+});

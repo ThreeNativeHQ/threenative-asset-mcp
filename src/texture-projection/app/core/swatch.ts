@@ -81,6 +81,54 @@ const SWATCH_PERIOD_MIN_RISE = 0.15;
 const SWATCH_MIN_PERIODS = 4;
 
 /**
+ * How much darker than its own neighbourhood a row has to be to be a bed joint, as a share of the row
+ * profile's range (phase 2y). The painted mortar of the sample courtyard is only ~15 % darker than its
+ * bricks, so the bar is low; it is a share of the range, not a level, so a sunlit and a shaded wall pass
+ * the same. A dip that fails it is the paint's tonal variation, and cutting there would join two patches.
+ */
+const SWATCH_JOINT_MIN_DEPTH = 0.18;
+
+/** Joints a coursed wall has to show before its rows are trusted to be courses, not one dark stain. */
+const SWATCH_JOINT_MIN_COUNT = 4;
+
+/** Radius of the row profile's slow average, as a share of the image: the neighbourhood a joint darkens. */
+const SWATCH_JOINT_BASE_SHARE = 1 / 16;
+
+/**
+ * Share of the rows at each end a bed-joint crop may open and close in: the tile starts inside a joint
+ * in the top quarter of the patch and ends inside one in the bottom quarter, so the wrap needs no blend
+ * and the cut loses at most half the paint.
+ */
+const SWATCH_JOINT_WINDOW_SHARE = 0.25;
+
+/**
+ * A course's own x wrap is closed by a head joint drawn across the seam, half of it on either side: a
+ * mortar band as wide as the bed joints are thick, ramping out over this many px so the joint keeps a
+ * soft edge instead of a two-texel step (phase 2y).
+ */
+const SWATCH_HEAD_SOFT_PX = 1.5;
+
+/** Spread of the grain a drawn head joint carries, in levels: enough to break a flat stripe, small
+ * enough that the two sides of the seam still agree.
+ */
+const SWATCH_HEAD_GRAIN = 12;
+
+/**
+ * The engine transcodes a base-colour map in 4x4 texel blocks and refuses one that is not a whole number of
+ * them (the cook's ktx2 pass fails on e.g. 1024x871). A tile cut to joints therefore has each of its sides
+ * snapped to one, which a joint crop can afford: its ends are inside a joint, and two rows either way
+ * around a joint's centre are still mortar.
+ */
+const SWATCH_BLOCK = 4;
+
+/**
+ * How far each course is rolled along x: half the tile on alternate courses, plus a deterministic jitter
+ * of up to this share either way, so the head joints stagger like a running bond and never stack up.
+ */
+const SWATCH_BOND_OFFSET_SHARE = 0.5;
+const SWATCH_BOND_JITTER_SHARE = 0.15;
+
+/**
  * Share of a period a joint may cover, after folding the profile onto one period. A mortar joint is a
  * narrow band of a course (a tenth of it); a dip wider than this is a tonal patch — moss on a sett floor,
  * a stain — and cutting there would butt two unrelated patches together, so that axis keeps its fade.
@@ -421,18 +469,40 @@ export function rectifySwatch(
  * colour instead of washing out or brightening; on the border one sample has weight 1 and the other 0,
  * which is what lets the edges wrap.
  *
+ * A wall without a period takes a third path (phase 2y), because the blend is what a coursed wall shows:
+ * the painted courses of the sample courtyard have no repeat, so both axes were faded, and at a metre the
+ * band read as a strip of thin courses with two parallel bed joints and as joint stubs cut by a vertical
+ * line. Such a wall's bed joints are found in the row profile instead and the rows are cut to two of
+ * them, so the wrap lands inside mortar and needs no blend; each course then closes its own x wrap on a
+ * head joint drawn across the seam and is rolled onto a running bond. When no bed joints are found the
+ * blend stays — a wall with no courses has nothing better to wrap on.
+ *
  * The crop is what the swatch's own extent has to follow: a cropped axis covers less than `side`, so
  * the tile reports `metresX` and `metresY` and a game repeats it with both. The pixel grid itself is
  * untouched (whole rows and columns are dropped, never resampled), so the metres per pixel stay the
  * patch's own on both axes.
  */
-export function tileSwatch(rectified: Uint8ClampedArray, side: number, size = SWATCH_SIZE): SwatchTile {
+export function tileSwatch(
+  rectified: Uint8ClampedArray,
+  side: number,
+  size = SWATCH_SIZE,
+  klass: SwatchClass = 'wall',
+): SwatchTile {
   // One profile per axis: the mean over a row says what a course does down y, the mean over a column
   // says what a joint does across x.
   const rows = smoothed(axisProfile(rectified, size, true));
   const columns = smoothed(axisProfile(rectified, size, false));
   const periodY = axisPeriod(rows);
   const periodX = axisPeriod(columns);
+  if (klass === 'wall' && periodY === 0) {
+    const joints = bedJoints(rows, size);
+    // The x axis keeps a period it has: a head-joint wrap drawn over a repeating pattern would be a
+    // second, freer rule where the paint already gives one.
+    if (joints) {
+      const croppedX = periodX > 0 ? periodCrop(columns, periodX) : undefined;
+      return jointSwatch(rectified, side, size, joints, croppedX && { ...croppedX, period: periodX });
+    }
+  }
   const croppedY = periodY > 0 ? periodCrop(rows, periodY) : undefined;
   const croppedX = periodX > 0 ? periodCrop(columns, periodX) : undefined;
   const left = croppedX?.start ?? 0;
@@ -681,6 +751,262 @@ function periodCrop(values: Float64Array, period: number): { start: number; leng
     if (start >= 0) return { start, length };
   }
   return undefined;
+}
+
+/** A bed joint the wall path found in the row profile. */
+interface BedJoint {
+  /** Centre row of the joint, in the rectified patch's own rows. */
+  readonly row: number;
+  /** How far above the joint the rows around it sit, in profile levels: the clearest joint of a window wins. */
+  readonly depth: number;
+  /** Rows its dark core covers, px: the head joints the tile draws take their width from these. */
+  readonly thickness: number;
+}
+
+/** Where a coursed wall is cut, and the joints its courses are made of. */
+interface JointCrop {
+  /** Row the tile starts on: the centre of a bed joint in the top quarter of the patch. */
+  readonly top: number;
+  /** Row the tile ends on: the centre of a bed joint in the bottom quarter. */
+  readonly bottom: number;
+  readonly joints: readonly BedJoint[];
+  /** Width of the band the tile's head joints are drawn with, px: the median bed joint's own thickness. */
+  readonly headWidth: number;
+}
+
+/**
+ * The bed joints a coursed wall shows, and where to cut it (phase 2y). A bed joint is a narrow band of
+ * rows clearly darker than the rows around it: the row profile is compared against its own slow average,
+ * so the wall's lighting gradient — which makes the profile's absolute level meaningless — drops out, and
+ * the darkest row of each dip is the joint's centre. A dip that is not deep enough, or is glossed over by
+ * a nearby deeper one, is the paint's tonal variation, not a joint. A wall with fewer than
+ * `SWATCH_JOINT_MIN_COUNT` joints is not coursed: it keeps the blend.
+ *
+ * The crop opens and closes inside the clearest joint of the top and bottom quarter, so both ends of the
+ * tile are mortar and the half of each joint left outside the cut is what the other end's half meets when
+ * the tile repeats.
+ */
+function bedJoints(values: Float64Array, size: number): JointCrop | undefined {
+  const count = values.length;
+  let low = Infinity;
+  let high = -Infinity;
+  for (const value of values) {
+    low = Math.min(low, value);
+    high = Math.max(high, value);
+  }
+  if (!(high - low > 1e-6)) return undefined;
+  const minDepth = SWATCH_JOINT_MIN_DEPTH * (high - low);
+  const radius = Math.max(8, Math.round(size * SWATCH_JOINT_BASE_SHARE));
+  // A joint is a few rows wide; a dip narrower than the grain is not one.
+  const reach = Math.max(2, Math.round(size / 256));
+  const spacing = Math.max(4, Math.round(size / 32));
+  const found: BedJoint[] = [];
+  for (let row = reach; row < count - reach; row++) {
+    const base = neighbourhood(values, row, radius);
+    const depth = base - values[row]!;
+    if (depth < minDepth) continue;
+    let darkest = true;
+    for (let t = -reach; t <= reach; t++) {
+      if (t !== 0 && values[row + t]! < values[row]!) {
+        darkest = false;
+        break;
+      }
+    }
+    if (!darkest) continue;
+    // The joint's own rows: how far the dip stays past halfway back up to its neighbourhood.
+    const level = (values[row]! + base) / 2;
+    let above = 0;
+    while (row - above - 1 >= 0 && values[row - above - 1]! < level) above++;
+    let below = 0;
+    while (row + below + 1 < count && values[row + below + 1]! < level) below++;
+    found.push({ row, depth, thickness: above + below + 1 });
+  }
+  if (found.length < SWATCH_JOINT_MIN_COUNT) return undefined;
+  // One joint per course: of two candidates closer together than a course, the deeper is the joint.
+  found.sort((a, b) => b.depth - a.depth);
+  const joints: BedJoint[] = [];
+  for (const joint of found) {
+    if (joints.some((kept) => Math.abs(kept.row - joint.row) < spacing)) continue;
+    joints.push(joint);
+  }
+  if (joints.length < SWATCH_JOINT_MIN_COUNT) return undefined;
+  joints.sort((a, b) => a.row - b.row);
+  const window = Math.max(1, Math.round(count * SWATCH_JOINT_WINDOW_SHARE));
+  const clearest = (from: number, to: number) => {
+    let best: BedJoint | undefined;
+    for (const joint of joints) {
+      if (joint.row < from || joint.row >= to) continue;
+      if (!best || joint.depth > best.depth) best = joint;
+    }
+    return best;
+  };
+  const top = clearest(0, window);
+  const bottom = clearest(count - window, count);
+  // A crop that keeps less than half the patch is a cut on two dips, not a tile of this wall.
+  if (!top || !bottom || bottom.row - top.row < count / 2) return undefined;
+  const thicknesses = joints.map((joint) => joint.thickness).sort((a, b) => a - b);
+  const median = thicknesses[Math.floor(thicknesses.length / 2)]!;
+  // Both ends to a block boundary: two rows either way around a joint's centre are still its core, and the
+  // tile's height then is a whole number of the blocks the engine transcodes.
+  const aligned = (row: number) => Math.min(count, Math.max(0, Math.round(row / SWATCH_BLOCK) * SWATCH_BLOCK));
+  return {
+    top: aligned(top.row),
+    bottom: aligned(bottom.row),
+    joints,
+    headWidth: Math.max(3, Math.min(Math.round(size / 16), median)),
+  };
+}
+
+/** The largest whole number of transcoding blocks no longer than `value`. */
+function blockAligned(value: number): number {
+  return Math.max(SWATCH_BLOCK, value - (value % SWATCH_BLOCK));
+}
+
+/** The mean of `values` over `radius` either side of `at`, clamped to the ends. */
+function neighbourhood(values: Float64Array, at: number, radius: number): number {
+  let sum = 0;
+  let seen = 0;
+  for (let t = -radius; t <= radius; t++) {
+    const i = at + t;
+    if (i < 0 || i >= values.length) continue;
+    sum += values[i]!;
+    seen++;
+  }
+  return sum / seen;
+}
+
+/**
+ * The tile of a coursed wall (phase 2y): the patch's rows cut to two bed joints, and — where the columns
+ * have no period of their own — each course's x wrap closed on a head joint instead of cross-faded. The
+ * y axis needs no blend at all: both of its ends are mortar, and so is the wrap.
+ */
+function jointSwatch(
+  rectified: Uint8ClampedArray,
+  side: number,
+  size: number,
+  crop: JointCrop,
+  columns: { start: number; length: number; period: number } | undefined,
+): SwatchTile {
+  const left = columns?.start ?? 0;
+  // A period the x axis kept ends just short of the next joint, so dropping the last few columns of it is
+  // as safe as keeping them; a side off the block grid is not.
+  const width = blockAligned(columns?.length ?? size);
+  const height = blockAligned(crop.bottom - crop.top);
+  const out = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    const from = 4 * ((crop.top + y) * size + left);
+    out.set(rectified.subarray(from, from + 4 * width), 4 * y * width);
+  }
+  if (!columns) closeHeadJoints(out, width, height, crop);
+  return {
+    // Sharpened as the periodic crop is: the drawn head joints are made crisp the same way the paint's
+    // bed joints are, so they read as one material.
+    pixels: sharpenSwatch(out, width, height),
+    width,
+    height,
+    metresX: (side * width) / size,
+    metresY: (side * height) / size,
+    // Neither axis was cut on a period here: y was cut to joints; x either keeps its own period or is
+    // closed per course, and a course boundary is not a repeat the game may use.
+    periodX: columns ? columns.period : 0,
+    periodY: 0,
+  };
+}
+
+/**
+ * Close every course's own x wrap on a head joint (phase 2y). The band is drawn across the seam first —
+ * half of it either side, blended to the mortar the bed joints are made of — and only then is the course
+ * rolled onto its bond, so the place the roll's copy jumps falls inside the joint: the tile's own seam is
+ * mortar on both sides, never brick against brick, and a rolled course stays continuous because a circular
+ * shift of a circularly continuous row is continuous. Alternate courses take half the width, so the drawn
+ * joints stagger like a running bond instead of stacking into a vertical line.
+ */
+function closeHeadJoints(pixels: Uint8ClampedArray, width: number, height: number, crop: JointCrop) {
+  const bounds = [0];
+  for (const joint of crop.joints) {
+    const row = joint.row - crop.top;
+    if (row > 0 && row < height) bounds.push(row);
+  }
+  bounds.push(height);
+  const mortar = jointColour(pixels, width, height, bounds);
+  const reach = Math.max(1, Math.round(crop.headWidth / 2));
+  const scratch = new Uint8ClampedArray(width * 4);
+  for (let course = 0; course < bounds.length - 1; course++) {
+    const from = bounds[course]!;
+    const to = bounds[course + 1]!;
+    for (let y = from; y < to; y++) {
+      const base = 4 * y * width;
+      // A joint is not a printed stripe: its width wanders down the course, and mortar has grain. Both
+      // only depend on the distance to the seam and the row, so the band is mirror-symmetric about the
+      // seam and stays continuous across it (the unsharp mask would ring on a step there).
+      const edge = reach + Math.round(1.5 * Math.sin(y * 0.09) + Math.sin(y * 0.031 + 2.1));
+      // Out to the soft edge and no further: the last column the band writes has to be all brick, or the
+      // joint would end on a step instead of on the ramp the paint's own joints have.
+      for (let d = 0; d < edge + SWATCH_HEAD_SOFT_PX; d++) {
+        const weight = Math.min(1, Math.max(0, (edge - d) / SWATCH_HEAD_SOFT_PX));
+        if (!(weight > 0)) break;
+        let hash = (Math.imul(d + 1, 0x9e3779b1) ^ Math.imul(y + 1, 0x85ebca6b)) >>> 0;
+        hash ^= hash >>> 15;
+        const grain = ((hash % 1000) / 1000 - 0.5) * SWATCH_HEAD_GRAIN;
+        for (const x of [d, width - 1 - d]) {
+          const at = base + 4 * x;
+          for (let c = 0; c < 3; c++) pixels[at + c] = (1 - weight) * pixels[at + c]! + weight * (mortar[c]! + grain);
+        }
+      }
+    }
+    const offset = bondOffset(course, width);
+    if (offset === 0) continue;
+    for (let y = from; y < to; y++) {
+      const base = 4 * y * width;
+      for (let x = 0; x < width; x++) {
+        const at = base + 4 * ((((x - offset) % width) + width) % width);
+        scratch[4 * x] = pixels[at]!;
+        scratch[4 * x + 1] = pixels[at + 1]!;
+        scratch[4 * x + 2] = pixels[at + 2]!;
+        scratch[4 * x + 3] = 255;
+      }
+      pixels.set(scratch, base);
+    }
+  }
+}
+
+/**
+ * The mortar the tile's head joints are made of: the mean RGB of every bed joint's core rows. Averaged over
+ * all the joints and the whole width, so one joint's stain — and the paint's lighting gradient, which
+ * brightens a joint at one end of the patch — does not carry into a band drawn somewhere else.
+ */
+function jointColour(pixels: Uint8ClampedArray, width: number, height: number, bounds: readonly number[]): Vec3 {
+  const sum = [0, 0, 0];
+  let count = 0;
+  for (const bound of bounds) {
+    // The core only: the rows either side of the joint's centre are its darkest, and the ones beyond are
+    // the brick's own edge, which is lighter and would wash the band out.
+    for (let dy = -1; dy <= 1; dy++) {
+      const y = bound + dy;
+      if (y < 0 || y >= height) continue;
+      for (let x = 0; x < width; x++) {
+        for (let c = 0; c < 3; c++) sum[c] = sum[c]! + pixels[4 * (y * width + x) + c]!;
+      }
+      count += width;
+    }
+  }
+  if (count === 0) return [0, 0, 0];
+  return [sum[0]! / count, sum[1]! / count, sum[2]! / count];
+}
+
+/**
+ * How far a course is rolled along x: alternate courses take half the tile, the way a running bond
+ * staggers its head joints, and every course its own fixed jitter — a hash of its index, not a random, so
+ * the same paint gives the same swatch on every run.
+ */
+function bondOffset(course: number, width: number): number {
+  const half = course % 2 === 0 ? 0 : Math.round(width * SWATCH_BOND_OFFSET_SHARE);
+  let hash = Math.imul(course + 1, 0x9e3779b1) >>> 0;
+  hash ^= hash >>> 15;
+  hash = Math.imul(hash, 0x85ebca6b) >>> 0;
+  hash = (hash ^ (hash >>> 13)) >>> 0;
+  const jitter = Math.round((((hash % 1001) / 1000) * 2 - 1) * width * SWATCH_BOND_JITTER_SHARE);
+  return (((half + jitter) % width) + width) % width;
 }
 
 /** Bilinear RGBA sample of a square image at a continuous pixel coordinate, edges clamped. */
