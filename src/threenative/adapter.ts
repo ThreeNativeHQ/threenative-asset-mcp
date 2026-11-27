@@ -195,8 +195,8 @@ async function companionFiles(
   };
 }
 
-/** The license as the preserved evidence states it: the source's license URL, and where its own document
- * and original receipt are kept. */
+/** The license as the preserved evidence states it: the original source's license name and URL when the
+ * provenance records them, and where its own document and original receipt are kept. */
 function withEvidence(
   asset: Asset,
   companions: { files: AssetFile[]; manifest?: ThreeNativeManifest },
@@ -204,18 +204,21 @@ function withEvidence(
   const at = (role: string) => companions.files.find((file) => file.metadata?.companionRole === role)?.path;
   const document = at("license");
   const receipt = at("source-receipt");
-  const url = companions.manifest?.provenance?.license?.url;
-  if (!document && !receipt && !url) return asset;
+  const source = companions.manifest?.provenance?.license;
+  if (!document && !receipt && !source?.name) return asset;
   const kept = [
     ...(document ? [`the license document at ${document}`] : []),
     ...(receipt ? [`the original acquisition receipt at ${receipt}`] : []),
   ];
-  return AssetSchema.parse({
-    ...asset,
-    license: {
-      ...asset.license,
-      ...(url ? { url } : {}),
-      evidence: `${asset.license.evidence}${kept.length ? ` ThreeNative keeps ${kept.join(" and ")}.` : ""}`.slice(0, 2000),
-    },
-  });
+  const keeps = kept.length ? ` ThreeNative keeps ${kept.join(" and ")}.` : "";
+  const license: Asset["license"] = source?.name
+    ? {
+        name: source.name,
+        ...(source.url ? { url: source.url } : {}),
+        evidence: `The original source records ${source.name}.${keeps}`,
+        commercialUse: "unknown",
+        attributionRequired: /^CC[- ]?BY/iu.test(source.name) ? "yes" : "unknown",
+      }
+    : { ...asset.license, evidence: `${asset.license.evidence}${keeps}` };
+  return AssetSchema.parse({ ...asset, license: { ...license, evidence: license.evidence.slice(0, 2000) } });
 }

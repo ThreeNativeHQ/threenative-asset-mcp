@@ -138,7 +138,11 @@ describe("ThreeNative companions", () => {
     );
     expect(detail.asset.rankingFactors).toContain("ready GLB");
     expect(detail.asset.downloadReason).toMatch(/complete.*4 companion files/u);
-    expect(detail.asset.license.url).toBe("https://creativecommons.org/licenses/by/4.0/");
+    expect(detail.asset.license).toMatchObject({
+      attributionRequired: "yes",
+      name: "CC-BY-4.0",
+      url: "https://creativecommons.org/licenses/by/4.0/",
+    });
     expect(detail.asset.license.evidence).toMatch(/companions\/LICENSE\.txt/u);
     expect(methods).toEqual([`HEAD /api/assets/cache/${COMPLETE}`, `GET /api/assets/cache/${COMPLETE}/manifest`]);
   });
