@@ -123,7 +123,33 @@ async function safeDirectory(path: string): Promise<string> {
   return realpath(path);
 }
 
-async function validateGltf(directory: string, files: AssetFile[]): Promise<void> {
+/** Required glTF extensions the engine and three.js load without a companion resource. */
+const SUPPORTED_REQUIRED_EXTENSIONS = new Set([
+  "EXT_mesh_gpu_instancing",
+  "EXT_meshopt_compression",
+  "EXT_texture_webp",
+  "KHR_draco_mesh_compression",
+  "KHR_lights_punctual",
+  "KHR_materials_anisotropy",
+  "KHR_materials_clearcoat",
+  "KHR_materials_diffuse_transmission",
+  "KHR_materials_dispersion",
+  "KHR_materials_emissive_strength",
+  "KHR_materials_ior",
+  "KHR_materials_iridescence",
+  "KHR_materials_pbrSpecularGlossiness",
+  "KHR_materials_sheen",
+  "KHR_materials_specular",
+  "KHR_materials_transmission",
+  "KHR_materials_unlit",
+  "KHR_materials_variants",
+  "KHR_materials_volume",
+  "KHR_mesh_quantization",
+  "KHR_texture_basisu",
+  "KHR_texture_transform",
+]);
+
+export async function validateGltf(directory: string, files: AssetFile[]): Promise<void> {
   const paths = new Set(files.map((file) => file.path));
   for (const file of files.filter((file) => /\.(?:gltf|glb)$/iu.test(file.path))) {
     let json: unknown;
@@ -191,35 +217,15 @@ async function validateGltf(directory: string, files: AssetFile[]): Promise<void
     };
     if (doc.asset?.version !== "2.0") throw new AcquisitionError("Unsupported glTF version.");
     // ponytail: standard buffers/images only; extensions with external resources need explicit qualification.
-    if (
-      doc.extensionsRequired !== undefined &&
-      (!Array.isArray(doc.extensionsRequired) ||
-        doc.extensionsRequired.some(
-          (name) =>
-            ![
-              "KHR_materials_unlit",
-              "KHR_mesh_quantization",
-              "KHR_texture_transform",
-              "KHR_materials_pbrSpecularGlossiness",
-              "KHR_draco_mesh_compression",
-              "EXT_meshopt_compression",
-              "EXT_texture_webp",
-              "KHR_texture_basisu",
-              "KHR_materials_clearcoat",
-              "KHR_materials_emissive_strength",
-              "KHR_materials_ior",
-              "KHR_materials_specular",
-              "KHR_materials_transmission",
-              "KHR_materials_volume",
-              "KHR_materials_sheen",
-              "KHR_materials_anisotropy",
-              "KHR_materials_iridescence",
-              "KHR_lights_punctual",
-              "EXT_mesh_gpu_instancing",
-            ].includes(String(name)),
-        ))
-    )
-      throw new AcquisitionError("Unsupported glTF required extension.");
+    if (doc.extensionsRequired !== undefined && !Array.isArray(doc.extensionsRequired))
+      throw new AcquisitionError("Invalid glTF extensionsRequired.");
+    const unsupported = ((doc.extensionsRequired ?? []) as unknown[])
+      .map(String)
+      .filter((name) => !SUPPORTED_REQUIRED_EXTENSIONS.has(name));
+    if (unsupported.length)
+      throw new AcquisitionError(
+        `Unsupported glTF required extension: ${unsupported.slice(0, 8).join(", ")}.`,
+      );
     for (const [kind, collection] of [doc.buffers, doc.images].entries()) {
       if (collection === undefined) continue;
       if (!Array.isArray(collection) || collection.length > 128)
@@ -250,10 +256,11 @@ async function validateGltf(directory: string, files: AssetFile[]): Promise<void
               !isMeshoptFallback &&
               (index !== 0 ||
                 binaryLength === undefined ||
-                binaryLength < (byteLength as number) ||
-                binaryLength > (byteLength as number) + 3)
+                binaryLength < (byteLength as number))
             )
-              throw new AcquisitionError("Missing or incomplete GLB embedded buffer.");
+              throw new AcquisitionError(
+                `Missing or incomplete GLB embedded buffer: the binary chunk holds ${binaryLength ?? 0} of ${byteLength} bytes${index === 0 ? "" : ` (buffer ${index} has no uri)`}.`,
+              );
           } else if (
             !Number.isSafeInteger(bufferView) ||
             (bufferView as number) < 0 ||

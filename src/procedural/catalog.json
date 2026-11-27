@@ -1,6 +1,6 @@
 {
  "package": "@threenative/procedural-environment",
- "version": "0.1.2",
+ "version": "0.1.10",
  "elements": [
   {
    "id": "oak",
