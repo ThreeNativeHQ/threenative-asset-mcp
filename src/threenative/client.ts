@@ -286,8 +286,10 @@ export class ThreeNativeCatalogClient {
     const reply = await this.fetch(url, { headers: this.authFor(url), redirect: "error", signal }).catch(
       () => undefined,
     );
-    if (!reply?.ok) return undefined;
+    // A manifest lists at most 16 members: anything near a megabyte is not one.
+    if (!reply?.ok || Number(reply.headers.get("content-length") ?? 0) > 1024 * 1024) return undefined;
     const bytes = new Uint8Array(await reply.arrayBuffer());
+    if (bytes.byteLength > 1024 * 1024) return undefined;
     let parsed: unknown;
     try {
       parsed = JSON.parse(new TextDecoder().decode(bytes));
