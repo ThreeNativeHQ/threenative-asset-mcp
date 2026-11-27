@@ -208,7 +208,7 @@ const SwatchSchema = z
       .describe("Metres of surface per pixel of that view; below metresPerPixel means the swatch is an upsample."),
     incidence: z.number().min(0).max(90).describe("Angle between the patch's normal and its view, in degrees."),
     corners: z
-      .array(z.tuple([z.number(), z.number(), z.number()]))
+      .array(z.array(z.number()).length(3))
       .length(4)
       .describe("The patch's four world corners, in order: -u-v, +u-v, +u+v, -u+v from its centre."),
   })
@@ -677,7 +677,7 @@ const SurfaceCropSchema = z
   })
   .strict();
 
-const ModelDimensionsSchema = z.tuple([z.number().positive(), z.number().positive(), z.number().positive()]);
+const ModelDimensionsSchema = z.array(z.number().positive()).length(3);
 
 const SurfaceQuerySchema = z
   .object({
@@ -852,7 +852,15 @@ export function createTextureProjectMatchMaterialsHandler(
         name: model.name,
         query: model.query,
         ...(model.crop === undefined ? {} : { crop: model.crop }),
-        ...(model.dimensionsMeters === undefined ? {} : { dimensionsMeters: model.dimensionsMeters }),
+        ...(model.dimensionsMeters === undefined
+          ? {}
+          : {
+              dimensionsMeters: [
+                model.dimensionsMeters[0] ?? 0,
+                model.dimensionsMeters[1] ?? 0,
+                model.dimensionsMeters[2] ?? 0,
+              ] as const,
+            }),
         ...(model.maxPolycount === undefined ? {} : { maxPolycount: model.maxPolycount }),
         ...(model.referenceImagePath === undefined
           ? {}

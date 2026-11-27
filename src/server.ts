@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
 
 import { McpServer } from "@modelcontextprotocol/server";
+import {
+  applyStudioProfileFilter,
+  resolveAssetMcpProfile,
+  type AssetMcpProfile,
+} from "./studio-profile.js";
 
 import type { TextureProjectionMode } from "./config.js";
 
@@ -274,37 +279,25 @@ export interface AssetServerClients {
   audioGenerator?: AudioGenerator;
   /** Workflow mode for texture projection tools; defaults to "detailed". */
   textureMode?: TextureProjectionMode;
+  /** Tool profile filter; defaults to "detailed". */
+  profile?: AssetMcpProfile;
 }
 
-export function createAssetServer(
-  clients: AssetServerClients = {
-    fab: new FabClient(),
-    polyhaven: new PolyHavenClient(),
-    ambientcg: new AmbientCgClient(),
-    smithsonian: new SmithsonianClient(),
-    sketchfab: new SketchfabClient(),
-    audio: new AudioCatalogClient(),
-    directDownloader: new DirectAssetDownloader(),
-    itch: new ItchAssetClient(),
-    bundle: new BundleAssetClient({ itch: new ItchAssetClient() }),
-  },
-): McpServer {
+export function createAssetServer(clients: Partial<AssetServerClients> = {}): McpServer {
   const textureMode: TextureProjectionMode = clients.textureMode ?? "detailed";
   const kenneySetting = process.env.ASSET_ENABLE_KENNEY ?? "1";
   if (kenneySetting !== "0" && kenneySetting !== "1") {
     throw new Error("ASSET_ENABLE_KENNEY must be 0 or 1.");
   }
-  const {
-    fab,
-    polyhaven,
-    ambientcg,
-    smithsonian,
-    sketchfab,
-    audio,
-    directDownloader,
-    itch,
-    bundle,
-  } = clients;
+  const fab = clients.fab ?? new FabClient();
+  const polyhaven = clients.polyhaven ?? new PolyHavenClient();
+  const ambientcg = clients.ambientcg ?? new AmbientCgClient();
+  const smithsonian = clients.smithsonian ?? new SmithsonianClient();
+  const sketchfab = clients.sketchfab ?? new SketchfabClient();
+  const audio = clients.audio ?? new AudioCatalogClient();
+  const directDownloader = clients.directDownloader ?? new DirectAssetDownloader();
+  const itch = clients.itch ?? new ItchAssetClient();
+  const bundle = clients.bundle ?? new BundleAssetClient({ itch });
   const polyfork = clients.polyfork ?? new PolyforkClient();
   const audioInspector = clients.audioInspector ?? new AudioInspector();
   // Constructing this reads no credentials: a missing key fails at call time, not at startup, so
@@ -316,6 +309,10 @@ export function createAssetServer(
     name: "threenative-asset-mcp",
     version: packageVersion(),
   });
+  applyStudioProfileFilter(
+    server,
+    clients.profile ?? resolveAssetMcpProfile(process.argv, process.env),
+  );
 
   const blendkitSettings = blendkitConfig();
   const blendkit =
